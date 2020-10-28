@@ -175,11 +175,6 @@ batch_uploaded = 0
 batch_number = 1  # This will break apart the input parquet file into batches defined by batch_size
 
 for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
-
-
-
-
-
     dpla_id = getattr(row, 'id')
     title = getattr(row, 'title')
     wiki_markup = getattr(row, 'wiki_markup')
@@ -210,6 +205,9 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
     """
 
     upload_size = 0
+
+    out, time, size = None, 0, 0  # Defaults
+
     if len(download_urls) > 1:
         # TODO handle multi-asset upload for single item
         # - page title creation
@@ -223,8 +221,13 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
     elif len(download_urls) == 1:
         # Handle single asset upload
         url = download_urls[0]
-        # download asset
-        out, time, size = download(url, asset_path)
+        # download asset and swallow Exceptions 
+        try:
+            out, time, size = download(url, asset_path)
+        except Exception as e:
+            out = None
+            time = 0
+            size = 0
 
         # Update size
         batch_uploaded = batch_uploaded + size
@@ -236,15 +239,17 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
         #   - size of asset to upload
         #   - title/wiki page name
         #   - wiki markup
-        row = {
-            'dpla_id': dpla_id,
-            'path': out,
-            'size': size,
-            'title': title,
-            'markup': wiki_markup
-        }
 
-        upload_rows.append(row)
+        if out is not None:
+            row = {
+                'dpla_id': dpla_id,
+                'path': out,
+                'size': size,
+                'title': title,
+                'markup': wiki_markup
+            }
+
+            upload_rows.append(row)
     else:
         logging.info("Undefined condition met")
 

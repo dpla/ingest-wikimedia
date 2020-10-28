@@ -87,7 +87,7 @@ class Dupload:
                 return out, (end - start), file_size
         except Exception as e:
             # TODO cleaner error handling here
-            logging.error(f"Failed to download {url}: {e}")
+            # logging.error(f"Failed to download {url}: {e}")
             raise Exception(f"Failed to download ${url}: {e}")
 
     def download(self, url, out):
@@ -107,7 +107,6 @@ class Dupload:
 
         except Exception as e:
             # TODO cleaner error handling here
-            logging.error(f"Failed to download {url}: {e}")
             raise Exception(f"Failed to download ${url}: {e}")
 
     def download_single_item(self, url, save_location):
