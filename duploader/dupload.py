@@ -5,11 +5,9 @@ from time import process_time
 
 import boto3
 import logging
-import pywikibot
 import requests
 import tempfile
 from pathlib import Path
-from pywikibot import UploadWarning
 from urllib.parse import urlparse
 from botocore.exceptions import ClientError
 
