@@ -189,6 +189,7 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
     except Exception as e:
         logging.error(f"Unable to get attributes from row {row}")
 
+    row_number = row_number + 1
     logging.info(f"Row number {row_number}")
 
     asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
