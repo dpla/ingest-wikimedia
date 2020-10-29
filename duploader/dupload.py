@@ -88,7 +88,7 @@ class Dupload:
         except Exception as e:
             # TODO cleaner error handling here
             # logging.error(f"Failed to download {url}: {e}")
-            raise Exception(f"Failed to download ${url}: {e}")
+            raise Exception(f"Failed to download {url}: {e}")
 
     def download(self, url, out):
         """
@@ -107,7 +107,7 @@ class Dupload:
 
         except Exception as e:
             # TODO cleaner error handling here
-            raise Exception(f"Failed to download ${url}: {e}")
+            raise Exception(f"Failed to download {url}: {e}")
 
     def download_single_item(self, url, save_location):
         # TODO confirm replacing .jp2 with .jpeg

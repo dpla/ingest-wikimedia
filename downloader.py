@@ -221,10 +221,11 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
     elif len(download_urls) == 1:
         # Handle single asset upload
         url = download_urls[0]
-        # download asset and swallow Exceptions 
+        # download asset and swallow Exceptions
         try:
             out, time, size = download(url, asset_path)
         except Exception as e:
+            logging.info(f"Error {e}")
             out = None
             time = 0
             size = 0
@@ -252,6 +253,8 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
             upload_rows.append(row)
     else:
         logging.info("Undefined condition met")
+
+    logging.info(f"Batch total {sizeof_fmt(batch_uploaded)}")
 
     if batch_uploaded > batch_size:
         logging.info(f"Upload quota met for batch {batch_number}")
