@@ -123,7 +123,7 @@ def get_df(path):
 
 
 def create_path(path):
-    if not Path(path).exists():
+    if not path.startswith("s3") and not Path(path).exists():
         Path(path).mkdir(parents=True)
 
 
@@ -176,6 +176,9 @@ batch_number = 1  # This will break apart the input parquet file into batches de
 
 logging.info(f"Total rows in dataframe {df.size}")
 
+row_number = 0
+
+
 for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
     try:
         dpla_id = getattr(row, 'id')
@@ -186,8 +189,12 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
     except Exception as e:
         logging.error(f"Unable to get attributes from row {row}")
 
+    logging.info(f"Row number {row_number}")
+
     asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
     df_output_path = f"{save_location}/batch_{batch_number}/data/"
+
+    logging.info(asset_path)
 
     create_path(asset_path)
     create_path(df_output_path)
@@ -292,3 +299,5 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
         logging.info(f"Saving {batch_parquet_out_path}")
         df_out.to_parquet(batch_parquet_out_path)
         break
+
+    logging.info("next record")
