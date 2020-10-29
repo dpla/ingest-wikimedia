@@ -254,7 +254,7 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
     else:
         logging.info("Undefined condition met")
 
-    logging.info(f"Batch total {sizeof_fmt(batch_uploaded)}")
+    logging.info(f"Item {sizeof_fmt(size)} -- Batch total {sizeof_fmt(batch_uploaded)}")
 
     if batch_uploaded > batch_size:
         logging.info(f"Upload quota met for batch {batch_number}")
