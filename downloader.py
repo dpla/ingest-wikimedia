@@ -174,12 +174,17 @@ total_uploaded = 0
 batch_uploaded = 0
 batch_number = 1  # This will break apart the input parquet file into batches defined by batch_size
 
+logging.info(f"Total rows in dataframe {df.size}")
+
 for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
-    dpla_id = getattr(row, 'id')
-    title = getattr(row, 'title')
-    wiki_markup = getattr(row, 'wiki_markup')
-    iiif = getattr(row, 'iiif')
-    media_master = getattr(row, 'media_master')
+    try:
+        dpla_id = getattr(row, 'id')
+        title = getattr(row, 'title')
+        wiki_markup = getattr(row, 'wiki_markup')
+        iiif = getattr(row, 'iiif')
+        media_master = getattr(row, 'media_master')
+    except Exception as e:
+        logging.error(f"Unable to get attributes from row {row}")
 
     asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
     df_output_path = f"{save_location}/batch_{batch_number}/data/"
