@@ -4,11 +4,11 @@ aioitertools==0.7.0
 alabaster==0.7.12
 async-timeout==3.0.1
 attrs==20.2.0
-awswrangler==1.9.4
+awswrangler
 Babel==2.8.0
-boto3==1.15.3
-boto3-stubs==1.16.6.0
-botocore==1.17.44
+boto3
+boto3-stubs
+botocore
 certifi==2020.6.20
 chardet==3.0.4
 docutils==0.15.2
