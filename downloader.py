@@ -28,8 +28,12 @@ Production use case:
 # |https://ark.digitalcommonwealth.org/ark:/50959/c247kb43p/manifest|
 # |https://ark.digitalcommonwealth.org/ark:/50959/8s45r279b/manifest|
 # +-----------------------------------------------------------------+
+import fnmatch
+import os
+
 import json
 import requests
+import traceback
 from pathlib import Path
 
 from duploader.dupload import Dupload
@@ -37,6 +41,7 @@ import awswrangler as wr
 import getopt
 import sys
 import pandas as pd
+import fastparquet as fp
 
 import logging
 
@@ -114,8 +119,19 @@ def get_df_s3(path):
 
 
 def get_df_local(path):
-    return pd.read_parquet(path, engine='fastparquet') \
-        .rename(columns={"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"})
+    from pathlib import Path
+
+    data_dir = Path(path)
+
+    full_df = pd.concat(
+        pd.read_parquet(parquet_file, engine='fastparquet')
+            .rename(columns={"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"})
+        for parquet_file in data_dir.glob('*.parquet')
+    )
+    return full_df
+
+    # return pd.read_parquet(path, gather_statistics=False) \
+    #     .rename(columns={"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"})
 
 
 def get_df(path):
@@ -167,6 +183,28 @@ logging.info(f"Batch size: {sizeof_fmt(batch_size)}")  # 1 TB === 1000000000000
 logging.info(f"Input:      {input_wiki_parquet_file}")
 logging.info(f"Output:     {save_location}")
 
+file_list = []
+
+"""
+    Loop to extract python files 
+
+    path --> Name of each directory
+    folders --> List of subdirectories inside current 'path'
+    files --> List of files inside current 'path'
+
+"""
+# print("List of python files in the directory:")
+# for path, folders, files in os.walk(input_wiki_parquet_file):
+#     for file in files:
+#         if fnmatch.fnmatch(file, '*.parquet'):
+#             file_list.append(os.path.join(path, file))
+#
+# logging.info(file_list)
+#
+# fp.writer.merge(file_list[1:], verify_schema=False)
+#
+# logging.info("Merged parquet files")
+
 df = get_df(input_wiki_parquet_file)
 
 upload_rows = list()
@@ -185,7 +223,7 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
         iiif = getattr(row, 'iiif')
         media_master = getattr(row, 'media_master')
     except Exception as e:
-        logging.error(f"Unable to get attributes from row {row}")
+        logging.error(f"Unable to get attributes from row {row}: {e}")
 
     row_number = row_number + 1
     logging.info(f"Row number {row_number}")
@@ -234,7 +272,9 @@ for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'ti
         try:
             out, time, size = download(url, asset_path)
         except Exception as e:
-            logging.info(f"Error {e}")
+            traceback.print_exc()
+
+            logging.info(f"Error {e.with_traceback()}")
             out = None
             time = 0
             size = 0

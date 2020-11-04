@@ -112,7 +112,8 @@ class Dupload:
     def download_single_item(self, url, save_location):
         # TODO confirm replacing .jp2 with .jpeg
         # .replace('.jp2', '.jpeg')
-        output_file = f"{save_location}/{url.split('/')[-1]}"
+        file = url.split(str.encode('/'))[-1]
+        output_file = f"{save_location}/{file.decode()}"
         return self.download(url=url, out=output_file)
 
 
