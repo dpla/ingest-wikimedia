@@ -279,12 +279,11 @@ for parquet_file in data_dir.glob('*.parquet'):
             try:
                 out, time, size = download(url, asset_path)
             except Exception as e:
-                traceback.print_exc()
-
                 logging.info(f"Error {e.with_traceback()}")
                 out = None
                 time = 0
                 size = 0
+                continue
 
             # Update size
             batch_uploaded = batch_uploaded + size
