@@ -205,7 +205,8 @@ file_list = []
 #
 # logging.info("Merged parquet files")
 
-df = get_df(input_wiki_parquet_file)
+# TODO Uncomment
+# df = get_df(input_wiki_parquet_file)
 
 upload_rows = list()
 total_uploaded = 0
@@ -214,125 +215,131 @@ batch_number = 1  # This will break apart the input parquet file into batches de
 
 row_number = 0
 
+from pathlib import Path
+data_dir = Path(input_wiki_parquet_file)
 
-for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
-    try:
-        dpla_id = getattr(row, 'id')
-        title = getattr(row, 'title')
-        wiki_markup = getattr(row, 'wiki_markup')
-        iiif = getattr(row, 'iiif')
-        media_master = getattr(row, 'media_master')
-    except Exception as e:
-        logging.error(f"Unable to get attributes from row {row}: {e}")
-
-    row_number = row_number + 1
-    logging.info(f"Row number {row_number}")
-
-    asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
-    df_output_path = f"{save_location}/batch_{batch_number}/data/"
-
-    create_path(asset_path)
-    create_path(df_output_path)
-
-    # Are we working with iiif or media_master?
-    download_urls = get_iiif_urls(iiif) if iiif else media_master
-
-    """
-    Get urls to download
-    Download images up to 1TB 
-    Store them and then upload later 
-    
-    Generate values required by uploader 
-    upload parquet file
-        - dpla id
-        - Page title 
-        - Path to asset
-        - size of asset 
-        - Wiki markup 
-    """
-
-    upload_size = 0
-
-    out, time, size = None, 0, 0  # Defaults
-
-    if len(download_urls) > 1:
-        # TODO handle multi-asset upload for single item
-        # - page title creation
-        # - filename
-        # - upload asset
-        logging.info("Unsupported multi-asset upload")
-        for url in download_urls:
-            single_file_upload_size = 0
-        break
-
-    elif len(download_urls) == 1:
-        # Handle single asset upload
-        url = download_urls[0]
-        # download asset and swallow Exceptions
+for parquet_file in data_dir.glob('*.parquet'):
+    logging.info(f"Processing {parquet_file}")
+    df = pd.read_parquet(parquet_file, engine='fastparquet')\
+        .rename(columns={"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"})
+    for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
         try:
-            out, time, size = download(url, asset_path)
+            dpla_id = getattr(row, 'id')
+            title = getattr(row, 'title')
+            wiki_markup = getattr(row, 'wiki_markup')
+            iiif = getattr(row, 'iiif')
+            media_master = getattr(row, 'media_master')
         except Exception as e:
-            traceback.print_exc()
+            logging.error(f"Unable to get attributes from row {row}: {e}")
 
-            logging.info(f"Error {e.with_traceback()}")
-            out = None
-            time = 0
-            size = 0
+        row_number = row_number + 1
+        logging.info(f"Row number {row_number}")
 
-        # Update size
-        batch_uploaded = batch_uploaded + size
-        total_uploaded = total_uploaded + size
+        asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
+        df_output_path = f"{save_location}/batch_{batch_number}/data/"
 
-        # create row for "upload" parquet file
-        #   - dpla id, its just good to have
-        #   - path to asset to upload
-        #   - size of asset to upload
-        #   - title/wiki page name
-        #   - wiki markup
+        create_path(asset_path)
+        create_path(df_output_path)
 
-        if out is not None:
-            row = {
-                'dpla_id': dpla_id,
-                'path': out,
-                'size': size,
-                'title': title,
-                'markup': wiki_markup
-            }
+        # Are we working with iiif or media_master?
+        download_urls = get_iiif_urls(iiif) if iiif else media_master
 
-            upload_rows.append(row)
-    else:
-        logging.info("Undefined condition met")
+        """
+        Get urls to download
+        Download images up to 1TB 
+        Store them and then upload later 
+        
+        Generate values required by uploader 
+        upload parquet file
+            - dpla id
+            - Page title 
+            - Path to asset
+            - size of asset 
+            - Wiki markup 
+        """
 
-    logging.info(f"Item {sizeof_fmt(size)} -- Batch total {sizeof_fmt(batch_uploaded)}")
+        upload_size = 0
 
-    if batch_uploaded > batch_size:
-        logging.info(f"Upload quota met for batch {batch_number}")
-        logging.info(f"\n\tBatch {batch_number} \n" \
-                         f"\t{len(upload_rows)} files \n" \
-                         f"\t{sizeof_fmt(batch_uploaded)}")
+        out, time, size = None, 0, 0  # Defaults
 
-        # Save upload info dataframe
-        df_out = pd.DataFrame(upload_rows, columns=['dpla_id', 'path', 'size', 'title', 'markup'])
-        batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
-        logging.info(f"Saving {batch_parquet_out_path}")
-        df_out.to_parquet(batch_parquet_out_path)
+        if len(download_urls) > 1:
+            # TODO handle multi-asset upload for single item
+            # - page title creation
+            # - filename
+            # - upload asset
+            logging.info("Unsupported multi-asset upload")
+            for url in download_urls:
+                single_file_upload_size = 0
+            break
 
-        # Reset
-        # logging.info(f"Resetting `upload_row` to empty list()")
-        upload_rows = list()
-        batch_number = batch_number + 1
-        batch_uploaded = 0
-        logging.info(f"Starting batch number {batch_number}")
+        elif len(download_urls) == 1:
+            # Handle single asset upload
+            url = download_urls[0]
+            # download asset and swallow Exceptions
+            try:
+                out, time, size = download(url, asset_path)
+            except Exception as e:
+                traceback.print_exc()
 
-    # If there is a total limit in place then abort after it has been breached.
-    if 0 < upload_limit < total_uploaded:
-        logging.info(f"Total upload limit breached at {sizeof_fmt(total_uploaded)}. Stopping run.")
-        logging.info(f"\n\tBatch {batch_number} \n" \
-                         f"\t{len(upload_rows)} files \n" \
-                         f"\t{sizeof_fmt(batch_uploaded)}")
+                logging.info(f"Error {e.with_traceback()}")
+                out = None
+                time = 0
+                size = 0
 
-        df_out = pd.DataFrame(upload_rows, columns=['dpla_id', 'path', 'size', 'title', 'markup'])
-        batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
-        logging.info(f"Saving {batch_parquet_out_path}")
-        df_out.to_parquet(batch_parquet_out_path)
-        break
+            # Update size
+            batch_uploaded = batch_uploaded + size
+            total_uploaded = total_uploaded + size
+
+            # create row for "upload" parquet file
+            #   - dpla id, its just good to have
+            #   - path to asset to upload
+            #   - size of asset to upload
+            #   - title/wiki page name
+            #   - wiki markup
+
+            if out is not None:
+                row = {
+                    'dpla_id': dpla_id,
+                    'path': out,
+                    'size': size,
+                    'title': title,
+                    'markup': wiki_markup
+                }
+
+                upload_rows.append(row)
+        else:
+            logging.info("Undefined condition met")
+
+        logging.info(f"Item {sizeof_fmt(size)} -- Batch total {sizeof_fmt(batch_uploaded)}")
+
+        if batch_uploaded > batch_size:
+            logging.info(f"Upload quota met for batch {batch_number}")
+            logging.info(f"\n\tBatch {batch_number} \n" \
+                             f"\t{len(upload_rows)} files \n" \
+                             f"\t{sizeof_fmt(batch_uploaded)}")
+
+            # Save upload info dataframe
+            df_out = pd.DataFrame(upload_rows, columns=['dpla_id', 'path', 'size', 'title', 'markup'])
+            batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
+            logging.info(f"Saving {batch_parquet_out_path}")
+            df_out.to_parquet(batch_parquet_out_path)
+
+            # Reset
+            # logging.info(f"Resetting `upload_row` to empty list()")
+            upload_rows = list()
+            batch_number = batch_number + 1
+            batch_uploaded = 0
+            logging.info(f"Starting batch number {batch_number}")
+
+        # If there is a total limit in place then abort after it has been breached.
+        if 0 < upload_limit < total_uploaded:
+            logging.info(f"Total upload limit breached at {sizeof_fmt(total_uploaded)}. Stopping run.")
+            logging.info(f"\n\tBatch {batch_number} \n" \
+                             f"\t{len(upload_rows)} files \n" \
+                             f"\t{sizeof_fmt(batch_uploaded)}")
+
+            df_out = pd.DataFrame(upload_rows, columns=['dpla_id', 'path', 'size', 'title', 'markup'])
+            batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
+            logging.info(f"Saving {batch_parquet_out_path}")
+            df_out.to_parquet(batch_parquet_out_path)
+            break
