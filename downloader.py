@@ -279,7 +279,7 @@ for parquet_file in data_dir.glob('*.parquet'):
             try:
                 out, time, size = download(url, asset_path)
             except Exception as e:
-                logging.info(f"Error {e.with_traceback()}")
+                logging.info(f"Error: {e}")
                 out = None
                 time = 0
                 size = 0
