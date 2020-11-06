@@ -68,6 +68,7 @@ file_list = utils.get_parquet_files(path=input_df)
 for parquet_file in file_list:
     logging.info(f"Processing...{parquet_file}")
     df = utils.get_df(parquet_file, columns=columns)
+    df_output_path = f"{save_location}/batch_{batch_number}/data/"
     for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
         try:
             dpla_id = getattr(row, 'id')
@@ -79,7 +80,6 @@ for parquet_file in file_list:
             logging.error(f"Unable to get attributes from row {row}: {e}")
 
         asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
-        df_output_path = f"{save_location}/batch_{batch_number}/data/"
 
         utils.create_path(asset_path)
         utils.create_path(df_output_path)
@@ -177,4 +177,10 @@ for parquet_file in file_list:
 
             batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
             utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
+            df_rows = list()
             break
+
+    if df_rows:
+        batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
+        utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
+        df_rows = list() # reset
