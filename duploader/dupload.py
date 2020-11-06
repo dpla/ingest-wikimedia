@@ -18,51 +18,9 @@ class Dupload:
     utils = None
 
     def __init__(self):
-        #  This is only required for the uploader
-        # self.site = pywikibot.Site()
-        # self.site.login()
-
         format = "%(asctime)s: %(message)s"
         logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
         self.utils = Utils()
-
-        # logging.info(f"Logged in user is: {self.site.user()}")
-
-    # FIXME This is duplicating the above functions and consolidated into a single method
-    def dupload(self, dpla_id, title, wiki_markup, download_urls):
-        pass
-        # # FIXME hard code taking the first element for NARA, this works for only one image but won't for (page N)
-        # # Needs explode() on media_master and then passing page number value to create_wiki_page_title()
-        # if len(download_urls) != 1:
-        #     logging.info("Got more than one URL. Unable to take action. Functionality TBI")  # FIXME
-        #     return 0  # return 0 to indicate no upload
-        #
-        # # logging.info(f"{download_urls[0]}")
-        # # Download file. Record local destination, time to download and file size
-        # try:
-        #     # duploader.duownload() will raise an exception if file cannot be downloaded
-        #     file_out, time, size = self.download_single_item(url=download_urls[0], save_location=save_location)
-        #
-        #     # Create Wikimedia page title
-        #     page_title = self.create_wiki_page_title(title=title,
-        #                                                   dpla_identifier=dpla_id,
-        #                                                   suffix=file_out[-4:]  # TODO unpack why trimt suffix
-        #                                                   )
-        #
-        #     # Create wiki page
-        #     wiki_page = self.create_wiki_file_page(title=page_title)
-        #     # Upload to wiki page
-        #     self.upload(wiki_file_page=wiki_page,
-        #                      dpla_identifier=dpla_id,
-        #                      text=wiki_markup,
-        #                      file=file_out)
-        #     logging.info(f"Uploaded {file_out}")
-        #     # Return file size to add to accumulator
-        #     return size
-        # except Exception as e:
-        #     logging.error(f"failed {e}")
-        #     return 0
-
 
     def download_s3(self, url, out):
         """
@@ -73,7 +31,7 @@ class Dupload:
         """
         start = process_time()
 
-        s3 = boto3.client('s3')
+        s3 = boto3.client("s3")
 
         o = urlparse(out)
         bucket = o.netloc

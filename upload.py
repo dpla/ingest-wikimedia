@@ -2,6 +2,7 @@ import logging
 from time import process_time
 
 import boto3
+import botocore
 import logging
 import pywikibot
 import requests
@@ -13,6 +14,7 @@ from botocore.exceptions import ClientError
 import getopt
 import sys
 
+from duploader.dupload import Dupload
 from duploader.utils import Utils
 
 """
@@ -25,6 +27,8 @@ Read parquet file and then upload assets
 
 class Upload:
     site = None
+    download = Dupload()
+
 
     def __init__(self):
         #  This is only required for the uploader
@@ -55,11 +59,28 @@ class Upload:
         #              f"comment = {comment}\n")
 
         try:
-            self.site.upload(filepage=wiki_file_page,
-                             source_filename=file,
-                             ignore_warnings=False,
-                             comment=comment,
-                             text=text)
+            if(file.startswith("s3")):
+                s3 = boto3.resource('s3')
+                temp_file = tempfile.NamedTemporaryFile(delete=False)
+
+                o = urlparse(file)
+                bucket = o.netloc
+                key = o.path.replace('//', '/').lstrip('/')
+
+                with open(temp_file.name, "wb") as f:
+                    try:
+                        s3.Bucket(bucket).download_file(key, temp_file.name)
+                        logging.info(f"Saved to {temp_file.name}")
+                        file = temp_file.name
+                    except botocore.exceptions.ClientError as e:
+                        if e.response['Error']['Code'] == "404":
+                            print("The object does not exist.")
+                        else:
+                            raise
+                self.site.upload(filepage=wiki_file_page,
+                                 source_filename=file,
+                                 comment=comment,
+                                 text=text)
             logging.info(f"Uploaded {file}")
         except UploadWarning as upload_warning:
             logging.warning(f"Image already uploaded: {wiki_file_page}: {upload_warning}")
@@ -106,7 +127,7 @@ class Upload:
 
 utils = Utils()
 upload = Upload()
-columns = ['dpla_id', 'path', 'size', 'title', 'markup']
+columns = {"dpla_id": "dpla_id", "path": "path", "size": "size", "title": "title", "markup": "markup"}
 input = None
 
 try:
@@ -139,25 +160,25 @@ for parquet_file in file_list:
     for row in df.itertuples(index=columns):
         dpla_id, path, size, title, wiki_markup = None, None, None, None, None
         try:
-            dpla_id = getattr(row, 'id')
+            dpla_id = getattr(row, 'dpla_id')
             path = getattr(row, 'path')
             size = getattr(row, 'size')
             title = getattr(row, 'title')
-            wiki_markup = getattr(row, 'wiki_markup')
+            wiki_markup = getattr(row, 'markup')
         except Exception as e:
             logging.error(f"Unable to get attributes from row {row}: {e}")
 
         # Create Wikimedia page title
-        # page_title = upload.create_wiki_page_title(title=title,
-        #                                            dpla_identifier=dpla_id,
-        #                                            suffix=path[-4:])
-        #
-        # # Create wiki page
-        # wiki_page = upload.create_wiki_file_page(title=title)
-        #
-        # # Upload to wiki page
-        # upload.upload(wiki_file_page=wiki_page,
-        #               dpla_identifier=dpla_id,
-        #               text=wiki_markup,
-        #               file=path)
+        page_title = upload.create_wiki_page_title(title=title,
+                                                   dpla_identifier=dpla_id,
+                                                   suffix=path[-4:])
+
+        # Create wiki page
+        wiki_page = upload.create_wiki_file_page(title=page_title)
+
+        # Upload to wiki page
+        upload.upload(wiki_file_page=wiki_page,
+                      dpla_identifier=dpla_id,
+                      text=wiki_markup,
+                      file=path)
         logging.info(f"Uploaded {path}")
