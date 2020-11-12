@@ -1,3 +1,5 @@
+import os
+
 import logging
 from time import process_time
 
@@ -29,7 +31,6 @@ class Upload:
     site = None
     download = Dupload()
 
-
     def __init__(self):
         #  This is only required for the uploader
         self.site = pywikibot.Site()
@@ -51,18 +52,14 @@ class Upload:
         """
 
         comment = f"Uploading DPLA ID {dpla_identifier}"
-        #
-        # logging.info(f"Uploading...\n"
-        #              f"filepage = {wiki_file_page}\n"
-        #              f"source_filename = {file}\n"
-        #              f"text = {text}\n"
-        #              f"comment = {comment}\n")
-
+        temp_file = None
         try:
-            if(file.startswith("s3")):
+            # This is a massive kludge because direct s3 upload via source_url is not allowed.
+            # Download from s3 to temp location on ec2
+            # Upload to wikimeida
+            if file.startswith("s3"):
                 s3 = boto3.resource('s3')
                 temp_file = tempfile.NamedTemporaryFile(delete=False)
-
                 o = urlparse(file)
                 bucket = o.netloc
                 key = o.path.replace('//', '/').lstrip('/')
@@ -70,22 +67,23 @@ class Upload:
                 with open(temp_file.name, "wb") as f:
                     try:
                         s3.Bucket(bucket).download_file(key, temp_file.name)
-                        logging.info(f"Saved to {temp_file.name}")
                         file = temp_file.name
                     except botocore.exceptions.ClientError as e:
                         if e.response['Error']['Code'] == "404":
-                            print("The object does not exist.")
+                            logging.info("The object does not exist.")
                         else:
                             raise
                 self.site.upload(filepage=wiki_file_page,
                                  source_filename=file,
                                  comment=comment,
                                  text=text)
-            logging.info(f"Uploaded {file}")
         except UploadWarning as upload_warning:
-            logging.warning(f"Image already uploaded: {wiki_file_page}: {upload_warning}")
+            logging.warning(f"{upload_warning}")
         except Exception as e:
             logging.error(f"Error uploading {wiki_file_page}: {e}")
+        finally:
+            if temp_file:
+                os.unlink(temp_file.name)
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
@@ -119,7 +117,6 @@ class Upload:
         :return:
         """
         try:
-            logging.info(f"Creating Wiki FilePage '{title}'")
             return pywikibot.FilePage(self.site, title=title)
         except Exception as e:
             logging.error(f"Unable to create FilePage: {e}")
@@ -181,4 +178,4 @@ for parquet_file in file_list:
                       dpla_identifier=dpla_id,
                       text=wiki_markup,
                       file=path)
-        logging.info(f"Uploaded {path}")
+        # logging.info(f"Uploaded {path}")

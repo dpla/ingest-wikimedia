@@ -162,10 +162,11 @@ for parquet_file in file_list:
             batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
             utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
 
-            # Reset batch control vars
+            # Reset batch control vars, update df_output_path
             df_rows = list()
             batch_number = batch_number + 1
             batch_downloaded = 0
+            df_output_path = f"{save_location}/batch_{batch_number}/data/"
             logging.info(f"Starting batch number {batch_number}")
 
         # If there is a total limit in place then abort after it has been breached.
@@ -183,4 +184,4 @@ for parquet_file in file_list:
     if df_rows:
         batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
         utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
-        df_rows = list() # reset
+        df_rows = list()  # reset
