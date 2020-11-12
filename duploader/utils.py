@@ -51,7 +51,14 @@ class Utils:
             return list()  # ['canvases']['images']['resource']['@id']
 
     def get_parquet_files(self, path):
-        return wr.s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
+        return wr.s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
+
+    def get_local_parquet(self, path):
+        posix_files = Path(path).glob('*.parquet')
+        files_str = list()
+        for p in posix_files:
+            files_str.append(str(p))
+        return files_str
 
     def sizeof_fmt(self, num, suffix='B'):
         for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
