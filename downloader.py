@@ -10,6 +10,7 @@ import sys
 
 import getopt
 import logging
+import traceback
 import pandas as pd
 
 from duploader.dupload import Dupload
@@ -67,6 +68,7 @@ file_list = utils.get_parquet_files(path=input_df)
 
 for parquet_file in file_list:
     logging.info(f"Processing...{parquet_file}")
+    # parquet_file = parquet_file.encode()
     df = utils.get_df(parquet_file, columns=columns)
     df_output_path = f"{save_location}/batch_{batch_number}/data/"
     for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
@@ -120,7 +122,7 @@ for parquet_file in file_list:
             try:
                 out, time, size = duploader.download_single_item(url=url, save_location=asset_path)
             except Exception as e:
-                logging.error(e)
+                logging.error(f"Error downloading asset: {e}\n{traceback.format_exc()}")
                 out = None
                 time = 0
                 size = 0
