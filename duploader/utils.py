@@ -57,7 +57,7 @@ class Utils:
         posix_files = Path(path).glob('*.parquet')
         files_str = list()
         for p in posix_files:
-            files_str.append(str(p))
+            files_str.append(f"{p.parent}/{p.name}".encode())
         return files_str
 
     def sizeof_fmt(self, num, suffix='B'):
