@@ -32,7 +32,7 @@ class Utils:
 
     def get_df_local(self, path, columns):
         path = path if isinstance(path, bytes) else path.encode('utf-8')
-        print("Type is instance of " + type(path))
+        print(f"Type is instance of {type(path)}")
         return pd.read_parquet(path, engine='fastparquet')\
             .rename(columns=columns)
 
