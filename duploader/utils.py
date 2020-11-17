@@ -21,7 +21,8 @@ class Utils:
         logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
 
     def create_path(self, path):
-        if not path.startswith("s3") and not Path(path).exists():
+        prefix = b's3' if isinstance(path, bytes) else "s3"
+        if not path.startswith(prefix) and not Path(path).exists():
             Path(path).mkdir(parents=True)
 
     def get_df_s3(self, path, columns):
@@ -35,7 +36,8 @@ class Utils:
 
     def get_df(self, path, columns):
         # {"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"} ingest df columns
-        return self.get_df_s3(path, columns) if path.startswith("s3") else self.get_df_local(path, columns)
+        prefix = b's3' if isinstance(path, bytes) else "s3"
+        return self.get_df_s3(path, columns) if path.startswith(prefix) else self.get_df_local(path, columns)
 
     def get_iiif_urls(self, iiif):
         request = requests.get(iiif)
