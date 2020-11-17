@@ -32,14 +32,15 @@ class Utils:
 
     def get_df_local(self, path, columns):
         path = path if isinstance(path, bytes) else path.encode('utf-8')
-        print(f"Type is instance of {type(path)}")
+        print(f"Type of {path} == {type(path)}")
         return pd.read_parquet(path, engine='fastparquet')\
             .rename(columns=columns)
 
     def get_df(self, path, columns):
         # {"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"} ingest df columns
-        prefix = b's3' if isinstance(path, bytes) else "s3"
-        return self.get_df_s3(path, columns) if path.startswith(prefix) else self.get_df_local(path, columns)
+        # prefix = b's3' if isinstance(path, bytes) else "s3"
+        # return self.get_df_s3(path, columns) if path.startswith(prefix) else self.get_df_local(path, columns)
+        return self.get_df_local(path, columns)
 
     def get_iiif_urls(self, iiif):
         request = requests.get(iiif)
@@ -58,11 +59,12 @@ class Utils:
         return wr.s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
 
     def get_local_parquet(self, path):
-        posix_files = Path(path).glob('*.parquet')
-        files_str = list()
-        for p in posix_files:
-            files_str.append(f"{p.parent}/{p.name}".encode())
-        return files_str
+        return Path(path).glob('*.parquet')
+        #
+        # files_str = list()
+        # for p in posix_files:
+        #     files_str.append(f"{p.parent}/{p.name}".encode())
+        # return files_str
 
     def sizeof_fmt(self, num, suffix='B'):
         for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
