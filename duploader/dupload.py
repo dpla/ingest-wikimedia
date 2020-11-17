@@ -109,8 +109,8 @@ class Dupload:
         # TODO confirm replacing .jp2 with .jpeg
         # .replace('.jp2', '.jpeg')
         url = url if isinstance(url, bytes) else url.encode('utf-8')
-
         file = url.split(b'/')[-1]
+        file = file.decode('utf-8')
         output_file = f"{save_location}/{file}"
         return self.download(url=url, out=output_file)
 
