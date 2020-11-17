@@ -31,8 +31,8 @@ class Utils:
             .rename(columns=columns)
 
     def get_df_local(self, path, columns):
-        path = path if isinstance(path, bytes) else path.encode('utf-8')
-        print(f"Type of {path} == {type(path)}")
+        # path = path if isinstance(path, bytes) else path.encode('utf-8')
+        # print(f"Type of {path} == {type(path)}")
         return pd.read_parquet(path, engine='fastparquet')\
             .rename(columns=columns)
 
