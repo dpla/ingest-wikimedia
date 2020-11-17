@@ -31,6 +31,7 @@ class Utils:
             .rename(columns=columns)
 
     def get_df_local(self, path, columns):
+        path = path if isinstance(path, bytes) else path.decode()
         return pd.read_parquet(path, engine='fastparquet')\
             .rename(columns=columns)
 
