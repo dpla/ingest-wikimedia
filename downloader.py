@@ -147,8 +147,8 @@ for parquet_file in file_list:
                     'title': title,
                     'markup': wiki_markup
                 }
-
                 df_rows.append(row)
+                logging.info(f"{len(df_rows)} items")
         else:
             logging.info("Undefined condition met")
 
