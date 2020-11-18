@@ -65,12 +65,11 @@ logging.info(f"Input:      {input_df}")
 logging.info(f"Output:     {save_location}")
 
 file_list = utils.get_parquet_files(path=input_df)
+df_output_path = f"{save_location}/batch_{batch_number}/data/"
 
 for parquet_file in file_list:
     logging.info(f"Processing...{parquet_file}")
-    # parquet_file = parquet_file.encode()
     df = utils.get_df(parquet_file, columns=columns)
-    df_output_path = f"{save_location}/batch_{batch_number}/data/"
     for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
         try:
             dpla_id = getattr(row, 'id')
@@ -183,7 +182,8 @@ for parquet_file in file_list:
             df_rows = list()
             break
 
-    if df_rows:
-        batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
-        utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
-        df_rows = list()  # reset
+# If finished processing parquet files without breaching limits then write data out 
+if df_rows:
+    batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
+    utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
+    df_rows = list()  # reset
