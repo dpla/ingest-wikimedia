@@ -77,7 +77,8 @@ class Upload:
                                         source_filename=file,
                                         comment=comment,
                                         text=text,
-                                        report_success=True
+                                        report_success=True,
+                                        ignore_warnings=True
                                        )
         except UploadWarning as upload_warning:
             logging.warning(f"{upload_warning}")
