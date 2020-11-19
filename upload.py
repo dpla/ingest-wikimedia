@@ -71,8 +71,6 @@ class Upload:
                             logging.info("The object does not exist.")
                         else:
                             raise
-                logging.info(f"Attempting to upload local file: {temp_file.name} as {file}")
-                logging.info(f"Uploading to: {wiki_file_page.title}")
                 return self.site.upload(filepage=wiki_file_page,
                                         source_filename=file,
                                         comment=comment,
@@ -129,6 +127,7 @@ utils = Utils()
 upload = Upload()
 columns = {"dpla_id": "dpla_id", "path": "path", "size": "size", "title": "title", "markup": "markup"}
 input = None
+upload_count = 1
 
 try:
     opts, args = getopt.getopt(sys.argv[1:], "hi:u:o:", ["input="])
@@ -173,8 +172,6 @@ for parquet_file in file_list:
                                                    dpla_identifier=dpla_id,
                                                    suffix=path[path.rfind('.'):])
 
-        logging.info(f"Create page title {page_title}")
-
         # Create wiki page
         wiki_page = upload.create_wiki_file_page(title=page_title)
 
@@ -184,6 +181,7 @@ for parquet_file in file_list:
                           dpla_identifier=dpla_id,
                           text=wiki_markup,
                           file=path)
-            logging.info(f"Uploaded {dpla_id}")
+            logging.info(f"Uploaded {dpla_id}. Uploaded count {upload_count}")
+            upload_count = upload_count+1
         except Exception as e:
             logging.error(f"Unable to upload: {e}\nTarget file {path}")
