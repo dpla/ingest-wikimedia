@@ -182,7 +182,7 @@ for parquet_file in file_list:
             df_rows = list()
             break
 
-# If finished processing parquet files without breaching limits then write data out 
+# If finished processing parquet files without breaching limits then write data out
 if df_rows:
     batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
     utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)

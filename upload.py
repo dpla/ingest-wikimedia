@@ -7,9 +7,7 @@ import boto3
 import botocore
 import logging
 import pywikibot
-import requests
 import tempfile
-from pathlib import Path
 from pywikibot import UploadWarning
 from urllib.parse import urlparse
 from botocore.exceptions import ClientError
@@ -168,7 +166,9 @@ for parquet_file in file_list:
         # Create Wikimedia page title
         page_title = upload.create_wiki_page_title(title=title,
                                                    dpla_identifier=dpla_id,
-                                                   suffix=path[-4:])
+                                                   suffix=path[path.rfind('.'):])
+
+        logging.info(f"Create page title {page_title}")
 
         # Create wiki page
         wiki_page = upload.create_wiki_file_page(title=page_title)
@@ -178,4 +178,7 @@ for parquet_file in file_list:
                       dpla_identifier=dpla_id,
                       text=wiki_markup,
                       file=path)
-        # logging.info(f"Uploaded {path}")
+        logging.info(f"Uploaded {path}")
+
+        # Force abort
+        sys.exit()

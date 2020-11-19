@@ -1,18 +1,9 @@
-
-import boto3
-import logging
-import requests
-import tempfile
-from pathlib import Path
-from urllib.parse import urlparse
-from botocore.exceptions import ClientError
-
 import awswrangler as wr
-import getopt
 import json
 import logging
 import pandas as pd
 import requests
+from pathlib import Path
 
 
 class Utils:
