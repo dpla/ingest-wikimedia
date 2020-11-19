@@ -72,11 +72,13 @@ class Upload:
                         else:
                             raise
                 logging.info(f"Attempting to upload local file: {temp_file.name} as {file}")
-                self.site.upload(filepage=wiki_file_page,
-                                 source_filename=file,
-                                 comment=comment,
-                                 text=text)
-
+                logging.info(f"Uploading to: {wiki_file_page.title}")
+                return self.site.upload(filepage=wiki_file_page,
+                                        source_filename=file,
+                                        comment=comment,
+                                        text=text,
+                                        report_success=True
+                                       )
         except UploadWarning as upload_warning:
             logging.warning(f"{upload_warning}")
         except Exception as e:
