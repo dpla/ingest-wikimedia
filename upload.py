@@ -71,11 +71,12 @@ class Upload:
                             logging.info("The object does not exist.")
                         else:
                             raise
+                logging.info(f"Attempting to upload local file: {temp_file.name} as {file}")
                 self.site.upload(filepage=wiki_file_page,
                                  source_filename=file,
                                  comment=comment,
                                  text=text)
-                logging.info(f"Uploaded local file: {file}")
+
         except UploadWarning as upload_warning:
             logging.warning(f"{upload_warning}")
         except Exception as e:
