@@ -187,7 +187,3 @@ for parquet_file in file_list:
             logging.info(f"Uploaded {dpla_id}")
         except Exception as e:
             logging.error(f"Unable to upload: {e}\nTarget file {path}")
-
-
-        # Force abort
-        sys.exit()
