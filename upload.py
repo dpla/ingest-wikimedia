@@ -75,6 +75,7 @@ class Upload:
                                  source_filename=file,
                                  comment=comment,
                                  text=text)
+                logging.info(f"Uploaded local file: {file}")
         except UploadWarning as upload_warning:
             logging.warning(f"{upload_warning}")
         except Exception as e:
@@ -174,11 +175,15 @@ for parquet_file in file_list:
         wiki_page = upload.create_wiki_file_page(title=page_title)
 
         # Upload to wiki page
-        upload.upload(wiki_file_page=wiki_page,
-                      dpla_identifier=dpla_id,
-                      text=wiki_markup,
-                      file=path)
-        logging.info(f"Uploaded {path}")
+        try:
+            upload.upload(wiki_file_page=wiki_page,
+                          dpla_identifier=dpla_id,
+                          text=wiki_markup,
+                          file=path)
+            logging.info(f"Uploaded {dpla_id}")
+        except Exception as e:
+            logging.error(f"Unable to upload: {e}\nTarget file {path}")
+
 
         # Force abort
         sys.exit()
