@@ -57,7 +57,7 @@ class Upload:
             # Upload to wikimeida
             if file.startswith("s3"):
                 s3 = boto3.resource('s3')
-                temp_file = tempfile.NamedTemporaryFile(delete=False)
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file[file.rfind('.'):])
                 o = urlparse(file)
                 bucket = o.netloc
                 key = o.path.replace('//', '/').lstrip('/')
