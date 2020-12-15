@@ -63,6 +63,8 @@ class Utils:
         images_urls = list()
         for canvas in canvases:
             image_url = canvas['images'][0]['resource']['@id']
+            # if missing file extension add it to URL to be requested
+            image_url = image_url if '.' in image_url[image_url.rfind('/'):] else f"{image_url}.jpg"
             images_urls.append(image_url)
 
         return images_urls
