@@ -1,7 +1,7 @@
+import pandas as pd
 import awswrangler as wr
 import json
 import logging
-import pandas as pd
 import requests
 from pathlib import Path
 
@@ -34,17 +34,38 @@ class Utils:
         return self.get_df_local(path, columns)
 
     def get_iiif_urls(self, iiif):
-        request = requests.get(iiif)
-        data = request.content
-        jsonData = json.loads(data)
-        # More than one sequence, return empty list and log some kind of message
-        sequences = jsonData['sequences']
+        # sequences \ [array] — [0, default]  \ canvases \ [array] \ images \ [array, 0 default] \ resource \ @id
+        canvases = None
+        sequences = None
+        try:
+            request = requests.get(iiif)
+            data = request.content
+            iiif_manifest = json.loads(data)
+            sequences = iiif_manifest['sequences']
+        except ConnectionError as ce:
+            logging.error(f"Unable to request {iiif}: {ce}")
+            return list()
+        except Exception as e:
+            logging.error(f"Unknown error requesting {iiif}: {e}")
+            return list()
+
         if len(sequences) > 1:
+            # More than one sequence, return empty list and log some kind of message
+            logging.info(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
             return list()
         elif len(sequences) == 1:
-            print(f"Got IIIF at {iiif}")
-            print(f"{sequences[0]}")
-            return list()  # ['canvases']['images']['resource']['@id']
+            canvases = sequences[0]['canvases']
+
+        if canvases is None:
+            logging.info(f"No sequences or canvases in IIIF manifest: {iiif}")
+            return list()
+
+        images_urls = list()
+        for canvas in canvases:
+            image_url = canvas['images'][0]['resource']['@id']
+            images_urls.append(image_url)
+
+        return images_urls
 
     def get_parquet_files(self, path):
         return wr.s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)

@@ -38,7 +38,7 @@ batch_downloaded = 0  # Running incrementer for tracking total bytes downloaded 
 batch_number = 1  # This will break apart the input parquet file into batches defined by batch_size
 
 columns = {"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"}
-upload_parquet_columns = ['dpla_id', 'path', 'size', 'title', 'markup']
+upload_parquet_columns = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
 try:
     opts, args = getopt.getopt(sys.argv[1:], "hi:u:o:", ["limit=", "batch_size=", "input=", "output="])
 except getopt.GetoptError:
@@ -66,6 +66,7 @@ logging.info(f"Output:     {save_location}")
 
 file_list = utils.get_parquet_files(path=input_df)
 df_output_path = f"{save_location}/batch_{batch_number}/data/"
+record_count = 1
 
 for parquet_file in file_list:
     logging.info(f"Processing...{parquet_file}")
@@ -78,12 +79,8 @@ for parquet_file in file_list:
             iiif = getattr(row, 'iiif')
             media_master = getattr(row, 'media_master')
         except Exception as e:
-            logging.error(f"Unable to get attributes from row {row}: {e}")
-
-        asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/"
-
-        utils.create_path(asset_path)
-        utils.create_path(df_output_path)
+            logging.error(f"Unable to get attributes from row {row}: {e}. Aborting...")
+            break
 
         # Are we working with iiif or media_master?
         download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
@@ -102,30 +99,32 @@ for parquet_file in file_list:
             - Wiki markup 
         """
 
+
+
+        # TODO `out` should be the root save location or the asset path?
         out, time, size = save_location, 0, 0  # Defaults
+        asset_count = 1
 
-        if len(download_urls) > 1:
-            # TODO handle multi-asset upload for single item
-            # - page title creation
-            # - filename
-            # - upload asset
-            logging.info("Unsupported multi-asset upload")
-            for url in download_urls:
-                single_file_upload_size = 0
-            break
+        # MULTI-ASSET SUPPORT
 
-        elif len(download_urls) == 1:
-            # Handle single asset upload
-            url = download_urls[0]
-            # download asset and swallow Exceptions
+        # TODO if one asset fails in a multi-asset record then the entire record needs to fail
+        rows = list()
+        for url in download_urls:
+            # Create asset path
+            asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{asset_count}"
+
+            utils.create_path(asset_path)
+            utils.create_path(df_output_path)
+
             try:
                 out, time, size = duploader.download_single_item(url=url, save_location=asset_path)
             except Exception as e:
-                logging.error(f"Error downloading asset: {e}\n{traceback.format_exc()}")
+                logging.error(f"Error downloading asset: {e}\n{traceback.format_exc()}. Aborting all assets for {dpla_id}")
+                rows = list()
                 out = None
                 time = 0
                 size = 0
-                continue
+                break
 
             # Update size
             batch_downloaded = batch_downloaded + size
@@ -137,6 +136,7 @@ for parquet_file in file_list:
             #   - size of asset to upload
             #   - title/wiki page name
             #   - wiki markup
+            #   - page
 
             if out is not None:
                 row = {
@@ -144,14 +144,22 @@ for parquet_file in file_list:
                     'path': out,
                     'size': size,
                     'title': title,
-                    'markup': wiki_markup
+                    'markup': wiki_markup,
+                    'page': asset_count
                 }
-                df_rows.append(row)
-                logging.info(f"{len(df_rows)} items")
-        else:
-            logging.info("Undefined condition met")
+                rows.append(row)
+            logging.info(f"Page {asset_count} for {dpla_id}")
+            asset_count = asset_count + 1  # increment asset count
 
-        # logging.info(f"Item {utils.sizeof_fmt(size)} -- Batch total {utils.sizeof_fmt(batch_uploaded)}")
+        # append all assets/rows for a given metadata record
+        logging.info(f"Appending {len(rows)} rows to df")
+        df_rows.extend(rows)
+
+        # Only log a message every 100 records
+        if(record_count % 100 == 0):
+            logging.info(f"{record_count} records and {len(df_rows)} images")
+
+        record_count = record_count + 1
 
         if batch_downloaded > batch_size:
             logging.info(f"Upload quota met for batch {batch_number}")
@@ -180,7 +188,8 @@ for parquet_file in file_list:
             batch_parquet_out_path = f"{df_output_path}batch_{batch_number}.parquet"
             utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
             df_rows = list()
-            break
+            logging.info("Exiting...")
+            sys.exit()
 
 # If finished processing parquet files without breaching limits then write data out
 if df_rows:

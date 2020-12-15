@@ -77,7 +77,15 @@ class Upload:
                                         text=text,
                                         report_success=True,
                                         ignore_warnings=True
-                                       )
+                                        )
+            else:
+                return self.site.upload(filepage=wiki_file_page,
+                                        source_filename=file,
+                                        comment=comment,
+                                        text=text,
+                                        report_success=True,
+                                        ignore_warnings=True
+                                        )
         except UploadWarning as upload_warning:
             logging.warning(f"{upload_warning}")
         except Exception as e:
@@ -125,7 +133,7 @@ class Upload:
 
 utils = Utils()
 upload = Upload()
-columns = {"dpla_id": "dpla_id", "path": "path", "size": "size", "title": "title", "markup": "markup"}
+columns = {"dpla_id": "dpla_id", "path": "path", "size": "size", "title": "title", "markup": "markup", "page": "page"}
 input = None
 upload_count = 1
 
@@ -164,13 +172,18 @@ for parquet_file in file_list:
             size = getattr(row, 'size')
             title = getattr(row, 'title')
             wiki_markup = getattr(row, 'markup')
+            page = getattr(row, 'page')
         except Exception as e:
             logging.error(f"Unable to get attributes from row {row}: {e}")
+            break
+
+        page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
 
         # Create Wikimedia page title
         page_title = upload.create_wiki_page_title(title=title,
                                                    dpla_identifier=dpla_id,
-                                                   suffix=path[path.rfind('.'):])
+                                                   suffix=path[path.rfind('.'):],
+                                                   page=page)
 
         # Create wiki page
         wiki_page = upload.create_wiki_file_page(title=page_title)
@@ -182,6 +195,6 @@ for parquet_file in file_list:
                           text=wiki_markup,
                           file=path)
             logging.info(f"Uploaded {dpla_id}. Uploaded count {upload_count}")
-            upload_count = upload_count+1
+            upload_count = upload_count + 1
         except Exception as e:
             logging.error(f"Unable to upload: {e}\nTarget file {path}")

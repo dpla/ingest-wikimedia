@@ -69,7 +69,6 @@ class Dupload:
         try:
             # Image already exists, do nothing
             if Path(out).exists() and not overwrite:
-                logging.info(f"{out} already exists, skipping download")
                 return out, 0, os.path.getsize(out)
             else:
                 start = process_time()
