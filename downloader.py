@@ -111,7 +111,7 @@ for parquet_file in file_list:
         rows = list()
         for url in download_urls:
             # Create asset path
-            asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{asset_count}"
+            asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{asset_count}"
 
             utils.create_path(asset_path)
             utils.create_path(df_output_path)
