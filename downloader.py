@@ -4,6 +4,10 @@ Downloads user specified amount of images
 Production use case:
     python download.py --limit 1000000000000 --source /path/to/wiki-parquet/ --output /path/to/save/images
 
+    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/1/image.jpeg
+    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/2/image.jpeg
+    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/3/image.jpeg
+    s3://wiki/plainstopeaks/20210120/batch_1/data/
 """
 
 import sys
@@ -12,6 +16,7 @@ import getopt
 import logging
 import traceback
 import pandas as pd
+import mimetypes
 
 from duploader.dupload import Dupload
 from duploader.utils import Utils
@@ -117,7 +122,8 @@ for parquet_file in file_list:
             utils.create_path(df_output_path)
 
             try:
-                out, time, size = duploader.download_single_item(url=url, save_location=asset_path)
+                out, time, size, name = duploader.download_single_item(url=url, save_location=asset_path)
+                # name is ignored
             except Exception as e:
                 logging.error(f"Error downloading asset: {e}\n{traceback.format_exc()}. Aborting all assets for {dpla_id}")
                 rows = list()

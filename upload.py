@@ -133,7 +133,12 @@ class Upload:
 
 utils = Utils()
 upload = Upload()
-columns = {"dpla_id": "dpla_id", "path": "path", "size": "size", "title": "title", "markup": "markup", "page": "page"}
+columns = {"dpla_id": "dpla_id",
+           "path": "path",
+           "size": "size",
+           "title": "title",
+           "markup": "markup",
+           "page": "page"}
 input = None
 upload_count = 1
 
