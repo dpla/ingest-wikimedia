@@ -1,17 +1,15 @@
-import os
-
-import logging
-from time import process_time
-
 import boto3
 import logging
+import mimetypes
+import os
+import re
 import requests
 import tempfile
-from pathlib import Path
-from urllib.parse import urlparse
 from botocore.exceptions import ClientError
 from duploader.utils import Utils
-import mimetypes
+from pathlib import Path
+from time import process_time
+from urllib.parse import urlparse
 
 
 class Dupload:
@@ -54,7 +52,7 @@ class Dupload:
             size = response['ContentLength']
 
             logging.info(f"{key} already exists, skipping download")
-            return out, 0, size  # Return if file already exists in s3
+            return out, 0, size, None  # Return if file already exists in s3
         except ClientError as ex:
             # swallow exception generated from checking ContentLength on non-existant item
             # File does not exist in S3, need to download
@@ -84,11 +82,20 @@ class Dupload:
                 return out, 0, os.path.getsize(out), None
             else:
                 start = process_time()
-                request = requests.get(url)
-                name = request.url.split('/')[-1]
+                response = requests.get(url)
+
+                name = response.url.split('/')[-1]
+                try:
+                    content_disposition = response.headers['content-disposition']
+                    name = re.findall("filename=\"(.+)\"", content_disposition)[0]
+                except Exception as e:
+                    logging.info("No content-disposition header")
+
+                if '.' not in name:
+                    raise Exception("No file extension in file name")
 
                 with open(out, 'wb') as f:
-                    f.write(request.content)
+                    f.write(response.content)
                 end = process_time()
                 file_size = os.path.getsize(out)
 
