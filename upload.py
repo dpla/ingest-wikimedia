@@ -16,6 +16,8 @@ import sys
 
 from duploader.dupload import Dupload
 from duploader.utils import Utils
+import magic
+import mimetypes
 
 """
 This needs a "batch" folder for input 
@@ -28,6 +30,7 @@ Read parquet file and then upload assets
 class Upload:
     site = None
     download = Dupload()
+    s3 = boto3.client('s3')
 
     def __init__(self):
         #  This is only required for the uploader
@@ -87,9 +90,9 @@ class Upload:
                                         ignore_warnings=True
                                         )
         except UploadWarning as upload_warning:
-            logging.warning(f"{upload_warning}")
+            logging.warning(f"{upload_warning.info}")
         except Exception as e:
-            logging.error(f"Error uploading {wiki_file_page}: {e}")
+            logging.error(f"Error uploading {wiki_file_page}")
         finally:
             if temp_file:
                 os.unlink(temp_file.name)
@@ -129,6 +132,56 @@ class Upload:
             return pywikibot.FilePage(self.site, title=title)
         except Exception as e:
             logging.error(f"Unable to create FilePage: {e}")
+
+
+    def get_extension_from_file(self, file):
+        """
+
+        :param file:
+        :return:
+        """
+        try:
+            mime = magic.from_file(file, mime=True)
+            ext = mimetypes.guess_extension(mime)
+
+            logging.info(f"{file} is {mime}")
+            logging.info(f"Using {ext}")
+            return ext
+        except Exception as e:
+            raise Exception(f"Unable to determine file type for {file}")
+
+    def get_extension_from_mime(self, mime):
+        """
+
+        :param file:
+        :return:
+        """
+        try:
+            logging.info(f"Checking {mime}")
+            ext = mimetypes.guess_extension(mime)
+            logging.info(f"For {mime} using `{ext}`")
+            return ext
+        except Exception as e:
+            raise Exception(f"Unable to determine file type for {mime}")
+
+    def get_mime(self, path):
+        mime = None
+        # Use boto3 to get mimetype from header metadata
+        if "s3://" in path:
+            path_url = urlparse(path)
+            bucket = path_url.netloc
+            # generate full s3 key using file name from url and path generate previously
+            key_parsed = f"{path_url.path.replace('//', '/').lstrip('/')}"
+
+            response = self.s3.head_object(Bucket=bucket, Key=key_parsed)
+            mime = response['ContentType']
+        # Assume file is on filesystem
+        else:
+            mime = mimetypes.guess_type(path)[0]
+
+        if mime is None:
+            raise Exception(f"Unable to determine ContentType for {path}")
+        return mime
 
 
 utils = Utils()
@@ -185,9 +238,15 @@ for parquet_file in file_list:
         page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
 
         # Create Wikimedia page title
+        logging.info(f"Checking file {path}")
+        mime = upload.get_mime(path)
+        ext = upload.get_extension_from_mime(mime)
+
+        logging.info(f"Got {ext} from {mime} for {path}")
+
         page_title = upload.create_wiki_page_title(title=title,
                                                    dpla_identifier=dpla_id,
-                                                   suffix=path[path.rfind('.'):],
+                                                   suffix=ext,
                                                    page=page)
 
         # Create wiki page

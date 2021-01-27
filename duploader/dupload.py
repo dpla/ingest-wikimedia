@@ -10,6 +10,8 @@ from duploader.utils import Utils
 from pathlib import Path
 from time import process_time
 from urllib.parse import urlparse
+import mimetypes
+import magic
 
 
 class Dupload:
@@ -26,6 +28,7 @@ class Dupload:
 
         :param url:
         :param out:
+        :param name
         :return:
         """
         start = process_time()
@@ -33,75 +36,63 @@ class Dupload:
 
         o = urlparse(out)
         bucket = o.netloc
-        key = None
+        # generate full s3 key using file name from url and path generate previously
+        key = f"{o.path.replace('//', '/').lstrip('/')}"
+
+        try:
+            # logging.info(f"Checking | aws s3api head-object --bucket {bucket} --key {key}")
+            response = s3.head_object(Bucket=bucket, Key=key)
+            size = response['ContentLength']
+            logging.info(f"{key} already exists, skipping download")
+            return out, 0, size  # Return if file already exists in s3
+        except ClientError as ex:
+            # swallow exception generated from checking ContentLength on non-existant item
+            # File does not exist in S3, need to download
+            pass
 
         # download file to tmp local
         temp_file = tempfile.NamedTemporaryFile(delete=False)
 
         # download local returns
         logging.info(f"Downloading {url}")
-        out, time, size, name = self.download_local(url, temp_file.name, overwrite=True)
-        # generate full s3 key using file name from url and path generate previously
-        key = f"{o.path.replace('//', '/').lstrip('/')}/{name}"
+        out, time, size = self.download_local(url=url, file=temp_file.name, overwrite=True)
 
-        logging.info(f"key == {key}")
-
-        try:
-            # logging.info(f"Checking | aws s3api head-object --bucket {bucket} --key {key}")
-            response = s3.head_object(Bucket=bucket, Key=key)
-            size = response['ContentLength']
-
-            logging.info(f"{key} already exists, skipping download")
-            return out, 0, size, None  # Return if file already exists in s3
-        except ClientError as ex:
-            # swallow exception generated from checking ContentLength on non-existant item
-            # File does not exist in S3, need to download
-            pass
+        content_type = magic.from_file(temp_file.name, mime=True)
+        logging.info(f"Got {content_type} from {temp_file.name}")
 
         try:
             with open(temp_file.name, "rb") as f:
-                s3.upload_fileobj(f, bucket, key)
+                s3.upload_fileobj(Fileobj=f, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
                 end = process_time()
                 logging.info(f"Saved to s3://{bucket}/{key}")
-                return f"s3://{bucket}/{key}", (end - start), size, name
+                return f"s3://{bucket}/{key}", (end - start), size
         finally:
             # cleanup temp file
             os.unlink(temp_file.name)
 
-    def download_local(self, url, out, overwrite=False):
+    def download_local(self, url, file, overwrite=False):
         """
 
         :param overwrite: Boolean
         :param url:
-        :param out:
+        :param file:
         :return:
         """
         try:
             # Image already exists, do nothing
-            if Path(out).exists() and not overwrite:
-                return out, 0, os.path.getsize(out), None
+            if Path(file).exists() and not overwrite:
+                return file, 0, os.path.getsize(file)
             else:
                 start = process_time()
                 response = requests.get(url)
-
-                name = response.url.split('/')[-1]
-                try:
-                    content_disposition = response.headers['content-disposition']
-                    name = re.findall("filename=\"(.+)\"", content_disposition)[0]
-                except Exception as e:
-                    logging.info("No content-disposition header")
-
-                if '.' not in name:
-                    raise Exception("No file extension in file name")
-
-                with open(out, 'wb') as f:
+                with open(file, 'wb') as f:
                     f.write(response.content)
                 end = process_time()
-                file_size = os.path.getsize(out)
+                file_size = os.path.getsize(file)
 
-                logging.info(f"Download to: {out} \n"
+                logging.info(f"Download to: {file} \n"
                              f"\tSize: {self.utils.sizeof_fmt(file_size)}")
-                return out, (end - start), file_size, name
+                return file, (end - start), file_size
         except Exception as e:
             # TODO cleaner error handling here
             raise Exception(f"Failed to download {url}: {e}")
@@ -114,27 +105,52 @@ class Dupload:
         :return: url, time to process download, filesize (in bytes), name
         """
         try:
-
-            # TODO handle write to S3
             if out.startswith("s3"):
-                return self.download_s3(url, out)
+                return self.download_s3(url=url, out=out)
             else:
-                return self.download_local(url, out)
+                return self.download_local(url=url, file=out, overwrite=False)
 
         except Exception as e:
-            # TODO cleaner error handling here
             raise Exception(f"Failed to download {url}: {e}")
 
-    def get_extension(self, file):
-        mimetypes.guess_type(file)
+    def get_extension_from_file(self, file):
+        """
 
-        return ""
+        :param file:
+        :return:
+        """
+        try:
+            mime = magic.from_file(file, mime=True)
+            ext = mimetypes.guess_extension(mime)
+
+            logging.info(f"{file} is {mime}")
+            logging.info(f"Using {ext}")
+            return ext
+        except Exception as e:
+            raise Exception(f"Unable to determine file type for {file}")
+
+    def get_extension_from_mime(self, mime):
+        """
+
+        :param file:
+        :return:
+        """
+        try:
+            ext = mimetypes.guess_extension(mime)
+            logging.info(f"For {mime} using `{ext}`")
+            return ext
+        except Exception as e:
+            raise Exception(f"Unable to determine file type for {mime}")
 
     def download_single_item(self, url, save_location):
+        """
+
+        :param url: URL from metadata record
+        :param save_location: Base bath to save file
+        :param name: Name of file (sans extension)
+        :return:
+        """
         url = url if isinstance(url, bytes) else url.encode('utf-8')
-        # file = url.split(b'/')[-1]
-        # file = file.decode('utf-8')
-        # output_path = f"{save_location}/"
         return self.download(url=url, out=save_location)
 
 

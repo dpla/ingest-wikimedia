@@ -112,20 +112,21 @@ for parquet_file in file_list:
 
         # MULTI-ASSET SUPPORT
 
-        # TODO if one asset fails in a multi-asset record then the entire record needs to fail
         rows = list()
         for url in download_urls:
             # Create asset path
-            asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{asset_count}"
+            asset_path = f"{save_location}/batch_{batch_number}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{asset_count}_{dpla_id}"
 
             utils.create_path(asset_path)
             utils.create_path(df_output_path)
 
+            # The asset path should be {0}/{1}/{2}/{3}/{dpla_id}/{assetcount_dplaId}
+            #
             try:
-                out, time, size, name = duploader.download_single_item(url=url, save_location=asset_path)
+                out, time, size = duploader.download_single_item(url=url, save_location=asset_path)
                 # name is ignored
             except Exception as e:
-                logging.error(f"Error downloading asset: {e}\n{traceback.format_exc()}. Aborting all assets for {dpla_id}")
+                logging.error(f"Aborting all assets for {dpla_id}\n{e}\n{traceback.format_exc()}")
                 rows = list()
                 out = None
                 time = 0
