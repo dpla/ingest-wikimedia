@@ -14,8 +14,7 @@ from botocore.exceptions import ClientError
 import getopt
 import sys
 
-from duploader.dupload import Dupload
-from duploader.utils import Utils
+from wikiutils.utils import Utils
 import magic
 import mimetypes
 
@@ -29,7 +28,6 @@ Read parquet file and then upload assets
 
 class Upload:
     site = None
-    download = Dupload()
     s3 = boto3.client('s3')
 
     def __init__(self):
@@ -56,8 +54,7 @@ class Upload:
         temp_file = None
         try:
             # This is a massive kludge because direct s3 upload via source_url is not allowed.
-            # Download from s3 to temp location on ec2
-            # Upload to wikimeida
+            # Download from s3 to temp location on box then upload local file to wikimeida
             if file.startswith("s3"):
                 s3 = boto3.resource('s3')
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file[file.rfind('.'):])
@@ -72,27 +69,22 @@ class Upload:
                     except botocore.exceptions.ClientError as e:
                         if e.response['Error']['Code'] == "404":
                             logging.info("The object does not exist.")
+                            return False
                         else:
                             raise
-                return self.site.upload(filepage=wiki_file_page,
-                                        source_filename=file,
-                                        comment=comment,
-                                        text=text,
-                                        report_success=True,
-                                        ignore_warnings=True
-                                        )
-            else:
-                return self.site.upload(filepage=wiki_file_page,
-                                        source_filename=file,
-                                        comment=comment,
-                                        text=text,
-                                        report_success=True,
-                                        ignore_warnings=True
-                                        )
-        except UploadWarning as upload_warning:
-            logging.warning(f"{upload_warning.info}")
+            # upload to Wikimedia
+            # TODO Resolve the correct combination of report_success and ignore_warnings
+            #      And route output to parse JSON and log clearer messages 
+            return self.site.upload(filepage=wiki_file_page,
+                                    source_filename=file,
+                                    comment=comment,
+                                    text=text,
+                                    report_success=True,
+                                    ignore_warnings=True
+                                    )
         except Exception as e:
-            logging.error(f"Error uploading {wiki_file_page}")
+            logging.info(f"Error uploading {wiki_file_page}: {e}")
+            return False
         finally:
             if temp_file:
                 os.unlink(temp_file.name)
@@ -133,22 +125,15 @@ class Upload:
         except Exception as e:
             logging.error(f"Unable to create FilePage: {e}")
 
-
-    def get_extension_from_file(self, file):
+    def get_extension(self, path):
         """
 
-        :param file:
+        :param path:
         :return:
         """
-        try:
-            mime = magic.from_file(file, mime=True)
-            ext = mimetypes.guess_extension(mime)
-
-            logging.info(f"{file} is {mime}")
-            logging.info(f"Using {ext}")
-            return ext
-        except Exception as e:
-            raise Exception(f"Unable to determine file type for {file}")
+        mime = self.get_mime(path)
+        extension = self.get_extension_from_mime(mime)
+        return extension
 
     def get_extension_from_mime(self, mime):
         """
@@ -157,14 +142,19 @@ class Upload:
         :return:
         """
         try:
-            logging.info(f"Checking {mime}")
-            ext = mimetypes.guess_extension(mime)
-            logging.info(f"For {mime} using `{ext}`")
-            return ext
+            extension = mimetypes.guess_extension(mime)
+            if extension is None:
+                raise Exception(f"Unable to determine file type for {mime}")
+            return extension
         except Exception as e:
-            raise Exception(f"Unable to determine file type for {mime}")
+            raise Exception(f"Unable to determine file type for {mime}. {e}")
 
     def get_mime(self, path):
+        """
+
+        :param path:
+        :return:
+        """
         mime = None
         # Use boto3 to get mimetype from header metadata
         if "s3://" in path:
@@ -185,7 +175,7 @@ class Upload:
 
 
 utils = Utils()
-upload = Upload()
+uploader = Upload()
 columns = {"dpla_id": "dpla_id",
            "path": "path",
            "size": "size",
@@ -238,27 +228,25 @@ for parquet_file in file_list:
         page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
 
         # Create Wikimedia page title
-        logging.info(f"Checking file {path}")
-        mime = upload.get_mime(path)
-        ext = upload.get_extension_from_mime(mime)
-
-        logging.info(f"Got {ext} from {mime} for {path}")
-
-        page_title = upload.create_wiki_page_title(title=title,
-                                                   dpla_identifier=dpla_id,
-                                                   suffix=ext,
-                                                   page=page)
+        logging.info(f"Starting file {dpla_id} {path}")
+        ext = uploader.get_extension(path)
+        page_title = uploader.create_wiki_page_title(title=title,
+                                                     dpla_identifier=dpla_id,
+                                                     suffix=ext,
+                                                     page=page)
 
         # Create wiki page
-        wiki_page = upload.create_wiki_file_page(title=page_title)
+        wiki_page = uploader.create_wiki_file_page(title=page_title)
 
         # Upload to wiki page
         try:
-            upload.upload(wiki_file_page=wiki_page,
-                          dpla_identifier=dpla_id,
-                          text=wiki_markup,
-                          file=path)
-            logging.info(f"Uploaded {dpla_id}. Uploaded count {upload_count}")
-            upload_count = upload_count + 1
+            upload_status = uploader.upload(
+                            wiki_file_page=wiki_page,
+                            dpla_identifier=dpla_id,
+                            text=wiki_markup,
+                            file=path)
+            if upload_status:
+                logging.info(f"Uploaded {dpla_id}. Uploaded count {upload_count}")
+                upload_count = upload_count + 1
         except Exception as e:
             logging.error(f"Unable to upload: {e}\nTarget file {path}")
