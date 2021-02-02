@@ -74,7 +74,7 @@ class Upload:
                             raise
             # upload to Wikimedia
             # TODO Resolve the correct combination of report_success and ignore_warnings
-            #      And route output to parse JSON and log clearer messages 
+            #      And route output to parse JSON and log clearer messages
             return self.site.upload(filepage=wiki_file_page,
                                     source_filename=file,
                                     comment=comment,
