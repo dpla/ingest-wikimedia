@@ -28,7 +28,6 @@ class Utils:
         """
         prefix = b's3' if isinstance(path, bytes) else "s3"
         if not path.startswith(prefix) and not Path(path).exists():
-            logging.info(f"Creating directory {path}")
             Path(path).mkdir(parents=True)
 
     def download(self, url, out):
