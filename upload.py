@@ -15,7 +15,6 @@ import getopt
 import sys
 
 from wikiutils.utils import Utils
-import magic
 import mimetypes
 
 """
