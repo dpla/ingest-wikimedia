@@ -203,11 +203,6 @@ class Utils:
 
     def get_local_parquet(self, path):
         return Path(path).glob('*.parquet')
-        #
-        # files_str = list()
-        # for p in posix_files:
-        #     files_str.append(f"{p.parent}/{p.name}".encode())
-        # return files_str
 
     def sizeof_fmt(self, num, suffix='B'):
         for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
@@ -215,6 +210,12 @@ class Utils:
                 return "%3.1f%s%s" % (num, unit, suffix)
             num /= 1024.0
         return "%.1f%s%s" % (num, 'Yi', suffix)
+
+    def timer_message(self, msg, start, end):
+        time = "{:.5f}".format(round(end - start, 2))
+        return f"{time}: {msg}"
+
+
 
     def write_parquet(self, path, data, columns):
         logging.info(f"Saving {path}")

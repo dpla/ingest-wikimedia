@@ -1,21 +1,18 @@
-import os
-
-import logging
-from time import process_time
+import sys
+import time
 
 import boto3
 import botocore
+import getopt
 import logging
+import mimetypes
+import os
 import pywikibot
 import tempfile
-from pywikibot import UploadWarning
-from urllib.parse import urlparse
 from botocore.exceptions import ClientError
-import getopt
-import sys
+from urllib.parse import urlparse
 
 from wikiutils.utils import Utils
-import mimetypes
 
 """
 This needs a "batch" folder for input 
@@ -51,10 +48,12 @@ class Upload:
 
         comment = f"Uploading DPLA ID {dpla_identifier}"
         temp_file = None
+
         try:
             # This is a massive kludge because direct s3 upload via source_url is not allowed.
             # Download from s3 to temp location on box then upload local file to wikimeida
             if file.startswith("s3"):
+                start = time.perf_counter()
                 s3 = boto3.resource('s3')
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file[file.rfind('.'):])
                 o = urlparse(file)
@@ -71,17 +70,26 @@ class Upload:
                             return False
                         else:
                             raise
+                end = time.perf_counter()
+                logging.info(utils.timer_message(msg="Download s3 to tmp", start=start, end=end))
+
             # upload to Wikimedia
             # TODO Resolve the correct combination of report_success and ignore_warnings
             #      And route output to parse JSON and log clearer messages
-            return self.site.upload(filepage=wiki_file_page,
-                                    source_filename=file,
-                                    comment=comment,
-                                    text=text,
-                                    report_success=True,
-                                    ignore_warnings=True
-                                    )
+            start = time.perf_counter()
+            upload_result = self.site.upload(filepage=wiki_file_page,
+                                             source_filename=file,
+                                             comment=comment,
+                                             text=text,
+                                             report_success=True,
+                                             ignore_warnings=True)
+            end = time.perf_counter()
+            logging.info(utils.timer_message(msg="Upload to wikimedia", start=start, end=end))
+
+            return upload_result
         except Exception as e:
+            end = time.perf_counter()
+            logging.info(utils.timer_message(msg="Upload error ", start=start, end=end))
             logging.info(f"Error uploading {wiki_file_page}: {e}")
             return False
         finally:
@@ -212,7 +220,12 @@ for parquet_file in file_list:
     df = utils.get_df(parquet_file, columns=columns)
 
     for row in df.itertuples(index=columns):
+        start_image = time.perf_counter()
+        start_image_proc = time.process_time()
         dpla_id, path, size, title, wiki_markup = None, None, None, None, None
+
+        # Load record from dataframe
+        start = time.process_time()
         try:
             dpla_id = getattr(row, 'dpla_id')
             path = getattr(row, 'path')
@@ -223,29 +236,51 @@ for parquet_file in file_list:
         except Exception as e:
             logging.error(f"Unable to get attributes from row {row}: {e}")
             break
+        end = time.process_time()
+        logging.info(utils.timer_message(msg="Load record from dataframe", start=start, end=end))
 
         page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
 
-        # Create Wikimedia page title
-        logging.info(f"Starting file {dpla_id} {path}")
+        # Get file extension
+        start = time.process_time()
         ext = uploader.get_extension(path)
+        end = time.process_time()
+        logging.info(utils.timer_message(msg="Get file extension", start=start, end=end))
+
+        # Create Wikimedia page title
+        start = time.process_time()
         page_title = uploader.create_wiki_page_title(title=title,
                                                      dpla_identifier=dpla_id,
                                                      suffix=ext,
                                                      page=page)
+        end = time.process_time()
+        logging.info(utils.timer_message(msg="Create wiki page title", start=start, end=end))
 
         # Create wiki page
+        start = time.process_time()
         wiki_page = uploader.create_wiki_file_page(title=page_title)
+        end = time.process_time()
+        logging.info(utils.timer_message(msg="Create wiki page", start=start, end=end))
 
-        # Upload to wiki page
+        # Upload image to wiki page
+        start = time.process_time()
+        image_upload_sleep_start = time.perf_counter()
         try:
             upload_status = uploader.upload(
-                            wiki_file_page=wiki_page,
-                            dpla_identifier=dpla_id,
-                            text=wiki_markup,
-                            file=path)
+                wiki_file_page=wiki_page,
+                dpla_identifier=dpla_id,
+                text=wiki_markup,
+                file=path)
             if upload_status:
-                logging.info(f"Uploaded {dpla_id}. Uploaded count {upload_count}")
+                logging.info(f"Uploaded count {upload_count}")
                 upload_count = upload_count + 1
         except Exception as e:
             logging.error(f"Unable to upload: {e}\nTarget file {path}")
+        end = time.process_time()
+        end_image = time.perf_counter()
+
+        logging.info(utils.timer_message(msg="Upload image", start=start, end=end))
+        logging.info(utils.timer_message(msg="Upload image (w/sleep)", start=image_upload_sleep_start, end=end_image))
+        logging.info(utils.timer_message(msg="Overall proc time)", start=start_image_proc, end=end))
+        logging.info(utils.timer_message(msg="Overall time (w/sleep)", start=start_image, end=end_image))
+        logging.info("--------------------------------------------------------------")
