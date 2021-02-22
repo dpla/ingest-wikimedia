@@ -69,7 +69,7 @@ class Utils:
                 end = process_time()
                 file_size = os.path.getsize(file)
 
-                logger.info(f"Download {url} \n"
+                self.logger.info(f"Download {url} \n"
                              f"\tSize: {self.sizeof_fmt(file_size)}")
                 return file, (end - start), file_size
         except Exception as e:
@@ -95,7 +95,7 @@ class Utils:
         try:
             response = s3.head_object(Bucket=bucket, Key=key)
             size = response['ContentLength']
-            logger.info(f"{key} already exists, skipping download")
+            self.logger.info(f"{key} already exists, skipping download")
             return out, 0, size  # Return if file already exists in s3
         except ClientError as ex:
             # swallow exception generated from checking ContentLength on non-existant item
@@ -111,7 +111,7 @@ class Utils:
             with open(temp_file.name, "rb") as f:
                 s3.upload_fileobj(Fileobj=f, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
                 end = process_time()
-                logger.info(f"Uploaded to s3://{bucket}/{key}")
+                self.logger.info(f"Uploaded to s3://{bucket}/{key}")
                 return f"s3://{bucket}/{key}", (end - start), size
         finally:
             # cleanup temp file
@@ -152,7 +152,7 @@ class Utils:
         """
         try:
             ext = mimetypes.guess_extension(mime)
-            logging.info(f"For {mime} using `{ext}`")
+            self.logger.info(f"For {mime} using `{ext}`")
             return ext
         except Exception as e:
             raise Exception(f"Unable to determine file type for {mime}")
@@ -172,21 +172,21 @@ class Utils:
             iiif_manifest = json.loads(data)
             sequences = iiif_manifest['sequences']
         except ConnectionError as ce:
-            logging.error(f"Unable to request {iiif}: {ce}")
+            self.logger.error(f"Unable to request {iiif}: {ce}")
             return list()
         except Exception as e:
-            logging.error(f"Unknown error requesting {iiif}: {e}")
+            self.logger.error(f"Unknown error requesting {iiif}: {e}")
             return list()
 
         if len(sequences) > 1:
             # More than one sequence, return empty list and log some kind of message
-            logging.info(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
+            self.logger.info(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
             return list()
         elif len(sequences) == 1:
             canvases = sequences[0]['canvases']
 
         if canvases is None:
-            logging.info(f"No sequences or canvases in IIIF manifest: {iiif}")
+            self.logger.info(f"No sequences or canvases in IIIF manifest: {iiif}")
             return list()
 
         images_urls = list()
@@ -215,10 +215,8 @@ class Utils:
         time = "{:.5f}".format(round(end - start, 2))
         return f"{time}: {msg}"
 
-
-
     def write_parquet(self, path, data, columns):
-        logging.info(f"Saving {path}")
+        self.logger.info(f"Saving {path}")
         df_out = pd.DataFrame(data, columns=columns)
         df_out.to_parquet(path)
 
