@@ -16,9 +16,10 @@ from urllib.parse import urlparse
 
 
 class Utils:
+    logger = logging.getLogger('logger')
+
     def __init__(self):
-        format = "%(asctime)s: %(message)s"
-        logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
+        pass
 
     def create_path(self, path):
         """
@@ -68,7 +69,7 @@ class Utils:
                 end = process_time()
                 file_size = os.path.getsize(file)
 
-                logging.info(f"Download {url} \n"
+                logger.info(f"Download {url} \n"
                              f"\tSize: {self.sizeof_fmt(file_size)}")
                 return file, (end - start), file_size
         except Exception as e:
@@ -92,10 +93,9 @@ class Utils:
         key = f"{o.path.replace('//', '/').lstrip('/')}"
 
         try:
-            # logging.info(f"Checking | aws s3api head-object --bucket {bucket} --key {key}")
             response = s3.head_object(Bucket=bucket, Key=key)
             size = response['ContentLength']
-            logging.info(f"{key} already exists, skipping download")
+            logger.info(f"{key} already exists, skipping download")
             return out, 0, size  # Return if file already exists in s3
         except ClientError as ex:
             # swallow exception generated from checking ContentLength on non-existant item
@@ -111,7 +111,7 @@ class Utils:
             with open(temp_file.name, "rb") as f:
                 s3.upload_fileobj(Fileobj=f, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
                 end = process_time()
-                logging.info(f"Uploaded to s3://{bucket}/{key}")
+                logger.info(f"Uploaded to s3://{bucket}/{key}")
                 return f"s3://{bucket}/{key}", (end - start), size
         finally:
             # cleanup temp file
@@ -138,8 +138,8 @@ class Utils:
             mime = magic.from_file(file, mime=True)
             ext = mimetypes.guess_extension(mime)
 
-            logging.info(f"{file} is {mime}")
-            logging.info(f"Using {ext}")
+            self.logger.info(f"{file} is {mime}")
+            self.logger.info(f"Using {ext}")
             return ext
         except Exception as e:
             raise Exception(f"Unable to determine file type for {file}")

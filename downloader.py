@@ -9,8 +9,9 @@ Production use case:
     s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/3/image.jpeg
     s3://wiki/plainstopeaks/20210120/batch_1/data/
 """
-
+import os
 import sys
+import time
 
 import getopt
 import logging
@@ -60,10 +61,30 @@ for opt, arg in opts:
     elif opt in ("-b", "--batch_size"):
         batch_size = int(arg)
 
-logging.info(f"Size limit: {utils.sizeof_fmt(download_limit)}")  # 1 TB === 1000000000000, 0 for no limit
-logging.info(f"Batch size: {utils.sizeof_fmt(batch_size)}")  # 1 TB === 1000000000000
-logging.info(f"Input:      {input_df}")
-logging.info(f"Output:     {base_output_path}")
+
+# Setup log config
+timestr = time.strftime("%Y%m%d-%H%M%S")
+log_dir = "./logs/"
+os.makedirs(log_dir, exist_ok=True)
+
+# self.logger.basicConfig(filename=, level=logging.INFO)
+# logging.basicConfig(format='%(asctime)s %(message)s')
+
+logger = logging.getLogger('logger')
+
+file_handler = logging.FileHandler(f"{log_dir}/download-{timestr}.log")
+file_handler.setLevel(logging.INFO)
+# create console handler with a higher log level
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.ERROR)
+
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+logger.info(f"Size limit: {utils.sizeof_fmt(download_limit)}")  # 1 TB === 1000000000000, 0 for no limit
+logger.info(f"Batch size: {utils.sizeof_fmt(batch_size)}")  # 1 TB === 1000000000000
+logger.info(f"Input:      {input_df}")
+logger.info(f"Output:     {base_output_path}")
 
 # Get individual parquet files from ingestion3 wiki output
 file_list = utils.get_parquet_files(path=input_df)
@@ -71,11 +92,14 @@ file_list = utils.get_parquet_files(path=input_df)
 df_batch_out = f"{base_output_path}/batch_{batch_number}/data/"
 dpla_item_count = 1
 
+logger.info(f"{file_list.__sizeof__()} files to process")
+
 for parquet_file in file_list:
-    logging.info(f"Processing...{parquet_file}")
     utils.create_path(df_batch_out)
     # read parquet file
     df = utils.get_df(parquet_file, columns=columns)
+
+    logger.info(f"Processing...{df.shape[0]} rows in {parquet_file}")
 
     for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
         try:
@@ -159,13 +183,13 @@ for parquet_file in file_list:
 
         # Only log a message every 100 records
         if dpla_item_count % 100 == 0:
-            logging.info(f"{dpla_item_count} records and {len(df_rows)} assets")
+            logger.info(f"{dpla_item_count} records and {len(df_rows)} assets")
 
         dpla_item_count = dpla_item_count + 1
 
         if batch_downloaded > batch_size:
-            logging.info(f"Upload quota met for batch {batch_number}")
-            logging.info(f"\n\tBatch {batch_number} \n" \
+            logger.info(f"Upload quota met for batch {batch_number}")
+            logger.info(f"\n\tBatch {batch_number} \n" \
                              f"\t{len(df_rows)} files \n" \
                              f"\t{utils.sizeof_fmt(batch_downloaded)}")
 
@@ -178,19 +202,19 @@ for parquet_file in file_list:
             batch_number = batch_number + 1
             batch_downloaded = 0
             df_batch_out = f"{base_output_path}/batch_{batch_number}/data/"
-            logging.info(f"Starting batch number {batch_number}")
+            logger.info(f"Starting batch number {batch_number}")
 
         # If there is a total limit in place then abort after it has been breached.
         if 0 < download_limit < total_downloaded:
-            logging.info(f"Total download limit breached at {utils.sizeof_fmt(total_downloaded)}. Stopping run.")
-            logging.info(f"\n\tBatch {batch_number} \n" \
+            logger.info(f"Total download limit breached at {utils.sizeof_fmt(total_downloaded)}. Stopping run.")
+            logger.info(f"\n\tBatch {batch_number} \n" \
                              f"\t{len(df_rows)} files \n" \
                              f"\t{utils.sizeof_fmt(batch_downloaded)}")
 
             batch_parquet_out_path = f"{df_batch_out}batch_{batch_number}.parquet"
             utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
             df_rows = list()
-            logging.info("Exiting...")
+            logger.info("Exiting...")
             sys.exit()
 
 # If finished processing parquet files without breaching limits then write data out
