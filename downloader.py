@@ -138,7 +138,7 @@ for parquet_file in file_list:
         for url in download_urls:
             # Create asset path
             asset_path = f"{base_output_path}/batch_{batch_number}/assets/" \
-                f"{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{asset_count}_{dpla_id} "
+                f"{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{asset_count}_{dpla_id}".strip()
 
             utils.create_path(asset_path)
             try:
