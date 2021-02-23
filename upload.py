@@ -91,7 +91,10 @@ class Upload:
         except Exception as e:
             end = time.perf_counter()
             self.logger.error(utils.timer_message(msg="Upload error ", start=start, end=end))
-            self.logger.error(f"Error uploading {wiki_file_page}: {e}")
+            if 'file exists no change' in e:
+                logger.error("File already uploaded")
+            else:
+                self.logger.error(f"Error uploading: \n\tFile: {file}\n\tTo:{wiki_file_page.title}\n\tReason: {e}")
             return False
         finally:
             if temp_file:
