@@ -201,12 +201,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
 file_handler = logging.FileHandler(f"{log_dir}/upload-{timestr}.log")
 file_handler.setLevel(logging.INFO)
+log.addHandler(file_handler)
 # create console handler with a higher log level
 # console_handler = logging.StreamHandler()
 # console_handler.setLevel(logging.INFO)
-
 # log.addHandler(console_handler)
-log.addHandler(file_handler)
 
 # Create utils
 utils = Utils()
@@ -317,3 +316,5 @@ for parquet_file in file_list:
         log.info(utils.timer_message(msg="Overall proc time)", start=start_image_proc, end=end))
         log.info(utils.timer_message(msg="Overall time (w/sleep)", start=start_image, end=end_image))
         log.info("--------------------------------------------------------------")
+
+log.info(f"FINISHED upload for {input}")

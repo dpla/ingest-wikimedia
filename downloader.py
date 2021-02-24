@@ -67,8 +67,7 @@ timestr = time.strftime("%Y%m%d-%H%M%S")
 log_dir = "./logs/"
 os.makedirs(log_dir, exist_ok=True)
 
-# self.logger.basicConfig(filename=, level=logging.INFO)
-# logging.basicConfig(format='%(asctime)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
 logger = logging.getLogger('logger')
 
@@ -222,3 +221,5 @@ if df_rows:
     batch_parquet_out_path = f"{df_batch_out}batch_{batch_number}.parquet"
     utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
     df_rows = list()  # reset
+
+logger.info(f"FINISHED download for {input_df}")
