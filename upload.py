@@ -28,14 +28,9 @@ class Upload:
     log = None
 
     def __init__(self):
-        #  This is only required for the uploader
+        self.log = logging.getLogger('logger')
         self.site = pywikibot.Site()
         self.site.login()
-
-        # format = "%(asctime)s: %(message)s"
-        # self.logger.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
-        self.log = logging.getLogger('logger')
-
         self.log.info(f"Logged in user is: {self.site.user()}")
 
     def upload(self, wiki_file_page, dpla_identifier, text, file):
@@ -82,7 +77,9 @@ class Upload:
 
             # self.log.error(f"FILE == {file}")
             # self.log.error(f"WIKI FILE PAGE== {wiki_file_page}")
-            # self.log.error(f"EXISTS == {wiki_file_page.exists()}")
+
+            self.log.error(f"EXISTS == {wiki_file_page.exists()}")
+            self.log.error(f"GET == {wiki_file_page.get()}")
             # self.log.error(f"IS FILE PAGE== {wiki_file_page.is_filepage()}")
 
             upload_result = self.site.upload(filepage=wiki_file_page,
@@ -96,6 +93,7 @@ class Upload:
             self.log.info(utils.timer_message(msg="Upload to wikimedia", start=start, end=end))
 
             return upload_result
+
         except Exception as e:
             end = time.perf_counter()
             self.log.error(utils.timer_message(msg="Time to failure", start=start, end=end))
@@ -103,7 +101,10 @@ class Upload:
             if 'fileexists-shared-forbidden:' in e.__str__():
                 self.log.error("File already uploaded")
             else:
-                self.log.error(f"Error uploading: \n\tFile: {file}\n\tTo:{wiki_file_page.title}\n\tReason: {e}")
+                self.log.error(f"Error uploading: \n"
+                               f"\tFile: {file}\n"
+                               f"\tTo:{wiki_file_page.text.title()}\n"
+                               f"\tReason: {e}")
 
             return False
         finally:
@@ -135,16 +136,20 @@ class Upload:
         else:
             return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
 
+    # noinspection PyStatementEffect
     def create_wiki_file_page(self, title):
         """
         Create wiki file page
         :param title:
         :return:
         """
+        page = pywikibot.FilePage(self.site, title=title)
         try:
-            return pywikibot.FilePage(self.site, title=title)
+            page.latest_file_info
+            self.log.info(f"{title} already exists, skipping upload")
+            return None
         except Exception as e:
-            self.log.error(f"Unable to create FilePage: {e}")
+            return page
 
     def get_extension(self, path):
         """
@@ -195,6 +200,25 @@ class Upload:
         return mime
 
 
+# Setup log config
+timestr = time.strftime("%Y%m%d-%H%M%S")
+log_dir = "./logs/"
+os.makedirs(log_dir, exist_ok=True)
+
+log = logging.getLogger('logger')
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+file_handler = logging.FileHandler(f"{log_dir}/upload-{timestr}.log")
+file_handler.setLevel(logging.INFO)
+# create console handler with a higher log level
+# console_handler = logging.StreamHandler()
+# console_handler.setLevel(logging.INFO)
+
+# log.addHandler(console_handler)
+log.addHandler(file_handler)
+
+# Create utils
 utils = Utils()
 uploader = Upload()
 columns = {"dpla_id": "dpla_id",
@@ -219,25 +243,6 @@ for opt, arg in opts:
         sys.exit()
     elif opt in ("-i", "--input"):
         input = arg
-
-# Setup log config
-timestr = time.strftime("%Y%m%d-%H%M%S")
-log_dir = "./logs/"
-os.makedirs(log_dir, exist_ok=True)
-
-# self.logger.basicConfig(filename=, level=logging.INFO)
-# logging.basicConfig(format='%(asctime)s %(message)s')
-
-log = logging.getLogger('logger')
-
-file_handler = logging.FileHandler(f"{log_dir}/upload-{timestr}.log")
-file_handler.setLevel(logging.INFO)
-# create console handler with a higher log level
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.ERROR)
-
-log.addHandler(console_handler)
-log.addHandler(file_handler)
 
 log.info(f"Input: {input}")
 
@@ -270,7 +275,7 @@ for parquet_file in file_list:
             log.error(f"Unable to get attributes from row {row}: {e}")
             break
         end = time.process_time()
-        log.info(utils.timer_message(msg="Load record from dataframe", start=start, end=end))
+        # log.info(utils.timer_message(msg="Load record from dataframe", start=start, end=end))
 
         page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
 
@@ -278,7 +283,7 @@ for parquet_file in file_list:
         start = time.process_time()
         ext = uploader.get_extension(path)
         end = time.process_time()
-        log.info(utils.timer_message(msg="Get file extension", start=start, end=end))
+        # logging.info(utils.timer_message(msg="Get file extension", start=start, end=end))
 
         # Create Wikimedia page title
         start = time.process_time()
@@ -287,13 +292,18 @@ for parquet_file in file_list:
                                                      suffix=ext,
                                                      page=page)
         end = time.process_time()
-        log.info(utils.timer_message(msg="Create wiki page title", start=start, end=end))
+        # log.info(utils.timer_message(msg="Create wiki page title", start=start, end=end))
 
         # Create wiki page
         start = time.process_time()
         wiki_page = uploader.create_wiki_file_page(title=page_title)
         end = time.process_time()
-        log.info(utils.timer_message(msg="Create wiki page", start=start, end=end))
+        # log.info(utils.timer_message(msg="Create wiki page", start=start, end=end))
+
+        # Do not continue if page already exists
+        # This would be the place to possibly do metadata sync.
+        if wiki_page is None:
+            continue
 
         # Upload image to wiki page
         start = time.process_time()
