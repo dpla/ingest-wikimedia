@@ -36,7 +36,7 @@ class Upload:
     def upload(self, wiki_file_page, dpla_identifier, text, file):
         """
 
-        :parama wiki_file_page:
+        :param wiki_file_page:
         :param dpla_identifier:
         :param text
         :param file
@@ -74,14 +74,6 @@ class Upload:
             # TODO Resolve the correct combination of report_success and ignore_warnings
             #      And route output to parse JSON and log clearer messages
             start = time.perf_counter()
-
-            # self.log.error(f"FILE == {file}")
-            # self.log.error(f"WIKI FILE PAGE== {wiki_file_page}")
-
-            self.log.error(f"EXISTS == {wiki_file_page.exists()}")
-            self.log.error(f"GET == {wiki_file_page.get()}")
-            # self.log.error(f"IS FILE PAGE== {wiki_file_page.is_filepage()}")
-
             upload_result = self.site.upload(filepage=wiki_file_page,
                                              source_filename=file,
                                              comment=comment,
@@ -101,9 +93,7 @@ class Upload:
             if 'fileexists-shared-forbidden:' in e.__str__():
                 self.log.error("File already uploaded")
             else:
-                self.log.error(f"Error uploading: \n"
-                               f"\tFile: {file}\n"
-                               f"\tTo:{wiki_file_page.text.title()}\n"
+                self.log.error(f"Error uploading: {file} \n"
                                f"\tReason: {e}")
 
             return False
