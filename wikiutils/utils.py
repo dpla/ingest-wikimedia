@@ -57,11 +57,14 @@ class Utils:
         :param file:
         :return:
         """
+        exists = Path(file).exists()
         try:
             # Image already exists, do nothing
-            if Path(file).exists() and not overwrite:
+            if exists and not overwrite:
                 return file, 0, os.path.getsize(file)
             else:
+                if exists:
+                    os.remove(file)
                 start = process_time()
                 response = requests.get(url)
                 with open(file, 'wb') as f:
@@ -69,8 +72,7 @@ class Utils:
                 end = process_time()
                 file_size = os.path.getsize(file)
 
-                self.logger.info(f"Download {url} \n"
-                             f"\tSize: {self.sizeof_fmt(file_size)}")
+                self.logger.info(f"Download {url}, {self.sizeof_fmt(file_size)}")
                 return file, (end - start), file_size
         except Exception as e:
             # TODO cleaner error handling here
@@ -219,4 +221,3 @@ class Utils:
         self.logger.info(f"Saving {path}")
         df_out = pd.DataFrame(data, columns=columns)
         df_out.to_parquet(path)
-
