@@ -118,7 +118,9 @@ class Upload:
         escaped_title = title[0:181] \
             .replace('[', '(') \
             .replace(']', ')') \
-            .replace('/', '-')
+            .replace('/', '-') \
+            .replace('{', '(') \
+            .replace('}', ')')
 
         # Add pagination to page title if needed
         if page is None:
