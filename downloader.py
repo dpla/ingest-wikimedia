@@ -18,7 +18,7 @@ import logging
 import traceback
 import ssl
 
-ssl.SSLContext.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
+ssl.SSLContext.verify_mode = ssl.CERT_OPTIONAL
 
 from wikiutils.utils import Utils
 
