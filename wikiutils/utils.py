@@ -15,10 +15,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import ssl
+import traceback
+
+ssl.SSLContext.verify_mode = ssl.CERT_OPTIONAL
 
 
 class Utils:
     logger = logging.getLogger('logger')
+
+    s3 = boto3.client(service_name='s3', verify=False)
+
+    my_session = boto3.session.Session()
+    mys3 = my_session.client(service_name='s3', verify=False)
 
     # ssl.SSLContext.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
 
@@ -51,7 +59,7 @@ class Utils:
                 return self.download_local(url=url, file=out, overwrite=False)
 
         except Exception as e:
-            raise Exception(f"Failed to download {url}: {e}")
+            raise Exception(f"Failed to download {url}: {traceback.format_exc()}")
 
     def download_local(self, url, file, overwrite=False):
         """
@@ -71,8 +79,6 @@ class Utils:
                     os.remove(file)
                 start = process_time()
                 response = requests.get(url)
-
-                res
                 with open(file, 'wb') as f:
                     f.write(response.content)
                 end = process_time()
@@ -82,7 +88,7 @@ class Utils:
                 return file, (end - start), file_size
         except Exception as e:
             # TODO cleaner error handling here
-            raise Exception(f"Failed to download {url}: {e}")
+            raise Exception(f"Failed to download local {url}: {e}")
 
     def download_s3(self, url, out):
         """
@@ -93,7 +99,7 @@ class Utils:
         :return:
         """
         start = process_time()
-        s3 = boto3.client('s3')
+
 
         o = urlparse(out)
         bucket = o.netloc
@@ -101,7 +107,7 @@ class Utils:
         key = f"{o.path.replace('//', '/').lstrip('/')}"
 
         try:
-            response = s3.head_object(Bucket=bucket, Key=key)
+            response = self.s3.head_object(Bucket=bucket, Key=key)
             size = response['ContentLength']
             self.logger.info(f"{key} already exists, skipping download")
             return out, 0, size  # Return if file already exists in s3
@@ -117,7 +123,7 @@ class Utils:
         content_type = magic.from_file(temp_file.name, mime=True)
         try:
             with open(temp_file.name, "rb") as f:
-                s3.upload_fileobj(Fileobj=f, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
+                self.s3.upload_fileobj(Fileobj=f, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
                 end = process_time()
                 self.logger.info(f"Uploaded to s3://{bucket}/{key}")
                 return f"s3://{bucket}/{key}", (end - start), size
@@ -212,7 +218,10 @@ class Utils:
         return images_urls
 
     def get_parquet_files(self, path):
-        return wr.s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
+        return \
+            wr.s3.list_objects(path, suffix=".parquet", boto3_session=self.my_session) \
+            if path.startswith("s3") \
+            else self.get_local_parquet(path)
 
     def get_local_parquet(self, path):
         return Path(path).glob('*.parquet')
