@@ -16,6 +16,9 @@ import time
 import getopt
 import logging
 import traceback
+import ssl
+
+ssl.SSLContext.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
 
 from wikiutils.utils import Utils
 
@@ -121,16 +124,16 @@ for parquet_file in file_list:
 
         """
         Get urls to download
-        Download images up to 1TB 
-        Store them and then upload later 
-        
-        Generate values required by uploader 
+        Download images up to 1TB
+        Store them and then upload later
+
+        Generate values required by uploader
         upload parquet file
             - dpla id
-            - Page title 
+            - Page title
             - Path to asset
-            - size of asset 
-            - Wiki markup 
+            - size of asset
+            - Wiki markup
         """
         # TODO `out` should be the root save location or the asset path?
         out, time, size = base_output_path, 0, 0  # Defaults

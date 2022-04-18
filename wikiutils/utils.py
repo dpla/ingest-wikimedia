@@ -14,9 +14,13 @@ from botocore.exceptions import ClientError
 from pathlib import Path
 from urllib.parse import urlparse
 
+import ssl
+
 
 class Utils:
     logger = logging.getLogger('logger')
+
+    # ssl.SSLContext.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
 
     def __init__(self):
         pass
@@ -67,6 +71,8 @@ class Utils:
                     os.remove(file)
                 start = process_time()
                 response = requests.get(url)
+
+                res
                 with open(file, 'wb') as f:
                     f.write(response.content)
                 end = process_time()
@@ -185,7 +191,12 @@ class Utils:
             self.logger.info(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
             return list()
         elif len(sequences) == 1:
-            canvases = sequences[0]['canvases']
+            try:
+                canvases = sequences[0]['canvases']
+            except KeyError as e:
+                self.logger.info(f'No canvasses defined in  {iiif}')
+            except Exception as e:
+                self.logger.info(f'Error extracting canvasses  {iiif} because {e}')
 
         if canvases is None:
             self.logger.info(f"No sequences or canvases in IIIF manifest: {iiif}")

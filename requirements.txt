@@ -1,5 +1,5 @@
 aiobotocore==1.1.2
-aiohttp==3.7.2
+aiohttp==3.7.4
 aioitertools==0.7.0
 alabaster==0.7.12
 async-timeout==3.0.1
@@ -35,7 +35,7 @@ pyparsing==2.4.7
 python-dateutil==2.8.1
 python-snappy==0.5.4
 pytz==2020.1
-pywikibot==4.3.0
+pywikibot==6.6.3
 requests==2.24.0
 s3==3.0.0
 s3fs==0.5.1
