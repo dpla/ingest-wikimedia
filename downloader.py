@@ -12,11 +12,9 @@ Production use case:
 import os
 import sys
 import time
-
 import getopt
 import logging
 import traceback
-import ssl
 
 from wikiutils.utils import Utils
 
