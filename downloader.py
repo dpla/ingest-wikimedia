@@ -26,7 +26,6 @@ if __name__ == "__main__":
     format = "%(asctime)s: %(message)s"
     logging.basicConfig(format=format, level=logging.INFO, datefmt="%H:%M:%S")
 
-
 # Helper classes
 utils = Utils()
 
@@ -48,7 +47,8 @@ upload_parquet_columns = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
 try:
     opts, args = getopt.getopt(sys.argv[1:], "hi:u:o:", ["limit=", "batch_size=", "input=", "output=", "max_filesize="])
 except getopt.GetoptError:
-    print('downloader.py --limit <bytes> --batch_size <bytes> --input <path to parquet> --output <path to save files> --max_filesize <max filesize>')
+    print(
+        'downloader.py --limit <bytes> --batch_size <bytes> --input <path to parquet> --output <path to save files> --max_filesize <max filesize>')
     sys.exit(2)
 
 for opt, arg in opts:
@@ -67,7 +67,6 @@ for opt, arg in opts:
         batch_size = int(arg)
     elif opt in ("-m", "--max_filesize"):
         max_filesize = int(arg)
-
 
 # Setup log config
 timestr = time.strftime("%Y%m%d-%H%M%S")
@@ -199,8 +198,8 @@ for parquet_file in file_list:
         if batch_downloaded > batch_size:
             logger.info(f"Upload quota met for batch {batch_number}")
             logger.info(f"\n\tBatch {batch_number} \n" \
-                             f"\t{len(df_rows)} files \n" \
-                             f"\t{utils.sizeof_fmt(batch_downloaded)}")
+                            f"\t{len(df_rows)} files \n" \
+                            f"\t{utils.sizeof_fmt(batch_downloaded)}")
 
             # Save upload info dataframe
             batch_parquet_out_path = f"{df_batch_out}batch_{batch_number}.parquet"
@@ -217,8 +216,8 @@ for parquet_file in file_list:
         if 0 < download_limit < total_downloaded:
             logger.info(f"Total download limit breached at {utils.sizeof_fmt(total_downloaded)}. Stopping run.")
             logger.info(f"\n\tBatch {batch_number} \n" \
-                             f"\t{len(df_rows)} files \n" \
-                             f"\t{utils.sizeof_fmt(batch_downloaded)}")
+                            f"\t{len(df_rows)} files \n" \
+                            f"\t{utils.sizeof_fmt(batch_downloaded)}")
 
             batch_parquet_out_path = f"{df_batch_out}batch_{batch_number}.parquet"
             utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)

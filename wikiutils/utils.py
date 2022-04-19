@@ -1,6 +1,6 @@
 from time import process_time
 
-import awswrangler as wr
+from awswrangler import s3
 import boto3
 import json
 import logging
@@ -10,25 +10,21 @@ import os
 import pandas as pd
 import requests
 import tempfile
+from botocore.config import Config
 from botocore.exceptions import ClientError
 from pathlib import Path
 from urllib.parse import urlparse
 
-import ssl
 import traceback
-
-ssl.SSLContext.verify_mode = ssl.CERT_OPTIONAL
 
 
 class Utils:
     logger = logging.getLogger('logger')
 
-    s3 = boto3.client(service_name='s3', verify=False)
+    s3 = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
 
     my_session = boto3.session.Session()
-    mys3 = my_session.client(service_name='s3', verify=False)
-
-    # ssl.SSLContext.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
+    mys3 = my_session.client(service_name='s3', config=Config(signature_version='s3v4'))
 
     def __init__(self):
         pass
@@ -132,7 +128,7 @@ class Utils:
             os.unlink(temp_file.name)
 
     def get_df_s3(self, path, columns):
-        return wr.s3 \
+        return s3 \
             .read_parquet(path=path) \
             .rename(columns=columns)
 
@@ -219,7 +215,7 @@ class Utils:
 
     def get_parquet_files(self, path):
         return \
-            wr.s3.list_objects(path, suffix=".parquet", boto3_session=self.my_session) \
+            s3.list_objects(path, suffix=".parquet", boto3_session=self.my_session) \
             if path.startswith("s3") \
             else self.get_local_parquet(path)
 
