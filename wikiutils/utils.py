@@ -23,9 +23,6 @@ class Utils:
 
     s3 = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
 
-    my_session = boto3.session.Session()
-    mys3 = my_session.client(service_name='s3', config=Config(signature_version='s3v4'))
-
     def __init__(self):
         pass
 
@@ -214,10 +211,7 @@ class Utils:
         return images_urls
 
     def get_parquet_files(self, path):
-        return \
-            s3.list_objects(path, suffix=".parquet", boto3_session=self.my_session) \
-            if path.startswith("s3") \
-            else self.get_local_parquet(path)
+        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
 
     def get_local_parquet(self, path):
         return Path(path).glob('*.parquet')
