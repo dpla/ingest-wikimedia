@@ -203,11 +203,15 @@ class Utils:
 
         images_urls = list()
         for canvas in canvases:
-            image_url = canvas['images'][0]['resource']['@id']
-            # if missing file extension add it to URL to be requested
-            image_url = image_url if '.' in image_url[image_url.rfind('/'):] else f"{image_url}.jpg"
-            images_urls.append(image_url)
-
+            try:
+                image_url = canvas['images'][0]['resource']['@id']
+                # if missing file extension add it to URL to be requested
+                image_url = image_url if '.' in image_url[image_url.rfind('/'):] else f"{image_url}.jpg"
+                images_urls.append(image_url)
+            except KeyError as e:
+                self.logger.info(f'No images defined in  {iiif}')
+            except Exception as e:
+                self.logger.info(f'Error extracting canvasses  {iiif} because {e}')
         return images_urls
 
     def get_parquet_files(self, path):
