@@ -52,7 +52,8 @@ class Upload:
             if file.startswith("s3"):
                 start = time.perf_counter()
                 s3 = boto3.resource('s3')
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file[file.rfind('.'):])
+
+                temp_file = tempfile.NamedTemporaryFile(delete=False)
                 o = urlparse(file)
                 bucket = o.netloc
                 key = o.path.replace('//', '/').lstrip('/')
@@ -94,7 +95,8 @@ class Upload:
                 self.log.error("File already uploaded")
             else:
                 self.log.error(f"Error uploading: {file} \n"
-                               f"\tReason: {e}")
+                               f"\tReason: ....")
+                logging.exception("Reason")
 
             return False
         finally:
