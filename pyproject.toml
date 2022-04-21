@@ -13,6 +13,7 @@ awswrangler = "^2.15.1"
 python-magic = "^0.4.25"
 fastparquet = "^0.8.1"
 s3fs = "^2022.3.0"
+mwparserfromhell = "^0.6.4"
 
 [tool.poetry.dev-dependencies]
 
