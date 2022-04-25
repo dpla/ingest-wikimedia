@@ -71,7 +71,7 @@ class Utils:
                 if exists:
                     os.remove(file)
                 start = process_time()
-                response = requests.get(url)
+                response = requests.get(url, timeout=10)
                 with open(file, 'wb') as f:
                     f.write(response.content)
                 end = process_time()
