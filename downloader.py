@@ -134,8 +134,9 @@ for parquet_file in file_list:
             break
 
         # Should this DPLA id be downloaded?
+
         if dpla_id not in ids:
-            break
+            continue
 
         # Are we working with IIIF or media_master?
         download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
