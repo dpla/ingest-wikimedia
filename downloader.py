@@ -94,7 +94,7 @@ logger.info(f"Output: {base_output_path}")
 if file_filter:
     logger.info(f"File filter: {file_filter}")
 
-# Get IDs to check for 
+# Get IDs to check for
 ids = list()
 if not file_filter:
     with open('file_filter') as f:
@@ -111,7 +111,12 @@ logger.info(f"{file_list.__sizeof__()} files to process")
 for parquet_file in file_list:
     utils.create_path(df_batch_out)
     # read parquet file
-    df = utils.get_df(parquet_file, columns=columns)
+    df = None
+    try:
+        df = utils.get_df(parquet_file, columns=columns)
+    except Exception as e:
+        logger.error(f"Unable to read file {e}. Aborting file {parquet_file}")
+        break
 
     logger.info(f"Processing...{df.shape[0]} rows in {parquet_file}")
 
