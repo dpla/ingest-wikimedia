@@ -97,7 +97,7 @@ if file_filter:
 # Get IDs to check for
 ids = list()
 if file_filter:
-    with open('file_filter') as f:
+    with open(file_filter) as f:
         ids = [line.rstrip() for line in f]
 
 logger.info(f"{len(ids)} IDs to download")
