@@ -96,7 +96,7 @@ if file_filter:
 
 # Get IDs to check for
 ids = list()
-if not file_filter:
+if file_filter:
     with open('file_filter') as f:
         ids = [line.rstrip() for line in f]
 
