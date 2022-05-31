@@ -116,7 +116,7 @@ for parquet_file in file_list:
         df = utils.get_df(parquet_file, columns=columns)
     except Exception as e:
         logger.error(f"Unable to read file {e}. Aborting file {parquet_file}")
-        break
+        continue
 
     logger.info(f"Processing...{df.shape[0]} rows in {parquet_file}")
 
