@@ -134,7 +134,7 @@ for parquet_file in file_list:
             break
 
         # Should this DPLA id be downloaded
-        if ids and (dpla_id not in ids):
+        if file_filter and (dpla_id not in ids):
             continue
 
         # Are we working with IIIF or media_master?
