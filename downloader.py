@@ -133,9 +133,8 @@ for parquet_file in file_list:
             logger.error(f"Unable to get attributes from row {row}: {e}. Aborting...")
             break
 
-        # Should this DPLA id be downloaded?
-
-        if dpla_id not in ids:
+        # Should this DPLA id be downloaded
+        if file_filter and (dpla_id not in ids):
             continue
 
         # Are we working with IIIF or media_master?
