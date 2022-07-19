@@ -99,8 +99,7 @@ ids = list()
 if file_filter:
     with open(file_filter) as f:
         ids = [line.rstrip() for line in f]
-
-logger.info(f"{len(ids)} IDs to download")
+    logger.info(f"{len(ids)} IDs to download")
 
 # Get individual parquet files from ingestion3 wiki output
 file_list = utils.get_parquet_files(path=input_df)
