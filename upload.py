@@ -43,7 +43,7 @@ class Upload:
         :return:
         """
 
-        comment = f"Uploading DPLA ID {dpla_identifier}"
+        comment = f"Uploading DPLA ID [[dpla:{dpla_identifier}]]"
         temp_file = None
 
         try:
