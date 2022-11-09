@@ -10,7 +10,6 @@ sudo apt-get update
 echo "apt install python3.8"
 sudo apt-get install -y python3.8
 sudo apt-get install -y python3.8-dev
-sudo apt-get install -y libsnappy-dev
 
 echo "install python3-setuptools"
 sudo apt-get -y install python3-setuptools
