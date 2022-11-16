@@ -98,6 +98,8 @@ class Upload:
                                              text=text,
                                              report_success=True,
                                              ignore_warnings=warnings_to_ignore,
+                                             asynchronous= True,
+                                             chunk_size=50000000
                                             )
 
             end = time.perf_counter()
