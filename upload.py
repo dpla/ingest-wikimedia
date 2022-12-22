@@ -94,7 +94,7 @@ class Upload:
             if 'fileexists-shared-forbidden:' in e.__str__():
                 self.log.error("File already uploaded")
             else:
-                self.log.error(f"Error uploading: {file} \n"
+                self.log.error(f"Error uploading: {dpla_id} \n"
                                f"\tReason: ....")
                 logging.exception("Reason")
 
@@ -274,7 +274,11 @@ for parquet_file in file_list:
 
         # Get file extension
         start = time.process_time()
-        ext = uploader.get_extension(path)
+        try: 
+            ext = uploader.get_extension(path)
+        except Exception as e:
+            log.error(f"Unable to determine mimetype/extension for {path}")
+            break
         end = time.process_time()
         # logging.info(utils.timer_message(msg="Get file extension", start=start, end=end))
 
