@@ -116,9 +116,9 @@ class Upload:
             if 'fileexists-shared-forbidden:' in e.__str__():
                 logger.error("File already uploaded")
             else:
-                logger.error(f"Error uploading: {dpla_id} \n"
+                log.error(f"Error uploading: {dpla_id} \n"
                                f"\tReason: ....")
-                logging.exception("Reason")
+                log.exception("Reason")
 
             return False
         finally:
@@ -334,15 +334,14 @@ for parquet_file in file_list:
                 text=wiki_markup,
                 file=path)
             if upload_status:
-                log.info(f"Uploaded count {upload_count}")
+                # log.info(f"Uploaded count {upload_count}")
                 upload_count = upload_count + 1
         except Exception as e:
-            logging.error(f"Unable to upload: {e}\nTarget file {path}")
+            log.error(f"Unable to upload: {e}\nTarget file {path}")
         end = time.process_time()
         end_image = time.perf_counter()
 
         log.info(utils.timer_message(msg="Upload image", start=start, end=end))
-        break
 
 log.info(f"FINISHED upload for {input}")
 
