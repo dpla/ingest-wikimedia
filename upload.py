@@ -26,6 +26,7 @@ class Upload:
     site = None
     s3 = boto3.client('s3')
     log = None
+    log_file_name = None
 
     def __init__(self):
         self.log = logging.getLogger('logger')
@@ -33,7 +34,7 @@ class Upload:
         self.site.login()
         self.log.info(f"Logged in user is: {self.site.user()}")
 
-    def upload(self, wiki_file_page, dpla_identifier, text, file):
+    def upload(self, wiki_file_page, dpla_identifier, text, file, logger):
         """
 
         :param wiki_file_page:
@@ -69,7 +70,7 @@ class Upload:
                         else:
                             raise
                 end = time.perf_counter()
-                self.log.info(utils.timer_message(msg="Download s3 to tmp", start=start, end=end))
+                logger.info(utils.timer_message(msg="Download s3 to tmp", start=start, end=end))
 
             # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
             # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
@@ -103,18 +104,19 @@ class Upload:
                                             )
 
             end = time.perf_counter()
-            self.log.info(utils.timer_message(msg="Upload to wikimedia", start=start, end=end))
+            logger.info(utils.timer_message(msg=f"Uploaded {file} for {dpla_identifier} ", start=start, end=end))
 
             return upload_result
 
         except Exception as e:
             end = time.perf_counter()
-            self.log.error(utils.timer_message(msg="Time to failure", start=start, end=end))
+            logger.error(f"Failed to upload {file} for {dpla_identifier} ")
+            logger.error(utils.timer_message(msg="Time to failure", start=start, end=end))
 
             if 'fileexists-shared-forbidden:' in e.__str__():
-                self.log.error("File already uploaded")
+                logger.error("File already uploaded")
             else:
-                self.log.error(f"Error uploading: {dpla_id} \n"
+                logger.error(f"Error uploading: {dpla_id} \n"
                                f"\tReason: ....")
                 logging.exception("Reason")
 
@@ -216,20 +218,20 @@ class Upload:
 
 # Setup log config
 timestr = time.strftime("%Y%m%d-%H%M%S")
-log_dir = "./logs/"
-os.makedirs(log_dir, exist_ok=True)
+# log_dir = "./logs/"
+# os.makedirs(log_dir, exist_ok=True)
 
 log = logging.getLogger('logger')
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
-
-file_handler = logging.FileHandler(f"{log_dir}/upload-{timestr}.log")
-file_handler.setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.DEBUG, 
+    filemode='a',
+    datefmt='%H:%M:%S',
+    format='%(asctime)s %(message)s'
+    )
+log_file_name = f"upload-{timestr}.log"
+file_handler = logging.FileHandler(log_file_name)
+file_handler.setLevel(logging.DEBUG)
 log.addHandler(file_handler)
-# create console handler with a higher log level
-# console_handler = logging.StreamHandler()
-# console_handler.setLevel(logging.INFO)
-# log.addHandler(console_handler)
 
 # Create utils
 utils = Utils()
@@ -340,9 +342,10 @@ for parquet_file in file_list:
         end_image = time.perf_counter()
 
         log.info(utils.timer_message(msg="Upload image", start=start, end=end))
-        log.info(utils.timer_message(msg="Upload image (w/sleep)", start=image_upload_sleep_start, end=end_image))
-        log.info(utils.timer_message(msg="Overall proc time)", start=start_image_proc, end=end))
-        log.info(utils.timer_message(msg="Overall time (w/sleep)", start=start_image, end=end_image))
-        log.info("--------------------------------------------------------------")
+        break
 
 log.info(f"FINISHED upload for {input}")
+
+with open(log_file_name, "rb") as f:
+    Utils.upload_to_s3(file=f, bucket="dpla-wikimedia", key="logs", content_type="text/plain")
+
