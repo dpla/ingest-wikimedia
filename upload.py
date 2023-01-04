@@ -347,5 +347,5 @@ for parquet_file in file_list:
 log.info(f"FINISHED upload for {input}")
 
 with open(log_file_name, "rb") as f:
-    utils.upload_to_s3(file=f, bucket="dpla-wikimedia", key="logs", content_type="text/plain")
+    utils.upload_to_s3(file=f, bucket="dpla-wikimedia", key=f"logs/{log_file_name}", content_type="text/plain")
 
