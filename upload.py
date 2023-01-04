@@ -332,7 +332,8 @@ for parquet_file in file_list:
                 wiki_file_page=wiki_page,
                 dpla_identifier=dpla_id,
                 text=wiki_markup,
-                file=path)
+                file=path,
+                logger=log)
             if upload_status:
                 # log.info(f"Uploaded count {upload_count}")
                 upload_count = upload_count + 1
