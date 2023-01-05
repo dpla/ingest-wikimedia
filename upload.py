@@ -110,10 +110,10 @@ class Upload:
 
         except Exception as e:
             end = time.perf_counter()
-            log.error(f"Failed to upload {s3_file_name} for {dpla_identifier} ")
-
             if 'fileexists-shared-forbidden:' in e.__str__():
-                log.error("File already uploaded")
+                log.error("Failed to upload {s3_file_name} for {dpla_identifier}, File already uploaded")
+            elif 'filetype-badmime' in e.__str__():
+                 log.error("Failed to upload {s3_file_name} for {dpla_identifier}, Invalid MIME type")
             else:
                 log.exception("Reason")
             return False
