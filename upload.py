@@ -58,7 +58,8 @@ class Upload:
                 o = urlparse(file)
                 bucket = o.netloc
                 key = o.path.replace('//', '/').lstrip('/')
-
+                s3_file_name = key.split('/')[-1]
+                
                 with open(temp_file.name, "wb") as f:
                     try:
                         s3.Bucket(bucket).download_file(key, temp_file.name)
@@ -103,7 +104,7 @@ class Upload:
                                             )
 
             end = time.perf_counter()
-            s3_file_name = key.split('/')[-1]
+            
             log.info(utils.timer_message(msg=f"Uploaded {s3_file_name} for {dpla_identifier} ", start=start, end=end))
 
             return upload_result
