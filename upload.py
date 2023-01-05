@@ -104,7 +104,7 @@ class Upload:
 
             end = time.perf_counter()
             s3_file_name = key.split('/')[-1]
-            log.info(utils.timer_message(msg=f"Uploaded {s3_file_name]} for {dpla_identifier} ", start=start, end=end))
+            log.info(utils.timer_message(msg=f"Uploaded {s3_file_name} for {dpla_identifier} ", start=start, end=end))
 
             return upload_result
 
