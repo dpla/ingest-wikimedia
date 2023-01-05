@@ -103,20 +103,19 @@ class Upload:
                                             )
 
             end = time.perf_counter()
-            log.info(utils.timer_message(msg=f"Uploaded {key.rstrip('/')} for {dpla_identifier} ", start=start, end=end))
+            s3_file_name = key.split('/')[-1]
+            log.info(utils.timer_message(msg=f"Uploaded {s3_file_name]} for {dpla_identifier} ", start=start, end=end))
 
             return upload_result
 
         except Exception as e:
             end = time.perf_counter()
-            log.error(f"Failed to upload {file} for {dpla_identifier} ")
+            log.error(f"Failed to upload {s3_file_name} for {dpla_identifier} ")
 
             if 'fileexists-shared-forbidden:' in e.__str__():
                 log.error("File already uploaded")
             else:
-                log.error(f"Error uploading: {dpla_id}")
                 log.exception("Reason")
-
             return False
         finally:
             if temp_file:
