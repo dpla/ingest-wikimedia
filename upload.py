@@ -65,12 +65,11 @@ class Upload:
                         file = temp_file.name
                     except botocore.exceptions.ClientError as e:
                         if e.response['Error']['Code'] == "404":
-                            self.log.error("The object does not exist.")
+                            log.error("The object does not exist.")
                             return False
                         else:
                             raise
                 end = time.perf_counter()
-                logger.info(utils.timer_message(msg="Download s3 to tmp", start=start, end=end))
 
             # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
             # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
@@ -104,20 +103,18 @@ class Upload:
                                             )
 
             end = time.perf_counter()
-            logger.info(utils.timer_message(msg=f"Uploaded {file} for {dpla_identifier} ", start=start, end=end))
+            log.info(utils.timer_message(msg=f"Uploaded {file} for {dpla_identifier} ", start=start, end=end))
 
             return upload_result
 
         except Exception as e:
             end = time.perf_counter()
-            logger.error(f"Failed to upload {file} for {dpla_identifier} ")
-            logger.error(utils.timer_message(msg="Time to failure", start=start, end=end))
+            log.error(f"Failed to upload {file} for {dpla_identifier} ")
 
             if 'fileexists-shared-forbidden:' in e.__str__():
-                logger.error("File already uploaded")
+                log.error("File already uploaded")
             else:
-                log.error(f"Error uploading: {dpla_id} \n"
-                               f"\tReason: ....")
+                log.error(f"Error uploading: {dpla_id}")
                 log.exception("Reason")
 
             return False
@@ -215,22 +212,21 @@ class Upload:
             raise Exception(f"Unable to determine ContentType for {path}")
         return mime
 
-
 # Setup log config
 timestr = time.strftime("%Y%m%d-%H%M%S")
-# log_dir = "./logs/"
-# os.makedirs(log_dir, exist_ok=True)
+log_file_name = f"upload-{timestr}.log"
 
-log = logging.getLogger('logger')
 logging.basicConfig(
     level=logging.DEBUG, 
     filemode='a',
     datefmt='%H:%M:%S',
     format='%(asctime)s %(message)s'
     )
-log_file_name = f"upload-{timestr}.log"
+
 file_handler = logging.FileHandler(log_file_name)
 file_handler.setLevel(logging.DEBUG)
+
+log = logging.getLogger('logger')
 log.addHandler(file_handler)
 
 # Create utils
@@ -245,6 +241,7 @@ columns = {"dpla_id": "dpla_id",
 input = None
 upload_count = 1
 
+# Get input parameters 
 try:
     opts, args = getopt.getopt(sys.argv[1:], "hi:u:o:", ["input="])
 except getopt.GetoptError:
@@ -346,6 +343,12 @@ for parquet_file in file_list:
 
 log.info(f"FINISHED upload for {input}")
 
+
+o = urlparse(input)
+bucket = o.netloc
+# generate full s3 key using file name from url and path generate previously
+key = f"{o.path.replace('//', '/').lstrip('/')}"
+
 with open(log_file_name, "rb") as f:
-    utils.upload_to_s3(file=f, bucket="dpla-wikimedia", key=f"logs/{log_file_name}", content_type="text/plain")
+    utils.upload_to_s3(file=f, bucket=bucket, key=f"{key}/log/{log_file_name}", content_type="text/plain")
 
