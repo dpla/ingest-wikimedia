@@ -103,7 +103,7 @@ class Upload:
                                             )
 
             end = time.perf_counter()
-            log.info(utils.timer_message(msg=f"Uploaded {file} for {dpla_identifier} ", start=start, end=end))
+            log.info(utils.timer_message(msg=f"Uploaded {key.rstrip('/')} for {dpla_identifier} ", start=start, end=end))
 
             return upload_result
 
@@ -339,7 +339,10 @@ for parquet_file in file_list:
         end = time.process_time()
         end_image = time.perf_counter()
 
-        log.info(utils.timer_message(msg="Upload image", start=start, end=end))
+        # log.info(utils.timer_message(msg="Upload image", start=start, end=end))
+
+        if(upload_count > 100):
+            break
 
 log.info(f"FINISHED upload for {input}")
 
