@@ -124,6 +124,9 @@ class Utils:
             # cleanup temp file
             os.unlink(temp_file.name)
 
+    def upload_to_s3(self, bucket, key, file, content_type): 
+        self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
+
     def get_df_s3(self, path, columns):
         return s3 \
             .read_parquet(path=path) \
