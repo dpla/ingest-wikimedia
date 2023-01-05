@@ -71,6 +71,23 @@ class Upload:
                 end = time.perf_counter()
                 self.log.info(utils.timer_message(msg="Download s3 to tmp", start=start, end=end))
 
+            # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
+            # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
+            # https://doc.wikimedia.org/pywikibot/master/_modules/pywikibot/site/_upload.html
+            
+            warnings_to_ignore = [
+                'bad-prefix',
+                'badfilename',
+                'duplicate-archive',
+                'duplicate-version',
+                'empty-file',
+                'exists',
+                'exists-normalized',
+                'filetype-unwanted-type',
+                'page-exists',
+                'was-deleted'
+            ]
+                
             # upload to Wikimedia
             # TODO Resolve the correct combination of report_success and ignore_warnings
             #      And route output to parse JSON and log clearer messages
@@ -80,7 +97,10 @@ class Upload:
                                              comment=comment,
                                              text=text,
                                              report_success=True,
-                                             ignore_warnings=True)
+                                             ignore_warnings=warnings_to_ignore,
+                                             asynchronous= True,
+                                             chunk_size=50000000
+                                            )
 
             end = time.perf_counter()
             self.log.info(utils.timer_message(msg="Upload to wikimedia", start=start, end=end))
