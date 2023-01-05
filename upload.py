@@ -114,6 +114,8 @@ class Upload:
                 log.error(f"Failed to upload {s3_file_name} for {dpla_identifier}, File already uploaded")
             elif 'filetype-badmime' in e.__str__():
                  log.error(f"Failed to upload {s3_file_name} for {dpla_identifier}, Invalid MIME type")
+            elif 'filetype-banned' in e.__str__():
+                log.error(f"Failed to upload {s3_file_name} for {dpla_identifier}, Banned file type")
             else:
                 log.exception("Reason")
             return False
