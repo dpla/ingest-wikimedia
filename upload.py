@@ -98,17 +98,17 @@ class Upload:
                                              asynchronous= True,
                                              chunk_size=50000000
                                             )
-            log.info(f"Successfully uploaded {page_title} for {dpla_identifier}")
+            log.info(f"Successfully uploaded '{page_title}'")
 
             return upload_result
 
         except Exception as e:
             if 'fileexists-shared-forbidden:' in e.__str__():
-                log.error(f"Failed to upload {page_title} for {dpla_identifier}, File already uploaded")
+                log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded")
             elif 'filetype-badmime' in e.__str__():
-                 log.error(f"Failed to upload {page_title} for {dpla_identifier}, Invalid MIME type")
+                 log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type")
             elif 'filetype-banned' in e.__str__():
-                log.error(f"Failed to upload {page_title} for {dpla_identifier}, Banned file type")
+                log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type")
             else:
                 log.exception("Reason")
             return False
@@ -319,8 +319,8 @@ for parquet_file in file_list:
         except Exception as e:
             log.error(f"Unable to upload {path} because {e}")
 
-log.info(f"FINISHED upload for {input}")
-log.info(f"Uploaded {upload_count} files")
+log.info(f"Finished upload for {input}")
+log.info(f"Uploaded {upload_count} new files")
 
 
 o = urlparse(input)
