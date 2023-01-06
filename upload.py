@@ -153,7 +153,7 @@ class Upload:
         page = pywikibot.FilePage(self.site, title=title)
         try:
             page.latest_file_info
-            self.log.info(f"Page in wikimedia already exists, skipping upload for {title}")
+            self.log.info(f"Page already exists in Wikimedia '{title}'")
             return None
         except Exception as e:
             return page
