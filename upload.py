@@ -34,7 +34,7 @@ class Upload:
         self.site.login()
         self.log.info(f"Logged in user is: {self.site.user()}")
 
-    def upload(self, wiki_file_page, dpla_identifier, text, file, logger):
+    def upload(self, wiki_file_page, dpla_identifier, text, file, logger, page_title):
         """
 
         :param wiki_file_page:
@@ -51,7 +51,6 @@ class Upload:
             # This is a massive kludge because direct s3 upload via source_url is not allowed.
             # Download from s3 to temp location on box then upload local file to wikimeida
             if file.startswith("s3"):
-                start = time.perf_counter()
                 s3 = boto3.resource('s3')
 
                 temp_file = tempfile.NamedTemporaryFile(delete=False)
@@ -66,11 +65,10 @@ class Upload:
                         file = temp_file.name
                     except botocore.exceptions.ClientError as e:
                         if e.response['Error']['Code'] == "404":
-                            log.error("The object does not exist.")
+                            log.error(f"S3 object does not exist: {bucket}{key} ")
                             return False
                         else:
                             raise
-                end = time.perf_counter()
 
             # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
             # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
@@ -92,7 +90,6 @@ class Upload:
             # upload to Wikimedia
             # TODO Resolve the correct combination of report_success and ignore_warnings
             #      And route output to parse JSON and log clearer messages
-            start = time.perf_counter()
             upload_result = self.site.upload(filepage=wiki_file_page,
                                              source_filename=file,
                                              comment=comment,
@@ -101,21 +98,17 @@ class Upload:
                                              asynchronous= True,
                                              chunk_size=50000000
                                             )
-
-            end = time.perf_counter()
-            
-            log.info(utils.timer_message(msg=f"Uploaded {s3_file_name} for {dpla_identifier} ", start=start, end=end))
+            log.info(f"Successfully uploaded '{page_title}'")
 
             return upload_result
 
         except Exception as e:
-            end = time.perf_counter()
             if 'fileexists-shared-forbidden:' in e.__str__():
-                log.error(f"Failed to upload {s3_file_name} for {dpla_identifier}, File already uploaded")
+                log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded")
             elif 'filetype-badmime' in e.__str__():
-                 log.error(f"Failed to upload {s3_file_name} for {dpla_identifier}, Invalid MIME type")
+                 log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type")
             elif 'filetype-banned' in e.__str__():
-                log.error(f"Failed to upload {s3_file_name} for {dpla_identifier}, Banned file type")
+                log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type")
             else:
                 log.exception("Reason")
             return False
@@ -160,7 +153,7 @@ class Upload:
         page = pywikibot.FilePage(self.site, title=title)
         try:
             page.latest_file_info
-            self.log.info(f"{title} already exists, skipping upload")
+            self.log.info(f"Page already exists in Wikimedia '{title}'")
             return None
         except Exception as e:
             return page
@@ -221,7 +214,12 @@ logging.basicConfig(
     level=logging.DEBUG, 
     filemode='a',
     datefmt='%H:%M:%S',
-    format='%(asctime)s %(message)s'
+    # format='%(asctime)s %(message)s'
+    format='%(filename)s: '    
+            '%(levelname)s: '
+            '%(funcName)s(): '
+            '%(lineno)d:\t'
+            '%(message)s'
     )
 
 file_handler = logging.FileHandler(log_file_name)
@@ -264,7 +262,7 @@ log.info(f"Input: {input}")
 file_list = utils.get_parquet_files(path=input)
 
 for parquet_file in file_list:
-    log.info(f"Processing...{parquet_file}")
+    log.info(f"Processing {parquet_file}")
     df = utils.get_df(parquet_file, columns=columns)
 
     for row in df.itertuples(index=columns):
@@ -281,7 +279,7 @@ for parquet_file in file_list:
             wiki_markup = getattr(row, 'markup')
             page = getattr(row, 'page')
         except Exception as e:
-            log.error(f"Unable to get attributes from row {row}: {e}")
+            log.error(f"Unable to get attributes from row {row} in {parquet_file}: {e}")
             break
 
         page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
@@ -300,10 +298,7 @@ for parquet_file in file_list:
                                                      page=page)
 
         # Create wiki page
-        start = time.process_time()
         wiki_page = uploader.create_wiki_file_page(title=page_title)
-        end = time.process_time()
-        # log.info(utils.timer_message(msg="Create wiki page", start=start, end=end))
 
         # Do not continue if page already exists
         # This would be the place to possibly do metadata sync.
@@ -311,24 +306,21 @@ for parquet_file in file_list:
             continue
 
         # Upload image to wiki page
-        start = time.process_time()
-        image_upload_sleep_start = time.perf_counter()
         try:
             upload_status = uploader.upload(
                 wiki_file_page=wiki_page,
                 dpla_identifier=dpla_id,
                 text=wiki_markup,
                 file=path,
-                logger=log)
+                logger=log,
+                page_title=page_title)
             if upload_status:
                 upload_count = upload_count + 1
         except Exception as e:
-            log.error(f"Unable to upload: {e}\nTarget file {path}")
-        end = time.process_time()
-        end_image = time.perf_counter()
+            log.error(f"Unable to upload {path} because {e}")
 
-log.info(f"FINISHED upload for {input}")
-log.info(f"Uploaded {upload_count} files")
+log.info(f"Finished upload for {input}")
+log.info(f"Uploaded {upload_count} new files")
 
 
 o = urlparse(input)
