@@ -19,6 +19,7 @@ This box was created by Vagrant (see `Vagrantfile` in project) so you can ssh in
 Start a screen session so that the processes can continue after you log off the instance. It is also useful to set a screen session name.
 
 ## Running download
+
 Running a download requires two pieces of information
 
 1) The path to most recent Wikimedia parquet file export from ingestion3.
