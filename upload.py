@@ -158,6 +158,8 @@ class Upload:
         except Exception as e:
             return page
 
+
+    # Create a function to get the extension from the mime type
     def get_extension(self, path):
         """
 
@@ -238,7 +240,7 @@ columns = {"dpla_id": "dpla_id",
            "markup": "markup",
            "page": "page"}
 input = None
-upload_count = 1
+failed_count, upload_count = 0
 
 # Get input parameters 
 try:
@@ -292,14 +294,22 @@ for parquet_file in file_list:
             break
 
         # Create Wikimedia page title
-        page_title = uploader.create_wiki_page_title(title=title,
+        try: 
+            page_title = uploader.create_wiki_page_title(title=title,
                                                      dpla_identifier=dpla_id,
                                                      suffix=ext,
                                                      page=page)
+        except Exception as e:
+            log.error("Unable to generate page title for {dpla_id} - {path}")
+            break
 
         # Create wiki page
-        wiki_page = uploader.create_wiki_file_page(title=page_title)
-
+        try:
+            wiki_page = uploader.create_wiki_file_page(title=page_title)
+        except Exception as e:
+            log.error("Unable to generate wiki page for {dpla_id} - {path}")
+            break
+        
         # Do not continue if page already exists
         # This would be the place to possibly do metadata sync.
         if wiki_page is None:
@@ -316,11 +326,14 @@ for parquet_file in file_list:
                 page_title=page_title)
             if upload_status:
                 upload_count = upload_count + 1
+            else:
+                failed_count = failed_count +1
         except Exception as e:
             log.error(f"Unable to upload {path} because {e}")
 
 log.info(f"Finished upload for {input}")
 log.info(f"Uploaded {upload_count} new files")
+log.info(f"Failed {failed_count} files")
 
 
 o = urlparse(input)

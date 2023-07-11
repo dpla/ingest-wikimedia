@@ -249,4 +249,17 @@ if df_rows:
     utils.write_parquet(batch_parquet_out_path, df_rows, upload_parquet_columns)
     df_rows = list()  # reset
 
+# write a summary of the images downloaded
+input_df = pd.DataFrame({   'dpla_id': [dpla_id],
+                            'title': [title],
+                            'wiki_markup': [wiki_markup],
+                            'iiif': [iiif],
+                            'media_master': [media_master],
+                            'downloaded': [out],
+                            'download_time': [time],
+                            'download_size': [size]
+                        })
+input_df.to_parquet(f"{base_output_path}/input.parquet")
+
+
 logger.info(f"FINISHED download for {input_df}")
