@@ -240,7 +240,7 @@ columns = {"dpla_id": "dpla_id",
            "markup": "markup",
            "page": "page"}
 input = None
-failed_count, upload_count = 0
+failed_count, upload_count = 0, 0
 
 # Get input parameters 
 try:
