@@ -90,15 +90,15 @@ class Upload:
             # TODO Resolve the correct combination of report_success and ignore_warnings
             #      And route output to parse JSON and log clearer messages
             try:
-                upload_result = self.site.upload(filepage=wiki_file_page,
+                self.site.upload(filepage=wiki_file_page,
                                                 source_filename=file,
                                                 comment=comment,
                                                 text=text,
                                                 ignore_warnings=warnings_to_ignore,
                                                 asynchronous= True,
                                                 chunk_size=50000000
-                                                # report_success=True || This cannot be set if ignore_warnings is an iterable 
                                                 )
+                return True
             except Exception as e:
                 if 'fileexists-shared-forbidden:' in e.__str__():
                     log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded")
@@ -112,12 +112,6 @@ class Upload:
             finally:
                 if temp_file:
                     os.unlink(temp_file.name)
-            if upload_result:                    
-                log.info(f"Successfully uploaded '{page_title} for {dpla_identifier}'")
-                return True
-            else:
-                log.error(f"Failed to upload '{page_title}' for {dpla_identifier} for unnamed reason")
-                return False   
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
