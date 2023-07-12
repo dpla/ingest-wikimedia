@@ -150,10 +150,10 @@ class Upload:
         page = pywikibot.FilePage(self.site, title=title)
         try:
             page.latest_file_info
+            return None
         except Exception as e:
-            raise Exception(f"Page already exists in Wikimedia '{title}'")
-        return page
-
+            # Raising an exception indicates that the page does not exist 
+            return page
 
     # Create a function to get the extension from the mime type
     def get_extension(self, path):
@@ -302,12 +302,11 @@ for parquet_file in file_list:
             break
 
         # Create wiki page using Wikimedia page title
-        try:
-            wiki_page = uploader.create_wiki_file_page(title=page_title)
-        except Exception as e:
-            log.info(f"{e.__str__()}")
+        wiki_page = uploader.create_wiki_file_page(title=page_title)
+        if wiki_page is None:
+            log.info(f"Skipping {page_title}, already exists")
             failed_count = failed_count + 1
-            break
+            continue
 
         # Upload image to wiki page
         try:
