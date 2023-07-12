@@ -115,7 +115,7 @@ class Upload:
             if upload_result:                    
                 log.info(f"Successfully uploaded '{page_title} for {dpla_identifier}'")
                 return True
-            else :
+            else:
                 log.error(f"Failed to upload '{page_title}' for {dpla_identifier} for unnamed reason")
                 return False   
 
@@ -156,11 +156,8 @@ class Upload:
         page = pywikibot.FilePage(self.site, title=title)
         try:
             page.latest_file_info
-            self.log.info(f"Page already exists in Wikimedia '{title}'")
-            page = None
         except Exception as e:
-            self.log.info(f"Error creating FilePage for '{title}'")
-            return None
+            raise Exception(f"Page already exists in Wikimedia '{title}'")
         return page
 
 
@@ -310,31 +307,27 @@ for parquet_file in file_list:
             failed_count = failed_count + 1
             break
 
-        # Create wiki page
+        # Create wiki page using Wikimedia page title
         try:
             wiki_page = uploader.create_wiki_file_page(title=page_title)
-            if wiki_page is None:
-                failed_count = failed_count + 1
         except Exception as e:
-            log.error(f"Unable to generate wiki page for {dpla_id} - {path}, {e.__str__()}")
             failed_count = failed_count + 1
             break
 
         # Upload image to wiki page
         try:
-            upload_status = uploader.upload(
+            uploader.upload(
                 wiki_file_page=wiki_page,
                 dpla_identifier=dpla_id,
                 text=wiki_markup,
                 file=path,
                 logger=log,
                 page_title=page_title)
-            if upload_status:
-                upload_count = upload_count + 1
-            else:
-                failed_count = failed_count + 1
+            
+            upload_count = upload_count + 1                
         except Exception as e:
-            log.error(f"Unable to upload {path} because {e}")
+            log.error(f"Unable to upload {path}, {e.__str__}")
+            failed_count = failed_count + 1
 
 log.info(f"Finished upload for {input}")
 log.info(f"Uploaded {upload_count} new files")
