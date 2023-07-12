@@ -90,16 +90,20 @@ class Upload:
             # upload to Wikimedia
             # TODO Resolve the correct combination of report_success and ignore_warnings
             #      And route output to parse JSON and log clearer messages
-            upload_result = self.site.upload(filepage=wiki_file_page,
-                                             source_filename=file,
-                                             comment=comment,
-                                             text=text,
-                                             ignore_warnings=warnings_to_ignore,
-                                             asynchronous= True,
-                                             chunk_size=50000000
-                                            )
+            try:
+                upload_result = self.site.upload(filepage=wiki_file_page,
+                                                source_filename=file,
+                                                comment=comment,
+                                                text=text,
+                                                ignore_warnings=warnings_to_ignore,
+                                                asynchronous= True,
+                                                chunk_size=50000000
+                                                )
+            except Exception as e:
+                log.info(f"Failed to upload '{page_title}'")
+                return False
+            
             log.info(f"Successfully uploaded '{page_title}'")
-
             return upload_result
 
         except Exception as e:
