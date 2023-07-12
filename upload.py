@@ -306,7 +306,7 @@ for parquet_file in file_list:
                                                      suffix=ext,
                                                      page=page)
         except Exception as e:
-            log.error("Unable to generate page title for {dpla_id} - {path}")
+            log.error(f"Unable to generate page title for {dpla_id} - {path}, {e.__str__()}")
             failed_count = failed_count + 1
             break
 
@@ -316,7 +316,7 @@ for parquet_file in file_list:
             if wiki_page is None:
                 failed_count = failed_count + 1
         except Exception as e:
-            log.error("Unable to generate wiki page for {dpla_id} - {path}")
+            log.error(f"Unable to generate wiki page for {dpla_id} - {path}, {e.__str__()}")
             failed_count = failed_count + 1
             break
 
