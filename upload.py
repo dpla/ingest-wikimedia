@@ -262,11 +262,10 @@ log.info(f"Input: {input}")
 file_list = utils.get_parquet_files(path=input)
 
 for parquet_file in file_list:
-    log.info(f"Processing {parquet_file}")
-    log.info(f"Number of rows in {parquet_file}: {str(utils.get_row_count(parquet_file))}")
-             
     df = utils.get_df(parquet_file, columns=columns)
-
+    log.info(f"Processing {parquet_file}")             
+    log.info(f"Number of rows in {parquet_file}: {str(len(df))}")
+    
     for row in df.itertuples(index=columns):
         start_image = time.perf_counter()
         start_image_proc = time.process_time()
