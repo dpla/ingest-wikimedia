@@ -317,7 +317,7 @@ for parquet_file in file_list:
         if wiki_page is None:
             log.info(f"Skipping {path} because page already exists")
             failed_count = failed_count + 1
-            break
+            continue
 
         # Upload image to wiki page
         try:
