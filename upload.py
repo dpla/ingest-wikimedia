@@ -97,6 +97,7 @@ class Upload:
                                                 ignore_warnings=warnings_to_ignore,
                                                 asynchronous= True,
                                                 chunk_size=50000000
+                                                # report_success=True || This cannot be set if ignore_warnings is an iterable 
                                                 )
             except Exception as e:
                 if 'fileexists-shared-forbidden:' in e.__str__():
@@ -111,9 +112,12 @@ class Upload:
             finally:
                 if temp_file:
                     os.unlink(temp_file.name)
-                                
-            log.info(f"Successfully uploaded '{page_title} for {dpla_identifier}'")
-            return True
+            if upload_result:                    
+                log.info(f"Successfully uploaded '{page_title} for {dpla_identifier}'")
+                return True
+            else :
+                log.error(f"Failed to upload '{page_title}' for {dpla_identifier} for unnamed reason")
+                return False   
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
@@ -153,9 +157,11 @@ class Upload:
         try:
             page.latest_file_info
             self.log.info(f"Page already exists in Wikimedia '{title}'")
-            return None
+            page = None
         except Exception as e:
-            return page
+            self.log.info(f"Error creating FilePage for '{title}'")
+            return None
+        return page
 
 
     # Create a function to get the extension from the mime type
@@ -307,16 +313,12 @@ for parquet_file in file_list:
         # Create wiki page
         try:
             wiki_page = uploader.create_wiki_file_page(title=page_title)
+            if wiki_page is None:
+                failed_count = failed_count + 1
         except Exception as e:
             log.error("Unable to generate wiki page for {dpla_id} - {path}")
             failed_count = failed_count + 1
             break
-        
-        # Do not continue if page already exists
-        # This would be the place to possibly do metadata sync.
-        if wiki_page is None:
-            # failed_count = failed_count + 1
-            continue
 
         # Upload image to wiki page
         try:
