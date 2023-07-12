@@ -47,45 +47,44 @@ class Upload:
         comment = f"Uploading DPLA ID \"[[dpla:{dpla_identifier}|{dpla_identifier}]]\"."
         temp_file = None
 
-        try:
-            # This is a massive kludge because direct s3 upload via source_url is not allowed.
-            # Download from s3 to temp location on box then upload local file to wikimeida
-            if file.startswith("s3"):
-                s3 = boto3.resource('s3')
+        # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
+        # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
+        # https://doc.wikimedia.org/pywikibot/master/_modules/pywikibot/site/_upload.html
+        
+        warnings_to_ignore = [
+            'bad-prefix',
+            'badfilename',
+            'duplicate-archive',
+            'duplicate-version',
+            'empty-file',
+            'exists',
+            'exists-normalized',
+            'filetype-unwanted-type',
+            'page-exists',
+            'was-deleted'
+        ]
 
-                temp_file = tempfile.NamedTemporaryFile(delete=False)
-                o = urlparse(file)
-                bucket = o.netloc
-                key = o.path.replace('//', '/').lstrip('/')
-                s3_file_name = key.split('/')[-1]
-                
-                with open(temp_file.name, "wb") as f:
-                    try:
-                        s3.Bucket(bucket).download_file(key, temp_file.name)
-                        file = temp_file.name
-                    except botocore.exceptions.ClientError as e:
-                        if e.response['Error']['Code'] == "404":
-                            log.error(f"S3 object does not exist: {bucket}{key} ")
-                            return False
-                        else:
-                            raise
+        # This is a massive kludge because direct s3 upload via source_url is not allowed.
+        # Download from s3 to temp location on box then upload local file to wikimeida
+        if file.startswith("s3"):
+            s3 = boto3.resource('s3')
 
-            # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
-            # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
-            # https://doc.wikimedia.org/pywikibot/master/_modules/pywikibot/site/_upload.html
+            temp_file = tempfile.NamedTemporaryFile(delete=False)
+            o = urlparse(file)
+            bucket = o.netloc
+            key = o.path.replace('//', '/').lstrip('/')
+            s3_file_name = key.split('/')[-1]
             
-            warnings_to_ignore = [
-                'bad-prefix',
-                'badfilename',
-                'duplicate-archive',
-                'duplicate-version',
-                'empty-file',
-                'exists',
-                'exists-normalized',
-                'filetype-unwanted-type',
-                'page-exists',
-                'was-deleted'
-            ]
+            with open(temp_file.name, "wb") as f:
+                try:
+                    s3.Bucket(bucket).download_file(key, temp_file.name)
+                    file = temp_file.name
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == "404":
+                        log.error(f"S3 object does not exist: {bucket}{key} ")
+                        return False
+                    else:
+                        raise
                 
             # upload to Wikimedia
             # TODO Resolve the correct combination of report_success and ignore_warnings
@@ -100,25 +99,21 @@ class Upload:
                                                 chunk_size=50000000
                                                 )
             except Exception as e:
-                log.info(f"Failed to upload '{page_title}'")
+                if 'fileexists-shared-forbidden:' in e.__str__():
+                    log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded")
+                elif 'filetype-badmime' in e.__str__():
+                    log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type")
+                elif 'filetype-banned' in e.__str__():
+                    log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type")
+                else:
+                    log.info(f"Failed to upload '{page_title}' for {dpla_id}, {e.__str__()}")
                 return False
-            
-            log.info(f"Successfully uploaded '{page_title}'")
-            return upload_result
-
-        except Exception as e:
-            if 'fileexists-shared-forbidden:' in e.__str__():
-                log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded")
-            elif 'filetype-badmime' in e.__str__():
-                 log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type")
-            elif 'filetype-banned' in e.__str__():
-                log.error(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type")
-            else:
-                log.exception("Reason")
-            return False
-        finally:
-            if temp_file:
-                os.unlink(temp_file.name)
+            finally:
+                if temp_file:
+                    os.unlink(temp_file.name)
+                                
+            log.info(f"Successfully uploaded '{page_title} for {dpla_identifier}'")
+            return True
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
@@ -217,10 +212,9 @@ timestr = time.strftime("%Y%m%d-%H%M%S")
 log_file_name = f"upload-{timestr}.log"
 
 logging.basicConfig(
-    level=logging.DEBUG, 
+    level=logging.NOTSET, 
     filemode='a',
     datefmt='%H:%M:%S',
-    # format='%(asctime)s %(message)s'
     format='%(filename)s: '    
             '%(levelname)s: '
             '%(funcName)s(): '
@@ -229,7 +223,7 @@ logging.basicConfig(
     )
 
 file_handler = logging.FileHandler(log_file_name)
-file_handler.setLevel(logging.DEBUG)
+file_handler.setLevel(logging.NOTSET)
 
 log = logging.getLogger('logger')
 log.addHandler(file_handler)
@@ -269,6 +263,8 @@ file_list = utils.get_parquet_files(path=input)
 
 for parquet_file in file_list:
     log.info(f"Processing {parquet_file}")
+    log.info(f"Number of rows in {parquet_file}: {str(utils.get_row_count(parquet_file))}")
+             
     df = utils.get_df(parquet_file, columns=columns)
 
     for row in df.itertuples(index=columns):
@@ -295,6 +291,7 @@ for parquet_file in file_list:
             ext = uploader.get_extension(path)
         except Exception as e:
             log.error(f"Unable to determine mimetype/extension for {path}")
+            failed_count = failed_count + 1
             break
 
         # Create Wikimedia page title
@@ -305,6 +302,7 @@ for parquet_file in file_list:
                                                      page=page)
         except Exception as e:
             log.error("Unable to generate page title for {dpla_id} - {path}")
+            failed_count = failed_count + 1
             break
 
         # Create wiki page
@@ -312,12 +310,15 @@ for parquet_file in file_list:
             wiki_page = uploader.create_wiki_file_page(title=page_title)
         except Exception as e:
             log.error("Unable to generate wiki page for {dpla_id} - {path}")
+            failed_count = failed_count + 1
             break
         
         # Do not continue if page already exists
         # This would be the place to possibly do metadata sync.
         if wiki_page is None:
-            continue
+            log.info(f"Skipping {path} because page already exists")
+            failed_count = failed_count + 1
+            break
 
         # Upload image to wiki page
         try:
@@ -331,7 +332,7 @@ for parquet_file in file_list:
             if upload_status:
                 upload_count = upload_count + 1
             else:
-                failed_count = failed_count +1
+                failed_count = failed_count + 1
         except Exception as e:
             log.error(f"Unable to upload {path} because {e}")
 
