@@ -305,7 +305,7 @@ for parquet_file in file_list:
         try:
             wiki_page = uploader.create_wiki_file_page(title=page_title)
         except Exception as e:
-            log.error(f"{e.__str__()}")
+            log.info(f"{e.__str__()}")
             failed_count = failed_count + 1
             break
 
