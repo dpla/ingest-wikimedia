@@ -9,7 +9,7 @@ import getopt
 import sys
 
 from wikiutils.utils import Utils
-from lib.uploader import Uploader
+from wikiutils.uploader import Uploader
 
 utils = Utils()
 uploader = Uploader()
