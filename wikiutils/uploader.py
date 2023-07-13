@@ -12,6 +12,7 @@ import boto3
 import botocore
 
 from wikiutils.logger import Logger
+from wikiutils.exceptions import UploadException
 
 class Uploader:
     """
@@ -36,7 +37,7 @@ class Uploader:
         'page-exists',
         'was-deleted'
     ]
-    
+
     def __init__(self):
         self.log = Logger(type="upload")
         self.site = pywikibot.Site()
@@ -63,7 +64,7 @@ class Uploader:
             bucket = s3_path.netloc
             key = s3_path.path.replace('//', '/').lstrip('/')
         else: 
-            raise Exception("File must be on s3")
+            raise UploadException("File must be on s3")
 
         temp_file = tempfile.NamedTemporaryFile(delete=False)
 
@@ -73,8 +74,8 @@ class Uploader:
                 file = temp_file.name
             except botocore.exceptions.ClientError as client_error:
                 if client_error.response['Error']['Code'] == "404":
-                    raise Exception(f"S3 object does not exist: {bucket}{key} ") from client_error
-                raise Exception(f"Unable to download {bucket}{key} to {temp_file.name}: \
+                    raise UploadException(f"S3 object does not exist: {bucket}{key} ") from client_error
+                raise UploadException(f"Unable to download {bucket}{key} to {temp_file.name}: \
                                 {client_error.__str__}") from client_error
         # TODO Resolve the correct combination of report_success and ignore_warnings
         #      And route output to parse JSON and log clearer messages
@@ -90,13 +91,13 @@ class Uploader:
             return True
         except Exception as exception:
             if 'fileexists-shared-forbidden:' in exception.__str__():
-                raise Exception(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded") from exception
+                raise UploadException(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded") from exception
             elif 'filetype-badmime' in exception.__str__():
-                raise Exception(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type") from exception
+                raise UploadException(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type") from exception
             elif 'filetype-banned' in exception.__str__():
-                raise Exception(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type") from exception
+                raise UploadException(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type") from exception
             else:
-                raise Exception("Failed to upload '{page_title}' for {dpla_identifier}, {e.__str__()}") from exception
+                raise UploadException("Failed to upload '{page_title}' for {dpla_identifier}, {e.__str__()}") from exception
         finally:
             if temp_file:
                 os.unlink(temp_file.name)
@@ -116,22 +117,17 @@ class Uploader:
         :param page:
         :return:
         """
+        escaped_title = title[0:181] \
+            .replace('[', '(') \
+            .replace(']', ')') \
+            .replace('/', '-') \
+            .replace('{', '(') \
+            .replace('}', ')')
 
-        try:
-            escaped_title = title[0:181] \
-                .replace('[', '(') \
-                .replace(']', ')') \
-                .replace('/', '-') \
-                .replace('{', '(') \
-                .replace('}', ')')
-
-            # Add pagination to page title if needed
-            if page is None:
-                return f"{escaped_title} - DPLA - {dpla_identifier}{suffix}"
-            else:
-                return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
-        except Exception as e:
-            self.log.log_error(f"Unable to generate page title for:  {title} - {dpla_identifier} - {e.__str__}")
+        # Add pagination to page title if needed
+        if page is None:
+            return f"{escaped_title} - DPLA - {dpla_identifier}{suffix}"
+        return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
         
     # noinspection PyStatementEffect
     def create_wiki_file_page(self, title):
@@ -145,7 +141,7 @@ class Uploader:
         try:
             wiki_page.latest_file_info
             return None
-        except Exception as e:
+        except Exception as exception:
             # Raising an exception indicates that the page does not exist and the image is not a duplicate
             return wiki_page
 
@@ -157,12 +153,8 @@ class Uploader:
         :param path: The path to the file
         :return: The file extension if it can be determined
         """
-        try:        
-            mime = self.get_mime(path)
-            extension = self.get_extension_from_mime(mime)
-            return extension
-        except Exception as e:
-            self.log.log_error(f"Unable to determine mimetype/extension for {path}")
+        mime = self.get_mime(path)
+        return self.get_extension_from_mime(mime)
 
     def get_extension_from_mime(self, mime):
         """
@@ -170,13 +162,10 @@ class Uploader:
         :param file:
         :return:
         """
-        try:
-            extension = mimetypes.guess_extension(mime)
-            if extension is None:
-                raise Exception(f"Unable to determine file type for {mime}")
-            return extension
-        except Exception as e:
-            raise Exception(f"Unable to determine file type for {mime}. {e}")
+        extension = mimetypes.guess_extension(mime)
+        if extension is None:
+            raise UploadException(("Unable to determine file type from %s", mime))
+        return extension
 
     def get_mime(self, path):
         """
@@ -199,7 +188,7 @@ class Uploader:
             mime = mimetypes.guess_type(path)[0]
 
         if mime is None:
-            raise Exception(f"Unable to determine ContentType for {path}")
+            raise UploadException(f"Unable to determine ContentType for {path}")
         return mime
     
     def get_metadata(self, row):
@@ -218,5 +207,5 @@ class Uploader:
             page = getattr(row, 'page')
 
             return dpla_id, path, size, title, wiki_markup, page
-        except Exception as e:
-            raise Exception(f"Unable to get attributes from row {row}: {e.__str__}")
+        except AttributeError as attribute_error:
+            raise UploadException(f"Unable to get attributes from row {row}: {e.__str__}") from attribute_error
