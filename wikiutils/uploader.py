@@ -77,8 +77,6 @@ class Uploader:
                     raise UploadException(f"S3 object does not exist: {bucket}{key} ") from client_error
                 raise UploadException(f"Unable to download {bucket}{key} to {temp_file.name}: \
                                 {client_error.__str__}") from client_error
-        # TODO Resolve the correct combination of report_success and ignore_warnings
-        #      And route output to parse JSON and log clearer messages
         try:
             self.site.upload(filepage=wiki_file_page,
                              source_filename=file,
@@ -91,13 +89,12 @@ class Uploader:
             return True
         except Exception as exception:
             if 'fileexists-shared-forbidden:' in exception.__str__():
-                raise UploadException(f"Failed to upload '{page_title}' for {dpla_identifier}, File already uploaded") from exception
-            elif 'filetype-badmime' in exception.__str__():
-                raise UploadException(f"Failed to upload '{page_title}' for {dpla_identifier}, Invalid MIME type") from exception
-            elif 'filetype-banned' in exception.__str__():
-                raise UploadException(f"Failed to upload '{page_title}' for {dpla_identifier}, Banned file type") from exception
-            else:
-                raise UploadException("Failed to upload '{page_title}' for {dpla_identifier}, {e.__str__()}") from exception
+                raise UploadException(f"Failed '{page_title}' - {dpla_identifier}, File already uploaded") from exception
+            if 'filetype-badmime' in exception.__str__():
+                raise UploadException(f"Failed '{page_title}' - {dpla_identifier}, Invalid MIME type") from exception
+            if 'filetype-banned' in exception.__str__():
+                raise UploadException(f"Failed '{page_title}' - {dpla_identifier}, Banned file type") from exception
+            raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {exception.__str__()}") from exception
         finally:
             if temp_file:
                 os.unlink(temp_file.name)
@@ -128,7 +125,7 @@ class Uploader:
         if page is None:
             return f"{escaped_title} - DPLA - {dpla_identifier}{suffix}"
         return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
-        
+
     # noinspection PyStatementEffect
     def create_wiki_file_page(self, title):
         """
@@ -190,7 +187,7 @@ class Uploader:
         if mime is None:
             raise UploadException(f"Unable to determine ContentType for {path}")
         return mime
-    
+
     def get_metadata(self, row):
         """
         Get metadata for a DPLA record
