@@ -86,6 +86,7 @@ class Uploader:
                              asynchronous= True,
                              chunk_size=50000000
                             )
+            self.log.log_info(f"Uploaded '{page_title}' - {dpla_identifier}")
             return True
         except Exception as exception:
             if 'fileexists-shared-forbidden:' in exception.__str__():
@@ -205,4 +206,4 @@ class Uploader:
 
             return dpla_id, path, size, title, wiki_markup, page
         except AttributeError as attribute_error:
-            raise UploadException(f"Unable to get attributes from row {row}: {e.__str__}") from attribute_error
+            raise UploadException(f"Unable to get attributes from row {row}: {attribute_error.__str__}") from attribute_error

@@ -86,6 +86,7 @@ for parquet_file in file_list:
                             )
             upload_count += 1
         except Exception as e:
+            uploader.log.log_error(f"Error uploading {path}: {e}")
             failed_count =+ 1
             continue
 

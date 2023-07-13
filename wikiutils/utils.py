@@ -21,7 +21,6 @@ import requests
 from awswrangler import s3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from requests.exceptions import ConnectionError
 
 
 class Utils:
