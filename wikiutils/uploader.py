@@ -8,6 +8,7 @@ import tempfile
 from urllib.parse import urlparse
 
 import pywikibot
+import pywikibot.exceptions as pywikibot_exceptions
 import boto3
 import botocore
 
@@ -136,12 +137,9 @@ class Uploader:
         :return: None if the page already exists, otherwise a pywikibot.FilePage object
         """
         wiki_page = pywikibot.FilePage(self.site, title=title)
-        try:
-            wiki_page.latest_file_info
+        if wiki_page.exists():
             return None
-        except Exception as exception:
-            # Raising an exception indicates that the page does not exist and the image is not a duplicate
-            return wiki_page
+        return wiki_page
 
     # Create a function to get the extension from the mime type
     def get_extension(self, path):
