@@ -29,6 +29,12 @@ class Utils:
     logger = logging.getLogger('logger')
 
     s3 = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
+    # Remove retry handler for s3, this is to prevent the botocore retry handler from retrying
+    # taken from
+    #   https://stackoverflow.com/questions/73910120/can-i-disable-region-redirector-s3regionredirector-in-boto3
+    deq = cli.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
+    while len(deq) > 0:
+        cli.meta.events.unregister("needs-retry.s3", handler=deq.pop())
 
     def __init__(self):
         pass
@@ -100,7 +106,7 @@ class Utils:
             response = self.s3.head_object(Bucket=bucket, Key=key)
             size = response['ContentLength']
             self.logger.info(f"%s already exists, skipping download", key)
-            return out, 0, size  # Return if file already exists in s3
+            return out, size  # Return if file already exists in s3
         except ClientError as client_error:
             # swallow exception generated from checking ContentLength on non-existant item
             # File does not exist in S3, need to download
