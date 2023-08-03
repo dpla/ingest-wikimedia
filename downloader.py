@@ -14,8 +14,8 @@ import sys
 import time
 import getopt
 import logging
-import traceback
-
+import pandas as pd
+from urllib.parse import urlparse
 from wikiutils.utils import Utils
 
 if __name__ == "__main__":
@@ -41,8 +41,11 @@ batch_number = 1  # This will break apart the input parquet file into batches de
 
 columns = {"_1": "id", "_2": "wiki_markup", "_3": "iiif", "_4": "media_master", "_5": "title"}
 upload_parquet_columns = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
+
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hi:u:o:", ["limit=", "batch_size=", "input=", "output=", "max_filesize=", "file_filter="])
+    opts, args = getopt.getopt(sys.argv[1:], 
+                               "hi:u:o:", 
+                               ["limit=", "batch_size=", "input=", "output=", "max_filesize=", "file_filter="])
 except getopt.GetoptError:
     print(
         'downloader.py --limit <bytes> --batch_size <bytes> --input <path to parquet> '
@@ -77,7 +80,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
 logger = logging.getLogger('logger')
 
-file_handler = logging.FileHandler(f"{log_dir}/download-{timestr}.log")
+log_file_name = f"download-{timestr}.log"
+
+file_handler = logging.FileHandler(log_file_name)
 file_handler.setLevel(logging.INFO)
 # create console handler with a higher log level
 console_handler = logging.StreamHandler()
@@ -166,7 +171,7 @@ for parquet_file in file_list:
 
             utils.create_path(asset_path)
             try:
-                out, time, size = utils.download(url=url, out=asset_path)
+                out, size = utils.download(url=url, out=asset_path)
                 if size > max_filesize:
                     raise Exception(f"file size {utils.sizeof_fmt(size)} exceeds max file size limit {utils.sizeof_fmt(max_filesize)} for {url}")
             except Exception as e:
@@ -260,6 +265,12 @@ input_df = pd.DataFrame({   'dpla_id': [dpla_id],
                             'download_size': [size]
                         })
 input_df.to_parquet(f"{base_output_path}/input.parquet")
-
-
 logger.info(f"FINISHED download for {input_df}")
+
+o = urlparse(input)
+bucket = o.netloc
+# generate full s3 key using file name from url and path generate previously
+key = f"{o.path.replace('//', '/').lstrip('/')}"
+
+with open(log_file_name, "rb") as f:
+    utils.upload_to_s3(file=f, bucket=bucket, key=f"{key}log/{log_file_name}", content_type="text/plain")
