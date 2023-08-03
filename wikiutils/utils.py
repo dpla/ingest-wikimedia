@@ -32,9 +32,9 @@ class Utils:
     # Remove retry handler for s3, this is to prevent the botocore retry handler from retrying
     # taken from
     #   https://stackoverflow.com/questions/73910120/can-i-disable-region-redirector-s3regionredirector-in-boto3
-    deq = cli.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
+    deq = s3.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
     while len(deq) > 0:
-        cli.meta.events.unregister("needs-retry.s3", handler=deq.pop())
+        s3.meta.events.unregister("needs-retry.s3", handler=deq.pop())
 
     def __init__(self):
         pass
