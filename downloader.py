@@ -170,7 +170,7 @@ for parquet_file in file_list:
                 if size > max_filesize:
                     raise Exception(f"file size {utils.sizeof_fmt(size)} exceeds max file size limit {utils.sizeof_fmt(max_filesize)} for {url}")
             except Exception as e:
-                # If a single asset files for a multi-asset upload then all assets are dropped
+                # If a single asset fails for a multi-asset upload then all assets are dropped
                 logger.error(f"Aborting all assets for {dpla_id}\n\t{e}")
                 rows = list()
                 out = None
