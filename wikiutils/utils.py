@@ -80,7 +80,7 @@ class Utils:
                 return file, 0, os.path.getsize(file)
             if exists:
                 os.remove(file)
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=30)
             with open(file, 'wb') as f:
                 f.write(response.content)
             file_size = os.path.getsize(file)
