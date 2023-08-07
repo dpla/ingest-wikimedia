@@ -5,7 +5,7 @@ description = "Uploading media to Wikimedia Commons"
 authors = ["Scott Williams <scott@dp.la>"]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.11"
+python = ">=3.10,<=3.11.4"
 pywikibot = "^7.1.0"
 certifi = "^2021.10.8"
 urllib3 = "^1.26.9"
