@@ -57,7 +57,7 @@ for parquet_file in file_list:
         try: 
             # Load record from dataframe
             dpla_id, path, size, title, wiki_markup, page = uploader.get_metadata(row)
-            
+
             page = None if len(df.loc[df['dpla_id'] == dpla_id]) == 1 else page
 
             # Get file extension
@@ -70,6 +70,7 @@ for parquet_file in file_list:
                                                     page=page)
 
             # Create wiki page using Wikimedia page title
+
             wiki_page = uploader.create_wiki_file_page(title=page_title)
             
             if wiki_page is None:
@@ -78,6 +79,8 @@ for parquet_file in file_list:
                 continue
 
             # Upload image to wiki page
+            uploader.log.log_info(f"Uploading to https://commons.wikimedia.org/wiki/{wiki_page.title()}")
+
             uploader.upload(wiki_file_page=wiki_page,
                             dpla_identifier=dpla_id,
                             text=wiki_markup,

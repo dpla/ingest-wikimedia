@@ -85,18 +85,21 @@ class Uploader:
                              text=text,
                              ignore_warnings=self.warnings_to_ignore,
                              asynchronous= True,
-                             chunk_size=50000000
+                             chunk_size=3000000 # 3MB
                             )
-            self.log.log_info(f"Uploaded '{page_title}' - {dpla_identifier}")
+            self.log.log_info(f"Uploaded '{page_title}'")
             return True
         except Exception as exception:
-            if 'fileexists-shared-forbidden:' in exception.__str__():
-                raise UploadException(f"Failed '{page_title}' - {dpla_identifier}, File already uploaded") from exception
-            if 'filetype-badmime' in exception.__str__():
-                raise UploadException(f"Failed '{page_title}' - {dpla_identifier}, Invalid MIME type") from exception
-            if 'filetype-banned' in exception.__str__():
-                raise UploadException(f"Failed '{page_title}' - {dpla_identifier}, Banned file type") from exception
-            raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {exception.__str__()}") from exception
+            error_string = exception.__str__()
+            if 'fileexists-shared-forbidden:' in error_string:
+                raise UploadException(f"Failed '{page_title}', File already uploaded") from exception
+            if 'filetype-badmime' in error_string:
+                raise UploadException(f"Failed '{page_title}', Invalid MIME type") from exception
+            if 'filetype-banned' in error_string:
+                raise UploadException(f"Failed '{page_title}', Banned file type") from exception
+            if 'duplicate' in error_string:
+                raise UploadException(f"Failed '{page_title}', File already exists, {error_string}") from exception
+            raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {error_string}") from exception
         finally:
             if temp_file:
                 os.unlink(temp_file.name)
@@ -119,9 +122,10 @@ class Uploader:
         escaped_title = title[0:181] \
             .replace('[', '(') \
             .replace(']', ')') \
-            .replace('/', '-') \
             .replace('{', '(') \
-            .replace('}', ')')
+            .replace('}', ')') \
+            .replace('/', '-') \
+            .replace(':', '-') \
 
         # Add pagination to page title if needed
         if page is None:
@@ -136,6 +140,13 @@ class Uploader:
         :param title: Title of the record in DPLA
         :return: None if the page already exists, otherwise a pywikibot.FilePage object
         """
+        # Check to see if the page contains invisible characters and is invalid
+        # This is probably unnecessary, but it's here just in case
+        invaild_name = pywikibot.tools.chars.contains_invisible(title)
+        if invaild_name:
+            self.log.log_info(f"Invalid name: {invaild_name}")
+            return None
+
         wiki_page = pywikibot.FilePage(self.site, title=title)
         if wiki_page.exists():
             return None

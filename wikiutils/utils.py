@@ -168,6 +168,37 @@ class Utils:
         :return: Dataframe
         """
         return self.get_df_local(path, columns)
+    
+    def get_parquet_files(self, path):
+        """
+        Get parquet files from path, either local or s3
+        
+        :param path: Path to parquet files
+        :return: List of parquet files
+        """
+        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
+
+    def get_local_parquet(self, path):
+        """
+        Get local parquet files
+        
+        :param path: Path to local parquet files
+        :return: List of parquet files
+        """
+        return Path(path).glob('*.parquet')
+    
+    def write_parquet(self, path, data, columns):
+        """
+        Write data to parquet file
+        
+        :param path: Path to write parquet file
+        :param data: Data to write
+        :param columns: Columns to write
+        :return: None
+        """
+        self.logger.info(f"Saving {path}")
+        df_out = pd.DataFrame(data, columns=columns)
+        df_out.to_parquet(path)    
 
     def get_extension_from_file(self, file):
         """
@@ -243,24 +274,6 @@ class Utils:
                 self.logger.info(f'Error extracting canvasses  {iiif} because {exception}')
         return images_urls
 
-    def get_parquet_files(self, path):
-        """
-        Get parquet files from path, either local or s3
-        
-        :param path: Path to parquet files
-        :return: List of parquet files
-        """
-        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
-
-    def get_local_parquet(self, path):
-        """
-        Get local parquet files
-        
-        :param path: Path to local parquet files
-        :return: List of parquet files
-        """
-        return Path(path).glob('*.parquet')
-
     def sizeof_fmt(self, num, suffix='B'):
         """
         Convert bytes to human readable format
@@ -274,16 +287,4 @@ class Utils:
                 return "%3.1f%s%s" % (num, unit, suffix)
             num /= 1024.0
         return "%.1f%s%s" % (num, 'Yi', suffix)
-
-    def write_parquet(self, path, data, columns):
-        """
-        Write data to parquet file
-        
-        :param path: Path to write parquet file
-        :param data: Data to write
-        :param columns: Columns to write
-        :return: None
-        """
-        self.logger.info(f"Saving {path}")
-        df_out = pd.DataFrame(data, columns=columns)
-        df_out.to_parquet(path)
+    
