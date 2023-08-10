@@ -169,51 +169,22 @@ class Uploader:
         except AttributeError as attribute_error:
             raise UploadException(f"Unable to get attributes from row {row}: {attribute_error.__str__}") from attribute_error
         
-    ##
-    ## TODO these extension functions should be moved to the utils class, they are reapeated and *slightly* different
-    ##
     def get_extension(self, path):
         """
-        Get file extension from path
+        Derive the file extension from the MIME type
 
         :param path: The path to the file
-        :return: The file extension if it can be determined
-        """
-        mime = self.get_mime(path)
-        return self.get_extension_from_mime(mime)
-    def get_extension_from_mime(self, mime):
-        """
-
-        :param file:
-        :return:
-        """
-        extension = mimetypes.guess_extension(mime)
-        if extension is None:
-            raise UploadException(("Unable to determine file type from %s", mime))
-        return extension
-    def get_mime(self, path):
-        """
-
-        :param path:
-        :return:
+        :return: The file extension
         """
         mime = None
-        # Use boto3 to get mimetype from header metadata
-        if "s3://" in path:
-            path_url = urlparse(path)
-            bucket = path_url.netloc
-            # generate full s3 key using file name from url and path generate previously
-            key_parsed = f"{path_url.path.replace('//', '/').lstrip('/')}"
-
-            response = self.s3.head_object(Bucket=bucket, Key=key_parsed)
-            mime = response['ContentType']
-        # Assume file is on filesystem
-        else:
-            mime = mimetypes.guess_type(path)[0]
-
-        if mime is None:
-            raise UploadException(f"Unable to determine ContentType for {path}")
-        return mime
-    ##
-    ##
-    ##
+        try: 
+            if "s3://" in path:
+                bucket, key = self.wikiutils.get_bucket_key(path)
+                response = self.s3.head_object(Bucket=bucket, Key=key)
+                mime = response['ContentType']
+            else:
+                mime = mimetypes.guess_type(path)[0]
+            return mimetypes.guess_extension(mime)
+        except Exception as exception:
+            raise UploadException(f"Unable to get extension for {path}: {exception.__str__}") from exception
+        

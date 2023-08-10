@@ -7,13 +7,10 @@ __license__ = "MIT"
 
 import json
 import logging
-import mimetypes
-import os
 from pathlib import Path
 from urllib.parse import urlparse
 
 import boto3
-import magic
 import pandas as pd
 import requests
 
@@ -36,18 +33,18 @@ class Utils:
     def __init__(self):
         pass
 
-    def create_path(self, path):
-        """
+    # def create_path(self, path):
+    #     """
 
-        :param path:
-        :return:
-        """
-        # WTF is this doing? I'm really not sure what or why this exists. 
-        # This doesn't seem like it is necessary for s3 since there is not need to 
-        # create a path for s3.
-        prefix = b's3' if isinstance(path, bytes) else "s3"
-        if not path.startswith(prefix) and not Path(path).exists():
-            Path(path).mkdir(parents=True)
+    #     :param path:
+    #     :return:
+    #     """
+    #     # WTF is this doing? I'm really not sure what or why this exists. 
+    #     # This doesn't seem like it is necessary for s3 since there is not need to 
+    #     # create a path for s3.
+    #     prefix = b's3' if isinstance(path, bytes) else "s3"
+    #     if not path.startswith(prefix) and not Path(path).exists():
+    #         Path(path).mkdir(parents=True)
 
     def create_destination_path(self, base, batch, count, dpla_id):
         """
@@ -55,26 +52,6 @@ class Utils:
         """
         return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
     
-    def get_file_info(self, file, overwrite):
-        """
-        Does the file exist? If so, return the file path and the file size in bytes
-
-        :param file: Full path to save asset (ex /tmp/image.jpg)
-        :param overwrite: Boolean to overwrite existing downloaded file
-        :return: None, 0 if the image already exists and overwrite is True otherwise 
-                            return the file path. 
-                file, 0 if the file does not exist and needs to be downloaded for 
-                        the first time
-                file, file_size if the file does exist and overwrite is False
-        """
-        if Path(file).exists():
-            file_size = os.path.getsize(file)
-            if overwrite:
-                os.remove(file)
-                return None, 0
-            return file, file_size
-        return file, 0
-   
     def file_exists_s3(self, bucket, key):
         """
         Check to see if the file exists in s3
@@ -92,7 +69,7 @@ class Utils:
         except ClientError:
             # The head request fails therefore we assume the file does not exist in s3
             return False, 0
-    
+
     def get_bucket_key(self, s3_url):
         """
         Parse S3 url and return bucket and key
@@ -104,20 +81,7 @@ class Utils:
         bucket = s3_url_parsed.netloc
         key = f"{s3_url_parsed.path.replace('//', '/').lstrip('/')}"
         return bucket, key
-
-
-    def upload_to_s3(self, bucket, key, file, content_type): 
-        """
-        Uploads file to S3
-        
-        :param bucket: S3 bucket
-        :param key: S3 key
-        :param filexception: File to upload
-        :param content_typexception: Content type of file
-        return: None
-        """
-        self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
-
+   
     def get_df(self, path, columns):
         """
         Get datqframe from path
@@ -136,7 +100,34 @@ class Utils:
         :return: List of parquet files
         """
         return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
-    
+            
+    def sizeof_fmt(self, num, suffix='B'):
+        """
+        Convert bytes to human readable format
+
+        :param num: number of bytes
+        :param suffix: suffix to append to number
+        :return: human readable string
+        """
+        for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
+            if abs(num) < 1024.0:
+                return "%3.1f%s%s" % (num, unit, suffix)
+            num /= 1024.0
+        return "%.1f%s%s" % (num, 'Yi', suffix)
+
+
+    def upload_to_s3(self, bucket, key, file, content_type): 
+        """
+        Uploads file to S3
+        
+        :param bucket: S3 bucket
+        :param key: S3 key
+        :param filexception: File to upload
+        :param content_typexception: Content type of file
+        return: None
+        """
+        self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
+
     def write_parquet(self, path, data, columns):
         """
         Write data to parquet file
@@ -148,48 +139,18 @@ class Utils:
         """
         pd.DataFrame(data, columns=columns).to_parquet(path)
 
-    def get_extension_from_file(self, file):
-        """
-        Guess the extension from the file type
-        :param filexception:
-        :return:
-        """
-        mime = magic.from_file(file, mime=True)
-        extension = mimetypes.guess_extension(mime)
-        if extension is None:
-            raise Exception(f"Unable to determine file type for %s", file)
-        return extension
+    # IIIF Manifest functions
 
-    def get_extension_from_mime(self, mime):
+    def iiif_v2_urls(self, iiif):
         """
-        Guess the extension from the mime type
-        :param filexception: file to guess extension for
-        :return: extension or Exception
+        Extracts image URLs from IIIF manfiest and returns them as a list
         """
-        ext = mimetypes.guess_extension(mime)
-        if ext is None:
-            raise Exception(f"Unable to determine file type for {mime}")
-        return ext
-            
 
-    def _get_iiif_manifest(self, url):
-        """
-        :return: JSON object
-        """
-        try:
-            request = requests.get(url, timeout=30)
-            data = request.content
-            return json.loads(data)
-        except ConnectionError as connection_error:
-            raise Exception(f"Unable to request {url}: {str(connection_error)}") from connection_error
-
-    def get_iiif__v3_urls(self, iiif): 
+    def iiif__v3_urls(self, iiif): 
         """
         Needs to be implemented for Georgia uploads to Wikimedia Commons
         To be done by October 2023
-        
         """
-        pass
 
     def get_iiif_urls(self, iiif):
         """
@@ -222,16 +183,13 @@ class Utils:
                 self.logger.error("No images defined in %s", iiif)
         return images_urls
 
-    def sizeof_fmt(self, num, suffix='B'):
+    def _get_iiif_manifest(self, url):
         """
-        Convert bytes to human readable format
-
-        :param num: number of bytes
-        :param suffix: suffix to append to number
-        :return: human readable string
+        :return: JSON object
         """
-        for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
-            if abs(num) < 1024.0:
-                return "%3.1f%s%s" % (num, unit, suffix)
-            num /= 1024.0
-        return "%.1f%s%s" % (num, 'Yi', suffix)
+        try:
+            request = requests.get(url, timeout=30)
+            data = request.content
+            return json.loads(data)
+        except ConnectionError as connection_error:
+            raise Exception(f"Unable to request {url}: {str(connection_error)}") from connection_error

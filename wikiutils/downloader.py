@@ -17,30 +17,45 @@ class Downloader:
     def __init__(self, logger):
         self.log = logger
 
+    # Path to save the dataframe which holds all the metadata for the batch of downloaded files
+    def batch_data_output(self, base,n):
+        """
+        Returns the output path for the batch of downloaded files
+        """
+        return f"{base}/batch_{n}/data/"
+
+    def batch_parquet_path(self, base, n):
+        """
+        """
+        return f"{self.batch_data_output(base, n)}batch_{n}.parquet"
+
     def download(self, source, destination):
         """
         Download asset to local file system or s3
         
         :param source: URL of asset to download
-        :param destination: Full path to save asset
-        :return:    url
-                    time to process download
+        :param destination: Full path to save the asset
+        
+        TODO: this return value doesn't make sense, I'm just returning the destination. It should
+        be returning the status of the download
+        - Skipped
+        - Downloaded
+        - Failed
+        :return:    output_path: Full path to downloaded asset
                     filesize (in bytes)
-                    name
         """
         try:
-            # If the destination is s3, then check to see if the file already exists
+            # Destination is s3
             if destination.startswith("s3://"):
                 bucket, key = self.utils.get_bucket_key(destination)
                 exists, size = self.utils.file_exists_s3(bucket=bucket, key=key)
-                if not exists:
-                    return self.utils.download_to_s3(source=source, bucket=bucket, key=key)
-                return destination, size
-            # If the destination is local file system, then download the file and don't overwrite it
-            else: 
-                return self._download_to_local(source=source, file=destination)
+                if exists:
+                    return destination, size
+                return self._download_to_s3(source=source, bucket=bucket, key=key)
+            # Download to local file system
+            return self._download_to_local(source=source, file=destination)
         except Exception as exeception:
-            raise DownloadException("Failed to download %s: %s" % (source, str(exeception))) from exeception
+            raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
     def _download_to_local(self, source, file, overwrite=False):
         """
@@ -53,17 +68,17 @@ class Downloader:
         :param filexception:
         :return:
         """
-        if overwrite: 
+        if overwrite:
             os.remove(file)
         try:
-            
             response = requests.get(source, timeout=30)
             with open(file, 'wb') as f:
                 f.write(response.content)
-            file_size = os.path.getsize(file)
-            return file, file_size
         except Exception as exeception:
             raise DownloadException(f"Error in download_local() {str(exeception)}") from exeception
+        
+        file_size = os.path.getsize(file)
+        return file, file_size
 
     def _download_to_s3(self, source, bucket, key):
         """
