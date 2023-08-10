@@ -8,12 +8,12 @@ import tempfile
 from urllib.parse import urlparse
 
 import pywikibot
-import pywikibot.exceptions as pywikibot_exceptions
 import boto3
 import botocore
 
-from wikiutils.logger import Logger
 from wikiutils.exceptions import UploadException
+from wikiutils.logger import WikimediaLogger
+from wikiutils.utils import Utils as WikimediaUtils
 
 class Uploader:
     """
@@ -22,6 +22,7 @@ class Uploader:
     site = None
     log = None
     s3 = boto3.client('s3')
+    wikiutils = None
 
     # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
     # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
@@ -39,8 +40,9 @@ class Uploader:
         'was-deleted'
     ]
 
-    def __init__(self):
-        self.log = Logger(type="upload")
+    def __init__(self, partner_name):
+        self.log = WikimediaLogger(partner_name=partner_name, event_type="upload")
+        self.wikiutils = WikimediaUtils()
         self.site = pywikibot.Site()
         self.site.login()
         self.log.log_info(f"Logged in user is: {self.site.user()}")
@@ -61,26 +63,21 @@ class Uploader:
         # Download from s3 to temp location on box then upload local file to wikimeida
         if file.startswith("s3"):
             s3 = boto3.resource('s3')
-            s3_path = urlparse(file)
-            bucket = s3_path.netloc
-            key = s3_path.path.replace('//', '/').lstrip('/')
+            bucket, key = self.wikiutils.get_bucket_key(file)
         else: 
             raise UploadException("File must be on s3")
 
         temp_file = tempfile.NamedTemporaryFile(delete=False)
-
         with open(temp_file.name, "wb") as f:
             try:
                 s3.Bucket(bucket).download_file(key, temp_file.name)
-                file = temp_file.name
             except botocore.exceptions.ClientError as client_error:
                 if client_error.response['Error']['Code'] == "404":
-                    raise UploadException(f"S3 object does not exist: {bucket}{key} ") from client_error
-                raise UploadException(f"Unable to download {bucket}{key} to {temp_file.name}: \
-                                {client_error.__str__}") from client_error
+                    raise UploadException(f"Does not exist: {bucket}{key}") from client_error
+                raise UploadException(f"Unable to download {bucket}{key} to {temp_file.name}: {str(client_error)}") from client_error
         try:
             self.site.upload(filepage=wiki_file_page,
-                             source_filename=file,
+                             source_filename=temp_file.name,
                              comment=comment,
                              text=text,
                              ignore_warnings=self.warnings_to_ignore,
@@ -88,9 +85,10 @@ class Uploader:
                              chunk_size=3000000 # 3MB
                             )
             self.log.log_info(f"Uploaded '{page_title}'")
-            return True
+            # FIXME this is dumb and should be betterm, it either raises and exception or returns true
+            return True 
         except Exception as exception:
-            error_string = exception.__str__()
+            error_string = str(exception)
             if 'fileexists-shared-forbidden:' in error_string:
                 raise UploadException(f"Failed '{page_title}', File already uploaded") from exception
             if 'filetype-badmime' in error_string:
@@ -128,9 +126,9 @@ class Uploader:
             .replace(':', '-') \
 
         # Add pagination to page title if needed
-        if page is None:
-            return f"{escaped_title} - DPLA - {dpla_identifier}{suffix}"
-        return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
+        if page:
+            return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
+        return f"{escaped_title} - DPLA - {dpla_identifier}{suffix}"
 
     # noinspection PyStatementEffect
     def create_wiki_file_page(self, title):
@@ -150,9 +148,30 @@ class Uploader:
         wiki_page = pywikibot.FilePage(self.site, title=title)
         if wiki_page.exists():
             return None
-        return wiki_page
+        return wiki_page    # Create a function to get the extension from the mime type
+    
+    def get_metadata(self, row):
+        """
+        Get metadata for a DPLA record
 
-    # Create a function to get the extension from the mime type
+        :param dpla_id: The DPLA identifier
+        :return: A
+        """
+        try:
+            dpla_id = getattr(row, 'dpla_id')
+            path = getattr(row, 'path')
+            size = getattr(row, 'size')
+            title = getattr(row, 'title')
+            wiki_markup = getattr(row, 'markup')
+            page = getattr(row, 'page')
+
+            return dpla_id, path, size, title, wiki_markup, page
+        except AttributeError as attribute_error:
+            raise UploadException(f"Unable to get attributes from row {row}: {attribute_error.__str__}") from attribute_error
+        
+    ##
+    ## TODO these extension functions should be moved to the utils class, they are reapeated and *slightly* different
+    ##
     def get_extension(self, path):
         """
         Get file extension from path
@@ -162,7 +181,6 @@ class Uploader:
         """
         mime = self.get_mime(path)
         return self.get_extension_from_mime(mime)
-
     def get_extension_from_mime(self, mime):
         """
 
@@ -173,7 +191,6 @@ class Uploader:
         if extension is None:
             raise UploadException(("Unable to determine file type from %s", mime))
         return extension
-
     def get_mime(self, path):
         """
 
@@ -197,22 +214,6 @@ class Uploader:
         if mime is None:
             raise UploadException(f"Unable to determine ContentType for {path}")
         return mime
-
-    def get_metadata(self, row):
-        """
-        Get metadata for a DPLA record
-
-        :param dpla_id: The DPLA identifier
-        :return: A
-        """
-        try:
-            dpla_id = getattr(row, 'dpla_id')
-            path = getattr(row, 'path')
-            size = getattr(row, 'size')
-            title = getattr(row, 'title')
-            wiki_markup = getattr(row, 'markup')
-            page = getattr(row, 'page')
-
-            return dpla_id, path, size, title, wiki_markup, page
-        except AttributeError as attribute_error:
-            raise UploadException(f"Unable to get attributes from row {row}: {attribute_error.__str__}") from attribute_error
+    ##
+    ##
+    ##

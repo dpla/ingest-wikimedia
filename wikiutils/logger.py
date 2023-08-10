@@ -4,39 +4,60 @@ Logging wrapper
 
 import time
 import logging
+import os
 
 from urllib.parse import urlparse
 from wikiutils.utils import Utils
 
-class Logger:
+
+# DATE_TIME = time.strftime("%Y%m%d-%H%M%S")
+# log_file = f"logs/{partner_name}-download-{DATE_TIME}.log"
+# os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+# logging.basicConfig(format="[%(levelname)s] %(asctime)s: %(message)s",
+#                     level=logging.INFO, 
+#                     datefmt="%H:%M:%S", 
+#                     handlers=[logging.StreamHandler(), 
+#                               logging.FileHandler(log_file, mode="w")] 
+#                     )
+# logger = logging.getLogger('logger')
+
+
+class WikimediaLogger:
     """
     Logging wrapper
     """
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    log_file = None
     log = None
     utils = Utils()
 
-    def __init__(self, type):
-        self.log_file = f"{type}-{self.timestamp}.log"
-
+    def __init__(self, partner_name, event_type):
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        log_file = f"./logs/{partner_name}-{event_type}-{timestamp}.log"
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        
         logging.basicConfig(
-            level=logging.NOTSET, 
-            filemode='a',
+            level=logging.INFO, 
             datefmt='%H:%M:%S',
-            format='%(filename)s: '    
-                    '%(levelname)s: '
-                    '%(funcName)s(): '
-                    '%(lineno)d:\t'
+            handlers=[logging.StreamHandler(),
+                      logging.FileHandler(log_file, mode="w")],
+            format= '[%(levelname)s] '
+                    '%(asctime)s: '
                     '%(message)s'
         )
-
-
-        file_handler = logging.FileHandler(self.log_file)
-        file_handler.setLevel(logging.NOTSET)
-
         self.log = logging.getLogger('logger')
-        self.log.addHandler(file_handler)
+
+    def info(self, **args):
+        """
+        Wrapper for logging.info
+        :param message:
+        """
+        self.log.info(args.values)
+
+    def error(self, **args):
+        """
+        Wrapper for logging.error
+        :param message:"""
+        self.log.error(args.values)
 
     def log_info(self, message):
         """
@@ -51,13 +72,9 @@ class Logger:
         :param message:"""
         self.log.error(message)
 
-    def write_log_s3(self, out_path): 
+    def write_log_s3(self, key, bucket): 
         """
         Upload log file to s3
         :param out_path: s3 path to upload log file to"""
-        out_parsed = urlparse(out_path)
-        bucket = out_parsed.netloc
-        key = f"{out_parsed.path.replace('//', '/').lstrip('/')}"
-
-        with open(self.log_file, "rb") as f:
-            self.utils.upload_to_s3(file=f, bucket=bucket, key=f"{key}log/{self.log_file}", content_type="text/plain")
+        with open(self.log.getLogFileName, "rb") as f:
+            self.utils.upload_to_s3(file=f, bucket=bucket, key=f"{key}log/{self.log.getLogFileName}", content_type="text/plain")

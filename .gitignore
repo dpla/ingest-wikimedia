@@ -1,3 +1,11 @@
+# mine 
+.DS_Store
+.idea/
+apicache-py3/
+*.lwp
+throttle.ctrl
+metastore_db/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

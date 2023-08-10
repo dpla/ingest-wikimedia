@@ -9,7 +9,6 @@ import json
 import logging
 import mimetypes
 import os
-import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -29,8 +28,7 @@ class Utils:
 
     s3 = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
     # Remove retry handler for s3, this is to prevent the botocore retry handler from retrying
-    # taken from
-    #   https://stackoverflow.com/questions/73910120/can-i-disable-region-redirector-s3regionredirector-in-boto3
+    # taken from https://stackoverflow.com/questions/73910120/can-i-disable-region-redirector-s3regionredirector-in-boto3
     deq = s3.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
     while len(deq) > 0:
         s3.meta.events.unregister("needs-retry.s3", handler=deq.pop())
@@ -51,34 +49,12 @@ class Utils:
         if not path.startswith(prefix) and not Path(path).exists():
             Path(path).mkdir(parents=True)
 
-    def download(self, source, destination):
+    def create_destination_path(self, base, batch, count, dpla_id):
         """
-        Download asset to local file system or s3
-        
-        :param source: URL of asset to download
-        :param destination: Full path to save asset
-        :return:    url
-                    time to process download
-                    filesize (in bytes)
-                    name
+        Create destination path to download file to
         """
-        # Endcode source to bytes if it is not already
-        # source = source if isinstance(source, bytes) else source.encode('utf-8')
-        try:
-            # If the destination is s3, then check to see if the file already exists
-            if destination.startswith("s3://"):
-                bucket, key = self.get_bucket_key(destination)
-                exists, size =  self.file_exists_s3(bucket=bucket, key=key)
-                if not exists:
-                    return self.download_to_s3(source=source, bucket=bucket, key=key)
-                return destination, size
-            
-            # If the destination is local file system, then download the file and don't overwrite it
-            else: 
-                return self.download_local(source=source, file=destination)
-        except Exception as exception:
-            raise Exception("Failed to download %s: %s", source, str(exception))
-
+        return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
+    
     def get_file_info(self, file, overwrite):
         """
         Does the file exist? If so, return the file path and the file size in bytes
@@ -97,35 +73,8 @@ class Utils:
                 os.remove(file)
                 return None, 0
             return file, file_size
-        else:
-            pass
-            # new file to download
-            return file, 0
+        return file, 0
    
-    def download_local(self, source, file, overwrite=False):
-        """
-        Download images to local file system and return path to file 
-        and the size of the file in bytes
-
-        :param source: The url to download
-        :param file: Full path to save asset (ex /tmp/image.jpg)
-        :param overwrite: Boolean to overwrite existing downloaded file
-        :param filexception:
-        :return:
-        """
-        # self.download_to_temp(file, file_exists, source, overwrite)
-        if overwrite: 
-            os.remove(file)
-        try:
-            
-            response = requests.get(source, timeout=30)
-            with open(file, 'wb') as f:
-                f.write(response.content)
-            file_size = os.path.getsize(file)
-            return file, file_size
-        except Exception as exception:
-            raise Exception("Error in download_local() %s", str(exception))
-
     def file_exists_s3(self, bucket, key):
         """
         Check to see if the file exists in s3
@@ -156,32 +105,6 @@ class Utils:
         key = f"{s3_url_parsed.path.replace('//', '/').lstrip('/')}"
         return bucket, key
 
-    def download_to_s3(self, source, bucket, key):
-        """
-
-        Tries to download a file from the source url and save it to s3. If the file
-        already exists in s3 then this step is skipped. To achive this 
-        the file is downloaded to a temp file on the local file system and then uploaded
-        to s3. 
-
-        :param url:
-        :param out:
-        :param name
-        :return:
-        """
-        # Create temp local file and download source file to it
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-
-        out, size = self.download_local(source=source, file=temp_file.name, overwrite=True)
-        # Get content type from file, used in metadata for s3 upload
-        content_type = magic.from_file(temp_file.name, mime=True)
-        try:
-            # Upload temp file to s3
-            with open(temp_file.name, "rb") as file:
-                self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
-                return f"s3://{bucket}/{key}", size
-        finally:
-            os.unlink(temp_file.name) 
 
     def upload_to_s3(self, bucket, key, file, content_type): 
         """
@@ -195,26 +118,6 @@ class Utils:
         """
         self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
 
-    def get_df_s3(self, path, columns):
-        """
-        Get dataframe from S3 path
-
-        :param path: S3 path
-        :param columns: Columns to rename
-        :return: Dataframe
-        """
-        return s3.read_parquet(path=path).rename(columns=columns)
-
-    def get_df_local(self, path, columns):
-        """
-        Get dataframe from local path
-
-        :param path: Local path
-        :param columns: Columns to rename
-        :return: Dataframe
-        """
-        
-
     def get_df(self, path, columns):
         """
         Get datqframe from path
@@ -224,7 +127,6 @@ class Utils:
         :return: Dataframe
         """
         return pd.read_parquet(path, engine='fastparquet').rename(columns=columns)
-        # return self.get_df_local(path, columns)
     
     def get_parquet_files(self, path):
         """
@@ -233,16 +135,7 @@ class Utils:
         :param path: Path to parquet files
         :return: List of parquet files
         """
-        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else self.get_local_parquet(path)
-
-    def get_local_parquet(self, path):
-        """
-        Get local parquet files
-        
-        :param path: Path to local parquet files
-        :return: List of parquet files
-        """
-        return Path(path).glob('*.parquet')
+        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
     
     def write_parquet(self, path, data, columns):
         """
@@ -253,7 +146,6 @@ class Utils:
         :param columns: Columns to write
         :return: None
         """
-        self.logger.info("Saving %s", path)
         pd.DataFrame(data, columns=columns).to_parquet(path)
 
     def get_extension_from_file(self, file):
@@ -266,7 +158,7 @@ class Utils:
         extension = mimetypes.guess_extension(mime)
         if extension is None:
             raise Exception(f"Unable to determine file type for %s", file)
-        return extension            
+        return extension
 
     def get_extension_from_mime(self, mime):
         """
@@ -280,7 +172,7 @@ class Utils:
         return ext
             
 
-    def get_iiif_manifest(self, url):
+    def _get_iiif_manifest(self, url):
         """
         :return: JSON object
         """
@@ -289,8 +181,7 @@ class Utils:
             data = request.content
             return json.loads(data)
         except ConnectionError as connection_error:
-            # self.logger.error("Unable to request %s: %s", url, str(connection_error))
-            raise Exception(f"Unable to request {url}: {str(connection_error)}")
+            raise Exception(f"Unable to request {url}: {str(connection_error)}") from connection_error
 
     def get_iiif_urls(self, iiif):
         """
@@ -302,7 +193,7 @@ class Utils:
         canvases = []
         images_urls = []
 
-        iiif_manifest = self.get_iiif_manifest(iiif)
+        iiif_manifest = self._get_iiif_manifest(iiif)
         # if 'sequences' in iiif_manifest and there is one sequence value
         if 'sequences' in iiif_manifest and len(iiif_manifest['sequences']) == 1:
             canvases = iiif_manifest['sequences'][0]['canvases'] if 'canvases' in iiif_manifest['sequences'][0] else []
@@ -334,9 +225,3 @@ class Utils:
                 return "%3.1f%s%s" % (num, unit, suffix)
             num /= 1024.0
         return "%.1f%s%s" % (num, 'Yi', suffix)
-    
-    def create_destination_path(self, base, batch, count, dpla_id):
-        """
-        Create destination path to download file to
-        """
-        return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
