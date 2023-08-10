@@ -10,7 +10,7 @@ from wikiutils.utils import Utils
 
 class WikimediaLogger(logging.Logger):
     """
-    Logging wrapper
+    Wikimedia logger
     """
     log = None
     utils = Utils()
@@ -34,30 +34,19 @@ class WikimediaLogger(logging.Logger):
         self.log = logging.getLogger('wikimedia_logger')
 
     def info(self, msg, *args, **kwargs):
-        """
-        Wrapper for logging.info
-        :param message:
-        """
         self.log.info(msg)
 
-    # def error(self, message):
-    #     """
-    #     Wrapper for logging.error
-    #     :param message:"""
-    #     self.log.error(message)
+    def warning(self, msg, *args, **kwargs):
+        self.log.warning(msg)
 
-    # def log_info(self, message):
-    #     """
-    #     Wrapper for logging.info
-    #     :param message:
-    #     """
-    #     self.log.info(message)
+    def debug(self, msg, *args, **kwargs):
+        self.log.debug(msg)
 
-    # def log_error(self, message):
-    #     """
-    #     Wrapper for logging.error
-    #     :param message:"""
-    #     self.log.error(message)
+    def error(self, msg, *args, **kwargs):
+        self.log.error(msg)
+    
+    def fatal(self, msg, *args, **kwargs):
+        self.log.fatal(msg)
 
     def write_log_s3(self, key, bucket): 
         """
