@@ -139,8 +139,6 @@ file_list = utils.get_parquet_files(path=input_df)
     
 # TODO rewrite this to use a generator
 for parquet_file in file_list:
-    # this looks stupid too 
-    # utils.create_path(batch_data_output(batch_number)) 
     df = utils.get_df(parquet_file, columns=columns)
 
     # TODO rewrite this to use a generator
