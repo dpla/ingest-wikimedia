@@ -40,8 +40,8 @@ class Uploader:
         'was-deleted'
     ]
 
-    def __init__(self, partner_name):
-        self.log = WikimediaLogger(partner_name=partner_name, event_type="upload")
+    def __init__(self, partner_name, logger):
+        self.log = logger
         self.wikiutils = WikimediaUtils()
         self.site = pywikibot.Site()
         self.site.login()

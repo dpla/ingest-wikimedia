@@ -17,6 +17,12 @@ class Downloader:
     def __init__(self, logger):
         self.log = logger
 
+    def destination_path(self, base, batch, count, dpla_id):
+        """
+        Create destination path to download file to
+        """
+        return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
+    
     # Path to save the dataframe which holds all the metadata for the batch of downloaded files
     def batch_data_output(self, base,n):
         """
@@ -50,7 +56,9 @@ class Downloader:
                 bucket, key = self.utils.get_bucket_key(destination)
                 exists, size = self.utils.file_exists_s3(bucket=bucket, key=key)
                 if exists:
-                    return destination, size
+                    self.log.info(f" - Skipping {destination}, already exists in s3")
+                    return destination, size 
+                self.log.info(f" - Downloading {source} to {destination}")
                 return self._download_to_s3(source=source, bucket=bucket, key=key)
             # Download to local file system
             return self._download_to_local(source=source, file=destination)

@@ -6,24 +6,9 @@ import time
 import logging
 import os
 
-from urllib.parse import urlparse
 from wikiutils.utils import Utils
 
-
-# DATE_TIME = time.strftime("%Y%m%d-%H%M%S")
-# log_file = f"logs/{partner_name}-download-{DATE_TIME}.log"
-# os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
-# logging.basicConfig(format="[%(levelname)s] %(asctime)s: %(message)s",
-#                     level=logging.INFO, 
-#                     datefmt="%H:%M:%S", 
-#                     handlers=[logging.StreamHandler(), 
-#                               logging.FileHandler(log_file, mode="w")] 
-#                     )
-# logger = logging.getLogger('logger')
-
-
-class WikimediaLogger:
+class WikimediaLogger(logging.Logger):
     """
     Logging wrapper
     """
@@ -31,6 +16,8 @@ class WikimediaLogger:
     utils = Utils()
 
     def __init__(self, partner_name, event_type):
+        super().__init__(name="wikimedia_logger")
+
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         log_file = f"./logs/{partner_name}-{event_type}-{timestamp}.log"
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -44,33 +31,33 @@ class WikimediaLogger:
                     '%(asctime)s: '
                     '%(message)s'
         )
-        self.log = logging.getLogger('logger')
+        self.log = logging.getLogger('wikimedia_logger')
 
-    def info(self, **args):
+    def info(self, msg, *args, **kwargs):
         """
         Wrapper for logging.info
         :param message:
         """
-        self.log.info(args.values)
+        self.log.info(msg)
 
-    def error(self, **args):
-        """
-        Wrapper for logging.error
-        :param message:"""
-        self.log.error(args.values)
+    # def error(self, message):
+    #     """
+    #     Wrapper for logging.error
+    #     :param message:"""
+    #     self.log.error(message)
 
-    def log_info(self, message):
-        """
-        Wrapper for logging.info
-        :param message:
-        """
-        self.log.info(message)
+    # def log_info(self, message):
+    #     """
+    #     Wrapper for logging.info
+    #     :param message:
+    #     """
+    #     self.log.info(message)
 
-    def log_error(self, message):
-        """
-        Wrapper for logging.error
-        :param message:"""
-        self.log.error(message)
+    # def log_error(self, message):
+    #     """
+    #     Wrapper for logging.error
+    #     :param message:"""
+    #     self.log.error(message)
 
     def write_log_s3(self, key, bucket): 
         """
