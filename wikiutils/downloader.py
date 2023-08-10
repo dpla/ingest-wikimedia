@@ -2,12 +2,9 @@
 import os
 import tempfile
 import requests
-
 import magic
-import boto3
 
 from wikiutils.utils import Utils
-# from wikiutils.logger import WikimediaLogger
 from wikiutils.exceptions import DownloadException
 
 class Downloader:
@@ -15,11 +12,10 @@ class Downloader:
     Download images from parters
     """
     log = None
-    s3 = boto3.client('s3')
     utils = Utils()
 
     def __init__(self, logger):
-        self.log = logger # WikimediaLogger(partner_name=partner_name, event_type="download")
+        self.log = logger
 
     def download(self, source, destination):
         """
@@ -32,8 +28,6 @@ class Downloader:
                     filesize (in bytes)
                     name
         """
-        # Endcode source to bytes if it is not already
-        # source = source if isinstance(source, bytes) else source.encode('utf-8')
         try:
             # If the destination is s3, then check to see if the file already exists
             if destination.startswith("s3://"):
@@ -44,12 +38,11 @@ class Downloader:
                 return destination, size
             # If the destination is local file system, then download the file and don't overwrite it
             else: 
-                return self._download_local(source=source, file=destination)
+                return self._download_to_local(source=source, file=destination)
         except Exception as exeception:
             raise DownloadException("Failed to download %s: %s" % (source, str(exeception))) from exeception
 
-    # TODO refactor as download_to_local
-    def _download_local(self, source, file, overwrite=False):
+    def _download_to_local(self, source, file, overwrite=False):
         """
         Download images to local file system and return path to file 
         and the size of the file in bytes
@@ -88,13 +81,13 @@ class Downloader:
         # Create temp local file and download source file to it
         temp_file = tempfile.NamedTemporaryFile(delete=False)
 
-        _, size = self._download_local(source=source, file=temp_file.name, overwrite=True)
+        _, size = self._download_to_local(source=source, file=temp_file.name, overwrite=True)
         # Get content type from file, used in metadata for s3 upload
         content_type = magic.from_file(temp_file.name, mime=True)
         try:
             # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
-                self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
+                self.utils.upload_to_s3(file=file, bucket=bucket, key=key, content_type=content_type)
                 return f"s3://{bucket}/{key}", size
         finally:
             os.unlink(temp_file.name) 

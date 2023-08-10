@@ -183,13 +183,23 @@ class Utils:
         except ConnectionError as connection_error:
             raise Exception(f"Unable to request {url}: {str(connection_error)}") from connection_error
 
+    def get_iiif__v3_urls(self, iiif): 
+        """
+        Needs to be implemented for Georgia uploads to Wikimedia Commons
+        To be done by October 2023
+        
+        """
+        pass
+
     def get_iiif_urls(self, iiif):
         """
+        Extracts image URLs from IIIF manfiest and returns them as a list
+        Currently only supports IIIF v2
 
-        :param iiif:
-        :return:
+        :param iiif: IIIF manifest URL
+        :return: List of image URLs
         """
-        # sequences \ [array] — [0, default]  \ canvases \ [array] \ images \ [array, 0 default] \ resource \ @id
+        
         canvases = []
         images_urls = []
 
