@@ -33,25 +33,6 @@ class Utils:
     def __init__(self):
         pass
 
-    # def create_path(self, path):
-    #     """
-
-    #     :param path:
-    #     :return:
-    #     """
-    #     # WTF is this doing? I'm really not sure what or why this exists. 
-    #     # This doesn't seem like it is necessary for s3 since there is not need to 
-    #     # create a path for s3.
-    #     prefix = b's3' if isinstance(path, bytes) else "s3"
-    #     if not path.startswith(prefix) and not Path(path).exists():
-    #         Path(path).mkdir(parents=True)
-
-    def create_destination_path(self, base, batch, count, dpla_id):
-        """
-        Create destination path to download file to
-        """
-        return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
-    
     def file_exists_s3(self, bucket, key):
         """
         Check to see if the file exists in s3

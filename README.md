@@ -1,7 +1,7 @@
 
 # end-to-end process
 
-There are three high level steps for uploading image to Wikimedia
+There are three steps for uploading images to Wikimedia.
 
 - ingestion3 Wikimedia export
 - ingest-wikimedia download
@@ -12,17 +12,22 @@ The first step when running ingests is to start the `wikimedia` ec2 instance
 - log into AWS console
 - go to the ec2 panel
 - find stopped `wikimedia` instances
-- change state from stopped to start
+- start the instance and SSH in
+  
+Creates a new screen session with a name of `nwdh` and attach to that session. Use `-xS` to reattach after disconnecting.
 
-This box was created by Vagrant (see `Vagrantfile` in project) so you can ssh into the box by using `vagrant ssh`
+```shell
+> screen -S nwdh 
+> screen -xS nwdh
+```
 
-Start a screen session so that the processes can continue after you log off the instance. It is also useful to set a screen session name.
+[A quick cheat sheet](https://gist.github.com/jctosta/af918e1618682638aa82) for `screen` commands. 
 
 ## Running download
 
 Running a download requires two pieces of information
 
-1) The path to most recent Wikimedia parquet file export from ingestion3.
+1) The path to most recent Wikimedia export from ingestion3.
 2) The path to save the output in s3
 
 The most recent Wikimedia export from ingestion3 can be identified by using the AWS CLI.
@@ -48,29 +53,43 @@ With these two pieces we are now ready to kick off the download within the previ
 ```shell
 > cd ~/ingest-wikimedia/ 
 > source venv-3.10/bin/activate 
-> poetry run python downloader.py --input s3://dpla-master-dataset/il/wiki/20230130_201856-il-wiki.parquet/ --output s3://dpla-wikimedia/il/20230130/ --batch_size 500000000000  --limit 5000000000000
+> poetry run python downloade-entry.py \
+    --input s3://dpla-master-dataset/il/wiki/20230130_201856-il-wiki.parquet/ \
+    --output s3://dpla-wikimedia/il/20230130/ \
+    --batch_size 500000000000  \
+    --limit 5000000000000 \
+    --partner il
 ```
 
-The `--batch-size` and `--limit` can be adjusted as needed.
+`--limit` is an optionsal parameter and if omitted it will download all assests. This parameter is useful if a provider has multiple terrabytes of images and you don't want to download all of them in a single session (e.g. NARA or Texas). 
+
+When a downloaded batch is completed then the upload for that batch can be executed.
 
 ## Running upload
 
-Generally, starting a new screen session for the upload is helpful if you uploading multiple batches concurrently so you can track the batch by session name
+Starting a new screen session for the uploads is helpful if you uploading multiple batches concurrently.
 
 ```shell
-> :sessionname il-up-1
+> screen -S il-upload-1
 ```
 
-When a downloaded batch is completed then the upload for that batch can be executed. The invocation is very similar to the download
+The invocation is very similar to the download
 
 ```shell
 > cd ~/ingest-wikimedia/; 
 > source venv-3.10/bin/activate; 
-> poetry run python upload.py --input s3://dpla-wikimedia/il/20230130/batch_1/
+> poetry run python upload-entry.py \
+--input s3://dpla-wikimedia/il/20230130/batch_1/
+--partner il
 ```
 
+## Logs 
+Log files are written out on the local file system in `./ingest-wikimedia/logs/` and on sucessful completetion written to the s3 location of the activity (ex )`s3://dpla-wikimedia/il/202309/batch_1/logs/`).
+
+## Closing out
 When all the downloads and uploads for the month have been completed go back to the ec2 console and **stop** the `wikimedia` instance.
 
 # Useful links
 
-- <https://presentation-validator.iiif.io/i>
+- [IIIF validator](https://presentation-validator.iiif.io/i)
+- [Cheat sheet](https://gist.github.com/jctosta/af918e1618682638aa82) for `screen` commands
