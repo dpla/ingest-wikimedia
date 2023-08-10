@@ -64,9 +64,9 @@ class Uploader:
             except botocore.exceptions.ClientError as client_error:
                 if client_error.response['Error']['Code'] == "404":
                     raise UploadException(f"Does not exist: {bucket}{key}") from client_error
-                elif client_error.response['Error']['Code'] == "403":
+                if client_error.response['Error']['Code'] == "403":
                     raise UploadException(f"Access denied: {bucket}{key}") from client_error
-                # TODO include specific client errors here  
+                # TODO include more specific client errors
                 else:   
                     raise UploadException(f"Unable to download {bucket}{key} to {destination.name}: \
                                           {str(client_error)}") from client_error
