@@ -36,15 +36,15 @@ download_limit = 0  # Total number of bytes to download
 # Default value is 250 GB
 batch_size = 268435456000 
 # Input parquet file (the wiki output of ingestion3)
-input_df = ""  
+input_data = ""  
 # Output path is where the assets are saved to
-base_path = ""  # output location
+output_base = ""  # output location
 # Max file size is the maximum size of a file to download
 # Default value is 10GB
 max_filesize = 10737418240
 # File filter is a file that contains a list of DPLA IDs to download and is used to only 
 # upload a specific set of DPLA IDs
-file_filter = ""
+file_filter = None
 
 # Controlling vars
 df_rows = list()  #
@@ -104,9 +104,9 @@ for opt, arg in opts:
     elif opt in ("-l", "--limit"):
         download_limit = int(arg)
     elif opt in ("-i", "--input"):
-        input_df = arg
+        input_data = arg
     elif opt in ("-o", "--output"):
-        base_path = arg.rstrip('/')
+        output_base = arg.rstrip('/')
     elif opt in ("-b", "--batch_size"):
         batch_size = int(arg)
     elif opt in ("-m", "--max_filesize"):
@@ -123,8 +123,8 @@ downloader = WikimediaDownloader(logger=logger)
 logger.info(f"Total download limit: {utils.sizeof_fmt(download_limit)}")
 logger.info(f"Batch size: {utils.sizeof_fmt(batch_size)}")
 logger.info(f"Max file size: {utils.sizeof_fmt(max_filesize)}")
-logger.info(f"Input: {input_df}")
-logger.info(f"Output: {base_path}")
+logger.info(f"Input: {input_data}")
+logger.info(f"Output: {output_base}")
 
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []
@@ -135,7 +135,7 @@ if file_filter:
     logger.info(f"Attempting {len(ids)} DPLA records")
 
 # Get individual parquet files from ingestion3 wiki output
-file_list = utils.get_parquet_files(path=input_df)
+file_list = utils.get_parquet_files(path=input_data)
     
 # TODO rewrite this to use a generator
 for parquet_file in file_list:
@@ -163,7 +163,7 @@ for parquet_file in file_list:
         download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
 
         # TODO `out` should be the root save location or the asset path?
-        out, time, size = base_path, 0, 0  # Defaults
+        out, time, size = output_base, 0, 0  # Defaults
         # Asset count for a single DPLA record
         asset_count = 1
 
@@ -171,7 +171,7 @@ for parquet_file in file_list:
         logger.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
         for url in download_urls:
             # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
-            destination_path = downloader.destination_path(base_path, batch_number, asset_count, dpla_id) 
+            destination_path = downloader.destination_path(output_base, batch_number, asset_count, dpla_id) 
             # If the destination path is not an S3 path then create the parent dirs on the local file system
             try:
                 output, size = downloader.download(source=url, destination=destination_path)
@@ -213,7 +213,7 @@ for parquet_file in file_list:
             logger.info(f"Download quota met for batch {batch_number}")
             logger.info(f"- {len(df_rows)} files")
             # Save the dataframe that contains all the metadata for the batch of downloaded files
-            parquet_out = downloader.batch_parquet_path(base_path, batch_number)            
+            parquet_out = downloader.batch_parquet_path(output_base, batch_number)            
             utils.write_parquet(parquet_out, df_rows, upload_parquet_columns)
             # Reset batch control vars, update df_output_path
             df_rows = []
@@ -222,12 +222,12 @@ for parquet_file in file_list:
 
 # If finished processing parquet files without breaching limits then write data out
 if df_rows:
-    parquet_out = downloader.batch_parquet_path(base_path, batch_number)
+    parquet_out = downloader.batch_parquet_path(output_base, batch_number)
     utils.write_parquet(parquet_out, df_rows, upload_parquet_columns)
 
 # TODO Fix this and have it write out for all records rather than just the last one.
 # write a summary of the images downloaded
-# input_df = pd.DataFrame({   'dpla_id': [dpla_id],
+# input_data = pd.DataFrame({   'dpla_id': [dpla_id],
 #                             'title': [title],
 #                             'wiki_markup': [wiki_markup],
 #                             'iiif': [iiif],
@@ -236,7 +236,7 @@ if df_rows:
 #                             'download_time': [time],
 #                             'download_size': [size]
 #                         })
-# input_df.to_parquet(f"{base_path}/input.parquet")
+# input_data.to_parquet(f"{output_base}/input.parquet")
 
 logger.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
 logger.info("Finished.")
