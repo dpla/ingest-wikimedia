@@ -27,15 +27,18 @@ columns = {
 
 # Get input parameters
 try:
-    opts, args = getopt.getopt(sys.argv[1:], "hi:u:o:", ["input="])
+    opts, args = getopt.getopt(sys.argv[1:], 
+                               "hi:u:o:", 
+                               ["input=",
+                                "partner="])
 except getopt.GetoptError:
-    print('upload.py --partner <dpla partner abbreviation> --input <path to parquet>')
+    print('upload-entry.py --partner <dpla partner abbreviation> --input <path to parquet>')
     sys.exit(2)
 
 for opt, arg in opts:
     if opt == '-h':
         print(
-            'upload.py --input <path to parquet>')
+            'upload-entry.py --partner <DPLA hub abbreviation> --input <path to parquet>')
         sys.exit()
     elif opt in ("-i", "--input"):
         input_df = arg
@@ -77,18 +80,20 @@ for parquet_file in file_list:
             wiki_page = uploader.create_wiki_file_page(title=page_title)
 
             if wiki_page is None:
-                log.info(f"Skipping, already exists - {page_title}")
+                # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
+                log.info("Skipping, exists https://commons.wikimedia.org/wiki/File:%s", page_title.replace(' ', '_'))
                 skip_count += 1
                 continue
 
             # Upload image to wiki page
             log.info(f"Uploading to https://commons.wikimedia.org/wiki/{wiki_page.title()}")
-            uploader.upload(wiki_file_page=wiki_page,
-                            dpla_identifier=dpla_id,
-                            text=wiki_markup,
-                            file=path,
-                            page_title=page_title
-                            )
+            # FIXME -- Commented out for --dry-run testing 
+            # uploader.upload(wiki_file_page=wiki_page,
+            #                 dpla_identifier=dpla_id,
+            #                 text=wiki_markup,
+            #                 file=path,
+            #                 page_title=page_title
+            #                 )
             upload_count += 1
         except UploadException as upload_exec:
             log.error("Upload error: %s", str(upload_exec))
@@ -100,11 +105,11 @@ for parquet_file in file_list:
             continue
 
 # Summarize upload
-log.info(f"Finished upload for {input}")
-log.info(f"Attempted: {total_count} files")
-log.info(f"Uploaded {upload_count} new files")
-log.info(f"Failed {failed_count} files")
-log.info(f"Skipped {skip_count} files")
+log.info("Finished upload for %s", input)
+log.info("Attempted: %s file", total_count)
+log.info("Uploaded %s new files", upload_count)
+log.info("Failed %s files", failed_count)
+log.info("Skipped %s files", skip_count)
 
 # Upload log file to s3
 bucket, key = utils.get_bucket_key(input)

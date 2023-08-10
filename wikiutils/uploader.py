@@ -19,7 +19,8 @@ class Uploader:
     """
     site = None
     log = None
-    s3 = boto3.resource('s3')
+    s3 = boto3.resource('s3')       # Used for download
+    s3_client = boto3.client('s3')  # Used for head_object
     wikiutils = None
 
     # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
@@ -43,11 +44,13 @@ class Uploader:
         self.wikiutils = WikimediaUtils()
         self.site = pywikibot.Site()
         self.site.login()
-        self.log.log(f"Logged in user is: {self.site.user()}")
+        self.log.info(f"Logged in user is: {self.site.user()}")
 
     def download(self, bucket, key, destination):
         """
         Download file from s3 to local file system
+
+        # TODO this may be redundant with wikiutils.utils.download, but I'm not sure yet.
         
         :param bucket: s3 bucket
         :param key: s3 key
@@ -62,11 +65,12 @@ class Uploader:
                 if client_error.response['Error']['Code'] == "404":
                     raise UploadException(f"Does not exist: {bucket}{key}") from client_error
                 elif client_error.response['Error']['Code'] == "403":
-                    raise UploadException(f"Access denied: {bucket}{key}") from client_error  
+                    raise UploadException(f"Access denied: {bucket}{key}") from client_error
                 # TODO include specific client errors here  
                 else:   
-                    raise UploadException(f"Unable to download {bucket}{key} to {destination.name}: {str(client_error)}") from client_error   
-                     
+                    raise UploadException(f"Unable to download {bucket}{key} to {destination.name}: \
+                                          {str(client_error)}") from client_error
+
     def upload(self, wiki_file_page, dpla_identifier, text, file, page_title):
         """
 
@@ -202,7 +206,7 @@ class Uploader:
         try: 
             if "s3://" in path:
                 bucket, key = self.wikiutils.get_bucket_key(path)
-                response = self.s3.head_object(Bucket=bucket, Key=key)
+                response = self.s3_client.head_object(Bucket=bucket, Key=key)
                 mime = response['ContentType']
             else:
                 mime = mimetypes.guess_type(path)[0]
