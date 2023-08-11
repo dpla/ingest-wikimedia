@@ -103,14 +103,13 @@ class Downloader:
         """
         # Create temp local file and download source file to it
         temp_file = tempfile.NamedTemporaryFile(delete=False)
-
         _, size = self._download_to_local(source=source, file=temp_file.name, overwrite=True)
         # Get content type from file, used in metadata for s3 upload
         content_type = magic.from_file(temp_file.name, mime=True)
         try:
             # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
-                self.utils.upload_to_s3(file=file, bucket=bucket, key=key, content_type=content_type)
-                return f"s3://{bucket}/{key}", size
+                self.utils.upload_to_s3(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
         finally:
-            os.unlink(temp_file.name) 
+            os.unlink(temp_file.name)
+        return f"s3://{bucket}/{key}", size
