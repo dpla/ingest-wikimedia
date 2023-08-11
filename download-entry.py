@@ -181,8 +181,6 @@ for parquet_file in file_list:
                 # If a single asset fails for a multi-asset upload then all assets are dropped
                 logger.error(f"Aborting all assets for {dpla_id}\n- {str(de)}")
                 rows = []
-                # output = None
-                # time, size = 0, 0
                 break
 
             # Create a row for a single asset and if multiple assests exist them append them to the rows list
@@ -208,6 +206,8 @@ for parquet_file in file_list:
 
         dpla_item_count += 1
         
+        # TODO Move the batch and total control logic into fucntions in the downloader class
+        # 
         # If the batch exceeds the batch limit size then write out the dataframe and reset the metrics
         if batch_downloaded > batch_size:
             logger.info(f"Download quota met for batch {batch_number}")
@@ -219,6 +219,23 @@ for parquet_file in file_list:
             df_rows = []
             batch_number += 1
             batch_downloaded = 0
+
+        # This was removed for ... reasons.... I'm not sure why atm but I added it back for controlled 
+        # testing of the log file access.
+        # SBW -- 2021-09-09
+        # If there is a total limit in place then abort after it has been breached.
+        if 0 < download_limit < total_downloaded:
+            parquet_out = downloader.batch_parquet_path(output_base, batch_number)            
+            utils.write_parquet(parquet_out, df_rows, upload_parquet_columns)
+
+            logger.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
+            logger.info("Finished.")
+            
+            # Save the log file to S3
+            bucket, key = utils.get_bucket_key(output_base)
+            public_url = logger.write_log_s3(bucket=bucket, key=key)
+            logger.info(f"Log file saved to {public_url}")
+            sys.exit()
 
 # If finished processing parquet files without breaching limits then write data out
 if df_rows:
@@ -240,6 +257,8 @@ if df_rows:
 
 logger.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
 logger.info("Finished.")
+
 # Save the log file to S3
-bucket, key = utils.get_bucket_key(input)
-logger.write_log_s3(bucket=bucket, key=key)
+bucket, key = utils.get_bucket_key(output_base)
+public_url = logger.write_log_s3(bucket=bucket, key=key)
+logger.info(f"Log file saved to {public_url}")
