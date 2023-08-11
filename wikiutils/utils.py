@@ -97,17 +97,20 @@ class Utils:
         return "%.1f%s%s" % (num, 'Yi', suffix)
 
 
-    def upload_to_s3(self, bucket, key, file, content_type): 
+    def upload_to_s3(self, bucket, key, file, extra_args=None):
         """
         Uploads file to S3
         
         :param bucket: S3 bucket
         :param key: S3 key
-        :param filexception: File to upload
-        :param content_typexception: Content type of file
+        :param file: File to upload
+        :param extra_args: Extra arguments to pass to upload_fileobj
         return: None
         """
-        self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs={'ContentType': content_type})
+        if extra_args is not None: 
+            self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs=extra_args)
+        else: 
+            self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key)
 
     def write_parquet(self, path, data, columns):
         """
