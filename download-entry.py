@@ -27,16 +27,17 @@ from wikiutils.logger import WikimediaLogger
 if __name__ == "__main__":
     pass
 
-# Input parameters
+TUPLE_INDEX = ['id', 'wiki_markup', 'iiif', 'media_master', 'title']
+
 # partner_name is the hub abbreviation and is used to create the output path
 partner_name = ""
 # Download limit is the total number of bytes to download
-download_limit = 0  # Total number of bytes to download
-# batch_size is the number of bytes to download in a batch
+total_limit = 0  # Total number of bytes to download
+# batch_limit is the number of bytes to download in a batch
 # Default value is 250 GB
-batch_size = 268435456000 
+batch_limit = 268435456000
 # Input parquet file (the wiki output of ingestion3)
-input_data = ""  
+input_data = ""
 # Output path is where the assets are saved to
 output_base = ""  # output location
 # Max file size is the maximum size of a file to download
@@ -46,29 +47,24 @@ max_filesize = 10737418240
 # upload a specific set of DPLA IDs
 file_filter = None
 
+# Helper classes
+utils = WikimediaUtils()
+log = WikimediaLogger(partner_name=partner_name, event_type="download")
+downloader = WikimediaDownloader(logger=log)
+
 # Controlling vars
-df_rows = list()  #
-total_downloaded = 0  # Running incrementer for tracking total bytes downloaded
-batch_downloaded = 0  # Running incrementer for tracking total bytes downloaded in a batch
-batch_number = 1  # This will break apart the input parquet file into batches defined by batch_size
-dpla_item_count = 1  # Running incrementer for tracking total number of DPLA items downloaded
-
-# Index and column names for the input parquet file
-columns = {"_1": "id", 
-           "_2": "wiki_markup", 
-           "_3": "iiif", 
-           "_4": "media_master", 
-           "_5": "title"}
-
-# Column names for the output parquet file
-upload_parquet_columns = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
+batch_rows = list()     #
+total_downloaded = 0    # Running incrementer for tracking total bytes downloaded
+batch_downloaded = 0    # Running incrementer for tracking total bytes downloaded in a batch
+batch_number = 1        # This will break apart the input parquet file into batches defined by batch_limit
+dpla_item_count = 1     # Running incrementer for tracking total number of DPLA items downloaded
 
 try:
     opts, args = getopt.getopt(sys.argv[1:],
                                "hi:u:o:", 
                                ["partner=",
                                 "limit=", 
-                                "batch_size=", 
+                                "batch_limit=", 
                                 "input=", 
                                 "output=", 
                                 "max_filesize=", 
@@ -78,7 +74,7 @@ except getopt.GetoptError:
         "downloader.py\n" \
         "--partner <dpla partner name>\n" \
         "--limit <bytes>\n" \
-        "--batch_size <bytes>\n" \
+        "--batch_limit <bytes>\n" \
         "--input <path to parquet>\n" \
         "--output <path to save files>\n" \
         "--max_filesize <max filesize>\n" \
@@ -92,7 +88,7 @@ for opt, arg in opts:
             "downloader.py\n" \
                 "--partner <dpla partner name>\n" \
                 "--limit <total limit in bytes>\n" \
-                "--batch_size <batch size limit in bytes>\n" \
+                "--batch_limit <batch size limit in bytes>\n" \
                 "--input <path to wikimedia parquet file>\n" \
                 "--output <path to save files>\n" \
                 "--max_filesize <max file size in bytes>" \
@@ -102,163 +98,115 @@ for opt, arg in opts:
     elif opt in ("-p", "--partner"):
         partner_name = arg
     elif opt in ("-l", "--limit"):
-        download_limit = int(arg)
+        total_limit = int(arg)
     elif opt in ("-i", "--input"):
         input_data = arg
     elif opt in ("-o", "--output"):
         output_base = arg.rstrip('/')
-    elif opt in ("-b", "--batch_size"):
-        batch_size = int(arg)
+    elif opt in ("-b", "--batch_limit"):
+        batch_limit = int(arg)
     elif opt in ("-m", "--max_filesize"):
         max_filesize = int(arg)
     elif opt in ("-f", "--file_filter"):
         file_filter = arg
 
-# Helper classes
-utils = WikimediaUtils()
-logger = WikimediaLogger(partner_name=partner_name, event_type="download")
-downloader = WikimediaDownloader(logger=logger)
-
 # Summary of input parameters
-logger.info(f"Total download limit: {utils.sizeof_fmt(download_limit)}")
-logger.info(f"Batch size: {utils.sizeof_fmt(batch_size)}")
-logger.info(f"Max file size: {utils.sizeof_fmt(max_filesize)}")
-logger.info(f"Input: {input_data}")
-logger.info(f"Output: {output_base}")
+log.info("Total download limit: %s{utils.sizeof_fmt(total_limit)}")
+log.info("Batch size: %s", utils.sizeof_fmt(batch_limit))
+log.info("Max file size: %s", utils.sizeof_fmt(max_filesize))
+log.info("Input: %s", input_data)
+log.info("Output: %s", output_base)
 
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []
 if file_filter:
-    logger.info(f"Using filter: {file_filter}")
+    log.info("Using filter: %s", file_filter)
     with open(file_filter, encoding='utf-8') as f:
         ids = [line.rstrip() for line in f]
-    logger.info(f"Attempting {len(ids)} DPLA records")
+    log.info("Attempting %s DPLA records", len(ids))
 
-# Get individual parquet files from ingestion3 wiki output
-file_list = utils.get_parquet_files(path=input_data)
+data_in = utils.read_parquet(input_data)
+
+for row in data_in.itertuples(index=TUPLE_INDEX):
+    try:
+        dpla_id = getattr(row, 'id')
+        title = getattr(row, 'title')
+        wiki_markup = getattr(row, 'wiki_markup')
+        iiif = getattr(row, 'iiif')
+        media_master = getattr(row, 'media_master')
+    except AttributeError as ae:
+        log.error("Unable to get all attributes from row %s: %s", row, str(ae))
+        break
+
+    # If a file_filter paramter is specified then only download files that match the DPLA IDs in 
+    # the file
+    # TODO Rewrite this as a prefilter of the parquet files
+    if file_filter and (dpla_id not in ids):
+        continue
+
+    # Are we working with IIIF or media_master?
+    download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
+    log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
     
-# TODO rewrite this to use a generator
-for parquet_file in file_list:
-    df = utils.get_df(parquet_file, columns=columns)
-
-    # TODO rewrite this to use a generator
-    for row in df.itertuples(index=['id', 'wiki_markup', 'iiif', 'media_master', 'title']):
+    page = 1
+    images = []
+    for url in download_urls:
+        filesize = 0 
+        # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
+        destination_path = downloader.destination_path(output_base, batch_number, page, dpla_id) 
+        # If the destination path is not an S3 path then create the parent dirs on the local file system
         try:
-            dpla_id = getattr(row, 'id')
-            title = getattr(row, 'title')
-            wiki_markup = getattr(row, 'wiki_markup')
-            iiif = getattr(row, 'iiif')
-            media_master = getattr(row, 'media_master')
-        except AttributeError as ae:
-            logger.info(f"Unable to get all attributes from row {row}: {str(ae)}")
+            output, filesize = downloader.download(source=url, destination=destination_path)
+            if output is None:
+                raise DownloadException(f"Download failed for {url}")
+        except DownloadException as de:
+            # If a single asset fails for a multi-asset upload then all assets are dropped
+            log.error("Aborting all assets for %s \n- %s", dpla_id, str(de))
+            images = []
             break
 
-        # If a file_filter paramter is specified then only download files that match the DPLA IDs in 
-        # the file
-        # TODO Rewrite this as a prefilter of the parquet files
-        if file_filter and (dpla_id not in ids):
-            continue
+        # Create a row for a single asset and if multiple assests exist them append them to the rows list
+        # When a single asset fails to download then this object is destroyed by the `break`` above and 
+        # the rows for already downloaded assets are not added to the final dataframe
+        row = {
+            'dpla_id': dpla_id,
+            'path': output,
+            'size': filesize,
+            'title': title,
+            'markup': wiki_markup,
+            'page': page
+        }
+        images.append(row)
 
-        # Are we working with IIIF or media_master?
-        download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
+        page += 1  # increment asset count
+        batch_downloaded += filesize # track the cumluative size of this batch
+        total_downloaded += filesize # track the cumluative size of the total download
 
-        # TODO `out` should be the root save location or the asset path?
-        out, time, size = output_base, 0, 0  # Defaults
-        # Asset count for a single DPLA record
-        asset_count = 1
+    # append all assets/rows for a given metadata record
+    if len(images) > 0:
+        batch_rows.extend(images)
 
-        rows = []
-        logger.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
-        for url in download_urls:
-            # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
-            destination_path = downloader.destination_path(output_base, batch_number, asset_count, dpla_id) 
-            # If the destination path is not an S3 path then create the parent dirs on the local file system
-            try:
-                output, size = downloader.download(source=url, destination=destination_path)
-                if output is None:
-                    raise DownloadException(f"Download failed for {url}")
-            except DownloadException as de:
-                # If a single asset fails for a multi-asset upload then all assets are dropped
-                logger.error(f"Aborting all assets for {dpla_id}\n- {str(de)}")
-                rows = []
-                break
+    dpla_item_count += 1
 
-            # Create a row for a single asset and if multiple assests exist them append them to the rows list
-            # When a single asset fails to download then this object is destroyed by the `break`` above and 
-            # the rows for already downloaded assets are not added to the final dataframe
-            row = {
-                'dpla_id': dpla_id,
-                'path': output,
-                'size': size,
-                'title': title,
-                'markup': wiki_markup,
-                'page': asset_count
-            }
-            rows.append(row)
-
-            asset_count += 1  # increment asset count
-            batch_downloaded += size # track the cumluative size of this batch
-            total_downloaded += size # track the cumluative size of the total download
-
-        # append all assets/rows for a given metadata record
-        if len(rows) > 0:
-            df_rows.extend(rows)
-
-        dpla_item_count += 1
-        
-        # TODO Move the batch and total control logic into fucntions in the downloader class
-        # 
-        # If the batch exceeds the batch limit size then write out the dataframe and reset the metrics
-        if batch_downloaded > batch_size:
-            logger.info(f"Download quota met for batch {batch_number}")
-            logger.info(f"- {len(df_rows)} files")
-            # Save the dataframe that contains all the metadata for the batch of downloaded files
-            parquet_out = downloader.batch_parquet_path(output_base, batch_number)            
-            utils.write_parquet(parquet_out, df_rows, upload_parquet_columns)
-            # Reset batch control vars, update df_output_path
-            df_rows = []
-            batch_number += 1
-            batch_downloaded = 0
-
-        # This was removed for ... reasons.... I'm not sure why atm but I added it back for controlled 
-        # testing of the log file access.
-        # SBW -- 2021-09-09
-        # If there is a total limit in place then abort after it has been breached.
-        if 0 < download_limit < total_downloaded:
-            parquet_out = downloader.batch_parquet_path(output_base, batch_number)            
-            utils.write_parquet(parquet_out, df_rows, upload_parquet_columns)
-
-            logger.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
-            logger.info("Finished.")
-            
-            # Save the log file to S3
-            bucket, key = utils.get_bucket_key(output_base)
-            public_url = logger.write_log_s3(bucket=bucket, key=key)
-            logger.info(f"Log file saved to {public_url}")
-            sys.exit()
+    # If the batch exceeds the batch limit size then write out the dataframe and reset the metrics
+    if batch_downloaded > batch_limit:
+        downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+        # Reset batch control vars
+        batch_rows = []
+        batch_number += 1
+        batch_downloaded = 0
+    elif 0 < total_limit < total_downloaded:
+        log.info("Total download limit reached")
+        downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+        break
 
 # If finished processing parquet files without breaching limits then write data out
-if df_rows:
-    parquet_out = downloader.batch_parquet_path(output_base, batch_number)
-    utils.write_parquet(parquet_out, df_rows, upload_parquet_columns)
-
-# TODO Fix this and have it write out for all records rather than just the last one.
-# write a summary of the images downloaded
-# input_data = pd.DataFrame({   'dpla_id': [dpla_id],
-#                             'title': [title],
-#                             'wiki_markup': [wiki_markup],
-#                             'iiif': [iiif],
-#                             'media_master': [media_master],
-#                             'downloaded': [out],
-#                             'download_time': [time],
-#                             'download_size': [size]
-#                         })
-# input_data.to_parquet(f"{output_base}/input.parquet")
-
-logger.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
-logger.info("Finished.")
+if batch_rows:
+    downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
 
 # Save the log file to S3
 bucket, key = utils.get_bucket_key(output_base)
-public_url = logger.write_log_s3(bucket=bucket, key=key)
-logger.info(f"Log file saved to {public_url}")
+public_url = log.write_log_s3(bucket=bucket, key=key)
+log.info("Log file saved to %s", public_url)
+log.info("Total download size: %s", utils.sizeof_fmt(total_downloaded))
+log.info("Fin.")

@@ -14,6 +14,9 @@ class Downloader:
     log = None
     utils = Utils()
 
+    # Column names for the output parquet file
+    UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
+
     def __init__(self, logger):
         self.log = logger
 
@@ -113,3 +116,26 @@ class Downloader:
         finally:
             os.unlink(temp_file.name)
         return f"s3://{bucket}/{key}", size
+    
+    
+    def save(self, batch, base, rows):
+            """
+            Save the dataframe that contains all the metadata for the batch of downloaded files
+
+            """
+            p_out = self.batch_parquet_path(base, batch)
+            self.utils.write_parquet(p_out, rows, self.UPLOAD_PARQUET_COLUMNS)
+
+
+# TODO Fix this and have it write out for all records rather than just the last one.
+# write a summary of the images downloaded
+# input_data = pd.DataFrame({  'dpla_id': [dpla_id],
+#                             'title': [title],
+#                             'wiki_markup': [wiki_markup],
+#                             'iiif': [iiif],
+#                             'media_master': [media_master],
+#                             'downloaded': [out],
+#                             'download_time': [time],
+#                             'download_size': [size]
+#                         })
+# input_data.to_parquet(f"{output_base}/input.parquet")

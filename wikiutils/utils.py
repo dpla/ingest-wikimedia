@@ -23,6 +23,13 @@ class Utils:
 
     logger = logging.getLogger('logger')
 
+    # Index and column names for the input parquet file
+    columns = { "_1": "id", 
+                "_2": "wiki_markup", 
+                "_3": "iiif", 
+                "_4": "media_master", 
+                "_5": "title"}
+
     s3 = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
     # Remove retry handler for s3, this is to prevent the botocore retry handler from retrying
     # taken from https://stackoverflow.com/questions/73910120/can-i-disable-region-redirector-s3regionredirector-in-boto3
@@ -33,6 +40,22 @@ class Utils:
     def __init__(self):
         pass
 
+    def read_parquet(self, path):
+        """Reads parquet file and returns a dataframe"""
+        temp = []
+        for file in self._get_parquet_files(path=path):
+            temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns=self.columns))
+        return pd.concat(temp, axis=0, ignore_index=True)
+
+    def _get_parquet_files(self, path):
+        """
+        Get parquet files from path, either local or s3
+        
+        :param path: Path to parquet files
+        :return: List of parquet files
+        """
+        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
+    
     def file_exists_s3(self, bucket, key):
         """
         Check to see if the file exists in s3
@@ -62,25 +85,6 @@ class Utils:
         bucket = s3_url_parsed.netloc
         key = f"{s3_url_parsed.path.replace('//', '/').lstrip('/')}"
         return bucket, key
-   
-    def get_df(self, path, columns):
-        """
-        Get datqframe from path
-
-        :param path: Path to data
-        :param columns: Columns to rename
-        :return: Dataframe
-        """
-        return pd.read_parquet(path, engine='fastparquet').rename(columns=columns)
-    
-    def get_parquet_files(self, path):
-        """
-        Get parquet files from path, either local or s3
-        
-        :param path: Path to parquet files
-        :return: List of parquet files
-        """
-        return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
             
     def sizeof_fmt(self, num, suffix='B'):
         """
