@@ -216,13 +216,15 @@ log.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
 log.info("Fin.")
 
 # Send email notification
-client = boto3.client('ses', region_name='us-east-1')
-emailer = SesMailSender(client)
-summary = DownloadSummary()
+ses_client = boto3.client('ses', region_name='us-east-1')
+emailer = SesMailSender(ses_client)
+summary = DownloadSummary(partner_name=partner_name, 
+                          log_url=public_url, 
+                          total_download=utils.sizeof_fmt(total_downloaded))
 
 emailer.send_email(source="tech@dp.la",
                    destination=SesDestination(tos=["scott@dp.la"]), 
-                   subject=summary.subject(partner_name=partner_name),
-                   text=summary.body_text(log_url=public_url),
-                   html=summary.body_html(log_url=public_url, total_download=utils.sizeof_fmt(total_downloaded)),
+                   subject=summary.subject(),
+                   text=summary.body_text(),
+                   html=summary.body_html(),
                    reply_tos=["tech@dp.la"])

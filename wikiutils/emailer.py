@@ -2,26 +2,32 @@
 # Taken from Amzaon example code:
 #   https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
 
-import boto3
 from botocore.exceptions import ClientError
 
 class DownloadSummary:
-    def __init__(self):
-        pass
+    """Contains data about a download."""
+    partner_name = ""
+    total_download = 0
+    log_url = ""
 
-    def subject(self, partner_name):
-        return f"{partner_name.upper()} - Wikimedia download finished"
+    def __init__(self, partner_name, total_download, log_url):
+        self.partner_name = partner_name
+        self.total_download = total_download
+        self.log_url = log_url
+
+    def subject(self):
+        return f"{self.partner_name.upper()} - Wikimedia download finished"
     
-    def body_text(self, log_url):
+    def body_text(self):
         return f"""
-            Log file available at {log_url}
+            Log file available at {self.log_url}
         """
 
-    def body_html(self, log_url, total_download):
+    def body_html(self):
         return f"""
         <p>
-            Log file available <a href="{log_url}">{log_url}</a><br>
-            Total download: <b>{total_download}</b>
+            Log file available <a href="{self.log_url}">{self.log_url}</a><br>
+            Total download: <b>{self.total_download}</b>
         </p>
         """
 
