@@ -17,6 +17,7 @@ Downloads images from a DPLA partner to be uploaded to Wikimedia Commons.
 """
 import sys
 import getopt
+import boto3
 
 from wikiutils.utils import Utils as WikimediaUtils
 from wikiutils.downloader import Downloader as WikimediaDownloader
@@ -214,8 +215,8 @@ log.info(f"Log file saved to {public_url}")
 log.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
 log.info("Fin.")
 
-import boto3
-client = boto3.client('ses')
+# Send email notification
+client = boto3.client('ses', region_name='us-east-1')
 emailer = SesMailSender(client)
 summary = DownloadSummary()
 
