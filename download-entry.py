@@ -207,6 +207,6 @@ if batch_rows:
 # Save the log file to S3
 bucket, key = utils.get_bucket_key(output_base)
 public_url = log.write_log_s3(bucket=bucket, key=key)
-log.info("Log file saved to %s", public_url)
-log.info("Total download size: %s", utils.sizeof_fmt(total_downloaded))
+log.info(f"Log file saved to {public_url}")
+log.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
 log.info("Fin.")

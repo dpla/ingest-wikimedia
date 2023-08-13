@@ -88,12 +88,10 @@ class Uploader:
             raise UploadException("File must be on s3")
         bucket, key = self.wikiutils.get_bucket_key(file)
             
-
         # Download to temp file on local file system
         # Will raise exceptions if the file cannot be downloaded
         temp_file = tempfile.NamedTemporaryFile()
         self.download(bucket=bucket, key=key, destination=temp_file)
-
         try:
             self.site.upload(filepage=wiki_file_page,
                              source_filename=temp_file.name,
@@ -103,9 +101,9 @@ class Uploader:
                              asynchronous= True,
                              chunk_size=3000000 # 3MB
                             )
-            self.log.info(f"Uploaded '{page_title}'")
+            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be betterm, it either raises and exception or returns true
-            return True 
+            return True
         except Exception as exception:
             error_string = str(exception)
             if 'fileexists-shared-forbidden:' in error_string:
@@ -118,8 +116,9 @@ class Uploader:
                 raise UploadException(f"Failed '{page_title}', File already exists, {error_string}") from exception
             raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {error_string}") from exception
         finally:
-            if temp_file:
-                os.unlink(temp_file.name)
+            pass
+            # if temp_file:
+                # os.unlink(temp_file.name)
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
