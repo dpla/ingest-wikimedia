@@ -22,6 +22,7 @@ from wikiutils.utils import Utils as WikimediaUtils
 from wikiutils.downloader import Downloader as WikimediaDownloader
 from wikiutils.exceptions import DownloadException
 from wikiutils.logger import WikimediaLogger
+from wikiutils.emailer import SesMailSender, SesDestination, DownloadSummary
 
 
 if __name__ == "__main__":
@@ -46,11 +47,6 @@ max_filesize = 10737418240
 # File filter is a file that contains a list of DPLA IDs to download and is used to only 
 # upload a specific set of DPLA IDs
 file_filter = None
-
-# Helper classes
-utils = WikimediaUtils()
-log = WikimediaLogger(partner_name=partner_name, event_type="download")
-downloader = WikimediaDownloader(logger=log)
 
 # Controlling vars
 batch_rows = list()     #
@@ -110,12 +106,19 @@ for opt, arg in opts:
     elif opt in ("-f", "--file_filter"):
         file_filter = arg
 
+# Helper classes
+# These need to remain below the input parameters
+utils = WikimediaUtils()
+log = WikimediaLogger(partner_name=partner_name, event_type="download")
+downloader = WikimediaDownloader(logger=log)
+
 # Summary of input parameters
 log.info(f"Total download limit: {utils.sizeof_fmt(total_limit)}")
 log.info(f"Batch size: {utils.sizeof_fmt(batch_limit)}")
 log.info(f"Max file size: {utils.sizeof_fmt(max_filesize)}")
 log.info(f"Input: {input_data}")
 log.info(f"Output: {output_base}")
+
 
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []
@@ -210,3 +213,15 @@ public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
 log.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
 log.info("Fin.")
+
+import boto3
+client = boto3.client('ses')
+emailer = SesMailSender(client)
+summary = DownloadSummary()
+
+emailer.send_email(source="tech@dp.la",
+                   destination=SesDestination(tos=["scott@dp.la"]), 
+                   subject=summary.subject(partner_name=partner_name),
+                   text=summary.body_text(log_url=public_url),
+                   html=summary.body_html(log_url=public_url, total_download=utils.sizeof_fmt(total_downloaded)),
+                   reply_tos=["tech@dp.la"])
