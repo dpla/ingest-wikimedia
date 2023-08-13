@@ -218,12 +218,12 @@ log.info("Fin.")
 # Send email notification
 ses_client = boto3.client('ses', region_name='us-east-1')
 emailer = SesMailSender(ses_client)
-summary = DownloadSummary(partner_name=partner_name, 
-                          log_url=public_url, 
+summary = DownloadSummary(partner_name=partner_name,
+                          log_url=public_url,
                           total_download=utils.sizeof_fmt(total_downloaded))
 
 emailer.send_email(source="tech@dp.la",
-                   destination=SesDestination(tos=["scott@dp.la"]), 
+                   destination=SesDestination(tos=["scott@dp.la, dominic@dp.la"]), 
                    subject=summary.subject(),
                    text=summary.body_text(),
                    html=summary.body_html(),
