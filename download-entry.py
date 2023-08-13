@@ -111,11 +111,11 @@ for opt, arg in opts:
         file_filter = arg
 
 # Summary of input parameters
-log.info("Total download limit: %s{utils.sizeof_fmt(total_limit)}")
-log.info("Batch size: %s", utils.sizeof_fmt(batch_limit))
-log.info("Max file size: %s", utils.sizeof_fmt(max_filesize))
-log.info("Input: %s", input_data)
-log.info("Output: %s", output_base)
+log.info(f"Total download limit: {utils.sizeof_fmt(total_limit)}")
+log.info(f"Batch size: {utils.sizeof_fmt(batch_limit)}")
+log.info(f"Max file size: {utils.sizeof_fmt(max_filesize)}")
+log.info(f"Input: {input_data}")
+log.info(f"Output: {output_base}")
 
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []

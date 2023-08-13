@@ -128,16 +128,17 @@ class Utils:
         pd.DataFrame(data, columns=columns).to_parquet(path)
 
     # IIIF Manifest functions
-
     def iiif_v2_urls(self, iiif):
         """
         Extracts image URLs from IIIF manfiest and returns them as a list
+        # TODO
         """
 
     def iiif__v3_urls(self, iiif): 
         """
         Needs to be implemented for Georgia uploads to Wikimedia Commons
         To be done by October 2023
+        # TODO
         """
 
     def get_iiif_urls(self, iiif):

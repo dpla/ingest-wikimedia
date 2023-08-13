@@ -25,18 +25,6 @@ class Downloader:
         Create destination path to download file to
         """
         return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
-    
-    # Path to save the dataframe which holds all the metadata for the batch of downloaded files
-    def batch_data_output(self, base,n):
-        """
-        Returns the output path for the batch of downloaded files
-        """
-        return f"{base}/batch_{n}/data/"
-
-    def batch_parquet_path(self, base, n):
-        """
-        """
-        return f"{self.batch_data_output(base, n)}batch_{n}.parquet"
 
     def download(self, source, destination):
         """
@@ -123,8 +111,22 @@ class Downloader:
             Save the dataframe that contains all the metadata for the batch of downloaded files
 
             """
-            p_out = self.batch_parquet_path(base, batch)
+            p_out = self._batch_parquet_path(base, batch)
             self.utils.write_parquet(p_out, rows, self.UPLOAD_PARQUET_COLUMNS)
+
+    # TODO These might be over abstracted.
+    #       Additionally, these are probably mute once I've ripped out the batching of assets.
+    def _batch_parquet_path(self, base, n):
+        """
+        Returns the path to the parquet file for the batch of downloaded files
+        """
+        return f"{self._batch_data_output(base, n)}batch_{n}.parquet"
+    
+    def _batch_data_output(self, base,n):
+        """
+        Returns the output path for the batch of downloaded files
+        """
+        return f"{base}/batch_{n}/data/"
 
 
 # TODO Fix this and have it write out for all records rather than just the last one.
