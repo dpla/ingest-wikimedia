@@ -5,34 +5,7 @@ import magic
 
 from wikimedia.utilities.fs import FileSystem
 from wikimedia.utilities.exceptions import DownloadException
-
-class DownloadStatus:
-    """
-    Status of download
-    """
-    SKIPPED = "SKIPPED"
-    DOWNLOADED = "DOWNLOADED"
-    FAILED = "FAILED"
-
-    skip_count = 0
-    fail_count = 0
-    download_count = 0
-
-    def __init__(self):
-        pass
-
-    def increment(self, status):
-        """
-        Increment the status
-        """
-        if status == DownloadStatus.SKIPPED:
-            DownloadStatus.skip_count += 1
-        elif status == DownloadStatus.DOWNLOADED:
-            DownloadStatus.download_count += 1
-        elif status == DownloadStatus.FAILED:
-            DownloadStatus.fail_count += 1
-        else:
-            raise DownloadException(f"Unknown status: {status}")
+from wikimedia.trackers.tracker import DownloadTracker
 
 class Downloader:
     """
@@ -40,7 +13,7 @@ class Downloader:
     """
     log = None
     _fs = FileSystem()
-    _status = DownloadStatus()
+    _status = DownloadTracker()
 
     # Column names for the output parquet file
     UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
@@ -82,15 +55,15 @@ class Downloader:
                 exists, size = self._fs.file_exists_s3(bucket=bucket, key=key)
                 if exists:
                     self.log.info(f" - Skipping {destination}, already exists in s3")
-                    self._status.increment(DownloadStatus.SKIPPED)
+                    self._status.increment(DownloadTracker.SKIPPED)
                     return destination, size
                 self.log.info(f" - Downloading {source} to {destination}")
-                self._status.increment(DownloadStatus.DOWNLOADED)
+                self._status.increment(DownloadTracker.DOWNLOADED)
                 return self._download_to_s3(source=source, bucket=bucket, key=key)
             # Download to local file system
             return self._download_to_local(source=source, file=destination)
         except Exception as exeception:
-            self._status.increment(DownloadStatus.FAILED)
+            self._status.increment(DownloadTracker.FAILED)
             raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
     def _download_to_local(self, source, file, overwrite=False):
@@ -141,15 +114,6 @@ class Downloader:
         finally:
             os.unlink(temp_file.name)
         return f"s3://{bucket}/{key}", size
-
-
-    # def save(self, batch, base, rows):
-    #         """
-    #         Save the dataframe that contains all the metadata for the batch of downloaded files
-
-    #         """
-    #         p_out = self._batch_parquet_path(base, batch)
-    #         self._fs.write_parquet(p_out, rows, self.UPLOAD_PARQUET_COLUMNS)
 
     # TODO These might be over abstracted.
     #       Additionally, these are probably mute once I've ripped out the batching of assets.

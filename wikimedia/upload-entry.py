@@ -39,7 +39,7 @@ log = WikimediaLogger(partner_name=partner_name, event_type="upload")
 uploader = Uploader(log)
 fs = FileSystem()
 
-# This is the schema emitted by the ingest-wikimedia download process
+# This is the schema emitted by the Wikimedia ingest download process
 READ_COLUMNS = {"_1": "dpla_id",
                 "_2": "path",
                 "_3": "size",
@@ -50,7 +50,7 @@ READ_COLUMNS = {"_1": "dpla_id",
 data_in = fs.read_parquet(input_path, cols=READ_COLUMNS)
 
 log.info(f"Read {len(data_in)} from {input_path}")
-uploader.execute_upload(data_in)
+uploader.execute_upload(data_in, READ_COLUMNS)
 
 # Summarize upload
 status = uploader.get_status()
