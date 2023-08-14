@@ -9,10 +9,10 @@ import getopt
 import sys
 import boto3
 
-from wikiutils.utils import Utils
-from wikiutils.logger import WikimediaLogger
-from wikiutils.uploader import Uploader
-from wikiutils.emailer import SesMailSender, SesDestination, UploadSummary
+from utilities.fs import FileSystem
+from utilities.logger import WikimediaLogger
+from executors.uploader import Uploader
+from utilities.emailer import SesMailSender, SesDestination, UploadSummary
 
 # Get input parameters
 partner_name, input_path = None, None
@@ -37,9 +37,17 @@ for opt, arg in opts:
 
 log = WikimediaLogger(partner_name=partner_name, event_type="upload")
 uploader = Uploader(log)
-utils = Utils()
+fs = FileSystem()
 
-data_in = utils.read_parquet(input_path)
+# This is the schema emitted by the ingest-wikimedia download process
+READ_COLUMNS = {"_1": "dpla_id",
+                "_2": "path",
+                "_3": "size",
+                "_4": "title",
+                "_5": "markup",
+                "_6": "page"}
+
+data_in = fs.read_parquet(input_path, cols=READ_COLUMNS)
 
 log.info(f"Read {len(data_in)} from {input_path}")
 uploader.execute_upload(data_in)
@@ -52,7 +60,7 @@ log.info(f"Failed {status.fail_count} files")
 log.info(f"Skipped {status.skip_count} files")
 
 # Upload log file to s3
-bucket, key = utils.get_bucket_key(input_path)
+bucket, key = fs.get_bucket_key(input_path)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
 log.info("Fin")

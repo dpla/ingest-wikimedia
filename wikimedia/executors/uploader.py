@@ -10,8 +10,8 @@ import boto3
 import botocore
 import numpy as np
 
-from wikiutils.exceptions import UploadException
-from wikiutils.utils import Utils
+from utilities.exceptions import UploadException
+from utilities.fs import FileSystem
 
 class UploadStatus:
     """
@@ -73,7 +73,7 @@ class Uploader:
     _site = None
     _log = None
     _status = None
-    _utils = Utils()
+    _fs = FileSystem()
     s3 = boto3.resource('s3')       # Used for download
     s3_client = boto3.client('s3')  # Used for head_object
 
@@ -202,7 +202,7 @@ class Uploader:
         # Download from s3 to temp location on box then upload local file to wikimeida
         if not file.startswith("s3"):
             raise UploadException("File must be on s3")
-        bucket, key = self._utils.get_bucket_key(file)
+        bucket, key = self._fs.get_bucket_key(file)
         # Download to temp file on local file system
         # Will raise exceptions if the file cannot be downloaded
         temp_file = tempfile.NamedTemporaryFile()
@@ -217,7 +217,7 @@ class Uploader:
             #                  chunk_size=3000000 # 3MB
             #                 )
             self._log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
-            # FIXME this is dumb and should be betterm, it either raises and exception or returns true
+            # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:
             error_string = str(exception)
@@ -317,7 +317,7 @@ class Uploader:
         mime = None
         try:
             if "s3://" in path:
-                bucket, key = self._utils.get_bucket_key(path)
+                bucket, key = self._fs.get_bucket_key(path)
                 response = self.s3_client.head_object(Bucket=bucket, Key=key)
                 mime = response['ContentType']
             else:

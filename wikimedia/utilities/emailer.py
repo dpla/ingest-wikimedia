@@ -1,9 +1,8 @@
-# Description: This file contains the code to send emails using Amazon SES.
-# Taken from Amzaon example code:
-#   https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
+"""
+"""
 
 from botocore.exceptions import ClientError
-from wikiutils.utils import Utils
+from utilities.format import sizeof_fmt
 
 class UploadSummary:
     """
@@ -26,7 +25,6 @@ class UploadSummary:
     def body_text(self):
         """
         Returns the body of the email in plain text format."""
-        formatted_size = Utils().sizeof_fmt(self.status.cumulative_size)
         return f"""
             Finished uploading all Wikimedia assets for {self.partner.upper()}.
 
@@ -39,7 +37,7 @@ class UploadSummary:
             - Failed: {self.status.fail_count}
             ----------------------------------------
             File information
-            - Added: {formatted_size}
+            - Added: {sizeof_fmt(self.status.cumulative_size)}
             ----------------------------------------
             Log file available at {self.log_url}
         """
@@ -141,7 +139,7 @@ class UploadSummary:
                         <p class="c4"><span class="c0">Size</span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{Utils().sizeof_fmt(self.status.cumulative_size)}</span></p>
+                        <p class="c4"><span class="c0">{sizeof_fmt(self.status.cumulative_size)}</span></p>
                         </td>
                     </tr>
                 </table>
@@ -182,7 +180,7 @@ class DownloadSummary:
             ----------------------------------------
             File information
             - Downloaded: TBD
-            - All records: {Utils().sizeof_fmt(self.status.cumulative_size)}
+            - All records: {sizeof_fmt(self.status.cumulative_size)}
             ----------------------------------------
             Log file available at {self.log_url}
         """
@@ -212,7 +210,7 @@ class DownloadSummary:
                         <p class="c4"><span class="c2"></span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">___DPLA_RECORDS</span></p>
+                        <p class="c6"><span class="c2">{self.status.dpla_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -234,7 +232,7 @@ class DownloadSummary:
                         <p class="c8"><span class="c2">Attempted</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.status.download_count + self.status.skip_count + self.status.fail_count}</span></p>
+                        <p class="c6"><span class="c2">{self.status.attempted}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -297,7 +295,7 @@ class DownloadSummary:
                         <p class="c6"><span class="c2">All records</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{Utils().sizeof_fmt(self.status.cumulative_size)}</span></p>
+                        <p class="c6"><span class="c2">{sizeof_fmt(self.status.cumulative_size)}</span></p>
                         </td>
                     </tr>
                 </table>
@@ -306,6 +304,9 @@ class DownloadSummary:
             </html>
         """
 
+
+# Taken from Amzaon example code:
+# >  https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
 class SesMailSender:
     """Encapsulates functions to send emails with Amazon SES."""
     def __init__(self, ses_client):
@@ -347,7 +348,6 @@ class SesMailSender:
             raise
         else:
             return message_id
-
 
 class SesDestination:
     """Contains data about an email destination."""

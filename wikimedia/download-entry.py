@@ -19,17 +19,33 @@ import sys
 import getopt
 import boto3
 
-from wikiutils.utils import Utils as WikimediaUtils
-from wikiutils.downloader import Downloader as WikimediaDownloader
-from wikiutils.exceptions import DownloadException, IIIFException
-from wikiutils.logger import WikimediaLogger
-from wikiutils.emailer import SesMailSender, SesDestination, DownloadSummary
+from wikimedia.utilities.iiif import IIIF
+from wikimedia.executors.downloader import Downloader
+from wikimedia.utilities.fs import FileSystem
+from wikimedia.utilities.exceptions import DownloadException, IIIFException
+from wikimedia.utilities.logger import WikimediaLogger
+from wikimedia.utilities.emailer import SesMailSender, SesDestination, DownloadSummary
+from wikimedia.utilities.format import sizeof_fmt
 
 
 if __name__ == "__main__":
     pass
 
-TUPLE_INDEX = ['id', 'wiki_markup', 'iiif', 'media_master', 'title']
+# These are the columns emitted by the ingestion3 process
+READ_COLUMNS = { "_1": "id",
+                "_2": "wiki_markup",
+                "_3": "iiif",
+                "_4": "media_master",
+                "_5": "title"}
+
+TUPLE_INDEX = list(READ_COLUMNS.values())
+
+WRITE_COLUMNS = ['dpla_id',
+                 'path',
+                 'size',
+                 'title',
+                 'markup',
+                 'page']
 
 # partner_name is the hub abbreviation and is used to create the output path
 partner_name = ""
@@ -109,14 +125,16 @@ for opt, arg in opts:
 
 # Helper classes
 # These need to remain below the input parameters
-utils = WikimediaUtils()
+# utils = WikimediaUtils()
+iiif = IIIF()
+fs = FileSystem()
 log = WikimediaLogger(partner_name=partner_name, event_type="download")
-downloader = WikimediaDownloader(logger=log)
+downloader = Downloader(logger=log)
 
 # Summary of input parameters
-log.info(f"Total download limit: {utils.sizeof_fmt(total_limit)}")
-log.info(f"Batch size: {utils.sizeof_fmt(batch_limit)}")
-log.info(f"Max file size: {utils.sizeof_fmt(max_filesize)}")
+log.info(f"Total download limit: {sizeof_fmt(total_limit)}")
+log.info(f"Batch size: {sizeof_fmt(batch_limit)}")
+log.info(f"Max file size: {sizeof_fmt(max_filesize)}")
 log.info(f"Input: {input_data}")
 log.info(f"Output: {output_base}")
 
@@ -129,14 +147,16 @@ if file_filter:
         ids = [line.rstrip() for line in f]
     log.info("Attempting %s DPLA records", len(ids))
 
-data_in = utils.read_parquet(input_data)
+data_in = fs.read_parquet(input_data, columns=READ_COLUMNS)
 
 for row in data_in.itertuples(index=TUPLE_INDEX):
+    batch_out = downloader.batch_parquet_path(base=output_base, n=batch_number)
+
     try:
         dpla_id = getattr(row, 'id')
         title = getattr(row, 'title')
         wiki_markup = getattr(row, 'wiki_markup')
-        iiif = getattr(row, 'iiif')
+        iiif_manifest = getattr(row, 'iiif')
         media_master = getattr(row, 'media_master')
     except AttributeError as ae:
         log.error("Unable to get all attributes from row %s: %s", row, str(ae))
@@ -150,7 +170,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
 
     # Are we working with IIIF or media_master?
     try:
-        download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
+        download_urls = iiif.get_iiif_urls(iiif_manifest) if iiif else media_master
         log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
     except IIIFException as iffex:
         log.error("Unable to get IIIF urls for %s: %s", dpla_id, str(iffex))
@@ -198,25 +218,26 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
 
     # If the batch exceeds the batch limit size then write out the dataframe and reset the metrics
     if batch_downloaded > batch_limit:
-        downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+        fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
         # Reset batch control vars
         batch_rows = []
         batch_number += 1
         batch_downloaded = 0
     elif 0 < total_limit < total_downloaded:
         log.info("Total download limit reached")
-        downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+        fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
         break
 
 # If finished processing parquet files without breaching limits then write data out
 if batch_rows:
-    downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+    # downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+    fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
 
 # Save the log file to S3
-bucket, key = utils.get_bucket_key(output_base)
+bucket, key = fs.get_bucket_key(output_base)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
-log.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
+log.info(f"Total download size: {sizeof_fmt(total_downloaded)}")
 log.info("Fin.")
 
 # Send email notification

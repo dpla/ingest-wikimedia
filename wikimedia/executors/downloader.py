@@ -3,8 +3,8 @@ import tempfile
 import requests
 import magic
 
-from wikiutils.utils import Utils
-from wikiutils.exceptions import DownloadException
+from wikimedia.utilities.fs import FileSystem
+from wikimedia.utilities.exceptions import DownloadException
 
 class DownloadStatus:
     """
@@ -39,7 +39,7 @@ class Downloader:
     Download images from parters
     """
     log = None
-    utils = Utils()
+    _fs = FileSystem()
     _status = DownloadStatus()
 
     # Column names for the output parquet file
@@ -53,7 +53,7 @@ class Downloader:
         Get the status of the download
         """
         return self._status
-    
+
     def destination_path(self, base, batch, count, dpla_id):
         """
         Create destination path to download file to
@@ -63,10 +63,10 @@ class Downloader:
     def download(self, source, destination):
         """
         Download asset to local file system or s3
-        
+
         :param source: URL of asset to download
         :param destination: Full path to save the asset
-        
+
         TODO: this return value doesn't make sense, I'm just returning the destination. It should
         be returning the status of the download
         - Skipped
@@ -78,8 +78,8 @@ class Downloader:
         try:
             # Destination is s3
             if destination.startswith("s3://"):
-                bucket, key = self.utils.get_bucket_key(destination)
-                exists, size = self.utils.file_exists_s3(bucket=bucket, key=key)
+                bucket, key = self._fs.get_bucket_key(destination)
+                exists, size = self._fs.file_exists_s3(bucket=bucket, key=key)
                 if exists:
                     self.log.info(f" - Skipping {destination}, already exists in s3")
                     self._status.increment(DownloadStatus.SKIPPED)
@@ -95,7 +95,7 @@ class Downloader:
 
     def _download_to_local(self, source, file, overwrite=False):
         """
-        Download images to local file system and return path to file 
+        Download images to local file system and return path to file
         and the size of the file in bytes
 
         :param source: The url to download
@@ -112,7 +112,7 @@ class Downloader:
                 f.write(response.content)
         except Exception as exeception:
             raise DownloadException(f"Error in download_local() {str(exeception)}") from exeception
-        
+
         file_size = os.path.getsize(file)
         return file, file_size
 
@@ -120,9 +120,9 @@ class Downloader:
         """
 
         Tries to download a file from the source url and save it to s3. If the file
-        already exists in s3 then this step is skipped. To achive this 
+        already exists in s3 then this step is skipped. To achive this
         the file is downloaded to a temp file on the local file system and then uploaded
-        to s3. 
+        to s3.
 
         :param url:
         :param out:
@@ -137,44 +137,30 @@ class Downloader:
         try:
             # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
-                self.utils.upload_to_s3(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
+                self._fs.upload_to_s3(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
         finally:
             os.unlink(temp_file.name)
         return f"s3://{bucket}/{key}", size
-    
-    
-    def save(self, batch, base, rows):
-            """
-            Save the dataframe that contains all the metadata for the batch of downloaded files
 
-            """
-            p_out = self._batch_parquet_path(base, batch)
-            self.utils.write_parquet(p_out, rows, self.UPLOAD_PARQUET_COLUMNS)
+
+    # def save(self, batch, base, rows):
+    #         """
+    #         Save the dataframe that contains all the metadata for the batch of downloaded files
+
+    #         """
+    #         p_out = self._batch_parquet_path(base, batch)
+    #         self._fs.write_parquet(p_out, rows, self.UPLOAD_PARQUET_COLUMNS)
 
     # TODO These might be over abstracted.
     #       Additionally, these are probably mute once I've ripped out the batching of assets.
-    def _batch_parquet_path(self, base, n):
+    def batch_parquet_path(self, base, n):
         """
         Returns the path to the parquet file for the batch of downloaded files
         """
         return f"{self._batch_data_output(base, n)}batch_{n}.parquet"
-    
+
     def _batch_data_output(self, base,n):
         """
         Returns the output path for the batch of downloaded files
         """
         return f"{base}/batch_{n}/data/"
-
-
-# TODO Fix this and have it write out for all records rather than just the last one.
-# write a summary of the images downloaded
-# input_data = pd.DataFrame({  'dpla_id': [dpla_id],
-#                             'title': [title],
-#                             'wiki_markup': [wiki_markup],
-#                             'iiif': [iiif],
-#                             'media_master': [media_master],
-#                             'downloaded': [out],
-#                             'download_time': [time],
-#                             'download_size': [size]
-#                         })
-# input_data.to_parquet(f"{output_base}/input.parquet")
