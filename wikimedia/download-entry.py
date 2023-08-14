@@ -21,7 +21,7 @@ import boto3
 
 from wikimedia.utilities.iiif import IIIF
 from wikimedia.executors.downloader import Downloader
-from wikimedia.utilities.fs import FileSystem
+from wikimedia.utilities.fs import FileSystem, S3Helper
 from wikimedia.utilities.exceptions import DownloadException, IIIFException
 from wikimedia.utilities.logger import WikimediaLogger
 from wikimedia.utilities.emailer import SesMailSender, SesDestination, DownloadSummary
@@ -128,6 +128,7 @@ for opt, arg in opts:
 # utils = WikimediaUtils()
 iiif = IIIF()
 fs = FileSystem()
+s3 = S3Helper()
 log = WikimediaLogger(partner_name=partner_name, event_type="download")
 downloader = Downloader(logger=log)
 
@@ -234,7 +235,7 @@ if batch_rows:
     fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
 
 # Save the log file to S3
-bucket, key = fs.get_bucket_key(output_base)
+bucket, key = s3.get_bucket_key(output_base)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
 log.info(f"Total download size: {sizeof_fmt(total_downloaded)}")

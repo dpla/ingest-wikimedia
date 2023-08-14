@@ -1,15 +1,12 @@
 """
 Upload to Wikimedia Commons
 
-This needs a "batch" folder for input
-Read parquet file and then upload assets
-
 """
 import getopt
 import sys
 import boto3
 
-from utilities.fs import FileSystem
+from utilities.fs import FileSystem, S3Helper
 from utilities.logger import WikimediaLogger
 from executors.uploader import Uploader
 from utilities.emailer import SesMailSender, SesDestination, UploadSummary
@@ -38,6 +35,7 @@ for opt, arg in opts:
 log = WikimediaLogger(partner_name=partner_name, event_type="upload")
 uploader = Uploader(log)
 fs = FileSystem()
+s3 = S3Helper()
 
 # This is the schema emitted by the Wikimedia ingest download process
 READ_COLUMNS = {"_1": "dpla_id",
@@ -60,7 +58,7 @@ log.info(f"Failed {status.fail_count} files")
 log.info(f"Skipped {status.skip_count} files")
 
 # Upload log file to s3
-bucket, key = fs.get_bucket_key(input_path)
+bucket, key = s3.get_bucket_key(input_path)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
 log.info("Fin")

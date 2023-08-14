@@ -3,7 +3,7 @@ import tempfile
 import requests
 import magic
 
-from wikimedia.utilities.fs import FileSystem
+from wikimedia.utilities.fs import FileSystem, S3Helper
 from wikimedia.utilities.exceptions import DownloadException
 from wikimedia.trackers.tracker import DownloadTracker
 
@@ -12,7 +12,7 @@ class Downloader:
     Download images from parters
     """
     log = None
-    _fs = FileSystem()
+    _s3 = S3Helper()
     _status = DownloadTracker()
 
     # Column names for the output parquet file
@@ -51,8 +51,8 @@ class Downloader:
         try:
             # Destination is s3
             if destination.startswith("s3://"):
-                bucket, key = self._fs.get_bucket_key(destination)
-                exists, size = self._fs.file_exists_s3(bucket=bucket, key=key)
+                bucket, key = self._s3.get_bucket_key(destination)
+                exists, size = self._s3.file_exists(bucket=bucket, key=key)
                 if exists:
                     self.log.info(f" - Skipping {destination}, already exists in s3")
                     self._status.increment(DownloadTracker.SKIPPED)
@@ -110,7 +110,7 @@ class Downloader:
         try:
             # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
-                self._fs.upload_to_s3(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
+                self._s3.upload(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
         finally:
             os.unlink(temp_file.name)
         return f"s3://{bucket}/{key}", size

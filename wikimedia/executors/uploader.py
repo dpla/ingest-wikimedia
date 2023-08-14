@@ -11,7 +11,7 @@ import botocore
 import numpy as np
 
 from utilities.exceptions import UploadException
-from utilities.fs import FileSystem
+from utilities.fs import FileSystem, S3Helper
 from trackers.tracker import UploadTracker
 
 class Uploader:
@@ -23,6 +23,7 @@ class Uploader:
     _log = None
     _status = None
     _fs = FileSystem()
+    s3_helper = S3Helper()
     s3 = boto3.resource('s3')       # Used for download
     s3_client = boto3.client('s3')  # Used for head_object
 
@@ -159,7 +160,7 @@ class Uploader:
         # Download from s3 to temp location on box then upload local file to wikimeida
         if not file.startswith("s3"):
             raise UploadException("File must be on s3")
-        bucket, key = self._fs.get_bucket_key(file)
+        bucket, key = self.s3_helper.get_bucket_key(file)
         # Download to temp file on local file system
         # Will raise exceptions if the file cannot be downloaded
         temp_file = tempfile.NamedTemporaryFile()
@@ -247,7 +248,7 @@ class Uploader:
         mime = None
         try:
             if "s3://" in path:
-                bucket, key = self._fs.get_bucket_key(path)
+                bucket, key = self.s3_helper.get_bucket_key(path)
                 response = self.s3_client.head_object(Bucket=bucket, Key=key)
                 mime = response['ContentType']
             else:

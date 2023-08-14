@@ -6,7 +6,7 @@ import time
 import logging
 import os
 
-from utilities.fs import FileSystem
+from utilities.fs import S3Helper
 
 class WikimediaLogger(logging.Logger):
     """
@@ -14,7 +14,7 @@ class WikimediaLogger(logging.Logger):
     """
     log = None
     _log_file = None
-    _fs = FileSystem()
+    _s3 = S3Helper()
 
     def __init__(self, partner_name, event_type):
         super().__init__(name="wikimedia_logger")
@@ -69,7 +69,7 @@ class WikimediaLogger(logging.Logger):
             default_args.update(extra_args)
 
         with open(f"./logs/{self._log_file}", "rb") as file:
-            self._fs.upload_to_s3(file=file,
+            self._s3.upload(file=file,
                                     bucket=bucket,
                                     key=s3_log_key,
                                     extra_args=default_args)
