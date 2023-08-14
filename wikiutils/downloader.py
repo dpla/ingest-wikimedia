@@ -6,12 +6,43 @@ import magic
 from wikiutils.utils import Utils
 from wikiutils.exceptions import DownloadException
 
+class DownloadStatus:
+    """
+    Status of download
+    """
+    SKIPPED = "SKIPPED"
+    DOWNLOADED = "DOWNLOADED"
+    FAILED = "FAILED"
+
+    skip_count = 0
+    fail_count = 0
+    download_count = 0
+
+    def __init__(self):
+        pass
+
+    def increment(self, status):
+        """
+        Increment the status
+        """
+        if status == DownloadStatus.SKIPPED:
+            DownloadStatus.skip_count += 1
+        elif status == DownloadStatus.DOWNLOADED:
+            DownloadStatus.download_count += 1
+        elif status == DownloadStatus.FAILED:
+            DownloadStatus.fail_count += 1
+        else:
+            raise DownloadException(f"Unknown status: {status}")
+
+
+
 class Downloader:
     """
     Download images from parters
     """
     log = None
     utils = Utils()
+    _status = DownloadStatus()
 
     # Column names for the output parquet file
     UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
@@ -19,6 +50,12 @@ class Downloader:
     def __init__(self, logger):
         self.log = logger
 
+    def get_status(self):
+        """
+        Get the status of the download
+        """
+        return self._status
+    
     def destination_path(self, base, batch, count, dpla_id):
         """
         Create destination path to download file to
@@ -47,12 +84,15 @@ class Downloader:
                 exists, size = self.utils.file_exists_s3(bucket=bucket, key=key)
                 if exists:
                     self.log.info(f" - Skipping {destination}, already exists in s3")
-                    return destination, size 
+                    self._status.increment(DownloadStatus.SKIPPED)
+                    return destination, size
                 self.log.info(f" - Downloading {source} to {destination}")
+                self._status.increment(DownloadStatus.DOWNLOADED)
                 return self._download_to_s3(source=source, bucket=bucket, key=key)
             # Download to local file system
             return self._download_to_local(source=source, file=destination)
         except Exception as exeception:
+            self._status.increment(DownloadStatus.FAILED)
             raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
     def _download_to_local(self, source, file, overwrite=False):
