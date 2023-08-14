@@ -6,7 +6,6 @@ __version__ = "0.0.1"
 __license__ = "MIT"
 
 import json
-import logging
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -18,16 +17,16 @@ from awswrangler import s3
 from botocore.config import Config
 from botocore.exceptions import ClientError, ConnectionError
 
+from wikiutils.exceptions import IIIFException
+
 class Utils:
     """General utility functions for Wikimedia project"""
 
-    logger = logging.getLogger('logger')
-
     # Index and column names for the input parquet file
-    columns = { "_1": "id", 
-                "_2": "wiki_markup", 
-                "_3": "iiif", 
-                "_4": "media_master", 
+    columns = { "_1": "id",
+                "_2": "wiki_markup",
+                "_3": "iiif",
+                "_4": "media_master",
                 "_5": "title"}
 
     s3 = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
@@ -50,12 +49,12 @@ class Utils:
     def _get_parquet_files(self, path):
         """
         Get parquet files from path, either local or s3
-        
+
         :param path: Path to parquet files
         :return: List of parquet files
         """
         return s3.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
-    
+
     def file_exists_s3(self, bucket, key):
         """
         Check to see if the file exists in s3
@@ -85,7 +84,7 @@ class Utils:
         bucket = s3_url_parsed.netloc
         key = f"{s3_url_parsed.path.replace('//', '/').lstrip('/')}"
         return bucket, key
-            
+
     def sizeof_fmt(self, num, suffix='B'):
         """
         Convert bytes to human readable format
@@ -104,22 +103,22 @@ class Utils:
     def upload_to_s3(self, bucket, key, file, extra_args=None):
         """
         Uploads file to S3
-        
+
         :param bucket: S3 bucket
         :param key: S3 key
         :param file: File to upload
         :param extra_args: Extra arguments to pass to upload_fileobj
         return: None
         """
-        if extra_args is not None: 
+        if extra_args is not None:
             self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs=extra_args)
-        else: 
+        else:
             self.s3.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key)
 
     def write_parquet(self, path, data, columns):
         """
         Write data to parquet file
-        
+
         :param path: Path to write parquet file
         :param data: Data to write
         :param columns: Columns to write
@@ -134,7 +133,7 @@ class Utils:
         # TODO
         """
 
-    def iiif__v3_urls(self, iiif): 
+    def iiif__v3_urls(self, iiif):
         """
         Needs to be implemented for Georgia uploads to Wikimedia Commons
         To be done by October 2023
@@ -149,7 +148,7 @@ class Utils:
         :param iiif: IIIF manifest URL
         :return: List of image URLs
         """
-        
+
         canvases = []
         images_urls = []
 
@@ -157,10 +156,11 @@ class Utils:
         # if 'sequences' in iiif_manifest and there is one sequence value
         if 'sequences' in iiif_manifest and len(iiif_manifest['sequences']) == 1:
             canvases = iiif_manifest['sequences'][0]['canvases'] if 'canvases' in iiif_manifest['sequences'][0] else []
-        else: 
+        else:
             # More than one sequence, return empty list and log some kind of message
-            self.logger.info("Got more than one IIIF sequence. Unsure of meaning. %s", iiif)
-            return []
+            raise IIIFException(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
+            # self.logger.info("Got more than one IIIF sequence. Unsure of meaning. %s", iiif)
+            # return []
 
         for canvas in canvases:
             try:
@@ -168,8 +168,9 @@ class Utils:
                 # if missing file extension add it to URL to be requested
                 image_url = image_url if '.' in image_url[image_url.rfind('/'):] else f"{image_url}.jpg"
                 images_urls.append(image_url)
-            except KeyError:
-                self.logger.error("No images defined in %s", iiif)
+            except KeyError as keyerr:
+                raise IIIFException(f"No `image` key for: {iiif}") from keyerr
+                # self.logger.error("No images defined in %s", iiif)
         return images_urls
 
     def _get_iiif_manifest(self, url):

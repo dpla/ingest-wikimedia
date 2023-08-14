@@ -8,28 +8,14 @@ Read parquet file and then upload assets
 import getopt
 import sys
 import boto3
-import numpy as np
 
 from wikiutils.utils import Utils
 from wikiutils.logger import WikimediaLogger
-from wikiutils.uploader import Uploader, UploadStatus
-from wikiutils.exceptions import UploadException
+from wikiutils.uploader import Uploader
 from wikiutils.emailer import SesMailSender, SesDestination, UploadSummary
 
-utils = Utils()
-status = UploadStatus()
-
-partner_name, input_df = None, None
-columns = {
-            "dpla_id": "dpla_id",
-            "path": "path",
-            "size": "size",
-            "title": "title",
-            "markup": "markup",
-            "page": "page"
-           }
-
 # Get input parameters
+partner_name, input_path = None, None
 try:
     opts, args = getopt.getopt(sys.argv[1:],
                                "hi:u:o:",
@@ -45,82 +31,39 @@ for opt, arg in opts:
             'upload-entry.py --partner <DPLA hub abbreviation> --input <path to parquet>')
         sys.exit()
     elif opt in ("-i", "--input"):
-        input_df = arg
+        input_path = arg
     elif opt in ("-p", "--partner"):
         partner_name = arg
 
 log = WikimediaLogger(partner_name=partner_name, event_type="upload")
 uploader = Uploader(log)
+utils = Utils()
 
-log.info(f"Input: {input_df}")
-data_in = utils.read_parquet(input_df)
-status.set_total(len(data_in))
+data_in = utils.read_parquet(input_path)
 
-# Get unique dpla_ids and counts
-unique, counts = np.unique(data_in["dpla_id"], return_counts=True)
-unique_ids = dict(zip(unique, counts))
-
-for row in data_in.itertuples(index=columns):
-    dpla_id, path, size, title, wiki_markup = None, None, None, None, None
-    try:
-        # Load record from dataframe
-        dpla_id, path, size, title, wiki_markup, page = uploader.get_metadata(row)
-        # If there is only one record for this dpla_id, then page is `None` and pagination will not
-        # be used in the Wikimedia page title
-        page = None if unique_ids[dpla_id] == 1 else page
-        # Get file extension
-        ext = uploader.get_extension(path)
-        # Create Wikimedia page title
-        page_title = uploader.create_wiki_page_title(title=title,
-                                                     dpla_identifier=dpla_id,
-                                                     suffix=ext,
-                                                     page=page)
-
-        # Create wiki page using Wikimedia page title
-        wiki_page = uploader.create_wiki_file_page(title=page_title)
-
-        if wiki_page is None:
-            # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-            log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
-            status.increment(UploadStatus.SKIPPED)
-            continue
-
-        # Upload image to wiki page
-        # FIXME -- Commented out for --dry-run testing
-        uploader.upload(wiki_file_page=wiki_page,
-                        dpla_identifier=dpla_id,
-                        text=wiki_markup,
-                        file=path,
-                        page_title=page_title)
-    except UploadException as upload_exec:
-        log.error("Upload error: %s", str(upload_exec))
-        status.increment(UploadStatus.FAILED)
-        continue
-    except Exception as exception:
-        log.error(f"Unknown error: {str(exception)}")
-        status.increment(UploadStatus.FAILED)
-        continue
+log.info(f"Read {len(data_in)} from {input_path}")
+uploader.execute_upload(data_in)
 
 # Summarize upload
-log.info(f"Finished upload for {input_df}")
+status = uploader.get_status()
 log.info(f"Attempted: {status.attempted} files")
 log.info(f"Uploaded {status.upload_count} new files")
 log.info(f"Failed {status.fail_count} files")
 log.info(f"Skipped {status.skip_count} files")
 
 # Upload log file to s3
-bucket, key = utils.get_bucket_key(input_df)
+bucket, key = utils.get_bucket_key(input_path)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
-log.info("Fin.")
+log.info("Fin")
 
 # Send email notification
 ses_client = boto3.client('ses', region_name='us-east-1')
 emailer = SesMailSender(ses_client)
-summary = UploadSummary(partner_name=partner_name,
+summary = UploadSummary(partner=partner_name,
                         log_url=public_url,
-                        total_upload=0,
                         status=status)
+
 emailer.send_email(source="DPLA Tech Bot<tech@dp.la>",
                    destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else?
                    subject=summary.subject(),

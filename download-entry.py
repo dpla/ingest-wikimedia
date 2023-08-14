@@ -4,7 +4,7 @@ Downloads images from a DPLA partner to be uploaded to Wikimedia Commons.
     - Writes out a parquet file with metadata for each image
     - Uploads parquet file to S3
 
-    python download.py 
+    python download.py
         --partner nwdh \
         --limit 1000000000000 \
         --source s3://dpla-master-dataset/nwdh/wiki/[]/ \
@@ -21,7 +21,7 @@ import boto3
 
 from wikiutils.utils import Utils as WikimediaUtils
 from wikiutils.downloader import Downloader as WikimediaDownloader
-from wikiutils.exceptions import DownloadException
+from wikiutils.exceptions import DownloadException, IIIFException
 from wikiutils.logger import WikimediaLogger
 from wikiutils.emailer import SesMailSender, SesDestination, DownloadSummary
 
@@ -45,7 +45,7 @@ output_base = ""  # output location
 # Max file size is the maximum size of a file to download
 # Default value is 10GB
 max_filesize = 10737418240
-# File filter is a file that contains a list of DPLA IDs to download and is used to only 
+# File filter is a file that contains a list of DPLA IDs to download and is used to only
 # upload a specific set of DPLA IDs
 file_filter = None
 
@@ -58,13 +58,13 @@ dpla_item_count = 1     # Running incrementer for tracking total number of DPLA 
 
 try:
     opts, args = getopt.getopt(sys.argv[1:],
-                               "hi:u:o:", 
+                               "hi:u:o:",
                                ["partner=",
-                                "limit=", 
-                                "batch_limit=", 
-                                "input=", 
-                                "output=", 
-                                "max_filesize=", 
+                                "limit=",
+                                "batch_limit=",
+                                "input=",
+                                "output=",
+                                "max_filesize=",
                                 "file_filter="])
 except getopt.GetoptError:
     print(
@@ -142,22 +142,26 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
         log.error("Unable to get all attributes from row %s: %s", row, str(ae))
         break
 
-    # If a file_filter paramter is specified then only download files that match the DPLA IDs in 
+    # If a file_filter paramter is specified then only download files that match the DPLA IDs in
     # the file
     # TODO Rewrite this as a prefilter of the parquet files
     if file_filter and (dpla_id not in ids):
         continue
 
     # Are we working with IIIF or media_master?
-    download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
-    log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
-    
+    try:
+        download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
+        log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
+    except IIIFException as iffex:
+        log.error("Unable to get IIIF urls for %s: %s", dpla_id, str(iffex))
+        continue
+
     page = 1
     images = []
     for url in download_urls:
-        filesize = 0 
+        filesize = 0
         # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
-        destination_path = downloader.destination_path(output_base, batch_number, page, dpla_id) 
+        destination_path = downloader.destination_path(output_base, batch_number, page, dpla_id)
         # If the destination path is not an S3 path then create the parent dirs on the local file system
         try:
             output, filesize = downloader.download(source=url, destination=destination_path)
@@ -170,7 +174,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
             break
 
         # Create a row for a single asset and if multiple assests exist them append them to the rows list
-        # When a single asset fails to download then this object is destroyed by the `break`` above and 
+        # When a single asset fails to download then this object is destroyed by the `break`` above and
         # the rows for already downloaded assets are not added to the final dataframe
         row = {
             'dpla_id': dpla_id,
@@ -218,13 +222,12 @@ log.info("Fin.")
 # Send email notification
 ses_client = boto3.client('ses', region_name='us-east-1')
 emailer = SesMailSender(ses_client)
-summary = DownloadSummary(partner_name=partner_name,
+summary = DownloadSummary(partner=partner_name,
                           log_url=public_url,
-                          total_download=utils.sizeof_fmt(total_downloaded),
                           status=downloader.get_status())
 
 emailer.send_email(source="tech@dp.la",
-                   destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else? 
+                   destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else?
                    subject=summary.subject(),
                    text=summary.body_text(),
                    html=summary.body_html(),

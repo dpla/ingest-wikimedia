@@ -3,34 +3,33 @@
 #   https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
 
 from botocore.exceptions import ClientError
+from wikiutils.utils import Utils
 
 class UploadSummary:
     """
     Summarizes upload events"""
 
-    partner_name = ""
-    total_upload = 0
-    log_url = ""
+    partner = None
+    log_url = None
     status = None
 
-    def __init__(self, partner_name, log_url, total_upload, status):
-        self.partner_name = partner_name
-        self.total_upload = total_upload
+    def __init__(self, partner, log_url, status):
+        self.partner = partner
         self.log_url = log_url
         self.status = status
 
     def subject(self):
         """
         Returns the subject of the email."""
-        return f"{self.partner_name.upper()} - Wikimedia upload finished"
-    
+        return f"{self.partner.upper()} - Wikimedia upload finished"
+
     def body_text(self):
         """
         Returns the body of the email in plain text format."""
-
+        formatted_size = Utils().sizeof_fmt(self.status.cumulative_size)
         return f"""
-            Finished uploading all Wikimedia assets for {self.partner_name.upper()}.     
-        
+            Finished uploading all Wikimedia assets for {self.partner.upper()}.
+
             DPLA records: TBD
             ----------------------------------------
             Images
@@ -40,39 +39,139 @@ class UploadSummary:
             - Failed: {self.status.fail_count}
             ----------------------------------------
             File information
-            - Added: {self.total_upload}
+            - Added: {formatted_size}
             ----------------------------------------
             Log file available at {self.log_url}
         """
-    
+
     def body_html(self):
-        return ""
+        return f"""
+            <html>
+            <head>
+                <meta content="text/html; charset=UTF-8" http-equiv="content-type">
+                <style type="text/css">.lst-kix_ugfaekz7c25d-4>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-5>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-7>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-1>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-5>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-4>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-8>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-0>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-8>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-1>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-3>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-6>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-7>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-7{{list-style-type:none}}.lst-kix_75qdqn1hz53m-2>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-8{{list-style-type:none}}.lst-kix_75qdqn1hz53m-6>li:before{{content:"-  "}}ul.lst-kix_ugfaekz7c25d-0{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-1{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-2{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-5{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-6{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-3{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-4{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-1{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-2{{list-style-type:none}}.lst-kix_75qdqn1hz53m-0>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-0{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-3{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-4{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-5{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-6{{list-style-type:none}}.lst-kix_ugfaekz7c25d-2>li:before{{content:"-  "}}ul.lst-kix_ugfaekz7c25d-7{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-8{{list-style-type:none}}.lst-kix_ugfaekz7c25d-3>li:before{{content:"-  "}}ol{{margin:0;padding:0}}table td,table th{{padding:0}}.c2{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:99pt;border-top-color:#ffffff;border-bottom-style:solid}}.c1{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:218.2pt;border-top-color:#ffffff;border-bottom-style:solid}}.c13{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:109.5pt;border-top-color:#ffffff;border-bottom-style:solid}}.c10{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:208.5pt;border-top-color:#ffffff;border-bottom-style:solid}}.c0{{color:#000000;font-weight:400;text-decoration:none;vertical-align:baseline;font-size:11pt;font-family:"Arial";font-style:normal}}.c3{{color:#000000;font-weight:700;text-decoration:none;vertical-align:baseline;font-size:11pt;font-family:"Arial";font-style:normal}}.c7{{padding-top:0pt;padding-bottom:0pt;line-height:1.15;orphans:2;widows:2;text-align:left;height:11pt}}.c11{{padding-top:0pt;padding-bottom:0pt;line-height:1.15;orphans:2;widows:2;text-align:left}}.c4{{padding-top:0pt;padding-bottom:0pt;line-height:1.0;text-align:left}}.c15{{text-decoration-skip-ink:none;-webkit-text-decoration-skip:none;color:#1155cc;text-decoration:underline}}.c8{{border-spacing:0;border-collapse:collapse;margin-right:auto}}.c9{{background-color:#ffffff;max-width:468pt;padding:72pt 72pt 72pt 72pt}}.c5{{color:inherit;text-decoration:inherit}}.c14{{font-weight:700}}.c6{{height:0pt}}.c12{{height:11pt}}.title{{padding-top:0pt;color:#000000;font-size:26pt;padding-bottom:3pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}.subtitle{{padding-top:0pt;color:#666666;font-size:15pt;padding-bottom:16pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}li{{color:#000000;font-size:11pt;font-family:"Arial"}}p{{margin:0;color:#000000;font-size:11pt;font-family:"Arial"}}h1{{padding-top:20pt;color:#000000;font-size:20pt;padding-bottom:6pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h2{{padding-top:18pt;color:#000000;font-size:16pt;padding-bottom:6pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h3{{padding-top:16pt;color:#434343;font-size:14pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h4{{padding-top:14pt;color:#666666;font-size:12pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h5{{padding-top:12pt;color:#666666;font-size:11pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h6{{padding-top:12pt;color:#666666;font-size:11pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;font-style:italic;orphans:2;widows:2;text-align:left}}</style>
+            </head>
+            <body class="c9 doc-content">
+                <p class="c11"><span>Finished uploading all Wikimedia assets for </span><span class="c14">PARTNER. </span><span>Click </span><span class="c15"><a class="c5" href="https://www.google.com/url?q=https://www.google.com/&amp;sa=D&amp;source=editors&amp;ust=1691999047767600&amp;usg=AOvVaw2jE6lkAYiPD6rIoFOjXsCz">here</a></span><span>&nbsp;to download the complete log file</span><span class="c3">.</span></p>
+                <p class="c7"><span class="c3"></span></p>
+                <hr>
+                <p class="c7"><span class="c0"></span></p>
+                <p class="c7"><span class="c0"></span></p>
+                <a id="t.ada0f9698b83dc43aac32176437d71a8ee112aac"></a><a id="t.0"></a>
+                <table class="c8">
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c11"><span class="c3">DPLA records</span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">___DPLA_RECORDS</span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c11"><span class="c14">Images</span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c7"><span class="c0"></span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c11"><span class="c0">Attempted</span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">{self.status.attempted}</span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c11"><span class="c0">Uploaded</span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">{self.status.upload_count}</span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c11"><span class="c0">Skipped</span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">{self.status.skip_count}</span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c11"><span class="c0">Failed</span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">{self.status.fail_count}</span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c10" colspan="2" rowspan="1">
+                        <p class="c4"><span class="c3">File Information</span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                    </tr>
+                    <tr class="c6">
+                        <td class="c2" colspan="1" rowspan="1">
+                        <p class="c4 c12"><span class="c0"></span></p>
+                        </td>
+                        <td class="c13" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">Size</span></p>
+                        </td>
+                        <td class="c1" colspan="1" rowspan="1">
+                        <p class="c4"><span class="c0">{Utils().sizeof_fmt(self.status.cumulative_size)}</span></p>
+                        </td>
+                    </tr>
+                </table>
+                <p class="c7"><span class="c0"></span></p>
+            </body>
+            </html>"""
 
 class DownloadSummary:
     """
     Summarizes download events"""
-    partner_name = ""
-    total_download = 0
+    partner = ""
     log_url = ""
     status = None
 
-    def __init__(self, partner_name, log_url, total_download, status):
-        self.partner_name = partner_name
-        self.total_download = total_download
+    def __init__(self, partner, log_url, status):
+        self.partner = partner
         self.log_url = log_url
         self.status = status
 
     def subject(self):
         """
         Returns the subject of the email."""
-        return f"{self.partner_name.upper()} - Wikimedia download finished"
-    
+        return f"{self.partner.upper()} - Wikimedia download finished"
+
     def body_text(self):
         """
         Returns the body of the email in plain text format."""
         return f"""
-            Finished downloading all Wikimedia assets for {self.partner_name.upper()}.     
-        
+            Finished downloading all Wikimedia assets for {self.partner.upper()}.
+
             DPLA records: TBD
             ----------------------------------------
             Images
@@ -83,7 +182,7 @@ class DownloadSummary:
             ----------------------------------------
             File information
             - Downloaded: TBD
-            - All records: {self.total_download}
+            - All records: {Utils().sizeof_fmt(self.status.cumulative_size)}
             ----------------------------------------
             Log file available at {self.log_url}
         """
@@ -98,7 +197,7 @@ class DownloadSummary:
                 <style type="text/css">.lst-kix_ugfaekz7c25d-4>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-5>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-7>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-1>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-5>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-4>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-8>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-0>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-8>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-1>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-3>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-6>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-7>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-7{{list-style-type:none}}.lst-kix_75qdqn1hz53m-2>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-8{{list-style-type:none}}.lst-kix_75qdqn1hz53m-6>li:before{{content:"-  "}}ul.lst-kix_ugfaekz7c25d-0{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-1{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-2{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-5{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-6{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-3{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-4{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-1{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-2{{list-style-type:none}}.lst-kix_75qdqn1hz53m-0>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-0{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-3{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-4{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-5{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-6{{list-style-type:none}}.lst-kix_ugfaekz7c25d-2>li:before{{content:"-  "}}ul.lst-kix_ugfaekz7c25d-7{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-8{{list-style-type:none}}.lst-kix_ugfaekz7c25d-3>li:before{{content:"-  "}}ol{{margin:0;padding:0}}table td,table th{{padding:0}}.c5{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:99pt;border-top-color:#ffffff;border-bottom-style:solid}}.c7{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:109.5pt;border-top-color:#ffffff;border-bottom-style:solid}}.c12{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:218.2pt;border-top-color:#ffffff;border-bottom-style:solid}}.c0{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:208.5pt;border-top-color:#ffffff;border-bottom-style:solid}}.c3{{padding-top:0pt;padding-bottom:0pt;line-height:1.15;orphans:2;widows:2;text-align:left;height:11pt}}.c10{{color:#000000;font-weight:700;text-decoration:none;vertical-align:baseline;font-size:11pt;font-family:"Arial";font-style:normal}}.c2{{color:#000000;font-weight:400;text-decoration:none;vertical-align:baseline;font-size:11pt;font-family:"Arial";font-style:normal}}.c8{{padding-top:0pt;padding-bottom:0pt;line-height:1.15;orphans:2;widows:2;text-align:left}}.c4{{padding-top:0pt;padding-bottom:0pt;line-height:1.0;text-align:left;height:11pt}}.c11{{text-decoration-skip-ink:none;-webkit-text-decoration-skip:none;color:#1155cc;text-decoration:underline}}.c15{{border-spacing:0;border-collapse:collapse;margin-right:auto}}.c6{{padding-top:0pt;padding-bottom:0pt;line-height:1.0;text-align:left}}.c9{{background-color:#ffffff;max-width:468pt;padding:72pt 72pt 72pt 72pt}}.c13{{color:inherit;text-decoration:inherit}}.c14{{font-weight:700}}.c1{{height:0pt}}.title{{padding-top:0pt;color:#000000;font-size:26pt;padding-bottom:3pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}.subtitle{{padding-top:0pt;color:#666666;font-size:15pt;padding-bottom:16pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}li{{color:#000000;font-size:11pt;font-family:"Arial"}}p{{margin:0;color:#000000;font-size:11pt;font-family:"Arial"}}h1{{padding-top:20pt;color:#000000;font-size:20pt;padding-bottom:6pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h2{{padding-top:18pt;color:#000000;font-size:16pt;padding-bottom:6pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h3{{padding-top:16pt;color:#434343;font-size:14pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h4{{padding-top:14pt;color:#666666;font-size:12pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h5{{padding-top:12pt;color:#666666;font-size:11pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h6{{padding-top:12pt;color:#666666;font-size:11pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;font-style:italic;orphans:2;widows:2;text-align:left}}</style>
             </head>
             <body class="c9 doc-content">
-                <p class="c8"><span>Finished downloading all Wikimedia assets for </span><span class="c14">{self.partner_name.upper()}. </span><span>Click </span><span class="c11"><a class="c13" href="{self.log_url}">here</a></span><span>&nbsp;to download the complete log file</span><span class="c10">.</span></p>
+                <p class="c8"><span>Finished downloading all Wikimedia assets for </span><span class="c14">{self.partner.upper()}. </span><span>Click </span><span class="c11"><a class="c13" href="{self.log_url}">here</a></span><span>&nbsp;to download the complete log file</span><span class="c10">.</span></p>
                 <p class="c3"><span class="c10"></span></p>
                 <hr>
                 <p class="c3"><span class="c2"></span></p>
@@ -198,7 +297,7 @@ class DownloadSummary:
                         <p class="c6"><span class="c2">All records</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.total_download}</span></p>
+                        <p class="c6"><span class="c2">{Utils().sizeof_fmt(self.status.cumulative_size)}</span></p>
                         </td>
                     </tr>
                 </table>
@@ -248,7 +347,7 @@ class SesMailSender:
             raise
         else:
             return message_id
-        
+
 
 class SesDestination:
     """Contains data about an email destination."""
