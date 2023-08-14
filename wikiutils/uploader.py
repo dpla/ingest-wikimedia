@@ -23,9 +23,16 @@ class UploadStatus:
     skip_count = 0
     fail_count = 0
     upload_count = 0
+    attempted = 0
 
     def __init__(self):
         pass
+
+    def set_total(self, total):
+        """
+        Set the total number of uploads
+        """
+        UploadStatus.attempted = total
 
     def increment(self, status):
         """
@@ -39,7 +46,7 @@ class UploadStatus:
             UploadStatus.fail_count += 1
         else:
             raise UploadException(f"Unknown status: {status}")
-        
+   
 class Uploader:
     """
     Upload to Wikimedia Commons
