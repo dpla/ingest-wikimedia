@@ -141,6 +141,9 @@ class Uploader:
         """
         Upload images to Wikimedia Commons"""
         unique_ids = self._unique_ids(df)
+        # Set the total number of intended uploads and number of unique DPLA records
+        self._status.set_total(len(df))
+        self._status.set_dpla_count(len(unique_ids))
 
         for row in df.itertuples(index=self.IN_COULUMNS):
             dpla_id, path, title, wiki_markup, size = None, None, None, None, None

@@ -46,7 +46,7 @@ uploader.execute_upload(data_in)
 
 # Summarize upload
 status = uploader.get_status()
-log.info(f"Attempted: {status.attempted} files")
+log.info(f"Attempted: {status.attempted} files for {status.dpla_count} DPLA records")
 log.info(f"Uploaded {status.upload_count} new files")
 log.info(f"Failed {status.fail_count} files")
 log.info(f"Skipped {status.skip_count} files")
