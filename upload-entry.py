@@ -115,10 +115,7 @@ log.info("Fin.")
 # Send email notification
 ses_client = boto3.client('ses', region_name='us-east-1')
 emailer = SesMailSender(ses_client)
-summary = UploadSummary(partner_name=partner_name,
-                          log_url=public_url,
-                          total_download=-1,
-                          status=status)
+summary = UploadSummary(partner_name=partner_name, log_url=public_url, total_upload=0, status=status)
 
 emailer.send_email(source="tech@dp.la",
                    destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else? 

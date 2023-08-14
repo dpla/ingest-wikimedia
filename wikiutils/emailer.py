@@ -4,7 +4,7 @@
 
 from botocore.exceptions import ClientError
 
-class UploadSummary():
+class UploadSummary:
     """
     Summarizes upload events"""
 
@@ -13,7 +13,7 @@ class UploadSummary():
     log_url = ""
     status = None
 
-    def ___init___(self, partner_name, log_url, total_upload, status):
+    def __init__(self, partner_name, log_url, total_upload, status):
         self.partner_name = partner_name
         self.total_upload = total_upload
         self.log_url = log_url
@@ -34,8 +34,8 @@ class UploadSummary():
             DPLA records: TBD
             ----------------------------------------
             Images
-            - Attempted: {self.status.download_count + self.status.skip_count + self.status.fail_count}
-            - Uploaded: {self.status.download_count}
+            - Attempted: {self.status.upload_count + self.status.skip_count + self.status.fail_count}
+            - Uploaded: {self.status.upload_count}
             - Skipped: {self.status.skip_count}
             - Failed: {self.status.fail_count}
             ----------------------------------------
@@ -44,8 +44,9 @@ class UploadSummary():
             ----------------------------------------
             Log file available at {self.log_url}
         """
+    
     def body_html(self):
-        pass
+        return ""
 
 class DownloadSummary:
     """
