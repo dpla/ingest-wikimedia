@@ -7,13 +7,17 @@ Read parquet file and then upload assets
 """
 import getopt
 import sys
+import boto3
 
 from wikiutils.utils import Utils
 from wikiutils.logger import WikimediaLogger
-from wikiutils.uploader import Uploader
+from wikiutils.uploader import Uploader, UploadStatus
 from wikiutils.exceptions import UploadException
+from wikiutils.emailer import SesMailSender, SesDestination, UploadSummary
 
 utils = Utils()
+status = UploadStatus()
+
 partner_name, input_df = None, None
 failed_count, upload_count, skip_count, total_count = 0, 0, 0, 0
 columns = {
@@ -74,7 +78,7 @@ for row in data_in.itertuples(index=columns):
         if wiki_page is None:
             # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
             log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
-            skip_count += 1
+            status.increment(UploadStatus.SKIPPED)
             continue
 
         # Upload image to wiki page
@@ -88,22 +92,37 @@ for row in data_in.itertuples(index=columns):
         upload_count += 1
     except UploadException as upload_exec:
         log.error("Upload error: %s", str(upload_exec))
-        failed_count += 1
+        status.increment(UploadStatus.FAILED)
         continue
     except Exception as exception:
         log.error("Unknown error: %s", str(exception))
-        failed_count += 1
+        status.increment(UploadStatus.FAILED)
         continue
 
 # Summarize upload
 log.info(f"Finished upload for {input_df}")
-log.info(f"Attempted: {total_count} file")
-log.info(f"Uploaded {upload_count} new files")
-log.info(f"Failed {failed_count} files")
-log.info(f"Skipped {skip_count} files")
+log.info(f"Attempted: {status.skip_count + status.fail_count + status.upload_count} file")
+log.info(f"Uploaded {status.upload_count} new files")
+log.info(f"Failed {status.fail_count} files")
+log.info(f"Skipped {status.skip_count} files")
 
 # Upload log file to s3
 bucket, key = utils.get_bucket_key(input_df)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
 log.info("Fin.")
+
+# Send email notification
+ses_client = boto3.client('ses', region_name='us-east-1')
+emailer = SesMailSender(ses_client)
+summary = UploadSummary(partner_name=partner_name,
+                          log_url=public_url,
+                          total_download=-1,
+                          status=status)
+
+emailer.send_email(source="tech@dp.la",
+                   destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else? 
+                   subject=summary.subject(),
+                   text=summary.body_text(),
+                   html=summary.body_html(),
+                   reply_tos=["tech@dp.la"])

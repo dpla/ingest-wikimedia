@@ -3,7 +3,6 @@ Upload images to Wikimedia Commons
 
 """
 import mimetypes
-import os
 import tempfile
 
 import pywikibot
@@ -13,6 +12,34 @@ import botocore
 from wikiutils.exceptions import UploadException
 from wikiutils.utils import Utils as WikimediaUtils
 
+class UploadStatus:
+    """
+    Status of uploads
+    """
+    SKIPPED = "SKIPPED"
+    UPLOADED = "UPLOADED"
+    FAILED = "FAILED"
+
+    skip_count = 0
+    fail_count = 0
+    upload_count = 0
+
+    def __init__(self):
+        pass
+
+    def increment(self, status):
+        """
+        Increment the status
+        """
+        if status == UploadStatus.SKIPPED:
+            UploadStatus.skip_count += 1
+        elif status == UploadStatus.UPLOADED:
+            UploadStatus.upload_count += 1
+        elif status == UploadStatus.FAILED:
+            UploadStatus.fail_count += 1
+        else:
+            raise UploadException(f"Unknown status: {status}")
+        
 class Uploader:
     """
     Upload to Wikimedia Commons

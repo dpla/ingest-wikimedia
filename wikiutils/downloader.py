@@ -34,8 +34,6 @@ class DownloadStatus:
         else:
             raise DownloadException(f"Unknown status: {status}")
 
-
-
 class Downloader:
     """
     Download images from parters
