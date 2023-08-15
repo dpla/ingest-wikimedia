@@ -343,8 +343,7 @@ class SesMailSender:
             response = self.ses_client.send_email(**send_args)
             message_id = response['MessageId']
         except ClientError:
-            print(
-                "Couldn't send mail from %s to %s.", source, destination.tos)
+            print(f"Couldn't send mail from {source} to {destination}.")
             raise
         else:
             return message_id
