@@ -21,7 +21,7 @@ class Uploader:
 
     _site = None
     _log = None
-    _status = None
+    _tracker = None
     _fs = FileSystem()
     s3_helper = S3Helper()
     s3 = boto3.resource('s3')       # Used for download
@@ -46,7 +46,7 @@ class Uploader:
 
     def __init__(self, logger):
         self._log = logger
-        self._status = Tracker()
+        self._tracker = Tracker()
         self._site = pywikibot.Site()
         self._site.login()
         self._log.info(f"Logged in user is: {self._site.user()}")
@@ -75,11 +75,11 @@ class Uploader:
                 else:
                     raise UploadException(f"Unable to download {bucket}{key} to {destination.name}: \
                                           {str(client_error)}") from client_error
-    def get_status(self):
+    def get_tracker(self):
         """
         Return the status of the upload
         """
-        return self._status
+        return self._tracker
 
     def _unique_ids(self, df):
         """
@@ -136,11 +136,11 @@ class Uploader:
                             page_title=page_title)
                 self._tracker.increment(Tracker.UPLOADED, size=size)
             except UploadException as upload_exec:
-                self._log.error("Upload error: %s", str(upload_exec))
+                self._log.error(f"Upload error {page_title} -- {str(upload_exec)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
             except Exception as exception:
-                self._log.error(f"Unknown error: {str(exception)}")
+                self._log.error(f"Unknown error {page_title} -- {str(exception)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
 
