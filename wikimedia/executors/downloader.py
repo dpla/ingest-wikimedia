@@ -2,11 +2,10 @@ import os
 import tempfile
 import requests
 import magic
-import validators
 
 from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
-from trackers.tracker import DownloadTracker
+from trackers.tracker import Tracker
 
 class Downloader:
     """
@@ -14,7 +13,7 @@ class Downloader:
     """
     log = None
     _s3 = S3Helper()
-    _status = DownloadTracker()
+    _tracker = Tracker()
 
     # Column names for the output parquet file
     UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
@@ -58,13 +57,14 @@ class Downloader:
             exists, size = self._s3.file_exists(bucket=bucket, key=key)
             if exists:
                 self.log.info(f" - Skipping {destination}, already exists in s3")
-                self._status.increment(DownloadTracker.SKIPPED)
+                self._tracker.increment(Tracker.SKIPPED)
                 return destination, size
             self.log.info(f" - Downloading {source} to {destination}")
-            self._status.increment(DownloadTracker.DOWNLOADED)
-            return self._download_to_s3(source=source, bucket=bucket, key=key)
+            destination, size = self._download_to_s3(source=source, bucket=bucket, key=key)
+            self._tracker.increment(Tracker.DOWNLOADED, size=size)
+            return destination, size
         except Exception as exeception:
-            self._status.increment(DownloadTracker.FAILED)
+            self._tracker.increment(Tracker.FAILED)
             raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
     def _download_to_local(self, source, file):
@@ -85,8 +85,6 @@ class Downloader:
             return file, file_size
         except Exception as exeception:
             raise DownloadException(f"Error in download_local() {str(exeception)}") from exeception
-        finally:
-            requests.close()
 
     def _download_to_s3(self, source, bucket, key):
         """
@@ -103,7 +101,7 @@ class Downloader:
         """
         # Create temp local file and download source file to it
         temp_file = tempfile.NamedTemporaryFile(delete=False)
-        _, size = self.download(source=source, file=temp_file.name)
+        _, size = self.download(source=source, destination=temp_file.name)
         # Get content type from file, used in metadata for s3 upload
         content_type = magic.from_file(temp_file.name, mime=True)
         try:

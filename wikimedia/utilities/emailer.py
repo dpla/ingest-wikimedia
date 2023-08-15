@@ -10,12 +10,12 @@ class UploadSummary:
 
     partner = None
     log_url = None
-    status = None
+    tracker = None
 
-    def __init__(self, partner, log_url, status):
+    def __init__(self, partner, log_url, tracker):
         self.partner = partner
         self.log_url = log_url
-        self.status = status
+        self.tracker = tracker
 
     def subject(self):
         """
@@ -28,16 +28,16 @@ class UploadSummary:
         return f"""
             Finished uploading all Wikimedia assets for {self.partner.upper()}.
 
-            DPLA records: {self.status.dpla_count}
+            DPLA records: {self.tracker.dpla_count}
             ----------------------------------------
             Images
-            - Attempted: {self.status.attempted}
-            - Uploaded: {self.status.upload_count}
-            - Skipped: {self.status.skip_count}
-            - Failed: {self.status.fail_count}
+            - Attempted: {self.tracker.attempted}
+            - Uploaded: {self.tracker.upload_count}
+            - Skipped: {self.tracker.skip_count}
+            - Failed: {self.tracker.fail_count}
             ----------------------------------------
             File information
-            - Added: {sizeof_fmt(self.status.cumulative_size)}
+            - Added: {sizeof_fmt(self.tracker.cumulative_size)}
             ----------------------------------------
             Log file available at {self.log_url}
         """
@@ -65,7 +65,7 @@ class UploadSummary:
                         <p class="c4 c12"><span class="c0"></span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{self.status.dpla_count}</span></p>
+                        <p class="c4"><span class="c0">{self.tracker.dpla_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c6">
@@ -87,7 +87,7 @@ class UploadSummary:
                         <p class="c11"><span class="c0">Attempted</span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{self.status.attempted}</span></p>
+                        <p class="c4"><span class="c0">{self.tracker.attempted}</span></p>
                         </td>
                     </tr>
                     <tr class="c6">
@@ -98,7 +98,7 @@ class UploadSummary:
                         <p class="c11"><span class="c0">Uploaded</span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{self.status.upload_count}</span></p>
+                        <p class="c4"><span class="c0">{self.tracker.upload_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c6">
@@ -109,7 +109,7 @@ class UploadSummary:
                         <p class="c11"><span class="c0">Skipped</span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{self.status.skip_count}</span></p>
+                        <p class="c4"><span class="c0">{self.tracker.skip_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c6">
@@ -120,7 +120,7 @@ class UploadSummary:
                         <p class="c11"><span class="c0">Failed</span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{self.status.fail_count}</span></p>
+                        <p class="c4"><span class="c0">{self.tracker.fail_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c6">
@@ -139,7 +139,7 @@ class UploadSummary:
                         <p class="c4"><span class="c0">Size</span></p>
                         </td>
                         <td class="c1" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c0">{sizeof_fmt(self.status.cumulative_size)}</span></p>
+                        <p class="c4"><span class="c0">{sizeof_fmt(self.tracker.cumulative_size)}</span></p>
                         </td>
                     </tr>
                 </table>
@@ -152,12 +152,12 @@ class DownloadSummary:
     Summarizes download events"""
     partner = ""
     log_url = ""
-    status = None
+    tracker = None
 
-    def __init__(self, partner, log_url, status):
+    def __init__(self, partner, log_url, tracker):
         self.partner = partner
         self.log_url = log_url
-        self.status = status
+        self.tracker = tracker
 
     def subject(self):
         """
@@ -173,14 +173,14 @@ class DownloadSummary:
             DPLA records: TBD
             ----------------------------------------
             Images
-            - Attempted: {self.status.download_count + self.status.skip_count + self.status.fail_count}
-            - Downloaded: {self.status.download_count}
-            - Skipped: {self.status.skip_count}
-            - Failed: {self.status.fail_count}
+            - Attempted: {self.tracker.download_count + self.tracker.skip_count + self.tracker.fail_count}
+            - Downloaded: {self.tracker.download_count}
+            - Skipped: {self.tracker.skip_count}
+            - Failed: {self.tracker.fail_count}
             ----------------------------------------
             File information
             - Downloaded: TBD
-            - All records: {sizeof_fmt(self.status.cumulative_size)}
+            - All records: {sizeof_fmt(self.tracker.cumulative_size)}
             ----------------------------------------
             Log file available at {self.log_url}
         """
@@ -210,7 +210,7 @@ class DownloadSummary:
                         <p class="c4"><span class="c2"></span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.status.dpla_count}</span></p>
+                        <p class="c6"><span class="c2">{self.tracker.dpla_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -232,7 +232,7 @@ class DownloadSummary:
                         <p class="c8"><span class="c2">Attempted</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.status.attempted}</span></p>
+                        <p class="c6"><span class="c2">{self.tracker.attempted}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -243,7 +243,7 @@ class DownloadSummary:
                         <p class="c8"><span class="c2">Downloaded</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.status.download_count}</span></p>
+                        <p class="c6"><span class="c2">{self.tracker.download_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -254,7 +254,7 @@ class DownloadSummary:
                         <p class="c8"><span class="c2">Skipped</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.status.skip_count}</span></p>
+                        <p class="c6"><span class="c2">{self.tracker.skip_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -265,7 +265,7 @@ class DownloadSummary:
                         <p class="c8"><span class="c2">Failed</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.status.fail_count}</span></p>
+                        <p class="c6"><span class="c2">{self.tracker.fail_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">
@@ -295,7 +295,7 @@ class DownloadSummary:
                         <p class="c6"><span class="c2">All records</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{sizeof_fmt(self.status.cumulative_size)}</span></p>
+                        <p class="c6"><span class="c2">{sizeof_fmt(self.tracker.cumulative_size)}</span></p>
                         </td>
                     </tr>
                 </table>

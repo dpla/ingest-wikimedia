@@ -12,7 +12,7 @@ import numpy as np
 
 from utilities.exceptions import UploadException
 from utilities.fs import FileSystem, S3Helper
-from trackers.tracker import UploadTracker
+from trackers.tracker import Tracker
 
 class Uploader:
     """
@@ -46,7 +46,7 @@ class Uploader:
 
     def __init__(self, logger):
         self._log = logger
-        self._status = UploadTracker()
+        self._status = Tracker()
         self._site = pywikibot.Site()
         self._site.login()
         self._log.info(f"Logged in user is: {self._site.user()}")
@@ -92,8 +92,8 @@ class Uploader:
         Upload images to Wikimedia Commons"""
         unique_ids = self._unique_ids(df)
         # Set the total number of intended uploads and number of unique DPLA records
-        self._status.set_total(len(df))
-        self._status.set_dpla_count(len(unique_ids))
+        self._tracker.set_total(len(df))
+        self._tracker.set_dpla_count(len(unique_ids))
 
         for row in df.itertuples(): #  (index=cols):
             dpla_id, path, title, wiki_markup, size = None, None, None, None, None
@@ -125,7 +125,7 @@ class Uploader:
             if wiki_page is None:
                 # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
                 self._log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
-                self._status.increment(UploadTracker.SKIPPED)
+                self._tracker.increment(Tracker.SKIPPED)
                 continue
             try:
                 # Upload image to wiki page
@@ -134,14 +134,14 @@ class Uploader:
                             text=wiki_markup,
                             file=path,
                             page_title=page_title)
-                self._status.increment(UploadTracker.UPLOADED, size=size)
+                self._tracker.increment(Tracker.UPLOADED, size=size)
             except UploadException as upload_exec:
                 self._log.error("Upload error: %s", str(upload_exec))
-                self._status.increment(UploadTracker.FAILED)
+                self._tracker.increment(Tracker.FAILED)
                 continue
             except Exception as exception:
                 self._log.error(f"Unknown error: {str(exception)}")
-                self._status.increment(UploadTracker.FAILED)
+                self._tracker.increment(Tracker.FAILED)
                 continue
 
 

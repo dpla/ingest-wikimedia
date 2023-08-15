@@ -28,12 +28,7 @@ READ_COLUMNS = { "_1": "id",
 
 TUPLE_INDEX = list(READ_COLUMNS.values())
 
-WRITE_COLUMNS = ['dpla_id',
-                 'path',
-                 'size',
-                 'title',
-                 'markup',
-                 'page']
+WRITE_COLUMNS = ['dpla_id','path','size','title','markup','page']
 
 # partner_name is the hub abbreviation and is used to create the output path
 partner_name = ""
@@ -203,7 +198,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
             'markup': wiki_markup,
             'page': page
         }
-        images.extend(row)
+        images.append(row) # TODO investigate why append is different that extend here.
 
         page += 1  # increment asset count
         # TODO remove batch_downloaded and
