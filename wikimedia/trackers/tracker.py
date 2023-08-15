@@ -8,11 +8,14 @@ class Tracker:
     UPLOADED = "UPLOADED"
 
     dpla_count = 0           # TODO implement in Download.download()
+    dpla_fail_count = 0      # TODO implement in Download.download() this is the number of failed DPLA records which is
+                             #    distinct from the number of failed images
     skip_count = 0
     fail_count = 0
     success_count = 0
     cumulative_size = 0     # TODO implement in Download.download()
     attempted = 0           # TODO implement in Download.download()
+
 
     def __init__(self):
         pass
