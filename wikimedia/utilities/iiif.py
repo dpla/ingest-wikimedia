@@ -50,7 +50,7 @@ class IIIF:
             for image in canvase.get('images', []):
                 url = image.get('resource', {}).get('@id', None)
                 if url:
-                    urls.apppend(url)
+                    urls.append(url)
         return urls
 
     def _get_iiif_manifest(self, url):
