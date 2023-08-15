@@ -142,7 +142,7 @@ if file_filter:
     log.info("Using filter: %s", file_filter)
     with open(file_filter, encoding='utf-8') as f:
         ids = [line.rstrip() for line in f]
-    log.info("Attempting %s DPLA records", len(ids))
+    log.info(f"Attempting len(ids) DPLA records")
 
 data_in = fs.read_parquet(input_data, cols=READ_COLUMNS)
 
@@ -155,7 +155,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
         dpla_id = row.id
         title = row.title
         wiki_markup = row.wiki_markup
-        iiif_manifest = row.iiif
+        manifest = row.iiif
         media_master = row.media_master
     except AttributeError as attribute_error:
         log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
@@ -169,10 +169,10 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
 
     # Are we working with IIIF or media_master?
     try:
-        download_urls = iiif.get_iiif_urls(iiif_manifest) if iiif else media_master
+        download_urls = iiif.get_iiif_urls(manifest) if manifest else media_master
         log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
     except IIIFException as iffex:
-        log.error("Unable to get IIIF urls for %s: %s", dpla_id, str(iffex))
+        log.error(f"Unable to get IIIF urls: {dpla_id} from {manifest}\n- {str(iffex)}")
         continue
 
     page = 1
@@ -188,7 +188,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
                 raise DownloadException(f"Download failed for {url}")
         except DownloadException as de:
             # If a single asset fails for a multi-asset upload then all assets are dropped
-            log.error("Aborting all assets for %s \n- %s", dpla_id, str(de))
+            log.error(f"Aborting all assets for {dpla_id} \n -{str(de)}")
             images = []
             break
 
@@ -203,13 +203,15 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
             'markup': wiki_markup,
             'page': page
         }
-        images.append(row)
+        images.extend(row)
 
         page += 1  # increment asset count
+        # TODO remove batch_downloaded and
         batch_downloaded += filesize # track the cumluative size of this batch
         total_downloaded += filesize # track the cumluative size of the total download
 
-    # append all assets/rows for a given metadata record
+    # Add all assets/rows for a given metadata record. len(images) check is necessary because
+    # we'd get [a,b,[]]
     if len(images) > 0:
         batch_rows.extend(images)
 
@@ -230,7 +232,6 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
 
 # If finished processing parquet files without breaching limits then write data out
 if batch_rows:
-    # downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
     fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
 
 # Save the log file to S3

@@ -2,6 +2,7 @@ import os
 import tempfile
 import requests
 import magic
+import validators
 
 from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
@@ -49,45 +50,43 @@ class Downloader:
                     filesize (in bytes)
         """
         try:
-            # Destination is s3
-            if destination.startswith("s3://"):
-                bucket, key = self._s3.get_bucket_key(destination)
-                exists, size = self._s3.file_exists(bucket=bucket, key=key)
-                if exists:
-                    self.log.info(f" - Skipping {destination}, already exists in s3")
-                    self._status.increment(DownloadTracker.SKIPPED)
-                    return destination, size
-                self.log.info(f" - Downloading {source} to {destination}")
-                self._status.increment(DownloadTracker.DOWNLOADED)
-                return self._download_to_s3(source=source, bucket=bucket, key=key)
-            # Download to local file system
-            return self._download_to_local(source=source, file=destination)
+            # Destination is local
+            if not destination.startswith("s3://"):
+                return self._download_to_local(source=source, file=destination)
+            # Just destination is s3 :pray:
+            bucket, key = self._s3.get_bucket_key(destination)
+            exists, size = self._s3.file_exists(bucket=bucket, key=key)
+            if exists:
+                self.log.info(f" - Skipping {destination}, already exists in s3")
+                self._status.increment(DownloadTracker.SKIPPED)
+                return destination, size
+            self.log.info(f" - Downloading {source} to {destination}")
+            self._status.increment(DownloadTracker.DOWNLOADED)
+            return self._download_to_s3(source=source, bucket=bucket, key=key)
         except Exception as exeception:
             self._status.increment(DownloadTracker.FAILED)
             raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
-    def _download_to_local(self, source, file, overwrite=False):
+    def _download_to_local(self, source, file):
         """
         Download images to local file system and return path to file
         and the size of the file in bytes
 
         :param source: The url to download
         :param file: Full path to save asset (ex /tmp/image.jpg)
-        :param overwrite: Boolean to overwrite existing downloaded file
         :param filexception:
         :return:
         """
-        if overwrite:
-            os.remove(file)
         try:
             response = requests.get(source, timeout=30)
             with open(file, 'wb') as f:
                 f.write(response.content)
+            file_size = os.path.getsize(file)
+            return file, file_size
         except Exception as exeception:
             raise DownloadException(f"Error in download_local() {str(exeception)}") from exeception
-
-        file_size = os.path.getsize(file)
-        return file, file_size
+        finally:
+            requests.close()
 
     def _download_to_s3(self, source, bucket, key):
         """
@@ -104,16 +103,19 @@ class Downloader:
         """
         # Create temp local file and download source file to it
         temp_file = tempfile.NamedTemporaryFile(delete=False)
-        _, size = self._download_to_local(source=source, file=temp_file.name, overwrite=True)
+        _, size = self.download(source=source, file=temp_file.name)
         # Get content type from file, used in metadata for s3 upload
         content_type = magic.from_file(temp_file.name, mime=True)
         try:
             # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
                 self._s3.upload(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
+            return f"s3://{bucket}/{key}", size
+        except Exception as ex:
+            raise DownloadException(f"Error uploading to s3 - s3://{bucket}/{key} -- {str(ex)}") from ex
         finally:
             os.unlink(temp_file.name)
-        return f"s3://{bucket}/{key}", size
+
 
     # TODO remove method, batching is irrelevant and the output
     # path is /base_output

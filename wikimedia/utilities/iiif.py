@@ -58,14 +58,14 @@ class IIIF:
         :return: JSON object
         """
         if not validators.url(url):
-            raise IIIFException(f"Invalid url {url}:")
+            raise IIIFException(f"Invalid url {url}")
         try:
             request = requests.get(url, timeout=30)
             if request.status_code not in [200, 301, 302]:
-                raise IIIFException(f"Unable to request {url}: {request.status_code}")
+                raise IIIFException(f"Unable to request: {url} - Status code {request.status_code}")
             data = request.content
             return json.loads(data)
-        except ConnectionError as connection_error:
-            raise IIIFException(f"Unable to request {url}: {str(connection_error)}") from connection_error
         except json.decoder.JSONDecodeError as json_decode_error:
-            raise IIIFException(f"Unable to decode JSON from {url}: {str(json_decode_error)}") from json_decode_error
+            raise IIIFException(f"Unable to decode JSON: {url} -- {str(json_decode_error)}") from json_decode_error
+        except requests.exceptions.RequestException as re:
+            raise IIIFException(f"Unable to request: {url} -- {str(re)}") from re
