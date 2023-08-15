@@ -134,7 +134,7 @@ log.info(f"Output: {output_base}")
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []
 if file_filter:
-    log.info("Using filter: %s", file_filter)
+    log.info(f"Using filter: {file_filter}")
     with open(file_filter, encoding='utf-8') as f:
         ids = [line.rstrip() for line in f]
     log.info(f"Attempting len(ids) DPLA records")
