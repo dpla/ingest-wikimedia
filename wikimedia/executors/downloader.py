@@ -3,9 +3,9 @@ import tempfile
 import requests
 import magic
 
-from wikimedia.utilities.fs import FileSystem, S3Helper
-from wikimedia.utilities.exceptions import DownloadException
-from wikimedia.trackers.tracker import DownloadTracker
+from utilities.fs import S3Helper
+from utilities.exceptions import DownloadException
+from trackers.tracker import DownloadTracker
 
 class Downloader:
     """

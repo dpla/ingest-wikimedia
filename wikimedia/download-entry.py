@@ -8,13 +8,13 @@ import sys
 import getopt
 import boto3
 
-from wikimedia.utilities.iiif import IIIF
-from wikimedia.executors.downloader import Downloader
-from wikimedia.utilities.fs import FileSystem, S3Helper
-from wikimedia.utilities.exceptions import DownloadException, IIIFException
-from wikimedia.utilities.logger import WikimediaLogger
-from wikimedia.utilities.emailer import SesMailSender, SesDestination, DownloadSummary
-from wikimedia.utilities.format import sizeof_fmt
+from utilities.iiif import IIIF
+from executors.downloader import Downloader
+from utilities.fs import FileSystem, S3Helper
+from utilities.exceptions import DownloadException, IIIFException
+from utilities.logger import WikimediaLogger
+from utilities.emailer import SesMailSender, SesDestination, DownloadSummary
+from utilities.format import sizeof_fmt
 
 if __name__ == "__main__":
     pass
@@ -142,7 +142,7 @@ if file_filter:
         ids = [line.rstrip() for line in f]
     log.info("Attempting %s DPLA records", len(ids))
 
-data_in = fs.read_parquet(input_data, columns=READ_COLUMNS)
+data_in = fs.read_parquet(input_data, cols=READ_COLUMNS)
 
 for row in data_in.itertuples(index=TUPLE_INDEX):
     batch_out = downloader.batch_parquet_path(base=output_base, n=batch_number)

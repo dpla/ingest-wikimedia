@@ -8,7 +8,7 @@ __license__ = "MIT"
 import json
 import requests
 
-from wikimedia.utilities.exceptions import IIIFException
+from utilities.exceptions import IIIFException
 
 class IIIF:
     """
