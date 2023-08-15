@@ -23,16 +23,15 @@ class S3Helper:
     # Used for head operation in file_exists and upload_fileobj in upload
     s3_client = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
 
+    # Remove retry handler for s3, this is to prevent the botocore retry
+    # handler from retrying. Taken from https://tinyurl.com/jd27xjz4
     deq = s3_client.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
     while len(deq) > 0:
         s3_client.meta.events.unregister("needs-retry.s3", handler=deq.pop())
 
     def __init__(self):
         pass
-        # Remove retry handler for s3, this is to prevent the botocore retry
-        # handler from retrying. Taken from https://tinyurl.com/jd27xjz4
 
-    # FIXME remove function in FileSystem
     def file_exists(self, bucket, key):
         """
         Check to see if the file exists in s3
@@ -119,5 +118,4 @@ class FileSystem:
         :param path: Path to parquet files
         :return: List of parquet files
         """
-        # return self.s3_resource.list_objects(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
         return S3Helper().list_files(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')

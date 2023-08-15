@@ -49,8 +49,6 @@ class IIIF:
         else:
             # More than one sequence, return empty list and log some kind of message
             raise IIIFException(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
-            # self.logger.info("Got more than one IIIF sequence. Unsure of meaning. %s", iiif)
-            # return []
 
         for canvas in canvases:
             try:
@@ -60,7 +58,6 @@ class IIIF:
                 images_urls.append(image_url)
             except KeyError as keyerr:
                 raise IIIFException(f"No `image` key for: {iiif}") from keyerr
-                # self.logger.error("No images defined in %s", iiif)
         return images_urls
 
     def _get_iiif_manifest(self, url):
@@ -69,7 +66,11 @@ class IIIF:
         """
         try:
             request = requests.get(url, timeout=30)
+            if request.status_code not in [200, 301, 302]:
+                raise Exception(f"Unable to request {url}: {request.status_code}")
             data = request.content
             return json.loads(data)
         except ConnectionError as connection_error:
             raise Exception(f"Unable to request {url}: {str(connection_error)}") from connection_error
+        except json.decoder.JSONDecodeError as json_decode_error:
+            raise Exception(f"Unable to decode JSON from {url}: {str(json_decode_error)}") from json_decode_error

@@ -3,17 +3,6 @@ Downloads images from a DPLA partner to be uploaded to Wikimedia Commons.
     - Downloads images in batches
     - Writes out a parquet file with metadata for each image
     - Uploads parquet file to S3
-
-    python download.py
-        --partner nwdh \
-        --limit 1000000000000 \
-        --source s3://dpla-master-dataset/nwdh/wiki/[]/ \
-        --output s3://dpla-wikimeida/nwdh/[date]
-
-    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/1/image.jpeg
-    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/2/image.jpeg
-    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/3/image.jpeg
-    s3://wiki/plainstopeaks/20210120/batch_1/data/
 """
 import sys
 import getopt
@@ -26,7 +15,6 @@ from wikimedia.utilities.exceptions import DownloadException, IIIFException
 from wikimedia.utilities.logger import WikimediaLogger
 from wikimedia.utilities.emailer import SesMailSender, SesDestination, DownloadSummary
 from wikimedia.utilities.format import sizeof_fmt
-
 
 if __name__ == "__main__":
     pass
@@ -49,21 +37,31 @@ WRITE_COLUMNS = ['dpla_id',
 
 # partner_name is the hub abbreviation and is used to create the output path
 partner_name = ""
-# Download limit is the total number of bytes to download
-total_limit = 0  # Total number of bytes to download
-# batch_limit is the number of bytes to download in a batch
-# Default value is 250 GB
-batch_limit = 268435456000
+
 # Input parquet file (the wiki output of ingestion3)
 input_data = ""
 # Output path is where the assets are saved to
 output_base = ""  # output location
-# Max file size is the maximum size of a file to download
-# Default value is 10GB
-max_filesize = 10737418240
+
+# TODO this is also a little bit tied to total_limit where is only applies to NARA or SI where
+# we don't want to download the entire dataset and have a target set of records.
+
 # File filter is a file that contains a list of DPLA IDs to download and is used to only
 # upload a specific set of DPLA IDs
 file_filter = None
+
+# TODO This will still generally be a flag but the most common use will be fore
+# NARA so we don't download 15TB on a single run. Documentation should reflect this.
+
+
+total_limit = 0  # the total number of bytes to download, 0 is no limit
+
+# TODO This should be removed on a future PR. We are moving
+# entirely away from batching.
+batch_limit = 268435456000 # batch size
+
+# TODO this is no longer required and should be removed entirely. Will also remove a if/else check below.
+max_filesize = 10737418240 # Default value is 10GB
 
 # Controlling vars
 batch_rows = list()     #
@@ -133,12 +131,8 @@ log = WikimediaLogger(partner_name=partner_name, event_type="download")
 downloader = Downloader(logger=log)
 
 # Summary of input parameters
-log.info(f"Total download limit: {sizeof_fmt(total_limit)}")
-log.info(f"Batch size: {sizeof_fmt(batch_limit)}")
-log.info(f"Max file size: {sizeof_fmt(max_filesize)}")
 log.info(f"Input: {input_data}")
 log.info(f"Output: {output_base}")
-
 
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []
@@ -218,6 +212,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
     dpla_item_count += 1
 
     # If the batch exceeds the batch limit size then write out the dataframe and reset the metrics
+    # TODO this will get removed on migration away from batch.
     if batch_downloaded > batch_limit:
         fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
         # Reset batch control vars
@@ -239,7 +234,7 @@ bucket, key = s3.get_bucket_key(output_base)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
 log.info(f"Total download size: {sizeof_fmt(total_downloaded)}")
-log.info("Fin.")
+log.info("Fin")
 
 # Send email notification
 ses_client = boto3.client('ses', region_name='us-east-1')
