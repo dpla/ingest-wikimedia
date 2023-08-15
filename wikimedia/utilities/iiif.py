@@ -7,6 +7,7 @@ __license__ = "MIT"
 
 import json
 import requests
+import validators
 
 from utilities.exceptions import IIIFException
 
@@ -39,31 +40,25 @@ class IIIF:
         :return: List of image URLs
         """
 
-        canvases = []
-        images_urls = []
+        manifest = self._get_iiif_manifest(iiif)
 
-        iiif_manifest = self._get_iiif_manifest(iiif)
-        # if 'sequences' in iiif_manifest and there is one sequence value
-        if 'sequences' in iiif_manifest and len(iiif_manifest['sequences']) == 1:
-            canvases = iiif_manifest['sequences'][0]['canvases'] if 'canvases' in iiif_manifest['sequences'][0] else []
-        else:
-            # More than one sequence, return empty list and log some kind of message
-            raise IIIFException(f"Got more than one IIIF sequence. Unsure of meaning. {iiif}")
-
-        for canvas in canvases:
-            try:
-                image_url = canvas['images'][0]['resource']['@id']
-                # if missing file extension add it to URL to be requested
-                image_url = image_url if '.' in image_url[image_url.rfind('/'):] else f"{image_url}.jpg"
-                images_urls.append(image_url)
-            except KeyError as keyerr:
-                raise IIIFException(f"No `image` key for: {iiif}") from keyerr
-        return images_urls
+        urls = []
+        sequences = manifest.get('sequences', [])
+        sequence = sequences[0:1] if len(sequences) == 1 else None
+        canvases = sequence[0].get('canvases', []) if sequence else  []
+        for canvase in canvases:
+            for image in canvase.get('images', []):
+                url = image.get('resource', {}).get('@id', None)
+                if url:
+                    urls.apppend(url)
+        return urls
 
     def _get_iiif_manifest(self, url):
         """
         :return: JSON object
         """
+        if not validators.url(url):
+            raise IIIFException(f"Invalid url {url}:")
         try:
             request = requests.get(url, timeout=30)
             if request.status_code not in [200, 301, 302]:

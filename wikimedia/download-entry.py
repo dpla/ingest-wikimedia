@@ -64,11 +64,13 @@ batch_limit = 268435456000 # batch size
 max_filesize = 10737418240 # Default value is 10GB
 
 # Controlling vars
-batch_rows = list()     #
 total_downloaded = 0    # Running incrementer for tracking total bytes downloaded
+dpla_item_count = 1     # Running incrementer for tracking total number of DPLA items downloaded
+
+# TODO remove all batch controllers
+batch_rows = list()
 batch_downloaded = 0    # Running incrementer for tracking total bytes downloaded in a batch
 batch_number = 1        # This will break apart the input parquet file into batches defined by batch_limit
-dpla_item_count = 1     # Running incrementer for tracking total number of DPLA items downloaded
 
 try:
     opts, args = getopt.getopt(sys.argv[1:],
@@ -145,17 +147,19 @@ if file_filter:
 data_in = fs.read_parquet(input_data, cols=READ_COLUMNS)
 
 for row in data_in.itertuples(index=TUPLE_INDEX):
+    # TODO fixed output path, output_base
+    # TODO apply dateetime as prefix (see ingestion3 for example)
     batch_out = downloader.batch_parquet_path(base=output_base, n=batch_number)
 
     try:
-        dpla_id = getattr(row, 'id')
-        title = getattr(row, 'title')
-        wiki_markup = getattr(row, 'wiki_markup')
-        iiif_manifest = getattr(row, 'iiif')
-        media_master = getattr(row, 'media_master')
-    except AttributeError as ae:
-        log.error("Unable to get all attributes from row %s: %s", row, str(ae))
-        break
+        dpla_id = row.id
+        title = row.title
+        wiki_markup = row.wiki_markup
+        iiif_manifest = row.iiif
+        media_master = row.media_master
+    except AttributeError as attribute_error:
+        log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
+        continue
 
     # If a file_filter paramter is specified then only download files that match the DPLA IDs in
     # the file
