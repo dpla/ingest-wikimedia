@@ -13,11 +13,16 @@ Projects and improvements needed for this project
 
 ## Downloads
 
-- [ ] **Paralleize downloads**.
+- [ ] Implement parsing of IIIF v3 manifests
+- [ ] Paralleize downloads
   - Paralleize around DPLA records (10 threads for 10 records).
   - For multi-page records the images are processed sequenctially. This might make aborting an entire record when one image fails.
   - *Needs further investigation*.
-- [ ] Implement parsing of IIIF v3 manifests
+
+- [ ] Implement filter to skip an entire DPLA record if the record id exists in some kind of 'banned object list'.
+
+  - This is necessary to prevent our bot from getting banned when a page is deleted for copyright reasons and we automatiicaly re-attempt to upload it on the next cycle.
+  - Likely implementation is a filter applied to data read in at Download step (similar to `--filter-filter`)
 
 ## Uploads
 
@@ -31,4 +36,4 @@ Projects and improvements needed for this project
 
 ## Metadata Sync
 
-A much larger unscropped set of work that is folded into the Wikimedia Workflow document $$
+A much larger unscropped set of work that is folded into the Wikimedia Workflow document
