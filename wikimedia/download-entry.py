@@ -3,58 +3,69 @@ Downloads images from a DPLA partner to be uploaded to Wikimedia Commons.
     - Downloads images in batches
     - Writes out a parquet file with metadata for each image
     - Uploads parquet file to S3
-
-    python download.py
-        --partner nwdh \
-        --limit 1000000000000 \
-        --source s3://dpla-master-dataset/nwdh/wiki/[]/ \
-        --output s3://dpla-wikimeida/nwdh/[date]
-
-    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/1/image.jpeg
-    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/2/image.jpeg
-    s3://wiki/plainstopeaks/20210120/batch_1/assets/0/0/0/1/00001121215151/3/image.jpeg
-    s3://wiki/plainstopeaks/20210120/batch_1/data/
 """
 import sys
 import getopt
 import boto3
 
-from wikiutils.utils import Utils as WikimediaUtils
-from wikiutils.downloader import Downloader as WikimediaDownloader
-from wikiutils.exceptions import DownloadException, IIIFException
-from wikiutils.logger import WikimediaLogger
-from wikiutils.emailer import SesMailSender, SesDestination, DownloadSummary
-
+from utilities.iiif import IIIF
+from executors.downloader import Downloader
+from utilities.fs import FileSystem, S3Helper
+from utilities.exceptions import DownloadException, IIIFException
+from utilities.logger import WikimediaLogger
+from utilities.emailer import SesMailSender, SesDestination, DownloadSummary
+from utilities.format import sizeof_fmt
 
 if __name__ == "__main__":
     pass
 
-TUPLE_INDEX = ['id', 'wiki_markup', 'iiif', 'media_master', 'title']
+# These are the columns emitted by the ingestion3 process
+READ_COLUMNS = { "_1": "id",
+                "_2": "wiki_markup",
+                "_3": "iiif",
+                "_4": "media_master",
+                "_5": "title"}
+
+TUPLE_INDEX = list(READ_COLUMNS.values())
+
+WRITE_COLUMNS = ['dpla_id','path','size','title','markup','page']
 
 # partner_name is the hub abbreviation and is used to create the output path
 partner_name = ""
-# Download limit is the total number of bytes to download
-total_limit = 0  # Total number of bytes to download
-# batch_limit is the number of bytes to download in a batch
-# Default value is 250 GB
-batch_limit = 268435456000
+
 # Input parquet file (the wiki output of ingestion3)
 input_data = ""
 # Output path is where the assets are saved to
 output_base = ""  # output location
-# Max file size is the maximum size of a file to download
-# Default value is 10GB
-max_filesize = 10737418240
+
+# TODO this is also a little bit tied to total_limit where is only applies to NARA or SI where
+# we don't want to download the entire dataset and have a target set of records.
+
 # File filter is a file that contains a list of DPLA IDs to download and is used to only
 # upload a specific set of DPLA IDs
 file_filter = None
 
+# TODO This will still generally be a flag but the most common use will be fore
+# NARA so we don't download 15TB on a single run. Documentation should reflect this.
+
+
+total_limit = 0  # the total number of bytes to download, 0 is no limit
+
+# TODO This should be removed on a future PR. We are moving
+# entirely away from batching.
+batch_limit = 268435456000 # batch size
+
+# TODO this is no longer required and should be removed entirely. Will also remove a if/else check below.
+max_filesize = 10737418240 # Default value is 10GB
+
 # Controlling vars
-batch_rows = list()     #
 total_downloaded = 0    # Running incrementer for tracking total bytes downloaded
+dpla_item_count = 1     # Running incrementer for tracking total number of DPLA items downloaded
+
+# TODO remove all batch controllers
+batch_rows = list()
 batch_downloaded = 0    # Running incrementer for tracking total bytes downloaded in a batch
 batch_number = 1        # This will break apart the input parquet file into batches defined by batch_limit
-dpla_item_count = 1     # Running incrementer for tracking total number of DPLA items downloaded
 
 try:
     opts, args = getopt.getopt(sys.argv[1:],
@@ -109,38 +120,41 @@ for opt, arg in opts:
 
 # Helper classes
 # These need to remain below the input parameters
-utils = WikimediaUtils()
+# utils = WikimediaUtils()
+iiif = IIIF()
+fs = FileSystem()
+s3 = S3Helper()
 log = WikimediaLogger(partner_name=partner_name, event_type="download")
-downloader = WikimediaDownloader(logger=log)
+downloader = Downloader(logger=log)
 
 # Summary of input parameters
-log.info(f"Total download limit: {utils.sizeof_fmt(total_limit)}")
-log.info(f"Batch size: {utils.sizeof_fmt(batch_limit)}")
-log.info(f"Max file size: {utils.sizeof_fmt(max_filesize)}")
 log.info(f"Input: {input_data}")
 log.info(f"Output: {output_base}")
-
 
 # If using file filter then read in the file and create a list of DPLA IDs
 ids = []
 if file_filter:
-    log.info("Using filter: %s", file_filter)
+    log.info(f"Using filter: {file_filter}")
     with open(file_filter, encoding='utf-8') as f:
         ids = [line.rstrip() for line in f]
-    log.info("Attempting %s DPLA records", len(ids))
+    log.info(f"Attempting len(ids) DPLA records")
 
-data_in = utils.read_parquet(input_data)
+data_in = fs.read_parquet(input_data, cols=READ_COLUMNS)
 
 for row in data_in.itertuples(index=TUPLE_INDEX):
+    # TODO fixed output path, output_base
+    # TODO apply dateetime as prefix (see ingestion3 for example)
+    batch_out = downloader.batch_parquet_path(base=output_base, n=batch_number)
+
     try:
-        dpla_id = getattr(row, 'id')
-        title = getattr(row, 'title')
-        wiki_markup = getattr(row, 'wiki_markup')
-        iiif = getattr(row, 'iiif')
-        media_master = getattr(row, 'media_master')
-    except AttributeError as ae:
-        log.error("Unable to get all attributes from row %s: %s", row, str(ae))
-        break
+        dpla_id = row.id
+        title = row.title
+        wiki_markup = row.wiki_markup
+        manifest = row.iiif
+        media_master = row.media_master
+    except AttributeError as attribute_error:
+        log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
+        continue
 
     # If a file_filter paramter is specified then only download files that match the DPLA IDs in
     # the file
@@ -150,10 +164,10 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
 
     # Are we working with IIIF or media_master?
     try:
-        download_urls = utils.get_iiif_urls(iiif) if iiif else media_master
+        download_urls = iiif.get_iiif_urls(manifest) if manifest else media_master
         log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
     except IIIFException as iffex:
-        log.error("Unable to get IIIF urls for %s: %s", dpla_id, str(iffex))
+        log.error(f"Unable to get IIIF urls: {dpla_id} from {manifest}\n- {str(iffex)}")
         continue
 
     page = 1
@@ -169,7 +183,7 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
                 raise DownloadException(f"Download failed for {url}")
         except DownloadException as de:
             # If a single asset fails for a multi-asset upload then all assets are dropped
-            log.error("Aborting all assets for %s \n- %s", dpla_id, str(de))
+            log.error(f"Aborting all assets for {dpla_id} \n -{str(de)}")
             images = []
             break
 
@@ -184,40 +198,43 @@ for row in data_in.itertuples(index=TUPLE_INDEX):
             'markup': wiki_markup,
             'page': page
         }
-        images.append(row)
+        images.append(row) # TODO investigate why append is different that extend here.
 
         page += 1  # increment asset count
+        # TODO remove batch_downloaded and
         batch_downloaded += filesize # track the cumluative size of this batch
         total_downloaded += filesize # track the cumluative size of the total download
 
-    # append all assets/rows for a given metadata record
+    # Add all assets/rows for a given metadata record. len(images) check is necessary because
+    # we'd get [a,b,[]]
     if len(images) > 0:
         batch_rows.extend(images)
 
     dpla_item_count += 1
 
     # If the batch exceeds the batch limit size then write out the dataframe and reset the metrics
+    # TODO this will get removed on migration away from batch.
     if batch_downloaded > batch_limit:
-        downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+        fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
         # Reset batch control vars
         batch_rows = []
         batch_number += 1
         batch_downloaded = 0
     elif 0 < total_limit < total_downloaded:
         log.info("Total download limit reached")
-        downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+        fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
         break
 
 # If finished processing parquet files without breaching limits then write data out
 if batch_rows:
-    downloader.save(base=output_base, batch=batch_number, rows=batch_rows)
+    fs.write_parquet(path=batch_out, data=batch_rows, columns=WRITE_COLUMNS)
 
 # Save the log file to S3
-bucket, key = utils.get_bucket_key(output_base)
+bucket, key = s3.get_bucket_key(output_base)
 public_url = log.write_log_s3(bucket=bucket, key=key)
 log.info(f"Log file saved to {public_url}")
-log.info(f"Total download size: {utils.sizeof_fmt(total_downloaded)}")
-log.info("Fin.")
+log.info(f"Total download size: {sizeof_fmt(total_downloaded)}")
+log.info("Fin")
 
 # Send email notification
 ses_client = boto3.client('ses', region_name='us-east-1')

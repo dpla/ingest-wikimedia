@@ -13,22 +13,27 @@ Projects and improvements needed for this project
 
 ## Downloads
 
-- [ ] **Paralleize downloads**. 
-  - Paralleize around DPLA records (10 threads for 10 records). 
+- [ ] Implement parsing of IIIF v3 manifests
+- [ ] Paralleize downloads
+  - Paralleize around DPLA records (10 threads for 10 records).
   - For multi-page records the images are processed sequenctially. This might make aborting an entire record when one image fails.
   - *Needs further investigation*.
-- [ ] Implement parsing of IIIF v3 manifests
 
-## Uploads 
+- [ ] Implement filter to skip an entire DPLA record if the record id exists in some kind of 'banned object list'.
 
-- [ ] **User logged out of Site** 
+  - This is necessary to prevent our bot from getting banned when a page is deleted for copyright reasons and we automatiicaly re-attempt to upload it on the next cycle.
+  - Likely implementation is a filter applied to data read in at Download step (similar to `--filter-filter`)
+
+## Uploads
+
+- [ ] **User logged out of Site**
   - In the pywikibot logs we can see that the user was logged out but the process still kept running.
   - There is likely a session timeout limit but it is not obvious what it is or how to trap that error and reauthenticate.
   - This may not have been an issue before because we ran smaller batches that finished before the session expired.
 
 - [ ] **Existing pages**
   - *cases for that need addressings*
-  
+
 ## Metadata Sync
 
-A much larger unscropped set of work that is folded into the Wikimedia Workflow document $$
+A much larger unscropped set of work that is folded into the Wikimedia Workflow document
