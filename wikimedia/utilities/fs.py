@@ -34,7 +34,7 @@ class S3Helper:
     # Used for most s3 operations
     s3_resource = boto3.resource('s3')
     # Used for head operation in file_exists and upload_fileobj in upload
-    s3_client = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
+    s3_client = boto3.client(service_name='s3', config=Config(signature_version='s3v4', max_pool_connections=25, retries={'max_attempts': 3}))
 
     # Remove retry handler for s3, this is to prevent the botocore retry
     # handler from retrying. Taken from https://tinyurl.com/jd27xjz4
@@ -44,6 +44,31 @@ class S3Helper:
 
     def __init__(self):
         pass
+
+    def write_log_s3(self, key, bucket, file, extra_args=None):
+        """
+        Upload log file to s3
+        :param key: Key to upload log file to
+        :param bucket: Bucket to upload log file to
+        :param extra_args: Extra arguments to pass to s3 upload_fileobj
+        :return: The URL of the uploaded log file
+        """
+        s3_log_key = f"{key}"
+
+        # Default extra_args for log files are text/plain and public read.
+        # These can be overridden by passing in extra_args
+        default_args = {"ACL": "public-read", "ContentType": "text/plain"}
+        if extra_args:
+            default_args.update(extra_args)
+
+        with open(file, "rb") as file:
+            self.upload(file=file,
+                            bucket=bucket,
+                            key=key,
+                            extra_args=default_args)
+
+        # The publicly accessible S3 url for the log file
+        return f"https://{bucket}.s3.amazonaws.com/{key}"
 
     def file_exists(self, bucket, key):
         """

@@ -52,3 +52,7 @@ def get_download_args(args):
             params["file_filter"] = arg
 
     return params
+
+
+
+# TODO add upload param to this

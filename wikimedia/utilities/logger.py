@@ -63,7 +63,9 @@ class WikimediaLogger(logging.Logger):
         :return: The URL of the uploaded log file
         """
         s3_log_key = f"{key}/logs/{self._log_file}"
-        # default extra_args for log files are text/plain and public read. These can be overridden by passing in extra_args
+
+        # Default extra_args for log files are text/plain and public read.
+        # These can be overridden by passing in extra_args
         default_args = {"ACL": "public-read", "ContentType": "text/plain"}
         if extra_args:
             default_args.update(extra_args)
@@ -73,5 +75,6 @@ class WikimediaLogger(logging.Logger):
                                     bucket=bucket,
                                     key=s3_log_key,
                                     extra_args=default_args)
+
         # The publicly accessible S3 url for the log file
         return f"https://{bucket}.s3.amazonaws.com/{s3_log_key}"
