@@ -3,8 +3,6 @@
 Downloads Wikimedia eligible images from a DPLA partner
 
 """
-import sys
-import boto3
 
 from utilities.iiif import IIIF
 from executors.downloader import Downloader
@@ -26,6 +24,7 @@ class DownloadEntry():
                     "_5": "title"}
 
     TUPLE_INDEX = list(READ_COLUMNS.values())
+
     # Column names for the output parquet file
     WRITE_COLUMNS = ['dpla_id','path','size','title','markup','page']
 
@@ -43,17 +42,15 @@ class DownloadEntry():
         Load data from parquet file and filter out ids if a file filter is provided
         """
         fs = FileSystem()
-        exclude_ids = []
+
         if file_filter:
             self.log.info(f"Using filter: {file_filter}")
+            exclude_ids = []
             with open(file_filter, encoding='utf-8') as f:
                 exclude_ids = [line.rstrip() for line in f]
-
-        # TODO continue to massage this
-        if exclude_ids:
             return fs.read_parquet(data_in, cols=self.READ_COLUMNS).filter(lambda x: x.id in exclude_ids)
-        else:
-            return fs.read_parquet(data_in, cols=self.READ_COLUMNS).head(20)
+
+        return fs.read_parquet(data_in, cols=self.READ_COLUMNS).head(20)
 
     def data_out_path(self, base, name):
         """
@@ -63,9 +60,59 @@ class DownloadEntry():
         """
         return f"{base}/data/{get_datetime_prefix()}_{name}_download.parquet"
 
+    def get_images(self, urls, dpla_id) :
+        """
+        Download images for a single DPLA record from a list of urls
+        """
+        page = 1
+        image_rows = []
+        for url in urls:
+            filesize = 0
+            # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
+            destination_path = self.downloader.destination_path(self.args.get('output_base'),
+                                                                page,
+                                                                dpla_id)
+            try:
+                output, filesize = self.downloader.download(source=url, destination=destination_path)
+                if output is None and len(urls) > 1:
+                    self.log.error(f"Failure in multi-page record {dpla_id}. {page} files were saved but" \
+                                "metadata for all images will not be saved in output." \
+                                f"  \n - {str(de)}")
+                    raise DownloadException(f"Download failed for {url}")
+            except Exception as de:
+                raise DownloadException(f"Download failed for {url}") from de
+            page += 1
+
+            # Create a row for a single asset and if multiple assests exist them append them to the rows list
+            # When a single asset fails to download then this object is destroyed by the `break` above and
+            # the rows for already downloaded assets are not added to the final dataframe
+            image_row = {
+                'dpla_id': dpla_id,
+                'path': output,
+                'size': filesize,
+                'page': page
+            }
+            image_rows.append(image_row)
+        return image_rows
+
+    def update_metadata(self, images, title, wiki_markup):
+        """
+        Update the metadata for a list of images
+        """
+        update = list()
+        for image in images:
+            image.update({'title': title, 'markup': wiki_markup})
+            update.append(image)
+        return update
+
     def execute(self):
         """
         """
+        # For IIIF and FileSystem stuff
+        iiif = IIIF()
+        fs = FileSystem()
+        image_rows = list()
+
         # read data in
         data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None))
         # Set the total number of DPLA items to be attempted
@@ -79,11 +126,6 @@ class DownloadEntry():
         self.log.info(f"Data out:        {data_out}")
         self.log.info(f"DPLA records:    {self.downloader._tracker.dpla_count}")
 
-        # For IIIF and FileSystem stuff
-        iiif = IIIF()
-        fs = FileSystem()
-        out_rows = list()
-
         for row in data_in.itertuples(index=False):
             dpla_id = row.id
             title = row.title
@@ -94,53 +136,31 @@ class DownloadEntry():
             # If the IIIF manfiest is defined that parse the manfiest to get the download urls
             # otherwise use the media_master url
             try:
-                download_urls = iiif.get_iiif_urls(manifest) if manifest else media_master
-                self.log.info(f"https://dp.la/item/{dpla_id} has {len(download_urls)} assets")
+                urls = iiif.get_iiif_urls(manifest) if manifest else media_master
+                self.log.info(f"https://dp.la/item/{dpla_id} has {len(urls)} assets")
             except IIIFException as iffex:
                 self.log.error(f"Unable to get IIIF urls: {dpla_id} from {manifest}\n- {str(iffex)}")
                 continue
 
-            page = 1
-            images = []
-            for url in download_urls:
-                filesize = 0
-                # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
-                destination_path = self.downloader.destination_path(self.args.get('output_base'), page, dpla_id)
-                # If the destination path is not an S3 path then create the parent dirs on the local file system
-                try:
-                    output, filesize = self.downloader.download(source=url, destination=destination_path)
-                    if output is None:
-                        raise DownloadException(f"Download failed for {url}")
-                except DownloadException as de:
-                    # If a single asset fails for a multi-asset upload then all assets are dropped
-                    # FIXME this error message should indicate that images were downloaded but the metadata rows
-                    # will not be written out. Partial asset download, no rows passed forward to uploader.
-                    self.log.error(f"Aborting all assets for {dpla_id} \n -{str(de)}")
-                    images = []
-                    break
-
-                # Create a row for a single asset and if multiple assests exist them append them to the rows list
-                # When a single asset fails to download then this object is destroyed by the `break`` above and
-                # the rows for already downloaded assets are not added to the final dataframe
-                out_row = {
-                    'dpla_id': dpla_id,
-                    'path': output,
-                    'size': filesize,
-                    'title': title,
-                    'markup': wiki_markup,
-                    'page': page
-                }
-                images.append(out_row)
-                page += 1  # increment asset counter
+            # TODO this will raise an exception if downloads fail. We should catch that and continue
+            try:
+                images = self.get_images(urls, dpla_id)
+                # update images with metadata applicable to all images
+                images = self.update_metadata(images, title, wiki_markup)
+            except DownloadException as de:
+                self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
+                continue
 
             # Add all assets/rows for a given metadata record. len(images) check is necessary because
             # we'd get [a,b,[]] extending with an empty list
             if len(images) > 0:
-                out_rows.extend(images)
+                image_rows.extend(images)
 
             # If the total limit is set and we've exceeded it then stop processing
             if 0 < self.args.get('total_limit', 0) < self.downloader._tracker.get_size():
                 break
 
+        self.log.info(f"Downloaded {self.downloader._tracker.success_count} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
+
         # Write data out
-        fs.write_parquet(path=data_out, data=out_rows, columns=self.WRITE_COLUMNS)
+        fs.write_parquet(path=data_out, data=image_rows, columns=self.WRITE_COLUMNS)
