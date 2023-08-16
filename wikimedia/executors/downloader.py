@@ -25,7 +25,7 @@ class Downloader:
         """
         Get the status of the download
         """
-        return self._status
+        return self._tracker
 
     def destination_path(self, base, batch, count, dpla_id):
         """
