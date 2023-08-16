@@ -241,7 +241,7 @@ ses_client = boto3.client('ses', region_name='us-east-1')
 emailer = SesMailSender(ses_client)
 summary = DownloadSummary(partner=partner_name,
                           log_url=public_url,
-                          status=downloader.get_status())
+                          tracker=downloader.get_status())
 
 emailer.send_email(source="tech@dp.la",
                    destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else?

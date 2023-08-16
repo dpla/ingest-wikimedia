@@ -173,8 +173,8 @@ class DownloadSummary:
             DPLA records: TBD
             ----------------------------------------
             Images
-            - Attempted: {self.tracker.download_count + self.tracker.skip_count + self.tracker.fail_count}
-            - Downloaded: {self.tracker.download_count}
+            - Attempted: {self.tracker.success_count + self.tracker.skip_count + self.tracker.fail_count}
+            - Downloaded: {self.tracker.success_count}
             - Skipped: {self.tracker.skip_count}
             - Failed: {self.tracker.fail_count}
             ----------------------------------------
@@ -243,7 +243,7 @@ class DownloadSummary:
                         <p class="c8"><span class="c2">Downloaded</span></p>
                         </td>
                         <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.tracker.download_count}</span></p>
+                        <p class="c6"><span class="c2">{self.tracker.success_count}</span></p>
                         </td>
                     </tr>
                     <tr class="c1">

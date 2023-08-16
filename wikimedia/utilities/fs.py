@@ -109,8 +109,6 @@ class FileSystem:
         :param columns: Columns to write
         :return: None
         """
-        print(f"data: {data}")
-        print(f"columns: {columns}")
         pd.DataFrame(data, columns=columns).to_parquet(path)
 
     def _get_parquet_files(self, path):
