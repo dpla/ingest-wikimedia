@@ -24,6 +24,7 @@ class DownloadEntry():
                     "_5": "title"}
 
     TUPLE_INDEX = list(READ_COLUMNS.values())
+
     # Column names for the output parquet file
     WRITE_COLUMNS = ['dpla_id','path','size','title','markup','page']
 
