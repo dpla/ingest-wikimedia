@@ -119,20 +119,3 @@ class Downloader:
             raise DownloadException(f"Error uploading to s3 - s3://{bucket}/{key} -- {str(ex)}") from ex
         finally:
             os.unlink(temp_file.name)
-
-
-    # TODO remove method, batching is irrelevant and the output
-    # path is /base_output
-    def batch_parquet_path(self, base, n):
-        """
-        Returns the path to the parquet file for the batch of downloaded files
-        """
-        return f"{self._batch_data_output(base, n)}batch_{n}.parquet"
-
-    # TODO remove method, batching is irrelevant and the output
-    # path is /base_output/datetime_partner.parquet of the like
-    def _batch_data_output(self, base,n):
-        """
-        Returns the output path for the batch of downloaded files
-        """
-        return f"{base}/batch_{n}/data/"
