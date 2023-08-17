@@ -3,6 +3,7 @@ import tempfile
 import requests
 import magic
 
+from pathlib import Path
 from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
 from trackers.tracker import Tracker
@@ -27,11 +28,16 @@ class Downloader:
         """
         return self._tracker
 
-    def destination_path(self, base, batch, count, dpla_id):
+    def destination_path(self, base, count, dpla_id):
         """
         Create destination path to download file to
         """
-        return f"{base}/batch_{batch}/assets/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
+        dest = f"{base}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
+        if base.startswith("s3://"):
+            return dest
+        Path.mkdir(Path(dest), parents=True, exist_ok=True)
+        return dest
+
 
     def download(self, source, destination):
         """
@@ -113,20 +119,3 @@ class Downloader:
             raise DownloadException(f"Error uploading to s3 - s3://{bucket}/{key} -- {str(ex)}") from ex
         finally:
             os.unlink(temp_file.name)
-
-
-    # TODO remove method, batching is irrelevant and the output
-    # path is /base_output
-    def batch_parquet_path(self, base, n):
-        """
-        Returns the path to the parquet file for the batch of downloaded files
-        """
-        return f"{self._batch_data_output(base, n)}batch_{n}.parquet"
-
-    # TODO remove method, batching is irrelevant and the output
-    # path is /base_output/datetime_partner.parquet of the like
-    def _batch_data_output(self, base,n):
-        """
-        Returns the output path for the batch of downloaded files
-        """
-        return f"{base}/batch_{n}/data/"

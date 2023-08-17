@@ -32,6 +32,12 @@ class Tracker:
         """
         Tracker.attempted = total
 
+    def get_size(self):
+        """
+        Get the cumulative size of all files
+        """
+        return Tracker.cumulative_size
+
     def increment(self, status, size=0):
         """
         Increment the status

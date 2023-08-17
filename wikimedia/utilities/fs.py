@@ -5,6 +5,7 @@ __author__ = "DPLA"
 __version__ = "0.0.1"
 __license__ = "MIT"
 
+from time import strftime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,6 +15,18 @@ import pandas as pd
 from awswrangler import s3 as s3wrangler
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+def get_datetime_prefix():
+    """
+    Get a datetime prefix for the log file
+
+    ex 20230525_133102
+
+    :return: datetime prefix
+    """
+    date = strftime("%Y%m%d")
+    time = strftime("%H%M%S")
+    return f"{date}_{time}"
 
 class S3Helper:
     """
