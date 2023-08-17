@@ -38,9 +38,9 @@ class S3Helper:
 
     # Remove retry handler for s3, this is to prevent the botocore retry
     # handler from retrying. Taken from https://tinyurl.com/jd27xjz4
-    deq = s3_client.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
-    while len(deq) > 0:
-        s3_client.meta.events.unregister("needs-retry.s3", handler=deq.pop())
+    # deq = s3_client.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
+    # while len(deq) > 0:
+    #     s3_client.meta.events.unregister("needs-retry.s3", handler=deq.pop())
 
     def __init__(self):
         pass

@@ -22,9 +22,8 @@ class Downloader:
     # Column names for the output parquet file
     UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
 
-    def __init__(self, logger = None):
+    def __init__(self):
         pass
-        # self.log = logging.getLogger('wikimedia_logger') if not logger else logger
 
     def get_status(self):
         """

@@ -12,8 +12,10 @@ from utilities.format import sizeof_fmt
 from utilities.arguements import get_download_args
 
 import logging
-
+from concurrent.futures import ThreadPoolExecutor
+import os
 import pandas as pd
+
 class DownloadEntry():
     """
     Downloads Wikimedia eligible images from a DPLA partner
@@ -34,11 +36,9 @@ class DownloadEntry():
     args = None
     log = logging.getLogger(__name__)
 
-
-    def __init__(self, args, log=None):
+    def __init__(self, args):
         self.args = args
-
-        self.downloader = Downloader(logger=logging.getLogger('wikimedia_logger'))
+        self.downloader = Downloader()
 
     def load_data(self, data_in, file_filter = None):
         """
@@ -53,7 +53,7 @@ class DownloadEntry():
                 exclude_ids = [line.rstrip() for line in f]
             return fs.read_parquet(data_in, cols=self.READ_COLUMNS).filter(lambda x: x.id in exclude_ids)
 
-        return fs.read_parquet(data_in, cols=self.READ_COLUMNS).head(40)
+        return fs.read_parquet(data_in, cols=self.READ_COLUMNS) # .head(2500) # for testing
 
     def data_out_path(self, base, name):
         """
@@ -72,18 +72,18 @@ class DownloadEntry():
         for url in urls:
             filesize = 0
             # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
-            destination_path = self.downloader.destination_path(self.args.get('output_base'),
-                                                                page,
-                                                                dpla_id)
+            dest_path = self.downloader.destination_path(self.args.get('output_base'),
+                                                         page,
+                                                         dpla_id)
             try:
-                output, filesize = self.downloader.download(source=url, destination=destination_path)
+                output, filesize = self.downloader.download(source=url, destination=dest_path)
                 if output is None and len(urls) > 1:
-                    self.log.error(f"Failure in multi-page record {dpla_id}. {page} files were saved but" \
+                    err_msg = f"Failure in multi-page record {dpla_id}. {page} files were saved but" \
                                 "metadata for all images will not be saved in output." \
-                                f"  \n - {str(de)}")
-                    raise DownloadException(f"Download failed for {url}")
+                                f"  \n - {str(de)}"
+                    raise DownloadException(err_msg)
             except Exception as de:
-                raise DownloadException(f"Download failed for {url}") from de
+                raise DownloadException(f"Download failed for {url}: {str(de)}") from de
             page += 1
 
             # Create a row for a single asset and if multiple assests exist them append them to the rows list
@@ -111,12 +111,7 @@ class DownloadEntry():
     def execute(self):
         """
         """
-        # For IIIF and FileSystem stuff
-        iiif = IIIF()
-        fs = FileSystem()
-        image_rows = list()
-
-        # read data in
+        # Read data in
         data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None))
         # Set the total number of DPLA items to be attempted
         self.downloader._tracker.set_dpla_count(len(data_in))
@@ -129,11 +124,7 @@ class DownloadEntry():
         self.log.info(f"Data out:        {data_out}")
         self.log.info(f"DPLA records:    {self.downloader._tracker.dpla_count}")
 
-        # TODO thread around this around processing rows and not images within a row
-        # FIXME hardcoded for testing with 20 images
-        from concurrent.futures import ThreadPoolExecutor
-        import os
-
+        # Bind to processor count, god only know what some of these endpoinnts can handle
         processors = os.cpu_count()
 
         df = data_in.to_dict('records')
@@ -141,28 +132,24 @@ class DownloadEntry():
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in df]
 
-        df_processed = [result.result() for result in results]
-
-        ## SEE BELOW
-
-        ###
-
+        image_rows = [result.result() for result in results]
         self.log.info(f"Downloaded {self.downloader._tracker.success_count} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
 
         # Write data out
         fs = FileSystem()
-        fs.write_parquet(path=data_out, data=image_rows, columns=self.WRITE_COLUMNS)
+        df_2 = pd.DataFrame([df])
+        fs.write_parquet(path=data_out, data=df_2, columns=self.WRITE_COLUMNS)
 
     def process_rows(self, rows):
         iiif = IIIF()
-
         urls = []
-        # print(rows)
+
         dpla_id = rows.get('id')
         title = rows.get('title')
         wiki_markup = rows.get('wiki_markup')
         manifest = rows.get('iiif')
         media_master = rows.get('media_master')
+
         # If the IIIF manfiest is defined that parse the manfiest to get the download urls
         # otherwise use the media_master url
         try:
@@ -186,74 +173,3 @@ class DownloadEntry():
             return images
 
         return images
-
-
-
-
-
-###############
-################
-
-        # If the total limit is set and we've exceeded it then stop processing
-        # if 0 < self.args.get('total_limit', 0) < self.downloader._tracker.get_size():
-        #     return None
-
-
-
-
-
-        # print(result)
-
-        # tuples = data_in.itertuples(index=False)
-
-        # start = time.time()
-        # number_of_chunks = 4
-        # chunk_size = 5
-        # executor = ThreadPoolExecutor(max_workers=number_of_chunks)
-        # futures = []
-
-        # for i in range(number_of_chunks):
-        #     chunk = tuples[i*chunk_size:(i+1)*chunk_size]
-        #     futures.append(executor.submit(self.process_rows, chunk))
-
-        # for future in concurrent.futures.as_completed(futures):
-        #     pass
-        # print('Time:', time.time() - start)
-
-
-
-
-
-        # for row in data_in.itertuples(index=False):
-            # dpla_id = row.id
-            # title = row.title
-            # wiki_markup = row.wiki_markup
-            # manifest = row.iiif
-            # media_master = row.media_master
-
-            # If the IIIF manfiest is defined that parse the manfiest to get the download urls
-            # otherwise use the media_master url
-            # try:
-            #     urls = iiif.get_iiif_urls(manifest) if manifest else media_master
-            #     self.log.info(f"https://dp.la/item/{dpla_id} has {len(urls)} assets")
-            # except IIIFException as iffex:
-            #     self.log.error(f"Unable to get IIIF urls: {dpla_id} from {manifest}\n- {str(iffex)}")
-            #     continue
-
-            # # TODO this will raise an exception if downloads fail. We should catch that and continue
-            # try:
-            #     images = self.get_images(urls, dpla_id)
-            #     # update images with metadata applicable to all images
-            #     images = self.update_metadata(images, title, wiki_markup)
-            # except DownloadException as de:
-            #     self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
-            #     continue
-
-            # # Add all assets/rows for a given metadata record. len(images) check is necessary because
-            # # we'd get [a,b,[]] extending with an empty list
-            # if len(images) > 0:
-            #     image_rows.extend(images)
-
-            # # If the total limit is set and we've exceeded it then stop processing
-            # if 0 < self.args.get('total_limit', 0) < self.downloader._tracker.get_size():
-            #     break
