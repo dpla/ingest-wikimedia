@@ -61,7 +61,6 @@ class IIIF:
         :return: JSON object
         """
         if not validators.url(url):
-            print(url)
             raise IIIFException(f"Invalid url {url}")
         try:
             request = requests.get(url, timeout=30, headers=headers)
