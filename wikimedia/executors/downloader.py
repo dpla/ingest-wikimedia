@@ -8,19 +8,22 @@ from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
 from trackers.tracker import Tracker
 
+from utilities.logger import WikimediaLogger
+import logging
+
 class Downloader:
     """
     Download images from parters
     """
-    log = None
+    log = logging.getLogger(__name__)
     _s3 = S3Helper()
     _tracker = Tracker()
 
     # Column names for the output parquet file
     UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
 
-    def __init__(self, logger):
-        self.log = logger
+    def __init__(self):
+        pass
 
     def get_status(self):
         """

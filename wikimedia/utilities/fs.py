@@ -4,7 +4,7 @@ Filesystem utilities
 __author__ = "DPLA"
 __version__ = "0.0.1"
 __license__ = "MIT"
-
+import os
 from time import strftime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,22 +28,48 @@ def get_datetime_prefix():
     time = strftime("%H%M%S")
     return f"{date}_{time}"
 
+def log_file(partner_name, event_type, log_dir="./logs"):
+    """
+    """
+    os.makedirs("./logs", exist_ok=True)
+    log_file_name = f"{partner_name}-{event_type}-{get_datetime_prefix()}.log"
+    return f"{log_dir}/{log_file_name}"
+
 class S3Helper:
     """
     """
     # Used for most s3 operations
     s3_resource = boto3.resource('s3')
     # Used for head operation in file_exists and upload_fileobj in upload
-    s3_client = boto3.client(service_name='s3', config=Config(signature_version='s3v4'))
-
-    # Remove retry handler for s3, this is to prevent the botocore retry
-    # handler from retrying. Taken from https://tinyurl.com/jd27xjz4
-    deq = s3_client.meta.events._emitter._handlers.prefix_search("needs-retry.s3")
-    while len(deq) > 0:
-        s3_client.meta.events.unregister("needs-retry.s3", handler=deq.pop())
+    s3_client = boto3.client(service_name='s3', config=Config(signature_version='s3v4', max_pool_connections=25, retries={'max_attempts': 3}))
 
     def __init__(self):
         pass
+
+    def write_log_s3(self, key, bucket, file, extra_args=None):
+        """
+        Upload log file to s3
+        :param key: Key to upload log file to
+        :param bucket: Bucket to upload log file to
+        :param extra_args: Extra arguments to pass to s3 upload_fileobj
+        :return: The URL of the uploaded log file
+        """
+        s3_name = Path(file).name
+        log_key = f"{key}/logs/{s3_name}"
+        # Default extra_args for log files are text/plain and public read.
+        # These can be overridden by passing in extra_args
+        default_args = {"ACL": "public-read", "ContentType": "text/plain"}
+        if extra_args:
+            default_args.update(extra_args)
+
+        with open(file, "rb") as file:
+            self.upload(file=file,
+                            bucket=bucket,
+                            key=log_key,
+                            extra_args=default_args)
+
+        # The publicly accessible S3 url for the log file
+        return f"https://{bucket}.s3.amazonaws.com/{log_key}"
 
     def file_exists(self, bucket, key):
         """
