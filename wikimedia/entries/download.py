@@ -112,7 +112,7 @@ class DownloadEntry():
         """
         """
         # Read data in
-        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None))
+        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None)).head(25)
         # Set the total number of DPLA items to be attempted
         self.downloader._tracker.set_dpla_count(len(data_in))
         # Full path to the output parquet file
@@ -142,7 +142,7 @@ class DownloadEntry():
 
     def process_rows(self, rows):
         iiif = IIIF()
-        urls = []
+        images = []
 
         dpla_id = rows.get('id')
         title = rows.get('title')
@@ -153,15 +153,15 @@ class DownloadEntry():
         # If the IIIF manfiest is defined that parse the manfiest to get the download urls
         # otherwise use the media_master url
         try:
-            urls = iiif.get_iiif_urls(manifest) if manifest else media_master
+            images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
             return images
 
         # TODO this will raise an exception if downloads fail. We should catch that and continue
         try:
-            self.log.info(f"https://dp.la/item/{dpla_id} has {len(urls)} assets")
-            images = self.get_images(urls, dpla_id)
+            self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
+            images = self.get_images(images, dpla_id)
             # update images with metadata applicable to all images
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:

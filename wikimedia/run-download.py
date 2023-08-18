@@ -5,44 +5,40 @@ Downloads Wikimedia eligible images from a DPLA partner
 import sys
 import boto3
 
-from utilities.fs import S3Helper
+from utilities.fs import S3Helper, log_file
 from utilities.logger import WikimediaLogger
 from utilities.emailer import SesMailSender, SesDestination, DownloadSummary
 from utilities.arguements import get_download_args
 from entries.download import DownloadEntry
 
-import time
-import os
 import logging
 
 def main():
     args = get_download_args(sys.argv[1:])
 
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    # FIX THIS
-    # I have now hard coded some really wonky shit together to get the s3 public access to log files work
-    # this probably has a lot of downstream consequences I don't know about yet and need to be patched up together.
-    # the filesytem path is relative to this project directory (.logs/*.log)
-    # the s3 log file path is bucket/name/logs/name-event_type-date.log
-    os.makedirs("./logs/", exist_ok=True)
-    log_file_name = f"{args.get('partner_name')}-download-{timestamp}.log"
-    log_file = f"./logs/{log_file_name}"
+    EMAIL_SOURCE = "tech@dp.la"
+    EMAMIL_REPLY = ["tech@dp.la"]
+    EMAIL_TO = ["scott@dp.la"]
 
-    log = logging
-    log.basicConfig(
-        level=logging.INFO,
-        datefmt='%H:%M:%S',
-        handlers=[logging.StreamHandler(),
-                  logging.FileHandler(log_file, mode="w")],
-        format= '[%(levelname)s] '
-                '%(asctime)s: '
-                '%(message)s'
-    )
     s3 = S3Helper()
     entry = DownloadEntry(args)
 
-    log.info("Starting download")
+    file = log_file(partner_name=args.get('partner_name'), event_type="download")
 
+    print(file)
+
+    # log_config = logging.basicConfig()
+
+    log = logging
+    log.basicConfig(level=logging.INFO,
+                    datefmt='%H:%M:%S',
+                    handlers=[logging.StreamHandler(),
+                              logging.FileHandler(filename=file, mode="w")],
+                              format='[%(levelname)s] '
+                              '%(asctime)s: '
+                              '%(message)s')
+
+    log.info("Starting download")
     # kick off the download
     entry.execute()
 
@@ -51,8 +47,7 @@ def main():
 
     # Save the log file to S3
     bucket, key = s3.get_bucket_key(args.get('output_base'))
-    log_file_key = f"{key}/logs/{log_file_name}"
-    public_url = s3.write_log_s3(bucket=bucket, key=log_file_key, file=log_file)
+    public_url = s3.write_log_s3(bucket=bucket, key=key, file=file)
 
     # Statement does not write to file but useful in the console
     log.info(f"Log file saved to {public_url}")
@@ -65,12 +60,13 @@ def main():
     # Send email notification
     ses_client = boto3.client('ses', region_name='us-east-1')
     emailer = SesMailSender(ses_client)
-    emailer.send_email(source="tech@dp.la",
-                    destination=SesDestination(tos=["scott@dp.la"]),  # FIXME dominic@dp.la should be here. Who else?
-                    subject=summary.subject(),
-                    text=summary.body_text(),
-                    html=summary.body_html(),
-                    reply_tos=["tech@dp.la"])
+    emailer.send_email(source=EMAIL_SOURCE,
+                       destination=SesDestination(tos=EMAIL_TO),
+                       reply_tos=EMAMIL_REPLY,
+                       subject=summary.subject(),
+                       text=summary.body_text(),
+                       html=summary.body_html()
+                    )
 
 
 if __name__ == "__main__":
