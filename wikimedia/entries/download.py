@@ -112,7 +112,7 @@ class DownloadEntry():
         """
         """
         # Read data in
-        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None)).head(25)
+        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None)).head(100)
         # Set the total number of DPLA items to be attempted
         self.downloader._tracker.set_dpla_count(len(data_in))
         # Full path to the output parquet file
@@ -128,10 +128,9 @@ class DownloadEntry():
         processors = os.cpu_count()
 
         df = data_in.to_dict('records')
-        batches = [df[i:i+processors] for i in range(0,len(df),processors)]
+        # batches = [df[i:i+processors] for i in range(0,len(df),processors)]
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in df]
-
         image_rows = [result.result() for result in results]
         self.log.info(f"Downloaded {self.downloader._tracker.success_count} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
 
@@ -155,6 +154,7 @@ class DownloadEntry():
         try:
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
+            self.downloader._tracker.fail_count += 1
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
             return images
 
@@ -165,6 +165,7 @@ class DownloadEntry():
             # update images with metadata applicable to all images
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:
+            self.downloader._tracker.fail_count += 1
             raise DownloadException(f"Failed download(s) for {dpla_id}\n - {str(de)}")
 
         # Add all assets/rows for a given metadata record. len(images) check is necessary because
