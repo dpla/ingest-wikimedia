@@ -53,7 +53,7 @@ class DownloadEntry():
                 exclude_ids = [line.rstrip() for line in f]
             return fs.read_parquet(data_in, cols=self.READ_COLUMNS).filter(lambda x: x.id in exclude_ids)
 
-        return fs.read_parquet(data_in, cols=self.READ_COLUMNS) # .head(2500) # for testing
+        return fs.read_parquet(data_in, cols=self.READ_COLUMNS).head(25) # for testing
 
     def data_out_path(self, base, name):
         """
@@ -125,7 +125,7 @@ class DownloadEntry():
         self.log.info(f"DPLA records:    {self.downloader._tracker.dpla_count}")
 
         # Bind to processor count, god only know what some of these endpoinnts can handle
-        processors = os.cpu_count()
+        # processors = os.cpu_count()
 
         df = data_in.to_dict('records')
         # batches = [df[i:i+processors] for i in range(0,len(df),processors)]
@@ -136,10 +136,14 @@ class DownloadEntry():
 
         # Write data out
         fs = FileSystem()
-        df_2 = pd.DataFrame([df])
+        df_2 = pd.DataFrame([image_rows])
         fs.write_parquet(path=data_out, data=df_2, columns=self.WRITE_COLUMNS)
 
     def process_rows(self, rows):
+        """
+
+        returns: rows: list of dicts for images and metadata associated with a single DPLA record
+        """
         iiif = IIIF()
         images = []
 
@@ -156,21 +160,15 @@ class DownloadEntry():
         except IIIFException as iffex:
             self.downloader._tracker.fail_count += 1
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
-            return images
+            return []
 
-        # TODO this will raise an exception if downloads fail. We should catch that and continue
         try:
             self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
             images = self.get_images(images, dpla_id)
             # update images with metadata applicable to all images
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:
+            images = []
             self.downloader._tracker.fail_count += 1
-            raise DownloadException(f"Failed download(s) for {dpla_id}\n - {str(de)}")
-
-        # Add all assets/rows for a given metadata record. len(images) check is necessary because
-        # we'd get [a,b,[]] extending with an empty list
-        if len(images) > 0:
-            return images
-
+            self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
         return images

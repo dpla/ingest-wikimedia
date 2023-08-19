@@ -302,14 +302,8 @@ class SesMailSender:
                           replies to the message.
         :return: The ID of the message, assigned by Amazon SES.
         """
-
-        from mjml import mjml_to_html
-        # with open('foo.mjml', 'rb') as mjml_fp:
         result = mjml_to_html(html)
-        assert not result.errors
         html: str = result.html
-        # html = mjml_to_html(html)
-
 
         send_args = {
             'Source': source,
