@@ -78,14 +78,15 @@ class S3Helper:
         :param bucket: S3 bucket
         :param key: S3 key
         """
+        # TODO does not check to see if the image is the same image, just that the file exists
+        # is should check the md5 hash of the file to see if it is the same and needs to be
+        # uploaded and replace the existing file.
         try:
-            # this does not check to see if the image is the same image, just that the file exists
-            # is should check the md5 hash of the file to see if it is the same and needs to be
-            # uploaded and replace the existing file.
             response = self.s3_client.head_object(Bucket=bucket, Key=key)
-            size = response['ContentLength']
+            size = response.get('ContentLength', 0)
             return True, size
         except ClientError:
+            print("File does not exist in s3")
             # The head request fails therefore we assume the file does not exist in s3
             return False, 0
 

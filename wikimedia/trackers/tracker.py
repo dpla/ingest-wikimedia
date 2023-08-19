@@ -46,6 +46,7 @@ class Tracker:
         if status == Tracker.SKIPPED:
             Tracker.skip_count += 1
             Tracker.total_size += size
+            print(f"Skipping {Tracker.skip_count} of {Tracker.total_size}")
         elif status == Tracker.DOWNLOADED or status == Tracker.UPLOADED:
             Tracker.success_count += 1
             Tracker.cumulative_size += size # this session

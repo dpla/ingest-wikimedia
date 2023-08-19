@@ -258,8 +258,8 @@ class DownloadSummary:
                   </tr>
                   <!-- TOTAL SIZE ROW  -->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <td style="padding: 0 15px;">Total size</td>
-                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.cumulative_size)}</td>
+                      <td style="padding: 0 15px;">All {self.partner} images</td>
+                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.total_size)}</td>
                   </tr>
                 </mj-table>
             </mj-column>
