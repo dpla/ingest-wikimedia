@@ -12,3 +12,12 @@ def sizeof_fmt(num, suffix='B'):
             return "%3.1f%s%s" % (num, unit, suffix)
         num /= 1024.0
     return "%.1f%s%s" % (num, 'Yi', suffix)
+
+def number_fmt(num):
+    """
+    Convert number to human readable format
+
+    :param num: number
+    :return: human readable string
+    """
+    return "{:,}".format(num)

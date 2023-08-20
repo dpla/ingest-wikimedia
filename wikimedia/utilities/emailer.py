@@ -2,7 +2,7 @@
 """
 
 from botocore.exceptions import ClientError
-from utilities.format import sizeof_fmt
+from utilities.format import sizeof_fmt, number_fmt
 from mjml import mjml_to_html
 
 class UploadSummary:
@@ -193,7 +193,7 @@ class DownloadSummary:
 <mjml>
   <mj-head>
       <mj-attributes>
-        <mj-class name="mjclass" color="black" font-size="30px" padding="30px 0px 30px 0px" />
+        <mj-class name="mjclass" color="black" font-size="20px" padding="0px 0px 0px 0px" />
       </mj-attributes>
     </mj-head>
 
@@ -207,13 +207,10 @@ class DownloadSummary:
         <mj-section>
             <mj-column>
                 <mj-table align="left" vertical-align="middle" padding="0px">
-                  <th style="padding: 0 15px 0 0;"></th>
-                  <th style="padding: 0 15px;"></th>
-                  <th style="padding: 0 15px;"></th>
                   <!-- COLUMN 1 -->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
                     <th style="padding: 0 15px 0 0;width:75px; ">DPLA Items</th>
-                    <td style="padding: 0 15px;">{self.tracker.dpla_count}</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.dpla_count)}</td>
                     <td style="padding: 0 15px;"></td>
                   </tr>
 
@@ -229,25 +226,25 @@ class DownloadSummary:
                   <!-- ATTEMPTED ROW  -->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
                     <td style="padding: 0 15px;width:75px; text-align:left">Attempted</td>
-                    <td style="padding: 0 15px;width:100px">{self.tracker.success_count + self.tracker.skip_count + self.tracker.fail_count}</td>
+                    <td style="padding: 0 15px;width:100px">{number_fmt(self.tracker.success_count + self.tracker.skip_count + self.tracker.fail_count)}</td>
                   </tr>
                   <!-- DOWNLOAD ROW  -->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
                     <td style="padding: 0 15px;">Downloaded</td>
-                    <td style="padding: 0 15px;">{self.tracker.success_count}</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.success_count)}</td>
                   </tr>
                   <!-- SKIP ROW  -->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Skipped</td>
-                    <td style="padding: 0 15px;">{self.tracker.skip_count}</td>
+                    <td style="padding: 0 15px;">Already in S3</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.skip_count)}</td>
                   </tr>
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
                     <td style="padding: 0 15px;">Failed</td>
-                    <td style="padding: 0 15px;">{self.tracker.fail_count}</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.fail_count)}</td>
                   </tr>
                   <!-- FILE INFO ROW  HEADER ONLY-->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <th style="padding: 0 15px 0 0; width:150px">File informations</th>
+                      <th style="padding: 0 15px 0 0; width:150px">File information</th>
                         <td style="padding: 0 15px;"></td>
                         <td style="padding: 0 15px;"></td>
                   </tr>
@@ -258,7 +255,7 @@ class DownloadSummary:
                   </tr>
                   <!-- TOTAL SIZE ROW  -->
                   <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <td style="padding: 0 15px;">All {self.partner} images</td>
+                      <td style="padding: 0 15px;">All {self.partner.upper()} images</td>
                       <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.total_size)}</td>
                   </tr>
                 </mj-table>
