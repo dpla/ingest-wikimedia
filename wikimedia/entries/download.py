@@ -9,7 +9,6 @@ from executors.downloader import Downloader
 from utilities.fs import FileSystem, get_datetime_prefix
 from utilities.exceptions import DownloadException, IIIFException
 from utilities.format import sizeof_fmt
-from utilities.arguements import get_download_args
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -53,7 +52,7 @@ class DownloadEntry():
                 exclude_ids = [line.rstrip() for line in f]
             return fs.read_parquet(data_in, cols=self.READ_COLUMNS).filter(lambda x: x.id in exclude_ids)
 
-        return fs.read_parquet(data_in, cols=self.READ_COLUMNS).head(25) # for testing
+        return fs.read_parquet(data_in, cols=self.READ_COLUMNS)
 
     def data_out_path(self, base, name):
         """
@@ -124,11 +123,7 @@ class DownloadEntry():
         self.log.info(f"Data out:        {data_out}")
         self.log.info(f"DPLA records:    {self.downloader._tracker.dpla_count}")
 
-        # Bind to processor count, god only know what some of these endpoinnts can handle
-        # processors = os.cpu_count()
-
         df = data_in.to_dict('records')
-        # batches = [df[i:i+processors] for i in range(0,len(df),processors)]
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in df]
         image_rows = [result.result() for result in results]
