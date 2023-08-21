@@ -9,7 +9,6 @@ from executors.downloader import Downloader
 from utilities.fs import FileSystem, get_datetime_prefix
 from utilities.exceptions import DownloadException, IIIFException
 from utilities.format import sizeof_fmt
-from utilities.arguements import get_download_args
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -53,7 +52,7 @@ class DownloadEntry():
                 exclude_ids = [line.rstrip() for line in f]
             return fs.read_parquet(data_in, cols=self.READ_COLUMNS).filter(lambda x: x.id in exclude_ids)
 
-        return fs.read_parquet(data_in, cols=self.READ_COLUMNS) # .head(2500) # for testing
+        return fs.read_parquet(data_in, cols=self.READ_COLUMNS)
 
     def data_out_path(self, base, name):
         """
@@ -112,7 +111,7 @@ class DownloadEntry():
         """
         """
         # Read data in
-        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None)).head(25)
+        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None))
         # Set the total number of DPLA items to be attempted
         self.downloader._tracker.set_dpla_count(len(data_in))
         # Full path to the output parquet file
@@ -124,23 +123,22 @@ class DownloadEntry():
         self.log.info(f"Data out:        {data_out}")
         self.log.info(f"DPLA records:    {self.downloader._tracker.dpla_count}")
 
-        # Bind to processor count, god only know what some of these endpoinnts can handle
-        processors = os.cpu_count()
-
         df = data_in.to_dict('records')
-        batches = [df[i:i+processors] for i in range(0,len(df),processors)]
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in df]
-
         image_rows = [result.result() for result in results]
         self.log.info(f"Downloaded {self.downloader._tracker.success_count} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
 
         # Write data out
         fs = FileSystem()
-        df_2 = pd.DataFrame([df])
+        df_2 = pd.DataFrame([image_rows])
         fs.write_parquet(path=data_out, data=df_2, columns=self.WRITE_COLUMNS)
 
     def process_rows(self, rows):
+        """
+
+        returns: rows: list of dicts for images and metadata associated with a single DPLA record
+        """
         iiif = IIIF()
         images = []
 
@@ -155,21 +153,17 @@ class DownloadEntry():
         try:
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
+            self.downloader._tracker.fail_count += 1
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
-            return images
+            return []
 
-        # TODO this will raise an exception if downloads fail. We should catch that and continue
         try:
             self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
             images = self.get_images(images, dpla_id)
             # update images with metadata applicable to all images
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:
-            raise DownloadException(f"Failed download(s) for {dpla_id}\n - {str(de)}")
-
-        # Add all assets/rows for a given metadata record. len(images) check is necessary because
-        # we'd get [a,b,[]] extending with an empty list
-        if len(images) > 0:
-            return images
-
+            images = []
+            self.downloader._tracker.fail_count += 1
+            self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
         return images

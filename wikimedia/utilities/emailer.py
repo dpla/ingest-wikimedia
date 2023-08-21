@@ -2,7 +2,8 @@
 """
 
 from botocore.exceptions import ClientError
-from utilities.format import sizeof_fmt
+from utilities.format import sizeof_fmt, number_fmt
+from mjml import mjml_to_html
 
 class UploadSummary:
     """
@@ -189,119 +190,86 @@ class DownloadSummary:
         """
         Returns the body of the email in HTML format."""
         return f"""
-            <html>
-            <head>
-                <meta content="text/html; charset=UTF-8" http-equiv="content-type">
-                <style type="text/css">.lst-kix_ugfaekz7c25d-4>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-5>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-7>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-1>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-5>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-4>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-8>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-0>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-8>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-1>li:before{{content:"-  "}}.lst-kix_75qdqn1hz53m-3>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-6>li:before{{content:"-  "}}.lst-kix_ugfaekz7c25d-7>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-7{{list-style-type:none}}.lst-kix_75qdqn1hz53m-2>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-8{{list-style-type:none}}.lst-kix_75qdqn1hz53m-6>li:before{{content:"-  "}}ul.lst-kix_ugfaekz7c25d-0{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-1{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-2{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-5{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-6{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-3{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-4{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-1{{list-style-type:none}}ul.lst-kix_75qdqn1hz53m-2{{list-style-type:none}}.lst-kix_75qdqn1hz53m-0>li:before{{content:"-  "}}ul.lst-kix_75qdqn1hz53m-0{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-3{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-4{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-5{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-6{{list-style-type:none}}.lst-kix_ugfaekz7c25d-2>li:before{{content:"-  "}}ul.lst-kix_ugfaekz7c25d-7{{list-style-type:none}}ul.lst-kix_ugfaekz7c25d-8{{list-style-type:none}}.lst-kix_ugfaekz7c25d-3>li:before{{content:"-  "}}ol{{margin:0;padding:0}}table td,table th{{padding:0}}.c5{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:99pt;border-top-color:#ffffff;border-bottom-style:solid}}.c7{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:109.5pt;border-top-color:#ffffff;border-bottom-style:solid}}.c12{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:218.2pt;border-top-color:#ffffff;border-bottom-style:solid}}.c0{{border-right-style:solid;padding:-9.4pt -9.4pt -9.4pt -9.4pt;border-bottom-color:#ffffff;border-top-width:1pt;border-right-width:1pt;border-left-color:#ffffff;vertical-align:middle;border-right-color:#ffffff;border-left-width:1pt;border-top-style:solid;border-left-style:solid;border-bottom-width:1pt;width:208.5pt;border-top-color:#ffffff;border-bottom-style:solid}}.c3{{padding-top:0pt;padding-bottom:0pt;line-height:1.15;orphans:2;widows:2;text-align:left;height:11pt}}.c10{{color:#000000;font-weight:700;text-decoration:none;vertical-align:baseline;font-size:11pt;font-family:"Arial";font-style:normal}}.c2{{color:#000000;font-weight:400;text-decoration:none;vertical-align:baseline;font-size:11pt;font-family:"Arial";font-style:normal}}.c8{{padding-top:0pt;padding-bottom:0pt;line-height:1.15;orphans:2;widows:2;text-align:left}}.c4{{padding-top:0pt;padding-bottom:0pt;line-height:1.0;text-align:left;height:11pt}}.c11{{text-decoration-skip-ink:none;-webkit-text-decoration-skip:none;color:#1155cc;text-decoration:underline}}.c15{{border-spacing:0;border-collapse:collapse;margin-right:auto}}.c6{{padding-top:0pt;padding-bottom:0pt;line-height:1.0;text-align:left}}.c9{{background-color:#ffffff;max-width:468pt;padding:72pt 72pt 72pt 72pt}}.c13{{color:inherit;text-decoration:inherit}}.c14{{font-weight:700}}.c1{{height:0pt}}.title{{padding-top:0pt;color:#000000;font-size:26pt;padding-bottom:3pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}.subtitle{{padding-top:0pt;color:#666666;font-size:15pt;padding-bottom:16pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}li{{color:#000000;font-size:11pt;font-family:"Arial"}}p{{margin:0;color:#000000;font-size:11pt;font-family:"Arial"}}h1{{padding-top:20pt;color:#000000;font-size:20pt;padding-bottom:6pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h2{{padding-top:18pt;color:#000000;font-size:16pt;padding-bottom:6pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h3{{padding-top:16pt;color:#434343;font-size:14pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h4{{padding-top:14pt;color:#666666;font-size:12pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h5{{padding-top:12pt;color:#666666;font-size:11pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;orphans:2;widows:2;text-align:left}}h6{{padding-top:12pt;color:#666666;font-size:11pt;padding-bottom:4pt;font-family:"Arial";line-height:1.15;page-break-after:avoid;font-style:italic;orphans:2;widows:2;text-align:left}}</style>
-            </head>
-            <body class="c9 doc-content">
-                <p class="c8"><span>Finished downloading all Wikimedia assets for </span><span class="c14">{self.partner.upper()}. </span><span>Click </span><span class="c11"><a class="c13" href="{self.log_url}">here</a></span><span>&nbsp;to download the complete log file</span><span class="c10">.</span></p>
-                <p class="c3"><span class="c10"></span></p>
-                <hr>
-                <p class="c3"><span class="c2"></span></p>
-                <p class="c3"><span class="c2"></span></p>
-                <a id="t.8c4053fb665b48bc85358613455d5b5f5ab451af"></a><a id="t.0"></a>
-                <table class="c15">
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c8"><span class="c10">DPLA records</span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.tracker.dpla_count}</span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c8"><span class="c14">Images</span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c3"><span class="c2"></span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c8"><span class="c2">Attempted</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.tracker.attempted}</span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c8"><span class="c2">Downloaded</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.tracker.success_count}</span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c8"><span class="c2">Skipped</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.tracker.skip_count}</span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c8"><span class="c2">Failed</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{self.tracker.fail_count}</span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c0" colspan="2" rowspan="1">
-                        <p class="c6"><span class="c10">File Information</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">Downloaded</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">___DOWNLOADED</span></p>
-                        </td>
-                    </tr>
-                    <tr class="c1">
-                        <td class="c5" colspan="1" rowspan="1">
-                        <p class="c4"><span class="c2"></span></p>
-                        </td>
-                        <td class="c7" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">All records</span></p>
-                        </td>
-                        <td class="c12" colspan="1" rowspan="1">
-                        <p class="c6"><span class="c2">{sizeof_fmt(self.tracker.cumulative_size)}</span></p>
-                        </td>
-                    </tr>
-                </table>
-                <p class="c3"><span class="c2"></span></p>
-            </body>
-            </html>
+<mjml>
+  <mj-head>
+      <mj-attributes>
+        <mj-class name="mjclass" color="black" font-size="20px" padding="0px 0px 0px 0px" />
+      </mj-attributes>
+    </mj-head>
+
+    <mj-body>
+        <mj-section>
+            <mj-column>
+                <mj-text mj-class="mjclass">Wikimedia download summary for {self.partner.upper()}</mj-text>
+            </mj-column>
+        </mj-section>
+
+        <mj-section>
+            <mj-column>
+                <mj-table align="left" vertical-align="middle" padding="0px">
+                  <!-- COLUMN 1 -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <th style="padding: 0 15px 0 0;width:75px; ">DPLA Items</th>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.dpla_count)}</td>
+                    <td style="padding: 0 15px;"></td>
+                  </tr>
+
+                  <!-- TODO FAILED DPLA RECORDS COUNT  -->
+                  <!-- TODO SUCCESSFUL DPLA RECORDS COUNT  -->
+
+                  <!-- IMAGES ROW  JUST A HEADER/LABEL-->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <th style="padding: 0 15px 0 0; width:75px">Images</th>
+                  <td style="padding: 0 15px;"></td>
+                  <td style="padding: 0 15px;"></td>
+                  </tr>
+                  <!-- ATTEMPTED ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;width:75px; text-align:left">Attempted</td>
+                    <td style="padding: 0 15px;width:100px">{number_fmt(self.tracker.success_count + self.tracker.skip_count + self.tracker.fail_count)}</td>
+                  </tr>
+                  <!-- DOWNLOAD ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;">Downloaded</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.success_count)}</td>
+                  </tr>
+                  <!-- SKIP ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;">Already in S3</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.skip_count)}</td>
+                  </tr>
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;">Failed</td>
+                    <td style="padding: 0 15px;">{number_fmt(self.tracker.fail_count)}</td>
+                  </tr>
+                  <!-- FILE INFO ROW  HEADER ONLY-->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                      <th style="padding: 0 15px 0 0; width:150px">File information</th>
+                        <td style="padding: 0 15px;"></td>
+                        <td style="padding: 0 15px;"></td>
+                  </tr>
+                  <!-- NEW DOWNLOAD ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                      <td style="padding: 0 15px;">New downloads</td>
+                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.cumulative_size)}</td>
+                  </tr>
+                  <!-- TOTAL SIZE ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                      <td style="padding: 0 15px;">All {self.partner.upper()} images</td>
+                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.total_size)}</td>
+                  </tr>
+                </mj-table>
+            </mj-column>
+        </mj-section>
+
+        <mj-section>
+            <mj-column>
+                <mj-text mj-class="mjclass"><a href="{self.log_url}">Click here</a> for complete log file</mj-text>
+            </mj-column>
+        </mj-section>
+
+    </mj-body>
+</mjml>
         """
 
 
@@ -319,9 +287,6 @@ class SesMailSender:
         """
         Sends an email.
 
-        Note: If your account is in the Amazon SES  sandbox, the source and
-        destination email accounts must both be verified.
-
         :param source: The source email account.
         :param destination: The destination email account.
         :param subject: The subject of the email.
@@ -331,6 +296,9 @@ class SesMailSender:
                           replies to the message.
         :return: The ID of the message, assigned by Amazon SES.
         """
+        result = mjml_to_html(html)
+        html: str = result.html
+
         send_args = {
             'Source': source,
             'Destination': destination.to_service_format(),

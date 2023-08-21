@@ -1,0 +1,81 @@
+<mjml>
+  <mj-head>
+      <mj-attributes>
+        <mj-class name="mjclass" color="black" font-size="30px" padding="30px 0px 30px 0px" />
+      </mj-attributes>
+    </mj-head>
+    <mj-body>
+        <mj-section>
+            <mj-column>
+                <mj-text mj-class="mjclass">Wikimedia download summary for {self.partner.upper()}</mj-text>
+            </mj-column>
+        </mj-section>
+        <mj-section>
+            <mj-column>
+                <mj-table align="left" vertical-align="middle" padding="0px">
+                  <th style="padding: 0 15px 0 0;"></th>
+                  <th style="padding: 0 15px;"></th>
+                  <th style="padding: 0 15px;"></th>
+                  <!-- COLUMN 1 -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <th style="padding: 0 15px 0 0;width:75px; ">DPLA Items</th>
+                    <td style="padding: 0 15px;">{self.tracker.dpla_count}</td>
+                    <td style="padding: 0 15px;"></td>
+                  </tr>
+
+                  <!-- TODO FAILED DPLA RECORDS COUNT  -->
+                  <!-- TODO SUCCESSFUL DPLA RECORDS COUNT  -->
+
+                  <!-- IMAGES ROW  JUST A HEADER/LABEL-->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <th style="padding: 0 15px 0 0; width:75px">Images</th>
+                  <td style="padding: 0 15px;"></td>
+                  <td style="padding: 0 15px;"></td>
+                  </tr>
+                  <!-- ATTEMPTED ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;width:75px; text-align:left">Attempted</td>
+                    <td style="padding: 0 15px;width:100px">{self.tracker.success_count + self.tracker.skip_count + self.tracker.fail_count}</td>
+                  </tr>
+                  <!-- DOWNLOAD ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;">Downloaded</td>
+                    <td style="padding: 0 15px;">{self.tracker.success_count}</td>
+                  </tr>
+                  <!-- SKIP ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;">Skipped</td>
+                    <td style="padding: 0 15px;">{self.tracker.skip_count}</td>
+                  </tr>
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                    <td style="padding: 0 15px;">Failed</td>
+                    <td style="padding: 0 15px;">{self.tracker.fail_count}</td>
+                  </tr>
+                  <!-- FILE INFO ROW  HEADER ONLY-->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                      <th style="padding: 0 15px 0 0; width:150px">File informations</th>
+                        <td style="padding: 0 15px;"></td>
+                        <td style="padding: 0 15px;"></td>
+                  </tr>
+                  <!-- NEW DOWNLOAD ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                      <td style="padding: 0 15px;">New downloads</td>
+                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.cumulative_size)}</td>
+                  </tr>
+                  <!-- TOTAL SIZE ROW  -->
+                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
+                      <td style="padding: 0 15px;">All {self.partner} images</td>
+                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.total_size)}</td>
+                  </tr>
+                </mj-table>
+            </mj-column>
+        </mj-section>
+
+        <mj-section>
+            <mj-column>
+                <mj-text mj-class="mjclass"><a href="{self.log_url}">Click here</a> for complete log file</mj-text>
+            </mj-column>
+        </mj-section>
+
+    </mj-body>
+</mjml>
