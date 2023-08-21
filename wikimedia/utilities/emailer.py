@@ -287,9 +287,6 @@ class SesMailSender:
         """
         Sends an email.
 
-        Note: If your account is in the Amazon SES  sandbox, the source and
-        destination email accounts must both be verified.
-
         :param source: The source email account.
         :param destination: The destination email account.
         :param subject: The subject of the email.

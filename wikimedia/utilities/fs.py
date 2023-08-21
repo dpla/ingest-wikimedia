@@ -86,7 +86,6 @@ class S3Helper:
             size = response.get('ContentLength', 0)
             return True, size
         except ClientError:
-            print("File does not exist in s3")
             # The head request fails therefore we assume the file does not exist in s3
             return False, 0
 
