@@ -3,11 +3,12 @@
 
 There are three steps for uploading images to Wikimedia.
 
-- ingestion3 Wikimedia export
-- ingest-wikimedia download
+- Export data for eligible records from the monthly ingest process [see ingestion3 documentation](https://github.com/dpla/ingestion3#wikimedia)
+- ingest-wikimedia `run-download.py`
 - ingest-wikimedia upload
 
 ## Starting up
+
 Start the `wikimedia` ec2 instance
 
 ```shell
@@ -27,26 +28,16 @@ Creates a new screen session with a name of `nwdh` and attach to that session. U
 
 Running a download requires two pieces of information
 
-1) The path to most recent Wikimedia export from ingestion3.
+1) The path to the Wikimedia output from ingestion3
 2) The path to save the output in s3
 
-The most recent Wikimedia export from ingestion3 can be identified by using the AWS CLI.
+The inpout path should be standard
 
-```shell
-> aws s3 ls s3://dpla-master-dataset/il/wiki/
-    PRE 20220719_182758-il-wiki.parquet/
-    PRE 20221027_195109-il-wiki.parquet/
-    PRE 20230130_201856-il-wiki.parquet/
-
-```
-
-We are going to download images from this set of eligible records identified during the ingest process
-
-`s3://dpla-master-dataset/il/wiki/20230130_201856-il-wiki.parquet/`
+`s3://dpla-master-dataset/il/wiki/`
 
 The path to output would be (this is determined by *you* and does not need to confirm to any specific formatting but consistent naming is very useful)
 
-`s3://dpla-wikimedia/il/images/`
+`s3://dpla-wikimedia/il/`
 
 With these two pieces we are now ready to kick off the download within the previously activated screen session.
 
@@ -54,7 +45,7 @@ With these two pieces we are now ready to kick off the download within the previ
 > cd ~/ingest-wikimedia/
 > source venv-3.10/bin/activate
 > poetry run python run-download.py \
-    --input s3://dpla-master-dataset/il/wiki/20230130_201856-il-wiki.parquet/ \
+    --input s3://dpla-master-dataset/il/wiki/ \
     --output s3://dpla-wikimedia/il/ \
     --partner il
 ```
