@@ -6,7 +6,6 @@ import sys
 import boto3
 
 from utilities.fs import S3Helper, log_file
-from utilities.logger import WikimediaLogger
 from utilities.emailer import SesMailSender, SesDestination, DownloadSummary
 from utilities.arguements import get_download_args
 from entries.download import DownloadEntry
