@@ -12,7 +12,6 @@ from utilities.format import sizeof_fmt
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
-import os
 import pandas as pd
 
 class DownloadEntry():
@@ -160,7 +159,7 @@ class DownloadEntry():
         try:
             self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
             images = self.get_images(images, dpla_id)
-            # update images with metadata applicable to all images
+            # Update images with metadata applicable to all images
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:
             images = []

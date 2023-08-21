@@ -16,6 +16,7 @@ from awswrangler import s3 as s3wrangler
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+@staticmethod
 def get_datetime_prefix():
     """
     Get a datetime prefix for the log file
@@ -28,12 +29,14 @@ def get_datetime_prefix():
     time = strftime("%H%M%S")
     return f"{date}_{time}"
 
+@staticmethod
 def log_file(partner_name, event_type, log_dir="./logs"):
     """
     """
     os.makedirs("./logs", exist_ok=True)
-    log_file_name = f"{partner_name}-{event_type}-{get_datetime_prefix()}.log"
+    log_file_name = f"{get_datetime_prefix()}-{partner_name}-{event_type}.log"
     return f"{log_dir}/{log_file_name}"
+
 
 class S3Helper:
     """
@@ -45,6 +48,14 @@ class S3Helper:
 
     def __init__(self):
         pass
+
+    def most_recent(self, bucket, key):
+        """
+        Find the most recent prefix in a path in s3
+        """
+        keys = self.s3_client.list_objects(Bucket=bucket, Prefix=key, Delimiter='/').get('CommonPrefixes', None)
+        prefixes =  [k.get('Prefix') for k in keys]
+        return max(prefixes)
 
     def write_log_s3(self, key, bucket, file, extra_args=None):
         """
