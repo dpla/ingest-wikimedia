@@ -6,15 +6,15 @@ class Tracker:
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
     UPLOADED = "UPLOADED"
-    # item tracking
+    # Item tracking
     item_cnt = 0
     item_fail_cnt = 0
-    # image tracking
+    # Image tracking
     image_attempted_cnt = 0
     image_fail_cnt = 0
     image_skip_cnt = 0
     image_success_cnt = 0
-    # size tracking
+    # Size tracking
     image_size_session = 0
     image_size_total = 0
 

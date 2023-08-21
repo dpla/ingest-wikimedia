@@ -3,16 +3,16 @@
 Downloads Wikimedia eligible images from a DPLA partner
 
 """
+from itertools import chain
+from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
+import logging
 
 from utilities.iiif import IIIF
 from executors.downloader import Downloader
 from utilities.fs import FileSystem, get_datetime_prefix
 from utilities.exceptions import DownloadException, IIIFException
 from utilities.format import sizeof_fmt
-
-import logging
-from concurrent.futures import ThreadPoolExecutor
-import pandas as pd
 
 class DownloadEntry():
     """
@@ -110,7 +110,7 @@ class DownloadEntry():
         """
         """
         # Read data in
-        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None))
+        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None)).head(1)
         # Set the total number of DPLA items to be attempted
         self.downloader._tracker.set_dpla_count(len(data_in))
         # Full path to the output parquet file
@@ -122,16 +122,19 @@ class DownloadEntry():
         self.log.info(f"Data out:        {data_out}")
         self.log.info(f"DPLA records:    {self.downloader._tracker.item_cnt}")
 
-        df = data_in.to_dict('records')
+        records = data_in.to_dict('records')
         with ThreadPoolExecutor() as executor:
-            results = [executor.submit(self.process_rows, chunk) for chunk in df]
+            results = [executor.submit(self.process_rows, chunk) for chunk in records]
         image_rows = [result.result() for result in results]
         self.log.info(f"Downloaded {self.downloader._tracker.image_success_cnt} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
 
-        # Write data out
+        # TODO dig into a better way to flatten this nested list
+        # Flatten data and create a dataframe
+        flat = list(chain.from_iterable(image_rows))
+        df = pd.DataFrame(flat, columns=self.WRITE_COLUMNS)
+        # Write dataframe out
         fs = FileSystem()
-        df_2 = pd.DataFrame([image_rows])
-        fs.write_parquet(path=data_out, data=df_2, columns=self.WRITE_COLUMNS)
+        fs.write_parquet(path=data_out, data=df, columns=self.WRITE_COLUMNS)
 
     def process_rows(self, rows):
         """
@@ -155,7 +158,6 @@ class DownloadEntry():
             self.downloader._tracker.image_fail_cnt += 1
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
             return []
-
         try:
             self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
             images = self.get_images(images, dpla_id)

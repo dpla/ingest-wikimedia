@@ -49,13 +49,21 @@ class S3Helper:
     def __init__(self):
         pass
 
-    def most_recent(self, bucket, key):
+    def most_recent_prefix(self, bucket, key):
         """
         Find the most recent prefix in a path in s3
         """
+        # key path
         keys = self.s3_client.list_objects(Bucket=bucket, Prefix=key, Delimiter='/').get('CommonPrefixes', None)
         prefixes =  [k.get('Prefix') for k in keys]
         return max(prefixes)
+
+    def most_recent_object(self, bucket, key):
+        # objects
+        keys = self.s3_client.list_objects(Bucket=bucket, Prefix=key, Delimiter='/')['Contents']
+        objects =  [k.get('Key') for k in keys]
+        return max(objects)
+
 
     def write_log_s3(self, key, bucket, file, extra_args=None):
         """
