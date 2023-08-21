@@ -40,10 +40,7 @@ def main():
                               '%(message)s')
 
     log.info("Starting download")
-    # kick off the download
     entry.execute()
-
-    # We are done.
     log.info("fin.")
 
     # Save the log file to S3

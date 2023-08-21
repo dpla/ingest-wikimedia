@@ -2,14 +2,12 @@ import os
 import tempfile
 import requests
 import magic
+import logging
 
 from pathlib import Path
 from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
 from trackers.tracker import Tracker
-
-from utilities.logger import WikimediaLogger
-import logging
 
 class Downloader:
     """

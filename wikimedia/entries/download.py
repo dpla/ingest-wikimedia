@@ -120,13 +120,13 @@ class DownloadEntry():
         self.log.info(f"Input:           {self.args.get('input_data')}")
         self.log.info(f"Base out:        {self.args.get('output_base')}")
         self.log.info(f"Data out:        {data_out}")
-        self.log.info(f"DPLA records:    {self.downloader._tracker.dpla_count}")
+        self.log.info(f"DPLA records:    {self.downloader._tracker.item_cnt}")
 
         df = data_in.to_dict('records')
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in df]
         image_rows = [result.result() for result in results]
-        self.log.info(f"Downloaded {self.downloader._tracker.success_count} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
+        self.log.info(f"Downloaded {self.downloader._tracker.image_success_cnt} images ({sizeof_fmt(self.downloader._tracker.get_size())})")
 
         # Write data out
         fs = FileSystem()
@@ -152,7 +152,7 @@ class DownloadEntry():
         try:
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
-            self.downloader._tracker.fail_count += 1
+            self.downloader._tracker.image_fail_cnt += 1
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
             return []
 
@@ -163,6 +163,6 @@ class DownloadEntry():
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:
             images = []
-            self.downloader._tracker.fail_count += 1
+            self.downloader._tracker.image_fail_cnt += 1
             self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
         return images

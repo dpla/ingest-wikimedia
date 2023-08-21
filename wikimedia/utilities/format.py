@@ -13,6 +13,7 @@ def sizeof_fmt(num, suffix='B'):
         num /= 1024.0
     return "%.1f%s%s" % (num, 'Yi', suffix)
 
+@staticmethod
 def number_fmt(num):
     """
     Convert number to human readable format
