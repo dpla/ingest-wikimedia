@@ -151,11 +151,13 @@ class FileSystem:
     def __init__(self):
         pass
 
-    def read_parquet(self, path, cols):
+    def read_parquet(self, path, cols=None):
         """Reads parquet file and returns a dataframe"""
         temp = []
         for file in self._get_parquet_files(path=path):
-            temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns=cols))
+            if cols:
+                temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns=cols))
+            temp.append(pd.read_parquet(file, engine='fastparquet'))
         return pd.concat(temp, axis=0, ignore_index=True)
 
     def write_parquet(self, path, data, columns):

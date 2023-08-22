@@ -173,15 +173,16 @@ class Uploader:
         temp_file = tempfile.NamedTemporaryFile()
         self.download(bucket=bucket, key=key, destination=temp_file)
         try:
-            # self._site.upload(filepage=wiki_file_page,
-            #                  source_filename=temp_file.name,
-            #                  comment=comment,
-            #                  text=text,
-            #                  ignore_warnings=self.warnings_to_ignore,
-            #                  asynchronous= True,
-            #                  chunk_size=3000000 # 3MB
-            #                 )
-            # self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self._site.upload(filepage=wiki_file_page,
+                             source_filename=temp_file.name,
+                             comment=comment,
+                             text=text,
+                             ignore_warnings=self.warnings_to_ignore,
+                             asynchronous= True,
+                             chunk_size=3000000 # 3MB
+                            )
+            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:

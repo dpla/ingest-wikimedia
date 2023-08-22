@@ -42,7 +42,7 @@ data_in = fs.read_parquet(args.get('input'))
 
 log.info(f"Read {len(data_in)} image rows from {args.get('input')}")
 
-# TODO begin the run entry here.
+# TODO begin the run entry here. 
 
 # Run upload
 uploader.execute_upload(data_in)
