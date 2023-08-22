@@ -9,24 +9,24 @@ import pywikibot
 import boto3
 import botocore
 import numpy as np
+import logging
 
 from utilities.exceptions import UploadException
-from utilities.fs import FileSystem, S3Helper
+from utilities.fs import S3Helper
 from trackers.tracker import Tracker
 
 class Uploader:
     """
     Upload to Wikimedia Commons
     """
+    log = logging.getLogger(__name__)
+
+    s3_helper = S3Helper()
+    s3_resource = boto3.resource('s3')  # Used for download
+    s3_client = boto3.client('s3')      # Used for head_object
 
     _site = None
-    _log = None
-    _tracker = None
-    _fs = FileSystem()
-    s3_helper = S3Helper()
-    s3 = boto3.resource('s3')       # Used for download
-    s3_client = boto3.client('s3')  # Used for head_object
-
+    _tracker = Tracker()
 
     # List of warning codes to ignore. This list exists mainly to exclude 'duplicate' (i.e.,
     # abort upload if it's a duplicate, but not other cases)Full list of warnings here:
@@ -44,12 +44,19 @@ class Uploader:
         'was-deleted'
     ]
 
-    def __init__(self, logger):
-        self._log = logger
-        self._tracker = Tracker()
+    # TODO this is probably not required.
+    # This is the schema emitted by the Wikimedia ingest download process
+    READ_COLUMNS = {"_1": "dpla_id",
+                    "_2": "path",
+                    "_3": "size",
+                    "_4": "title",
+                    "_5": "markup",
+                    "_6": "page"}
+
+    def __init__(self):
         self._site = pywikibot.Site()
         self._site.login()
-        self._log.info(f"Logged in user is: {self._site.user()}")
+        self.log.info(f"Logged in user is: {self._site.user()}")
 
     def download(self, bucket, key, destination):
         """
@@ -64,7 +71,7 @@ class Uploader:
         """
         with open(destination.name, "wb") as f:
             try:
-                self.s3.Bucket(bucket).download_file(key, destination.name)
+                self.s3_resource.Bucket(bucket).download_file(key, destination.name)
                 return destination.name
             except botocore.exceptions.ClientError as client_error:
                 if client_error.response['Error']['Code'] == "404":
@@ -87,7 +94,7 @@ class Uploader:
         unique, counts = np.unique(df["dpla_id"], return_counts=True)
         return dict(zip(unique, counts))
 
-    def execute_upload(self, df, cols):
+    def execute_upload(self, df):
         """
         Upload images to Wikimedia Commons"""
         unique_ids = self._unique_ids(df)
@@ -95,7 +102,7 @@ class Uploader:
         self._tracker.set_total(len(df))
         self._tracker.set_dpla_count(len(unique_ids))
 
-        for row in df.itertuples(): #  (index=cols):
+        for row in df.itertuples():
             dpla_id, path, title, wiki_markup, size = None, None, None, None, None
             try:
                 dpla_id = row.dpla_id
@@ -105,7 +112,7 @@ class Uploader:
                 wiki_markup = row.markup
                 page = row.page
             except AttributeError as attribute_error:
-                self._log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
+                self.log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
                 continue
 
             # If there is only one record for this dpla_id, then page is `None` and pagination will not
@@ -115,16 +122,16 @@ class Uploader:
             ext = self.get_extension(path)
             # Create Wikimedia page title
             page_title = self.create_wiki_page_title(title=title,
-                                                        dpla_identifier=dpla_id,
-                                                        suffix=ext,
-                                                        page=page)
+                                                     dpla_identifier=dpla_id,
+                                                     suffix=ext,
+                                                     page=page)
 
             # Create wiki page using Wikimedia page title
             wiki_page = self.create_wiki_file_page(title=page_title)
 
             if wiki_page is None:
                 # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-                self._log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+                self.log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
                 self._tracker.increment(Tracker.SKIPPED)
                 continue
             try:
@@ -136,11 +143,11 @@ class Uploader:
                             page_title=page_title)
                 self._tracker.increment(Tracker.UPLOADED, size=size)
             except UploadException as upload_exec:
-                self._log.error(f"Upload error {page_title} -- {str(upload_exec)}")
+                self.log.error(f"Upload error {page_title} -- {str(upload_exec)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
             except Exception as exception:
-                self._log.error(f"Unknown error {page_title} -- {str(exception)}")
+                self.log.error(f"Unknown error {page_title} -- {str(exception)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
 
@@ -166,15 +173,16 @@ class Uploader:
         temp_file = tempfile.NamedTemporaryFile()
         self.download(bucket=bucket, key=key, destination=temp_file)
         try:
-            # self._site.upload(filepage=wiki_file_page,
-            #                  source_filename=temp_file.name,
-            #                  comment=comment,
-            #                  text=text,
-            #                  ignore_warnings=self.warnings_to_ignore,
-            #                  asynchronous= True,
-            #                  chunk_size=3000000 # 3MB
-            #                 )
-            self._log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self._site.upload(filepage=wiki_file_page,
+                             source_filename=temp_file.name,
+                             comment=comment,
+                             text=text,
+                             ignore_warnings=self.warnings_to_ignore,
+                             asynchronous= True,
+                             chunk_size=3000000 # 3MB
+                            )
+            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:
@@ -218,7 +226,7 @@ class Uploader:
         # Check to see if the page contains invisible characters and is invalid
         # This is probably unnecessary, but it's here just in case
         if pywikibot.tools.chars.contains_invisible(title):
-            self._log.error(f"Invalid title due to invisible characters: {title}")
+            self.log.error(f"Invalid title due to invisible characters: {title}")
             return None
 
         # Add pagination to page title if needed

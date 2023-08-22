@@ -1,6 +1,7 @@
 import getopt
 import sys
 
+@staticmethod
 def get_download_args(args):
     """
     """
@@ -48,5 +49,25 @@ def get_download_args(args):
     return params
 
 
+@staticmethod
+def get_upload_args(args):
+    params = {}
+    try:
+        opts, args = getopt.getopt(sys.argv[1:],
+                                "hi:u:o:",
+                                ["input=",
+                                 "partner="])
+    except getopt.GetoptError:
+        print('upload-entry.py --partner <dpla partner abbreviation> --input <path to parquet>')
+        sys.exit(2)
 
-# TODO add upload param to this
+    for opt, arg in opts:
+        if opt == '-h':
+            print(
+                'upload-entry.py --partner <DPLA hub abbreviation> --input <path to parquet>')
+            sys.exit()
+        elif opt in ("-i", "--input"):
+            params['input'] = arg
+        elif opt in ("-p", "--partner"):
+            params['partner_name'] = arg
+    return params

@@ -23,7 +23,7 @@ def main():
 
     # Get the most recent parquet file from the input path
     bucket, key = s3.get_bucket_key(args.get('input_data'))
-    recent_key = s3.most_recent(bucket=bucket, key=key)
+    recent_key = s3.most_recent_prefix(bucket=bucket, key=key)
     args['input_data'] = f"s3://{bucket}/{recent_key}"
 
     entry = DownloadEntry(args)
@@ -40,10 +40,7 @@ def main():
                               '%(message)s')
 
     log.info("Starting download")
-    # kick off the download
     entry.execute()
-
-    # We are done.
     log.info("fin.")
 
     # Save the log file to S3

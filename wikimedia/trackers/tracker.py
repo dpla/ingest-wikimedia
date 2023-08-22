@@ -1,22 +1,22 @@
 
-from utilities.exceptions import DownloadException, UploadException
+from utilities.exceptions import UploadException
 
 class Tracker:
     DOWNLOADED = "DOWNLOADED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
     UPLOADED = "UPLOADED"
-
-    dpla_count = 0           # TODO implement in Download.download()
-    dpla_fail_count = 0      # TODO implement in Download.download() this is the number of failed DPLA records which is
-                             #    distinct from the number of failed images
-    skip_count = 0
-    fail_count = 0
-    success_count = 0
-    cumulative_size = 0     # This is the size of the images that were downloaded in the current session
-    total_size = 0          # This is the total size of all images for the provider (skipped and downloaded)
-    attempted = 0           # TODO implement in Download.download()
-
+    # Item tracking
+    item_cnt = 0
+    item_fail_cnt = 0
+    # Image tracking
+    image_attempted_cnt = 0
+    image_fail_cnt = 0
+    image_skip_cnt = 0
+    image_success_cnt = 0
+    # Size tracking
+    image_size_session = 0
+    image_size_total = 0
 
     def __init__(self):
         pass
@@ -25,32 +25,32 @@ class Tracker:
         """
         Set the number of DPLA items
         """
-        Tracker.dpla_count = count
+        Tracker.item_cnt = count
 
     def set_total(self, total):
         """
         Set the total number of uploads
         """
-        Tracker.attempted = total
+        Tracker.image_attempted_cnt = total
 
     def get_size(self):
         """
         Get the cumulative size of all files
         """
-        return Tracker.cumulative_size
+        return Tracker.image_size_session
 
     def increment(self, status, size=0):
         """
         Increment the status
         """
         if status == Tracker.SKIPPED:
-            Tracker.skip_count += 1
-            Tracker.total_size += size
+            Tracker.image_skip_cnt += 1
+            Tracker.image_size_total += size
         elif status == Tracker.DOWNLOADED or status == Tracker.UPLOADED:
-            Tracker.success_count += 1
-            Tracker.cumulative_size += size # this session
-            Tracker.total_size += size      # total of all images
+            Tracker.image_success_cnt += 1
+            Tracker.image_size_session += size
+            Tracker.image_size_total += size
         elif status == Tracker.FAILED:
-            Tracker.fail_count += 1
+            Tracker.image_fail_cnt += 1
         else:
             raise UploadException(f"Unknown status: {status}")
