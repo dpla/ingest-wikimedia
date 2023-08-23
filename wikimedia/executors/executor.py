@@ -1,0 +1,4 @@
+
+"""
+Generic interface for executors
+"""

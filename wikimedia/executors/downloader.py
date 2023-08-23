@@ -4,10 +4,9 @@ import requests
 import magic
 import logging
 
-from pathlib import Path
 from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
-from trackers.tracker import Tracker
+from trackers.tracker import Tracker, Result
 
 class Downloader:
     """
@@ -28,17 +27,6 @@ class Downloader:
         Get the status of the download
         """
         return self._tracker
-
-    def destination_path(self, base, count, dpla_id):
-        """
-        Create destination path to download file to
-        """
-        dest = f"{base}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
-        if base.startswith("s3://"):
-            return dest
-        Path.mkdir(Path(dest), parents=True, exist_ok=True)
-        return dest
-
 
     def download(self, source, destination):
         """
@@ -64,14 +52,14 @@ class Downloader:
             exists, size = self._s3.file_exists(bucket=bucket, key=key)
             if exists:
                 self.log.info(f" - Skipping {destination}, already exists in s3")
-                self._tracker.increment(Tracker.SKIPPED, size=size)
+                self._tracker.increment(Result.SKIPPED, size=size)
                 return destination, size
             self.log.info(f" - Downloading {source} to {destination}")
             destination, size = self._download_to_s3(source=source, bucket=bucket, key=key)
-            self._tracker.increment(Tracker.DOWNLOADED, size=size)
+            self._tracker.increment(Result.DOWNLOADED, size=size)
             return destination, size
         except Exception as exeception:
-            self._tracker.increment(Tracker.FAILED)
+            self._tracker.increment(Result.FAILED)
             raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
     def _download_to_local(self, source, file):
