@@ -65,11 +65,12 @@ class S3Helper:
         return max(objects)
 
 
-    def write_log_s3(self, key, bucket, file, extra_args=None):
+    def write_log_s3(self, bucket, key, file, extra_args=None):
         """
         Upload log file to s3
-        :param key: Key to upload log file to
+
         :param bucket: Bucket to upload log file to
+        :param key: Key to upload log file to
         :param extra_args: Extra arguments to pass to s3 upload_fileobj
         :return: The URL of the uploaded log file
         """

@@ -1,3 +1,4 @@
+
 """
 Upload images to Wikimedia Commons
 
@@ -13,6 +14,7 @@ import logging
 
 from utilities.exceptions import UploadException
 from utilities.fs import S3Helper
+from utilities.fs import FileSystem
 from trackers.tracker import Tracker
 
 class Uploader:
@@ -56,7 +58,12 @@ class Uploader:
     def __init__(self):
         self._site = pywikibot.Site()
         self._site.login()
-        self.log.info(f"Logged in user is: {self._site.user()}")
+        self.log.info(f"Logged in user is: {self._site.user()} in {self._site.family}")
+
+        # Set logging level for pywikibot
+        for d in logging.Logger.manager.loggerDict:
+            if d.startswith('pywiki'):
+                logging.getLogger(d).setLevel(logging.ERROR)
 
     def download(self, bucket, key, destination):
         """
@@ -94,9 +101,26 @@ class Uploader:
         unique, counts = np.unique(df["dpla_id"], return_counts=True)
         return dict(zip(unique, counts))
 
-    def execute_upload(self, df):
+    def load_data(self, data_in):
         """
+        Load data from parquet file and filter out ids if a file filter is provided
+        """
+        fs = FileSystem()
+        return fs.read_parquet(data_in)
+
+    def execute_upload(self, args):
+        """
+        :param args: Dictionary of arguments, partner_name and input
         Upload images to Wikimedia Commons"""
+
+        bucket, key = self.s3_helper.get_bucket_key(args.get('input'))
+        recent_key = self.s3_helper.most_recent_object(bucket=bucket, key=key)
+        args['input'] = f"s3://{bucket}/{recent_key}"
+
+        df = self.load_data(args.get('input'))
+
+        self.log.info(f"Read {len(df)} image rows from {args.get('input')}")
+
         unique_ids = self._unique_ids(df)
         # Set the total number of intended uploads and number of unique DPLA records
         self._tracker.set_total(len(df))
@@ -115,6 +139,8 @@ class Uploader:
                 self.log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
                 continue
 
+            print(f"Uploading {dpla_id} {title} {path}")
+
             # If there is only one record for this dpla_id, then page is `None` and pagination will not
             # be used in the Wikimedia page title
             page = None if unique_ids[dpla_id] == 1 else page
@@ -131,7 +157,7 @@ class Uploader:
 
             if wiki_page is None:
                 # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-                self.log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+                self.log.info(f"Already exists {self.wikimedia_url(title=page_title)}")
                 self._tracker.increment(Tracker.SKIPPED)
                 continue
             try:
@@ -143,11 +169,11 @@ class Uploader:
                             page_title=page_title)
                 self._tracker.increment(Tracker.UPLOADED, size=size)
             except UploadException as upload_exec:
-                self.log.error(f"Upload error {page_title} -- {str(upload_exec)}")
+                self.log.error(f"{str(upload_exec)} -- {self.wikimedia_url(page_title)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
             except Exception as exception:
-                self.log.error(f"Unknown error {page_title} -- {str(exception)}")
+                self.log.error(f"{str(exception)} -- {self.wikimedia_url(page_title)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
 
@@ -173,7 +199,6 @@ class Uploader:
         temp_file = tempfile.NamedTemporaryFile()
         self.download(bucket=bucket, key=key, destination=temp_file)
         try:
-            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             self._site.upload(filepage=wiki_file_page,
                              source_filename=temp_file.name,
                              comment=comment,
@@ -181,33 +206,28 @@ class Uploader:
                              ignore_warnings=self.warnings_to_ignore,
                              asynchronous= True,
                              chunk_size=3000000 # 3MB
+
                             )
-            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self.log.info(f"Uploaded to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:
             error_string = str(exception)
+            # TODO what does this error message actually mean? Page name?
             if 'fileexists-shared-forbidden:' in error_string:
-                raise UploadException(f"Failed '{page_title}', File already uploaded") from exception
+                raise UploadException(f"File already uploaded") from exception
             if 'filetype-badmime' in error_string:
-                raise UploadException(f"Failed '{page_title}', Invalid MIME type") from exception
+                raise UploadException(f"Invalid MIME type") from exception
             if 'filetype-banned' in error_string:
-                raise UploadException(f"Failed '{page_title}', Banned file type") from exception
+                raise UploadException(f"Banned file type") from exception
+            # TODO what does this error message actually mean? MD5 hash collision?
             if 'duplicate' in error_string:
-                raise UploadException(f"Failed '{page_title}', File already exists, {error_string}") from exception
-            raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {error_string}") from exception
+                raise UploadException(f"File already exists, {error_string}") from exception
+            raise UploadException(f"Failed to upload {error_string}") from exception
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
         Makes a proper Wikimedia page title from the DPLA identifier and the title of the image.
-
-        - only use the first 181 characters of image file name
-        - replace [ with (
-        - replace ] with )
-        - replace { with (
-        - replace } with )
-        - replace / with -
-        - replace : with -
 
         :param title: DPLA title
         :param dpla_identifier: DPLA identifier
@@ -264,3 +284,6 @@ class Uploader:
             return mimetypes.guess_extension(mime)
         except Exception as exception:
             raise UploadException(f"Unable to get extension for {path}: {str(exception)}") from exception
+
+    def wikimedia_url(self, title):
+        return f"https://commons.wikimedia.org/wiki/File:{title.replace(' ', '_')}"

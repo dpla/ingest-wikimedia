@@ -4,20 +4,21 @@ Downloads Wikimedia eligible images from a DPLA partner
 """
 import sys
 import boto3
+import logging
 
 from utilities.fs import S3Helper, log_file
-from utilities.emailer import SesMailSender, SesDestination, DownloadSummary
+from utilities.emailer import SesMailSender, SesDestination, Summary
 from utilities.arguements import get_download_args
 from entries.download import DownloadEntry
 
-import logging
 
 def main():
     args = get_download_args(sys.argv[1:])
 
-    EMAIL_SOURCE = "tech@dp.la"
-    EMAMIL_REPLY = ["tech@dp.la"]
-    EMAIL_TO = ["scott@dp.la"]
+    # email sources and destinations
+    EMAIL_SOURCE = "DPLA Tech Bot<tech@dp.la>"
+    EMAMIL_REPLY = ["DPLA Tech Bot<tech@dp.la>"]
+    EMAIL_TO = ["Scott<scott@dp.la>"] # TODO replace with tech@dp.la or dominic@dp.la
 
     s3 = S3Helper()
 
@@ -51,10 +52,11 @@ def main():
     log.info(f"Log file saved to {public_url}")
 
     # Build summary of download (for email)
-    summary = DownloadSummary(partner=args.get('partner_name'),
+    summary = Summary(partner=args.get('partner_name'),
                             log_url=public_url,
                             # FIXME this is B.S. here.
-                            tracker=entry.downloader.get_status())
+                            tracker=entry.downloader.get_status(),
+                            event_type=Summary.DOWNLOAD)
     # Send email notification
     ses_client = boto3.client('ses', region_name='us-east-1')
     emailer = SesMailSender(ses_client)

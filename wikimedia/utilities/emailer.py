@@ -3,253 +3,58 @@
 
 from botocore.exceptions import ClientError
 from utilities.format import sizeof_fmt, number_fmt
-from mjml import mjml_to_html
 
-class UploadSummary:
+
+class Summary:
     """
-    Summarizes upload events"""
-
+    Summarizes events"""
     partner = None
     log_url = None
     tracker = None
 
-    def __init__(self, partner, log_url, tracker):
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
+    event_type = None
+
+    def __init__(self, partner, log_url, tracker, event_type):
         self.partner = partner
         self.log_url = log_url
         self.tracker = tracker
+        self.event_type = event_type
 
     def subject(self):
         """
         Returns the subject of the email."""
-        return f"{self.partner.upper()} - Wikimedia upload finished"
+        return f"{self.partner.upper()} - Wikimedia {self.event_type} finished"
 
     def body_text(self):
         """
         Returns the body of the email in plain text format."""
         return f"""
-            Finished uploading all Wikimedia assets for {self.partner.upper()}.
+            Wikimedia {self.event_type} summary for {self.partner.upper()}.
 
-            DPLA records: {self.tracker.item_cnt}
-            ----------------------------------------
+            DPLA records
+              - Attempted.....{self.tracker.item_cnt}
+              - Successful....{0}
+              - Failed........{0}
+
             Images
-            - Attempted: {self.tracker.image_attempted_cnt}
-            - Uploaded: {self.tracker.image_fail_cnt}
-            - Skipped: {self.tracker.image_skip_cnt}
-            - Failed: {self.tracker.image_success_cnt}
-            ----------------------------------------
-            File information
-            - Added: {sizeof_fmt(self.tracker.image_size_session)}
-            - Total: {sizeof_fmt(self.tracker.image_size_total)}
-            ----------------------------------------
-            Log file available at {self.log_url}
-        """
+              - Attempted.....{self.tracker.image_attempted_cnt}
+              - Successful....{self.tracker.image_success_cnt}
+              - Skipped.......{self.tracker.image_skip_cnt}
+              - Failed........{self.tracker.image_fail_cnt}
 
-    def body_html(self):
-        return f"""
-<mjml>
-  <mj-head>
-      <mj-attributes>
-        <mj-class name="mjclass" color="black" font-size="20px" padding="0px 0px 0px 0px" />
-      </mj-attributes>
-    </mj-head>
+            Storage
+              - Added.........{sizeof_fmt(self.tracker.image_size_session)}
+              - Total.........{sizeof_fmt(self.tracker.image_size_total)}
 
-    <mj-body>
-        <mj-section>
-            <mj-column>
-                <mj-text mj-class="mjclass">Wikimedia upload summary for {self.partner.upper()}</mj-text>
-            </mj-column>
-        </mj-section>
-
-        <mj-section>
-            <mj-column>
-                <mj-table align="left" vertical-align="middle" padding="0px">
-                  <!-- COLUMN 1 -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <th style="padding: 0 15px 0 0;width:75px; ">DPLA Items</th>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.item_cnt)}</td>
-                    <td style="padding: 0 15px;"></td>
-                  </tr>
-
-                  <!-- TODO FAILED DPLA RECORDS COUNT  -->
-                  <!-- TODO SUCCESSFUL DPLA RECORDS COUNT  -->
-
-                  <!-- IMAGES ROW  JUST A HEADER/LABEL-->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <th style="padding: 0 15px 0 0; width:75px">Images</th>
-                  <td style="padding: 0 15px;"></td>
-                  <td style="padding: 0 15px;"></td>
-                  </tr>
-                  <!-- ATTEMPTED ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;width:75px; text-align:left">Attempted</td>
-                    <td style="padding: 0 15px;width:100px">{number_fmt(self.tracker.image_attempted_cnt)}</td>
-                  </tr>
-                  <!-- DOWNLOAD ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Downloaded</td>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.image_success_cnt)}</td>
-                  </tr>
-                  <!-- SKIP ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Already in S3</td>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.image_skip_cnt)}</td>
-                  </tr>
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Failed</td>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.image_fail_cnt)}</td>
-                  </tr>
-                  <!-- FILE INFO ROW  HEADER ONLY-->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <th style="padding: 0 15px 0 0; width:150px">File information</th>
-                        <td style="padding: 0 15px;"></td>
-                        <td style="padding: 0 15px;"></td>
-                  </tr>
-                  <!-- NEW DOWNLOAD ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <td style="padding: 0 15px;">New downloads</td>
-                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.image_size_session)}</td>
-                  </tr>
-                  <!-- TOTAL SIZE ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <td style="padding: 0 15px;">All {self.partner.upper()} images</td>
-                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.image_size_total)}</td>
-                  </tr>
-                </mj-table>
-            </mj-column>
-        </mj-section>
-
-        <mj-section>
-            <mj-column>
-                <mj-text mj-class="mjclass"><a href="{self.log_url}">Click here</a> for complete log file</mj-text>
-            </mj-column>
-        </mj-section>
-
-    </mj-body>
-</mjml>"""
-
-class DownloadSummary:
-    """
-    Summarizes download events"""
-    partner = ""
-    log_url = ""
-    tracker = None
-
-    def __init__(self, partner, log_url, tracker):
-        self.partner = partner
-        self.log_url = log_url
-        self.tracker = tracker
-
-    def subject(self):
-        """
-        Returns the subject of the email."""
-        return f"{self.partner.upper()} - Wikimedia download finished"
-
-    def body_text(self):
-        """
-        Returns the body of the email in plain text format."""
-        return f"""
-            Finished downloading all Wikimedia assets for {self.partner.upper()}.
-
-            DPLA records: TBD
-            ----------------------------------------
-            Images
-            - Attempted: {self.tracker.image_attempted_cnt}
-            - Downloaded: {self.tracker.image_success_cnt}
-            - Skipped: {self.tracker.image_skip_cnt}
-            - Failed: {self.tracker.image_fail_cnt}
-            ----------------------------------------
-            File information
-            - Downloaded: TBD
-            - All records: {sizeof_fmt(self.tracker.image_size_total)}
-            ----------------------------------------
             Log file available at {self.log_url}
         """
 
     def body_html(self):
         """
         Returns the body of the email in HTML format."""
-        return f"""
-<mjml>
-  <mj-head>
-      <mj-attributes>
-        <mj-class name="mjclass" color="black" font-size="20px" padding="0px 0px 0px 0px" />
-      </mj-attributes>
-    </mj-head>
-
-    <mj-body>
-        <mj-section>
-            <mj-column>
-                <mj-text mj-class="mjclass">Wikimedia download summary for {self.partner.upper()}</mj-text>
-            </mj-column>
-        </mj-section>
-
-        <mj-section>
-            <mj-column>
-                <mj-table align="left" vertical-align="middle" padding="0px">
-                  <!-- COLUMN 1 -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <th style="padding: 0 15px 0 0;width:75px; ">DPLA Items</th>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.item_cnt)}</td>
-                    <td style="padding: 0 15px;"></td>
-                  </tr>
-
-                  <!-- TODO FAILED DPLA RECORDS COUNT  -->
-                  <!-- TODO SUCCESSFUL DPLA RECORDS COUNT  -->
-
-                  <!-- IMAGES ROW  JUST A HEADER/LABEL-->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <th style="padding: 0 15px 0 0; width:75px">Images</th>
-                  <td style="padding: 0 15px;"></td>
-                  <td style="padding: 0 15px;"></td>
-                  </tr>
-                  <!-- ATTEMPTED ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;width:75px; text-align:left">Attempted</td>
-                    <td style="padding: 0 15px;width:100px">{number_fmt(self.tracker.image_attempted_cnt)}</td>
-                  </tr>
-                  <!-- DOWNLOAD ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Downloaded</td>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.image_success_cnt)}</td>
-                  </tr>
-                  <!-- SKIP ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Already in S3</td>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.image_skip_cnt)}</td>
-                  </tr>
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                    <td style="padding: 0 15px;">Failed</td>
-                    <td style="padding: 0 15px;">{number_fmt(self.tracker.image_fail_cnt)}</td>
-                  </tr>
-                  <!-- FILE INFO ROW  HEADER ONLY-->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <th style="padding: 0 15px 0 0; width:150px">File information</th>
-                        <td style="padding: 0 15px;"></td>
-                        <td style="padding: 0 15px;"></td>
-                  </tr>
-                  <!-- NEW DOWNLOAD ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <td style="padding: 0 15px;">New downloads</td>
-                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.image_size_session)}</td>
-                  </tr>
-                  <!-- TOTAL SIZE ROW  -->
-                  <tr style="border-bottom:1px solid #ecedee;text-align:left;padding:15px 0;">
-                      <td style="padding: 0 15px;">All {self.partner.upper()} images</td>
-                      <td style="padding: 0 15px;">{sizeof_fmt(self.tracker.image_size_total)}</td>
-                  </tr>
-                </mj-table>
-            </mj-column>
-        </mj-section>
-
-        <mj-section>
-            <mj-column>
-                <mj-text mj-class="mjclass"><a href="{self.log_url}">Click here</a> for complete log file</mj-text>
-            </mj-column>
-        </mj-section>
-
-    </mj-body>
-</mjml>
-        """
+        return f"""<pre>{self.body_text()}</pre>"""
 
 
 # Taken from Amzaon example code:
@@ -275,9 +80,6 @@ class SesMailSender:
                           replies to the message.
         :return: The ID of the message, assigned by Amazon SES.
         """
-        result = mjml_to_html(html)
-        html: str = result.html
-
         send_args = {
             'Source': source,
             'Destination': destination.to_service_format(),
