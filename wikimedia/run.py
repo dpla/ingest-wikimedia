@@ -2,13 +2,13 @@
 Generic runner
 
 """
-
 import sys
 import boto3
 import logging
 
-from executors.uploader import Uploader
+# TODO Add back entries.upload after logging issue is resolved.
 from entries.download import DownloadEntry
+from trackers.tracker import Tracker
 from utilities.fs import S3Helper, log_file
 from utilities.arguements import get_args
 from utilities.emailer import SesMailSender, SesDestination, Summary
@@ -19,12 +19,12 @@ EMAMIL_REPLY    = ["DPLA Tech Bot<tech@dp.la>"]
 EMAIL_TO        = ["Scott<scott@dp.la>"] # TODO replace with tech@dp.la or dominic@dp.la
 
 def main():
-    args = get_args(sys.argv[1:])
-
-    tracker = None
-    entry = None
+    tracker = Tracker()
     s3 = S3Helper()
+    entry = None
 
+    # Get arguements
+    args = get_args(sys.argv[1:])
     # Arguements required by run.py; default values of None if not provided
     partner = args.get('partner', None)
     event_type = args.get('type', None)
@@ -45,20 +45,19 @@ def main():
 
     match event_type:
         case "upload":
-            entry = Uploader()
-            # FIXME UploadEntry()
-            # FIXME execute_upload() --> execute() to match DownloadEntry
-            entry.execute_upload(input) # Upload only needs the input path
-            pass
+            # We do this here because I can't figure out how to prevent the instantiation of pywikibot
+            # in Uploader.__init__ from writing to the log file and dumping all that verbose logging to the
+            # screen
+            # TODO - contact pywikibot devs to see if there's a better way to do this
+            from entries.upload import UploadEntry
+            entry = UploadEntry(tracker)
         case "download":
-            entry = DownloadEntry()
-            entry.execute(**args)
+            entry = DownloadEntry(tracker)
         case _:
             log.critical(f"Event type {event_type} is not valid. Must be `upload` or `download`")
             sys.exit(-1)
 
-    # get_tracker to be implemented by other
-    tracker = entry.get_tracker()
+    entry.execute(**args)
 
     # Upload log file to s3
     bucket, _ = s3.get_bucket_key(input)

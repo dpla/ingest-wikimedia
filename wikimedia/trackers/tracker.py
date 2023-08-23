@@ -26,22 +26,26 @@ class Tracker:
     def __init__(self):
         pass
 
-    def set_dpla_count(self, count):
+    @staticmethod
+    def set_dpla_count(count):
         """
         Set the number of DPLA items"""
         Tracker.item_cnt = count
 
-    def set_total(self, total):
+    @staticmethod
+    def set_total(total):
         """
         Set the total number of uploads"""
         Tracker.image_attempted_cnt = total
 
-    def get_size(self):
+    @staticmethod
+    def get_size():
         """
         Get the cumulative size of all files"""
         return Tracker.image_size_session
 
-    def increment(self, status, size=0):
+    @staticmethod
+    def increment(status, size=0):
         """
         Increment the status"""
         if status == Result.SKIPPED:

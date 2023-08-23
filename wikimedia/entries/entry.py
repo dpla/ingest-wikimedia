@@ -3,10 +3,8 @@ from trackers.tracker import Tracker
 from utilities.fs import FileSystem
 
 class Entry():
-    tracker = None
-
-    def __init__(self) -> None:
-        self.tracker = Tracker()
+    """
+    """
 
     @staticmethod
     def load_data(data_in, columns = None, file_filter = None):
@@ -24,8 +22,5 @@ class Entry():
 
         return data
 
-    def get_tracker(self):
-        return self.tracker
-
-    def execute(self, **kwargs):
-        pass
+    def execute(self, tracker: Tracker, **kwargs):
+        raise NotImplementedError

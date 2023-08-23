@@ -11,7 +11,7 @@ import logging
 
 from entries.entry import Entry
 from executors.downloader import Downloader
-from trackers.tracker import Result
+from trackers.tracker import Result, Tracker
 from utilities.iiif import IIIF
 from utilities.fs import FileSystem, get_datetime_prefix
 from utilities.exceptions import DownloadException, IIIFException
@@ -29,17 +29,58 @@ class DownloadEntry(Entry):
                     "_5": "title"}
 
     TUPLE_INDEX = list(READ_COLUMNS.values())
-
     # Column names for the output parquet file
     WRITE_COLUMNS = ['dpla_id','path','size','title','markup','page']
-
     BASE_OUT = None
 
     downloader = None
+    tracker = None
+
     log = logging.getLogger(__name__)
 
-    def __init__(self):
+    def __init__(self, tracker: Tracker):
         self.downloader = Downloader()
+        self.tracker = tracker
+
+    def execute(self, **kwargs):
+        """
+        """
+        from utilities.fs import S3Helper
+        s3_helper = S3Helper()
+
+        # FIXME this is a kludge to pass this var to get_images which is called during paralleization
+        self.BASE_OUT = kwargs.get('output', None)
+        partner = kwargs.get('partner', None)
+        filter = kwargs.get('file_filter', None)
+
+        base_input = kwargs.get('input', None)
+        bucket, key = s3_helper.get_bucket_key(base_input)
+        recent_key = s3_helper.most_recent_prefix(bucket=bucket, key=key)
+        data_in = f"s3://{bucket}/{recent_key}"
+
+        df = Entry.load_data(data_in=data_in, columns=self.READ_COLUMNS, file_filter=filter).head(10) # FIXME remove head(10)
+        # Set the total number of DPLA items to be attempted
+        self.tracker.set_dpla_count(len(df))
+        # Full path to the output parquet file (partner/data/datatime prefix)
+        data_out = self.output_path(partner)
+        # Summary of input parameters
+        self.log.info(f"Input............{data_in}")
+        self.log.info(f"Output...........{data_out}")
+        self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
+
+        records = df.to_dict('records')
+        with ThreadPoolExecutor() as executor:
+            results = [executor.submit(self.process_rows, chunk) for chunk in records]
+        image_rows = [result.result() for result in results]
+        self.log.info(f"Downloaded {self.tracker.image_success_cnt} images ({sizeof_fmt(self.tracker.get_size())})")
+
+        # TODO dig into a better way to flatten this nested list
+        # Flatten data and create a dataframe
+        flat = list(chain.from_iterable(image_rows))
+        df = pd.DataFrame(flat, columns=self.WRITE_COLUMNS)
+        # Write dataframe out
+        fs = FileSystem()
+        fs.write_parquet(path=data_out, data=df, columns=self.WRITE_COLUMNS)
 
     def output_path(self, name):
         """
@@ -101,40 +142,6 @@ class DownloadEntry(Entry):
             update.append(image)
         return update
 
-    def execute(self, **kwargs):
-        """
-        """
-        partner = kwargs.get('partner', None)
-        filter = kwargs.get('file_filter', None)
-        data_in = kwargs.get('input', None)
-        # FIXME this is a kludge to pass this var to get_images which is called during
-        #       paralleization
-        self.BASE_OUT = kwargs.get('output', None)
-
-        data_in = Entry.load_data(data_in=data_in, file_filter=filter)
-        # Set the total number of DPLA items to be attempted
-        Entry.tracker.set_dpla_count(len(data_in))
-        # Full path to the output parquet file (partner/data/datatime prefix)
-        data_out = self.output_path(partner)
-        # Summary of input parameters
-        self.log.info(f"Input............{input}")
-        self.log.info(f"Output...........{data_out}")
-        self.log.info(f"DPLA records.....{Entry.tracker.item_cnt}")
-
-        records = data_in.to_dict('records')
-        with ThreadPoolExecutor() as executor:
-            results = [executor.submit(self.process_rows, chunk) for chunk in records]
-        image_rows = [result.result() for result in results]
-        self.log.info(f"Downloaded {Entry.tracker.image_success_cnt} images ({sizeof_fmt(Entry.tracker.get_size())})")
-
-        # TODO dig into a better way to flatten this nested list
-        # Flatten data and create a dataframe
-        flat = list(chain.from_iterable(image_rows))
-        df = pd.DataFrame(flat, columns=self.WRITE_COLUMNS)
-        # Write dataframe out
-        fs = FileSystem()
-        fs.write_parquet(path=data_out, data=df, columns=self.WRITE_COLUMNS)
-
     def process_rows(self, rows):
         """
 
@@ -154,19 +161,18 @@ class DownloadEntry(Entry):
         try:
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
-            Entry.tracker.increment(Result.FAILED)
+            self.tracker.increment(Result.FAILED)
             self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
             return []
+
         try:
             self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
-
             # FIXME get_images expect base_path
             images = self.get_images(images, dpla_id)
-
             # Update images with metadata applicable to all images
             images = self.update_metadata(images, title, wiki_markup)
         except DownloadException as de:
             images = []
-            Entry.tracker.increment(Result.FAILED)
+            self.tracker.increment(Result.FAILED)
             self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
         return images
