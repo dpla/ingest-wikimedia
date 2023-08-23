@@ -56,7 +56,12 @@ class Uploader:
     def __init__(self):
         self._site = pywikibot.Site()
         self._site.login()
-        self.log.info(f"Logged in user is: {self._site.user()}")
+        self.log.info(f"Logged in user is: {self._site.user()} in {self._site.family}")
+
+        # Set logging level for pywikibot
+        for d in logging.Logger.manager.loggerDict:
+            if d.startswith('pywiki'):
+                logging.getLogger(d).setLevel(logging.ERROR)
 
     def download(self, bucket, key, destination):
         """
@@ -131,7 +136,7 @@ class Uploader:
 
             if wiki_page is None:
                 # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-                self.log.info(f"Skipping, exists https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+                self.log.info(f"Skipping, exists {self.wikimedia_url(title=page_title)}")
                 self._tracker.increment(Tracker.SKIPPED)
                 continue
             try:
@@ -143,11 +148,11 @@ class Uploader:
                             page_title=page_title)
                 self._tracker.increment(Tracker.UPLOADED, size=size)
             except UploadException as upload_exec:
-                self.log.error(f"Upload error {page_title} -- {str(upload_exec)}")
+                self.log.error(f"{str(upload_exec)} -- {self.wikimedia_url(page_title)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
             except Exception as exception:
-                self.log.error(f"Unknown error {page_title} -- {str(exception)}")
+                self.log.error(f"{str(exception)} -- {self.wikimedia_url(page_title)}")
                 self._tracker.increment(Tracker.FAILED)
                 continue
 
@@ -181,20 +186,23 @@ class Uploader:
                              ignore_warnings=self.warnings_to_ignore,
                              asynchronous= True,
                              chunk_size=3000000 # 3MB
+
                             )
             self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:
             error_string = str(exception)
+            # TODO what does this error message actually mean? Page name?
             if 'fileexists-shared-forbidden:' in error_string:
-                raise UploadException(f"Failed '{page_title}', File already uploaded") from exception
+                raise UploadException(f"File already uploaded") from exception
             if 'filetype-badmime' in error_string:
-                raise UploadException(f"Failed '{page_title}', Invalid MIME type") from exception
+                raise UploadException(f"Invalid MIME type") from exception
             if 'filetype-banned' in error_string:
-                raise UploadException(f"Failed '{page_title}', Banned file type") from exception
+                raise UploadException(f"Banned file type") from exception
+            # TODO what does this error message actually mean? MD5 hash collision?
             if 'duplicate' in error_string:
-                raise UploadException(f"Failed '{page_title}', File already exists, {error_string}") from exception
+                raise UploadException(f"File already exists, {error_string}") from exception
             raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {error_string}") from exception
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
@@ -264,3 +272,6 @@ class Uploader:
             return mimetypes.guess_extension(mime)
         except Exception as exception:
             raise UploadException(f"Unable to get extension for {path}: {str(exception)}") from exception
+
+    def wikimedia_url(self, title):
+        return f"https://commons.wikimedia.org/wiki/File:{title.replace(' ', '_')}"

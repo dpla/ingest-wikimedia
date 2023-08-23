@@ -4,13 +4,13 @@ Downloads Wikimedia eligible images from a DPLA partner
 """
 import sys
 import boto3
+import logging
 
 from utilities.fs import S3Helper, log_file
 from utilities.emailer import SesMailSender, SesDestination, DownloadSummary
 from utilities.arguements import get_download_args
 from entries.download import DownloadEntry
 
-import logging
 
 def main():
     args = get_download_args(sys.argv[1:])
