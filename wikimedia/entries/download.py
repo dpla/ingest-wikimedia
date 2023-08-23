@@ -110,7 +110,7 @@ class DownloadEntry():
         """
         """
         # Read data in
-        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None)).head(1)
+        data_in = self.load_data(self.args.get('input_data'), self.args.get('file_filter', None))
         # Set the total number of DPLA items to be attempted
         self.downloader._tracker.set_dpla_count(len(data_in))
         # Full path to the output parquet file
