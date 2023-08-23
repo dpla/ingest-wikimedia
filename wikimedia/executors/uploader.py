@@ -1,3 +1,4 @@
+
 """
 Upload images to Wikimedia Commons
 
@@ -13,6 +14,7 @@ import logging
 
 from utilities.exceptions import UploadException
 from utilities.fs import S3Helper
+from utilities.fs import FileSystem
 from trackers.tracker import Tracker
 
 class Uploader:
@@ -99,9 +101,26 @@ class Uploader:
         unique, counts = np.unique(df["dpla_id"], return_counts=True)
         return dict(zip(unique, counts))
 
-    def execute_upload(self, df):
+    def load_data(self, data_in):
         """
+        Load data from parquet file and filter out ids if a file filter is provided
+        """
+        fs = FileSystem()
+        return fs.read_parquet(data_in)
+
+    def execute_upload(self, args):
+        """
+        :param args: Dictionary of arguments, partner_name and input
         Upload images to Wikimedia Commons"""
+
+        bucket, key = self.s3_helper.get_bucket_key(args.get('input'))
+        recent_key = self.s3_helper.most_recent_object(bucket=bucket, key=key)
+        args['input'] = f"s3://{bucket}/{recent_key}"
+
+        df = self.load_data(args.get('input'))
+
+        self.log.info(f"Read {len(df)} image rows from {args.get('input')}")
+
         unique_ids = self._unique_ids(df)
         # Set the total number of intended uploads and number of unique DPLA records
         self._tracker.set_total(len(df))
@@ -120,6 +139,8 @@ class Uploader:
                 self.log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
                 continue
 
+            print(f"Uploading {dpla_id} {title} {path}")
+
             # If there is only one record for this dpla_id, then page is `None` and pagination will not
             # be used in the Wikimedia page title
             page = None if unique_ids[dpla_id] == 1 else page
@@ -136,7 +157,7 @@ class Uploader:
 
             if wiki_page is None:
                 # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-                self.log.info(f"Skipping, exists {self.wikimedia_url(title=page_title)}")
+                self.log.info(f"Already exists {self.wikimedia_url(title=page_title)}")
                 self._tracker.increment(Tracker.SKIPPED)
                 continue
             try:
@@ -178,7 +199,6 @@ class Uploader:
         temp_file = tempfile.NamedTemporaryFile()
         self.download(bucket=bucket, key=key, destination=temp_file)
         try:
-            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             self._site.upload(filepage=wiki_file_page,
                              source_filename=temp_file.name,
                              comment=comment,
@@ -188,7 +208,7 @@ class Uploader:
                              chunk_size=3000000 # 3MB
 
                             )
-            self.log.info(f"Uploading to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self.log.info(f"Uploaded to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:
@@ -203,19 +223,11 @@ class Uploader:
             # TODO what does this error message actually mean? MD5 hash collision?
             if 'duplicate' in error_string:
                 raise UploadException(f"File already exists, {error_string}") from exception
-            raise UploadException(f"Failed to upload '{page_title}' - {dpla_identifier}, {error_string}") from exception
+            raise UploadException(f"Failed to upload {error_string}") from exception
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
         Makes a proper Wikimedia page title from the DPLA identifier and the title of the image.
-
-        - only use the first 181 characters of image file name
-        - replace [ with (
-        - replace ] with )
-        - replace { with (
-        - replace } with )
-        - replace / with -
-        - replace : with -
 
         :param title: DPLA title
         :param dpla_identifier: DPLA identifier

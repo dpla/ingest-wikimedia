@@ -115,7 +115,6 @@ class DownloadEntry():
         self.downloader._tracker.set_dpla_count(len(data_in))
         # Full path to the output parquet file
         data_out = self.data_out_path(self.args.get('output_base'), self.args.get('partner_name'))
-
         # Summary of input parameters
         self.log.info(f"Input:           {self.args.get('input_data')}")
         self.log.info(f"Base out:        {self.args.get('output_base')}")
