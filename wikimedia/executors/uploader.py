@@ -21,6 +21,8 @@ class Uploader:
     """
     Upload to Wikimedia Commons
     """
+    COMMONS_PREFIX = "https://commons.wikimedia.org/wiki/File:"
+
     log = logging.getLogger(__name__)
 
     s3_helper = S3Helper()
@@ -45,15 +47,6 @@ class Uploader:
         'page-exists',
         'was-deleted'
     ]
-
-    # TODO this is probably not required.
-    # This is the schema emitted by the Wikimedia ingest download process
-    READ_COLUMNS = {"_1": "dpla_id",
-                    "_2": "path",
-                    "_3": "size",
-                    "_4": "title",
-                    "_5": "markup",
-                    "_6": "page"}
 
     def __init__(self):
         self._site = pywikibot.Site()
@@ -208,7 +201,7 @@ class Uploader:
                              chunk_size=3000000 # 3MB
 
                             )
-            self.log.info(f"Uploaded to https://commons.wikimedia.org/wiki/File:{page_title.replace(' ', '_')}")
+            self.log.info(f"Uploaded to {self.COMMONS_PREFIX}{page_title.replace(' ', '_')}")
             # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
             return True
         except Exception as exception:
@@ -286,4 +279,4 @@ class Uploader:
             raise UploadException(f"Unable to get extension for {path}: {str(exception)}") from exception
 
     def wikimedia_url(self, title):
-        return f"https://commons.wikimedia.org/wiki/File:{title.replace(' ', '_')}"
+        return f"{self.COMMONS_PREFIX}{title.replace(' ', '_')}"

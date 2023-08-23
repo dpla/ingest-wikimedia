@@ -11,9 +11,6 @@ class Summary:
     partner = None
     log_url = None
     tracker = None
-
-    DOWNLOAD = "download"
-    UPLOAD = "upload"
     event_type = None
 
     def __init__(self, partner, log_url, tracker, event_type):

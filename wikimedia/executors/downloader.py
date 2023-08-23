@@ -4,7 +4,6 @@ import requests
 import magic
 import logging
 
-from pathlib import Path
 from utilities.fs import S3Helper
 from utilities.exceptions import DownloadException
 from trackers.tracker import Tracker
@@ -28,17 +27,6 @@ class Downloader:
         Get the status of the download
         """
         return self._tracker
-
-    def destination_path(self, base, count, dpla_id):
-        """
-        Create destination path to download file to
-        """
-        dest = f"{base}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
-        if base.startswith("s3://"):
-            return dest
-        Path.mkdir(Path(dest), parents=True, exist_ok=True)
-        return dest
-
 
     def download(self, source, destination):
         """

@@ -30,11 +30,11 @@ def get_datetime_prefix():
     return f"{date}_{time}"
 
 @staticmethod
-def log_file(partner_name, event_type, log_dir="./logs"):
+def log_file(partner, event_type, log_dir="./logs"):
     """
     """
     os.makedirs("./logs", exist_ok=True)
-    log_file_name = f"{get_datetime_prefix()}-{partner_name}-{event_type}.log"
+    log_file_name = f"{get_datetime_prefix()}-{partner}-{event_type}.log"
     return f"{log_dir}/{log_file_name}"
 
 
