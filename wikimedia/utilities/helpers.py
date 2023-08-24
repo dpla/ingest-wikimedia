@@ -12,6 +12,13 @@ from botocore.exceptions import ClientError
 
 class Text:
     @staticmethod
+    def wikimedia_url(title):
+        """
+        Return the URL for the Wikimedia page"""
+        url_prefix = "https://commons.wikimedia.org/wiki/File:"
+        return f"{url_prefix}{title.replace(' ', '_')}"
+
+    @staticmethod
     def datetime():
         """
         Get datetime value as YYYYMMDD_HHMMSS.  It is sortable and used for
@@ -72,7 +79,10 @@ class S3Helper:
     # Used for most s3 operations
     s3_resource = boto3.resource('s3')
     # Used for head operation in file_exists and upload_fileobj in upload
-    s3_client = boto3.client(service_name='s3', config=Config(signature_version='s3v4', max_pool_connections=25, retries={'max_attempts': 3}))
+    s3_client = boto3.client(service_name='s3',
+                             config=Config(signature_version='s3v4',
+                                           max_pool_connections=25,
+                                           retries={'max_attempts': 3}))
 
     def __init__(self):
         pass
@@ -131,9 +141,9 @@ class S3Helper:
         :param bucket: S3 bucket
         :param key: S3 key
         """
-        # TODO does not check to see if the image is the same image, just that the file exists
-        # is should check the md5 hash of the file to see if it is the same and needs to be
-        # uploaded and replace the existing file.
+        # TODO does not check to see if the image is the same image, just that
+        # the file exists is should check the md5 hash of the file to see if it
+        # is the same and needs to be uploaded and replace the existing file.
         try:
             response = self.s3_client.head_object(Bucket=bucket, Key=key)
             size = response.get('ContentLength', 0)
@@ -158,7 +168,8 @@ class S3Helper:
         """
         Returns a list of files in the s3 path with the given suffix
         """
-        # FIXME this can be done with standard libraries and will elminate the need for wranger library
+        # FIXME this can be done with standard libraries and will elminate the
+        # need for wranger library
         return s3wrangler.list_objects(path=path, suffix=suffix)
 
     def upload(self, bucket, key, file, extra_args=None):
@@ -171,18 +182,14 @@ class S3Helper:
         :param extra_args: Extra arguments to pass to upload_fileobj
         return: None
         """
-        if extra_args is not None:
-            self.s3_client.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key, ExtraArgs=extra_args)
-        else:
-            self.s3_client.upload_fileobj(Fileobj=file, Bucket=bucket, Key=key)
-
+        self.s3_client.upload_fileobj(Fileobj=file,
+                                        Bucket=bucket,
+                                        Key=key,
+                                        ExtraArgs=extra_args)
 
 class ParquetHelper:
     """
     """
-
-    s3 = S3Helper()
-
     def __init__(self):
         pass
 
@@ -190,9 +197,9 @@ class ParquetHelper:
         """Reads parquet file and returns a dataframe"""
         temp = []
         for file in self.parquet_files(path=path):
-            if cols:
-                temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns=cols))
-            temp.append(pd.read_parquet(file, engine='fastparquet'))
+            # if cols:
+            temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns=cols))
+            # temp.append(pd.read_parquet(file, engine='fastparquet'))
         return pd.concat(temp, axis=0, ignore_index=True)
 
     def parquet_files(self, path):
@@ -202,4 +209,7 @@ class ParquetHelper:
         :param path: Path to parquet files
         :return: List of parquet files
         """
-        return S3Helper().list_files(path, suffix=".parquet") if path.startswith("s3") else Path(path).glob('*.parquet')
+        if path.startswith("s3"):
+            s3 = S3Helper()
+            return s3.list_files(path, suffix=".parquet")
+        return Path(path).glob('*.parquet')

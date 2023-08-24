@@ -64,11 +64,11 @@ class UploadEntry(Entry):
                 wiki_markup = row.markup
                 page = row.page
             except AttributeError as attribute_error:
-                self.log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
+                self.log.error(f"No attributes from row {row}, {str(attribute_error)}")
                 continue
 
-            # If there is only one record for this dpla_id, then page is `None` and pagination will not
-            # be used in the Wikimedia page title
+            # If there is only one record for this dpla_id, then page is `None`
+            # and pagination will not be used in the Wikimedia page title
             page = None if unique_ids[dpla_id] == 1 else page
             # Get file extension
             ext = self.uploader.get_extension(path)
@@ -82,8 +82,7 @@ class UploadEntry(Entry):
             wiki_page = self.uploader.create_wiki_file_page(title=page_title)
 
             if wiki_page is None:
-                # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-                self.log.info(f"Already exists {self.uploader.wikimedia_url(title=page_title)}")
+                self.log.info(f"Exists {self.uploader.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)
                 continue
             try:

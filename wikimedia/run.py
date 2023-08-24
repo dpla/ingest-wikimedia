@@ -7,7 +7,8 @@ import logging
 import sys
 
 import boto3
-# TODO Move `entries.upload import UploadEntry` back up after logging issue is resolved (see below)
+# TODO Move `entries.upload import UploadEntry` back up after logging
+# issue is resolved (see below)
 from entries.download import DownloadEntry
 from utilities.emailer import SesDestination, SesMailSender, Summary
 from utilities.helpers import S3Helper, log_file
@@ -45,8 +46,9 @@ def main():
 
     match event_type:
         case "upload":
-            # We do this here because I can't figure out how to prevent the instantiation of pywikibot
-            # in Uploader.__init__ from writing to the log file and dumping all that verbose logging to the
+            # We do this here because I can't figure out how to prevent the
+            # instantiation of pywikibot in Uploader.__init__ from writing to
+            # the log file and dumping all that verbose logging to the
             # screen
             # TODO - contact pywikibot devs to see if there's a better way to do this
             from entries.upload import UploadEntry
@@ -54,7 +56,7 @@ def main():
         case "download":
             entry = DownloadEntry(tracker)
         case _:
-            log.critical(f"Event type {event_type} is not valid. Must be `upload` or `download`")
+            log.critical(f"{event_type} is not valid. Must be `upload` or `download`")
             sys.exit(-1)
 
     entry.execute(**args)

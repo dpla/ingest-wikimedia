@@ -9,11 +9,13 @@ from utilities.exceptions import IIIFException
 
 
 class IIIF:
-    HEADERS = {'User-Agent':
-               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36' }
+    """
+    IIIF utilities"""
 
-    """
-    """
+    HEADERS = {'User-Agent':
+               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36' }
+
     def __init__(self):
         pass
 
@@ -62,10 +64,12 @@ class IIIF:
         try:
             request = requests.get(url, timeout=30, headers=self.HEADERS)
             if request.status_code not in [200, 301, 302]:
-                raise IIIFException(f"Unable to request: {url} - Status code {request.status_code}")
+                raise IIIFException(f"Unable to request: {url} - \
+                                    Status code {request.status_code}")
             data = request.content
             return json.loads(data)
-        except json.decoder.JSONDecodeError as json_decode_error:
-            raise IIIFException(f"Unable to decode JSON: {url} -- {str(json_decode_error)}") from json_decode_error
+        except json.decoder.JSONDecodeError as jdex:
+            raise IIIFException(f"Unable to decode JSON: {url} - \
+                                {str(jdex)}") from jdex
         except requests.exceptions.RequestException as re:
-            raise IIIFException(f"Unable to request: {url} -- {str(re)}") from re
+            raise IIIFException(f"Unable to request: {url} - {str(re)}") from re

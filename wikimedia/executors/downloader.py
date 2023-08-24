@@ -32,8 +32,8 @@ class Downloader:
         :param source: URL of asset to download
         :param destination: Full path to save the asset
 
-        TODO: this return value doesn't make sense, I'm just returning the destination. It should
-        be returning the status of the download
+        TODO: this return value doesn't make sense, I'm just returning the destination.
+        It should be returning the status of the download
         - Skipped
         - Downloaded
         - Failed
@@ -54,9 +54,9 @@ class Downloader:
             destination, size = self._save_to_s3(source=source, bucket=bucket, key=key)
             self.tracker.increment(Result.DOWNLOADED, size=size)
             return destination, size
-        except Exception as exeception:
+        except Exception as exec:
             self.tracker.increment(Result.FAILED)
-            raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
+            raise DownloadException(f"Failed download {source} - {str(exec)}") from exec
 
     # TODO This maybe better in the FileSystem class
     def save_to_local(self, source, file):
@@ -75,8 +75,8 @@ class Downloader:
                 f.write(response.content)
             file_size = os.path.getsize(file)
             return file, file_size
-        except Exception as exeception:
-            raise DownloadException(f"Error in download_local() {str(exeception)}") from exeception
+        except Exception as exec:
+            raise DownloadException(f"Failed saving to local {str(exec)}") from exec
 
     # TODO This maybe better in the S3Helper class; if so rename as save()
     def _save_to_s3(self, source, bucket, key):
@@ -105,6 +105,7 @@ class Downloader:
                                       extra_args={"ContentType": content_type})
             return f"s3://{bucket}/{key}", size
         except Exception as ex:
-            raise DownloadException(f"Error uploading to s3 - s3://{bucket}/{key} -- {str(ex)}") from ex
+            raise DownloadException(f"Error uploading {source} to s3://{bucket}/{key} \
+                                     - {str(ex)}") from ex
         finally:
             os.unlink(temp_file.name)

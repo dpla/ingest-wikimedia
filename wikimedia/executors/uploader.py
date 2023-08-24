@@ -12,13 +12,13 @@ import numpy as np
 import pywikibot
 from utilities.exceptions import UploadException
 from utilities.helpers import S3Helper
+from utilities.helpers import wikimedia_url
 
 
 class Uploader:
     """
     Upload to Wikimedia Commons
     """
-    COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
     # This list exists mainly to exclude 'duplicate' records/images from being uploaded
     # Full list of warnings:
     #   https://doc.wikimedia.org/pywikibot/master/_modules/pywikibot/site/_upload.html
@@ -45,7 +45,7 @@ class Uploader:
     def __init__(self):
         self.wikimedia = pywikibot.Site()
         self.wikimedia.login()
-        self.log.info(f"Logged in user is: {self.wikimedia.user()} in {self.wikimedia.family}")
+        self.log.info(f"Logged: {self.wikimedia.user()} in {self.wikimedia.family}")
 
         # Set logging level for pywikibot (kludged)
         for d in logging.Logger.manager.loggerDict:
@@ -62,19 +62,19 @@ class Uploader:
         :param destination: Full path to save the asset
         :return:    output_path: Full path to downloaded asset
         """
-        with open(destination.name, "wb") as f:
+        with open(destination.name, "wb") as _:
             try:
                 self.s3_resource.Bucket(bucket).download_file(key, destination.name)
                 return destination.name
-            except botocore.exceptions.ClientError as client_error:
-                if client_error.response['Error']['Code'] == "404":
-                    raise UploadException(f"Does not exist: {bucket}{key}") from client_error
-                if client_error.response['Error']['Code'] == "403":
-                    raise UploadException(f"Access denied: {bucket}{key}") from client_error
+            except botocore.exceptions.ClientError as cex:
+                if cex.response['Error']['Code'] == "404":
+                    raise UploadException(f"Does not exist: {bucket}{key}") from cex
+                if cex.response['Error']['Code'] == "403":
+                    raise UploadException(f"Access denied: {bucket}{key}") from cex
                 # TODO include more specific client errors
                 else:
-                    raise UploadException(f"Unable to download {bucket}{key} to {destination.name}: \
-                                          {str(client_error)}") from client_error
+                    raise UploadException(f"Unable to download {bucket}{key} \
+                                          to {destination.name}: {str(cex)}") from cex
 
     def _unique_ids(self, df):
         """
@@ -93,7 +93,7 @@ class Uploader:
         """
         comment = f"Uploading DPLA ID \"[[dpla:{dpla_identifier}|{dpla_identifier}]]\"."
 
-        # This is a massive kludge because direct s3 upload via source_url is not allowed.
+        # Kludged because direct s3 upload via source_url is not allowed
         if not file.startswith("s3"):
             raise UploadException("File must be on s3")
         # Download from S3 to local temporary file
@@ -110,26 +110,28 @@ class Uploader:
                              chunk_size=3000000 # 3MB
 
                             )
-            self.log.info(f"Uploaded to {self.COMMONS_URL_PREFIX}{page_title.replace(' ', '_')}")
-            # FIXME this is dumb and should be better, it either raises and exception or returns True; kinda worthless?
+            self.log.info(f"Uploaded to {wikimedia_url(page_title)}")
+            # FIXME this is dumb and should be better, it either raises and exception
+            # or returns True; kinda worthless?
             return True
-        except Exception as exception:
-            error_string = str(exception)
+        except Exception as exec:
+            error_string = str(exec)
             # TODO what does this error message actually mean? Page name?
             if 'fileexists-shared-forbidden:' in error_string:
-                raise UploadException(f"File already uploaded") from exception
+                raise UploadException("File already uploaded") from exec
             if 'filetype-badmime' in error_string:
-                raise UploadException(f"Invalid MIME type") from exception
+                raise UploadException("Invalid MIME type") from exec
             if 'filetype-banned' in error_string:
-                raise UploadException(f"Banned file type") from exception
+                raise UploadException("Banned file type") from exec
             # TODO what does this error message actually mean? MD5 hash collision?
             if 'duplicate' in error_string:
-                raise UploadException(f"File already exists, {error_string}") from exception
-            raise UploadException(f"Failed to upload {error_string}") from exception
+                raise UploadException(f"File already exists, {error_string}") from exec
+            raise UploadException(f"Failed to upload {error_string}") from exec
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
-        Makes a proper Wikimedia page title from the DPLA identifier and the title of the image.
+        Makes a proper Wikimedia page title from the DPLA identifier and
+        the title of the image.
 
         :param title: DPLA title
         :param dpla_identifier: DPLA identifier
@@ -157,10 +159,12 @@ class Uploader:
 
     def create_wiki_file_page(self, title):
         """
-        Create a Wikimedia page for the image if it does not already exist. If it does exist, return None.
+        Create a Wikimedia page for the image if it does not already exist.If it
+        does exist then return None.
 
         :param title: Title of the record in DPLA
-        :return: None if the page already exists or the title , otherwise a pywikibot.FilePage object
+        :return: pywikibot.FilePage object if the page was created, None if the
+        page already exists
         """
         wiki_page = pywikibot.FilePage(self.wikimedia, title=title)
         if wiki_page.exists():
@@ -183,10 +187,5 @@ class Uploader:
             else:
                 mime = mimetypes.guess_type(path)[0]
             return mimetypes.guess_extension(mime)
-        except Exception as exception:
-            raise UploadException(f"Unable to get extension for {path}: {str(exception)}") from exception
-
-    def wikimedia_url(self, title):
-        """
-        Return the URL for the Wikimedia page"""
-        return f"{self.COMMONS_URL_PREFIX}{title.replace(' ', '_')}"
+        except Exception as exec:
+            raise UploadException(f"No extension {path}: {str(exec)}") from exec

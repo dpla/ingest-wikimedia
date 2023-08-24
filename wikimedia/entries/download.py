@@ -43,7 +43,8 @@ class DownloadEntry(Entry):
         """
         s3_helper = S3Helper()
 
-        # FIXME this is a kludge to pass this var to get_images which is called during paralleization
+        # FIXME this is a kludge to pass this var to get_images which is
+        # called during paralleization
         self.BASE_OUT = kwargs.get('output', None)
 
         partner = kwargs.get('partner', None)
@@ -54,8 +55,10 @@ class DownloadEntry(Entry):
         recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='prefix')
         input = f"s3://{bucket}/{recent_key}"
         # Read in most recent parquet file
-        df = Entry.load_data(data_in=input, columns=self.READ_COLUMNS, file_filter=filter)
-        # Full path to the output parquet file (partner/data/datatime prefix)
+        df = Entry.load_data(data_in=input,
+                             columns=self.READ_COLUMNS,
+                             file_filter=filter)
+        # data_out is the full path to the output parquet file
         data_out = self.output_path(partner)
         # Summary of input parameters
         self.log.info(f"Input............{input}")
@@ -69,19 +72,24 @@ class DownloadEntry(Entry):
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in records]
         image_rows = [result.result() for result in results]
-        self.log.info(f"Downloaded {self.tracker.image_success_cnt} images ({Text.sizeof_fmt(self.tracker.get_size())})")
+        self.log.info(f"Downloaded {self.tracker.image_success_cnt} images" +
+                      " ({Text.sizeof_fmt(self.tracker.get_size())})")
 
         # TODO dig into a better way to flatten this nested list
         # Flatten data and create a dataframe
         flat = list(chain.from_iterable(image_rows))
         df = pd.DataFrame(flat, columns=self.WRITE_COLUMNS)
         # Write dataframe out to parquet
-        pd.DataFrame(df, columns=self.WRITE_COLUMNS).to_parquet(data_out, compression='snappy')
+        pd.DataFrame(df, columns=self.WRITE_COLUMNS).to_parquet(data_out,
+                                                                compression='snappy')
 
     def process_rows(self, rows):
         """
 
-        returns: rows: list of dicts for images and metadata associated with a single DPLA record
+        Return list of dicts for images and metadata associated with a single DPLA record
+
+        :param rows: dict of DPLA record
+        returns: rows:
         """
         iiif = IIIF()
         images = []
@@ -92,13 +100,13 @@ class DownloadEntry(Entry):
         manifest = rows.get('iiif', None)
         media_master = rows.get('media_master', None)
 
-        # If the IIIF manfiest is defined that parse the manfiest to get the download urls
-        # otherwise use the media_master url
+        # If the IIIF manfiest is defined that parse the manfiest to get the
+        # download urls otherwise use the media_master url
         try:
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
             self.tracker.increment(Result.FAILED)
-            self.log.error(f"Error getting IIIF urls for \n{dpla_id} from {manifest}\n- {str(iffex)}")
+            self.log.error(f"No image urls {dpla_id} -- {manifest} -- {str(iffex)}")
             return []
 
         try:
@@ -124,17 +132,19 @@ class DownloadEntry(Entry):
             # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
             image_path = self.image_path(count=page, dpla_id=dpla_id)
             try:
-                output, filesize = self.downloader.download(source=url, destination=image_path)
+                output, filesize = self.downloader.download(source=url,
+                                                            destination=image_path)
                 if output is None and len(urls) > 1:
-                    err_msg = f"Multi-page record, page {page} {str(de)}"
+                    err_msg = f"Multi-page record, page {page}"
                     raise DownloadException(err_msg)
             except Exception as de:
                 raise DownloadException(f"{url}: {str(de)}") from de
             page += 1
 
-            # Create a row for a single asset and if multiple assests exist them append them to the rows list
-            # When a single asset fails to download then this object is destroyed by the `break` above and
-            # the rows for already downloaded assets are not added to the final dataframe
+            # Create a row for a single asset and if multiple assests exist them
+            # append them to the rows list. When a single asset fails to download
+            # then this object is destroyed by the `break` above and the rows for
+            # already downloaded assets are not added to the final dataframe
             image_row = {
                 'dpla_id': dpla_id,
                 'path': output,
@@ -155,7 +165,7 @@ class DownloadEntry(Entry):
         """
         Create destination path to download file to
         """
-        path = f"{self.BASE_OUT}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()
+        path = f"{self.BASE_OUT}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()  # noqa: E501
 
         if self.BASE_OUT.startswith("s3://"):
             return path
