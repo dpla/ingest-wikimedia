@@ -7,7 +7,7 @@ import logging
 from entries.entry import Entry
 from executors.uploader import Uploader
 from utilities.exceptions import UploadException
-from utilities.helpers import S3Helper, wikimedia_url
+from utilities.helpers import S3Helper, Text
 from utilities.tracker import Result, Tracker
 
 
@@ -39,19 +39,16 @@ class UploadEntry(Entry):
         bucket, key = s3_helper.get_bucket_key(base_input)
         recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='object')
         input = f"s3://{bucket}/{recent_key}"
-
         # Read in most recent parquet file
         df = Entry.load_data(data_in=input)
         unique_ids = self.uploader._unique_ids(df)
-
+        # Set the total number DPLA records and intended uploads
+        self.tracker.set_dpla_count(len(unique_ids))
+        self.tracker.set_total(len(df))
         # Summary of input parameters
         self.log.info(f"Input............{input}")
         self.log.info(f"Images...........{len(df)}")
         self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
-
-        # Set the total number DPLA records and intended uploads
-        self.tracker.set_dpla_count(len(unique_ids))
-        self.tracker.set_total(len(df))
 
         # TODO parallelize this
         for row in df.itertuples():
@@ -82,7 +79,7 @@ class UploadEntry(Entry):
             wiki_page = self.uploader.create_wiki_file_page(title=page_title)
 
             if wiki_page is None:
-                self.log.info(f"Exists {wikimedia_url(page_title)}")
+                self.log.info(f"Exists {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)
                 continue
             try:
@@ -94,10 +91,10 @@ class UploadEntry(Entry):
                             page_title=page_title)
                 self.tracker.increment(Result.UPLOADED, size=size)
             except UploadException as exec:
-                self.log.error(f"{str(exec)} -- {wikimedia_url(page_title)}")
+                self.log.error(f"{str(exec)} -- {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue
             except Exception as exception:
-                self.log.error(f"{str(exception)} -- {wikimedia_url(page_title)}")
+                self.log.error(f"{str(exception)} -- {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue

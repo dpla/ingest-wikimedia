@@ -60,20 +60,20 @@ class DownloadEntry(Entry):
                              file_filter=filter)
         # data_out is the full path to the output parquet file
         data_out = self.output_path(partner)
+        # Set the total number of DPLA items to be attempted
+        self.tracker.set_dpla_count(len(df))
         # Summary of input parameters
         self.log.info(f"Input............{input}")
         self.log.info(f"Output...........{data_out}")
         self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
 
-        # Set the total number of DPLA items to be attempted
-        self.tracker.set_dpla_count(len(df))
-
         records = df.to_dict('records')
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in records]
         image_rows = [result.result() for result in results]
+
         self.log.info(f"Downloaded {self.tracker.image_success_cnt} images" +
-                      " ({Text.sizeof_fmt(self.tracker.get_size())})")
+                      f" ({Text.sizeof_fmt(self.tracker.get_size())})")
 
         # TODO dig into a better way to flatten this nested list
         # Flatten data and create a dataframe
@@ -104,12 +104,12 @@ class DownloadEntry(Entry):
         # If the IIIF manfiest is defined that parse the manfiest to get the
         # download urls otherwise use the media_master url
         try:
+            print(manifest)
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
             self.tracker.increment(Result.FAILED)
             self.log.error(f"No image urls {dpla_id} -- {manifest} -- {str(iffex)}")
             return []
-
         try:
             self.log.info(f"https://dp.la/item/{dpla_id} has {len(images)} assets")
             # FIXME get_images expect base_path, kludged in with class var BASE_OUT

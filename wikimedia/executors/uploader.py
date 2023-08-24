@@ -12,7 +12,7 @@ import numpy as np
 import pywikibot
 from utilities.exceptions import UploadException
 from utilities.helpers import S3Helper
-from utilities.helpers import wikimedia_url
+from utilities.helpers import Text
 
 
 class Uploader:
@@ -110,7 +110,7 @@ class Uploader:
                              chunk_size=3000000 # 3MB
 
                             )
-            self.log.info(f"Uploaded to {wikimedia_url(page_title)}")
+            self.log.info(f"Uploaded to {Text.wikimedia_url(page_title)}")
             # FIXME this is dumb and should be better, it either raises and exception
             # or returns True; kinda worthless?
             return True

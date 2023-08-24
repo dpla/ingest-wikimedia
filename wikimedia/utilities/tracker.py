@@ -28,22 +28,22 @@ class Tracker:
     def __init__(self):
         pass
 
-    def set_dpla_count(count):
+    def set_dpla_count(self, count):
         """
         Set the number of DPLA items"""
         Tracker.item_cnt = count
 
-    def set_total(total):
+    def set_total(self, total):
         """
         Set the total number of uploads"""
         Tracker.image_attempted_cnt = total
 
-    def get_size():
+    def get_size(self):
         """
         Get the cumulative size of all files"""
         return Tracker.image_size_session
 
-    def increment(status, size=0):
+    def increment(self, status, size=0):
         """
         Increment the status"""
         if status == Result.SKIPPED:
