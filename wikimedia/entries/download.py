@@ -10,12 +10,10 @@ from pathlib import Path
 import pandas as pd
 from entries.entry import Entry
 from executors.downloader import Downloader
-from trackers.tracker import Result, Tracker
 from utilities.exceptions import DownloadException, IIIFException
-from utilities.helpers import Text
+from utilities.helpers import S3Helper, Text
 from utilities.iiif import IIIF
-
-from wikimedia.utilities.helpers import S3Helper
+from utilities.tracker import Result, Tracker
 
 
 class DownloadEntry(Entry):

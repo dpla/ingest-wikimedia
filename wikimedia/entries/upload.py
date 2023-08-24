@@ -6,10 +6,9 @@ import logging
 
 from entries.entry import Entry
 from executors.uploader import Uploader
-from trackers.tracker import Result, Tracker
 from utilities.exceptions import UploadException
-
-from wikimedia.utilities.helpers import S3Helper
+from utilities.helpers import S3Helper
+from utilities.tracker import Result, Tracker
 
 
 class UploadEntry(Entry):

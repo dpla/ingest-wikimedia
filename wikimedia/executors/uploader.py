@@ -11,8 +11,7 @@ import botocore
 import numpy as np
 import pywikibot
 from utilities.exceptions import UploadException
-
-from wikimedia.utilities.helpers import S3Helper
+from utilities.helpers import S3Helper
 
 
 class Uploader:

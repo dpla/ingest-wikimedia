@@ -1,5 +1,5 @@
-from trackers.tracker import Tracker
 from utilities.helpers import ParquetHelper
+from utilities.tracker import Tracker
 
 
 class Entry():

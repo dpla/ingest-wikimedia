@@ -9,11 +9,9 @@ import sys
 import boto3
 # TODO Move `entries.upload import UploadEntry` back up after logging issue is resolved (see below)
 from entries.download import DownloadEntry
-from trackers.tracker import Tracker
 from utilities.emailer import SesDestination, SesMailSender, Summary
-from utilities.helpers import log_file
-
-from wikimedia.utilities.helpers import S3Helper
+from utilities.helpers import S3Helper, log_file
+from utilities.tracker import Tracker
 
 # Email source and destination
 EMAIL_SOURCE    = "DPLA Tech Bot<tech@dp.la>"
