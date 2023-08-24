@@ -11,6 +11,20 @@ from awswrangler import s3 as s3wrangler
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+# DPLA Wikimedia partners
+DPLA_PARTNERS = [
+    'bpl',
+    'georgia',
+    'il',
+    'indiana',
+    'nara',
+    'northwest-heritage',
+    'ohio',
+    'p2p',
+    'pa',
+    'texas'
+]
+
 class InputHelper:
     """
     Helps construct relative paths for input data
@@ -287,7 +301,10 @@ def get_args(args):
                     )
             sys.exit()
         elif opt in ("-p", "--partner"):
-            params["partner"] = arg
+            # Validate partner
+            if arg in DPLA_PARTNERS:
+                params["partner"] = arg
+            raise ValueError(f"Invalid partner {arg} must be one of {DPLA_PARTNERS}")
         elif opt in ("-i", "--input"):
             params["input"] = arg
         elif opt in ("-o", "--output"):
