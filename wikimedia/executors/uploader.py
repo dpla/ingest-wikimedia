@@ -41,7 +41,6 @@ class Uploader:
     s3_helper = S3Helper()
     s3_resource = boto3.resource('s3')  # Used for downloading from s3
     s3_client = boto3.client('s3')      # Used for head_object on s3 object
-    # pywikibot Site()
     wikimedia = None
 
     def __init__(self):

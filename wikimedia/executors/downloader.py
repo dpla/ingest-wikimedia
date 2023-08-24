@@ -38,8 +38,7 @@ class Downloader:
         - Skipped
         - Downloaded
         - Failed
-        :return:    output_path: Full path to downloaded asset
-                    filesize (in bytes)
+        :return: output path, filesize
         """
         try:
             # Destination is local
