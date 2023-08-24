@@ -159,13 +159,6 @@ class DownloadEntry(Entry):
             image_rows.append(image_row)
         return image_rows
 
-    # def output_path(self, name):
-    #     """
-    #     Create the full path to the output parquet file
-
-    #     e.g. s3://bucket/path/to/data/20200101-120000_partner_download.parquet"""
-    #     return f"{self.OUTPUT_BASE}/data/{Text.datetime()}_{name}_download.parquet"
-
     def image_path(self, count, dpla_id):
         """
         Create destination path to download file to
