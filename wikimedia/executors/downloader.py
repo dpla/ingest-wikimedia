@@ -1,3 +1,7 @@
+"""
+Download images from parters
+
+"""
 import os
 import tempfile
 import requests
@@ -13,20 +17,12 @@ class Downloader:
     Download images from parters
     """
     log = logging.getLogger(__name__)
-    _s3 = S3Helper()
-    _tracker = Tracker()
 
-    # Column names for the output parquet file
-    UPLOAD_PARQUET_COLUMNS = ['dpla_id', 'path', 'size', 'title', 'markup', 'page']
+    s3_helper = S3Helper()
+    tracker = Tracker()
 
     def __init__(self):
         pass
-
-    def get_status(self):
-        """
-        Get the status of the download
-        """
-        return self._tracker
 
     def download(self, source, destination):
         """
@@ -46,23 +42,24 @@ class Downloader:
         try:
             # Destination is local
             if not destination.startswith("s3://"):
-                return self._download_to_local(source=source, file=destination)
+                return self.save_to_local(source=source, file=destination)
             # Just destination is s3 :pray:
-            bucket, key = self._s3.get_bucket_key(destination)
-            exists, size = self._s3.file_exists(bucket=bucket, key=key)
+            bucket, key = self.s3_helper.get_bucket_key(destination)
+            exists, size = self.s3_helper.file_exists(bucket=bucket, key=key)
             if exists:
                 self.log.info(f" - Skipping {destination}, already exists in s3")
-                self._tracker.increment(Result.SKIPPED, size=size)
+                self.tracker.increment(Result.SKIPPED, size=size)
                 return destination, size
             self.log.info(f" - Downloading {source} to {destination}")
-            destination, size = self._download_to_s3(source=source, bucket=bucket, key=key)
-            self._tracker.increment(Result.DOWNLOADED, size=size)
+            destination, size = self._save_to_s3(source=source, bucket=bucket, key=key)
+            self.tracker.increment(Result.DOWNLOADED, size=size)
             return destination, size
         except Exception as exeception:
-            self._tracker.increment(Result.FAILED)
+            self.tracker.increment(Result.FAILED)
             raise DownloadException(f"Failed to download {source}\n\t{str(exeception)}") from exeception
 
-    def _download_to_local(self, source, file):
+    # TODO This maybe better in the FileSystem class
+    def save_to_local(self, source, file):
         """
         Download images to local file system and return path to file
         and the size of the file in bytes
@@ -81,9 +78,9 @@ class Downloader:
         except Exception as exeception:
             raise DownloadException(f"Error in download_local() {str(exeception)}") from exeception
 
-    def _download_to_s3(self, source, bucket, key):
+    # TODO This maybe better in the S3Helper class; if so rename as save()
+    def _save_to_s3(self, source, bucket, key):
         """
-
         Tries to download a file from the source url and save it to s3. If the file
         already exists in s3 then this step is skipped. To achive this
         the file is downloaded to a temp file on the local file system and then uploaded
@@ -94,15 +91,18 @@ class Downloader:
         :param name
         :return:
         """
-        # Create temp local file and download source file to it
+        # Create temp local file and download file at source to it
         temp_file = tempfile.NamedTemporaryFile(delete=False)
         _, size = self.download(source=source, destination=temp_file.name)
         # Get content type from file, used in metadata for s3 upload
         content_type = magic.from_file(temp_file.name, mime=True)
+        # Upload temp file to s3
         try:
-            # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
-                self._s3.upload(file=file, bucket=bucket, key=key, extra_args={"ContentType": content_type})
+                self.s3_helper.upload(file=file,
+                                      bucket=bucket,
+                                      key=key,
+                                      extra_args={"ContentType": content_type})
             return f"s3://{bucket}/{key}", size
         except Exception as ex:
             raise DownloadException(f"Error uploading to s3 - s3://{bucket}/{key} -- {str(ex)}") from ex
