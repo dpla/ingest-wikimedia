@@ -29,3 +29,10 @@ class IIIFException(Exception):
     """
     def __init__(self, message):
         super().__init__(message)
+
+class UploadWarning(Warning):
+    """
+    Base class for warnings in this module.
+    """
+    def __init__(self, message):
+        super().__init__(message)

@@ -6,8 +6,8 @@ import logging
 
 from entries.entry import Entry
 from executors.uploader import Uploader
-from utilities.exceptions import UploadException
-from utilities.helpers import S3Helper, Text
+from utilities.exceptions import UploadException, UploadWarning
+from utilities.helpers import S3Helper, Text, InputHelper
 from utilities.tracker import Result, Tracker
 
 
@@ -34,13 +34,16 @@ class UploadEntry(Entry):
         """
         """
         s3_helper = S3Helper()
-        base_input = kwargs.get('input', None)
+        input_base=kwargs.get('input', None)
+        partner = kwargs.get('partner', None)
+        input_partner = InputHelper.upload_input(base=input_base, partner=partner)
         # Get the most recent parquet file from the input path
-        bucket, key = s3_helper.get_bucket_key(base_input)
+        bucket, key = s3_helper.get_bucket_key(input_partner)
         recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='object')
         input = f"s3://{bucket}/{recent_key}"
         # Read in most recent parquet file
-        df = Entry.load_data(data_in=input)
+        df = Entry.load_data(data_in=input,
+                             columns=self.READ_COLUMNS).rename(columns=self.READ_COLUMNS)
         unique_ids = self.uploader._unique_ids(df)
         # Set the total number DPLA records and intended uploads
         self.tracker.set_dpla_count(len(unique_ids))
@@ -90,6 +93,10 @@ class UploadEntry(Entry):
                             file=path,
                             page_title=page_title)
                 self.tracker.increment(Result.UPLOADED, size=size)
+            except UploadWarning as _:
+                self.log.info(f"Exists {Text.wikimedia_url(page_title)}")
+                self.tracker.increment(Result.SKIPPED)
+                continue
             except UploadException as exec:
                 self.log.error(f"{str(exec)} -- {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)

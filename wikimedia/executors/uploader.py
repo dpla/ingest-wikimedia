@@ -10,7 +10,7 @@ import boto3
 import botocore
 import numpy as np
 import pywikibot
-from utilities.exceptions import UploadException
+from utilities.exceptions import UploadException, UploadWarning
 from utilities.helpers import S3Helper
 from utilities.helpers import Text
 
@@ -118,14 +118,14 @@ class Uploader:
             error_string = str(exec)
             # TODO what does this error message actually mean? Page name?
             if 'fileexists-shared-forbidden:' in error_string:
-                raise UploadException("File already uploaded") from exec
+                raise UploadWarning("File already uploaded") from exec
             if 'filetype-badmime' in error_string:
                 raise UploadException("Invalid MIME type") from exec
             if 'filetype-banned' in error_string:
                 raise UploadException("Banned file type") from exec
             # TODO what does this error message actually mean? MD5 hash collision?
             if 'duplicate' in error_string:
-                raise UploadException(f"File already exists, {error_string}") from exec
+                raise UploadWarning(f"File already exists, {error_string}") from exec
             raise UploadException(f"Failed to upload {error_string}") from exec
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
