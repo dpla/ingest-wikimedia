@@ -7,7 +7,7 @@ import logging
 from entries.entry import Entry
 from executors.uploader import Uploader
 from utilities.exceptions import UploadException
-from utilities.helpers import S3Helper
+from utilities.helpers import S3Helper, wikimedia_url
 from utilities.tracker import Result, Tracker
 
 
@@ -82,7 +82,7 @@ class UploadEntry(Entry):
             wiki_page = self.uploader.create_wiki_file_page(title=page_title)
 
             if wiki_page is None:
-                self.log.info(f"Exists {self.uploader.wikimedia_url(page_title)}")
+                self.log.info(f"Exists {wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)
                 continue
             try:
@@ -93,11 +93,11 @@ class UploadEntry(Entry):
                             file=path,
                             page_title=page_title)
                 self.tracker.increment(Result.UPLOADED, size=size)
-            except UploadException as upload_exec:
-                self.log.error(f"{str(upload_exec)} -- {self.uploader.wikimedia_url(page_title)}")
+            except UploadException as exec:
+                self.log.error(f"{str(exec)} -- {wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue
             except Exception as exception:
-                self.log.error(f"{str(exception)} -- {self.uploader.wikimedia_url(page_title)}")
+                self.log.error(f"{str(exception)} -- {wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue

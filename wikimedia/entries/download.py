@@ -86,7 +86,8 @@ class DownloadEntry(Entry):
     def process_rows(self, rows):
         """
 
-        Return list of dicts for images and metadata associated with a single DPLA record
+        Return list of dicts for images and metadata associated with a
+        xsingle DPLA record
 
         :param rows: dict of DPLA record
         returns: rows:

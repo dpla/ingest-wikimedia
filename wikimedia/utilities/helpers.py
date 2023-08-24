@@ -193,12 +193,12 @@ class ParquetHelper:
     def __init__(self):
         pass
 
-    def read_parquet(self, path, cols=None):
+    def read_parquet(self, path, columns=None):
         """Reads parquet file and returns a dataframe"""
         temp = []
         for file in self.parquet_files(path=path):
             # if cols:
-            temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns=cols))
+            temp.append(pd.read_parquet(file, engine='fastparquet').rename(columns))
             # temp.append(pd.read_parquet(file, engine='fastparquet'))
         return pd.concat(temp, axis=0, ignore_index=True)
 

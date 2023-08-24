@@ -12,7 +12,7 @@ class Entry():
         Load data from parquet file and filter out ids if a file filter is provided
         """
         fs = ParquetHelper()
-        data = fs.read_parquet(data_in, cols=columns)
+        data = fs.read_parquet(data_in, columns=columns)
 
         if file_filter:
             exclude_ids = []
