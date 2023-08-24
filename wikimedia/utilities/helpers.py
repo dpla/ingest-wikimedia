@@ -304,7 +304,8 @@ def get_args(args):
             # Validate partner
             if arg in DPLA_PARTNERS:
                 params["partner"] = arg
-            raise ValueError(f"Invalid partner {arg} must be one of {DPLA_PARTNERS}")
+            else:
+                raise ValueError(f"Invalid partner {arg} must be one of {DPLA_PARTNERS}")
         elif opt in ("-i", "--input"):
             params["input"] = arg
         elif opt in ("-o", "--output"):
