@@ -11,6 +11,38 @@ from awswrangler import s3 as s3wrangler
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+class InputHelper:
+    """
+    Helps construct relative paths for input data
+    """
+    pass
+
+    @staticmethod
+    def download_input(base, partner):
+        """
+        Creates a path to the wiki data directory for a partner. This is the
+        output of ingestion3
+
+        Ex. s3://dpla-master-dataset/ohio/wiki/
+        """
+        return f"{base}/{partner}/wiki/"
+    @staticmethod
+    def download_output(base, partner):
+        """
+        Creates a path to the download data directory for a partner. This is the
+
+        Ex. s3://bucket/partner/data/20200101-120000_partner_download.parquet
+        """
+        return f"{base}/{partner}/data/{Text.datetime()}_{partner}_download.parquet"
+
+    @staticmethod
+    def upload_input(base, partner):
+        """
+        Create a path to the input data
+
+        Ex. s3://dpla-wikimedia/ohio/data/
+        """
+        return f"{base}/{partner}/data/"
 
 class Text:
     @staticmethod

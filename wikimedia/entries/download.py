@@ -11,7 +11,7 @@ import pandas as pd
 from entries.entry import Entry
 from executors.downloader import Downloader
 from utilities.exceptions import DownloadException, IIIFException
-from utilities.helpers import S3Helper, Text
+from utilities.helpers import S3Helper, Text, InputHelper
 from utilities.iiif import IIIF
 from utilities.tracker import Result, Tracker
 
@@ -20,7 +20,7 @@ class DownloadEntry(Entry):
     """
     Downloads Wikimedia eligible images from a DPLA partner
     """
-    BASE_OUT = None
+    OUTPUT_BASE = None
     # Columns names emitted by the ingestion3 process
     READ_COLUMNS = { "_1": "id",
                     "_2": "wiki_markup",
@@ -43,27 +43,32 @@ class DownloadEntry(Entry):
         """
         s3_helper = S3Helper()
 
-        # FIXME this is a kludge to pass this var to get_images which is
-        # called during paralleization
-        self.BASE_OUT = kwargs.get('output', None)
-
         partner = kwargs.get('partner', None)
         filter = kwargs.get('file_filter', None)
-        base_input = kwargs.get('input', None)
+
+        # Output and Input are the top level paths and should contain a directory
+        # for each partner
+        output = kwargs.get('output', None)
+        input = kwargs.get('input', None)
+        # FIXME this is a kludge to pass OUTPUT_BASE var to get_images() which is
+        # called during paralleization
+        self.OUTPUT_BASE = f"{output}/{partner}"
+        input_base = InputHelper.download_input(base=input, partner=partner)
         # Get the most recent parquet file from the input path
-        bucket, key = s3_helper.get_bucket_key(base_input)
+        bucket, key = s3_helper.get_bucket_key(input_base)
         recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='prefix')
-        input = f"s3://{bucket}/{recent_key}"
+        input_recent = f"s3://{bucket}/{recent_key}"
+
         # Read in most recent parquet file
-        df = Entry.load_data(data_in=input,
+        df = Entry.load_data(data_in=input_recent,
                              columns=self.READ_COLUMNS,
-                             file_filter=filter)
+                             file_filter=filter).rename(columns=self.READ_COLUMNS)
         # data_out is the full path to the output parquet file
-        data_out = self.output_path(partner)
+        data_out = InputHelper.download_output(base=output, partner=partner)
         # Set the total number of DPLA items to be attempted
         self.tracker.set_dpla_count(len(df))
         # Summary of input parameters
-        self.log.info(f"Input............{input}")
+        self.log.info(f"Input............{input_recent}")
         self.log.info(f"Output...........{data_out}")
         self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
 
@@ -104,7 +109,6 @@ class DownloadEntry(Entry):
         # If the IIIF manfiest is defined that parse the manfiest to get the
         # download urls otherwise use the media_master url
         try:
-            print(manifest)
             images = iiif.get_iiif_urls(manifest) if manifest else media_master
         except IIIFException as iffex:
             self.tracker.increment(Result.FAILED)
@@ -155,20 +159,13 @@ class DownloadEntry(Entry):
             image_rows.append(image_row)
         return image_rows
 
-    def output_path(self, name):
-        """
-        Create the full path to the output parquet file
-
-        e.g. s3://bucket/path/to/data/20200101-120000_partner_download.parquet"""
-        return f"{self.BASE_OUT}/data/{Text.datetime()}_{name}_download.parquet"
-
     def image_path(self, count, dpla_id):
         """
         Create destination path to download file to
         """
-        path = f"{self.BASE_OUT}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()  # noqa: E501
+        path = f"{self.OUTPUT_BASE}/images/{dpla_id[0]}/{dpla_id[1]}/{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{count}_{dpla_id}".strip()  # noqa: E501
 
-        if self.BASE_OUT.startswith("s3://"):
+        if self.OUTPUT_BASE.startswith("s3://"):
             return path
         Path.mkdir(Path(path), parents=True, exist_ok=True)
         return path

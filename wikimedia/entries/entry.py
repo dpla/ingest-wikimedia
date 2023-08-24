@@ -18,7 +18,7 @@ class Entry():
             with open(file_filter, encoding='utf-8') as f:
                 exclude_ids = [line.rstrip() for line in f]
             data = data.filter(lambda x: x.id in exclude_ids)
-        return data
+        return data.head(10)
 
     def execute(self, tracker: Tracker, **kwargs):
         raise NotImplementedError
