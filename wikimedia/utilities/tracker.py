@@ -1,5 +1,5 @@
 
-from utilities.exceptions import UploadException
+from utilities.exceptions import WikiException
 from enum import Enum
 
 class Result(Enum):
@@ -28,26 +28,22 @@ class Tracker:
     def __init__(self):
         pass
 
-    @staticmethod
-    def set_dpla_count(count):
+    def set_dpla_count(self, count):
         """
         Set the number of DPLA items"""
         Tracker.item_cnt = count
 
-    @staticmethod
-    def set_total(total):
+    def set_total(self, total):
         """
         Set the total number of uploads"""
         Tracker.image_attempted_cnt = total
 
-    @staticmethod
-    def get_size():
+    def get_size(self):
         """
         Get the cumulative size of all files"""
         return Tracker.image_size_session
 
-    @staticmethod
-    def increment(status, size=0):
+    def increment(self, status, size=0):
         """
         Increment the status"""
         if status == Result.SKIPPED:
@@ -61,4 +57,4 @@ class Tracker:
             Tracker.image_size_total += size
         else:
             # TODO Raise generic exception
-            raise UploadException(f"Unknown status: {status}")
+            raise WikiException(f"Unknown status: {status}")

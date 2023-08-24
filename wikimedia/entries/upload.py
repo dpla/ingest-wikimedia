@@ -6,9 +6,10 @@ import logging
 
 from entries.entry import Entry
 from executors.uploader import Uploader
-from trackers.tracker import Result, Tracker
-from utilities.fs import S3Helper
 from utilities.exceptions import UploadException
+from utilities.helpers import S3Helper, Text
+from utilities.tracker import Result, Tracker
+
 
 class UploadEntry(Entry):
     """
@@ -36,21 +37,18 @@ class UploadEntry(Entry):
         base_input = kwargs.get('input', None)
         # Get the most recent parquet file from the input path
         bucket, key = s3_helper.get_bucket_key(base_input)
-        recent_key = s3_helper.most_recent_object(bucket=bucket, key=key)
+        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='object')
         input = f"s3://{bucket}/{recent_key}"
-
         # Read in most recent parquet file
         df = Entry.load_data(data_in=input)
         unique_ids = self.uploader._unique_ids(df)
-
+        # Set the total number DPLA records and intended uploads
+        self.tracker.set_dpla_count(len(unique_ids))
+        self.tracker.set_total(len(df))
         # Summary of input parameters
         self.log.info(f"Input............{input}")
         self.log.info(f"Images...........{len(df)}")
         self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
-
-        # Set the total number DPLA records and intended uploads
-        self.tracker.set_dpla_count(len(unique_ids))
-        self.tracker.set_total(len(df))
 
         # TODO parallelize this
         for row in df.itertuples():
@@ -63,11 +61,11 @@ class UploadEntry(Entry):
                 wiki_markup = row.markup
                 page = row.page
             except AttributeError as attribute_error:
-                self.log.error(f"Unable to get attributes from row {row}: {attribute_error.__str__}")
+                self.log.error(f"No attributes from row {row}, {str(attribute_error)}")
                 continue
 
-            # If there is only one record for this dpla_id, then page is `None` and pagination will not
-            # be used in the Wikimedia page title
+            # If there is only one record for this dpla_id, then page is `None`
+            # and pagination will not be used in the Wikimedia page title
             page = None if unique_ids[dpla_id] == 1 else page
             # Get file extension
             ext = self.uploader.get_extension(path)
@@ -81,8 +79,7 @@ class UploadEntry(Entry):
             wiki_page = self.uploader.create_wiki_file_page(title=page_title)
 
             if wiki_page is None:
-                # Create a working URL for the file from the page title. Helpful for verifying the page in Wikimedia
-                self.log.info(f"Already exists {self.uploader.wikimedia_url(title=page_title)}")
+                self.log.info(f"Exists {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)
                 continue
             try:
@@ -93,11 +90,11 @@ class UploadEntry(Entry):
                             file=path,
                             page_title=page_title)
                 self.tracker.increment(Result.UPLOADED, size=size)
-            except UploadException as upload_exec:
-                self.log.error(f"{str(upload_exec)} -- {self.uploader.wikimedia_url(page_title)}")
+            except UploadException as exec:
+                self.log.error(f"{str(exec)} -- {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue
             except Exception as exception:
-                self.log.error(f"{str(exception)} -- {self.uploader.wikimedia_url(page_title)}")
+                self.log.error(f"{str(exception)} -- {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue
