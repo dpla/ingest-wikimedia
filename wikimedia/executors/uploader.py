@@ -2,17 +2,18 @@
 Upload images to Wikimedia Commons
 
 """
+import logging
 import mimetypes
 import tempfile
-import logging
+
 import boto3
 import botocore
 import numpy as np
-
 import pywikibot
-
 from utilities.exceptions import UploadException
-from utilities.fs import S3Helper
+
+from wikimedia.utilities.helpers import S3Helper
+
 
 class Uploader:
     """

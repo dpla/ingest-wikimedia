@@ -7,8 +7,10 @@ import logging
 from entries.entry import Entry
 from executors.uploader import Uploader
 from trackers.tracker import Result, Tracker
-from utilities.fs import S3Helper
 from utilities.exceptions import UploadException
+
+from wikimedia.utilities.helpers import S3Helper
+
 
 class UploadEntry(Entry):
     """
@@ -36,7 +38,7 @@ class UploadEntry(Entry):
         base_input = kwargs.get('input', None)
         # Get the most recent parquet file from the input path
         bucket, key = s3_helper.get_bucket_key(base_input)
-        recent_key = s3_helper.most_recent_object(bucket=bucket, key=key)
+        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='object')
         input = f"s3://{bucket}/{recent_key}"
 
         # Read in most recent parquet file

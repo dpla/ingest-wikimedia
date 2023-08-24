@@ -2,19 +2,21 @@
 Downloads Wikimedia eligible images from a DPLA partner
 
 """
-from itertools import chain
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-import pandas as pd
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from itertools import chain
+from pathlib import Path
 
+import pandas as pd
 from entries.entry import Entry
 from executors.downloader import Downloader
 from trackers.tracker import Result, Tracker
-from utilities.iiif import IIIF
-from utilities.fs import FileSystem, S3Helper, get_datetime_prefix
 from utilities.exceptions import DownloadException, IIIFException
-from utilities.format import sizeof_fmt
+from utilities.helpers import Text
+from utilities.iiif import IIIF
+
+from wikimedia.utilities.helpers import S3Helper
+
 
 class DownloadEntry(Entry):
     """
@@ -51,7 +53,7 @@ class DownloadEntry(Entry):
         base_input = kwargs.get('input', None)
         # Get the most recent parquet file from the input path
         bucket, key = s3_helper.get_bucket_key(base_input)
-        recent_key = s3_helper.most_recent_prefix(bucket=bucket, key=key)
+        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='prefix')
         input = f"s3://{bucket}/{recent_key}"
         # Read in most recent parquet file
         df = Entry.load_data(data_in=input, columns=self.READ_COLUMNS, file_filter=filter)
@@ -69,15 +71,14 @@ class DownloadEntry(Entry):
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in records]
         image_rows = [result.result() for result in results]
-        self.log.info(f"Downloaded {self.tracker.image_success_cnt} images ({sizeof_fmt(self.tracker.get_size())})")
+        self.log.info(f"Downloaded {self.tracker.image_success_cnt} images ({Text.sizeof_fmt(self.tracker.get_size())})")
 
         # TODO dig into a better way to flatten this nested list
         # Flatten data and create a dataframe
         flat = list(chain.from_iterable(image_rows))
         df = pd.DataFrame(flat, columns=self.WRITE_COLUMNS)
-        # Write dataframe out
-        fs = FileSystem()
-        fs.write_parquet(path=data_out, data=df, columns=self.WRITE_COLUMNS)
+        # Write dataframe out to parquet
+        pd.DataFrame(df, columns=self.WRITE_COLUMNS).to_parquet(data_out, compression='snappy')
 
     def process_rows(self, rows):
         """
@@ -150,7 +151,7 @@ class DownloadEntry(Entry):
         Create the full path to the output parquet file
 
         e.g. s3://bucket/path/to/data/20200101-120000_partner_download.parquet"""
-        return f"{self.BASE_OUT}/data/{get_datetime_prefix()}_{name}_download.parquet"
+        return f"{self.BASE_OUT}/data/{Text.datetime()}_{name}_download.parquet"
 
     def image_path(self, count, dpla_id):
         """

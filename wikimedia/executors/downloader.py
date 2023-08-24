@@ -2,15 +2,17 @@
 Download images from parters
 
 """
+import logging
 import os
 import tempfile
-import requests
-import magic
-import logging
 
-from utilities.fs import S3Helper
+import magic
+import requests
+from trackers.tracker import Result, Tracker
 from utilities.exceptions import DownloadException
-from trackers.tracker import Tracker, Result
+
+from wikimedia.utilities.helpers import S3Helper
+
 
 class Downloader:
     """

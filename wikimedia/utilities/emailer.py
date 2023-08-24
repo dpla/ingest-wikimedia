@@ -2,7 +2,7 @@
 """
 
 from botocore.exceptions import ClientError
-from utilities.format import sizeof_fmt, number_fmt
+from utilities.helpers import number_fmt, sizeof_fmt
 
 
 class Summary:
@@ -31,15 +31,15 @@ class Summary:
             Wikimedia {self.event_type} summary for {self.partner.upper()}.
 
             DPLA records
-              - Attempted.....{self.tracker.item_cnt}
+              - Attempted.....{number_fmt(self.tracker.item_cnt)}
               - Successful....{0}
               - Failed........{0}
 
             Images
-              - Attempted.....{self.tracker.image_attempted_cnt}
-              - Successful....{self.tracker.image_success_cnt}
-              - Skipped.......{self.tracker.image_skip_cnt}
-              - Failed........{self.tracker.image_fail_cnt}
+              - Attempted.....{number_fmt(self.tracker.image_attempted_cnt)}
+              - Successful....{number_fmt(self.tracker.image_success_cnt)}
+              - Skipped.......{number_fmt(self.tracker.image_skip_cnt)}
+              - Failed........{number_fmt(self.tracker.image_fail_cnt)}
 
             Storage
               - Added.........{sizeof_fmt(self.tracker.image_size_session)}
