@@ -6,7 +6,7 @@ import sys
 import boto3
 import logging
 
-# TODO Add back entries.upload after logging issue is resolved.
+# TODO Move `entries.upload import UploadEntry` back up after logging issue is resolved (see below)
 from entries.download import DownloadEntry
 from trackers.tracker import Tracker
 from utilities.fs import S3Helper, log_file
@@ -16,7 +16,7 @@ from utilities.emailer import SesMailSender, SesDestination, Summary
 # Email source and destination
 EMAIL_SOURCE    = "DPLA Tech Bot<tech@dp.la>"
 EMAMIL_REPLY    = ["DPLA Tech Bot<tech@dp.la>"]
-EMAIL_TO        = ["Scott<scott@dp.la>"] # TODO replace with tech@dp.la or dominic@dp.la
+EMAIL_TO        = ["DPLA Tech<tech@dp.la>"]
 
 def main():
     tracker = Tracker()
@@ -25,7 +25,7 @@ def main():
 
     # Get arguements
     args = get_args(sys.argv[1:])
-    # Arguements required by run.py; default values of None if not provided
+    # Arguements required by run.py; default values of None
     partner = args.get('partner', None)
     event_type = args.get('type', None)
     input = args.get('input', None)

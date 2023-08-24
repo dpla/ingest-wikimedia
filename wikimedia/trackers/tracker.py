@@ -9,6 +9,8 @@ class Result(Enum):
     UPLOADED = "UPLOADED"
 
 class Tracker:
+    """
+    Track the status of upload and download operations"""
     # Item tracking
     item_cnt = 0
     item_fail_cnt = 0

@@ -1,5 +1,5 @@
 """
-Upload to Wikimedia Commons
+Upload images to Wikimedia Commons
 
 """
 import logging
@@ -11,7 +11,8 @@ from utilities.fs import S3Helper
 from utilities.exceptions import UploadException
 
 class UploadEntry(Entry):
-
+    """
+    """
     # This is the schema emitted by the ingest-wikimedia download process
     READ_COLUMNS = {"_1": "dpla_id",
                     "_2": "path",
@@ -33,7 +34,7 @@ class UploadEntry(Entry):
         """
         s3_helper = S3Helper()
         base_input = kwargs.get('input', None)
-
+        # Get the most recent parquet file from the input path
         bucket, key = s3_helper.get_bucket_key(base_input)
         recent_key = s3_helper.most_recent_object(bucket=bucket, key=key)
         input = f"s3://{bucket}/{recent_key}"
@@ -42,14 +43,16 @@ class UploadEntry(Entry):
         df = Entry.load_data(data_in=input)
         unique_ids = self.uploader._unique_ids(df)
 
-        self.log.info(f"{len(df)} images for {len(unique_ids)} DPLA records from {input}")
+        # Summary of input parameters
+        self.log.info(f"Input............{input}")
+        self.log.info(f"Images...........{len(df)}")
+        self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
 
-        # Set the total number of intended uploads and number of unique DPLA records
-        # self.tracker.set_total(len(df))
-        print(f"Total: {len(df)}")
-        print(f"Unique: {len(unique_ids)}")
+        # Set the total number DPLA records and intended uploads
         self.tracker.set_dpla_count(len(unique_ids))
+        self.tracker.set_total(len(df))
 
+        # TODO parallelize this
         for row in df.itertuples():
             dpla_id, path, title, wiki_markup, size = None, None, None, None, None
             try:
