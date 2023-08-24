@@ -3,9 +3,9 @@
 
 There are three steps for uploading images to Wikimedia.
 
-- Export data for eligible records from the monthly ingest process [see ingestion3 documentation](https://github.com/dpla/ingestion3#wikimedia)
-- ingest-wikimedia `run-download.py`
-- ingest-wikimedia upload
+- `ingestion3` exports data for Wikimedia eligible records [see ingestion3 documentation](https://github.com/dpla/ingestion3#wikimedia)
+- `ingest-wikimedia` download images from providers (staged in s3)
+- `ingest-wikimedia` upload images from s3 to Wikimedia Commons
 
 ## Starting up
 
@@ -26,28 +26,26 @@ Creates a new screen session with a name of `nwdh` and attach to that session. U
 
 ## Running download
 
-Running a download requires two pieces of information
+```shell
+python3 wikimedia/run.py --input s3://dpla-master-dataset/ --output s3://dpla-wikimedia/ --partner ohio --type download
+```
 
-1) The path to the Wikimedia output from ingestion3
-2) The path to save the output in s3
+The download step expects four parameters
 
-The inpout path should be standard
+`--input` Root path of wikimedia exports from ingestion3 (ex. s3://dpla-master-dataset/)
 
-`s3://dpla-master-dataset/il/wiki/`
+`--output` Root path of where to save the images and data (ex. s3://dpla-wikimedia/)
 
-The path to output would be (this is determined by *you* and does not need to confirm to any specific formatting but consistent naming is very useful)
+`--partner` Name of the DPLA partner (ex. Ohio). Will be used as a prefix for both `--input` and `--output`
 
-`s3://dpla-wikimedia/il/`
-
-With these two pieces we are now ready to kick off the download within the previously activated screen session.
+`--type` The type of event (ex. download)
 
 ```shell
-> cd ~/ingest-wikimedia/
-> source venv-3.10/bin/activate
-> poetry run python run-download.py \
-    --input s3://dpla-master-dataset/il/wiki/ \
-    --output s3://dpla-wikimedia/il/ \
-    --partner il
+python3 wikimedia/run.py \
+--input s3://dpla-master-dataset/ \
+--output s3://dpla-wikimedia/ \
+--partner ohio \
+--type download
 ```
 
 `--limit` is an optionsal parameter and if omitted it will download all assests. This parameter is useful if a provider has multiple terrabytes of images and you don't want to download all of them in a single session (e.g. NARA or Texas).
@@ -63,16 +61,15 @@ Starting a new screen session for the uploads is helpful if you uploading multip
 The invocation is very similar to the download
 
 ```shell
-> cd ~/ingest-wikimedia/;
-> source venv-3.10/bin/activate;
-> poetry run python upload-entry.py \
---input s3://dpla-wikimedia/il/
---partner il
+python3 wikimedia/run.py \
+--input s3://dpla-wikimedia/ \
+--partner ohio \
+--type upload
 ```
 
 ## Logs
 
-Log files are written out on the local file system in `./ingest-wikimedia/logs/` and on sucessful completetion written to s3 `s3://dpla-wikimedia/il/logs/`).
+Log files are written out on the local file system in `./ingest-wikimedia/logs/` and on sucessful completetion written to s3 `s3://dpla-wikimedia/ohio/logs/`).
 
 ## Closing out
 
