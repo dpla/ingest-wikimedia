@@ -91,13 +91,14 @@ class Downloader:
         :param name
         :return:
         """
-        # Create temp local file and download file at source to it
-        temp_file = tempfile.NamedTemporaryFile()
-        _, size = self.download(source=source, destination=temp_file.name)
-        # Get content type from file, used in metadata for s3 upload
-        content_type = magic.from_file(temp_file.name, mime=True)
-        # Upload temp file to s3
+
         try:
+            # Create temp local file and download file at source to it
+            temp_file = tempfile.NamedTemporaryFile()
+            _, size = self.download(source=source, destination=temp_file.name)
+            # Get content type from file, used in metadata for s3 upload
+            content_type = magic.from_file(temp_file.name, mime=True)
+            # Upload temp file to s3
             with open(temp_file.name, "rb") as file:
                 self.s3_helper.upload(file=file,
                                       bucket=bucket,
@@ -105,8 +106,7 @@ class Downloader:
                                       extra_args={"ContentType": content_type})
             return f"s3://{bucket}/{key}", size
         except Exception as ex:
-            raise DownloadException(f"Error uploading {source} to s3://{bucket}/{key} \
-                                     - {str(ex)}") from ex
-        finally:
             if os.path.exists(temp_file.name):
                 os.remove(temp_file.name)
+            raise DownloadException(f"Error uploading {source} to s3://{bucket}/{key} \
+                                     - {str(ex)}") from ex
