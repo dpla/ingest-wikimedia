@@ -250,7 +250,7 @@ class ParquetHelper:
             AttributeError: 'NoneType' object has no attribute 'extend'
         '''
         temp = []
-        for file in self.parquet_files(path=path)[:50]:
+        for file in self.parquet_files(path=path)[:10]:
             print(file)
             temp_df = pd.read_parquet(file, engine='pyarrow')
             temp.append(temp_df)
