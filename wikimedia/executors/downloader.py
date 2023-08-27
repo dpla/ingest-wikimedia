@@ -109,4 +109,4 @@ class Downloader:
                                      - {str(ex)}") from ex
         finally:
             if os.path.exists(temp_file.name):
-                os.delete(temp_file.name)
+                os.remove(temp_file.name)
