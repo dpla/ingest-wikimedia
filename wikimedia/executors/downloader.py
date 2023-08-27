@@ -108,4 +108,5 @@ class Downloader:
             raise DownloadException(f"Error uploading {source} to s3://{bucket}/{key} \
                                      - {str(ex)}") from ex
         finally:
-            os.unlink(temp_file.name)
+            if os.path.exists(temp_file.name):
+                os.delete(temp_file.name)
