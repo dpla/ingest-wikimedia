@@ -243,10 +243,20 @@ class ParquetHelper:
 
     def read_parquet(self, path, columns=None):
         """Reads parquet file and returns a dataframe"""
+
+        ''''
+            TODO figure out why NARA failes this with
+          File "fastparquet/cencoding.pyx", line 440, in fastparquet.cencoding._assemble_objects
+            AttributeError: 'NoneType' object has no attribute 'extend'
+        '''
         temp = []
-        for file in self.parquet_files(path=path):
-            temp.append(pd.read_parquet(file, engine='fastparquet'))
+        for file in self.parquet_files(path=path)[:50]:
+            print(file)
+            temp_df = pd.read_parquet(file, engine='pyarrow')
+            temp.append(temp_df)
+            print(len(temp))
         df = pd.concat(temp, axis=0, ignore_index=True)
+
         if columns:
             return df.rename(columns)
         return df
