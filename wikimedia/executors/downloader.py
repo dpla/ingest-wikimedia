@@ -92,7 +92,7 @@ class Downloader:
         :return:
         """
         # Create temp local file and download file at source to it
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
+        temp_file = tempfile.NamedTemporaryFile()
         _, size = self.download(source=source, destination=temp_file.name)
         # Get content type from file, used in metadata for s3 upload
         content_type = magic.from_file(temp_file.name, mime=True)
