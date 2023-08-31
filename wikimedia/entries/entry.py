@@ -14,11 +14,11 @@ class Entry():
         fs = ParquetHelper()
         data = fs.read_parquet(data_in, columns=columns)
         if file_filter:
-            exclude_ids = []
+            include_ids = []
             with open(file_filter, encoding='utf-8') as f:
-                exclude_ids = [line.rstrip() for line in f]
-            data = data.filter(lambda x: x.id in exclude_ids)
-        return data.head(10)
+                include_ids = [line.rstrip() for line in f]
+            data = data.filter(lambda x: x.id in include_ids)
+        return data
 
     def execute(self, tracker: Tracker, **kwargs):
         raise NotImplementedError
