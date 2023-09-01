@@ -144,7 +144,6 @@ class DownloadEntry(Entry):
                     raise DownloadException(err_msg)
             except Exception as de:
                 raise DownloadException(f"{url}: {str(de)}") from de
-            page += 1
 
             # Create a row for a single asset and if multiple assests exist them
             # append them to the rows list. When a single asset fails to download
@@ -157,6 +156,7 @@ class DownloadEntry(Entry):
                 'page': page
             }
             image_rows.append(image_row)
+            page += 1
         return image_rows
 
     def image_path(self, count, dpla_id):
