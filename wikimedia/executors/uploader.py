@@ -113,7 +113,7 @@ class Uploader:
             if not result:
                 # Thise error message accounts for Page does not exist, but File does
                 # exist and is linked to another Page (ex. DPLA ID drift)
-                raise UploadException("wikimedi.upload() returned `False`")
+                raise UploadException("File linked to another page (possible ID drift)")
             self.log.info(f"Uploaded to {Text.wikimedia_url(page_title)}")
             # FIXME this is dumb and should be better, it either raises and exception
             # or returns True; kinda worthless?
@@ -132,7 +132,7 @@ class Uploader:
                 raise UploadWarning(f"File already exists, {error_string}") from exec
             if 'no-change' in error_string:
                 raise UploadWarning(f"File exists, no change, {error_string}") from exec
-            raise UploadException(f"Failed to upload {error_string}") from exec
+            raise UploadException(f"Failed: {error_string}") from exec
 
     def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
         """
