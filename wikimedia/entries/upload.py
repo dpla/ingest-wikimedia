@@ -74,6 +74,7 @@ class UploadEntry(Entry):
             ext = self.uploader.get_extension(path)
             # Create Wikimedia page title
             page_title = None
+            wiki_page = None
             try:
                 page_title = self.uploader.create_wiki_page_title(title=title,
                                                      dpla_identifier=dpla_id,
@@ -85,14 +86,20 @@ class UploadEntry(Entry):
                 continue
 
             # Create wiki page using Wikimedia page title
-            wiki_page = self.uploader.create_wiki_file_page(title=page_title)
+            try:
+                wiki_page = self.uploader.create_wiki_file_page(title=page_title)
+            except UploadException as exec:
+                self.log.error(f"{str(exec)}")
+                self.tracker.increment(Result.FAILED)
+                continue
 
             if wiki_page is None:
                 self.log.info(f"Exists {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)
                 continue
+
+            # Upload image to Wikimedia page
             try:
-                # Upload image to wiki page
                 self.uploader.upload(wiki_file_page=wiki_page,
                             dpla_identifier=dpla_id,
                             text=wiki_markup,

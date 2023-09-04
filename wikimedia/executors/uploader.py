@@ -171,7 +171,12 @@ class Uploader:
         :return: pywikibot.FilePage object if the page was created, None if the
         page already exists
         """
-        wiki_page = pywikibot.FilePage(self.wikimedia, title=title)
+        try:
+            wiki_page = pywikibot.FilePage(self.wikimedia, title=title)
+        except pywikibot.exceptions.InvalidTitleError as itex:
+            raise UploadException(f"Invalid title {title}: {str(itex)}") from itex
+        except Exception as ex:
+            raise UploadException(f"Unable to create page {title}: {str(exec)}") from ex
         if wiki_page.exists():
             return None
         return wiki_page
