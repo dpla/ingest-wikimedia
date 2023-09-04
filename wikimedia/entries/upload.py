@@ -73,10 +73,16 @@ class UploadEntry(Entry):
             # Get file extension
             ext = self.uploader.get_extension(path)
             # Create Wikimedia page title
-            page_title = self.uploader.create_wiki_page_title(title=title,
+            page_title = None
+            try:
+                page_title = self.uploader.create_wiki_page_title(title=title,
                                                      dpla_identifier=dpla_id,
                                                      suffix=ext,
                                                      page=page)
+            except UploadException as exec:
+                self.log.error(f"{str(exec)}")
+                self.tracker.increment(Result.FAILED)
+                continue
 
             # Create wiki page using Wikimedia page title
             wiki_page = self.uploader.create_wiki_file_page(title=page_title)

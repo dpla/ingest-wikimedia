@@ -155,8 +155,7 @@ class Uploader:
 
         # Check to see if the page contains invisible characters and is invalid
         if pywikibot.tools.chars.contains_invisible(title):
-            self.log.error(f"Invalid title due to invisible characters: {title}")
-            return None
+            raise UploadException(f"Invalid title due to invisible characters: {title}")
 
         # Add pagination to page title if needed
         if page:
