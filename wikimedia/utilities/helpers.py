@@ -145,7 +145,7 @@ class S3Helper:
         """
         Find the most recent object or prefix in a path in s3
         """
-        keys = self.s3_client.list_objects(Bucket=bucket, Prefix=key, Delimiter='/')
+        keys = self.s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter='/')
 
         if type == 'prefix':
             values = [k.get('Prefix') for k in keys.get('CommonPrefixes', None)]
