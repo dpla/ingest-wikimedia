@@ -53,9 +53,6 @@ class UploadEntry(Entry):
         self.log.info(f"Images...........{len(df)}")
         self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
 
-        # import sys
-        # sys.exit(0)
-
         # TODO parallelize this
         for row in df.itertuples():
             dpla_id, path, title, wiki_markup, size = None, None, None, None, None
@@ -87,12 +84,8 @@ class UploadEntry(Entry):
                 self.log.error(f"{str(exec)}")
                 self.tracker.increment(Result.FAILED)
                 continue
-            wiki_page = self.uploader.create_wiki_file_page(title=page_title)
             try:
                 wikimedia_page = self.uploader.get_page(title=page_title)
-                print(page_title)
-                print(wikimedia_page.title())
-
             except UploadException as exec:
                 self.log.error(f"{str(exec)}")
                 self.tracker.increment(Result.FAILED)
@@ -105,11 +98,11 @@ class UploadEntry(Entry):
             # Upload image to Wikimedia page
             try:
                 # Upload image to wiki page
-                self.uploader.upload(wiki_file_page=wiki_page,
-                            dpla_identifier=dpla_id,
-                            text=wiki_markup,
-                            file=path,
-                            page_title=page_title)
+                self.uploader.upload(wiki_file_page=wikimedia_page,
+                                     dpla_identifier=dpla_id,
+                                     text=wiki_markup,
+                                     file=path,
+                                     page_title=page_title)
                 self.tracker.increment(Result.UPLOADED, size=size)
 
             except UploadWarning as _:
@@ -124,6 +117,3 @@ class UploadEntry(Entry):
                 self.log.error(f"{str(exception)} -- {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.FAILED)
                 continue
-            finally:
-                import sys
-                sys.exit(0)

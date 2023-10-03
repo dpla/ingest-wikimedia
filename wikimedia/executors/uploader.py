@@ -105,19 +105,14 @@ class Uploader:
         bucket, key = self.s3_helper.get_bucket_key(file)
         self.download(bucket=bucket, key=key, destination=temp_file)
         try:
-            # https://commons.wikimedia.org/wiki/File:Driving_Park_Branch_photo_album-3_-_DPLA_-_09ca347b4c8883fa86dc17f974a561f5_(page_19).jpg
-            # print(f"Attempting upload {page_title} to Wikimedia Commons")
-            result = True
-            # result = self.wikimedia.upload(filepage=wiki_file_page,
-            #                  source_filename=temp_file.name,
-            #                  comment=comment,
-            #                  text=text,
-            #                  ignore_warnings=self.IGNORE_WARNINGS,
-            #                  asynchronous= True,
-            #                  chunk_size=3000000 # 3MB
-                            # )
-            print(result)
-
+            result = self.wikimedia.upload(filepage=wiki_file_page,
+                             source_filename=temp_file.name,
+                             comment=comment,
+                             text=text,
+                             ignore_warnings=self.IGNORE_WARNINGS,
+                             asynchronous= True,
+                             chunk_size=3000000 # 3MB
+                            )
             if not result:
                 # Thise error message accounts for Page does not exist, but File does
                 # exist and is linked to another Page (ex. DPLA ID drift)
@@ -160,7 +155,7 @@ class Uploader:
             .replace('}', ')') \
             .replace('/', '-') \
             .replace(':', '-') \
-            # .replace('#', '-')
+            .replace('#', '-')
 
         # Check to see if the page contains invisible characters and is invalid
         if pywikibot.tools.chars.contains_invisible(title):
