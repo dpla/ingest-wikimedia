@@ -195,6 +195,8 @@ class S3Helper:
         try:
             response = self.s3_client.head_object(Bucket=bucket, Key=key)
             size = response.get('ContentLength', 0)
+            # ChecksumSHA1': 'string',
+            # 'ChecksumSHA256': 'string',
             return True, size
         except ClientError:
             # The head request fails therefore we assume the file does not exist in s3
