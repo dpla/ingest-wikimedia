@@ -1,15 +1,18 @@
 
 # Roadmap
 
+**[Wikimedia Workflow Google Doc](https://docs.google.com/document/d/1gkKjgdxy9zxP233DTxp_dZUw6WmOd05iEk9f7g0Q0Cc/edit?usp=sharing)**
 Projects and improvements needed for this project
 
-**[Wikimedia Workflow Google Doc](https://docs.google.com/document/d/1gkKjgdxy9zxP233DTxp_dZUw6WmOd05iEk9f7g0Q0Cc/edit?usp=sharing)**
+- Logging
+- Downloads
+- Uploads
 
-## Logs
+## Logging
 
 - [x] Log files are written to s3
-- [ ] Log files should be emailed to tech@dp.la
-- [ ] Create a `_SUMMARY` files similar to ones producted by ingestion3
+- [x] Log files should be emailed to tech@dp.la
+- [x] Create a `_SUMMARY` files similar to ones producted by ingestion3
 
 ## Downloads
 
@@ -43,21 +46,79 @@ All multi-page records uploaded since August(?) have this issue. Steps to remedi
 
 The cases that need to be implemented for correctly handling uploading images to Wikimedia Commons
 
-### CASE 1
+## Logical flow
+
+```python
+# Evaluate CASE 1
+if (FilePage(TITLE).exists() === TRUE):
+  # evaluate CASE 5
+  if (s3.SHA1 === commonsImage.SHA1):
+    # Title and SHA1 match
+    # 1. Log SKIPPED message
+  else:
+    # s3.SHA1 != commonsImage.SHA1
+    # Does this SHA1 hash exist on Commons?
+    if(s3.SHA1.exists() == TRUE):
+      # 1. Implies that image is linked to another existing page in Commons
+      # 2. Override IGNORE_WARNINGS array and remove IGNORE_DUPLICATE warning
+      # 3. Upload image to Commons and replaces image on existing Commons page
+      # 3. Log REPLACED message
+      replaceImage()
+    else:
+      # Neither the SHA1 hash nor the Title exist on Commons
+      # 1. Upload new image to commons
+      # 2. Log UPLOAD message
+      uploadNewImage()
+else:
+  # FilePage(TITLE).exists() === FALSE
+  if(s3.SHA1.exists() == TRUE):
+    # Title does not exist but the image has already been uploaded
+    # Move the image to a new page
+    # log MOVED message
+    moveImage()
+  else:
+    # Neither the SHA1 hash nor the Title exist on Commons
+    # Upload new image to commons
+    # log UPLOAD message
+    uploadNewImage
+
+# page 1 does not exist
+# image for page 1 exists but linked to page 2
+#
+
+def replaceImage()
+# Replace image on existing page
+
+def moveImage()
+# Move existing image to new page
+
+def uploadNewImage()
+# Create new page
+
+```
+
+### CASE 1:  SHA1 Hash exists, matches Title
 
 ---
-SHA1 hash of image on s3 and SHA1 hash of image in Commons match and filename match.
+SHA1 hash of image on s3 and SHA1 hash of image in Commons match and filename match. This is one of the most basic cases and is a no-op. Logging should log a `Skipped` message.
 
-This is a no-op and should log a `Skipped` message
+TODO:
 
-### CASE 2
+1. This case is already partially handled by the ingest script by checking the the page title on Commonss. It needs to account for the hash component as well.
+
+NOTES:
+> If hashes of images on s3 and hash of oringal images in institution repo are not checked then does the hash comparison even matter?
+>
+> I don't think it does and this should only check 'Title' for agreement.
+
+### CASE 2: SHA1 exists, does not match Title
 
 ---
 The SHA1 of the iamge on s3 exists in Commons but the filename created by the Wikimedia ingest process does not exist on Commons. Move the file to a new page using pywikibot API. This will create a redirect from the old page name to the new page.
 
 Log a `WARNING` message to indicate the the page title has changed.
 
-### CASE 3
+### CASE 3: SHA1 exists, ______
 
 ---
 **TBD**  It is unclear to me right now what the difference between CASE 2 and CASE 3 based on the description below.
@@ -68,14 +129,14 @@ hash exists, file name disagreement between Wiki and DPLA
 - force upload of hash collision to DPLA page
 - continue for other other images in record
 
-### CASE 4
+### CASE 4: SHA1 does not exist, Title does not exist
 
 ---
 SHA1 hash does not exist in Commons and the page does not exist in Commons. Create new page and upload image. The is the most basic of cases.
 
 Log an `INFO` message that a new image was uploaded.
 
-### CASE 5
+### CASE 5: SHA1 does not exist, Title does exist
 
 ---
 The SHA1 hash does not exist in Commons but the page does exist. Overwrite the image in Commons.
@@ -87,13 +148,3 @@ Log an `INFO` message indicating an existing page was updated with new image.
 ## Structured Data on Commons + Metadata Sync
 
 A much larger unscropped set of work that is folded into the Wikimedia Workflow document. The script exists in the project as `sdc-sync.py`.
-
-
-## Miscellanious work
-
-1. Analytics Dashboard work
-
-   - Reported by Keila @ SSDN, she was trying to download a CSV of the Analytics data for the hub. This is an existing feature of the service that broke at some point in the past but percisely when is unclear.
-   - Th work requested is not adding new functionality, just repair what broke.
-   - This is bug in CSV where we are trying serialize a dict as a string and that type conversion errors out.
-   - This is a medium / big lift and something I need to skill up around (I don't know Ruby or the AD code base at all)
