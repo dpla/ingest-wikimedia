@@ -49,14 +49,11 @@ The cases that need to be implemented for correctly handling uploading images to
 ## Logical flow
 
 ```python
-# Evaluate CASE 1
-if (FilePage(TITLE).exists() === TRUE):
-  # evaluate CASE 5
-  if (s3.SHA1 === commonsImage.SHA1):
+if (WikiFilePage(TITLE).exists() == TRUE):
+  if (s3.SHA1 == commonsImage.SHA1):
     # Title and SHA1 match
     # 1. Log SKIPPED message
-  else:
-    # s3.SHA1 != commonsImage.SHA1
+  elif(s3.SHA1 != commonsImage.SHA1):
     # Does this SHA1 hash exist on Commons?
     if(s3.SHA1.exists() == TRUE):
       # 1. Implies that image is linked to another existing page in Commons
@@ -64,37 +61,35 @@ if (FilePage(TITLE).exists() === TRUE):
       # 3. Upload image to Commons and replaces image on existing Commons page
       # 3. Log REPLACED message
       replaceImage()
-    else:
-      # Neither the SHA1 hash nor the Title exist on Commons
-      # 1. Upload new image to commons
-      # 2. Log UPLOAD message
-      uploadNewImage()
-else:
-  # FilePage(TITLE).exists() === FALSE
+    elif(s3.SHA1.exists() == FALSE):
+      # Title exists but the image has never been uploaded to Commons
+      # 1. Upload new image to Commons and replace the existing image on the
+      #    existing page with a new image
+      # 2. Log REPLACE message
+      replaceImage()
+elif(WikiFilePage(TITLE).exists() == FALSE):
   if(s3.SHA1.exists() == TRUE):
-    # Title does not exist but the image has already been uploaded
-    # Move the image to a new page
-    # log MOVED message
+    # Title does not exist but the image has already been uploaded and linked to another page
+    # 1. Move the image to a new page
+    # 2. Log MOVED message
     moveImage()
-  else:
+  elif(s3.SHA1.exists() == FALSE):
     # Neither the SHA1 hash nor the Title exist on Commons
-    # Upload new image to commons
-    # log UPLOAD message
-    uploadNewImage
+    # 1. Upload new image to commons
+    # 2. Log UPLOAD message
+    uploadNewImage()
 
-# page 1 does not exist
-# image for page 1 exists but linked to page 2
-#
+# From Commons perspective there a functional difference
+# between replaceImage() and moveImage()?
 
 def replaceImage()
 # Replace image on existing page
 
 def moveImage()
-# Move existing image to new page
+# Move existing image to new page with redirect from old to new
 
 def uploadNewImage()
-# Create new page
-
+# Create new page with new image
 ```
 
 ### CASE 1:  SHA1 Hash exists, matches Title
