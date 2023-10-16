@@ -73,26 +73,38 @@ class UploadEntry(Entry):
             # Get file extension
             ext = self.uploader.get_extension(path)
             # Create Wikimedia page title
-            page_title = self.uploader.create_wiki_page_title(title=title,
+            page_title = None
+            wikimedia_page = None
+            try:
+                page_title = self.uploader.get_page_title(title=title,
                                                      dpla_identifier=dpla_id,
                                                      suffix=ext,
                                                      page=page)
-
-            # Create wiki page using Wikimedia page title
-            wiki_page = self.uploader.create_wiki_file_page(title=page_title)
-
-            if wiki_page is None:
+            except UploadException as exec:
+                self.log.error(f"{str(exec)}")
+                self.tracker.increment(Result.FAILED)
+                continue
+            try:
+                wikimedia_page = self.uploader.get_page(title=page_title)
+            except UploadException as exec:
+                self.log.error(f"{str(exec)}")
+                self.tracker.increment(Result.FAILED)
+                continue
+            if wikimedia_page is None:
                 self.log.info(f"Exists {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)
                 continue
+
+            # Upload image to Wikimedia page
             try:
                 # Upload image to wiki page
-                self.uploader.upload(wiki_file_page=wiki_page,
-                            dpla_identifier=dpla_id,
-                            text=wiki_markup,
-                            file=path,
-                            page_title=page_title)
+                self.uploader.upload(wiki_file_page=wikimedia_page,
+                                     dpla_identifier=dpla_id,
+                                     text=wiki_markup,
+                                     file=path,
+                                     page_title=page_title)
                 self.tracker.increment(Result.UPLOADED, size=size)
+
             except UploadWarning as _:
                 self.log.info(f"Exists {Text.wikimedia_url(page_title)}")
                 self.tracker.increment(Result.SKIPPED)

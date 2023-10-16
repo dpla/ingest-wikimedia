@@ -37,3 +37,27 @@ Projects and improvements needed for this project
 ## Metadata Sync
 
 A much larger unscropped set of work that is folded into the Wikimedia Workflow document
+
+## September 19th notes
+
+- Dominic has deleted all the duplicates
+- There are a number of items which may have misnumbered pages.
+- Domiic to writ
+
+Functionality for updating existing asset
+
+- Check hash on download; if different overwrite image in s3
+- Upload asset will check if hash on s3 is different from hash in wiki
+- overwirte if different
+
+Duplicate check
+case 1: hash and filename match; no op
+case 2: hash exists DPLA filename does not exist; move file to new page
+case 3: hash exists, file name disagreement between Wiki and DPLA
+
+- ignore duplicate warning
+- force upload of hash collision to DPLA page
+- continue for other other images in record
+
+case 4: hash does not exist: upload to new page
+case 5: hash does not exist page/file does exist; overwrite image in commons

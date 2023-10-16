@@ -22,17 +22,21 @@ class Uploader:
     # This list exists mainly to exclude 'duplicate' records/images from being uploaded
     # Full list of warnings:
     #   https://doc.wikimedia.org/pywikibot/master/_modules/pywikibot/site/_upload.html
+
     IGNORE_WARNINGS = [
-        'bad-prefix',
-        'badfilename',
-        'duplicate-archive',
-        'duplicate-version',
-        'empty-file',
-        'exists',
-        'exists-normalized',
-        'filetype-unwanted-type',
-        'page-exists',
-        'was-deleted'
+        'bad-prefix', # Target filename has a bad prefix {msg}.
+        'badfilename', # Target filename is invalid.
+        'duplicate-archive', # The file is a duplicate of a deleted file {msg}.
+        'duplicate-version', # The upload is an exact duplicate of older version(s) of this file
+        'empty-file', # File {msg} is empty.
+        'exists', # File [Page] {msg} already exists
+        'exists-normalized', # File exists with different extension as {msg}.
+        'filetype-unwanted-type', # File {msg} type is unwanted type.
+        'page-exists', # Target filename exists but with a different file {msg}
+        'was-deleted' # The file {msg} was previously deleted.
+        #
+        # 'duplicate', # Uploaded file is a duplicate of {msg}
+        # 'no-change', # The upload is an exact duplicate of the current version of this file
     ]
 
     log = logging.getLogger(__name__)
@@ -108,7 +112,6 @@ class Uploader:
                              ignore_warnings=self.IGNORE_WARNINGS,
                              asynchronous= True,
                              chunk_size=3000000 # 3MB
-
                             )
             if not result:
                 # Thise error message accounts for Page does not exist, but File does
@@ -134,7 +137,7 @@ class Uploader:
                 raise UploadWarning(f"File exists, no change, {error_string}") from exec
             raise UploadException(f"Failed: {error_string}") from exec
 
-    def create_wiki_page_title(self, title, dpla_identifier, suffix, page=None):
+    def get_page_title(self, title, dpla_identifier, suffix, page=None):
         """
         Makes a proper Wikimedia page title from the DPLA identifier and
         the title of the image.
@@ -152,18 +155,18 @@ class Uploader:
             .replace('}', ')') \
             .replace('/', '-') \
             .replace(':', '-') \
+            .replace('#', '-')
 
         # Check to see if the page contains invisible characters and is invalid
         if pywikibot.tools.chars.contains_invisible(title):
-            self.log.error(f"Invalid title due to invisible characters: {title}")
-            return None
+            raise UploadException(f"Invalid title due to invisible characters: {title}")
 
         # Add pagination to page title if needed
         if page:
             return f"{escaped_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
         return f"{escaped_title} - DPLA - {dpla_identifier}{suffix}"
 
-    def create_wiki_file_page(self, title):
+    def get_page(self, title):
         """
         Create a Wikimedia page for the image if it does not already exist.If it
         does exist then return None.
@@ -172,7 +175,12 @@ class Uploader:
         :return: pywikibot.FilePage object if the page was created, None if the
         page already exists
         """
-        wiki_page = pywikibot.FilePage(self.wikimedia, title=title)
+        try:
+            wiki_page = pywikibot.FilePage(self.wikimedia, title=title)
+        except pywikibot.exceptions.InvalidTitleError as itex:
+            raise UploadException(f"Invalid title {title}: {str(itex)}") from itex
+        except Exception as ex:
+            raise UploadException(f"Unable to create page {title}: {str(exec)}") from ex
         if wiki_page.exists():
             return None
         return wiki_page
