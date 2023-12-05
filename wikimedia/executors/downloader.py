@@ -58,7 +58,7 @@ class Downloader:
             return destination, size
         except Exception as exec:
             self.tracker.increment(Result.FAILED)
-            raise DownloadException(f"Failed download {source} - {str(exec)}") from exec
+            raise exec  # DownloadException(f"Failed download {source} - {str(exec)}") from exec
 
     # TODO This maybe better in the FileSystem class
     def save_to_local(self, source, file):
@@ -73,10 +73,25 @@ class Downloader:
         """
         try:
             response = requests.get(source, timeout=30)
+            invalid_types = [
+                "text/html",
+                "application/json",
+                "application/xml",
+                "text/plain",
+            ]
+            for invalid_type in invalid_types:
+                if invalid_type in response.headers["content-type"]:
+                    raise DownloadException(
+                        f"Invalid content-type: {response.headers['content-type']}"
+                    )
+            # if response.headers['content-type'] in invalid_types:
+            #     raise DownloadException(f"Invalid content-type: {response.headers['content-type']}")
             with open(file, "wb") as f:
                 f.write(response.content)
             file_size = os.path.getsize(file)
             return file, file_size
+        except DownloadException as de:
+            raise de
         except Exception as exec:
             raise DownloadException(f"Failed saving to local {str(exec)}") from exec
 
