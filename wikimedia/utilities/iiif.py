@@ -27,13 +27,30 @@ class IIIF:
         Extracts image URLs from IIIF manfiest and returns them as a list
         # TODO
         """
+        urls = []
+        sequences = iiif.get("sequences", [])
+        sequence = sequences[0:1] if len(sequences) == 1 else None
+        canvases = sequence[0].get("canvases", []) if sequence else []
+        for canvase in canvases:
+            for image in canvase.get("images", []):
+                url = image.get("resource", {}).get("@id", None)
+                if url:
+                    urls.append(url)
+        return urls
 
     def iiif__v3_urls(self, iiif):
         """
         Needs to be implemented for Georgia uploads to Wikimedia Commons
         To be done by October 2023
-        # TODO
         """
+        # items[0] \ items[x] \ items[0] \ body \ id
+        urls = []
+        for item in iiif.get("items", []):
+            try:
+                urls = item["items"][0]["items"][0].get("body", {}).get("id", None)
+            except (IndexError, TypeError, KeyError):
+                pass
+        return urls
 
     def get_iiif_urls(self, iiif):
         """
@@ -46,16 +63,19 @@ class IIIF:
 
         manifest = self._get_iiif_manifest(iiif)
 
-        urls = []
-        sequences = manifest.get("sequences", [])
-        sequence = sequences[0:1] if len(sequences) == 1 else None
-        canvases = sequence[0].get("canvases", []) if sequence else []
-        for canvase in canvases:
-            for image in canvase.get("images", []):
-                url = image.get("resource", {}).get("@id", None)
-                if url:
-                    urls.append(url)
-        return urls
+        # v2 or v3?
+        if (
+            manifest.get("@context", None)
+            == "http://iiif.io/api/presentation/3/context.json"
+        ):
+            return self.iiif__v3_urls(manifest)
+        elif (
+            manifest.get("@context", None)
+            == "http://iiif.io/api/presentation/2/context.json"
+        ):
+            return self.iiif_v2_urls(manifest)
+        else:
+            raise IIIFException(f"Unknown IIIF version: {iiif}")
 
     def _get_iiif_manifest(self, url):
         """
