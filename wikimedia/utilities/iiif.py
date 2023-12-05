@@ -45,9 +45,10 @@ class IIIF:
         urls = []
         for item in iiif.get('items', []):
             try:
-                urls = item['items'][0]['items'][0].get('body', {}).get('id', None)
+                url = item['items'][0]['items'][0].get('body', {}).get('id', None)
+                urls.append(url) if url.endswith('default.jpg') else urls.append(url + "/full/full/0/default.jpg")
             except (IndexError, TypeError, KeyError):
-                pass
+                return []
         return urls
 
 
@@ -79,12 +80,11 @@ class IIIF:
         try:
             request = requests.get(url, timeout=30, headers=self.HEADERS)
             if request.status_code not in [200, 301, 302]:
-                raise IIIFException(f"Unable to request: {url} - \
-                                    Status code {request.status_code}")
+                raise IIIFException(f"HTTP Error {request.status_code}")
             data = request.content
             return json.loads(data)
         except json.decoder.JSONDecodeError as jdex:
             raise IIIFException(f"Unable to decode JSON: {url} - \
                                 {str(jdex)}") from jdex
         except requests.exceptions.RequestException as re:
-            raise IIIFException(f"Unable to request: {url} - {str(re)}") from re
+            raise IIIFException(f"{str(re)}") from re
