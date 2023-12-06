@@ -237,6 +237,22 @@ class S3Helper:
                                         Key=key,
                                         ExtraArgs=extra_args)
 
+    def get_sha1(self, bucket, key):
+        """
+        Get SHA1 hash of file from s3
+
+        :param path: The path to the file
+        :return: The SHA1 hash
+        """
+        try:
+            response = self.s3_client.get_object_attributes(Bucket=bucket,
+                                                            Key=key,
+                                                            ObjectAttributes=['Checksum']
+                                                            )
+            return response['Checksum']['ChecksumSHA1']
+        except Exception as exec:
+                raise Exception(f"No SHA1 s3://{bucket}/{key}: {str(exec)}") from exec
+
 class ParquetHelper:
     """
     """

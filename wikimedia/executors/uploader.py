@@ -39,6 +39,10 @@ class Uploader:
         # 'no-change', # The upload is an exact duplicate of the current version of this file
     ]
 
+    # TODO confirm with Dominic this is the correct list of warnings to ignore for
+    # replacing images
+    REPLACE_IMAGE_WARNINGS = IGNORE_WARNINGS.copy().remove('duplicate')
+
     log = logging.getLogger(__name__)
 
     s3_helper = S3Helper()
@@ -86,7 +90,7 @@ class Uploader:
         unique, counts = np.unique(df["dpla_id"], return_counts=True)
         return dict(zip(unique, counts))
 
-    def upload(self, wiki_file_page, dpla_identifier, text, file, page_title):
+    def upload(self, wiki_file_page, dpla_identifier, text, file, page_title, replace=False):
         """
 
         :param wiki_file_page:
@@ -97,19 +101,27 @@ class Uploader:
         """
         comment = f"Uploading DPLA ID \"[[dpla:{dpla_identifier}|{dpla_identifier}]]\"."
 
+        # Are we uploading a new file or replacing an existing file?
+        if replace:
+            warnings = self.REPLACE_IMAGE_WARNINGS
+        else:
+            warnings = self.IGNORE_WARNINGS
+
         # Kludged because direct s3 upload via source_url is not allowed
         if not file.startswith("s3"):
             raise UploadException("File must be on s3")
+
         # Download from S3 to local temporary file
         temp_file = tempfile.NamedTemporaryFile()
         bucket, key = self.s3_helper.get_bucket_key(file)
         self.download(bucket=bucket, key=key, destination=temp_file)
+
         try:
             result = self.wikimedia.upload(filepage=wiki_file_page,
                              source_filename=temp_file.name,
                              comment=comment,
                              text=text,
-                             ignore_warnings=self.IGNORE_WARNINGS,
+                             ignore_warnings=warnings,
                              asynchronous= True,
                              chunk_size=3000000 # 3MB
                             )
@@ -177,13 +189,11 @@ class Uploader:
         """
         try:
             wiki_page = pywikibot.FilePage(self.wikimedia, title=title)
+            return wiki_page
         except pywikibot.exceptions.InvalidTitleError as itex:
             raise UploadException(f"Invalid title {title}: {str(itex)}") from itex
         except Exception as ex:
             raise UploadException(f"Unable to create page {title}: {str(exec)}") from ex
-        if wiki_page.exists():
-            return None
-        return wiki_page
 
     def get_extension(self, path):
         """
