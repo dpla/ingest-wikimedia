@@ -102,7 +102,8 @@ class Downloader:
                 self.s3_helper.upload(file=file,
                                       bucket=bucket,
                                       key=key,
-                                      extra_args={"ContentType": content_type})
+                                      extra_args={"ContentType": content_type,
+                                                  "ChecksumAlgorithm": "sha1"})
             return f"s3://{bucket}/{key}", size
         except Exception as ex:
             raise DownloadException(f"Error uploading {source} to s3://{bucket}/{key} \
