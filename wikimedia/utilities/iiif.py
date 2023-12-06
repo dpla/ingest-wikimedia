@@ -52,7 +52,7 @@ class IIIF:
                     if url.endswith("default.jpg"):
                         urls.append(url)
                     else:
-                        urls.append(f"${url}{resolution}")
+                        urls.append(f"{url}{resolution}")
             except (IndexError, TypeError, KeyError):
                 return []
         return urls
