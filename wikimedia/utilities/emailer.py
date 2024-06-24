@@ -56,7 +56,7 @@ class Summary:
 
 
 # Taken from Amzaon example code:
-# >  https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
+# https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
 class SesMailSender:
     """Encapsulates functions to send emails with Amazon SES."""
 

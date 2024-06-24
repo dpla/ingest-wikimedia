@@ -11,9 +11,9 @@ import boto3
 import botocore
 import numpy as np
 import pywikibot
-from utilities.exceptions import UploadException, UploadWarning
-from utilities.helpers import S3Helper
-from utilities.helpers import Text
+from wikimedia.utilities.exceptions import UploadException, UploadWarning
+from wikimedia.utilities.helpers import S3Helper
+from wikimedia.utilities.helpers import Text
 
 
 class Uploader:
@@ -29,7 +29,8 @@ class Uploader:
         "bad-prefix",  # Target filename has a bad prefix {msg}.
         "badfilename",  # Target filename is invalid.
         "duplicate-archive",  # The file is a duplicate of a deleted file {msg}.
-        "duplicate-version",  # The upload is an exact duplicate of older version(s) of this file
+        "duplicate-version",  # The upload is an exact duplicate of older version(s)
+        # of this file
         "empty-file",  # File {msg} is empty.
         "exists",  # File [Page] {msg} already exists
         "exists-normalized",  # File exists with different extension as {msg}.
@@ -38,7 +39,8 @@ class Uploader:
         "was-deleted",  # The file {msg} was previously deleted.
         #
         # 'duplicate', # Uploaded file is a duplicate of {msg}
-        # 'no-change', # The upload is an exact duplicate of the current version of this file
+        # 'no-change', # The upload is an exact duplicate of the current version
+        # of this file
     ]
 
     log = logging.getLogger(__name__)
@@ -84,7 +86,8 @@ class Uploader:
                                           to {destination.name}: {str(cex)}"
                     ) from cex
 
-    def _unique_ids(self, df):
+    @staticmethod
+    def _unique_ids(df):
         """
         Return a dictionary of unique dpla_ids and their counts"""
         unique, counts = np.unique(df["dpla_id"], return_counts=True)
@@ -92,11 +95,11 @@ class Uploader:
 
     def upload(self, wiki_file_page, dpla_identifier, text, file, page_title):
         """
-
         :param wiki_file_page:
         :param dpla_identifier:
         :param text
         :param file
+        :param page_title
         :return:
         """
         comment = f'Uploading DPLA ID "[[dpla:{dpla_identifier}|{dpla_identifier}]]".'
@@ -126,23 +129,26 @@ class Uploader:
             # FIXME this is dumb and should be better, it either raises and exception
             # or returns True; kinda worthless?
             return True
-        except Exception as exec:
-            error_string = str(exec)
+        except Exception as error:
+            error_string = str(error)
             # TODO what does this error message actually mean? Page name?
             if "fileexists-shared-forbidden:" in error_string:
-                raise UploadWarning("File already uploaded") from exec
+                raise UploadWarning("File already uploaded") from error
             if "filetype-badmime" in error_string:
-                raise UploadException("Invalid MIME type") from exec
+                raise UploadException("Invalid MIME type") from error
             if "filetype-banned" in error_string:
-                raise UploadException("Banned file type") from exec
+                raise UploadException("Banned file type") from error
             # TODO what does this error message actually mean? MD5 hash collision?
             if "duplicate" in error_string:
-                raise UploadWarning(f"File already exists, {error_string}") from exec
+                raise UploadWarning(f"File already exists, {error_string}") from error
             if "no-change" in error_string:
-                raise UploadWarning(f"File exists, no change, {error_string}") from exec
-            raise UploadException(f"Failed: {error_string}") from exec
+                raise UploadWarning(
+                    f"File exists, no change, {error_string}"
+                ) from error
+            raise UploadException(f"Failed: {error_string}") from error
 
-    def get_page_title(self, title, dpla_identifier, suffix, page=None):
+    @staticmethod
+    def get_page_title(title, dpla_identifier, suffix, page=None):
         """
         Makes a proper Wikimedia page title from the DPLA identifier and
         the title of the image.
@@ -208,5 +214,5 @@ class Uploader:
             else:
                 mime = mimetypes.guess_type(path)[0]
             return mimetypes.guess_extension(mime)
-        except Exception as exec:
-            raise UploadException(f"No extension {path}: {str(exec)}") from exec
+        except Exception as error:
+            raise UploadException(f"No extension {path}: {str(error)}") from exec
