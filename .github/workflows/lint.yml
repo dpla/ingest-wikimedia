@@ -1,0 +1,28 @@
+name: Lints
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-20.04
+
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: flake8
+        run: |
+          pip install `egrep -o 'flake8==\S+' requirements.txt`  # install our version of flake8
+          flake8 web/ --config wikimedia/setup.cfg
+
+      - name: black
+        run: |
+          pip install `egrep -o 'black==\S+' requirements.txt`  # install our version of black
+          black --check --diff . # Uses pyproject.toml
+
+      - name: mypy
+        run: |
+          pip install -r requirements.txt  # install a full environment for mypy
+          cd wikimedia
+          PYTHONPATH=. mypy
