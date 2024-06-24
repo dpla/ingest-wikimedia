@@ -2,6 +2,7 @@
 Download images from parters
 
 """
+
 import logging
 import os
 import tempfile
@@ -17,6 +18,7 @@ class Downloader:
     """
     Download images from parters
     """
+
     log = logging.getLogger(__name__)
 
     s3_helper = S3Helper()
@@ -71,7 +73,7 @@ class Downloader:
         """
         try:
             response = requests.get(source, timeout=30)
-            with open(file, 'wb') as f:
+            with open(file, "wb") as f:
                 f.write(response.content)
             file_size = os.path.getsize(file)
             return file, file_size
@@ -99,13 +101,17 @@ class Downloader:
         # Upload temp file to s3
         try:
             with open(temp_file.name, "rb") as file:
-                self.s3_helper.upload(file=file,
-                                      bucket=bucket,
-                                      key=key,
-                                      extra_args={"ContentType": content_type})
+                self.s3_helper.upload(
+                    file=file,
+                    bucket=bucket,
+                    key=key,
+                    extra_args={"ContentType": content_type},
+                )
             return f"s3://{bucket}/{key}", size
         except Exception as ex:
-            raise DownloadException(f"Error uploading {source} to s3://{bucket}/{key} \
-                                     - {str(ex)}") from ex
+            raise DownloadException(
+                f"Error uploading {source} to s3://{bucket}/{key} \
+                                     - {str(ex)}"
+            ) from ex
         finally:
             os.unlink(temp_file.name)

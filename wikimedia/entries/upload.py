@@ -2,6 +2,7 @@
 Upload images to Wikimedia Commons
 
 """
+
 import logging
 
 from entries.entry import Entry
@@ -12,15 +13,17 @@ from utilities.tracker import Result, Tracker
 
 
 class UploadEntry(Entry):
-    """
-    """
+    """ """
+
     # This is the schema emitted by the ingest-wikimedia download process
-    READ_COLUMNS = {"_1": "dpla_id",
-                    "_2": "path",
-                    "_3": "size",
-                    "_4": "title",
-                    "_5": "markup",
-                    "_6": "page"}
+    READ_COLUMNS = {
+        "_1": "dpla_id",
+        "_2": "path",
+        "_3": "size",
+        "_4": "title",
+        "_5": "markup",
+        "_6": "page",
+    }
 
     log = logging.getLogger(__name__)
     uploader = None
@@ -31,19 +34,19 @@ class UploadEntry(Entry):
         self.tracker = tracker
 
     def execute(self, **kwargs):
-        """
-        """
+        """ """
         s3_helper = S3Helper()
-        input_base=kwargs.get('input', None)
-        partner = kwargs.get('partner', None)
+        input_base = kwargs.get("input", None)
+        partner = kwargs.get("partner", None)
         input_partner = InputHelper.upload_input(base=input_base, partner=partner)
         # Get the most recent parquet file from the input path
         bucket, key = s3_helper.get_bucket_key(input_partner)
-        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='object')
+        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type="object")
         input = f"s3://{bucket}/{recent_key}"
         # Read in most recent parquet file
-        df = Entry.load_data(data_in=input,
-                             columns=self.READ_COLUMNS).rename(columns=self.READ_COLUMNS)
+        df = Entry.load_data(data_in=input, columns=self.READ_COLUMNS).rename(
+            columns=self.READ_COLUMNS
+        )
         unique_ids = self.uploader._unique_ids(df)
         # Set the total number DPLA records and intended uploads
         self.tracker.set_dpla_count(len(unique_ids))
@@ -76,10 +79,9 @@ class UploadEntry(Entry):
             page_title = None
             wikimedia_page = None
             try:
-                page_title = self.uploader.get_page_title(title=title,
-                                                     dpla_identifier=dpla_id,
-                                                     suffix=ext,
-                                                     page=page)
+                page_title = self.uploader.get_page_title(
+                    title=title, dpla_identifier=dpla_id, suffix=ext, page=page
+                )
             except UploadException as exec:
                 self.log.error(f"{str(exec)}")
                 self.tracker.increment(Result.FAILED)
@@ -98,11 +100,13 @@ class UploadEntry(Entry):
             # Upload image to Wikimedia page
             try:
                 # Upload image to wiki page
-                self.uploader.upload(wiki_file_page=wikimedia_page,
-                                     dpla_identifier=dpla_id,
-                                     text=wiki_markup,
-                                     file=path,
-                                     page_title=page_title)
+                self.uploader.upload(
+                    wiki_file_page=wikimedia_page,
+                    dpla_identifier=dpla_id,
+                    text=wiki_markup,
+                    file=path,
+                    page_title=page_title,
+                )
                 self.tracker.increment(Result.UPLOADED, size=size)
 
             except UploadWarning as _:

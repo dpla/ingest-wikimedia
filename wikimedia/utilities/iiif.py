@@ -1,6 +1,7 @@
 """
 IIIF utilities
 """
+
 import json
 
 import requests
@@ -12,9 +13,10 @@ class IIIF:
     """
     IIIF utilities"""
 
-    HEADERS = {'User-Agent':
-               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36' }
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+    }
 
     def __init__(self):
         pass
@@ -45,12 +47,12 @@ class IIIF:
         manifest = self._get_iiif_manifest(iiif)
 
         urls = []
-        sequences = manifest.get('sequences', [])
+        sequences = manifest.get("sequences", [])
         sequence = sequences[0:1] if len(sequences) == 1 else None
-        canvases = sequence[0].get('canvases', []) if sequence else  []
+        canvases = sequence[0].get("canvases", []) if sequence else []
         for canvase in canvases:
-            for image in canvase.get('images', []):
-                url = image.get('resource', {}).get('@id', None)
+            for image in canvase.get("images", []):
+                url = image.get("resource", {}).get("@id", None)
                 if url:
                     urls.append(url)
         return urls
@@ -64,12 +66,16 @@ class IIIF:
         try:
             request = requests.get(url, timeout=30, headers=self.HEADERS)
             if request.status_code not in [200, 301, 302]:
-                raise IIIFException(f"Unable to request: {url} - \
-                                    Status code {request.status_code}")
+                raise IIIFException(
+                    f"Unable to request: {url} - \
+                                    Status code {request.status_code}"
+                )
             data = request.content
             return json.loads(data)
         except json.decoder.JSONDecodeError as jdex:
-            raise IIIFException(f"Unable to decode JSON: {url} - \
-                                {str(jdex)}") from jdex
+            raise IIIFException(
+                f"Unable to decode JSON: {url} - \
+                                {str(jdex)}"
+            ) from jdex
         except requests.exceptions.RequestException as re:
             raise IIIFException(f"Unable to request: {url} - {str(re)}") from re

@@ -2,10 +2,12 @@
 Generic runner
 
 """
+
 import logging
 import sys
 
 import boto3
+
 # TODO Move `entries.upload import UploadEntry` back up after logging
 # issue is resolved (see below)
 from entries.download import DownloadEntry
@@ -15,9 +17,10 @@ from utilities.tracker import Tracker
 from utilities.helpers import get_args
 
 # Email source and destination
-EMAIL_SOURCE    = "DPLA Tech Bot<tech@dp.la>"
-EMAMIL_REPLY    = ["DPLA Tech Bot<tech@dp.la>"]
-EMAIL_TO        = ["Scott<scott@dp.la>"]
+EMAIL_SOURCE = "DPLA Tech Bot<tech@dp.la>"
+EMAMIL_REPLY = ["DPLA Tech Bot<tech@dp.la>"]
+EMAIL_TO = ["Scott<scott@dp.la>"]
+
 
 def main():
     tracker = Tracker()
@@ -27,20 +30,22 @@ def main():
     # Get arguements
     args = get_args(sys.argv[1:])
     # Arguements required by run.py; default values of None
-    partner = args.get('partner', None)
-    event_type = args.get('type', None)
-    input = args.get('input', None)
+    partner = args.get("partner", None)
+    event_type = args.get("type", None)
+    input = args.get("input", None)
 
     # Setup logging
     filename = Text.log_file(partner=partner, event_type=event_type)
     log = logging
-    log.basicConfig(level=logging.INFO,
-                    datefmt='%H:%M:%S',
-                    handlers=[logging.StreamHandler(),
-                              logging.FileHandler(filename=filename, mode="w")],
-                              format='[%(levelname)s] '
-                                '%(asctime)s: '
-                                '%(message)s')
+    log.basicConfig(
+        level=logging.INFO,
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(filename=filename, mode="w"),
+        ],
+        format="[%(levelname)s] " "%(asctime)s: " "%(message)s",
+    )
 
     log.info(f"Starting {event_type} for {partner}")
 
@@ -52,6 +57,7 @@ def main():
             # screen
             # TODO - contact pywikibot devs to see if there's a better way to do this
             from entries.upload import UploadEntry
+
             entry = UploadEntry(tracker)
         case "download":
             entry = DownloadEntry(tracker)
@@ -68,20 +74,22 @@ def main():
     log.info("fin.")
 
     # Generate event summary
-    summary = Summary(partner=partner,
-                      log_url=public_url,
-                      tracker=tracker,
-                      event_type=event_type)
+    summary = Summary(
+        partner=partner, log_url=public_url, tracker=tracker, event_type=event_type
+    )
 
     # Send notification email
-    ses_client = boto3.client('ses', region_name='us-east-1')
+    ses_client = boto3.client("ses", region_name="us-east-1")
     emailer = SesMailSender(ses_client)
-    emailer.send_email(source=EMAIL_SOURCE,
-                       destination=SesDestination(tos=EMAIL_TO),
-                       subject=summary.subject(),
-                       text=summary.body_text(),
-                       html=summary.body_html(),
-                       reply_tos=EMAMIL_REPLY)
+    emailer.send_email(
+        source=EMAIL_SOURCE,
+        destination=SesDestination(tos=EMAIL_TO),
+        subject=summary.subject(),
+        text=summary.body_text(),
+        html=summary.body_html(),
+        reply_tos=EMAMIL_REPLY,
+    )
+
 
 if __name__ == "__main__":
     main()
