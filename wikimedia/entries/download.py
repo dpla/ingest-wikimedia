@@ -9,12 +9,12 @@ from itertools import chain
 from pathlib import Path
 
 import pandas as pd
-from entries.entry import Entry
-from executors.downloader import Downloader
-from utilities.exceptions import DownloadException, IIIFException
-from utilities.helpers import S3Helper, Text, InputHelper
-from utilities.iiif import IIIF
-from utilities.tracker import Result, Tracker
+from wikimedia.entries.entry import Entry
+from wikimedia.executors.downloader import Downloader
+from wikimedia.utilities.exceptions import DownloadException, IIIFException
+from wikimedia.utilities.helpers import S3Helper, Text, InputHelper
+from wikimedia.utilities.iiif import IIIF
+from wikimedia.utilities.tracker import Result, Tracker
 
 
 class DownloadEntry(Entry):

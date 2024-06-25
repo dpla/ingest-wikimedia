@@ -6,7 +6,7 @@ import json
 
 import requests
 import validators
-from utilities.exceptions import IIIFException
+from wikimedia.utilities.exceptions import IIIFException
 
 
 class IIIF:

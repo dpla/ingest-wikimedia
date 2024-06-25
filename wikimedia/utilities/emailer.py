@@ -2,7 +2,7 @@
 """
 
 from botocore.exceptions import ClientError
-from utilities.helpers import Text
+from wikimedia.utilities.helpers import Text
 
 
 class Summary:
