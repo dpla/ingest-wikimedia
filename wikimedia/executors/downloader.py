@@ -9,9 +9,9 @@ import tempfile
 
 import magic
 import requests
-from utilities.exceptions import DownloadException
-from utilities.helpers import S3Helper
-from utilities.tracker import Result, Tracker
+from wikimedia.utilities.exceptions import DownloadException
+from wikimedia.utilities.helpers import S3Helper
+from wikimedia.utilities.tracker import Result, Tracker
 
 
 class Downloader:

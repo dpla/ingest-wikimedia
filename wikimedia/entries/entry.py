@@ -1,5 +1,5 @@
-from utilities.helpers import ParquetHelper
-from utilities.tracker import Tracker
+from wikimedia.utilities.helpers import ParquetHelper
+from wikimedia.utilities.tracker import Tracker
 
 
 class Entry:

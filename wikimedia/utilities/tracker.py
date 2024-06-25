@@ -1,4 +1,4 @@
-from utilities.exceptions import WikiException
+from wikimedia.utilities.exceptions import WikiException
 from enum import Enum
 
 
