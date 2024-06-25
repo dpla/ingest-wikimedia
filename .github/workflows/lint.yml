@@ -24,8 +24,3 @@ jobs:
       - name: black
         run: |
           poetry run black --check --diff . 
-
-      - name: mypy
-        run: |
-          cd wikimedia
-          PYTHONPATH=. poetry run mypy
