@@ -1052,7 +1052,7 @@ def dpla_claims(
         print(" --- Saved removals!")
 
 
-def parsed(dpla_id):
+def parsed(dpla_id, key):
 
     print(" -- Accessing DPLA ID " + dpla_id)
     try:
@@ -1060,7 +1060,7 @@ def parsed(dpla_id):
             requests.get(
                 "https://api.dp.la/v2/items/"
                 + dpla_id
-                + "?api_key=4e956679e5d18f3acdf8edb6c35f2462",
+                + "?api_key=" + key,
                 timeout=15,
             ).text
         )
@@ -1071,7 +1071,7 @@ def parsed(dpla_id):
             requests.get(
                 "https://api.dp.la/v2/items/"
                 + dpla_id
-                + "?api_key=4e956679e5d18f3acdf8edb6c35f2462"
+                + "?api_key=" + key
             ).text
         )
     print(" -- Accessed DPLA ID " + dpla_id)
@@ -1271,7 +1271,7 @@ if method == "list":
                     naids,
                     access,
                     level,
-                ) = parsed(dpla_id)
+                ) = parsed(dpla_id, key)
             except TypeError:
                 with open("Missing ids.txt", "a") as missing:
                     missing.write(dpla_id + "\n")
