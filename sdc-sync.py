@@ -1058,9 +1058,7 @@ def parsed(dpla_id, key):
     try:
         dpla = json.loads(
             requests.get(
-                "https://api.dp.la/v2/items/"
-                + dpla_id
-                + "?api_key=" + key,
+                "https://api.dp.la/v2/items/" + dpla_id + "?api_key=" + key,
                 timeout=15,
             ).text
         )
@@ -1069,9 +1067,7 @@ def parsed(dpla_id, key):
         time.sleep(30)
         dpla = json.loads(
             requests.get(
-                "https://api.dp.la/v2/items/"
-                + dpla_id
-                + "?api_key=" + key
+                "https://api.dp.la/v2/items/" + dpla_id + "?api_key=" + key
             ).text
         )
     print(" -- Accessed DPLA ID " + dpla_id)
