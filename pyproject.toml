@@ -24,9 +24,8 @@ line-length = 88
 extend-exclude = "sdc-sync.py"
 
 [tool.poetry.group.dev.dependencies]
-black = "^24.4.2"
-flake8 = "^7.1.0"
-mypy = "^1.10.0"
+black = "24.4.2"
+flake8 = "7.1.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
