@@ -13,22 +13,24 @@ from botocore.exceptions import ClientError
 
 # DPLA Wikimedia partners
 DPLA_PARTNERS = [
-    'bpl',
-    'georgia',
-    'il',
-    'indiana',
-    'nara',
-    'northwest-heritage',
-    'ohio',
-    'p2p',
-    'pa',
-    'texas'
+    "bpl",
+    "georgia",
+    "il",
+    "indiana",
+    "nara",
+    "northwest-heritage",
+    "ohio",
+    "p2p",
+    "pa",
+    "texas",
 ]
+
 
 class InputHelper:
     """
     Helps construct relative paths for input data
     """
+
     pass
 
     @staticmethod
@@ -40,6 +42,7 @@ class InputHelper:
         Ex. s3://dpla-master-dataset/ohio/wiki/
         """
         return f"{base}/{partner}/wiki/"
+
     @staticmethod
     def download_output(base, partner):
         """
@@ -57,6 +60,7 @@ class InputHelper:
         Ex. s3://dpla-wikimedia/ohio/data/
         """
         return f"{base}/{partner}/data/"
+
 
 class Text:
     @staticmethod
@@ -96,7 +100,7 @@ class Text:
         return f"{log_dir}/{log_file_name}"
 
     @staticmethod
-    def sizeof_fmt(num, suffix='B'):
+    def sizeof_fmt(num, suffix="B"):
         """
         Convert bytes to human readable format
 
@@ -104,11 +108,11 @@ class Text:
         :param suffix: suffix to append to number
         :return: human readable string
         """
-        for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
+        for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
             if abs(num) < 1024.0:
                 return "%3.1f%s%s" % (num, unit, suffix)
             num /= 1024.0
-        return "%.1f%s%s" % (num, 'Yi', suffix)
+        return "%.1f%s%s" % (num, "Yi", suffix)
 
     @staticmethod
     def number_fmt(num):
@@ -122,15 +126,19 @@ class Text:
 
 
 class S3Helper:
-    """
-    """
+    """ """
+
     # Used for most s3 operations
-    s3_resource = boto3.resource('s3')
+    s3_resource = boto3.resource("s3")
     # Used for head operation in file_exists and upload_fileobj in upload
-    s3_client = boto3.client(service_name='s3',
-                             config=Config(signature_version='s3v4',
-                                           max_pool_connections=25,
-                                           retries={'max_attempts': 3}))
+    s3_client = boto3.client(
+        service_name="s3",
+        config=Config(
+            signature_version="s3v4",
+            max_pool_connections=25,
+            retries={"max_attempts": 3},
+        ),
+    )
 
     def __init__(self):
         pass
@@ -145,16 +153,15 @@ class S3Helper:
         """
         Find the most recent object or prefix in a path in s3
         """
-        keys = self.s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter='/')
+        keys = self.s3_client.list_objects_v2(Bucket=bucket, Prefix=key, Delimiter="/")
 
-        if type == 'prefix':
-            values = [k.get('Prefix') for k in keys.get('CommonPrefixes', None)]
-        elif type == 'object':
-            values = [k.get('Key') for k in keys.get('Contents', None)]
+        if type == "prefix":
+            values = [k.get("Prefix") for k in keys.get("CommonPrefixes", None)]
+        elif type == "object":
+            values = [k.get("Key") for k in keys.get("Contents", None)]
         else:
             raise ValueError(f"Invalid type {type} passed to most_recent")
         return max(values)
-
 
     def write_log_s3(self, bucket, key, file, extra_args=None):
         """
@@ -174,10 +181,7 @@ class S3Helper:
             default_args.update(extra_args)
 
         with open(file, "rb") as file:
-            self.upload(file=file,
-                            bucket=bucket,
-                            key=log_key,
-                            extra_args=default_args)
+            self.upload(file=file, bucket=bucket, key=log_key, extra_args=default_args)
 
         # The publicly accessible S3 url for the log file
         return f"https://{bucket}.s3.amazonaws.com/{log_key}"
@@ -194,7 +198,7 @@ class S3Helper:
         # is the same and needs to be uploaded and replace the existing file.
         try:
             response = self.s3_client.head_object(Bucket=bucket, Key=key)
-            size = response.get('ContentLength', 0)
+            size = response.get("ContentLength", 0)
             return True, size
         except ClientError:
             # The head request fails therefore we assume the file does not exist in s3
@@ -230,14 +234,14 @@ class S3Helper:
         :param extra_args: Extra arguments to pass to upload_fileobj
         return: None
         """
-        self.s3_client.upload_fileobj(Fileobj=file,
-                                        Bucket=bucket,
-                                        Key=key,
-                                        ExtraArgs=extra_args)
+        self.s3_client.upload_fileobj(
+            Fileobj=file, Bucket=bucket, Key=key, ExtraArgs=extra_args
+        )
+
 
 class ParquetHelper:
-    """
-    """
+    """ """
+
     def __init__(self):
         pass
 
@@ -245,7 +249,7 @@ class ParquetHelper:
         """Reads parquet file and returns a dataframe"""
         temp = []
         for file in self.parquet_files(path=path):
-            temp.append(pd.read_parquet(file, engine='fastparquet'))
+            temp.append(pd.read_parquet(file, engine="fastparquet"))
         df = pd.concat(temp, axis=0, ignore_index=True)
         if columns:
             return df.rename(columns)
@@ -261,57 +265,56 @@ class ParquetHelper:
         if path.startswith("s3"):
             s3 = S3Helper()
             return s3.list_files(path, suffix=".parquet")
-        return Path(path).glob('*.parquet')
+        return Path(path).glob("*.parquet")
+
 
 @staticmethod
 def get_args(args):
     params = {}
 
     try:
-        opts, args = getopt.getopt(args,
-                                "hi:u:o:",
-                                ["partner=",
-                                 "limit=",
-                                 "input=",
-                                 "output=",
-                                 "file_filter=",
-                                 "type="])
+        opts, args = getopt.getopt(
+            args,
+            "hi:u:o:",
+            ["partner=", "limit=", "input=", "output=", "file_filter=", "type="],
+        )
     except getopt.GetoptError:
         print(
-            "run.py\n" \
-            "--partner <dpla partner name>\n" \
-            "--limit <bytes>\n" \
-            "--input <path to parquet>\n" \
-            "--output <path to save files>\n" \
-            "--file_filter <ids>" \
-            # TODO EVENT_TYPE
-            )
+            "run.py\n"
+            "--partner <dpla partner name>\n"
+            "--limit <bytes>\n"
+            "--input <path to parquet>\n"
+            "--output <path to save files>\n"
+            "--file_filter <ids>"  # TODO EVENT_TYPE
+        )
         sys.exit(2)
 
     for opt, arg in opts:
-        if opt == '-h':
+        if opt == "-h":
             print(
-                "run.py\n" \
-                    "--partner <dpla partner name>\n" \
-                    "--input <ingestion3 wiki ouput>\n" \
-                    "--output <path to save files>\n" \
-                    "--limit <total Download limit in bytes>\n" \
-                    "--file_filter <Download only these DPLA ids to download>"
-                    # TODO EVENT_TYPE
-                    )
+                "run.py\n"
+                "--partner <dpla partner name>\n"
+                "--input <ingestion3 wiki ouput>\n"
+                "--output <path to save files>\n"
+                "--limit <total Download limit in bytes>\n"
+                "--file_filter <Download only these DPLA ids to download>"
+                # TODO EVENT_TYPE
+            )
             sys.exit()
         elif opt in ("-p", "--partner"):
             # Validate partner
             if arg in DPLA_PARTNERS:
                 params["partner"] = arg
             else:
-                raise ValueError(f"Invalid partner {arg} must be one of {DPLA_PARTNERS}")
+                raise ValueError(
+                    f"Invalid partner {arg} must be one of {DPLA_PARTNERS}"
+                )
         elif opt in ("-i", "--input"):
             params["input"] = arg
         elif opt in ("-o", "--output"):
-            params["output"] = arg.rstrip('/')
-        elif opt in ('-t', '--type'):
-            params['type'] = arg
+            params["output"] = arg.rstrip("/")
+        elif opt in ("-t", "--type"):
+            params["type"] = arg
         # DOWNLOAD ONLY PARAMS
         elif opt in ("-l", "--limit"):
             params["total_limit"] = int(arg)

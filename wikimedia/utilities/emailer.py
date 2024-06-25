@@ -8,6 +8,7 @@ from utilities.helpers import Text
 class Summary:
     """
     Summarizes events"""
+
     partner = None
     log_url = None
     tracker = None
@@ -55,9 +56,10 @@ class Summary:
 
 
 # Taken from Amzaon example code:
-# >  https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
+# https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
 class SesMailSender:
     """Encapsulates functions to send emails with Amazon SES."""
+
     def __init__(self, ses_client):
         """
         :param ses_client: A Boto3 Amazon SES client.
@@ -78,24 +80,28 @@ class SesMailSender:
         :return: The ID of the message, assigned by Amazon SES.
         """
         send_args = {
-            'Source': source,
-            'Destination': destination.to_service_format(),
-            'Message': {
-                'Subject': {'Data': subject},
-                'Body': {'Text': {'Data': text}, 'Html': {'Data': html}}}}
+            "Source": source,
+            "Destination": destination.to_service_format(),
+            "Message": {
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": text}, "Html": {"Data": html}},
+            },
+        }
         if reply_tos is not None:
-            send_args['ReplyToAddresses'] = reply_tos
+            send_args["ReplyToAddresses"] = reply_tos
         try:
             response = self.ses_client.send_email(**send_args)
-            message_id = response['MessageId']
+            message_id = response["MessageId"]
         except ClientError:
             print(f"Couldn't send mail from {source} to {destination}.")
             raise
         else:
             return message_id
 
+
 class SesDestination:
     """Contains data about an email destination."""
+
     def __init__(self, tos, ccs=None, bccs=None):
         """
         :param tos: The list of recipients on the 'To:' line.
@@ -110,9 +116,9 @@ class SesDestination:
         """
         :return: The destination data in the format expected by Amazon SES.
         """
-        svc_format = {'ToAddresses': self.tos}
+        svc_format = {"ToAddresses": self.tos}
         if self.ccs is not None:
-            svc_format['CcAddresses'] = self.ccs
+            svc_format["CcAddresses"] = self.ccs
         if self.bccs is not None:
-            svc_format['BccAddresses'] = self.bccs
+            svc_format["BccAddresses"] = self.bccs
         return svc_format

@@ -2,6 +2,7 @@
 Downloads Wikimedia eligible images from a DPLA partner
 
 """
+
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
@@ -20,15 +21,18 @@ class DownloadEntry(Entry):
     """
     Downloads Wikimedia eligible images from a DPLA partner
     """
+
     OUTPUT_BASE = None
     # Columns names emitted by the ingestion3 process
-    READ_COLUMNS = { "_1": "id",
-                    "_2": "wiki_markup",
-                    "_3": "iiif",
-                    "_4": "media_master",
-                    "_5": "title"}
+    READ_COLUMNS = {
+        "_1": "id",
+        "_2": "wiki_markup",
+        "_3": "iiif",
+        "_4": "media_master",
+        "_5": "title",
+    }
     # Column names for the output parquet file
-    WRITE_COLUMNS = ['dpla_id','path','size','title','markup','page']
+    WRITE_COLUMNS = ["dpla_id", "path", "size", "title", "markup", "page"]
 
     log = logging.getLogger(__name__)
     downloader = None
@@ -39,30 +43,29 @@ class DownloadEntry(Entry):
         self.tracker = tracker
 
     def execute(self, **kwargs):
-        """
-        """
+        """ """
         s3_helper = S3Helper()
 
-        partner = kwargs.get('partner', None)
-        filter = kwargs.get('file_filter', None)
+        partner = kwargs.get("partner", None)
+        filter = kwargs.get("file_filter", None)
 
         # Output and Input are the top level paths and should contain a directory
         # for each partner
-        output = kwargs.get('output', None)
-        input = kwargs.get('input', None)
+        output = kwargs.get("output", None)
+        input = kwargs.get("input", None)
         # FIXME this is a kludge to pass OUTPUT_BASE var to get_images() which is
         # called during paralleization
         self.OUTPUT_BASE = f"{output}/{partner}"
         input_base = InputHelper.download_input(base=input, partner=partner)
         # Get the most recent parquet file from the input path
         bucket, key = s3_helper.get_bucket_key(input_base)
-        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type='prefix')
+        recent_key = s3_helper.most_recent(bucket=bucket, key=key, type="prefix")
         input_recent = f"s3://{bucket}/{recent_key}"
 
         # Read in most recent parquet file
-        df = Entry.load_data(data_in=input_recent,
-                             columns=self.READ_COLUMNS,
-                             file_filter=filter).rename(columns=self.READ_COLUMNS)
+        df = Entry.load_data(
+            data_in=input_recent, columns=self.READ_COLUMNS, file_filter=filter
+        ).rename(columns=self.READ_COLUMNS)
         # data_out is the full path to the output parquet file
         data_out = InputHelper.download_output(base=output, partner=partner)
         # Set the total number of DPLA items to be attempted
@@ -72,21 +75,24 @@ class DownloadEntry(Entry):
         self.log.info(f"Output...........{data_out}")
         self.log.info(f"DPLA records.....{self.tracker.item_cnt}")
 
-        records = df.to_dict('records')
+        records = df.to_dict("records")
         with ThreadPoolExecutor() as executor:
             results = [executor.submit(self.process_rows, chunk) for chunk in records]
         image_rows = [result.result() for result in results]
 
-        self.log.info(f"Downloaded {self.tracker.image_success_cnt} images" +
-                      f" ({Text.sizeof_fmt(self.tracker.get_size())})")
+        self.log.info(
+            f"Downloaded {self.tracker.image_success_cnt} images"
+            + f" ({Text.sizeof_fmt(self.tracker.get_size())})"
+        )
 
         # TODO dig into a better way to flatten this nested list
         # Flatten data and create a dataframe
         flat = list(chain.from_iterable(image_rows))
         df = pd.DataFrame(flat, columns=self.WRITE_COLUMNS)
         # Write dataframe out to parquet
-        pd.DataFrame(df, columns=self.WRITE_COLUMNS).to_parquet(data_out,
-                                                                compression='snappy')
+        pd.DataFrame(df, columns=self.WRITE_COLUMNS).to_parquet(
+            data_out, compression="snappy"
+        )
 
     def process_rows(self, rows):
         """
@@ -100,11 +106,11 @@ class DownloadEntry(Entry):
         iiif = IIIF()
         images = []
 
-        dpla_id = rows.get('id', None)
-        title = rows.get('title', None)
-        wiki_markup = rows.get('wiki_markup', None)
-        manifest = rows.get('iiif', None)
-        media_master = rows.get('media_master', None)
+        dpla_id = rows.get("id", None)
+        title = rows.get("title", None)
+        wiki_markup = rows.get("wiki_markup", None)
+        manifest = rows.get("iiif", None)
+        media_master = rows.get("media_master", None)
 
         # If the IIIF manfiest is defined that parse the manfiest to get the
         # download urls otherwise use the media_master url
@@ -126,7 +132,7 @@ class DownloadEntry(Entry):
             self.log.error(f"Failed download(s) for {dpla_id}\n - {str(de)}")
         return images
 
-    def get_images(self, urls, dpla_id) :
+    def get_images(self, urls, dpla_id):
         """
         Download images for a single DPLA record from a list of urls
         """
@@ -137,8 +143,9 @@ class DownloadEntry(Entry):
             # Creates the destination path for the asset (ex. batch_x/0/0/0/0/1_dpla_id)
             image_path = self.image_path(count=page, dpla_id=dpla_id)
             try:
-                output, filesize = self.downloader.download(source=url,
-                                                            destination=image_path)
+                output, filesize = self.downloader.download(
+                    source=url, destination=image_path
+                )
                 if output is None and len(urls) > 1:
                     err_msg = f"Multi-page record, page {page}"
                     raise DownloadException(err_msg)
@@ -150,10 +157,10 @@ class DownloadEntry(Entry):
             # then this object is destroyed by the `break` above and the rows for
             # already downloaded assets are not added to the final dataframe
             image_row = {
-                'dpla_id': dpla_id,
-                'path': output,
-                'size': filesize,
-                'page': page
+                "dpla_id": dpla_id,
+                "path": output,
+                "size": filesize,
+                "page": page,
             }
             image_rows.append(image_row)
             page += 1
@@ -176,6 +183,6 @@ class DownloadEntry(Entry):
         """
         update = list()
         for image in images:
-            image.update({'title': title, 'markup': wiki_markup})
+            image.update({"title": title, "markup": wiki_markup})
             update.append(image)
         return update
