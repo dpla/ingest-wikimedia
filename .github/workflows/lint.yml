@@ -11,18 +11,21 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-      - name: flake8
+
+      - name: Install dev dependencies
         run: |
-          pip install `egrep -o 'flake8==\S+' requirements.txt`  # install our version of flake8
-          flake8 web/ --config wikimedia/setup.cfg
+          pip install poetry
+          poetry install
+
+      - name: flake8
+        run: |          
+          poetry run flake8 wikimedia/ --config wikimedia/setup.cfg
 
       - name: black
         run: |
-          pip install `egrep -o 'black==\S+' requirements.txt`  # install our version of black
-          black --check --diff . # Uses pyproject.toml
+          poetry run black --check --diff . 
 
       - name: mypy
         run: |
-          pip install -r requirements.txt  # install a full environment for mypy
           cd wikimedia
-          PYTHONPATH=. mypy
+          PYTHONPATH=. poetry run mypy
