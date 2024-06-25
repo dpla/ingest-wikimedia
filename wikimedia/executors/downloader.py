@@ -56,9 +56,10 @@ class Downloader:
             destination, size = self._save_to_s3(source=source, bucket=bucket, key=key)
             self.tracker.increment(Result.DOWNLOADED, size=size)
             return destination, size
-        except Exception as exec:
+        except Exception as err:
             self.tracker.increment(Result.FAILED)
-            raise exec  # DownloadException(f"Failed download {source} - {str(exec)}") from exec
+            raise err
+            # DownloadException(f"Failed download {source} - {str(exec)}") from exec
 
     # TODO This maybe better in the FileSystem class
     def save_to_local(self, source, file):
@@ -84,8 +85,6 @@ class Downloader:
                     raise DownloadException(
                         f"Invalid content-type: {response.headers['content-type']}"
                     )
-            # if response.headers['content-type'] in invalid_types:
-            #     raise DownloadException(f"Invalid content-type: {response.headers['content-type']}")
             with open(file, "wb") as f:
                 f.write(response.content)
             file_size = os.path.getsize(file)

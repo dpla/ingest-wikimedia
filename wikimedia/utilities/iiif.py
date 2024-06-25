@@ -46,7 +46,8 @@ class IIIF:
         for item in iiif.get("items", []):
             try:
                 url = item["items"][0]["items"][0].get("body", {}).get("id", None)
-                # This is a hack to get around that v3 presumes the user supplies the resolution in the URL
+                # This is a hack to get around that v3 presumes the user supplies the
+                # resolution in the URL
                 if url:
                     # This condition may not be necessary but I'm leaving it in for now
                     if url.endswith("default.jpg"):
