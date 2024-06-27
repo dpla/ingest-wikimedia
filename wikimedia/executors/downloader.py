@@ -1,8 +1,3 @@
-"""
-Download images from parters
-
-"""
-
 import logging
 import os
 import tempfile
@@ -15,10 +10,6 @@ from wikimedia.utilities.tracker import Result, Tracker
 
 
 class Downloader:
-    """
-    Download images from parters
-    """
-
     log = logging.getLogger(__name__)
 
     s3_helper = S3Helper()
@@ -98,7 +89,7 @@ class Downloader:
     def _save_to_s3(self, source, bucket, key):
         """
         Tries to download a file from the source url and save it to s3. If the file
-        already exists in s3 then this step is skipped. To achive this
+        already exists in s3 then this step is skipped. To achieve this
         the file is downloaded to a temp file on the local file system and then uploaded
         to s3.
 
