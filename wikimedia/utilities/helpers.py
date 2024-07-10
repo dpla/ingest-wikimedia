@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 
 import boto3
 import pandas as pd
-from awswrangler import s3 as s3wrangler
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
@@ -31,10 +30,8 @@ class InputHelper:
     Helps construct relative paths for input data
     """
 
-    pass
-
     @staticmethod
-    def download_input(base, partner):
+    def download_input(base: str, partner: str) -> str:
         """
         Creates a path to the wiki data directory for a partner. This is the
         output of ingestion3
@@ -44,7 +41,7 @@ class InputHelper:
         return f"{base}/{partner}/wiki/"
 
     @staticmethod
-    def download_output(base, partner):
+    def download_output(base: str, partner: str) -> str:
         """
         Creates a path to the download data directory for a partner. This is the
 
@@ -53,7 +50,7 @@ class InputHelper:
         return f"{base}/{partner}/data/{Text.datetime()}_{partner}_download.parquet"
 
     @staticmethod
-    def upload_input(base, partner):
+    def upload_input(base: str, partner: str) -> str:
         """
         Create a path to the input data
 
@@ -64,14 +61,14 @@ class InputHelper:
 
 class Text:
     @staticmethod
-    def wikimedia_url(title):
+    def wikimedia_url(title: str) -> str:
         """
         Return the URL for the Wikimedia page"""
         url_prefix = "https://commons.wikimedia.org/wiki/File:"
         return f"{url_prefix}{title.replace(' ', '_')}"
 
     @staticmethod
-    def datetime():
+    def datetime() -> str:
         """
         Get datetime value as YYYYMMDD_HHMMSS.  It is sortable and used for
         file names and directories.
@@ -85,7 +82,7 @@ class Text:
         return f"{date}_{time}"
 
     @staticmethod
-    def log_file(partner, event_type, log_dir="./logs"):
+    def log_file(partner: str, event_type: str, log_dir="./logs") -> str:
         """
         Create a log file path for a given partner and event type
 
@@ -100,7 +97,7 @@ class Text:
         return f"{log_dir}/{log_file_name}"
 
     @staticmethod
-    def sizeof_fmt(num, suffix="B"):
+    def sizeof_fmt(num: int, suffix="B") -> str:
         """
         Convert bytes to human readable format
 
@@ -115,7 +112,7 @@ class Text:
         return "%.1f%s%s" % (num, "Yi", suffix)
 
     @staticmethod
-    def number_fmt(num):
+    def number_fmt(num: int) -> str:
         """
         Convert number to human readable format
 
@@ -204,7 +201,7 @@ class S3Helper:
             # The head request fails therefore we assume the file does not exist in s3
             return False, 0
 
-    def get_bucket_key(self, s3_url):
+    def get_bucket_key(self, s3_url: str) -> tuple[str, str]:
         """
         Parse S3 url and return bucket and key
 
@@ -220,9 +217,9 @@ class S3Helper:
         """
         Returns a list of files in the s3 path with the given suffix
         """
-        # FIXME this can be done with standard libraries and will elminate the
-        # need for wranger library
-        return s3wrangler.list_objects(path=path, suffix=suffix)
+        bucket, key = self.get_bucket_key(path)
+        response = self.s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
+        return filter(lambda obj: obj["Key"].endswith(suffix), response["Contents"])
 
     def upload(self, bucket, key, file, extra_args=None):
         """
@@ -268,7 +265,6 @@ class ParquetHelper:
         return Path(path).glob("*.parquet")
 
 
-@staticmethod
 def get_args(args):
     params = {}
 
