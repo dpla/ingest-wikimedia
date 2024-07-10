@@ -1,33 +1,34 @@
-"""
-"""
-
 from botocore.exceptions import ClientError
 from wikimedia.utilities.helpers import Text
+from wikimedia.utilities.tracker import Tracker
 
 
 class Summary:
     """
-    Summarizes events"""
+    Summarizes events
+    """
 
     partner = None
     log_url = None
     tracker = None
     event_type = None
 
-    def __init__(self, partner, log_url, tracker, event_type):
+    def __init__(self, partner: str, log_url: str, tracker: Tracker, event_type: str):
         self.partner = partner
         self.log_url = log_url
         self.tracker = tracker
         self.event_type = event_type
 
-    def subject(self):
+    def subject(self) -> str:
         """
-        Returns the subject of the email."""
+        Returns the subject of the email.
+        """
         return f"{self.partner.upper()} - Wikimedia {self.event_type} finished"
 
-    def body_text(self):
+    def body_text(self) -> str:
         """
-        Returns the body of the email in plain text format."""
+        Returns the body of the email in plain text format.
+        """
         return f"""
             Wikimedia {self.event_type} summary for {self.partner.upper()}.
 
@@ -49,16 +50,46 @@ class Summary:
             Log file available at {self.log_url}
         """
 
-    def body_html(self):
+    def body_html(self) -> str:
         """
-        Returns the body of the email in HTML format."""
+        Returns the body of the email in HTML format.
+        """
         return f"""<pre>{self.body_text()}</pre>"""
 
 
 # Taken from Amzaon example code:
 # https://github.com/awsdocs/aws-doc-sdk-examples/blob/main/python/example_code/ses/ses_email.py
+
+
+class SesDestination:
+    """Contains data about an email destination."""
+
+    def __init__(self, tos: list[str], ccs: list[str] = None, bccs: list[str] = None):
+        """
+        :param tos: The list of recipients on the 'To:' line.
+        :param ccs: The list of recipients on the 'CC:' line.
+        :param bccs: The list of recipients on the 'BCC:' line.
+        """
+        self.tos = tos
+        self.ccs = ccs
+        self.bccs = bccs
+
+    def to_service_format(self) -> dict[str, list[str]]:
+        """
+        :return: The destination data in the format expected by Amazon SES.
+        """
+        svc_format = {"ToAddresses": self.tos}
+        if self.ccs is not None:
+            svc_format["CcAddresses"] = self.ccs
+        if self.bccs is not None:
+            svc_format["BccAddresses"] = self.bccs
+        return svc_format
+
+
 class SesMailSender:
-    """Encapsulates functions to send emails with Amazon SES."""
+    """
+    Encapsulates functions to send emails with Amazon SES.
+    """
 
     def __init__(self, ses_client):
         """
@@ -66,7 +97,15 @@ class SesMailSender:
         """
         self.ses_client = ses_client
 
-    def send_email(self, source, destination, subject, text, html, reply_tos=None):
+    def send_email(
+        self,
+        source: str,
+        destination: SesDestination,
+        subject: str,
+        text: str,
+        html: str,
+        reply_tos: list[str] = None,
+    ) -> None:
         """
         Sends an email.
 
@@ -97,28 +136,3 @@ class SesMailSender:
             raise
         else:
             return message_id
-
-
-class SesDestination:
-    """Contains data about an email destination."""
-
-    def __init__(self, tos, ccs=None, bccs=None):
-        """
-        :param tos: The list of recipients on the 'To:' line.
-        :param ccs: The list of recipients on the 'CC:' line.
-        :param bccs: The list of recipients on the 'BCC:' line.
-        """
-        self.tos = tos
-        self.ccs = ccs
-        self.bccs = bccs
-
-    def to_service_format(self):
-        """
-        :return: The destination data in the format expected by Amazon SES.
-        """
-        svc_format = {"ToAddresses": self.tos}
-        if self.ccs is not None:
-            svc_format["CcAddresses"] = self.ccs
-        if self.bccs is not None:
-            svc_format["BccAddresses"] = self.bccs
-        return svc_format
