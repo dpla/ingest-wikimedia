@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 
 import boto3
 import pandas as pd
-from awswrangler import s3 as s3wrangler
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
