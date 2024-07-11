@@ -219,7 +219,10 @@ class S3Helper:
         """
         bucket, key = self.get_bucket_key(path)
         response = self.s3_client.list_objects_v2(Bucket=bucket, Prefix=key)
-        return filter(lambda obj: obj["Key"].endswith(suffix), response["Contents"])
+        return map(
+            lambda obj: f"s3://{bucket}/{obj['Key']}",
+            filter(lambda obj: obj["Key"].endswith(suffix), response["Contents"]),
+        )
 
     def upload(self, bucket, key, file, extra_args=None):
         """
@@ -246,7 +249,9 @@ class ParquetHelper:
         """Reads parquet file and returns a dataframe"""
         temp = []
         for file in self.parquet_files(path=path):
-            temp.append(pd.read_parquet(file, engine="fastparquet"))
+            print(f"Path {path} {type(path)}")
+            parquet = pd.read_parquet(file, engine="fastparquet")
+            temp.append(parquet)
         df = pd.concat(temp, axis=0, ignore_index=True)
         if columns:
             return df.rename(columns)
