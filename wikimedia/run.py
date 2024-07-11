@@ -10,16 +10,16 @@ import boto3
 
 # TODO Move `entries.upload import UploadEntry` back up after logging
 # issue is resolved (see below)
-from entries.download import DownloadEntry
-from utilities.emailer import SesDestination, SesMailSender, Summary
-from utilities.helpers import S3Helper, Text
-from utilities.tracker import Tracker
-from utilities.helpers import get_args
+from wikimedia.entries.download import DownloadEntry
+from wikimedia.utilities.emailer import SesDestination, SesMailSender, Summary
+from wikimedia.utilities.helpers import S3Helper, Text
+from wikimedia.utilities.tracker import Tracker
+from wikimedia.utilities.helpers import get_args
 
 # Email source and destination
 EMAIL_SOURCE = "DPLA Tech Bot<tech@dp.la>"
-EMAMIL_REPLY = ["DPLA Tech Bot<tech@dp.la>"]
-EMAIL_TO = ["Scott<scott@dp.la>"]
+EMAIL_REPLY = ["DPLA Tech Bot<tech@dp.la>"]
+EMAIL_TO = ["Michael Della Bitta<michael@dp.la>"]
 
 
 def main():
@@ -87,7 +87,7 @@ def main():
         subject=summary.subject(),
         text=summary.body_text(),
         html=summary.body_html(),
-        reply_tos=EMAMIL_REPLY,
+        reply_tos=EMAIL_REPLY,
     )
 
 
