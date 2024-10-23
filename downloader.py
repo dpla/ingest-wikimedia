@@ -7,6 +7,7 @@ import traceback
 import click
 import magic
 import requests
+from botocore.exceptions import ClientError
 from mypy_boto3_s3.service_resource import S3ServiceResource
 
 from common import (
@@ -53,10 +54,18 @@ def upload_temp_file(
     try:
         with open(temp_file.name, "rb") as file:
             obj = s3.Object(S3_BUCKET, destination_path)
-            obj_metadata = obj.metadata
+            obj_metadata = None
+            try:
+                # this throws if obj doesn't exist yet
+                obj_metadata = obj.metadata
+            except ClientError as e:
+                if not e.response["Error"]["Code"] == "404":
+                    raise e
+
             if obj_metadata and obj_metadata.get(CHECKSUM_KEY, None) == sha1:
                 # Already uploaded, move on.
                 return
+
             obj.upload_fileobj(
                 Fileobj=file,
                 ExtraArgs={
