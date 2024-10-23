@@ -121,7 +121,10 @@ DC_TITLE_FIELD_NAME = "title"
 DC_IDENTIFIER_FIELD_NAME = "identifier"
 
 # Institutions file constants
-INSTITUTIONS_URL = "https://raw.githubusercontent.com/dpla/ingestion3/refs/heads/develop/src/main/resources/wiki/institutions_v2.json"
+INSTITUTIONS_URL = (
+    "https://raw.githubusercontent.com/dpla/ingestion3"
+    "/refs/heads/develop/src/main/resources/wiki/institutions_v2.json"
+)
 UPLOAD_FIELD_NAME = "upload"
 INSTITUTIONS_FIELD_NAME = "institutions"
 WIKIDATA_FIELD_NAME = "Wikidata"

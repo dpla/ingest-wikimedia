@@ -233,12 +233,14 @@ def get_dict(data: dict, field_name: str) -> dict:
 
 
 def extract_strings(data: dict, field_name: str) -> str:
-    """Convenience method for building a string out of escaped strings from a dict field"""
+    """Convenience method for building a string
+    out of escaped strings from a dict field"""
     return join([escape_wiki_strings(value) for value in get_list(data, field_name)])
 
 
 def extract_strings_dict(data: dict, field_name1: str, field_name2: str) -> str:
-    """Convenience method for building a string out of escaped strings from a dict field from an inner dict"""
+    """Convenience method for building a string
+    out of escaped strings from a dict field from an inner dict"""
     return join(
         [
             escape_wiki_strings(get_str(value, field_name2))
@@ -274,7 +276,7 @@ def get_wiki_text(
         | Other fields 1 = {{ InFi | Creator | $creator }}
         | title = $title
         | description = $description
-        | date = $date_string 
+        | date = $date_string
         | permission = {{$permissions}}
         | source = {{ DPLA
             | $data_provider
@@ -417,7 +419,8 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
                     if not ext:
                         logging.info(
-                            f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
+                            f"Skipping {dpla_id} {ordinal}: "
+                            f"Unable to guess extension for {mime}"
                         )
                         tracker.increment(Result.SKIPPED)
                         continue
@@ -467,9 +470,9 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                         )
 
                         if not result:
-                            # These error message accounts for Page does not exist, but File does
-                            # exist and is linked to another Page (ex. DPLA ID drift)
-                            #
+                            # These error message accounts for Page does not exist,
+                            # but File does exist and is linked to another Page
+                            # (ex. DPLA ID drift)
                             tracker.increment(Result.FAILED)
                             raise Exception(
                                 "File linked to another page (possible ID drift)"
