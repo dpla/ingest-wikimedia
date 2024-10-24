@@ -405,7 +405,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
                         result = site.upload(
                             filepage=wiki_file_page,
-                            source_filename=str(temp_file),
+                            source_filename=temp_file.name,
                             comment=upload_comment,
                             text=wiki_markup,
                             ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
