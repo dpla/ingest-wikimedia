@@ -1,8 +1,8 @@
 import csv
 import hashlib
+import logging
 import os
-import tempfile
-import traceback
+import time
 
 import click
 import magic
@@ -18,6 +18,13 @@ from common import (
     setup_temp_dir,
     cleanup_temp_dir,
     get_s3,
+    Tracker,
+    setup_logging,
+    get_provider_and_data_provider,
+    get_providers_data,
+    is_wiki_eligible,
+    Result,
+    check_partner,
 )
 from constants import (
     S3_BUCKET,
@@ -49,7 +56,7 @@ def upload_temp_file(
     media_url: str,
     s3: S3ServiceResource,
     sha1: str,
-    temp_file: tempfile.NamedTemporaryFile,
+    temp_file,
 ):
     try:
         with open(temp_file.name, "rb") as file:
@@ -83,14 +90,14 @@ def get_file_hash(temp_file):
     return hashlib.file_digest(temp_file, CHECKSUM_KEY).hexdigest()
 
 
-def get_content_type(temp_file: tempfile.NamedTemporaryFile):
+def get_content_type(temp_file):
     content_type = magic.from_file(temp_file.name, mime=True)
     if content_type in INVALID_CONTENT_TYPES:
         raise Exception(f"Invalid content-type: {content_type}")
     return content_type
 
 
-def download_file_to_temp_path(media_url: str) -> tempfile.NamedTemporaryFile:
+def download_file_to_temp_path(media_url: str):
     temp_file = get_temp_file()
     try:
         response = requests.get(media_url, timeout=30)
@@ -103,19 +110,38 @@ def download_file_to_temp_path(media_url: str) -> tempfile.NamedTemporaryFile:
 
 
 @click.command()
-@click.argument("ids_file")
+@click.argument("ids_file", type=click.File("r"))
 @click.argument("partner")
 @click.argument("api_key")
 def main(ids_file: str, partner: str, api_key: str):
 
-    setup_temp_dir()
-    s3 = get_s3()
+    start_time = time.time()
+    tracker = Tracker()
 
-    with open(ids_file) as csv_file:
-        csv_reader = csv.reader(csv_file)
+    check_partner(partner)
+
+    try:
+        setup_temp_dir()
+        setup_logging(partner, "download", logging.INFO)
+        s3 = get_s3()
+        providers_json = get_providers_data()
+
+        logging.info(f"Starting download for {partner}")
+
+        csv_reader = csv.reader(ids_file)
         for row in csv_reader:
             dpla_id = row[0]
+            logging.info(f"DPLA ID: {dpla_id}")
             item_metadata = get_item_metadata(dpla_id, api_key)
+
+            provider, data_provider = get_provider_and_data_provider(
+                item_metadata, providers_json
+            )
+
+            if not is_wiki_eligible(item_metadata, provider, data_provider):
+                tracker.increment(Result.SKIPPED)
+                continue
+
             media_urls = extract_urls(item_metadata)
             count = 0
             for media_url in media_urls:
@@ -124,12 +150,17 @@ def main(ids_file: str, partner: str, api_key: str):
                 if media_url.startswith("https/"):
                     media_url = media_url.replace("https/", "https:/")
                 try:
-                    print(f"Downloading {partner} {dpla_id} {count} from {media_url}")
+                    logging.info(
+                        f"Downloading {partner} {dpla_id} {count} from {media_url}"
+                    )
                     download_media(partner, dpla_id, count, media_url, s3)
-                except Exception:
-                    traceback.print_exc()
-
-    cleanup_temp_dir()
+                except Exception as e:
+                    tracker.increment(Result.FAILED)
+                    logging.warning(f"Failed: {str(e)}", exc_info=True, stack_info=True)
+    finally:
+        logging.info("\n" + str(tracker))
+        logging.info(f"{time.time() - start_time} seconds.")
+        cleanup_temp_dir()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from enum import Enum
@@ -8,17 +9,33 @@ from enum import Enum
 import boto3
 import requests
 from botocore.config import Config
-
 # from mypy.typeshed.stdlib.tempfile import NamedTemporaryFile
 from mypy_boto3_s3 import S3ServiceResource
 
 from constants import (
     API_URL_BASE,
-    MEDIA_MASTER_FIELD_NAME,
     TMP_DIR_BASE,
     S3_RETRIES,
     LOGS_DIR_BASE,
+    UPLOAD_FIELD_NAME,
+    RIGHTS_CATEGORY_FIELD_NAME,
+    UNLIMITED_RE_USE,
+    IIIF_MANIFEST_FIELD_NAME,
+    PROVIDER_FIELD_NAME,
+    EDM_AGENT_NAME,
+    DATA_PROVIDER_FIELD_NAME,
+    INSTITUTIONS_FIELD_NAME,
+    INSTITUTIONS_URL,
+    DPLA_PARTNERS,
+    MEDIA_MASTER_FIELD_NAME,
+    WIKIDATA_FIELD_NAME,
 )
+from uploader import null_safe, get_str, get_list, get_dict
+
+
+def check_partner(partner: str) -> None:
+    if partner not in DPLA_PARTNERS:
+        sys.exit("Unrecognized partner.")
 
 
 def get_item_metadata(dpla_id: str, api_key: str) -> dict:
@@ -112,3 +129,60 @@ class Tracker:
             value = self.data[key]
             result += f"{key.name}: {value}\n"
         return result
+
+
+def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
+
+    provider_ok = null_safe(provider, UPLOAD_FIELD_NAME, False) or null_safe(
+        data_provider, UPLOAD_FIELD_NAME, False
+    )
+
+    rights_category_ok = (
+        get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
+    )
+
+    asset_ok = (len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0) or null_safe(
+        item_metadata, IIIF_MANIFEST_FIELD_NAME, False
+    )
+
+    # todo create banlist. item based? sha based? local id based? all three?
+    # todo don't reupload if deleted
+
+    id_ok = True
+
+    return rights_category_ok and asset_ok and provider_ok and id_ok
+
+
+def get_provider_and_data_provider(
+    item_metadata: dict, providers_json: dict
+) -> tuple[dict, dict]:
+    """
+    Loads metadata about the provider and data provider from the providers json file.
+    """
+
+    provider_name = get_str(
+        get_dict(item_metadata, PROVIDER_FIELD_NAME), EDM_AGENT_NAME
+    )
+    data_provider_name = get_str(
+        get_dict(item_metadata, DATA_PROVIDER_FIELD_NAME), EDM_AGENT_NAME
+    )
+    provider = get_dict(providers_json, provider_name)
+    data_provider = get_dict(
+        get_dict(provider, INSTITUTIONS_FIELD_NAME), data_provider_name
+    )
+    return provider, data_provider
+
+
+def get_providers_data() -> dict:
+    """Loads the institutions file from ingestion3 in github."""
+    return requests.get(INSTITUTIONS_URL).json()
+
+
+def provider_str(provider: dict) -> str:
+    if provider is None:
+        return "Provider: None"
+    else:
+        return (
+            f"Provider: {provider.get(WIKIDATA_FIELD_NAME, "")}, "
+            f"{provider.get(UPLOAD_FIELD_NAME, "")}"
+        )

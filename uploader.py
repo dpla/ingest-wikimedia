@@ -2,7 +2,6 @@ import csv
 import logging
 import mimetypes
 import re
-import sys
 import time
 from string import Template
 
@@ -24,23 +23,19 @@ from common import (
     clean_up_tmp_file,
     Tracker,
     Result,
+    is_wiki_eligible,
+    get_provider_and_data_provider,
+    get_providers_data,
+    check_partner,
+    provider_str,
 )
 from constants import (
-    INSTITUTIONS_URL,
     COMMONS_SITE_NAME,
-    UNLIMITED_RE_USE,
     WMC_UPLOAD_CHUNK_SIZE,
-    PROVIDER_FIELD_NAME,
-    DATA_PROVIDER_FIELD_NAME,
-    EDM_AGENT_NAME,
-    UPLOAD_FIELD_NAME,
-    RIGHTS_CATEGORY_FIELD_NAME,
     IGNORE_WIKIMEDIA_WARNINGS,
     S3_BUCKET,
     CHECKSUM_KEY,
     INVALID_CONTENT_TYPES,
-    MEDIA_MASTER_FIELD_NAME,
-    IIIF_MANIFEST_FIELD_NAME,
     WIKIDATA_FIELD_NAME,
     EDM_RIGHTS_FIELD_NAME,
     RESERVED_WIKITEXT_STRINGS,
@@ -65,9 +60,7 @@ from constants import (
     PD_US_TEMPLATE,
     CC_ZERO_TEMPLATE,
     RIGHTS_STATEMENTS_URL_BASE,
-    INSTITUTIONS_FIELD_NAME,
     COMMONS_URL_PREFIX,
-    DPLA_PARTNERS,
     FIND_BY_HASH_URL_PREFIX,
     FIND_BY_HASH_QUERY_FIELD_NAME,
     FIND_BY_HASH_ALLIMAGES_FIELD_NAME,
@@ -117,49 +110,6 @@ def get_page_title(
             f"{escaped_visible_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
         )
     return f"{escaped_visible_title} - DPLA - {dpla_identifier}{suffix}"
-
-
-def get_provider_and_data_provider(
-    item_metadata: dict, providers_json: dict
-) -> tuple[dict, dict]:
-    """
-    Loads metadata about the provider and data provider from the providers json file.
-    """
-
-    provider_name = get_str(
-        get_dict(item_metadata, PROVIDER_FIELD_NAME), EDM_AGENT_NAME
-    )
-    data_provider_name = get_str(
-        get_dict(item_metadata, DATA_PROVIDER_FIELD_NAME), EDM_AGENT_NAME
-    )
-    provider = get_dict(providers_json, provider_name)
-    data_provider = get_dict(
-        get_dict(provider, INSTITUTIONS_FIELD_NAME), data_provider_name
-    )
-    return provider, data_provider
-
-
-# todo centralize and use in downloader?
-def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
-
-    provider_ok = null_safe(provider, UPLOAD_FIELD_NAME, False) or null_safe(
-        data_provider, UPLOAD_FIELD_NAME, False
-    )
-
-    rights_category_ok = (
-        get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
-    )
-
-    asset_ok = (len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0) or null_safe(
-        item_metadata, IIIF_MANIFEST_FIELD_NAME, False
-    )
-
-    # todo create banlist. item based? sha based? local id based? all three?
-    # todo don't reupload if deleted
-
-    id_ok = True
-
-    return rights_category_ok and asset_ok and provider_ok and id_ok
 
 
 def license_to_markup_code(rights_uri: str) -> str:
@@ -315,11 +265,6 @@ def get_site() -> pywikibot.Site:
     return site
 
 
-def get_providers_data() -> dict:
-    """Loads the institutions file from ingestion3 in github."""
-    return requests.get(INSTITUTIONS_URL).json()
-
-
 def wiki_file_exists(sha1: str) -> bool:
     """Calls the find by hash api on commons to see if the file already exists."""
     response = requests.get(FIND_BY_HASH_URL_PREFIX + sha1)
@@ -347,8 +292,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
     start_time = time.time()
     tracker = Tracker()
 
-    if partner not in DPLA_PARTNERS:
-        sys.exit("Unrecognized partner.")
+    check_partner(partner)
 
     try:
         setup_temp_dir()
@@ -436,8 +380,8 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                         logging.info(f"DPLA ID: {dpla_id}")
                         logging.info(f"Title: {title}")
                         logging.info(f"Page title: {page_title}")
-                        logging.info(f"Provider: {provider}")
-                        logging.info(f"Data Provider: {data_provider}")
+                        logging.info(f"Provider: {provider_str(provider)}")
+                        logging.info(f"Data Provider: {provider_str(data_provider)}")
                         logging.info(f"MIME: {mime}")
                         logging.info(f"Extension: {ext}")
                         logging.info(f"File size: {file_size}")
