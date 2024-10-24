@@ -19,7 +19,7 @@ jobs:
 
       - name: flake8
         run: |          
-          poetry run flake8 wikimedia/ --config wikimedia/setup.cfg
+          poetry run flake8 . --config setup.cfg
 
       - name: black
         run: |
