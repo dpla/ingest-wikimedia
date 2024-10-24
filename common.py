@@ -9,7 +9,6 @@ from enum import Enum
 import boto3
 import requests
 from botocore.config import Config
-# from mypy.typeshed.stdlib.tempfile import NamedTemporaryFile
 from mypy_boto3_s3 import S3ServiceResource
 
 from constants import (
