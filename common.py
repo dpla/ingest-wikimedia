@@ -152,7 +152,6 @@ class Tracker:
 
 
 def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
-
     provider_ok = null_safe(provider, UPLOAD_FIELD_NAME, False) or null_safe(
         data_provider, UPLOAD_FIELD_NAME, False
     )

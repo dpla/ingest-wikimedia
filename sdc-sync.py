@@ -1,9 +1,17 @@
 # TODO caption, date, page, iiif manifest, url
 
-import pywikibot, requests, re, json, datetime, argparse, random, os, sys, time, unicodedata
+import pywikibot
+import requests
+import re
+import json
+import datetime
+import argparse
+import random
+import os
+import sys
+import time
 from bs4 import BeautifulSoup
 from pywikibot.comms import http
-from pywikibot import pagegenerators
 
 
 # DPLA API key
@@ -120,7 +128,6 @@ def formattedclaim(prop, value, type, dpla_id):
 
 
 def postqual(claimid, prop, value):
-
     summary = "Adding [[:d:Property:" + prop + "]] to " + claimid + "."
 
     postdata = {
@@ -629,7 +636,6 @@ def add_creator(mediaid, creator, dpla_id):
 
 # This will catch when displayDate is a single year or a date.
 def add_date(mediaid, date, dpla_id):
-
     prop = "P170"
     summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
     if re.match("^[0-9]{1,4}$", str(date)):
@@ -1053,7 +1059,6 @@ def dpla_claims(
 
 
 def parsed(dpla_id, key):
-
     print(" -- Accessing DPLA ID " + dpla_id)
     try:
         dpla = json.loads(
@@ -1216,7 +1221,6 @@ site = pywikibot.Site()
 
 
 def login():
-
     tokenrequest = http.fetch(
         "https://commons.wikimedia.org/w/api.php?action=query&meta=tokens&type=csrf&format=json"
     )
@@ -1233,9 +1237,8 @@ token = login()
 count = 0
 
 if method == "list":
-
     ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
-    lists = [i for i in ltotal if not ("COMPLETE" in i) and not ("WORKING" in i)]
+    lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
     percent = 100 * (len(ltotal) - len(lists)) / len(ltotal)
     while len(lists) > 0:
         if len(lists) > 1:
@@ -1466,7 +1469,7 @@ if method == "list":
         os.rename(working_file, args.lists + "/COMPLETE-" + lists[x])
 
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
-        lists = [i for i in ltotal if not ("COMPLETE" in i) and not ("WORKING" in i)]
+        lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
 
         # De-dupe missing file:
         duduped = set()

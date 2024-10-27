@@ -28,7 +28,6 @@ from common import (
     get_providers_data,
     check_partner,
     provider_str,
-    null_safe,
     get_str,
     get_list,
     get_dict,
@@ -270,7 +269,6 @@ def wiki_file_exists(sha1: str) -> bool:
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
 def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> None:
-
     start_time = time.time()
     tracker = Tracker()
 
@@ -314,7 +312,6 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
             files = extract_urls(item_metadata)
 
             for file in files:
-
                 ordinal += 1  # todo if we're walking s3, this comes from the name
                 logging.info(f"Page {ordinal}")
                 # one-pagers don't have page numbers in their titles

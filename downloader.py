@@ -114,7 +114,6 @@ def download_file_to_temp_path(media_url: str):
 @click.argument("partner")
 @click.argument("api_key")
 def main(ids_file: str, partner: str, api_key: str):
-
     start_time = time.time()
     tracker = Tracker()
 
