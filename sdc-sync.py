@@ -1,9 +1,18 @@
 # TODO caption, date, page, iiif manifest, url
 
-import pywikibot, requests, re, json, datetime, argparse, random, os, sys, time, unicodedata
+import pywikibot
+import requests
+import re
+import json
+import datetime
+import argparse
+import random
+import os
+import sys
+import time
 from bs4 import BeautifulSoup
 from pywikibot.comms import http
-from pywikibot import pagegenerators
+from pywikibot.pagegenerators import TextIOPageGenerator
 
 
 # DPLA API key
@@ -120,7 +129,6 @@ def formattedclaim(prop, value, type, dpla_id):
 
 
 def postqual(claimid, prop, value):
-
     summary = "Adding [[:d:Property:" + prop + "]] to " + claimid + "."
 
     postdata = {
@@ -135,7 +143,7 @@ def postqual(claimid, prop, value):
     }
 
     try:
-        qual = json.loads(
+        json.loads(
             http.fetch(
                 "https://commons.wikimedia.org/w/api.php", method="POST", data=postdata
             ).text
@@ -144,7 +152,6 @@ def postqual(claimid, prop, value):
 
     except Exception as e:
         print(repr(e))
-        #         print(qual)
         print(site.tokens["csrf"])
         site.get_tokens(["csrf"])
         site.tokens.load_tokens(["csrf"])
@@ -157,25 +164,20 @@ def postqual(claimid, prop, value):
 def check(mediaid, qid, prop):
     request = site.simple_request(action="wbgetentities", ids=mediaid)
 
-    bool = False
     ref = ""
-    ret = bool, ref
     raw = request.submit()
 
     if raw.get("entities").get(mediaid).get("pageid"):
         existing_data = raw.get("entities").get(mediaid)
     else:
         return True, ""
-        exit()
     try:
         if existing_data.get("statements").get(prop):
             statements = existing_data.get("statements").get(prop)
         else:
             return True, ""
-            exit()
-    except:
+    except Exception as _:
         return True, ""
-        exit()
 
     # The following code is used to check the existing statements that match the prop. If any statement matches the prop and qid but has no qualifiers, the statement id is returned. If there is a matching statement with qualifiers, return False. Otherwise (statements with matching prop have no matching qid) return True. This logic is not complete: it will return a statement id for a statement with no qualifier, even if another statement already has the desired qualifier. Also, it would return False even in cases where the qualifier value is different from the desired qualifier, in cases where there there is a matching qid and prop with qualifiers.
     #     statement['mainsnak']['datavalue']['value'] == qid
@@ -200,7 +202,6 @@ def check(mediaid, qid, prop):
                     1
                 ] and not statement.get("qualifiers"):
                     return add_det(statement["id"]), ref
-                    exit()
 
         elif any(
             statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
@@ -241,7 +242,6 @@ def check(mediaid, qid, prop):
                     1
                 ] and not statement.get("qualifiers"):
                     return add_det(statement["id"]), ref
-                    exit()
 
         elif any(
             statement["mainsnak"]["datavalue"]["value"] == qid[1]
@@ -282,7 +282,6 @@ def check(mediaid, qid, prop):
                     1
                 ] and not statement.get("qualifiers"):
                     return add_det(statement["id"]), ref
-                    exit()
 
         elif any(
             statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
@@ -330,7 +329,7 @@ def check(mediaid, qid, prop):
 
                         else:
                             return True, ref
-                    except:
+                    except Exception as _:
                         pass
             else:
                 return True, ref
@@ -364,7 +363,7 @@ def check(mediaid, qid, prop):
 
                         else:
                             return True, ref
-                    except:
+                    except Exception as _:
                         pass
             else:
                 return True, ref
@@ -389,7 +388,7 @@ def add_rs(mediaid, rs, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
         #             return claim
@@ -420,7 +419,7 @@ def add_rs(mediaid, rs, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -442,7 +441,7 @@ def add_collection(mediaid, hub, institution, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -462,7 +461,7 @@ def add_access(mediaid, access, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -482,7 +481,7 @@ def add_level(mediaid, level, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -502,7 +501,7 @@ def add_parent(mediaid, parent, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -515,7 +514,7 @@ def add_id(mediaid, id):
     checkclaim = check(mediaid, ("string", id), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
         return claim
@@ -528,7 +527,7 @@ def add_naid(mediaid, naid, dpla_id):
     checkclaim = check(mediaid, ("string", naid), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
         return claim
@@ -541,7 +540,7 @@ def add_subject(mediaid, subject, dpla_id):
     checkclaim = check(mediaid, ("string", subject), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
         return claim
@@ -560,7 +559,7 @@ def add_subject_entity(mediaid, qid, dpla_id):
     checkclaim = check(mediaid, ("item", qid), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
         return claim
@@ -580,7 +579,7 @@ def add_title(mediaid, title, dpla_id):
         checkclaim = check(mediaid, ("monolingualtext", title), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -600,7 +599,7 @@ def add_desc(mediaid, desc, dpla_id):
         checkclaim = check(mediaid, ("monolingualtext", desc), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -621,7 +620,7 @@ def add_creator(mediaid, creator, dpla_id):
         checkclaim = check(mediaid, ("somevalue", creator), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -629,7 +628,6 @@ def add_creator(mediaid, creator, dpla_id):
 
 # This will catch when displayDate is a single year or a date.
 def add_date(mediaid, date, dpla_id):
-
     prop = "P170"
     summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
     if re.match("^[0-9]{1,4}$", str(date)):
@@ -640,7 +638,7 @@ def add_date(mediaid, date, dpla_id):
 
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
         return claim
@@ -669,7 +667,7 @@ def add_contributed(mediaid, hub, institution, dpla_id):
     checkclaim = check(mediaid, ("item", qid), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
     if hub == "Q518155":
@@ -693,7 +691,7 @@ def add_contributed(mediaid, hub, institution, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
         qid = institution
@@ -716,7 +714,7 @@ def add_contributed(mediaid, hub, institution, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
     else:
@@ -740,7 +738,7 @@ def add_contributed(mediaid, hub, institution, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
         qid = institution
@@ -763,7 +761,7 @@ def add_contributed(mediaid, hub, institution, dpla_id):
         checkclaim = check(mediaid, ("item", qid), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
 
@@ -789,7 +787,7 @@ def add_local_id(mediaid, id, institution, dpla_id):
         ]
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
-        if checkclaim[0] == True:
+        if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
             return claim
@@ -829,7 +827,7 @@ def add_source(mediaid, hub, url, dpla_id):
     checkclaim = check(mediaid, ("source", url), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
-    if checkclaim[0] == True:
+    if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
         return claim
@@ -878,7 +876,7 @@ def dpla_claims(
                 + ".json"
             ).text
         )
-    except:
+    except Exception as _:
         file_claims = {}
         file_claims["entities"] = {mediaid: {"statements": {}}}
     print(" -- Accessed Commons ID " + mediaid)
@@ -919,25 +917,25 @@ def dpla_claims(
     creators = parsecreators
     descs = parsedescs
     subjects = parsesubjects
-    props = [
-        "P6216",
-        "P275",
-        "P217",
-        "P6426",
-        "P760",
-        "P1476",
-        "P195",
-        "P170",
-        "P9126",
-        "P7482",
-        "P4272",
-        "P571",
-        "P10358",
-        "P1225",
-        "P7228",
-        "P6224",
-        "P921",
-    ]
+    # props = [ # currently unused
+    #     "P6216",
+    #     "P275",
+    #     "P217",
+    #     "P6426",
+    #     "P760",
+    #     "P1476",
+    #     "P195",
+    #     "P170",
+    #     "P9126",
+    #     "P7482",
+    #     "P4272",
+    #     "P571",
+    #     "P10358",
+    #     "P1225",
+    #     "P7228",
+    #     "P6224",
+    #     "P921",
+    # ]
     claims = {
         "P6216": statusvalue,
         rightsprop: rightsvalue,
@@ -977,7 +975,7 @@ def dpla_claims(
                                         }
                                     }
                                 )
-                            except:
+                            except Exception as _:
                                 pass
                         elif type == "wikibase-entityid":
                             dpla_claims.append(
@@ -1022,7 +1020,7 @@ def dpla_claims(
                                     }
                                 }
                             )
-                        except:
+                        except Exception:
                             removals.append(stmt["id"])
     for claim in dpla_claims:
         for prop in claim.keys():
@@ -1046,14 +1044,13 @@ def dpla_claims(
             + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
         }
 
-        save = http.fetch(
+        http.fetch(
             "https://commons.wikimedia.org/w/api.php", method="POST", data=rmdata
         )
         print(" --- Saved removals!")
 
 
 def parsed(dpla_id, key):
-
     print(" -- Accessing DPLA ID " + dpla_id)
     try:
         dpla = json.loads(
@@ -1062,7 +1059,7 @@ def parsed(dpla_id, key):
                 timeout=15,
             ).text
         )
-    except:
+    except Exception:
         print(" -- Sleeping 30 seconds and retrying...")
         time.sleep(30)
         dpla = json.loads(
@@ -1074,7 +1071,7 @@ def parsed(dpla_id, key):
 
     try:
         dpla = dpla["docs"][0]
-    except:
+    except Exception:
         print(dpla)
         print("DPLA API returned error.")
         return False
@@ -1088,15 +1085,15 @@ def parsed(dpla_id, key):
 
     try:
         dates = dpla["sourceResource"]["date"]
-    except:
+    except Exception:
         dates = ""
     try:
         local_ids = dpla["sourceResource"]["identifier"]
-    except:
+    except Exception:
         local_ids = ""
     try:
         descs = dpla["sourceResource"]["description"]
-    except:
+    except Exception:
         descs = ""
     try:
         subjects = []
@@ -1131,15 +1128,15 @@ def parsed(dpla_id, key):
                     subjqid = subjectresults["q1"]["result"][0]["id"]
                 subjects.append((str(subject.get("name") or ""), subjqid))
                 added = True
-            if added == False:
+            if added is False:
                 # print((str(subject.get('name') or ''), ''))
                 subjects.append((str(subject.get("name") or ""), ""))
         # print(subjects)
-    except:
+    except Exception:
         subjects = ""
     try:
         creators = dpla["sourceResource"]["creator"]
-    except:
+    except Exception:
         creators = ""
     if dpla["provider"]["name"] == "National Archives and Records Administration":
         naids = dpla["sourceResource"]["identifier"]
@@ -1157,7 +1154,7 @@ def parsed(dpla_id, key):
                 xml.find("accessRestriction").find("status").find("naId").text
             )
             access = codes[acccess_naid]
-        except:
+        except Exception:
             access = ""
         for key in levels.keys():
             if xml.find(key):
@@ -1193,21 +1190,22 @@ def parsed(dpla_id, key):
 
     # Only make a post request if the claims array has accumulated at least one claim to add to the file. If any results set finds at least one edit to make, then 'posted' remains True, and the search will be tried again to pick up any more edits to make. If a whole results set is checked and no edits remain, we assume the edits to files with those search parameters are all complete.
 
-    if len(claims["claims"]) > 0:
-        posted = True
-        try:
-            post = json.loads(
-                http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postdata,
-                ).text
-            )
-            print(" --- Saved new claims!")
-        except:
-            print(" --- Error encountered. 1")
-            sys.exit()
-    return count
+    # unreachable code:
+    # if len(claims["claims"]) > 0:
+    #     posted = True
+    #     try:
+    #         post = json.loads(
+    #             http.fetch(
+    #                 "https://commons.wikimedia.org/w/api.php",
+    #                 method="POST",
+    #                 data=postdata,
+    #             ).text
+    #         )
+    #         print(" --- Saved new claims!")
+    #     except:
+    #         print(" --- Error encountered. 1")
+    #         sys.exit()
+    # return count
 
 
 # Since we are posting directly to the API, we must explicitly request a login token that will be sent with the POSTs.
@@ -1216,7 +1214,6 @@ site = pywikibot.Site()
 
 
 def login():
-
     tokenrequest = http.fetch(
         "https://commons.wikimedia.org/w/api.php?action=query&meta=tokens&type=csrf&format=json"
     )
@@ -1233,9 +1230,8 @@ token = login()
 count = 0
 
 if method == "list":
-
     ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
-    lists = [i for i in ltotal if not ("COMPLETE" in i) and not ("WORKING" in i)]
+    lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
     percent = 100 * (len(ltotal) - len(lists)) / len(ltotal)
     while len(lists) > 0:
         if len(lists) > 1:
@@ -1246,7 +1242,7 @@ if method == "list":
         print(working_file)
         os.rename(args.lists + "/" + lists[x], working_file)
 
-        files = pywikibot.pagegenerators.TextIOPageGenerator(working_file)
+        files = TextIOPageGenerator(working_file)
 
         for file in files:
             print("\n" + str(file).replace('""', '"'))
@@ -1338,7 +1334,7 @@ if method == "list":
                         print(post)
                         print(" --- Error encountered on save.")
                         sys.exit()
-                except:
+                except Exception:
                     try:
                         token = login()
                         postrefs = {
@@ -1366,7 +1362,7 @@ if method == "list":
                             print(post)
                             print(" --- Error encountered on save.")
                             sys.exit()
-                    except:
+                    except Exception:
                         print(" --- Error encountered. 2")
                         sys.exit()
 
@@ -1412,7 +1408,7 @@ if method == "list":
                         print(post)
                         print(" --- Error encountered on save.")
                         sys.exit()
-                except:
+                except Exception:
                     try:
                         token = login()
                         postdata = {
@@ -1440,7 +1436,7 @@ if method == "list":
                             print(post)
                             print(" --- Error encountered on save.")
                             sys.exit()
-                    except:
+                    except Exception:
                         print(str(post) + "\n" + str(postdata))
                         print(" --- Error encountered. 3")
                         sys.exit()
@@ -1466,7 +1462,7 @@ if method == "list":
         os.rename(working_file, args.lists + "/COMPLETE-" + lists[x])
 
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
-        lists = [i for i in ltotal if not ("COMPLETE" in i) and not ("WORKING" in i)]
+        lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
 
         # De-dupe missing file:
         duduped = set()

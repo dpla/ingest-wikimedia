@@ -28,6 +28,9 @@ from common import (
     get_providers_data,
     check_partner,
     provider_str,
+    get_str,
+    get_list,
+    get_dict,
 )
 from constants import (
     COMMONS_SITE_NAME,
@@ -160,28 +163,6 @@ def join(strs: list[str]) -> str:
     return VALUE_JOIN_DELIMITER.join(strs)
 
 
-def get_list(data: dict, field_name: str) -> list:
-    """Null safe shortcut for getting an array from a dict."""
-    return null_safe(data, field_name, [])
-
-
-def get_str(data: dict, field_name: str) -> str:
-    """Null safe shortcut for getting a string from a dict."""
-    return null_safe(data, field_name, "")
-
-
-def null_safe[T](data: dict, field_name: str, identity_element: T) -> T:
-    if data is not None:
-        return data.get(field_name, identity_element)
-    else:
-        return identity_element
-
-
-def get_dict(data: dict, field_name: str) -> dict:
-    """Null safe shortcut for getting a dict from a dict."""
-    return null_safe(data, field_name, {})
-
-
 def extract_strings(data: dict, field_name: str) -> str:
     """Convenience method for building a string
     out of escaped strings from a dict field"""
@@ -288,7 +269,6 @@ def wiki_file_exists(sha1: str) -> bool:
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
 def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> None:
-
     start_time = time.time()
     tracker = Tracker()
 
@@ -332,7 +312,6 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
             files = extract_urls(item_metadata)
 
             for file in files:
-
                 ordinal += 1  # todo if we're walking s3, this comes from the name
                 logging.info(f"Page {ordinal}")
                 # one-pagers don't have page numbers in their titles

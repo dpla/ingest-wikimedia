@@ -29,7 +29,28 @@ from constants import (
     MEDIA_MASTER_FIELD_NAME,
     WIKIDATA_FIELD_NAME,
 )
-from uploader import null_safe, get_str, get_list, get_dict
+
+
+def get_list(data: dict, field_name: str) -> list:
+    """Null safe shortcut for getting an array from a dict."""
+    return null_safe(data, field_name, [])
+
+
+def get_str(data: dict, field_name: str) -> str:
+    """Null safe shortcut for getting a string from a dict."""
+    return null_safe(data, field_name, "")
+
+
+def null_safe[T](data: dict, field_name: str, identity_element: T) -> T:
+    if data is not None:
+        return data.get(field_name, identity_element)
+    else:
+        return identity_element
+
+
+def get_dict(data: dict, field_name: str) -> dict:
+    """Null safe shortcut for getting a dict from a dict."""
+    return null_safe(data, field_name, {})
 
 
 def check_partner(partner: str) -> None:
@@ -131,7 +152,6 @@ class Tracker:
 
 
 def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
-
     provider_ok = null_safe(provider, UPLOAD_FIELD_NAME, False) or null_safe(
         data_provider, UPLOAD_FIELD_NAME, False
     )
