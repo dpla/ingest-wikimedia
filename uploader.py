@@ -28,6 +28,10 @@ from common import (
     get_providers_data,
     check_partner,
     provider_str,
+    null_safe,
+    get_str,
+    get_list,
+    get_dict,
 )
 from constants import (
     COMMONS_SITE_NAME,
@@ -158,28 +162,6 @@ def escape_wiki_strings(unescaped_string: str) -> str:
 def join(strs: list[str]) -> str:
     """Convenience method for joining lists of strings."""
     return VALUE_JOIN_DELIMITER.join(strs)
-
-
-def get_list(data: dict, field_name: str) -> list:
-    """Null safe shortcut for getting an array from a dict."""
-    return null_safe(data, field_name, [])
-
-
-def get_str(data: dict, field_name: str) -> str:
-    """Null safe shortcut for getting a string from a dict."""
-    return null_safe(data, field_name, "")
-
-
-def null_safe[T](data: dict, field_name: str, identity_element: T) -> T:
-    if data is not None:
-        return data.get(field_name, identity_element)
-    else:
-        return identity_element
-
-
-def get_dict(data: dict, field_name: str) -> dict:
-    """Null safe shortcut for getting a dict from a dict."""
-    return null_safe(data, field_name, {})
 
 
 def extract_strings(data: dict, field_name: str) -> str:
