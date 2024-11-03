@@ -7,7 +7,6 @@ from string import Template
 
 import click
 import pywikibot
-import requests
 from pywikibot import FilePage
 from pywikibot.tools.chars import replace_invisible
 
@@ -31,13 +30,14 @@ from common import (
     get_str,
     get_list,
     get_dict,
+    get_http_session,
 )
 from constants import (
     COMMONS_SITE_NAME,
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
     S3_BUCKET,
-    CHECKSUM_KEY,
+    S3_KEY_CHECKSUM,
     INVALID_CONTENT_TYPES,
     WIKIDATA_FIELD_NAME,
     EDM_RIGHTS_FIELD_NAME,
@@ -248,7 +248,7 @@ def get_site() -> pywikibot.Site:
 
 def wiki_file_exists(sha1: str) -> bool:
     """Calls the find by hash api on commons to see if the file already exists."""
-    response = requests.get(FIND_BY_HASH_URL_PREFIX + sha1)
+    response = get_http_session().get(FIND_BY_HASH_URL_PREFIX + sha1)
     sha1_response = response.json()
     if "error" in sha1_response:
         raise Exception(
@@ -328,7 +328,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                     # todo what if file doesn't exist
                     s3_object = s3.Object(S3_BUCKET, s3_path)
                     file_size = s3_object.content_length
-                    sha1 = s3_object.metadata.get(CHECKSUM_KEY, "")
+                    sha1 = s3_object.metadata.get(S3_KEY_CHECKSUM, "")
 
                     mime = s3_object.content_type
                     if mime in INVALID_CONTENT_TYPES:

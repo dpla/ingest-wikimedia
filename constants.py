@@ -9,6 +9,7 @@ DPLA_PARTNERS = [
     "p2p",
     "pa",
     "texas",
+    "minnesota",
 ]
 
 LOGS_DIR_BASE = "./logs"
@@ -19,32 +20,16 @@ TMP_DIR_BASE = "./tmp"
 # Wikimedia constants
 WIKIDATA_URL_BASE = "http://www.wikidata.org/entity/"
 COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
-RIGHTS_STATEMENTS_URL_BASE = "http://rightsstatements.org"
-CC_URL_BASE = "http://creativecommons.org"
-CC_URL_REGEX = "^http://creativecommons.org/licenses/)(.*)"
-RS_NKC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NKC/"
-RS_NKC_TEMPLATE = "NKC"
-RS_NOC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NoC-US/"
-NOC_US_TEMPLATE = "NoC-US"
-CC_PD_URL_BASE = CC_URL_BASE + "/publicdomain/mark/"
-PD_US_TEMPLATE = "PD-US"
-CC_ZERO_URL_BASE = CC_URL_BASE + "/publicdomain/zero/"
-CC_ZERO_TEMPLATE = "cc-zero"
-CC_BY_URL_BASE = CC_URL_BASE + "/licenses/by/"
-CC_BY_SA_URL_BASE = CC_URL_BASE + "/licenses/by-sa/"
-
 ERROR_FILEEXISTS = "fileexists-shared-forbidden"
 ERROR_MIME = "filetype-badmime"
 ERROR_BANNED = "filetype-banned"
 ERROR_DUPLICATE = "duplicate"
 ERROR_NOCHANGE = "no-change"
-
-
 COMMONS_SITE_NAME = "commons"
-WMC_UPLOAD_CHUNK_SIZE = 3_000_000  # 3 MB ish
-
+WMC_UPLOAD_CHUNK_SIZE = 20_000_000  # 20 MB
 VALUE_JOIN_DELIMITER = "; "
 RESERVED_WIKITEXT_STRINGS = ["|", "=", "[[", "]]", "{{", "}}", "''"]
+
 
 # This list exists mainly to exclude 'duplicate' records/images from being uploaded
 # Full list of warnings:
@@ -98,8 +83,25 @@ FIND_BY_TITLE_URL_PREFIX: str = (
     "&iiprop=sha1&titles="
 )
 
+# rights statements
+RIGHTS_STATEMENTS_URL_BASE = "http://rightsstatements.org"
+CC_URL_BASE = "http://creativecommons.org"
+CC_URL_REGEX = "^http://creativecommons.org/licenses/)(.*)"
+RS_NKC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NKC/"
+RS_NKC_TEMPLATE = "NKC"
+RS_NOC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NoC-US/"
+NOC_US_TEMPLATE = "NoC-US"
+CC_PD_URL_BASE = CC_URL_BASE + "/publicdomain/mark/"
+PD_US_TEMPLATE = "PD-US"
+CC_ZERO_URL_BASE = CC_URL_BASE + "/publicdomain/zero/"
+CC_ZERO_TEMPLATE = "cc-zero"
+CC_BY_URL_BASE = CC_URL_BASE + "/licenses/by/"
+CC_BY_SA_URL_BASE = CC_URL_BASE + "/licenses/by-sa/"
+
+
 # DPLA API
-API_URL_BASE = "https://api.dp.la/v2/items/"
+DPLA_API_URL_BASE = "https://api.dp.la/v2/items/"
+DPLA_API_DOCS = "docs"
 
 # DPLA MAP field names
 SOURCE_RESOURCE_FIELD_NAME = "sourceResource"
@@ -133,4 +135,34 @@ WIKIDATA_FIELD_NAME = "Wikidata"
 S3_RETRIES = 3
 S3_BUCKET = "dpla-mdpdb"  # TODO change for prod
 # we use sha1 because that's what commons uses for identifying files
-CHECKSUM_KEY = "sha1"
+S3_KEY_CHECKSUM = "sha1"
+S3_KEY_METADATA = "Metadata"
+S3_KEY_CONTENT_TYPE = "ContentType"
+
+
+CONTENT_DM_ISSHOWNAT_REGEX = "^(.*)/collection/(.*?)/id/(.*?)$"
+
+# http
+HTTP_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+            (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+}
+AUTHORIZATION_HEADER = "Authorization"
+
+# IIIF
+JSON_LD_AT_CONTEXT = "@context"
+JSON_LD_AT_ID = "@id"
+IIIF_DEFAULT_JPG_SUFFIX = "default.jpg"
+IIIF_ID = "id"
+IIIF_BODY = "body"
+IIIF_ITEMS = "items"
+IIIF_RESOURCE = "resource"
+IIIF_IMAGES = "images"
+IIIF_CANVASES = "canvases"
+IIIF_SEQUENCES = "sequences"
+IIIF_FULL_RES_JPG_SUFFIX = "/full/full/0/default.jpg"
+IIIF_PRESENTATION_API_MANIFEST_V2 = "http://iiif.io/api/presentation/2/context.json"
+IIIF_PRESENTATION_API_MANIFEST_V3 = "http://iiif.io/api/presentation/3/context.json"
+
+CONTENTDM_IIIF_MANIFEST_JSON = "/manifest.json"
+CONTENTDM_IIIF_INFO = "iiif/info/"

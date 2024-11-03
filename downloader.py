@@ -6,7 +6,6 @@ import time
 
 import click
 import magic
-import requests
 from botocore.exceptions import ClientError
 from mypy_boto3_s3.service_resource import S3ServiceResource
 
@@ -25,11 +24,15 @@ from common import (
     is_wiki_eligible,
     Result,
     check_partner,
+    provider_str,
+    get_http_session,
 )
 from constants import (
     S3_BUCKET,
-    CHECKSUM_KEY,
+    S3_KEY_CHECKSUM,
     INVALID_CONTENT_TYPES,
+    S3_KEY_METADATA,
+    S3_KEY_CONTENT_TYPE,
 )
 
 
@@ -69,15 +72,15 @@ def upload_temp_file(
                 if not e.response["Error"]["Code"] == "404":
                     raise e
 
-            if obj_metadata and obj_metadata.get(CHECKSUM_KEY, None) == sha1:
+            if obj_metadata and obj_metadata.get(S3_KEY_CHECKSUM, None) == sha1:
                 # Already uploaded, move on.
                 return
 
             obj.upload_fileobj(
                 Fileobj=file,
                 ExtraArgs={
-                    "ContentType": content_type,
-                    "Metadata": {CHECKSUM_KEY: sha1},
+                    S3_KEY_CONTENT_TYPE: content_type,
+                    S3_KEY_METADATA: {S3_KEY_CHECKSUM: sha1},
                 },
             )
     except Exception as e:
@@ -87,7 +90,7 @@ def upload_temp_file(
 
 
 def get_file_hash(temp_file):
-    return hashlib.file_digest(temp_file, CHECKSUM_KEY).hexdigest()
+    return hashlib.file_digest(temp_file, S3_KEY_CHECKSUM).hexdigest()
 
 
 def get_content_type(temp_file):
@@ -100,7 +103,7 @@ def get_content_type(temp_file):
 def download_file_to_temp_path(media_url: str):
     temp_file = get_temp_file()
     try:
-        response = requests.get(media_url, timeout=30)
+        response = get_http_session().get(media_url)
         with open(temp_file.name, "wb") as f:
             f.write(response.content)
 
@@ -113,7 +116,9 @@ def download_file_to_temp_path(media_url: str):
 @click.argument("ids_file", type=click.File("r"))
 @click.argument("partner")
 @click.argument("api_key")
-def main(ids_file: str, partner: str, api_key: str):
+@click.option("--dry-run", is_flag=True)
+@click.option("--verbose", is_flag=True)
+def main(ids_file: str, partner: str, api_key: str, dry_run: bool, verbose: bool):
     start_time = time.time()
     tracker = Tracker()
 
@@ -122,6 +127,9 @@ def main(ids_file: str, partner: str, api_key: str):
     try:
         setup_temp_dir()
         setup_logging(partner, "download", logging.INFO)
+        if dry_run:
+            logging.warning("---=== DRY RUN ===---")
+
         s3 = get_s3()
         providers_json = get_providers_data()
 
@@ -132,30 +140,39 @@ def main(ids_file: str, partner: str, api_key: str):
             dpla_id = row[0]
             logging.info(f"DPLA ID: {dpla_id}")
             item_metadata = get_item_metadata(dpla_id, api_key)
-
             provider, data_provider = get_provider_and_data_provider(
                 item_metadata, providers_json
             )
 
             if not is_wiki_eligible(item_metadata, provider, data_provider):
+                logging.info("Not eligible.")
                 tracker.increment(Result.SKIPPED)
                 continue
 
             media_urls = extract_urls(item_metadata)
+            logging.info(f"{len(media_urls)} files.")
             count = 0
+            if verbose:
+                logging.info(f"DPLA ID: {dpla_id}")
+                logging.info(f"Metadata: {item_metadata}")
+                logging.info(f"Provider: {provider_str(provider)}")
+                logging.info(f"Data Provider: {provider_str(data_provider)}")
+
             for media_url in media_urls:
                 count += 1
                 # hack to fix bad nara data
                 if media_url.startswith("https/"):
                     media_url = media_url.replace("https/", "https:/")
+                logging.info(
+                    f"Downloading {partner} {dpla_id} {count} from {media_url}"
+                )
                 try:
-                    logging.info(
-                        f"Downloading {partner} {dpla_id} {count} from {media_url}"
-                    )
-                    download_media(partner, dpla_id, count, media_url, s3)
+                    if not dry_run:
+                        download_media(partner, dpla_id, count, media_url, s3)
                 except Exception as e:
                     tracker.increment(Result.FAILED)
                     logging.warning(f"Failed: {str(e)}", exc_info=True, stack_info=True)
+
     finally:
         logging.info("\n" + str(tracker))
         logging.info(f"{time.time() - start_time} seconds.")
