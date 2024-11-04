@@ -86,7 +86,7 @@ FIND_BY_TITLE_URL_PREFIX: str = (
 # rights statements
 RIGHTS_STATEMENTS_URL_BASE = "http://rightsstatements.org"
 CC_URL_BASE = "http://creativecommons.org"
-CC_URL_REGEX = "^http://creativecommons.org/licenses/)(.*)"
+CC_URL_REGEX = "^http://creativecommons.org/licenses/(.*)"
 RS_NKC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NKC/"
 RS_NKC_TEMPLATE = "NKC"
 RS_NOC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NoC-US/"

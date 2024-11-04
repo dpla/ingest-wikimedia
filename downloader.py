@@ -26,6 +26,7 @@ from common import (
     check_partner,
     provider_str,
     get_http_session,
+    s3_file_exists,
 )
 from constants import (
     S3_BUCKET,
@@ -37,15 +38,27 @@ from constants import (
 
 
 def download_media(
-    partner: str, dpla_id: str, ordinal: int, media_url: str, s3: S3ServiceResource
+    partner: str,
+    dpla_id: str,
+    ordinal: int,
+    media_url: str,
+    overwrite: bool,
+    s3: S3ServiceResource,
+    tracker: Tracker,
 ) -> None:
     temp_file = None
     try:
         destination_path = get_s3_path(dpla_id, ordinal, partner)
+        if not overwrite and s3_file_exists(destination_path, s3):
+            logging.info("Key already in S3.")
+            tracker.increment(Result.SKIPPED)
+            return
         temp_file = download_file_to_temp_path(media_url)
         content_type = get_content_type(temp_file)
         sha1 = get_file_hash(temp_file)
-        upload_temp_file(content_type, destination_path, media_url, s3, sha1, temp_file)
+        upload_temp_file(
+            content_type, destination_path, media_url, s3, sha1, temp_file, tracker
+        )
 
     finally:
         if temp_file:
@@ -60,6 +73,7 @@ def upload_temp_file(
     s3: S3ServiceResource,
     sha1: str,
     temp_file,
+    tracker: Tracker,
 ):
     try:
         with open(temp_file.name, "rb") as file:
@@ -74,6 +88,8 @@ def upload_temp_file(
 
             if obj_metadata and obj_metadata.get(S3_KEY_CHECKSUM, None) == sha1:
                 # Already uploaded, move on.
+                logging.info("Already exists.")
+                tracker.increment(Result.SKIPPED)
                 return
 
             obj.upload_fileobj(
@@ -83,6 +99,7 @@ def upload_temp_file(
                     S3_KEY_METADATA: {S3_KEY_CHECKSUM: sha1},
                 },
             )
+            tracker.increment(Result.DOWNLOADED)
     except Exception as e:
         raise Exception(
             f"Error uploading {media_url} to s3://{S3_BUCKET}/{destination_path}"
@@ -118,7 +135,15 @@ def download_file_to_temp_path(media_url: str):
 @click.argument("api_key")
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
-def main(ids_file: str, partner: str, api_key: str, dry_run: bool, verbose: bool):
+@click.option("--overwrite", is_flag=True)
+def main(
+    ids_file: str,
+    partner: str,
+    api_key: str,
+    dry_run: bool,
+    verbose: bool,
+    overwrite: bool,
+):
     start_time = time.time()
     tracker = Tracker()
 
@@ -168,7 +193,10 @@ def main(ids_file: str, partner: str, api_key: str, dry_run: bool, verbose: bool
                 )
                 try:
                     if not dry_run:
-                        download_media(partner, dpla_id, count, media_url, s3)
+                        download_media(
+                            partner, dpla_id, count, media_url, overwrite, s3, tracker
+                        )
+
                 except Exception as e:
                     tracker.increment(Result.FAILED)
                     logging.warning(f"Failed: {str(e)}", exc_info=True, stack_info=True)

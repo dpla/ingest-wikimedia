@@ -11,46 +11,48 @@ import boto3
 import requests
 import validators
 from botocore.config import Config
-from mypy_boto3_s3 import S3ServiceResource
-from urllib3.util import Retry
+from mypy_boto3_s3.service_resource import S3ServiceResource
 from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from botocore.exceptions import ClientError
 
 from constants import (
-    DPLA_API_URL_BASE,
-    TMP_DIR_BASE,
-    S3_RETRIES,
-    LOGS_DIR_BASE,
-    UPLOAD_FIELD_NAME,
-    RIGHTS_CATEGORY_FIELD_NAME,
-    UNLIMITED_RE_USE,
-    IIIF_MANIFEST_FIELD_NAME,
-    PROVIDER_FIELD_NAME,
-    EDM_AGENT_NAME,
-    DATA_PROVIDER_FIELD_NAME,
-    INSTITUTIONS_FIELD_NAME,
-    INSTITUTIONS_URL,
-    DPLA_PARTNERS,
-    MEDIA_MASTER_FIELD_NAME,
-    WIKIDATA_FIELD_NAME,
-    CONTENT_DM_ISSHOWNAT_REGEX,
-    HTTP_REQUEST_HEADERS,
     AUTHORIZATION_HEADER,
+    CONTENT_DM_ISSHOWNAT_REGEX,
+    CONTENTDM_IIIF_INFO,
+    CONTENTDM_IIIF_MANIFEST_JSON,
+    DATA_PROVIDER_FIELD_NAME,
     DPLA_API_DOCS,
-    JSON_LD_AT_ID,
-    IIIF_DEFAULT_JPG_SUFFIX,
-    IIIF_ID,
+    DPLA_API_URL_BASE,
+    DPLA_PARTNERS,
+    EDM_AGENT_NAME,
+    HTTP_REQUEST_HEADERS,
     IIIF_BODY,
-    IIIF_ITEMS,
+    IIIF_CANVASES,
+    IIIF_DEFAULT_JPG_SUFFIX,
     IIIF_FULL_RES_JPG_SUFFIX,
+    IIIF_ID,
+    IIIF_IMAGES,
+    IIIF_ITEMS,
+    IIIF_MANIFEST_FIELD_NAME,
     IIIF_PRESENTATION_API_MANIFEST_V2,
     IIIF_PRESENTATION_API_MANIFEST_V3,
-    CONTENTDM_IIIF_MANIFEST_JSON,
-    CONTENTDM_IIIF_INFO,
     IIIF_RESOURCE,
-    IIIF_IMAGES,
-    IIIF_CANVASES,
     IIIF_SEQUENCES,
+    INSTITUTIONS_FIELD_NAME,
+    INSTITUTIONS_URL,
     JSON_LD_AT_CONTEXT,
+    JSON_LD_AT_ID,
+    LOGS_DIR_BASE,
+    MEDIA_MASTER_FIELD_NAME,
+    PROVIDER_FIELD_NAME,
+    RIGHTS_CATEGORY_FIELD_NAME,
+    S3_RETRIES,
+    TMP_DIR_BASE,
+    UNLIMITED_RE_USE,
+    UPLOAD_FIELD_NAME,
+    WIKIDATA_FIELD_NAME,
+    S3_BUCKET,
 )
 
 __http_session = None
@@ -136,9 +138,6 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
         for image in get_list(canvas, IIIF_IMAGES):
             resource = get_dict(image, IIIF_RESOURCE)
             url = get_str(resource, JSON_LD_AT_ID)
-            logging.info(f"IMAGE: {image}")
-            logging.info(f"RESOURCE: {resource}")
-            logging.info(f"URL: {url}")
             if url:
                 urls.append(url)
     return urls
@@ -224,6 +223,19 @@ def get_s3_path(dpla_id: str, ordinal: int, partner: str) -> str:
     ).strip()
 
 
+def s3_file_exists(path: str, s3: S3ServiceResource):
+    try:
+        s3.Object(S3_BUCKET, path).load()
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            # The object does not exist.
+            return False
+        else:
+            # Something else has gone wrong.
+            raise
+
+
 def setup_temp_dir() -> None:
     if not os.path.isdir(TMP_DIR_BASE):
         os.mkdir(TMP_DIR_BASE)
@@ -304,6 +316,7 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
         get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
     )
 
+    # todo test for contentdm?
     asset_ok = (len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0) or null_safe(
         item_metadata, IIIF_MANIFEST_FIELD_NAME, False
     )
@@ -312,6 +325,10 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
     # todo don't reupload if deleted
 
     id_ok = True
+
+    logging.info(
+        f"Rights: {rights_category_ok}, Asset: {asset_ok}, Provider: {provider_ok}, ID: {id_ok}"
+    )
 
     return rights_category_ok and asset_ok and provider_ok and id_ok
 
@@ -337,7 +354,7 @@ def get_provider_and_data_provider(
 
 
 def get_providers_data() -> dict:
-    """Loads the institutions file from ingestion3 in github."""
+    """Loads the institutions file from ingestion3 in GitHub."""
     return get_http_session().get(INSTITUTIONS_URL).json()
 
 
