@@ -3,7 +3,7 @@ name = "ingest-wikimedia"
 version = "0.2.0"
 description = "Uploading media from DPLA to Wikimedia Commons"
 authors = [
-    { name = "Scott Williams", email = "scott@dp.la>" },
+    { name = "Scott Williams", email = "scott@dp.la" },
     { name = "Michael Della Bitta", email = "michael@dp.la" },
 ]
 license = { text = "MIT License" }
@@ -13,10 +13,13 @@ dependencies = [
     "beautifulsoup4>=4.12.3",
     "boto3-stubs[essential]>=1.35.49",
     "boto3>=1.35.49",
+    "certifi>=2024.8.30",
     "click>=8.1.7",
+    "pip-system-certs>=4.0",
     "python-magic>=0.4.27",
     "pywikibot>=9.4.1",
     "requests>=2.32.3",
+    "validators>=0.34.0",
 ]
 
 [dependency-groups]

@@ -1,34 +1,89 @@
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
 from datetime import datetime
 from enum import Enum
+from urllib.parse import urlparse
 
 import boto3
 import requests
+import validators
 from botocore.config import Config
-from mypy_boto3_s3 import S3ServiceResource
+from mypy_boto3_s3.service_resource import S3ServiceResource
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from botocore.exceptions import ClientError
 
 from constants import (
-    API_URL_BASE,
-    TMP_DIR_BASE,
-    S3_RETRIES,
-    LOGS_DIR_BASE,
-    UPLOAD_FIELD_NAME,
-    RIGHTS_CATEGORY_FIELD_NAME,
-    UNLIMITED_RE_USE,
-    IIIF_MANIFEST_FIELD_NAME,
-    PROVIDER_FIELD_NAME,
-    EDM_AGENT_NAME,
+    AUTHORIZATION_HEADER,
+    CONTENT_DM_ISSHOWNAT_REGEX,
+    CONTENTDM_IIIF_INFO,
+    CONTENTDM_IIIF_MANIFEST_JSON,
     DATA_PROVIDER_FIELD_NAME,
+    DPLA_API_DOCS,
+    DPLA_API_URL_BASE,
+    DPLA_PARTNERS,
+    EDM_AGENT_NAME,
+    HTTP_REQUEST_HEADERS,
+    IIIF_BODY,
+    IIIF_CANVASES,
+    IIIF_DEFAULT_JPG_SUFFIX,
+    IIIF_FULL_RES_JPG_SUFFIX,
+    IIIF_ID,
+    IIIF_IMAGES,
+    IIIF_ITEMS,
+    IIIF_MANIFEST_FIELD_NAME,
+    IIIF_PRESENTATION_API_MANIFEST_V2,
+    IIIF_PRESENTATION_API_MANIFEST_V3,
+    IIIF_RESOURCE,
+    IIIF_SEQUENCES,
     INSTITUTIONS_FIELD_NAME,
     INSTITUTIONS_URL,
-    DPLA_PARTNERS,
+    JSON_LD_AT_CONTEXT,
+    JSON_LD_AT_ID,
+    LOGS_DIR_BASE,
     MEDIA_MASTER_FIELD_NAME,
+    PROVIDER_FIELD_NAME,
+    RIGHTS_CATEGORY_FIELD_NAME,
+    S3_RETRIES,
+    TMP_DIR_BASE,
+    UNLIMITED_RE_USE,
+    UPLOAD_FIELD_NAME,
     WIKIDATA_FIELD_NAME,
+    S3_BUCKET,
+    EDM_IS_SHOWN_AT,
 )
+
+__http_session = None
+
+
+def get_http_session() -> requests.Session:
+    global __http_session
+    if __http_session is not None:
+        return __http_session
+    retry_strategy = Retry(
+        total=10,
+        backoff_factor=1,
+        redirect=5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        raise_on_status=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    __http_session = requests.Session()
+    __http_session.mount("https://", adapter)
+    __http_session.mount("http://", adapter)
+    return __http_session
+
+
+def null_safe[T](data: dict, field_name: str, identity_element: T) -> T:
+    if data is not None:
+        return data.get(field_name, identity_element)
+    else:
+        return identity_element
 
 
 def get_list(data: dict, field_name: str) -> list:
@@ -39,13 +94,6 @@ def get_list(data: dict, field_name: str) -> list:
 def get_str(data: dict, field_name: str) -> str:
     """Null safe shortcut for getting a string from a dict."""
     return null_safe(data, field_name, "")
-
-
-def null_safe[T](data: dict, field_name: str, identity_element: T) -> T:
-    if data is not None:
-        return data.get(field_name, identity_element)
-    else:
-        return identity_element
 
 
 def get_dict(data: dict, field_name: str) -> dict:
@@ -59,18 +107,126 @@ def check_partner(partner: str) -> None:
 
 
 def get_item_metadata(dpla_id: str, api_key: str) -> dict:
-    url = API_URL_BASE + dpla_id
-    headers = {"Authorization": api_key}
-    response = requests.get(url, headers=headers)
+    url = DPLA_API_URL_BASE + dpla_id
+    headers = {AUTHORIZATION_HEADER: api_key}
+    response = get_http_session().get(url, headers=headers)
     response_json = response.json()
-    return response_json.get("docs")[0]
+    return response_json.get(DPLA_API_DOCS)[0]
 
 
 def extract_urls(item_metadata: dict) -> list[str]:
     if MEDIA_MASTER_FIELD_NAME in item_metadata:
-        return item_metadata.get(MEDIA_MASTER_FIELD_NAME, [])
+        return get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)
+
+    elif IIIF_MANIFEST_FIELD_NAME in item_metadata:
+        return get_iiif_urls(get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME))
+
     else:
-        raise NotImplementedError("No mediaMaster")
+        raise NotImplementedError(
+            f"No {MEDIA_MASTER_FIELD_NAME} or {IIIF_MANIFEST_FIELD_NAME}"
+        )
+
+
+def iiif_v2_urls(iiif: dict) -> list[str]:
+    """
+    Extracts image URLs from a v2 IIIF manifest and returns them as a list
+    """
+    urls = []
+    sequences = get_list(iiif, IIIF_SEQUENCES)
+    sequence = sequences[0:1] if len(sequences) == 1 else None
+    canvases = get_list(sequence[0], IIIF_CANVASES)
+
+    for canvas in canvases:
+        for image in get_list(canvas, IIIF_IMAGES):
+            resource = get_dict(image, IIIF_RESOURCE)
+            url = get_str(resource, JSON_LD_AT_ID)
+            if url:
+                urls.append(url)
+    return urls
+
+
+def iiif_v3_urls(iiif: dict) -> list[str]:
+    """
+    Extracts image URLs from a v3 IIIF manifest and returns them as a list
+    """
+    urls = []
+    for item in get_list(iiif, IIIF_ITEMS):
+        try:
+            url = get_str(
+                get_dict(item[IIIF_ITEMS][0][IIIF_ITEMS][0], IIIF_BODY), IIIF_ID
+            )
+            # This is a hack to get around that v3 presumes the user supplies the
+            # resolution in the URL
+            if url:
+                # This condition may not be necessary but I'm leaving it in for now
+                # TODO does this end up giving us smaller resources than we want?
+                if url.endswith(IIIF_DEFAULT_JPG_SUFFIX):
+                    urls.append(url)
+                else:
+                    urls.append(url + IIIF_FULL_RES_JPG_SUFFIX)
+        except (IndexError, TypeError, KeyError) as e:
+            logging.warning("Unable to parse IIIF manifest.", e)
+            return []
+    return urls
+
+
+def get_iiif_urls(iiif_presentation_api_url: str) -> list[str]:
+    """
+    Extracts image URLs from IIIF manifest and returns them as a list
+    Currently only supports IIIF v2 and v3
+    """
+    manifest = _get_iiif_manifest(iiif_presentation_api_url)
+    # v2 or v3?
+    if get_str(manifest, JSON_LD_AT_CONTEXT) == IIIF_PRESENTATION_API_MANIFEST_V3:
+        return iiif_v3_urls(manifest)
+    elif get_str(manifest, JSON_LD_AT_CONTEXT) == IIIF_PRESENTATION_API_MANIFEST_V2:
+        return iiif_v2_urls(manifest)
+    else:
+        raise Exception("Unimplemented IIIF version")
+
+
+def _get_iiif_manifest(url: str) -> dict:
+    """
+    :return: parsed JSON
+    """
+    if not validators.url(url):
+        raise Exception(f"Invalid url {url}")
+    try:
+        request = get_http_session().get(url, headers=HTTP_REQUEST_HEADERS)
+        request.raise_for_status()
+        return request.json()
+
+    except Exception as ex:
+        # todo maybe this should return None?
+        raise Exception(f"Error getting IIIF manifest at {url}") from ex
+
+
+def contentdm_iiif_url(is_shown_at: str) -> str | None:
+    """
+    Creates a IIIF presentation API manifest URL from the
+    link to the object in ContentDM
+
+    We want to go from
+    http://www.ohiomemory.org/cdm/ref/collection/p16007coll33/id/126923
+    to
+    http://www.ohiomemory.org/iiif/info/p16007coll33/126923/manifest.json
+
+    """
+    parsed_url = urlparse(is_shown_at)
+    match_result = re.match(CONTENT_DM_ISSHOWNAT_REGEX, parsed_url.path)
+    if not match_result:
+        return None
+    else:
+        return (
+            parsed_url.scheme
+            + "://"
+            + parsed_url.netloc
+            + CONTENTDM_IIIF_INFO
+            + match_result.group(1)
+            + "/"
+            + match_result.group(2)
+            + CONTENTDM_IIIF_MANIFEST_JSON
+        )
 
 
 def get_s3_path(dpla_id: str, ordinal: int, partner: str) -> str:
@@ -78,6 +234,19 @@ def get_s3_path(dpla_id: str, ordinal: int, partner: str) -> str:
         f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
         f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{ordinal}_{dpla_id}"
     ).strip()
+
+
+def s3_file_exists(path: str, s3: S3ServiceResource):
+    try:
+        s3.Object(S3_BUCKET, path).load()
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            # The object does not exist.
+            return False
+        else:
+            # Something else has gone wrong.
+            raise
 
 
 def setup_temp_dir() -> None:
@@ -128,7 +297,7 @@ def clean_up_tmp_file(temp_file) -> None:
         if temp_file:
             os.unlink(temp_file.name)
     except Exception as e:
-        logging.warning("Temp file unlink failed.", e)
+        logging.warning("Temp file unlink failed.", exc_info=e)
 
 
 Result = Enum("Result", ["DOWNLOADED", "FAILED", "SKIPPED", "UPLOADED", "BYTES"])
@@ -142,6 +311,12 @@ class Tracker:
         if status not in self.data:
             self.data[status] = 0
         self.data[status] = self.data[status] + amount
+
+    def count(self, status: Result) -> int:
+        if status not in self.data:
+            return 0
+        else:
+            return self.data[status]
 
     def __str__(self) -> str:
         result = "COUNTS:\n"
@@ -160,14 +335,28 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
         get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
     )
 
-    asset_ok = (len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0) or null_safe(
-        item_metadata, IIIF_MANIFEST_FIELD_NAME, False
-    )
+    is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
+    media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
+    iiif_manifest = null_safe(item_metadata, IIIF_MANIFEST_FIELD_NAME, False)
+
+    if not iiif_manifest and not media_master:
+        iiif_url = contentdm_iiif_url(is_shown_at)
+        if iiif_url is not None:
+            response = get_http_session().head(iiif_url, allow_redirects=True)
+            if response.status_code < 400:
+                item_metadata[IIIF_MANIFEST_FIELD_NAME] = iiif_url
+                iiif_manifest = True
+
+    asset_ok = media_master or iiif_manifest
 
     # todo create banlist. item based? sha based? local id based? all three?
     # todo don't reupload if deleted
 
     id_ok = True
+
+    logging.info(
+        f"Rights: {rights_category_ok}, Asset: {asset_ok}, Provider: {provider_ok}, ID: {id_ok}"
+    )
 
     return rights_category_ok and asset_ok and provider_ok and id_ok
 
@@ -193,8 +382,8 @@ def get_provider_and_data_provider(
 
 
 def get_providers_data() -> dict:
-    """Loads the institutions file from ingestion3 in github."""
-    return requests.get(INSTITUTIONS_URL).json()
+    """Loads the institutions file from ingestion3 in GitHub."""
+    return get_http_session().get(INSTITUTIONS_URL).json()
 
 
 def provider_str(provider: dict) -> str:
