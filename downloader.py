@@ -164,17 +164,23 @@ def main(
         for row in csv_reader:
             dpla_id = row[0]
             logging.info(f"DPLA ID: {dpla_id}")
-            item_metadata = get_item_metadata(dpla_id, api_key)
-            provider, data_provider = get_provider_and_data_provider(
-                item_metadata, providers_json
-            )
-
-            if not is_wiki_eligible(item_metadata, provider, data_provider):
-                logging.info("Not eligible.")
-                tracker.increment(Result.SKIPPED)
+            try:
+                item_metadata = get_item_metadata(dpla_id, api_key)
+                provider, data_provider = get_provider_and_data_provider(
+                    item_metadata, providers_json
+                )
+                if not is_wiki_eligible(item_metadata, provider, data_provider):
+                    logging.info(f"{dpla_id} is not eligible.")
+                    tracker.increment(Result.SKIPPED)
+                    continue
+                media_urls = extract_urls(item_metadata)
+            except Exception as e:
+                tracker.increment(Result.FAILED)
+                logging.warning(
+                    f"Caught exception getting media urls for {dpla_id}.", e
+                )
                 continue
 
-            media_urls = extract_urls(item_metadata)
             logging.info(f"{len(media_urls)} files.")
             count = 0
             if verbose:

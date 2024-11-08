@@ -6,6 +6,7 @@ import sys
 import tempfile
 from datetime import datetime
 from enum import Enum
+from urllib.parse import urlparse
 
 import boto3
 import requests
@@ -53,6 +54,7 @@ from constants import (
     UPLOAD_FIELD_NAME,
     WIKIDATA_FIELD_NAME,
     S3_BUCKET,
+    EDM_IS_SHOWN_AT,
 )
 
 __http_session = None
@@ -191,27 +193,38 @@ def _get_iiif_manifest(url: str) -> dict:
         raise Exception(f"Invalid url {url}")
     try:
         request = get_http_session().get(url, headers=HTTP_REQUEST_HEADERS)
+        request.raise_for_status()
         return request.json()
 
     except Exception as ex:
+        # todo maybe this should return None?
         raise Exception(f"Error getting IIIF manifest at {url}") from ex
 
 
-def contentdm_iiif_url(is_shown_at: str) -> str:
+def contentdm_iiif_url(is_shown_at: str) -> str | None:
     """
     Creates a IIIF presentation API manifest URL from the
     link to the object in ContentDM
+
+    We want to go from
+    http://www.ohiomemory.org/cdm/ref/collection/p16007coll33/id/126923
+    to
+    http://www.ohiomemory.org/iiif/info/p16007coll33/126923/manifest.json
+
     """
-    match_result = re.match(CONTENT_DM_ISSHOWNAT_REGEX, is_shown_at)
+    parsed_url = urlparse(is_shown_at)
+    match_result = re.match(CONTENT_DM_ISSHOWNAT_REGEX, parsed_url.path)
     if not match_result:
-        return ""
+        return None
     else:
         return (
-            match_result.group(1)
+            parsed_url.scheme
+            + "://"
+            + parsed_url.netloc
             + CONTENTDM_IIIF_INFO
-            + match_result.group(2)
+            + match_result.group(1)
             + "/"
-            + match_result.group(3)
+            + match_result.group(2)
             + CONTENTDM_IIIF_MANIFEST_JSON
         )
 
@@ -299,6 +312,12 @@ class Tracker:
             self.data[status] = 0
         self.data[status] = self.data[status] + amount
 
+    def count(self, status: Result) -> int:
+        if status not in self.data:
+            return 0
+        else:
+            return self.data[status]
+
     def __str__(self) -> str:
         result = "COUNTS:\n"
         for key in self.data:
@@ -316,10 +335,19 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
         get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
     )
 
-    # todo test for contentdm?
-    asset_ok = (len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0) or null_safe(
-        item_metadata, IIIF_MANIFEST_FIELD_NAME, False
-    )
+    is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
+    media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
+    iiif_manifest = null_safe(item_metadata, IIIF_MANIFEST_FIELD_NAME, False)
+
+    if not iiif_manifest and not media_master:
+        iiif_url = contentdm_iiif_url(is_shown_at)
+        if iiif_url is not None:
+            response = get_http_session().head(iiif_url, allow_redirects=True)
+            if response.status_code < 400:
+                item_metadata[IIIF_MANIFEST_FIELD_NAME] = iiif_url
+                iiif_manifest = True
+
+    asset_ok = media_master or iiif_manifest
 
     # todo create banlist. item based? sha based? local id based? all three?
     # todo don't reupload if deleted

@@ -140,8 +140,6 @@ S3_KEY_METADATA = "Metadata"
 S3_KEY_CONTENT_TYPE = "ContentType"
 
 
-CONTENT_DM_ISSHOWNAT_REGEX = "^(.*)/collection/(.*?)/id/(.*?)$"
-
 # http
 HTTP_REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
@@ -165,4 +163,5 @@ IIIF_PRESENTATION_API_MANIFEST_V2 = "http://iiif.io/api/presentation/2/context.j
 IIIF_PRESENTATION_API_MANIFEST_V3 = "http://iiif.io/api/presentation/3/context.json"
 
 CONTENTDM_IIIF_MANIFEST_JSON = "/manifest.json"
-CONTENTDM_IIIF_INFO = "iiif/info/"
+CONTENTDM_IIIF_INFO = "/iiif/info/"
+CONTENT_DM_ISSHOWNAT_REGEX = r"^/cdm/ref/collection/(.*)/id/(.*)$"  # todo
