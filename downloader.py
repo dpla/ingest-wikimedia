@@ -177,7 +177,7 @@ def main(
             except Exception as e:
                 tracker.increment(Result.FAILED)
                 logging.warning(
-                    f"Caught exception getting media urls for {dpla_id}.", e
+                    f"Caught exception getting media urls for {dpla_id}.", exc_info=e
                 )
                 continue
 
@@ -205,7 +205,7 @@ def main(
 
                 except Exception as e:
                     tracker.increment(Result.FAILED)
-                    logging.warning(f"Failed: {str(e)}", exc_info=True, stack_info=True)
+                    logging.warning(f"Failed: {dpla_id} {count}", exc_info=e)
 
     finally:
         logging.info("\n" + str(tracker))

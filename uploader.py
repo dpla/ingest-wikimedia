@@ -418,7 +418,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
 def handle_upload_exception(ex) -> None:
     error_string = str(ex)
-    message = ""
+    message = "Unknown"
     error = False
 
     if ERROR_FILEEXISTS in error_string:
@@ -439,9 +439,9 @@ def handle_upload_exception(ex) -> None:
         message = f"File exists, no change, {error_string}"
 
     if error:
-        logging.error(f"Failed: {message}", exc_info=True, stack_info=True)
+        logging.error(f"Failed: {message}", exc_info=ex)
     else:
-        logging.warning(f"Failed: {message}", exc_info=True, stack_info=True)
+        logging.warning(f"Failed: {message}", exc_info=ex)
 
 
 if __name__ == "__main__":

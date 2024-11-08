@@ -297,7 +297,7 @@ def clean_up_tmp_file(temp_file) -> None:
         if temp_file:
             os.unlink(temp_file.name)
     except Exception as e:
-        logging.warning("Temp file unlink failed.", e)
+        logging.warning("Temp file unlink failed.", exc_info=e)
 
 
 Result = Enum("Result", ["DOWNLOADED", "FAILED", "SKIPPED", "UPLOADED", "BYTES"])
