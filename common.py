@@ -1,3 +1,4 @@
+import csv
 import logging
 import os
 import re
@@ -6,7 +7,9 @@ import sys
 import tempfile
 from datetime import datetime
 from enum import Enum
+from typing import IO
 from urllib.parse import urlparse
+from tqdm import tqdm
 
 import boto3
 import requests
@@ -58,6 +61,14 @@ from constants import (
 )
 
 __http_session = None
+
+
+def load_ids(ids_file: IO) -> list[str]:
+    dpla_ids = []
+    csv_reader = csv.reader(ids_file)
+    for row in csv_reader:
+        dpla_ids.append(row[0])
+    return dpla_ids
 
 
 def get_http_session() -> requests.Session:
@@ -272,6 +283,19 @@ def get_s3() -> S3ServiceResource:
     return boto3.resource("s3", config=config)
 
 
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> None:
     os.makedirs(LOGS_DIR_BASE, exist_ok=True)
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -281,7 +305,7 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
         level=level,
         datefmt="%H:%M:%S",
         handlers=[
-            logging.StreamHandler(),
+            TqdmLoggingHandler(),
             logging.FileHandler(filename=filename, mode="w"),
         ],
         format="[%(levelname)s] " "%(asctime)s: " "%(message)s",
