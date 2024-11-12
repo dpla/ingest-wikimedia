@@ -76,9 +76,10 @@ def get_http_session() -> requests.Session:
     if __http_session is not None:
         return __http_session
     retry_strategy = Retry(
-        total=10,
+        total=5,
+        connect=3,
+        redirect=3,
         backoff_factor=1,
-        redirect=5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"],
         raise_on_status=True,
