@@ -19,6 +19,7 @@ dependencies = [
     "python-magic>=0.4.27",
     "pywikibot>=9.4.1",
     "requests>=2.32.3",
+    "tqdm>=4.67.0",
     "validators>=0.34.0",
 ]
 

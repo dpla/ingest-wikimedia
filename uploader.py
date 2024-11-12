@@ -1,4 +1,3 @@
-import csv
 import logging
 import mimetypes
 import re
@@ -7,6 +6,8 @@ from string import Template
 
 import click
 import pywikibot
+
+from tqdm import tqdm
 from pywikibot import FilePage
 from pywikibot.tools.chars import replace_invisible
 
@@ -31,6 +32,7 @@ from common import (
     get_list,
     get_dict,
     get_http_session,
+    load_ids,
 )
 from constants import (
     COMMONS_SITE_NAME,
@@ -284,10 +286,9 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
         providers_json = get_providers_data()
         logging.info(f"Starting upload for {partner}")
 
-        csv_reader = csv.reader(ids_file)
-        for row in csv_reader:
-            dpla_id = row[0]
+        dpla_ids = load_ids(ids_file)
 
+        for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit=" Items"):
             logging.info(f"DPLA ID: {dpla_id}")
 
             item_metadata = get_item_metadata(dpla_id, api_key)
@@ -309,9 +310,10 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
             ordinal = 0
             # todo should we walk s3 instead of trusting file list
+            # todo manifest of files?
             files = extract_urls(item_metadata)
 
-            for file in files:
+            for file in tqdm(files, desc="Uploading Files", leave=False, unit=" Files"):
                 ordinal += 1  # todo if we're walking s3, this comes from the name
                 logging.info(f"Page {ordinal}")
                 # one-pagers don't have page numbers in their titles
@@ -376,9 +378,18 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                         continue
 
                     if not dry_run:
-                        s3_object.download_file(
-                            temp_file.name,
-                        )
+                        with tqdm(
+                            s3_object.content_length,
+                            leave=False,
+                            desc="S3 Download",
+                            unit="B",
+                            unit_scale=1024,
+                            unit_divisor=True,
+                        ) as t:
+                            s3_object.download_file(
+                                temp_file.name,
+                                Callback=lambda bytes_xfer: t.update(bytes_xfer),
+                            )
 
                         wiki_file_page = get_page(site, page_title)
 

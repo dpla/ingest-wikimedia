@@ -1,39 +1,41 @@
-import csv
 import hashlib
 import logging
 import os
 import time
+from typing import IO
 
 import click
 import magic
 from botocore.exceptions import ClientError
 from mypy_boto3_s3.service_resource import S3ServiceResource
+from tqdm import tqdm
 
 from common import (
-    get_item_metadata,
-    extract_urls,
-    get_s3_path,
-    get_temp_file,
-    setup_temp_dir,
-    cleanup_temp_dir,
-    get_s3,
+    Result,
     Tracker,
-    setup_logging,
+    check_partner,
+    cleanup_temp_dir,
+    extract_urls,
+    get_http_session,
+    get_item_metadata,
     get_provider_and_data_provider,
     get_providers_data,
+    get_s3,
+    get_s3_path,
+    get_temp_file,
     is_wiki_eligible,
-    Result,
-    check_partner,
     provider_str,
-    get_http_session,
     s3_file_exists,
+    setup_logging,
+    setup_temp_dir,
+    load_ids,
 )
 from constants import (
+    INVALID_CONTENT_TYPES,
     S3_BUCKET,
     S3_KEY_CHECKSUM,
-    INVALID_CONTENT_TYPES,
-    S3_KEY_METADATA,
     S3_KEY_CONTENT_TYPE,
+    S3_KEY_METADATA,
 )
 
 
@@ -92,13 +94,22 @@ def upload_temp_file(
                 tracker.increment(Result.SKIPPED)
                 return
 
-            obj.upload_fileobj(
-                Fileobj=file,
-                ExtraArgs={
-                    S3_KEY_CONTENT_TYPE: content_type,
-                    S3_KEY_METADATA: {S3_KEY_CHECKSUM: sha1},
-                },
-            )
+            with tqdm(
+                os.stat(file.name).st_size,
+                desc="S3 Upload",
+                leave=False,
+                unit="B",
+                unit_divisor=1024,
+                unit_scale=True,
+            ) as t:
+                obj.upload_fileobj(
+                    Fileobj=file,
+                    ExtraArgs={
+                        S3_KEY_CONTENT_TYPE: content_type,
+                        S3_KEY_METADATA: {S3_KEY_CHECKSUM: sha1},
+                    },
+                    Callback=lambda bytes_xfer: t.update(bytes_xfer),
+                )
             tracker.increment(Result.DOWNLOADED)
     except Exception as e:
         raise Exception(
@@ -120,9 +131,20 @@ def get_content_type(temp_file):
 def download_file_to_temp_path(media_url: str):
     temp_file = get_temp_file()
     try:
-        response = get_http_session().get(media_url)
-        with open(temp_file.name, "wb") as f:
-            f.write(response.content)
+        response = get_http_session().get(media_url, stream=True)
+        total_size = int(response.headers.get("content-length", 0))
+        with tqdm(
+            total_size,
+            desc="HTTP Download",
+            leave=False,
+            unit="B",
+            unit_divisor=1024,
+            unit_scale=True,
+        ) as t:
+            with open(temp_file.name, "wb") as f:
+                for chunk in response.iter_content(None):
+                    t.update(len(chunk))
+                    f.write(chunk)
 
     except Exception as e:
         raise Exception(f"Failed saving {media_url} to local") from e
@@ -137,7 +159,7 @@ def download_file_to_temp_path(media_url: str):
 @click.option("--verbose", is_flag=True)
 @click.option("--overwrite", is_flag=True)
 def main(
-    ids_file: str,
+    ids_file: IO,
     partner: str,
     api_key: str,
     dry_run: bool,
@@ -160,9 +182,9 @@ def main(
 
         logging.info(f"Starting download for {partner}")
 
-        csv_reader = csv.reader(ids_file)
-        for row in csv_reader:
-            dpla_id = row[0]
+        dpla_ids = load_ids(ids_file)
+
+        for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit=" Items"):
             logging.info(f"DPLA ID: {dpla_id}")
             try:
                 item_metadata = get_item_metadata(dpla_id, api_key)
@@ -189,7 +211,9 @@ def main(
                 logging.info(f"Provider: {provider_str(provider)}")
                 logging.info(f"Data Provider: {provider_str(data_provider)}")
 
-            for media_url in media_urls:
+            for media_url in tqdm(
+                media_urls, desc="Downloading Files", leave=False, unit=" Files"
+            ):
                 count += 1
                 # hack to fix bad nara data
                 if media_url.startswith("https/"):
