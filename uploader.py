@@ -379,7 +379,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
                     if not dry_run:
                         with tqdm(
-                            s3_object.content_length,
+                            total=s3_object.content_length,
                             leave=False,
                             desc="S3 Download",
                             unit="B",

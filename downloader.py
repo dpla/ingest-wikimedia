@@ -95,7 +95,7 @@ def upload_temp_file(
                 return
 
             with tqdm(
-                os.stat(file.name).st_size,
+                total=os.stat(file.name).st_size,
                 desc="S3 Upload",
                 leave=False,
                 unit="B",
@@ -134,7 +134,7 @@ def download_file_to_temp_path(media_url: str):
         response = get_http_session().get(media_url, stream=True)
         total_size = int(response.headers.get("content-length", 0))
         with tqdm(
-            total_size,
+            total=total_size,
             desc="HTTP Download",
             leave=False,
             unit="B",
