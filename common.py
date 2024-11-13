@@ -2,7 +2,6 @@ import csv
 import logging
 import os
 import re
-import shutil
 import sys
 import tempfile
 from datetime import datetime
@@ -52,7 +51,6 @@ from constants import (
     PROVIDER_FIELD_NAME,
     RIGHTS_CATEGORY_FIELD_NAME,
     S3_RETRIES,
-    TMP_DIR_BASE,
     UNLIMITED_RE_USE,
     UPLOAD_FIELD_NAME,
     WIKIDATA_FIELD_NAME,
@@ -60,7 +58,8 @@ from constants import (
     EDM_IS_SHOWN_AT,
 )
 
-__http_session = None
+__http_session: requests.Session | None = None
+__temp_dir: tempfile.TemporaryDirectory | None = None
 
 
 def load_ids(ids_file: IO) -> list[str]:
@@ -262,16 +261,32 @@ def s3_file_exists(path: str, s3: S3ServiceResource):
 
 
 def setup_temp_dir() -> None:
-    if not os.path.isdir(TMP_DIR_BASE):
-        os.mkdir(TMP_DIR_BASE)
+    global __temp_dir
+    if __temp_dir is not None:
+        __temp_dir = tempfile.TemporaryDirectory(
+            "tmp", "wiki", dir=".", ignore_cleanup_errors=True, delete=False
+        )
 
 
 def cleanup_temp_dir() -> None:
-    shutil.rmtree(TMP_DIR_BASE)
+    global __temp_dir
+    if __temp_dir is not None:
+        __temp_dir.cleanup()
 
 
 def get_temp_file():
-    return tempfile.NamedTemporaryFile(delete=False, dir=TMP_DIR_BASE)
+    global __temp_dir
+    if __temp_dir is None:
+        raise Exception("Temp dir not initialized.")
+    return tempfile.NamedTemporaryFile(delete=False, dir=__temp_dir.name)
+
+
+def clean_up_tmp_file(temp_file) -> None:
+    try:
+        if temp_file:
+            os.unlink(temp_file.name)
+    except Exception as e:
+        logging.warning("Temp file unlink failed.", exc_info=e)
 
 
 def get_s3() -> S3ServiceResource:
@@ -315,14 +330,6 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
     for d in logging.Logger.manager.loggerDict:
         if d.startswith("pywiki"):
             logging.getLogger(d).setLevel(logging.ERROR)
-
-
-def clean_up_tmp_file(temp_file) -> None:
-    try:
-        if temp_file:
-            os.unlink(temp_file.name)
-    except Exception as e:
-        logging.warning("Temp file unlink failed.", exc_info=e)
 
 
 Result = Enum("Result", ["DOWNLOADED", "FAILED", "SKIPPED", "UPLOADED", "BYTES"])
