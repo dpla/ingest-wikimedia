@@ -12,69 +12,68 @@ from pywikibot import FilePage
 from pywikibot.tools.chars import replace_invisible
 
 from common import (
-    get_item_metadata,
-    extract_urls,
-    get_s3_path,
-    get_temp_file,
-    setup_temp_dir,
-    cleanup_temp_dir,
-    get_s3,
-    setup_logging,
-    clean_up_tmp_file,
-    Tracker,
-    Result,
-    is_wiki_eligible,
-    get_provider_and_data_provider,
-    get_providers_data,
-    check_partner,
-    provider_str,
     get_str,
     get_list,
     get_dict,
-    get_http_session,
     load_ids,
 )
-from constants import (
-    COMMONS_SITE_NAME,
-    WMC_UPLOAD_CHUNK_SIZE,
-    IGNORE_WIKIMEDIA_WARNINGS,
-    S3_BUCKET,
-    S3_KEY_CHECKSUM,
-    INVALID_CONTENT_TYPES,
-    WIKIDATA_FIELD_NAME,
-    EDM_RIGHTS_FIELD_NAME,
-    RESERVED_WIKITEXT_STRINGS,
+from logs import setup_logging
+from s3 import get_s3_path, get_s3, S3_BUCKET, S3_KEY_CHECKSUM
+from tracker import Result, Tracker
+from temp import setup_temp_dir, cleanup_temp_dir, get_temp_file, clean_up_tmp_file
+from dpla import (
+    check_partner,
+    get_item_metadata,
+    is_wiki_eligible,
+    get_provider_and_data_provider,
+    get_providers_data,
+    provider_str,
     SOURCE_RESOURCE_FIELD_NAME,
-    VALUE_JOIN_DELIMITER,
-    DC_CREATOR_FIELD_NAME,
-    DC_TITLE_FIELD_NAME,
-    DC_DESCRIPTION_FIELD_NAME,
-    DC_DATE_FIELD_NAME,
-    EDM_TIMESPAN_PREF_LABEL,
     EDM_IS_SHOWN_AT,
+    EDM_RIGHTS_FIELD_NAME,
+    EDM_TIMESPAN_PREF_LABEL,
+    DC_CREATOR_FIELD_NAME,
+    DC_DATE_FIELD_NAME,
+    DC_DESCRIPTION_FIELD_NAME,
+    DC_TITLE_FIELD_NAME,
     DC_IDENTIFIER_FIELD_NAME,
-    CC_URL_REGEX,
-    CC_BY_SA_URL_BASE,
-    CC_BY_URL_BASE,
-    CC_ZERO_URL_BASE,
-    CC_PD_URL_BASE,
-    RS_NOC_URL_BASE,
-    RS_NKC_URL_BASE,
-    RS_NKC_TEMPLATE,
-    NOC_US_TEMPLATE,
-    PD_US_TEMPLATE,
-    CC_ZERO_TEMPLATE,
-    RIGHTS_STATEMENTS_URL_BASE,
+    WIKIDATA_FIELD_NAME,
+    extract_urls,
+)
+from web import get_http_session
+from wikimedia import (
+    INVALID_CONTENT_TYPES,
     COMMONS_URL_PREFIX,
-    FIND_BY_HASH_URL_PREFIX,
-    FIND_BY_HASH_QUERY_FIELD_NAME,
-    FIND_BY_HASH_ALLIMAGES_FIELD_NAME,
     ERROR_FILEEXISTS,
     ERROR_MIME,
     ERROR_BANNED,
     ERROR_DUPLICATE,
     ERROR_NOCHANGE,
+    COMMONS_SITE_NAME,
+    WMC_UPLOAD_CHUNK_SIZE,
+    VALUE_JOIN_DELIMITER,
+    RESERVED_WIKITEXT_STRINGS,
+    IGNORE_WIKIMEDIA_WARNINGS,
+    FIND_BY_HASH_URL_PREFIX,
+    FIND_BY_HASH_QUERY_FIELD_NAME,
+    FIND_BY_HASH_ALLIMAGES_FIELD_NAME,
 )
+
+CC_URL_REGEX = "^http://creativecommons.org/licenses/(.*)"
+
+RIGHTS_STATEMENTS_URL_BASE = "http://rightsstatements.org"
+RS_NKC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NKC/"
+RS_NOC_URL_BASE = RIGHTS_STATEMENTS_URL_BASE + "/vocab/NoC-US/"
+CC_URL_BASE = "http://creativecommons.org"
+CC_PD_URL_BASE = CC_URL_BASE + "/publicdomain/mark/"
+CC_ZERO_URL_BASE = CC_URL_BASE + "/publicdomain/zero/"
+CC_BY_URL_BASE = CC_URL_BASE + "/licenses/by/"
+CC_BY_SA_URL_BASE = CC_URL_BASE + "/licenses/by-sa/"
+
+CC_ZERO_TEMPLATE = "cc-zero"
+RS_NKC_TEMPLATE = "NKC"
+NOC_US_TEMPLATE = "NoC-US"
+PD_US_TEMPLATE = "PD-US"
 
 
 def get_page(site: pywikibot.Site, title: str) -> FilePage:
@@ -288,7 +287,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
         dpla_ids = load_ids(ids_file)
 
-        for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit=" Items"):
+        for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item"):
             logging.info(f"DPLA ID: {dpla_id}")
 
             item_metadata = get_item_metadata(dpla_id, api_key)
@@ -313,7 +312,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
             # todo manifest of files?
             files = extract_urls(item_metadata)
 
-            for file in tqdm(files, desc="Uploading Files", leave=False, unit=" Files"):
+            for file in tqdm(files, desc="Uploading Files", leave=False, unit="File"):
                 ordinal += 1  # todo if we're walking s3, this comes from the name
                 logging.info(f"Page {ordinal}")
                 # one-pagers don't have page numbers in their titles
@@ -385,6 +384,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                             unit="B",
                             unit_scale=1024,
                             unit_divisor=True,
+                            delay=2,
                         ) as t:
                             s3_object.download_file(
                                 temp_file.name,
