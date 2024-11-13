@@ -19,7 +19,8 @@ def get_item_metadata(dpla_id: str, api_key: str) -> dict:
     headers = {AUTHORIZATION_HEADER: api_key}
     response = get_http_session().get(url, headers=headers)
     response_json = response.json()
-    return response_json.get(DPLA_API_DOCS)[0]
+    docs = get_list(response_json, DPLA_API_DOCS)
+    return docs[0] if docs else {}
 
 
 def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
