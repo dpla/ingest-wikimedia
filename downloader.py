@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import time
+from web import get_http_session
 from typing import IO
 
 import click
@@ -11,32 +12,30 @@ from mypy_boto3_s3.service_resource import S3ServiceResource
 from tqdm import tqdm
 
 from common import (
-    Result,
-    Tracker,
+    load_ids,
+)
+from wikimedia import INVALID_CONTENT_TYPES
+from dpla import (
     check_partner,
-    cleanup_temp_dir,
-    extract_urls,
-    get_http_session,
     get_item_metadata,
     get_provider_and_data_provider,
     get_providers_data,
-    get_s3,
-    get_s3_path,
-    get_temp_file,
     is_wiki_eligible,
     provider_str,
-    s3_file_exists,
-    setup_logging,
-    setup_temp_dir,
-    load_ids,
+    extract_urls,
 )
-from constants import (
-    INVALID_CONTENT_TYPES,
+from logs import setup_logging
+from s3 import (
+    get_s3,
+    get_s3_path,
+    s3_file_exists,
     S3_BUCKET,
     S3_KEY_CHECKSUM,
-    S3_KEY_CONTENT_TYPE,
     S3_KEY_METADATA,
+    S3_KEY_CONTENT_TYPE,
 )
+from temp import cleanup_temp_dir, get_temp_file, setup_temp_dir
+from tracker import Result, Tracker
 
 
 def download_media(
@@ -101,6 +100,7 @@ def upload_temp_file(
                 unit="B",
                 unit_divisor=1024,
                 unit_scale=True,
+                delay=2,
             ) as t:
                 obj.upload_fileobj(
                     Fileobj=file,
@@ -140,6 +140,7 @@ def download_file_to_temp_path(media_url: str):
             unit="B",
             unit_divisor=1024,
             unit_scale=True,
+            delay=2,
         ) as t:
             with open(temp_file.name, "wb") as f:
                 for chunk in response.iter_content(None):
@@ -184,7 +185,7 @@ def main(
 
         dpla_ids = load_ids(ids_file)
 
-        for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit=" Items"):
+        for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item"):
             logging.info(f"DPLA ID: {dpla_id}")
             try:
                 item_metadata = get_item_metadata(dpla_id, api_key)
@@ -212,7 +213,7 @@ def main(
                 logging.info(f"Data Provider: {provider_str(data_provider)}")
 
             for media_url in tqdm(
-                media_urls, desc="Downloading Files", leave=False, unit=" Files"
+                media_urls, desc="Downloading Files", leave=False, unit="File"
             ):
                 count += 1
                 # hack to fix bad nara data
