@@ -1,14 +1,16 @@
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
+import threading
 
-__http_session: requests.Session | None = None
+
+__thread_local = threading.local()
+__thread_local.http_session = None
 
 
 def get_http_session() -> requests.Session:
-    global __http_session
-    if __http_session is not None:
-        return __http_session
+    if __thread_local.http_session is not None:
+        return __thread_local.http_session
     retry_strategy = Retry(
         connect=3,
         read=3,
@@ -23,10 +25,11 @@ def get_http_session() -> requests.Session:
         raise_on_redirect=True,
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
-    __http_session = requests.Session()
-    __http_session.mount("https://", adapter)
-    __http_session.mount("http://", adapter)
-    return __http_session
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    __thread_local.http_session = session
+    return session
 
 
 HTTP_REQUEST_HEADERS = {
