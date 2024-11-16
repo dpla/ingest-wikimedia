@@ -18,7 +18,7 @@ from common import (
     load_ids,
 )
 from logs import setup_logging
-from s3 import get_s3_path, get_s3, S3_BUCKET, S3_KEY_CHECKSUM
+from s3 import get_s3_path, get_s3, S3_BUCKET, S3_KEY_CHECKSUM, s3_file_exists
 from tracker import Result, Tracker
 from temp import setup_temp_dir, cleanup_temp_dir, get_temp_file, clean_up_tmp_file
 from dpla import (
@@ -288,138 +288,153 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
         dpla_ids = load_ids(ids_file)
 
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item"):
-            logging.info(f"DPLA ID: {dpla_id}")
+            try:
+                logging.info(f"DPLA ID: {dpla_id}")
 
-            item_metadata = get_item_metadata(dpla_id, api_key)
+                item_metadata = get_item_metadata(dpla_id, api_key)
 
-            provider, data_provider = get_provider_and_data_provider(
-                item_metadata, providers_json
-            )
+                provider, data_provider = get_provider_and_data_provider(
+                    item_metadata, providers_json
+                )
 
-            if not is_wiki_eligible(item_metadata, provider, data_provider):
-                tracker.increment(Result.SKIPPED)
-                continue
+                if not is_wiki_eligible(item_metadata, provider, data_provider):
+                    tracker.increment(Result.SKIPPED)
+                    continue
 
-            titles = get_list(
-                get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME), DC_TITLE_FIELD_NAME
-            )
+                titles = get_list(
+                    get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
+                    DC_TITLE_FIELD_NAME,
+                )
 
-            # playing it safe in case titles is empty
-            title = titles[0] if titles else ""
+                # playing it safe in case titles is empty
+                title = titles[0] if titles else ""
 
-            ordinal = 0
-            # todo should we walk s3 instead of trusting file list
-            # todo manifest of files?
-            files = extract_urls(item_metadata)
+                ordinal = 0
+                # todo should we walk s3 instead of trusting file list
+                # todo manifest of files?
+                files = extract_urls(item_metadata)
 
-            for file in tqdm(files, desc="Uploading Files", leave=False, unit="File"):
-                ordinal += 1  # todo if we're walking s3, this comes from the name
-                logging.info(f"Page {ordinal}")
-                # one-pagers don't have page numbers in their titles
-                page_label = None if len(files) == 1 else ordinal
-                temp_file = get_temp_file()
-                try:
-                    wiki_markup = get_wiki_text(
-                        dpla_id, item_metadata, provider, data_provider
-                    )
-                    s3_path = get_s3_path(dpla_id, ordinal, partner)
-                    upload_comment = (
-                        f'Uploading DPLA ID "[[dpla:{dpla_id}|{dpla_id}]]".'
-                    )
-                    # todo what if file doesn't exist
-                    s3_object = s3.Object(S3_BUCKET, s3_path)
-                    file_size = s3_object.content_length
-                    sha1 = s3_object.metadata.get(S3_KEY_CHECKSUM, "")
-
-                    mime = s3_object.content_type
-                    if mime in INVALID_CONTENT_TYPES:
-                        logging.info(
-                            f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}"
+                for file in tqdm(
+                    files, desc="Uploading Files", leave=False, unit="File"
+                ):
+                    ordinal += 1  # todo if we're walking s3, this comes from the name
+                    logging.info(f"Page {ordinal}")
+                    # one-pagers don't have page numbers in their titles
+                    page_label = None if len(files) == 1 else ordinal
+                    temp_file = get_temp_file()
+                    try:
+                        wiki_markup = get_wiki_text(
+                            dpla_id, item_metadata, provider, data_provider
                         )
-                        tracker.increment(Result.SKIPPED)
-                        continue
-
-                    ext = mimetypes.guess_extension(mime)
-
-                    if not ext:
-                        logging.info(
-                            f"Skipping {dpla_id} {ordinal}: "
-                            f"Unable to guess extension for {mime}"
+                        s3_path = get_s3_path(dpla_id, ordinal, partner)
+                        upload_comment = (
+                            f'Uploading DPLA ID "[[dpla:{dpla_id}|{dpla_id}]]".'
                         )
-                        tracker.increment(Result.SKIPPED)
-                        continue
+                        if not s3_file_exists(s3_path, s3):
+                            logging.info(f"{dpla_id} {ordinal} not present.")
+                            tracker.increment(Result.SKIPPED)
+                            continue
+                        s3_object = s3.Object(S3_BUCKET, s3_path)
+                        file_size = s3_object.content_length
 
-                    page_title = get_page_title(
-                        item_title=title,
-                        dpla_identifier=dpla_id,
-                        suffix=ext,
-                        page=page_label,
-                    )
+                        sha1 = s3_object.metadata.get(S3_KEY_CHECKSUM, "")
 
-                    if verbose:
-                        logging.info(f"DPLA ID: {dpla_id}")
-                        logging.info(f"Title: {title}")
-                        logging.info(f"Page title: {page_title}")
-                        logging.info(f"Provider: {provider_str(provider)}")
-                        logging.info(f"Data Provider: {provider_str(data_provider)}")
-                        logging.info(f"MIME: {mime}")
-                        logging.info(f"Extension: {ext}")
-                        logging.info(f"File size: {file_size}")
-                        logging.info(f"SHA-1: {sha1}")
-                        logging.info(f"Upload comment: {upload_comment}")
-                        logging.info(f"Wikitext: \n {wiki_markup}")
+                        mime = s3_object.content_type
+                        if mime in INVALID_CONTENT_TYPES:
+                            logging.info(
+                                f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}"
+                            )
+                            tracker.increment(Result.SKIPPED)
+                            continue
 
-                    if wiki_file_exists(sha1):
-                        logging.info(
-                            f"Skipping {dpla_id} {ordinal}: Already exists on commons."
+                        ext = mimetypes.guess_extension(mime)
+
+                        if not ext:
+                            logging.info(
+                                f"Skipping {dpla_id} {ordinal}: "
+                                f"Unable to guess extension for {mime}"
+                            )
+                            tracker.increment(Result.SKIPPED)
+                            continue
+
+                        page_title = get_page_title(
+                            item_title=title,
+                            dpla_identifier=dpla_id,
+                            suffix=ext,
+                            page=page_label,
                         )
-                        tracker.increment(Result.SKIPPED)
-                        continue
 
-                    if not dry_run:
-                        with tqdm(
-                            total=s3_object.content_length,
-                            leave=False,
-                            desc="S3 Download",
-                            unit="B",
-                            unit_scale=1024,
-                            unit_divisor=True,
-                            delay=2,
-                        ) as t:
-                            s3_object.download_file(
-                                temp_file.name,
-                                Callback=lambda bytes_xfer: t.update(bytes_xfer),
+                        if verbose:
+                            logging.info(f"DPLA ID: {dpla_id}")
+                            logging.info(f"Title: {title}")
+                            logging.info(f"Page title: {page_title}")
+                            logging.info(f"Provider: {provider_str(provider)}")
+                            logging.info(
+                                f"Data Provider: {provider_str(data_provider)}"
+                            )
+                            logging.info(f"MIME: {mime}")
+                            logging.info(f"Extension: {ext}")
+                            logging.info(f"File size: {file_size}")
+                            logging.info(f"SHA-1: {sha1}")
+                            logging.info(f"Upload comment: {upload_comment}")
+                            logging.info(f"Wikitext: \n {wiki_markup}")
+
+                        if wiki_file_exists(sha1):
+                            logging.info(
+                                f"Skipping {dpla_id} {ordinal}: Already exists on commons."
+                            )
+                            tracker.increment(Result.SKIPPED)
+                            continue
+
+                        if not dry_run:
+                            with tqdm(
+                                total=s3_object.content_length,
+                                leave=False,
+                                desc="S3 Download",
+                                unit="B",
+                                unit_scale=1024,
+                                unit_divisor=True,
+                                delay=2,
+                            ) as t:
+                                s3_object.download_file(
+                                    temp_file.name,
+                                    Callback=lambda bytes_xfer: t.update(bytes_xfer),
+                                )
+
+                            wiki_file_page = get_page(site, page_title)
+
+                            result = site.upload(
+                                filepage=wiki_file_page,
+                                source_filename=temp_file.name,
+                                comment=upload_comment,
+                                text=wiki_markup,
+                                ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
+                                asynchronous=True,
+                                chunk_size=WMC_UPLOAD_CHUNK_SIZE,
                             )
 
-                        wiki_file_page = get_page(site, page_title)
+                            if not result:
+                                # These error message accounts for Page does not exist,
+                                # but File does exist and is linked to another Page
+                                # (ex. DPLA ID drift)
+                                tracker.increment(Result.FAILED)
+                                raise Exception(
+                                    "File linked to another page (possible ID drift)"
+                                )
 
-                        result = site.upload(
-                            filepage=wiki_file_page,
-                            source_filename=temp_file.name,
-                            comment=upload_comment,
-                            text=wiki_markup,
-                            ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
-                            asynchronous=True,
-                            chunk_size=WMC_UPLOAD_CHUNK_SIZE,
-                        )
+                            logging.info(f"Uploaded to {wikimedia_url(page_title)}")
+                            tracker.increment(Result.UPLOADED)
+                            tracker.increment(Result.BYTES, file_size)
 
-                        if not result:
-                            # These error message accounts for Page does not exist,
-                            # but File does exist and is linked to another Page
-                            # (ex. DPLA ID drift)
-                            tracker.increment(Result.FAILED)
-                            raise Exception(
-                                "File linked to another page (possible ID drift)"
-                            )
-
-                        logging.info(f"Uploaded to {wikimedia_url(page_title)}")
-                        tracker.increment(Result.UPLOADED)
-                        tracker.increment(Result.BYTES, file_size)
-
-                except Exception as ex:
-                    handle_upload_exception(ex)
-                finally:
-                    clean_up_tmp_file(temp_file)
+                    except Exception as ex:
+                        handle_upload_exception(ex)
+                    finally:
+                        clean_up_tmp_file(temp_file)
+            except Exception as ex:
+                logging.warning(
+                    f"Caught exception getting item info for {dpla_id}", exc_info=ex
+                )
+                tracker.increment(Result.FAILED)
 
     finally:
         logging.info("\n" + str(tracker))
