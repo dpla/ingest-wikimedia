@@ -9,7 +9,7 @@ def setup_temp_dir() -> None:
     global __temp_dir
     if __temp_dir is None:
         __temp_dir = tempfile.TemporaryDirectory(
-            "tmp", "wiki", dir="", ignore_cleanup_errors=True, delete=False
+            "tmp", "wiki-tmp-", dir="", ignore_cleanup_errors=True, delete=False
         )
 
 
