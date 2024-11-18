@@ -5,6 +5,7 @@ description = "Uploading media from DPLA to Wikimedia Commons"
 authors = [
     { name = "Scott Williams", email = "scott@dp.la" },
     { name = "Michael Della Bitta", email = "michael@dp.la" },
+    { name = "Dominic Byrd-McDevitt", email = "dominic@dp.la" },
 ]
 license = { text = "MIT License" }
 classifiers = ["Private :: Do Not Upload"]
