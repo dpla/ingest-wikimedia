@@ -1,29 +1,41 @@
+import json
 import logging
 import re
-import sys
 from urllib.parse import urlparse
 
 import validators
 
-from common import null_safe, get_str, get_list, get_dict
-from web import get_http_session, HTTP_REQUEST_HEADERS
+from .common import null_safe, get_str, get_list, get_dict
+from .s3 import write_iiif_manifest
+from .web import get_http_session, HTTP_REQUEST_HEADERS
 
 
 def check_partner(partner: str) -> None:
+    """
+    Blows up if we're working on a partner we shouldn't.
+    """
     if partner not in DPLA_PARTNERS:
-        sys.exit("Unrecognized partner.")
+        raise Exception("Unrecognized partner.")
 
 
 def get_item_metadata(dpla_id: str, api_key: str) -> dict:
+    """
+    Retrieves a DPLA MAP record from the DPLA API for an item.
+    """
     url = DPLA_API_URL_BASE + dpla_id
     headers = {AUTHORIZATION_HEADER: api_key}
     response = get_http_session().get(url, headers=headers)
+    response.raise_for_status()
     response_json = response.json()
     docs = get_list(response_json, DPLA_API_DOCS)
     return docs[0] if docs else {}
 
 
 def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
+    """
+    Enforces a number of criteria for ensuring this is an item we should upload.
+    """
+
     provider_ok = null_safe(provider, UPLOAD_FIELD_NAME, False) or null_safe(
         data_provider, UPLOAD_FIELD_NAME, False
     )
@@ -34,7 +46,7 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
 
     is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
     media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
-    iiif_manifest = null_safe(item_metadata, IIIF_MANIFEST_FIELD_NAME, False)
+    iiif_manifest = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
 
     if not iiif_manifest and not media_master:
         iiif_url = contentdm_iiif_url(is_shown_at)
@@ -44,10 +56,10 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
                 item_metadata[IIIF_MANIFEST_FIELD_NAME] = iiif_url
                 iiif_manifest = True
 
-    asset_ok = media_master or iiif_manifest
+    asset_ok = (media_master is not None) or (iiif_manifest is not None)
 
     # todo create banlist. item based? sha based? local id based? all three?
-    # todo don't reupload if deleted
+    # todo don't re-upload if deleted
 
     id_ok = True
 
@@ -64,7 +76,6 @@ def get_provider_and_data_provider(
     """
     Loads metadata about the provider and data provider from the providers json file.
     """
-
     provider_name = get_str(
         get_dict(item_metadata, PROVIDER_FIELD_NAME), EDM_AGENT_NAME
     )
@@ -84,6 +95,9 @@ def get_providers_data() -> dict:
 
 
 def provider_str(provider: dict) -> str:
+    """
+    Creates a human-readable string out of the provider record.
+    """
     if provider is None:
         return "Provider: None"
     else:
@@ -93,12 +107,23 @@ def provider_str(provider: dict) -> str:
         )
 
 
-def extract_urls(item_metadata: dict) -> list[str]:
+def extract_urls(
+    partner,
+    dpla_id,
+    item_metadata: dict,
+) -> list[str]:
+    """
+    Tries to find some way to get a list of file urls out of the item. Writes the IIIF
+    manifest to S3 if there is one.
+    """
     if MEDIA_MASTER_FIELD_NAME in item_metadata:
         return get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)
 
     elif IIIF_MANIFEST_FIELD_NAME in item_metadata:
-        return get_iiif_urls(get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME))
+        manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
+        manifest = get_iiif_manifest(manifest_url)
+        write_iiif_manifest(partner, dpla_id, json.dumps(manifest))
+        return get_iiif_urls(manifest)
 
     else:
         raise NotImplementedError(
@@ -149,12 +174,11 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
     return urls
 
 
-def get_iiif_urls(iiif_presentation_api_url: str) -> list[str]:
+def get_iiif_urls(manifest: dict) -> list[str]:
     """
     Extracts image URLs from IIIF manifest and returns them as a list
     Currently only supports IIIF v2 and v3
     """
-    manifest = _get_iiif_manifest(iiif_presentation_api_url)
     # v2 or v3?
     if get_str(manifest, JSON_LD_AT_CONTEXT) == IIIF_PRESENTATION_API_MANIFEST_V3:
         return iiif_v3_urls(manifest)
@@ -164,9 +188,9 @@ def get_iiif_urls(iiif_presentation_api_url: str) -> list[str]:
         raise Exception("Unimplemented IIIF version")
 
 
-def _get_iiif_manifest(url: str) -> dict:
+def get_iiif_manifest(url: str) -> dict:
     """
-    :return: parsed JSON
+    Gets the IIIF manifest from the given url.
     """
     if not validators.url(url):
         raise Exception(f"Invalid url {url}")

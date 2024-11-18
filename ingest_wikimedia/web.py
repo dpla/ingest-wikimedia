@@ -9,6 +9,9 @@ __thread_local.http_session = None
 
 
 def get_http_session() -> requests.Session:
+    """
+    Returns an initialized Requests session for the current thread.
+    """
     if __thread_local.http_session is not None:
         return __thread_local.http_session
     retry_strategy = Retry(

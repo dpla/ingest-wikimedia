@@ -11,17 +11,23 @@ from tqdm import tqdm
 from pywikibot import FilePage
 from pywikibot.tools.chars import replace_invisible
 
-from common import (
+from ingest_wikimedia.common import (
     get_str,
     get_list,
     get_dict,
     load_ids,
+    CHECKSUM,
 )
-from logs import setup_logging
-from s3 import get_s3_path, get_s3, S3_BUCKET, S3_KEY_CHECKSUM, s3_file_exists
-from tracker import Result, Tracker
-from temp import setup_temp_dir, cleanup_temp_dir, get_temp_file, clean_up_tmp_file
-from dpla import (
+from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.s3 import get_media_s3_path, get_s3, S3_BUCKET, s3_file_exists
+from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.local import (
+    setup_temp_dir,
+    cleanup_temp_dir,
+    get_temp_file,
+    clean_up_tmp_file,
+)
+from ingest_wikimedia.metadata import (
     check_partner,
     get_item_metadata,
     is_wiki_eligible,
@@ -40,8 +46,8 @@ from dpla import (
     WIKIDATA_FIELD_NAME,
     extract_urls,
 )
-from web import get_http_session
-from wikimedia import (
+from ingest_wikimedia.web import get_http_session
+from ingest_wikimedia.wikimedia import (
     INVALID_CONTENT_TYPES,
     COMMONS_URL_PREFIX,
     ERROR_FILEEXISTS,
@@ -310,9 +316,8 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                 title = titles[0] if titles else ""
 
                 ordinal = 0
-                # todo should we walk s3 instead of trusting file list
                 # todo manifest of files?
-                files = extract_urls(item_metadata)
+                files = extract_urls(partner, dpla_id, item_metadata)
 
                 for file in tqdm(
                     files, desc="Uploading Files", leave=False, unit="File"
@@ -326,20 +331,20 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
                         wiki_markup = get_wiki_text(
                             dpla_id, item_metadata, provider, data_provider
                         )
-                        s3_path = get_s3_path(dpla_id, ordinal, partner)
+                        s3_path = get_media_s3_path(dpla_id, ordinal, partner)
                         upload_comment = (
                             f'Uploading DPLA ID "[[dpla:{dpla_id}|{dpla_id}]]".'
                         )
-                        if not s3_file_exists(s3_path, s3):
+                        if not s3_file_exists(s3_path):
                             logging.info(f"{dpla_id} {ordinal} not present.")
                             tracker.increment(Result.SKIPPED)
                             continue
+
                         s3_object = s3.Object(S3_BUCKET, s3_path)
                         file_size = s3_object.content_length
-
-                        sha1 = s3_object.metadata.get(S3_KEY_CHECKSUM, "")
-
+                        sha1 = s3_object.metadata.get(CHECKSUM, "")
                         mime = s3_object.content_type
+
                         if mime in INVALID_CONTENT_TYPES:
                             logging.info(
                                 f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}"
@@ -428,8 +433,10 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
                     except Exception as ex:
                         handle_upload_exception(ex)
+
                     finally:
                         clean_up_tmp_file(temp_file)
+
             except Exception as ex:
                 logging.warning(
                     f"Caught exception getting item info for {dpla_id}", exc_info=ex
