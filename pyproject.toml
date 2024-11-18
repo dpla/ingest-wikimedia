@@ -39,5 +39,6 @@ build-backend = "hatchling.build"
 [project.scripts]
 uploader = "tools.uploader:main"
 downloader = "tools.downloader:main"
-
+sign = "tools.sign:main"
+nuke = "tools.nuke:main"
 
