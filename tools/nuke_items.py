@@ -25,7 +25,7 @@ def main(ids_file: IO, partner: str, dry_run: bool):
     for dpla_id in tqdm(dpla_ids, desc="Nuking Items", unit="Item"):
         logging.info(f"DPLA ID: {dpla_id}")
         s3_path = get_item_s3_path(dpla_id, "", partner)
-        command = f"aws s3 rm s3://{S3_BUCKET}/{s3_path} --recursive --dryrun"
+        command = f"aws s3 rm s3://{S3_BUCKET}/{s3_path} --recursive"
         if dry_run:
             command = command + " --dryrun"
         os.system(command)
