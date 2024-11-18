@@ -1,7 +1,7 @@
 import requests
 
 api_query_base = (
-    "https://api.dp.la/v2/items?api_key=f584083b954d0fb03cb2b882b100cd51"
+    "https://api.dp.la/v2/items?api_key=QQQ"
     "&provider.name=Minnesota+Digital+Library"
     "&dataProvider.name=Hennepin+County+Library"
     "&rightsCategory=Unlimited+Re-Use"
