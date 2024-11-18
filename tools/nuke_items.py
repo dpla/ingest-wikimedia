@@ -1,5 +1,5 @@
 import logging
-import os
+import subprocess
 import time
 from typing import IO
 
@@ -28,7 +28,7 @@ def main(ids_file: IO, partner: str, dry_run: bool):
         command = f"aws s3 rm s3://{S3_BUCKET}/{s3_path} --recursive"
         if dry_run:
             command = command + " --dryrun"
-        os.system(command)
+        subprocess.run(command, shell=True, check=True)
 
     logging.info(f"{time.time() - start_time} seconds.")
 
