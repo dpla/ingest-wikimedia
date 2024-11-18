@@ -14,8 +14,12 @@ def load_ids(ids_file: IO) -> list[str]:
 
 
 def null_safe[T](data: dict, field_name: str, identity_element: T) -> T:
-    if data is not None:
-        return data.get(field_name, identity_element)
+    if data is not None and type(data) is dict:
+        value = data.get(field_name, identity_element)
+        if type(value) is type(identity_element):
+            return value
+        else:
+            return identity_element
     else:
         return identity_element
 
