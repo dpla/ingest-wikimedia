@@ -24,6 +24,11 @@ class TqdmLoggingHandler(logging.Handler):
 
 
 def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> None:
+    """
+    Creates a logfile for this process with a unique timestamp and with the partner's
+    name. Passes local logging through tqdm so the progress bars don't get mangled.
+    Suppresses pywikibot logging below ERROR.
+    """
     os.makedirs(LOGS_DIR_BASE, exist_ok=True)
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_file_name = f"{time_str}-{partner}-{event_type}.log"

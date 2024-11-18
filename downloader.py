@@ -1,83 +1,63 @@
-import hashlib
+import json
 import logging
 import os
 import time
+
 from web import get_http_session
 from typing import IO
 
 import click
-import magic
 from botocore.exceptions import ClientError
-from mypy_boto3_s3.service_resource import S3ServiceResource
 from tqdm import tqdm
 
 from common import (
     load_ids,
+    get_list,
+    get_str,
 )
-from wikimedia import INVALID_CONTENT_TYPES
-from dpla import (
+from metadata import (
     check_partner,
     get_item_metadata,
     get_provider_and_data_provider,
     get_providers_data,
     is_wiki_eligible,
     provider_str,
-    extract_urls,
+    MEDIA_MASTER_FIELD_NAME,
+    IIIF_MANIFEST_FIELD_NAME,
+    get_iiif_manifest,
+    get_iiif_urls,
 )
 from logs import setup_logging
 from s3 import (
     get_s3,
-    get_s3_path,
+    get_media_s3_path,
     s3_file_exists,
     S3_BUCKET,
     S3_KEY_CHECKSUM,
     S3_KEY_METADATA,
     S3_KEY_CONTENT_TYPE,
+    write_item_metadata,
+    write_file_list,
+    write_iiif_manifest,
 )
-from temp import cleanup_temp_dir, get_temp_file, setup_temp_dir
+from local import (
+    cleanup_temp_dir,
+    setup_temp_dir,
+    get_file_hash,
+    get_content_type,
+    get_temp_file,
+)
 from tracker import Result, Tracker
 
 
-def download_media(
-    partner: str,
-    dpla_id: str,
-    ordinal: int,
-    media_url: str,
-    overwrite: bool,
-    s3: S3ServiceResource,
-    tracker: Tracker,
-) -> None:
-    temp_file = None
+def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1: str):
+    """
+    Once we have a valid file to store in S3, this puts it there.
+    """
+    tracker = Tracker()
     try:
-        destination_path = get_s3_path(dpla_id, ordinal, partner)
-        if not overwrite and s3_file_exists(destination_path, s3):
-            logging.info("Key already in S3.")
-            tracker.increment(Result.SKIPPED)
-            return
-        temp_file = download_file_to_temp_path(media_url)
-        content_type = get_content_type(temp_file)
-        sha1 = get_file_hash(temp_file)
-        upload_temp_file(
-            content_type, destination_path, media_url, s3, sha1, temp_file, tracker
-        )
-
-    finally:
-        if temp_file:
-            temp_file.close()
-            os.unlink(temp_file.name)
-
-
-def upload_temp_file(
-    content_type: str,
-    destination_path: str,
-    media_url: str,
-    s3: S3ServiceResource,
-    sha1: str,
-    temp_file,
-    tracker: Tracker,
-):
-    try:
-        with open(temp_file.name, "rb") as file:
+        with open(file, "rb") as file:
+            s3 = get_s3()
             obj = s3.Object(S3_BUCKET, destination_path)
             obj_metadata = None
             try:
@@ -111,25 +91,17 @@ def upload_temp_file(
                     Callback=lambda bytes_xfer: t.update(bytes_xfer),
                 )
             tracker.increment(Result.DOWNLOADED)
+
     except Exception as e:
         raise Exception(
-            f"Error uploading {media_url} to s3://{S3_BUCKET}/{destination_path}"
+            f"Error uploading to s3://{S3_BUCKET}/{destination_path}"
         ) from e
 
 
-def get_file_hash(temp_file):
-    return hashlib.file_digest(temp_file, S3_KEY_CHECKSUM).hexdigest()
-
-
-def get_content_type(temp_file):
-    content_type = magic.from_file(temp_file.name, mime=True)
-    if content_type in INVALID_CONTENT_TYPES:
-        raise Exception(f"Invalid content-type: {content_type}")
-    return content_type
-
-
-def download_file_to_temp_path(media_url: str):
-    temp_file = get_temp_file()
+def download_file_to_temp_path(media_url: str, local_file: str):
+    """
+    Tries to get a local copy of a file to stick in S3 later
+    """
     try:
         response = get_http_session().get(media_url, stream=True)
         total_size = int(response.headers.get("content-length", 0))
@@ -142,14 +114,118 @@ def download_file_to_temp_path(media_url: str):
             unit_scale=True,
             delay=2,
         ) as t:
-            with open(temp_file.name, "wb") as f:
+            with open(local_file, "wb") as f:
                 for chunk in response.iter_content(None):
                     t.update(len(chunk))
                     f.write(chunk)
 
     except Exception as e:
-        raise Exception(f"Failed saving {media_url} to local") from e
-    return temp_file
+        raise Exception(f"Failed downloading {media_url} to local") from e
+
+
+def process_media(
+    partner: str,
+    dpla_id: str,
+    ordinal: int,
+    media_url: str,
+    overwrite: bool,
+) -> None:
+    """
+    For a given capture for a given item, downloads it if we don't have it or are
+    overwriting, gets the mime and sha1, and sticks it in S3.
+    """
+    temp_file = get_temp_file()
+    temp_file_name = temp_file.name
+    tracker = Tracker()
+    try:
+        destination_path = get_media_s3_path(dpla_id, ordinal, partner)
+        if not overwrite and s3_file_exists(destination_path):
+            logging.info("Key already in S3.")
+            tracker.increment(Result.SKIPPED)
+            return
+
+        download_file_to_temp_path(media_url, temp_file_name)
+        content_type = get_content_type(temp_file_name)
+        sha1 = get_file_hash(temp_file_name)
+        upload_file_to_s3(temp_file_name, destination_path, content_type, sha1)
+
+    finally:
+        if temp_file:
+            temp_file.close()
+            os.unlink(temp_file.name)
+
+
+def process_item(
+    overwrite: bool,
+    dry_run: bool,
+    verbose: bool,
+    partner: str,
+    dpla_id: str,
+    providers_json: dict,
+    api_key: str,
+) -> None:
+    """
+    For every item, makes sure it's eligible, tries to get a list of files for it, and
+    stores the metadata in S3. Then calls process_media_file on the list.
+    """
+    tracker = Tracker()
+    try:
+        item_metadata = get_item_metadata(dpla_id, api_key)
+        write_item_metadata(partner, dpla_id, json.dumps(item_metadata))
+        provider, data_provider = get_provider_and_data_provider(
+            item_metadata, providers_json
+        )
+        if not is_wiki_eligible(item_metadata, provider, data_provider):
+            logging.info(f"{dpla_id} is not eligible.")
+            tracker.increment(Result.SKIPPED)
+            return
+
+        if MEDIA_MASTER_FIELD_NAME in item_metadata:
+            media_urls = get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)
+
+        elif IIIF_MANIFEST_FIELD_NAME in item_metadata:
+            manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
+            manifest = get_iiif_manifest(manifest_url)
+            write_iiif_manifest(partner, dpla_id, json.dumps(manifest))
+            media_urls = get_iiif_urls(manifest)
+
+        else:
+            raise NotImplementedError(
+                f"No {MEDIA_MASTER_FIELD_NAME} or {IIIF_MANIFEST_FIELD_NAME}"
+            )
+
+        write_file_list(partner, dpla_id, media_urls)
+
+    except Exception as e:
+        tracker.increment(Result.FAILED)
+        logging.warning(
+            f"Caught exception getting media urls for {dpla_id}.", exc_info=e
+        )
+        return
+
+    logging.info(f"{len(media_urls)} files.")
+    count = 0
+    if verbose:
+        logging.info(f"DPLA ID: {dpla_id}")
+        logging.info(f"Metadata: {item_metadata}")
+        logging.info(f"Provider: {provider_str(provider)}")
+        logging.info(f"Data Provider: {provider_str(data_provider)}")
+
+    for media_url in tqdm(
+        media_urls, desc="Downloading Files", leave=False, unit="File"
+    ):
+        count += 1
+        # hack to fix bad nara data
+        if media_url.startswith("https/"):
+            media_url = media_url.replace("https/", "https:/")
+        logging.info(f"Downloading {partner} {dpla_id} {count} from {media_url}")
+        try:
+            if not dry_run:
+                process_media(partner, dpla_id, count, media_url, overwrite)
+
+        except Exception as e:
+            tracker.increment(Result.FAILED)
+            logging.warning(f"Failed: {dpla_id} {count}", exc_info=e)
 
 
 @click.command()
@@ -170,67 +246,28 @@ def main(
     start_time = time.time()
     tracker = Tracker()
 
+    if dry_run:
+        logging.warning("---=== DRY RUN ===---")
+
     check_partner(partner)
+    logging.info(f"Starting download for {partner}")
 
     try:
         setup_temp_dir()
         setup_logging(partner, "download", logging.INFO)
-        if dry_run:
-            logging.warning("---=== DRY RUN ===---")
-
-        s3 = get_s3()
         providers_json = get_providers_data()
-
-        logging.info(f"Starting download for {partner}")
-
         dpla_ids = load_ids(ids_file)
-
         for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item"):
             logging.info(f"DPLA ID: {dpla_id}")
-            try:
-                item_metadata = get_item_metadata(dpla_id, api_key)
-                provider, data_provider = get_provider_and_data_provider(
-                    item_metadata, providers_json
-                )
-                if not is_wiki_eligible(item_metadata, provider, data_provider):
-                    logging.info(f"{dpla_id} is not eligible.")
-                    tracker.increment(Result.SKIPPED)
-                    continue
-                media_urls = extract_urls(item_metadata)
-            except Exception as e:
-                tracker.increment(Result.FAILED)
-                logging.warning(
-                    f"Caught exception getting media urls for {dpla_id}.", exc_info=e
-                )
-                continue
-
-            logging.info(f"{len(media_urls)} files.")
-            count = 0
-            if verbose:
-                logging.info(f"DPLA ID: {dpla_id}")
-                logging.info(f"Metadata: {item_metadata}")
-                logging.info(f"Provider: {provider_str(provider)}")
-                logging.info(f"Data Provider: {provider_str(data_provider)}")
-
-            for media_url in tqdm(
-                media_urls, desc="Downloading Files", leave=False, unit="File"
-            ):
-                count += 1
-                # hack to fix bad nara data
-                if media_url.startswith("https/"):
-                    media_url = media_url.replace("https/", "https:/")
-                logging.info(
-                    f"Downloading {partner} {dpla_id} {count} from {media_url}"
-                )
-                try:
-                    if not dry_run:
-                        download_media(
-                            partner, dpla_id, count, media_url, overwrite, s3, tracker
-                        )
-
-                except Exception as e:
-                    tracker.increment(Result.FAILED)
-                    logging.warning(f"Failed: {dpla_id} {count}", exc_info=e)
+            process_item(
+                overwrite,
+                dry_run,
+                verbose,
+                partner,
+                dpla_id,
+                providers_json,
+                api_key,
+            )
 
     finally:
         logging.info("\n" + str(tracker))
