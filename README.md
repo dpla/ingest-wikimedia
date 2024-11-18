@@ -1,8 +1,11 @@
 # ingest-wikimedia
 
-PREREQUISITE: This project is managed with [uv](https://docs.astral.sh/uv/). Run `uv build` to set the project
-up for execution.
+PREREQUISITE: This project is managed with [uv](https://docs.astral.sh/uv/).
 
+To set the project up for execution:
+
+1. Run `uv build` 
+2. Run `source .venv/bin/activate`
 
 ```downloader [OPTIONS] IDS_FILE PARTNER API_KEY```
 
