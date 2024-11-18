@@ -42,7 +42,7 @@ def main(partner: str):
                 obj = object_summary.Object()
                 sha1 = obj.metadata.get(CHECKSUM, "")
                 if sha1 != "":
-                    pass
+                    continue
 
                 with tqdm(
                     total=obj.content_length,
