@@ -1,10 +1,13 @@
 # ingest-wikimedia
 
-PREREQUISITE: This project is managed with [uv](https://docs.astral.sh/uv/).
+PREREQUISITE: This project is managed with [uv](https://docs.astral.sh/uv/). Run `uv build` to set the project
+up for execution.
 
-```uv run downloader.py [OPTIONS] IDS_FILE PARTNER API_KEY```
 
-```uv run uploader.py [OPTIONS] IDS_FILE PARTNER API_KEY```
+```downloader [OPTIONS] IDS_FILE PARTNER API_KEY```
+
+```uploader [OPTIONS] IDS_FILE PARTNER API_KEY```
+
 
 Options:
 - `--dry-run`: Does everything save for actually write to Commons.
@@ -16,8 +19,17 @@ Options:
 
 `API_KEY` is a DPLA API key.
 
+You can provide `--help` to these commands to see more options.
+
 ## Logs
 
-Log files are written out on the local file system in `logs`. This directory is specified in `constants.py`.
+Log files are written out on the local file system in `logs`. This directory is specified in `logs.py`.
 
-This project makes use of a temporary directory. By default, it uses `tmp`. This is specified in `constants.py` as well. 
+This project makes use of a temporary directory that it creates with a unique name locally.
+
+## Development
+
+This project makes use of [ruff](https://docs.astral.sh/ruff/), 
+[ggshield](https://www.gitguardian.com/ggshield), and 
+[pre-commit](https://pre-commit.com/) to enforce standards prior to commits to source 
+control. You may want to configure your editor to run ruff on save, as well.
