@@ -5,8 +5,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from mypy_boto3_s3 import S3ServiceResource
 
-from ingest_wikimedia.common import CHECKSUM
-from ingest_wikimedia.local import get_bytes_hash
+from .common import CHECKSUM
+from .local import get_bytes_hash
 
 IIIF_JSON = "iiif.json"
 FILE_LIST_TXT = "file-list.txt"

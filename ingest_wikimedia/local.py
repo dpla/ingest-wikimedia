@@ -4,8 +4,8 @@ import os
 import tempfile
 import magic
 
-from ingest_wikimedia.common import CHECKSUM
-from wikimedia import INVALID_CONTENT_TYPES
+from .common import CHECKSUM
+from .wikimedia import INVALID_CONTENT_TYPES
 
 __temp_dir: tempfile.TemporaryDirectory | None = None
 

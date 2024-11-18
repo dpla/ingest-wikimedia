@@ -5,9 +5,9 @@ from urllib.parse import urlparse
 
 import validators
 
-from ingest_wikimedia.common import null_safe, get_str, get_list, get_dict
-from s3 import write_iiif_manifest
-from web import get_http_session, HTTP_REQUEST_HEADERS
+from .common import null_safe, get_str, get_list, get_dict
+from .s3 import write_iiif_manifest
+from .web import get_http_session, HTTP_REQUEST_HEADERS
 
 
 def check_partner(partner: str) -> None:
@@ -25,6 +25,7 @@ def get_item_metadata(dpla_id: str, api_key: str) -> dict:
     url = DPLA_API_URL_BASE + dpla_id
     headers = {AUTHORIZATION_HEADER: api_key}
     response = get_http_session().get(url, headers=headers)
+    response.raise_for_status()
     response_json = response.json()
     docs = get_list(response_json, DPLA_API_DOCS)
     return docs[0] if docs else {}
@@ -45,7 +46,7 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
 
     is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
     media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
-    iiif_manifest = null_safe(item_metadata, IIIF_MANIFEST_FIELD_NAME, False)
+    iiif_manifest = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
 
     if not iiif_manifest and not media_master:
         iiif_url = contentdm_iiif_url(is_shown_at)
@@ -55,7 +56,7 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
                 item_metadata[IIIF_MANIFEST_FIELD_NAME] = iiif_url
                 iiif_manifest = True
 
-    asset_ok = media_master or iiif_manifest
+    asset_ok = (media_master is not None) or (iiif_manifest is not None)
 
     # todo create banlist. item based? sha based? local id based? all three?
     # todo don't re-upload if deleted
