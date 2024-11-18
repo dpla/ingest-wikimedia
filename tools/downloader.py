@@ -3,19 +3,21 @@ import logging
 import os
 import time
 
-from web import get_http_session
+from ingest_wikimedia.web import get_http_session
 from typing import IO
 
 import click
 from botocore.exceptions import ClientError
 from tqdm import tqdm
 
-from common import (
+from ingest_wikimedia.common import (
     load_ids,
     get_list,
     get_str,
+    CHECKSUM,
+    CONTENT_TYPE,
 )
-from metadata import (
+from ingest_wikimedia.metadata import (
     check_partner,
     get_item_metadata,
     get_provider_and_data_provider,
@@ -27,27 +29,25 @@ from metadata import (
     get_iiif_manifest,
     get_iiif_urls,
 )
-from logs import setup_logging
-from s3 import (
+from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.s3 import (
     get_s3,
     get_media_s3_path,
     s3_file_exists,
     S3_BUCKET,
-    S3_KEY_CHECKSUM,
     S3_KEY_METADATA,
-    S3_KEY_CONTENT_TYPE,
     write_item_metadata,
     write_file_list,
     write_iiif_manifest,
 )
-from local import (
+from ingest_wikimedia.local import (
     cleanup_temp_dir,
     setup_temp_dir,
     get_file_hash,
     get_content_type,
     get_temp_file,
 )
-from tracker import Result, Tracker
+from ingest_wikimedia.tracker import Result, Tracker
 
 
 def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1: str):
@@ -67,7 +67,7 @@ def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1:
                 if not e.response["Error"]["Code"] == "404":
                     raise e
 
-            if obj_metadata and obj_metadata.get(S3_KEY_CHECKSUM, None) == sha1:
+            if obj_metadata and obj_metadata.get(CHECKSUM, None) == sha1:
                 # Already uploaded, move on.
                 logging.info("Already exists.")
                 tracker.increment(Result.SKIPPED)
@@ -85,8 +85,8 @@ def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1:
                 obj.upload_fileobj(
                     Fileobj=file,
                     ExtraArgs={
-                        S3_KEY_CONTENT_TYPE: content_type,
-                        S3_KEY_METADATA: {S3_KEY_CHECKSUM: sha1},
+                        CONTENT_TYPE: content_type,
+                        S3_KEY_METADATA: {CHECKSUM: sha1},
                     },
                     Callback=lambda bytes_xfer: t.update(bytes_xfer),
                 )
@@ -175,6 +175,7 @@ def process_item(
         provider, data_provider = get_provider_and_data_provider(
             item_metadata, providers_json
         )
+        # todo make sure item is from partner somehow?
         if not is_wiki_eligible(item_metadata, provider, data_provider):
             logging.info(f"{dpla_id} is not eligible.")
             tracker.increment(Result.SKIPPED)
@@ -245,6 +246,7 @@ def main(
 ):
     start_time = time.time()
     tracker = Tracker()
+    setup_logging(partner, "download", logging.INFO)
 
     if dry_run:
         logging.warning("---=== DRY RUN ===---")
@@ -254,7 +256,7 @@ def main(
 
     try:
         setup_temp_dir()
-        setup_logging(partner, "download", logging.INFO)
+
         providers_json = get_providers_data()
         dpla_ids = load_ids(ids_file)
         for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item"):

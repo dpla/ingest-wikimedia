@@ -48,4 +48,4 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
             logging.getLogger(d).setLevel(logging.ERROR)
 
 
-LOGS_DIR_BASE = "logs"
+LOGS_DIR_BASE = "../logs"

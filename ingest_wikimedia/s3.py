@@ -5,7 +5,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from mypy_boto3_s3 import S3ServiceResource
 
-from local import get_bytes_hash
+from ingest_wikimedia.common import CHECKSUM
+from ingest_wikimedia.local import get_bytes_hash
 
 IIIF_JSON = "iiif.json"
 FILE_LIST_TXT = "file-list.txt"
@@ -14,9 +15,7 @@ DPLA_MAP_FILENAME = "dpla-map.json"
 APPLICATION_JSON = "application/json"
 S3_RETRIES = 3
 S3_BUCKET = "dpla-mdpdb"  # TODO change for prod
-S3_KEY_CHECKSUM = "sha1"
 S3_KEY_METADATA = "Metadata"
-S3_KEY_CONTENT_TYPE = "ContentType"
 
 # S3 resources are not thread safe, so make one per thread
 __thread_local = threading.local()
@@ -114,4 +113,4 @@ def write_item_file(
     s3_path = get_item_s3_path(dpla_id, filename, partner)
     s3_object = s3.Object(S3_BUCKET, s3_path)
     sha1 = get_bytes_hash(data)
-    s3_object.put(ContentType=content_type, Metadata={S3_KEY_CHECKSUM: sha1}, Body=data)
+    s3_object.put(ContentType=content_type, Metadata={CHECKSUM: sha1}, Body=data)

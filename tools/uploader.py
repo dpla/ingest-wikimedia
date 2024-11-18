@@ -11,17 +11,23 @@ from tqdm import tqdm
 from pywikibot import FilePage
 from pywikibot.tools.chars import replace_invisible
 
-from common import (
+from ingest_wikimedia.common import (
     get_str,
     get_list,
     get_dict,
     load_ids,
+    CHECKSUM,
 )
-from logs import setup_logging
-from s3 import get_media_s3_path, get_s3, S3_BUCKET, S3_KEY_CHECKSUM, s3_file_exists
-from tracker import Result, Tracker
-from local import setup_temp_dir, cleanup_temp_dir, get_temp_file, clean_up_tmp_file
-from metadata import (
+from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.s3 import get_media_s3_path, get_s3, S3_BUCKET, s3_file_exists
+from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.local import (
+    setup_temp_dir,
+    cleanup_temp_dir,
+    get_temp_file,
+    clean_up_tmp_file,
+)
+from ingest_wikimedia.metadata import (
     check_partner,
     get_item_metadata,
     is_wiki_eligible,
@@ -40,8 +46,8 @@ from metadata import (
     WIKIDATA_FIELD_NAME,
     extract_urls,
 )
-from web import get_http_session
-from wikimedia import (
+from ingest_wikimedia.web import get_http_session
+from ingest_wikimedia.wikimedia import (
     INVALID_CONTENT_TYPES,
     COMMONS_URL_PREFIX,
     ERROR_FILEEXISTS,
@@ -336,7 +342,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
 
                         s3_object = s3.Object(S3_BUCKET, s3_path)
                         file_size = s3_object.content_length
-                        sha1 = s3_object.metadata.get(S3_KEY_CHECKSUM, "")
+                        sha1 = s3_object.metadata.get(CHECKSUM, "")
                         mime = s3_object.content_type
 
                         if mime in INVALID_CONTENT_TYPES:

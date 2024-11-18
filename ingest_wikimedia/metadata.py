@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 import validators
 
-from common import null_safe, get_str, get_list, get_dict
+from ingest_wikimedia.common import null_safe, get_str, get_list, get_dict
 from s3 import write_iiif_manifest
 from web import get_http_session, HTTP_REQUEST_HEADERS
 

@@ -1,6 +1,9 @@
 import csv
 from typing import IO
 
+CHECKSUM = "sha1"
+CONTENT_TYPE = "ContentType"
+
 
 def load_ids(ids_file: IO) -> list[str]:
     dpla_ids = []

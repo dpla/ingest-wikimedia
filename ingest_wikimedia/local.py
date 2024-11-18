@@ -4,7 +4,7 @@ import os
 import tempfile
 import magic
 
-from s3 import S3_KEY_CHECKSUM
+from ingest_wikimedia.common import CHECKSUM
 from wikimedia import INVALID_CONTENT_TYPES
 
 __temp_dir: tempfile.TemporaryDirectory | None = None
@@ -58,7 +58,7 @@ def get_file_hash(file: str) -> str:
     """
     with open(file, "rb") as f:
         # noinspection PyTypeChecker
-        return hashlib.file_digest(f, S3_KEY_CHECKSUM).hexdigest()
+        return hashlib.file_digest(f, CHECKSUM).hexdigest()
 
 
 def get_bytes_hash(data: str) -> str:
@@ -71,7 +71,7 @@ def get_bytes_hash(data: str) -> str:
 
 def get_content_type(file: str) -> str:
     """
-    Tries to detect the mime type of a download.
+    Tries to detect the mime type of a downloaded file.
     """
     content_type = magic.from_file(file, mime=True)
     if content_type in INVALID_CONTENT_TYPES:
