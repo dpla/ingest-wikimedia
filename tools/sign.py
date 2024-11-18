@@ -49,8 +49,8 @@ def main(partner: str):
                     leave=False,
                     desc="S3 Download",
                     unit="B",
-                    unit_scale=1024,
-                    unit_divisor=True,
+                    unit_divisor=1024,
+                    unit_scale=True,
                     delay=2,
                 ) as t:
                     obj.download_file(
