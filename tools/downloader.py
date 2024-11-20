@@ -28,6 +28,7 @@ from ingest_wikimedia.metadata import (
     IIIF_MANIFEST_FIELD_NAME,
     get_iiif_manifest,
     get_iiif_urls,
+    check_record_partner,
 )
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.s3 import (
@@ -175,7 +176,12 @@ def process_item(
         provider, data_provider = get_provider_and_data_provider(
             item_metadata, providers_json
         )
-        # todo make sure item is from partner somehow?
+
+        if not check_record_partner(partner, item_metadata):
+            logging.info(f"{dpla_id} is from the wrong partner.")
+            tracker.increment(Result.SKIPPED)
+            return
+
         if not is_wiki_eligible(item_metadata, provider, data_provider):
             logging.info(f"{dpla_id} is not eligible.")
             tracker.increment(Result.SKIPPED)
