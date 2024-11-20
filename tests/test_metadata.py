@@ -110,12 +110,16 @@ def test_iiif_v3_urls():
 def test_get_iiif_urls():
     iiif_v2 = {"@context": "http://iiif.io/api/presentation/2/context.json"}
     iiif_v3 = {"@context": "http://iiif.io/api/presentation/3/context.json"}
+    iiif_not = {"@context": "https://realultimatepower.net/"}
 
     with patch("ingest_wikimedia.metadata.iiif_v2_urls", return_value=["v2_url"]):
         assert get_iiif_urls(iiif_v2) == ["v2_url"]
 
     with patch("ingest_wikimedia.metadata.iiif_v3_urls", return_value=["v3_url"]):
         assert get_iiif_urls(iiif_v3) == ["v3_url"]
+
+    with pytest.raises(Exception, match="Unimplemented IIIF version"):
+        get_iiif_urls(iiif_not)
 
 
 @patch("ingest_wikimedia.metadata.get_http_session")
