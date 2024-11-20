@@ -14,6 +14,7 @@ from ingest_wikimedia.metadata import (
     get_iiif_urls,
     get_iiif_manifest,
     contentdm_iiif_url,
+    check_record_partner,
 )
 
 
@@ -23,6 +24,24 @@ def test_check_partner():
 
     # Assuming "bpl" is a valid partner
     check_partner("bpl")
+
+
+def test_check_record_partner_valid():
+    partner = "bpl"
+    item_metadata = {"provider": {"name": "Digital Commonwealth"}}
+    assert check_record_partner(partner, item_metadata)
+
+
+def test_check_record_partner_invalid():
+    partner = "bpl"
+    item_metadata = {"provider": {"name": "Some Other Provider"}}
+    assert not check_record_partner(partner, item_metadata)
+
+
+def test_check_record_partner_missing_provider():
+    partner = "bpl"
+    item_metadata = {}
+    assert not check_record_partner(partner, item_metadata)
 
 
 @patch("ingest_wikimedia.metadata.get_http_session")

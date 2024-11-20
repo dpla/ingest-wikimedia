@@ -31,6 +31,14 @@ def get_item_metadata(dpla_id: str, api_key: str) -> dict:
     return docs[0] if docs else {}
 
 
+def check_record_partner(partner: str, item_metadata: dict) -> bool:
+    partner_long_name = DPLA_PARTNERS.get(partner, "")
+    record_partner_long_name = get_str(
+        get_dict(item_metadata, PROVIDER_FIELD_NAME), EDM_AGENT_NAME
+    )
+    return partner_long_name == record_partner_long_name
+
+
 def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
     """
     Enforces a number of criteria for ensuring this is an item we should upload.
