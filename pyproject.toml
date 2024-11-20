@@ -41,4 +41,5 @@ uploader = "tools.uploader:main"
 downloader = "tools.downloader:main"
 sign = "tools.sign:main"
 nuke = "tools.nuke:main"
+get-ids-api = "tools.get_ids_api:main"
 
