@@ -14,7 +14,7 @@ def check_partner(partner: str) -> None:
     """
     Blows up if we're working on a partner we shouldn't.
     """
-    if partner not in DPLA_PARTNERS:
+    if partner not in DPLA_PARTNERS.keys():
         raise Exception("Unrecognized partner.")
 
 
@@ -275,16 +275,17 @@ IIIF_PRESENTATION_API_MANIFEST_V3 = "http://iiif.io/api/presentation/3/context.j
 CONTENTDM_IIIF_MANIFEST_JSON = "/manifest.json"
 CONTENTDM_IIIF_INFO = "/iiif/info/"
 CONTENT_DM_ISSHOWNAT_REGEX = r"^/cdm/ref/collection/(.*)/id/(.*)$"  # todo
-DPLA_PARTNERS = [
-    "bpl",
-    "georgia",
-    "il",
-    "indiana",
-    "nara",
-    "northwest-heritage",
-    "ohio",
-    "p2p",
-    "pa",
-    "texas",
-    "minnesota",
-]
+DPLA_PARTNERS = {
+    "bpl": "Digital Commonwealth",
+    "georgia": "Digital Library of Georgia",
+    "il": "Illinois Digital Heritage Hub",
+    "indiana": "Indiana Memory",
+    "nara": "National Archives and Records Administration",
+    "northwest-heritage": "Northwest Digital Heritage",
+    "ohio": "Ohio Digital Network",
+    "p2p": "Plains to Peaks Collective",
+    "pa": "PA Digital",
+    "texas": "The Portal to Texas History",
+    "minnesota": "Minnesota Digital Library",
+    "mwdl": "Mountain West Digital Library",
+}

@@ -1,46 +1,15 @@
+import click
 import requests
 
-api_query_base = (
-    "https://api.dp.la/v2/items?api_key=QQQ"
-    "&provider.name=Minnesota+Digital+Library"
-    "&dataProvider.name=Hennepin+County+Library"
-    "&rightsCategory=Unlimited+Re-Use"
-    "&fields=id"
-    "&page_size=500"
-)
+from ingest_wikimedia.metadata import DPLA_PARTNERS, check_partner
 
-count = None
-page = 1
 
-# shards = [
-# "Bethel University",
-# "Bethel University Digital Herbarium",
-# "Bethel University Digital Library",
-# "Blue Earth County Historical Society",
-# "Carleton College",
-# "Hennepin County Library, James K. Hosmer Special Collections Library",
-# "Minitex",
-# "Nicollet County Historical Society",
-# "Norwegian-American Historical Association",
-# "Saint Paul Public Library",
-# "St. Cloud State University",
-# "Stillwater Public Library",
-# "Weavers Guild of Minnesota",
-# "University Archives and Southern Minnesota Historical Center, Memorial Library, Minnesota State University, Mankato",
-# "Hennepin County Library",
-# "Carleton College Archives",
-# "The History Center, Archives of Bethel University and Converge Worldwide - BGC",
-# ]
-shards = [hex(i)[2:].zfill(2) for i in range(256)]
-
-for shard in shards:
-    shard = shard.replace(" ", "+")
+def run_query(url):
     page = 0
     while True:
         page += 1
-        url = f"{api_query_base}&id={shard}*&page={page}"
-
-        response = requests.get(url)
+        page_url = url + "&page=" + str(page)
+        response = requests.get(page_url)
         response.raise_for_status()
         data = response.json()
         if not data.get("docs", None):
@@ -49,4 +18,36 @@ for shard in shards:
             dpla_id = doc.get("id")
             print(dpla_id)
 
-exit(0)
+
+@click.command()
+@click.argument("partner")
+@click.argument("api_key")
+@click.option("--shard", is_flag=True)
+@click.option("--add-query")
+def main(partner: str, api_key: str, shard: bool, add_query: str):
+    check_partner(partner)
+    partner_string = DPLA_PARTNERS.get(partner).replace(" ", "+")
+
+    api_query_base = (
+        f"https://api.dp.la/v2/items?api_key={api_key}"
+        f"&provider.name={partner_string}"
+        "&rightsCategory=Unlimited+Re-Use"
+        "&fields=id"
+        "&page_size=500"
+    )
+
+    if add_query:
+        api_query_base += "&" + add_query
+
+    if shard:
+        shards = [hex(i)[2:].zfill(2) for i in range(256)]
+        for shard in shards:
+            while True:
+                url = f"{api_query_base}&id={shard}*"
+                run_query(url)
+    else:
+        run_query(api_query_base)
+
+
+if __name__ == "__main__":
+    main()
