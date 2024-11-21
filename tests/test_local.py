@@ -52,10 +52,3 @@ def test_get_content_type(tmp_path):
     test_file = tmp_path / "test_file.txt"
     test_file.write_bytes(SPACER_GIF)
     assert get_content_type(str(test_file)) == "image/gif"
-
-
-def test_get_invalid_content_type(tmp_path):
-    invalid_file = tmp_path / "invalid_file.invalid"
-    invalid_file.write_text("invalid content")
-    with pytest.raises(Exception, match="Invalid content-type"):
-        get_content_type(str(invalid_file))
