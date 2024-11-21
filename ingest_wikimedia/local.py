@@ -5,7 +5,6 @@ import tempfile
 import magic
 
 from .common import CHECKSUM
-from .wikimedia import INVALID_CONTENT_TYPES
 
 __temp_dir: tempfile.TemporaryDirectory | None = None
 
@@ -74,6 +73,4 @@ def get_content_type(file: str) -> str:
     Tries to detect the mime type of a downloaded file.
     """
     content_type = magic.from_file(file, mime=True)
-    if content_type in INVALID_CONTENT_TYPES:
-        raise Exception(f"Invalid content-type: {content_type}")
     return content_type

@@ -49,6 +49,7 @@ from ingest_wikimedia.local import (
     get_temp_file,
 )
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.wikimedia import check_content_type
 
 
 def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1: str):
@@ -146,7 +147,13 @@ def process_media(
             return
 
         download_file_to_temp_path(media_url, temp_file_name)
+
         content_type = get_content_type(temp_file_name)
+        if not check_content_type(content_type):
+            logging.info(f"Bad content type: {content_type}")
+            tracker.increment(Result.SKIPPED)
+            return
+
         sha1 = get_file_hash(temp_file_name)
         upload_file_to_s3(temp_file_name, destination_path, content_type, sha1)
 
