@@ -50,7 +50,7 @@ from ingest_wikimedia.wikimedia import (
 )
 
 
-def proces_file(
+def process_file(
     dpla_id: str,
     title: str,
     item_metadata: dict,
@@ -205,7 +205,7 @@ def process_item(
             logging.info(f"Page {ordinal}")
             # one-pagers don't have page numbers in their titles
             page_label = None if len(files) == 1 else ordinal
-            proces_file(
+            process_file(
                 dpla_id,
                 title,
                 item_metadata,
