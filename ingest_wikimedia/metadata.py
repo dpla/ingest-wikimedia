@@ -188,12 +188,19 @@ def get_iiif_urls(manifest: dict) -> list[str]:
     Currently only supports IIIF v2 and v3
     """
     # v2 or v3?
-    if get_str(manifest, JSON_LD_AT_CONTEXT) == IIIF_PRESENTATION_API_MANIFEST_V3:
-        return iiif_v3_urls(manifest)
-    elif get_str(manifest, JSON_LD_AT_CONTEXT) == IIIF_PRESENTATION_API_MANIFEST_V2:
-        return iiif_v2_urls(manifest)
-    else:
-        raise Exception("Unimplemented IIIF version")
+    match manifest.get(JSON_LD_AT_CONTEXT, None):
+        case None:
+            raise Exception("No IIIF version specified.")
+        case x if x == IIIF_PRESENTATION_API_MANIFEST_V3:
+            return iiif_v3_urls(manifest)
+        case x if x == IIIF_PRESENTATION_API_MANIFEST_V2:
+            return iiif_v2_urls(manifest)
+        case x if type(x) is list and IIIF_PRESENTATION_API_MANIFEST_V3 in x:
+            return iiif_v3_urls(manifest)
+        case x if type(x) is list and IIIF_PRESENTATION_API_MANIFEST_V2 in x:
+            return iiif_v2_urls(manifest)
+        case x:
+            raise Exception(f"Unimplemented IIIF version: {x}")
 
 
 def get_iiif_manifest(url: str) -> dict:
