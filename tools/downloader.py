@@ -290,7 +290,6 @@ def main(
                 providers_json,
                 api_key,
             )
-            exit()
 
     finally:
         logging.info("\n" + str(tracker))
