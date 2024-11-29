@@ -44,7 +44,6 @@ def test_thread_safety(tracker):
 def test_str_representation(tracker):
     tracker.increment(Result.FAILED, 2)
     tracker.increment(Result.SKIPPED, 3)
-    expected_output = (
-        "COUNTS:\nDOWNLOADED: 0\nFAILED: 2\nSKIPPED: 3\nUPLOADED: 0\nBYTES: 0\n"
-    )
+    expected_output = "COUNTS:\nFAILED: 2\nSKIPPED: 3\n"
+
     assert str(tracker) == expected_output
