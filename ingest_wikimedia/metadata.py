@@ -1,12 +1,14 @@
 import json
 import logging
 import re
+from operator import itemgetter
 from urllib.parse import urlparse
 
 import validators
 
 from .common import null_safe, get_str, get_list, get_dict
 from .s3 import write_iiif_manifest
+from .tracker import Tracker, Result
 from .web import get_http_session, HTTP_REQUEST_HEADERS
 
 
@@ -71,10 +73,6 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
 
     id_ok = True
 
-    logging.info(
-        f"Rights: {rights_category_ok}, Asset: {asset_ok}, Provider: {provider_ok}, ID: {id_ok}"
-    )
-
     return rights_category_ok and asset_ok and provider_ok and id_ok
 
 
@@ -134,6 +132,7 @@ def extract_urls(
         return get_iiif_urls(manifest)
 
     else:
+        Tracker().increment(Result.NO_MEDIA)
         raise NotImplementedError(
             f"No {MEDIA_MASTER_FIELD_NAME} or {IIIF_MANIFEST_FIELD_NAME}"
         )
@@ -152,6 +151,7 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
         for image in get_list(canvas, IIIF_IMAGES):
             resource = get_dict(image, IIIF_RESOURCE)
             url = get_str(resource, JSON_LD_AT_ID)
+            # todo do these always max the resolution?
             if url:
                 urls.append(url)
     return urls
@@ -160,6 +160,7 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
 def iiif_v3_urls(iiif: dict) -> list[str]:
     """
     Extracts image URLs from a v3 IIIF manifest and returns them as a list
+    Servers specify urls in multiple ways.
     """
     urls = []
     for item in get_list(iiif, IIIF_ITEMS):
@@ -167,19 +168,58 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
             url = get_str(
                 get_dict(item[IIIF_ITEMS][0][IIIF_ITEMS][0], IIIF_BODY), IIIF_ID
             )
-            # This is a hack to get around that v3 presumes the user supplies the
-            # resolution in the URL
+            new_url = ""
             if url:
-                # This condition may not be necessary but I'm leaving it in for now
-                # TODO does this end up giving us smaller resources than we want?
-                if url.endswith(IIIF_DEFAULT_JPG_SUFFIX):
-                    urls.append(url)
-                else:
-                    urls.append(url + IIIF_FULL_RES_JPG_SUFFIX)
+                new_url = maximize_iiif_v3_url(url)
+            # This always adds something to the list.
+            # If we didn't get a URL, it's just an empty string.
+            # This prevents getting the page order wrong if we don't
+            # figure out the URL one time and fix it later.
+            urls.append(new_url)
+
         except (IndexError, TypeError, KeyError) as e:
             logging.warning("Unable to parse IIIF manifest.", e)
+            Tracker().increment(Result.BAD_IIIF_MANIFEST)
             return []
     return urls
+
+
+def maximize_iiif_v3_url(url: str) -> str:
+    m = None
+
+    if match := FULL_IMAGE_API_URL_REGEX.match(url):
+        m = match.groupdict()
+
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX.match(url):
+        m = match.groupdict()
+
+    if m is not None:
+        scheme, server, prefix, identifier = itemgetter(
+            "scheme",
+            "server",
+            "prefix",
+            "identifier",
+        )(m)
+
+        return f"{scheme}://{server}/{prefix}/{identifier}/full/max/0/default.jpg"
+
+    if match := FULL_IMAGE_API_URL_REGEX_NO_PREFIX.match(url):
+        m = match.groupdict()
+
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX.match(url):
+        m = match.groupdict()
+
+    if m is not None:
+        scheme, server, prefix, identifier = itemgetter(
+            "scheme",
+            "server",
+            "identifier",
+        )(m)
+
+        return f"{scheme}://{server}/{identifier}/full/max/0/default.jpg"
+
+    Tracker().increment(Result.BAD_IMAGE_API_V3)
+    return ""  # we give up
 
 
 def get_iiif_urls(manifest: dict) -> list[str]:
@@ -247,6 +287,31 @@ def contentdm_iiif_url(is_shown_at: str) -> str | None:
         )
 
 
+# {scheme}://{server}{/prefix}/{identifier}/
+IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX = re.compile(
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)(?P<prefix>/[^/]+)/"
+    r"(?P<identifier>[^/]+)/?$"
+)
+
+IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX = re.compile(
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/" r"(?P<identifier>[^/]+)/?$"
+)
+
+
+# {scheme}://{server}{/prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}
+FULL_IMAGE_API_URL_REGEX = re.compile(
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
+    r"(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
+    r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
+)
+
+FULL_IMAGE_API_URL_REGEX_NO_PREFIX = re.compile(
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
+    r"(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
+    r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
+)
+
+
 DPLA_API_URL_BASE = "https://api.dp.la/v2/items/"
 DPLA_API_DOCS = "docs"
 INSTITUTIONS_URL = (
@@ -284,7 +349,7 @@ IIIF_RESOURCE = "resource"
 IIIF_IMAGES = "images"
 IIIF_CANVASES = "canvases"
 IIIF_SEQUENCES = "sequences"
-IIIF_FULL_RES_JPG_SUFFIX = "/full/full/0/default.jpg"
+IIIF_FULL_RES_JPG_SUFFIX = "/full/max/0/default.jpg"
 IIIF_PRESENTATION_API_MANIFEST_V2 = "http://iiif.io/api/presentation/2/context.json"
 IIIF_PRESENTATION_API_MANIFEST_V3 = "http://iiif.io/api/presentation/3/context.json"
 CONTENTDM_IIIF_MANIFEST_JSON = "/manifest.json"

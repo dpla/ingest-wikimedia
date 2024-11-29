@@ -179,7 +179,14 @@ def process_item(
     tracker = Tracker()
     try:
         item_metadata = get_item_metadata(dpla_id, api_key)
+
+        if not item_metadata:
+            logging.info(f"{dpla_id} was not found in the DPLA API.")
+            tracker.increment(Result.SKIPPED)
+            return
+
         write_item_metadata(partner, dpla_id, json.dumps(item_metadata))
+
         provider, data_provider = get_provider_and_data_provider(
             item_metadata, providers_json
         )
@@ -204,9 +211,9 @@ def process_item(
             media_urls = get_iiif_urls(manifest)
 
         else:
-            raise NotImplementedError(
-                f"No {MEDIA_MASTER_FIELD_NAME} or {IIIF_MANIFEST_FIELD_NAME}"
-            )
+            # not sure how we got here
+            tracker.increment(Result.SKIPPED)
+            return
 
         write_file_list(partner, dpla_id, media_urls)
 

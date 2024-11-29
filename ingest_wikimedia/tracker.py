@@ -1,7 +1,16 @@
-from enum import Enum
+from enum import Enum, auto
 from threading import Lock
 
-Result = Enum("Result", ["DOWNLOADED", "FAILED", "SKIPPED", "UPLOADED", "BYTES"])
+
+class Result(Enum):
+    DOWNLOADED = auto()
+    FAILED = auto()
+    SKIPPED = auto()
+    UPLOADED = auto()
+    BYTES = auto()
+    BAD_IIIF_MANIFEST = auto()
+    NO_MEDIA = auto()
+    BAD_IMAGE_API_V3 = auto()
 
 
 class SingletonBase:
@@ -32,5 +41,6 @@ class Tracker(SingletonBase):
         result = "COUNTS:\n"
         for key in self.data:
             value = self.data[key]
-            result += f"{key.name}: {value}\n"
+            if value > 0:
+                result += f"{key.name}: {value}\n"
         return result

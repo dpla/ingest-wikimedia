@@ -119,11 +119,25 @@ def test_iiif_v2_urls():
 def test_iiif_v3_urls():
     iiif = {
         "items": [
-            {"items": [{"items": [{"body": {"id": "http://example.com/image"}}]}]}
+            {
+                "items": [
+                    {
+                        "items": [
+                            {
+                                "body": {
+                                    "id": "https://iiif.oregondigital.org/iiif/f0%2Fdf%2F72%2Fhj%2F15%2Ft-jp2.jp2/full/640,/0/default.jpg"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
         ]
     }
     result = iiif_v3_urls(iiif)
-    assert result == ["http://example.com/image/full/full/0/default.jpg"]
+    assert result == [
+        "https://iiif.oregondigital.org/iiif/f0%2Fdf%2F72%2Fhj%2F15%2Ft-jp2.jp2/full/max/0/default.jpg"
+    ]
 
 
 def test_get_iiif_urls():
