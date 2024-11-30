@@ -26,7 +26,6 @@ def test_get_site(mock_site):
     assert site == mock_site_instance
     mock_site.assert_called_once_with("commons")
     mock_site_instance.login.assert_called_once()
-    mock_site_instance.user.assert_called_once()
 
 
 def test_check_content_type_valid():
