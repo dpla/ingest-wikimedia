@@ -15,11 +15,7 @@ def get_http_session() -> requests.Session:
     if __thread_local.http_session is not None:
         return __thread_local.http_session
     retry_strategy = Retry(
-        connect=3,
-        read=3,
-        redirect=5,
-        status=5,
-        other=5,
+        total=3,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"],
