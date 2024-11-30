@@ -1,4 +1,3 @@
-import logging
 import re
 from string import Template
 
@@ -194,7 +193,6 @@ def get_site() -> pywikibot.Site:
     """Returns the Site object for wikimedia commons."""
     site = pywikibot.Site(COMMONS_SITE_NAME)
     site.login()
-    logging.info(f"Logged: {site.user()} in {site.family}")
     return site
 
 
