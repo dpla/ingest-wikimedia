@@ -1,3 +1,5 @@
+import sys
+
 import click
 import requests
 
@@ -9,6 +11,7 @@ def run_query(url):
     while True:
         page += 1
         page_url = url + "&page=" + str(page)
+        print(page_url, file=sys.stderr)
         response = requests.get(page_url)
         response.raise_for_status()
         data = response.json()
@@ -22,9 +25,9 @@ def run_query(url):
 @click.command()
 @click.argument("partner")
 @click.argument("api_key")
-@click.option("--shard", is_flag=True)
+@click.option("--no-shard", is_flag=True)
 @click.option("--add-query")
-def main(partner: str, api_key: str, shard: bool, add_query: str):
+def main(partner: str, api_key: str, no_shard: bool, add_query: str):
     check_partner(partner)
     partner_string = DPLA_PARTNERS.get(partner).replace(" ", "+")
 
@@ -39,12 +42,11 @@ def main(partner: str, api_key: str, shard: bool, add_query: str):
     if add_query:
         api_query_base += "&" + add_query
 
-    if shard:
+    if not no_shard:
         shards = [hex(i)[2:].zfill(2) for i in range(256)]
         for shard in shards:
-            while True:
-                url = f"{api_query_base}&id={shard}*"
-                run_query(url)
+            url = f"{api_query_base}&id={shard}*"
+            run_query(url)
     else:
         run_query(api_query_base)
 
