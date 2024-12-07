@@ -368,4 +368,5 @@ DPLA_PARTNERS = {
     "texas": "The Portal to Texas History",
     "minnesota": "Minnesota Digital Library",
     "mwdl": "Mountain West Digital Library",
+    "heartland": "Heartland Hub",
 }
