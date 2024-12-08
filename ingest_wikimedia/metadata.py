@@ -150,10 +150,13 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
     for canvas in canvases:
         for image in get_list(canvas, IIIF_IMAGES):
             resource = get_dict(image, IIIF_RESOURCE)
-            url = get_str(resource, JSON_LD_AT_ID)
-            # todo do these always max the resolution?
+            service = get_dict(resource, IIIF_SERVICE)
+            url = get_str(service, JSON_LD_AT_ID)
             if url:
-                urls.append(url)
+                print("FOOO")
+                urls.append(maximize_iiif_url(url))
+            else:
+                urls.append("")
     return urls
 
 
@@ -170,7 +173,7 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
             )
             new_url = ""
             if url:
-                new_url = maximize_iiif_v3_url(url)
+                new_url = maximize_iiif_url(url)
             # This always adds something to the list.
             # If we didn't get a URL, it's just an empty string.
             # This prevents getting the page order wrong if we don't
@@ -184,7 +187,7 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
     return urls
 
 
-def maximize_iiif_v3_url(url: str) -> str:
+def maximize_iiif_url(url: str) -> str:
     m = None
 
     if match := FULL_IMAGE_API_URL_REGEX.match(url):
@@ -218,7 +221,7 @@ def maximize_iiif_v3_url(url: str) -> str:
 
         return f"{scheme}://{server}/{identifier}/full/max/0/default.jpg"
 
-    Tracker().increment(Result.BAD_IMAGE_API_V3)
+    Tracker().increment(Result.BAD_IMAGE_API)
     return ""  # we give up
 
 
@@ -289,12 +292,12 @@ def contentdm_iiif_url(is_shown_at: str) -> str | None:
 
 # {scheme}://{server}{/prefix}/{identifier}/
 IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)(?P<prefix>/[^/]+)/"
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
     r"(?P<identifier>[^/]+)/?$"
 )
 
 IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/" r"(?P<identifier>[^/]+)/?$"
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<identifier>[^/]+)/?$"
 )
 
 
@@ -349,9 +352,12 @@ IIIF_RESOURCE = "resource"
 IIIF_IMAGES = "images"
 IIIF_CANVASES = "canvases"
 IIIF_SEQUENCES = "sequences"
+IIIF_SERVICE = "service"
 IIIF_FULL_RES_JPG_SUFFIX = "/full/max/0/default.jpg"
 IIIF_PRESENTATION_API_MANIFEST_V2 = "http://iiif.io/api/presentation/2/context.json"
 IIIF_PRESENTATION_API_MANIFEST_V3 = "http://iiif.io/api/presentation/3/context.json"
+IIIF_IMAGE_API_V2 = "http://iiif.io/api/image/2/context.json"
+IIIF_IMAGE_API_V3 = "http://iiif.io/api/image/3/context.json"
 CONTENTDM_IIIF_MANIFEST_JSON = "/manifest.json"
 CONTENTDM_IIIF_INFO = "/iiif/info/"
 CONTENT_DM_ISSHOWNAT_REGEX = r"^/cdm/ref/collection/(.*)/id/(.*)$"  # todo
