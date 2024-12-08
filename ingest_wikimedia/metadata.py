@@ -153,7 +153,6 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
             service = get_dict(resource, IIIF_SERVICE)
             url = get_str(service, JSON_LD_AT_ID)
             if url:
-                print("FOOO")
                 urls.append(maximize_iiif_url(url))
             else:
                 urls.append("")
