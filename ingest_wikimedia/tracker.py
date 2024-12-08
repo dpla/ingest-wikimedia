@@ -10,7 +10,7 @@ class Result(Enum):
     BYTES = auto()
     BAD_IIIF_MANIFEST = auto()
     NO_MEDIA = auto()
-    BAD_IMAGE_API_V3 = auto()
+    BAD_IMAGE_API = auto()
 
 
 class SingletonBase:

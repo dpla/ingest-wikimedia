@@ -107,13 +107,23 @@ def test_iiif_v2_urls():
         "sequences": [
             {
                 "canvases": [
-                    {"images": [{"resource": {"@id": "http://example.com/image"}}]}
+                    {
+                        "images": [
+                            {
+                                "resource": {
+                                    "service": {
+                                        "@id": "http://server/prefix/identifier"
+                                    }
+                                }
+                            }
+                        ]
+                    }
                 ]
             }
         ]
     }
     result = iiif_v2_urls(iiif)
-    assert result == ["http://example.com/image"]
+    assert result == ["http://server/prefix/identifier/full/max/0/default.jpg"]
 
 
 def test_iiif_v3_urls():
