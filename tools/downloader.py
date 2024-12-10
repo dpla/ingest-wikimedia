@@ -131,6 +131,7 @@ def process_media(
     ordinal: int,
     media_url: str,
     overwrite: bool,
+    sleep_secs: float,
 ) -> None:
     """
     For a given capture for a given item, downloads it if we don't have it or are
@@ -146,6 +147,8 @@ def process_media(
             tracker.increment(Result.SKIPPED)
             return
 
+        if sleep_secs != 0:
+            time.sleep(sleep_secs)
         download_file_to_temp_path(media_url, temp_file_name)
 
         content_type = get_content_type(temp_file_name)
@@ -236,8 +239,6 @@ def process_item(
     for media_url in tqdm(
         media_urls, desc="Downloading Files", leave=False, unit="File"
     ):
-        if sleep_secs != 0:
-            time.sleep(sleep_secs)
         count += 1
         # hack to fix bad nara data
         if media_url.startswith("https/"):
@@ -245,7 +246,7 @@ def process_item(
         logging.info(f"Downloading {partner} {dpla_id} {count} from {media_url}")
         try:
             if not dry_run:
-                process_media(partner, dpla_id, count, media_url, overwrite)
+                process_media(partner, dpla_id, count, media_url, overwrite, sleep_secs)
 
         except Exception as e:
             tracker.increment(Result.FAILED)
