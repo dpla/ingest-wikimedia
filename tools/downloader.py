@@ -171,6 +171,7 @@ def process_item(
     dpla_id: str,
     providers_json: dict,
     api_key: str,
+    sleep_secs: float,
 ) -> None:
     """
     For every item, makes sure it's eligible, tries to get a list of files for it, and
@@ -235,6 +236,8 @@ def process_item(
     for media_url in tqdm(
         media_urls, desc="Downloading Files", leave=False, unit="File"
     ):
+        if sleep_secs != 0:
+            time.sleep(sleep_secs)
         count += 1
         # hack to fix bad nara data
         if media_url.startswith("https/"):
@@ -255,7 +258,12 @@ def process_item(
 @click.argument("api_key")
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
-@click.option("--overwrite", is_flag=True)
+@click.option("--overwrite", is_flag=True, help="Overwrite already downloaded media.")
+@click.option(
+    "--sleep",
+    default=0.0,
+    help="Interval to wait in between http requests in float seconds.",
+)
 def main(
     ids_file: IO,
     partner: str,
@@ -263,6 +271,7 @@ def main(
     dry_run: bool,
     verbose: bool,
     overwrite: bool,
+    sleep: float,
 ):
     start_time = time.time()
     tracker = Tracker()
@@ -289,6 +298,7 @@ def main(
                 dpla_id,
                 providers_json,
                 api_key,
+                sleep,
             )
 
     finally:
