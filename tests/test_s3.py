@@ -11,6 +11,9 @@ from ingest_wikimedia.s3 import (
     write_file_list,
     write_iiif_manifest,
     write_item_file,
+    get_item_file,
+    get_item_metadata,
+    get_file_list,
 )
 from ingest_wikimedia.common import CHECKSUM
 
@@ -58,12 +61,24 @@ def test_write_item_metadata(mock_write_item_file):
     )
 
 
+@patch("ingest_wikimedia.s3.get_item_file")
+def test_read_item_metadata(mock_get_item_file):
+    get_item_metadata("partner", "abcd1234")
+    mock_get_item_file.assert_called_once_with("partner", "abcd1234", "dpla-map.json")
+
+
 @patch("ingest_wikimedia.s3.write_item_file")
 def test_write_file_list(mock_write_item_file):
     write_file_list("partner", "abcd1234", ["url1", "url2"])
     mock_write_item_file.assert_called_once_with(
         "partner", "abcd1234", "url1\nurl2", "file-list.txt", "text/plain"
     )
+
+
+@patch("ingest_wikimedia.s3.get_item_file")
+def test_read_file_list(mock_get_item_file):
+    get_file_list("partner", "abcd1234")
+    mock_get_item_file.assert_called_once_with("partner", "abcd1234", "file-list.txt")
 
 
 @patch("ingest_wikimedia.s3.write_item_file")
@@ -85,3 +100,11 @@ def test_write_item_file(mock_get_bytes_hash, mock_get_s3):
     mock_s3.Object.return_value.put.assert_called_once_with(
         ContentType="text/plain", Metadata={CHECKSUM: "fakehash"}, Body="data"
     )
+
+
+@patch("ingest_wikimedia.s3.get_s3")
+def test_read_item_file(mock_get_s3):
+    mock_s3 = MagicMock()
+    mock_get_s3.return_value = mock_s3
+    get_item_file("partner", "abcd1234", "file.txt")
+    mock_s3.Object.return_value.get.assert_called_once()

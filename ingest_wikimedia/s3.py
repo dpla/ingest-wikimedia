@@ -84,12 +84,23 @@ def write_item_metadata(partner: str, dpla_id: str, item_metadata: str) -> None:
     write_item_file(partner, dpla_id, item_metadata, DPLA_MAP_FILENAME, TEXT_PLAIN)
 
 
+def get_item_metadata(partner: str, dpla_id: str) -> str:
+    """
+    Reads the metadata file back from s3.
+    """
+    return get_item_file(partner, dpla_id, DPLA_MAP_FILENAME)
+
+
 def write_file_list(partner: str, dpla_id: str, file_urls: list[str]) -> None:
     """
     Writes the list of media files for the item in S3.
     """
     data = "\n".join(file_urls)
     write_item_file(partner, dpla_id, data, FILE_LIST_TXT, TEXT_PLAIN)
+
+
+def get_file_list(partner: str, dpla_id: str) -> list[str]:
+    return get_item_file(partner, dpla_id, FILE_LIST_TXT).split("\n")
 
 
 def write_iiif_manifest(partner: str, dpla_id: str, manifest: str) -> None:
@@ -114,3 +125,10 @@ def write_item_file(
     s3_object = s3.Object(S3_BUCKET, s3_path)
     sha1 = get_bytes_hash(data)
     s3_object.put(ContentType=content_type, Metadata={CHECKSUM: sha1}, Body=data)
+
+
+def get_item_file(partner, dpla_id, file_name) -> str:
+    s3 = get_s3()
+    s3_path = get_item_s3_path(dpla_id, file_name, partner)
+    s3_object = s3.Object(S3_BUCKET, s3_path)
+    return s3_object.get()["Body"].read().decode("utf-8")
