@@ -20,4 +20,7 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run tests
-        run: uv run pytest tests
+        run: uv run coverage run -m pytest tests
+
+      - name: Generate coverage
+        run: uv run coverage xml

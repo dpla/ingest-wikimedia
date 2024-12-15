@@ -27,6 +27,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "coverage>=7.6.9",
     "mypy>=1.13.0",
     "pytest>=8.3.3",
     "types-requests>=2.32.0.20241016",
