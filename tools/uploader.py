@@ -1,3 +1,4 @@
+import json
 import logging
 import mimetypes
 import time
@@ -13,7 +14,14 @@ from ingest_wikimedia.common import (
     CHECKSUM,
 )
 from ingest_wikimedia.logs import setup_logging
-from ingest_wikimedia.s3 import get_media_s3_path, get_s3, S3_BUCKET, s3_file_exists
+from ingest_wikimedia.s3 import (
+    get_media_s3_path,
+    get_s3,
+    S3_BUCKET,
+    s3_file_exists,
+    get_item_metadata,
+    get_file_list,
+)
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.local import (
     setup_temp_dir,
@@ -23,14 +31,12 @@ from ingest_wikimedia.local import (
 )
 from ingest_wikimedia.metadata import (
     check_partner,
-    get_item_metadata,
     is_wiki_eligible,
     get_provider_and_data_provider,
     get_providers_data,
     provider_str,
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
-    extract_urls,
 )
 from ingest_wikimedia.wikimedia import (
     ERROR_FILEEXISTS,
@@ -168,7 +174,6 @@ def process_file(
 
 def process_item(
     dpla_id: str,
-    api_key: str,
     providers_json: dict,
     partner: str,
     verbose: bool,
@@ -178,7 +183,7 @@ def process_item(
     try:
         logging.info(f"DPLA ID: {dpla_id}")
 
-        item_metadata = get_item_metadata(dpla_id, api_key)
+        item_metadata = json.loads(get_item_metadata(partner, dpla_id))
 
         provider, data_provider = get_provider_and_data_provider(
             item_metadata, providers_json
@@ -197,11 +202,10 @@ def process_item(
         title = titles[0] if titles else ""
 
         ordinal = 0
-        # todo manifest of files?
-        files = extract_urls(partner, dpla_id, item_metadata)
+        files = get_file_list(partner, dpla_id)
 
         for _ in tqdm(files, desc="Uploading Files", leave=False, unit="File"):
-            ordinal += 1  # todo if we're walking s3, this comes from the name
+            ordinal += 1  # todo should this come from the list or the name?
             logging.info(f"Page {ordinal}")
             # one-pagers don't have page numbers in their titles
             page_label = None if len(files) == 1 else ordinal
@@ -228,10 +232,9 @@ def process_item(
 @click.command()
 @click.argument("ids_file", type=click.File("r"))
 @click.argument("partner")
-@click.argument("api_key")
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
-def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> None:
+def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     start_time = time.time()
     tracker = Tracker()
 
@@ -249,7 +252,7 @@ def main(ids_file, partner: str, api_key: str, dry_run: bool, verbose: bool) -> 
         dpla_ids = load_ids(ids_file)
 
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item"):
-            process_item(dpla_id, api_key, providers_json, partner, verbose, dry_run)
+            process_item(dpla_id, providers_json, partner, verbose, dry_run)
 
     finally:
         logging.info("\n" + str(tracker))
