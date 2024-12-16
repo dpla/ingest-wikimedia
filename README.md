@@ -9,7 +9,7 @@ To set the project up for execution:
 
 ```downloader [OPTIONS] IDS_FILE PARTNER API_KEY```
 
-```uploader [OPTIONS] IDS_FILE PARTNER API_KEY```
+```uploader [OPTIONS] IDS_FILE PARTNER```
 
 
 Options:
