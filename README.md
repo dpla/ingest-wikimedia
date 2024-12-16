@@ -1,3 +1,7 @@
+![Build Badge](https://github.com/dpla/ingest-wikimedia/actions/workflows/pytest.yml/badge.svg)
+[![Codacy Quality Badge](https://app.codacy.com/project/badge/Grade/c648d5e684dc4a1393a0f59d5ddbeaa1)](https://app.codacy.com/gh/dpla/ingest-wikimedia/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![Codacy Coverage Badge](https://app.codacy.com/project/badge/Coverage/c648d5e684dc4a1393a0f59d5ddbeaa1)](https://app.codacy.com/gh/dpla/ingest-wikimedia/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
+---
 # ingest-wikimedia
 
 PREREQUISITE: This project is managed with [uv](https://docs.astral.sh/uv/).
