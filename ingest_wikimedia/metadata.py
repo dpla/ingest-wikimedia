@@ -318,7 +318,7 @@ DPLA_API_URL_BASE = "https://api.dp.la/v2/items/"
 DPLA_API_DOCS = "docs"
 INSTITUTIONS_URL = (
     "https://raw.githubusercontent.com/dpla/ingestion3"
-    "/refs/heads/develop/src/main/resources/wiki/institutions_v2.json"
+    "/refs/heads/main/src/main/resources/wiki/institutions_v2.json"
 )
 UPLOAD_FIELD_NAME = "upload"
 INSTITUTIONS_FIELD_NAME = "institutions"
