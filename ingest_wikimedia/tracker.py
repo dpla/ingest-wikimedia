@@ -13,17 +13,16 @@ class Result(Enum):
     BAD_IMAGE_API = auto()
 
 
-class SingletonBase:
+class Singleton(type):
     _instances = {}
 
-    def __new__(cls, *args, **kwargs):
+    def __call__(cls, *args, **kwargs):
         if cls not in cls._instances:
-            instance = super().__new__(cls)
-            cls._instances[cls] = instance
+            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
         return cls._instances[cls]
 
 
-class Tracker(SingletonBase):
+class Tracker(metaclass=Singleton):
     def __init__(self):
         self.data = {}
         for value in Result:
@@ -36,6 +35,11 @@ class Tracker(SingletonBase):
 
     def count(self, status: Result) -> int:
         return self.data[status]
+
+    def reset(self):
+        with self.lock:
+            for value in Result:
+                self.data[value] = 0
 
     def __str__(self) -> str:
         result = "COUNTS:\n"

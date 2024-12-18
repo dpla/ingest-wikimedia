@@ -2,6 +2,12 @@ import pytest
 from ingest_wikimedia.tracker import Tracker, Result
 
 
+@pytest.fixture(autouse=True)
+def before_and_after():
+    yield
+    Tracker().reset()
+
+
 @pytest.fixture
 def tracker():
     return Tracker()
