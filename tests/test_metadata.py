@@ -15,6 +15,7 @@ from ingest_wikimedia.metadata import (
     get_iiif_manifest,
     contentdm_iiif_url,
     check_record_partner,
+    maximize_iiif_url,
 )
 
 
@@ -189,3 +190,9 @@ def test_contentdm_iiif_url():
         "http://www.ohiomemory.org/iiif/info/p16007coll33/126923/manifest.json"
     )
     assert contentdm_iiif_url(is_shown_at) == expected_url
+
+
+def test_bpl_iiif_imageapi_url():
+    url = "https://iiif.digitalcommonwealth.org/iiif/2/commonwealth:c534kh14z"
+    expected_url = "https://iiif.digitalcommonwealth.org/iiif/2/commonwealth:c534kh14z/full/max/0/default.jpg"
+    assert maximize_iiif_url(url) == expected_url
