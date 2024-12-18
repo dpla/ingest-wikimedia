@@ -363,7 +363,7 @@ CONTENT_DM_ISSHOWNAT_REGEX = r"^/cdm/ref/collection/(.*)/id/(.*)$"  # todo
 DPLA_PARTNERS = {
     "bpl": "Digital Commonwealth",
     "georgia": "Digital Library of Georgia",
-    "il": "Illinois Digital Heritage Hub",
+    # hold off on illinois "il": "Illinois Digital Heritage Hub",
     "indiana": "Indiana Memory",
     "nara": "National Archives and Records Administration",
     "northwest-heritage": "Northwest Digital Heritage",
