@@ -14,7 +14,7 @@ TEXT_PLAIN = "text/plain"
 DPLA_MAP_FILENAME = "dpla-map.json"
 APPLICATION_JSON = "application/json"
 S3_RETRIES = 3
-S3_BUCKET = "dpla-mdpdb"  # TODO change for prod
+S3_BUCKET = "dpla-wikimedia"
 S3_KEY_METADATA = "Metadata"
 
 # S3 resources are not thread safe, so make one per thread
