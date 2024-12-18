@@ -159,6 +159,12 @@ def process_media(
 
         sha1 = get_file_hash(temp_file_name)
         upload_file_to_s3(temp_file_name, destination_path, content_type, sha1)
+        tracker.increment(Result.DOWNLOADED)
+        tracker.increment(Result.BYTES, os.stat(temp_file_name).st_size)
+
+    except Exception as e:
+        tracker.increment(Result.FAILED)
+        logging.warning(f"Failed: {dpla_id} {ordinal}", exc_info=e)
 
     finally:
         if temp_file:
@@ -244,13 +250,8 @@ def process_item(
         if media_url.startswith("https/"):
             media_url = media_url.replace("https/", "https:/")
         logging.info(f"Downloading {partner} {dpla_id} {count} from {media_url}")
-        try:
-            if not dry_run:
-                process_media(partner, dpla_id, count, media_url, overwrite, sleep_secs)
-
-        except Exception as e:
-            tracker.increment(Result.FAILED)
-            logging.warning(f"Failed: {dpla_id} {count}", exc_info=e)
+        if not dry_run:
+            process_media(partner, dpla_id, count, media_url, overwrite, sleep_secs)
 
 
 @click.command()
