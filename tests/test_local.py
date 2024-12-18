@@ -31,13 +31,17 @@ def test_get_and_cleanup_temp_file():
 def test_get_file_hash(tmp_path):
     test_file = tmp_path / "test_file.txt"
     test_file.write_text("test content")
-    expected_hash = hashlib.sha1(test_file.read_bytes()).hexdigest()
+    expected_hash = hashlib.sha1(
+        test_file.read_bytes(), usedforsecurity=False
+    ).hexdigest()
     assert get_file_hash(str(test_file)) == expected_hash
 
 
 def test_get_bytes_hash():
     data = "test content"
-    expected_hash = hashlib.sha1(data.encode("utf-8")).hexdigest()
+    expected_hash = hashlib.sha1(
+        data.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
     assert get_bytes_hash(data) == expected_hash
 
 
@@ -66,7 +70,7 @@ def test_get_file_hash_file_not_found():
 def test_get_file_hash_empty_file(tmp_path):
     test_file = tmp_path / "empty_file.txt"
     test_file.write_text("")
-    expected_hash = hashlib.sha1(b"").hexdigest()
+    expected_hash = hashlib.sha1(b"", usedforsecurity=False).hexdigest()
     assert get_file_hash(str(test_file)) == expected_hash
 
 
