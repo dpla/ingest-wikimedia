@@ -50,9 +50,15 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
         data_provider, UPLOAD_FIELD_NAME, False
     )
 
+    if not provider_ok:
+        logging.warning("Bad provider.")
+
     rights_category_ok = (
         get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
     )
+
+    if not rights_category_ok:
+        logging.warning("Bad rights category.")
 
     is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
     media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
@@ -67,6 +73,9 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
                 iiif_manifest = True
 
     asset_ok = (media_master is not None) or (iiif_manifest is not None)
+
+    if not asset_ok:
+        logging.warning("Bad asset.")
 
     # todo create banlist. item based? sha based? local id based? all three?
     # todo don't re-upload if deleted
@@ -189,26 +198,41 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
 def maximize_iiif_url(url: str) -> str:
     m = None
 
-    if match := FULL_IMAGE_API_URL_REGEX.match(url):
+    if match := FULL_IMAGE_API_URL_W_PREFIX_REGEX.match(url):
         m = match.groupdict()
 
-    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX.match(url):
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX.match(url):
+        m = match.groupdict()
+
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_DOUBLE_PREFIX_REGEX.match(url):
         m = match.groupdict()
 
     if m is not None:
-        scheme, server, prefix, identifier = itemgetter(
+        scheme, server, identifier = itemgetter(
             "scheme",
             "server",
-            "prefix",
             "identifier",
         )(m)
 
-        return f"{scheme}://{server}/{prefix}/{identifier}/full/max/0/default.jpg"
+        combined_prefix = ""
+        if prefix := m.get("prefix"):
+            combined_prefix += "/"
+            combined_prefix += prefix
+
+        elif (prefix1 := m.get("prefix1")) and (prefix2 := m.get("prefix2")):
+            combined_prefix += "/"
+            combined_prefix += prefix1
+            combined_prefix += "/"
+            combined_prefix += prefix2
+
+        return (
+            f"{scheme}://{server}{combined_prefix}/{identifier}/full/max/0/default.jpg"
+        )
 
     if match := FULL_IMAGE_API_URL_REGEX_NO_PREFIX.match(url):
         m = match.groupdict()
 
-    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX.match(url):
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX.match(url):
         m = match.groupdict()
 
     if m is not None:
@@ -290,10 +314,16 @@ def contentdm_iiif_url(is_shown_at: str) -> str | None:
 
 
 # {scheme}://{server}{/prefix}/{identifier}/
-IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX = re.compile(
+IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX = re.compile(
     r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
     r"(?P<identifier>[^/]+)/?$"
 )
+
+IMAGE_API_UP_THROUGH_IDENTIFIER_W_DOUBLE_PREFIX_REGEX = re.compile(
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix1>[^/]+)/"
+    r"(?P<prefix2>[^/]+)/(?P<identifier>[^/]+)/?$"
+)
+
 
 IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX = re.compile(
     r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<identifier>[^/]+)/?$"
@@ -301,9 +331,15 @@ IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX = re.compile(
 
 
 # {scheme}://{server}{/prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}
-FULL_IMAGE_API_URL_REGEX = re.compile(
+FULL_IMAGE_API_URL_W_PREFIX_REGEX = re.compile(
     r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
     r"(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
+    r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
+)
+
+FULL_IMAGE_API_URL_W_DOUBLE_PREFIX_REGEX = re.compile(
+    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix1>[^/]+)/"
+    r"(?P<prefix2>[^/]+)/(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
     r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
 )
 
