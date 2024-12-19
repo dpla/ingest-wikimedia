@@ -196,3 +196,9 @@ def test_bpl_iiif_imageapi_url():
     url = "https://iiif.digitalcommonwealth.org/iiif/2/commonwealth:c534kh14z"
     expected_url = "https://iiif.digitalcommonwealth.org/iiif/2/commonwealth:c534kh14z/full/max/0/default.jpg"
     assert maximize_iiif_url(url) == expected_url
+
+
+def test_colorado_imageapi_url():
+    url = "https://cudl.colorado.edu/luna/servlet/iiif/UCBOULDERCB1~17~17~33595~102636"
+    expected_url = "https://cudl.colorado.edu/luna/servlet/iiif/UCBOULDERCB1~17~17~33595~102636/full/max/0/default.jpg"
+    assert maximize_iiif_url(url) == expected_url
