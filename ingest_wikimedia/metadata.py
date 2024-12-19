@@ -196,54 +196,84 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
 
 
 def maximize_iiif_url(url: str) -> str:
-    m = None
+    """
+    This attempts to get whatever putative IIIF Image API URL and convert it to a
+    request for the largest payload the server will deliver. Many times, URLs are
+    supplied with arbitrary dimensions as default, which would result in Commons
+    uploads that aren't the full quality.
 
-    if match := FULL_IMAGE_API_URL_W_PREFIX_REGEX.match(url):
-        m = match.groupdict()
+    Unfortunately, many IIIF Image API servers are not deployed per the spec, which
+    requires that there only be one "prefix" path segment in the URL, max. So I'm
+    very pedantically parsing the URLs with inflexible regexes that are tailored to
+    each case of one, two or three prefixes. If someone pops up with a IIIF endpoint
+    four layers deep, it'll require more regexes and so forth.
+
+    Also, sometimes the URLs point to just the identifier rather than info.json or a
+    full Image API request, so I'm handling that too.
+
+    Someone more crafty than I am with regexes might be able to do a cleaner job of
+    this, but this does work.
+
+    The oss Python implementation of IIIF URL handling I ran into looked like it wasn't
+    going to handle these cases, so I've had to DIY to get more partners in.
+    """
+
+    def no_prefix(inner_match: re.Match) -> str:
+        scheme, server, identifier = itemgetter(
+            SCHEME_GROUP,
+            SERVER_GROUP,
+            IDENTIFIER_GROUP,
+        )(inner_match.groupdict())
+        return f"{scheme}://{server}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+
+    def one_prefix(inner_match: re.Match) -> str:
+        scheme, server, identifier, prefix1 = itemgetter(
+            SCHEME_GROUP, SERVER_GROUP, IDENTIFIER_GROUP, PREFIX1_GROUP
+        )(inner_match.groupdict())
+        return f"{scheme}://{server}/{prefix1}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+
+    def two_prefixes(inner_match: re.Match) -> str:
+        scheme, server, identifier, prefix1, prefix2 = itemgetter(
+            SCHEME_GROUP, SERVER_GROUP, IDENTIFIER_GROUP, PREFIX1_GROUP, PREFIX2_GROUP
+        )(inner_match.groupdict())
+        return f"{scheme}://{server}/{prefix1}/{prefix2}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+
+    def three_prefixes(inner_match: re.Match) -> str:
+        scheme, server, identifier, prefix1, prefix2, prefix3 = itemgetter(
+            SCHEME_GROUP,
+            SERVER_GROUP,
+            IDENTIFIER_GROUP,
+            PREFIX1_GROUP,
+            PREFIX2_GROUP,
+            PREFIX3_GROUP,
+        )(inner_match.groupdict())
+        return f"{scheme}://{server}/{prefix1}/{prefix2}/{prefix3}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+
+    if match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX.match(url):
+        return no_prefix(match)
 
     elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX.match(url):
-        m = match.groupdict()
+        return one_prefix(match)
 
     elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_DOUBLE_PREFIX_REGEX.match(url):
-        m = match.groupdict()
+        return two_prefixes(match)
 
-    if m is not None:
-        scheme, server, identifier = itemgetter(
-            "scheme",
-            "server",
-            "identifier",
-        )(m)
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_TRIPLE_PREFIX_REGEX.match(url):
+        return three_prefixes(match)
 
-        combined_prefix = ""
-        if prefix := m.get("prefix"):
-            combined_prefix += "/"
-            combined_prefix += prefix
+    elif match := FULL_IMAGE_API_URL_REGEX_NO_PREFIX.match(url):
+        return no_prefix(match)
 
-        elif (prefix1 := m.get("prefix1")) and (prefix2 := m.get("prefix2")):
-            combined_prefix += "/"
-            combined_prefix += prefix1
-            combined_prefix += "/"
-            combined_prefix += prefix2
+    elif match := FULL_IMAGE_API_URL_W_PREFIX_REGEX.match(url):
+        return one_prefix(match)
 
-        return (
-            f"{scheme}://{server}{combined_prefix}/{identifier}/full/max/0/default.jpg"
-        )
+    elif match := FULL_IMAGE_API_URL_W_DOUBLE_PREFIX_REGEX.match(url):
+        return two_prefixes(match)
 
-    if match := FULL_IMAGE_API_URL_REGEX_NO_PREFIX.match(url):
-        m = match.groupdict()
+    elif match := FULL_IMAGE_API_URL_W_TRIPLE_PREFIX_REGEX.match(url):
+        return three_prefixes(match)
 
-    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX.match(url):
-        m = match.groupdict()
-
-    if m is not None:
-        scheme, server, prefix, identifier = itemgetter(
-            "scheme",
-            "server",
-            "identifier",
-        )(m)
-
-        return f"{scheme}://{server}/{identifier}/full/max/0/default.jpg"
-
+    logging.warn(f"Couldn't maximize IIIF URL: {url}")
     Tracker().increment(Result.BAD_IMAGE_API)
     return ""  # we give up
 
@@ -313,42 +343,111 @@ def contentdm_iiif_url(is_shown_at: str) -> str | None:
         )
 
 
-# {scheme}://{server}{/prefix}/{identifier}/
+SCHEME_GROUP = "scheme"
+SCHEME_REGEX = r"^(?P<scheme>http|https)://"
+SERVER_GROUP = "server"
+SERVER_REGEX = r"(?P<server>[^/]+)/"
+PREFIX1_GROUP = "prefix1"
+PREFIX1_REGEX = r"(?P<prefix1>[^/]+)/"
+PREFIX2_GROUP = "prefix2"
+PREFIX2_REGEX = r"(?P<prefix2>[^/]+)/"
+PREFIX3_GROUP = "prefix3"
+PREFIX3_REGEX = r"(?P<prefix3>[^/]+)/"
+IDENTIFIER_GROUP = "identifier"
+IDENTIFIER_REGEX_OPTIONAL_SLASH = r"(?P<identifier>[^/]+)/?"
+IDENTIFIER_REGEX_REQUIRED_SLASH = r"(?P<identifier>[^/]+)/"
+REGION_GROUP = "region"
+REGION_REGEX = r"(?P<region>[^/]+)/"
+SIZE_GROUP = "size"
+SIZE_REGEX = r"(?P<size>[^/]+)/"
+ROTATION_GROUP = "rotation"
+ROTATION_REGEX = r"(?P<rotation>[^/]+)/"
+QUALITY_GROUP = "quality"
+FORMAT_GROUP = "format"
+QUALTY_FORMAT_REGEX = r"(?P<quality>[^./]+)\.(?P<format>.*)"
+STRING_END_REGEX = r"$"
+
 IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
-    r"(?P<identifier>[^/]+)/?$"
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + PREFIX1_REGEX
+    + IDENTIFIER_REGEX_OPTIONAL_SLASH
+    + STRING_END_REGEX
 )
 
 IMAGE_API_UP_THROUGH_IDENTIFIER_W_DOUBLE_PREFIX_REGEX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix1>[^/]+)/"
-    r"(?P<prefix2>[^/]+)/(?P<identifier>[^/]+)/?$"
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + PREFIX1_REGEX
+    + PREFIX2_REGEX
+    + IDENTIFIER_REGEX_OPTIONAL_SLASH
+    + STRING_END_REGEX
 )
 
+IMAGE_API_UP_THROUGH_IDENTIFIER_W_TRIPLE_PREFIX_REGEX = re.compile(
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + PREFIX1_REGEX
+    + PREFIX2_REGEX
+    + PREFIX3_REGEX
+    + IDENTIFIER_REGEX_OPTIONAL_SLASH
+    + STRING_END_REGEX
+)
 
 IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<identifier>[^/]+)/?$"
+    SCHEME_REGEX + SERVER_REGEX + IDENTIFIER_REGEX_OPTIONAL_SLASH + STRING_END_REGEX
 )
-
 
 # {scheme}://{server}{/prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}
 FULL_IMAGE_API_URL_W_PREFIX_REGEX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
-    r"(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
-    r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + PREFIX1_REGEX
+    + IDENTIFIER_REGEX_REQUIRED_SLASH
+    + REGION_REGEX
+    + SIZE_REGEX
+    + ROTATION_REGEX
+    + QUALTY_FORMAT_REGEX
+    + STRING_END_REGEX
 )
 
 FULL_IMAGE_API_URL_W_DOUBLE_PREFIX_REGEX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix1>[^/]+)/"
-    r"(?P<prefix2>[^/]+)/(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
-    r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + PREFIX1_REGEX
+    + PREFIX2_REGEX
+    + IDENTIFIER_REGEX_REQUIRED_SLASH
+    + REGION_REGEX
+    + SIZE_REGEX
+    + ROTATION_REGEX
+    + QUALTY_FORMAT_REGEX
+    + STRING_END_REGEX
+)
+
+FULL_IMAGE_API_URL_W_TRIPLE_PREFIX_REGEX = re.compile(
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + PREFIX1_REGEX
+    + PREFIX2_REGEX
+    + PREFIX3_REGEX
+    + IDENTIFIER_REGEX_REQUIRED_SLASH
+    + REGION_REGEX
+    + SIZE_REGEX
+    + ROTATION_REGEX
+    + QUALTY_FORMAT_REGEX
+    + STRING_END_REGEX
 )
 
 FULL_IMAGE_API_URL_REGEX_NO_PREFIX = re.compile(
-    r"^(?P<scheme>http|https)://(?P<server>[^/]+)/(?P<prefix>[^/]+)/"
-    r"(?P<identifier>[^/]+)/(?P<region>[^/]+)/(?P<size>[^/]+)/"
-    r"(?P<rotation>[^/]+)/(?P<quality>[^.]+).(?P<format>.*)$"
+    SCHEME_REGEX
+    + SERVER_REGEX
+    + IDENTIFIER_REGEX_REQUIRED_SLASH
+    + REGION_REGEX
+    + SIZE_REGEX
+    + ROTATION_REGEX
+    + QUALTY_FORMAT_REGEX
+    + STRING_END_REGEX
 )
-
 
 DPLA_API_URL_BASE = "https://api.dp.la/v2/items/"
 DPLA_API_DOCS = "docs"
