@@ -112,9 +112,7 @@ def test_iiif_v2_urls():
                         "images": [
                             {
                                 "resource": {
-                                    "service": {
-                                        "@id": "http://server/prefix/identifier"
-                                    }
+                                    "service": {"@id": "http://server/iiif/identifier"}
                                 }
                             }
                         ]
@@ -124,7 +122,7 @@ def test_iiif_v2_urls():
         ]
     }
     result = iiif_v2_urls(iiif)
-    assert result == ["http://server/prefix/identifier/full/max/0/default.jpg"]
+    assert result == ["http://server/iiif/identifier/full/max/0/default.jpg"]
 
 
 def test_iiif_v3_urls():
@@ -201,4 +199,10 @@ def test_bpl_iiif_imageapi_url():
 def test_colorado_imageapi_url():
     url = "https://cudl.colorado.edu/luna/servlet/iiif/UCBOULDERCB1~17~17~33595~102636"
     expected_url = "https://cudl.colorado.edu/luna/servlet/iiif/UCBOULDERCB1~17~17~33595~102636/full/max/0/default.jpg"
+    assert maximize_iiif_url(url) == expected_url
+
+
+def test_texas_imageapi_url():
+    url = "https://texashistory.unt.edu/iiif/ark:/67531/metapth540971/m1/1"
+    expected_url = "https://texashistory.unt.edu/iiif/ark:/67531/metapth540971/m1/1/full/max/0/default.jpg"
     assert maximize_iiif_url(url) == expected_url

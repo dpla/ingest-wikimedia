@@ -189,7 +189,7 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
             urls.append(new_url)
 
         except (IndexError, TypeError, KeyError) as e:
-            logging.warning("Unable to parse IIIF manifest.", e)
+            logging.warning("Unable to parse IIIF manifest.", str(e))
             Tracker().increment(Result.BAD_IIIF_MANIFEST)
             return []
     return urls
@@ -273,7 +273,12 @@ def maximize_iiif_url(url: str) -> str:
     elif match := FULL_IMAGE_API_URL_W_TRIPLE_PREFIX_REGEX.match(url):
         return three_prefixes(match)
 
-    logging.warn(f"Couldn't maximize IIIF URL: {url}")
+    elif match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_ONE_PREFIX_ID_W_SLASHES.match(
+        url
+    ):
+        return one_prefix(match)
+
+    logging.warning(f"Couldn't maximize IIIF URL: {url}")
     Tracker().increment(Result.BAD_IMAGE_API)
     return ""  # we give up
 
@@ -347,15 +352,23 @@ SCHEME_GROUP = "scheme"
 SCHEME_REGEX = r"^(?P<scheme>http|https)://"
 SERVER_GROUP = "server"
 SERVER_REGEX = r"(?P<server>[^/]+)/"
+
 PREFIX1_GROUP = "prefix1"
 PREFIX1_REGEX = r"(?P<prefix1>[^/]+)/"
+PREFIX1_IIIF_REGEX = r"(?P<prefix1>iiif)/"
+
 PREFIX2_GROUP = "prefix2"
 PREFIX2_REGEX = r"(?P<prefix2>[^/]+)/"
+PREFIX2_IIIF_REGEX = r"(?P<prefix2>iiif)/"
+
 PREFIX3_GROUP = "prefix3"
 PREFIX3_REGEX = r"(?P<prefix3>[^/]+)/"
+PREFIX3_IIIF_REGEX = r"(?P<prefix3>iiif)/"
+
 IDENTIFIER_GROUP = "identifier"
 IDENTIFIER_REGEX_OPTIONAL_SLASH = r"(?P<identifier>[^/]+)/?"
 IDENTIFIER_REGEX_REQUIRED_SLASH = r"(?P<identifier>[^/]+)/"
+IDENTIFIER_REGEX_REST_OF_STRING = r"(?P<identifier>.*)$"
 REGION_GROUP = "region"
 REGION_REGEX = r"(?P<region>[^/]+)/"
 SIZE_GROUP = "size"
@@ -364,13 +377,13 @@ ROTATION_GROUP = "rotation"
 ROTATION_REGEX = r"(?P<rotation>[^/]+)/"
 QUALITY_GROUP = "quality"
 FORMAT_GROUP = "format"
-QUALTY_FORMAT_REGEX = r"(?P<quality>[^./]+)\.(?P<format>.*)"
+QUALITY_FORMAT_REGEX = r"(?P<quality>[^./]+)\.(?P<format>.*)"
 STRING_END_REGEX = r"$"
 
 IMAGE_API_UP_THROUGH_IDENTIFIER_W_PREFIX_REGEX = re.compile(
     SCHEME_REGEX
     + SERVER_REGEX
-    + PREFIX1_REGEX
+    + PREFIX1_IIIF_REGEX
     + IDENTIFIER_REGEX_OPTIONAL_SLASH
     + STRING_END_REGEX
 )
@@ -379,7 +392,7 @@ IMAGE_API_UP_THROUGH_IDENTIFIER_W_DOUBLE_PREFIX_REGEX = re.compile(
     SCHEME_REGEX
     + SERVER_REGEX
     + PREFIX1_REGEX
-    + PREFIX2_REGEX
+    + PREFIX2_IIIF_REGEX
     + IDENTIFIER_REGEX_OPTIONAL_SLASH
     + STRING_END_REGEX
 )
@@ -389,7 +402,7 @@ IMAGE_API_UP_THROUGH_IDENTIFIER_W_TRIPLE_PREFIX_REGEX = re.compile(
     + SERVER_REGEX
     + PREFIX1_REGEX
     + PREFIX2_REGEX
-    + PREFIX3_REGEX
+    + PREFIX3_IIIF_REGEX
     + IDENTIFIER_REGEX_OPTIONAL_SLASH
     + STRING_END_REGEX
 )
@@ -398,16 +411,20 @@ IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX = re.compile(
     SCHEME_REGEX + SERVER_REGEX + IDENTIFIER_REGEX_OPTIONAL_SLASH + STRING_END_REGEX
 )
 
+IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_ONE_PREFIX_ID_W_SLASHES = re.compile(
+    SCHEME_REGEX + SERVER_REGEX + PREFIX1_IIIF_REGEX + IDENTIFIER_REGEX_REST_OF_STRING
+)
+
 # {scheme}://{server}{/prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}
 FULL_IMAGE_API_URL_W_PREFIX_REGEX = re.compile(
     SCHEME_REGEX
     + SERVER_REGEX
-    + PREFIX1_REGEX
+    + PREFIX1_IIIF_REGEX
     + IDENTIFIER_REGEX_REQUIRED_SLASH
     + REGION_REGEX
     + SIZE_REGEX
     + ROTATION_REGEX
-    + QUALTY_FORMAT_REGEX
+    + QUALITY_FORMAT_REGEX
     + STRING_END_REGEX
 )
 
@@ -415,12 +432,12 @@ FULL_IMAGE_API_URL_W_DOUBLE_PREFIX_REGEX = re.compile(
     SCHEME_REGEX
     + SERVER_REGEX
     + PREFIX1_REGEX
-    + PREFIX2_REGEX
+    + PREFIX2_IIIF_REGEX
     + IDENTIFIER_REGEX_REQUIRED_SLASH
     + REGION_REGEX
     + SIZE_REGEX
     + ROTATION_REGEX
-    + QUALTY_FORMAT_REGEX
+    + QUALITY_FORMAT_REGEX
     + STRING_END_REGEX
 )
 
@@ -429,12 +446,12 @@ FULL_IMAGE_API_URL_W_TRIPLE_PREFIX_REGEX = re.compile(
     + SERVER_REGEX
     + PREFIX1_REGEX
     + PREFIX2_REGEX
-    + PREFIX3_REGEX
+    + PREFIX3_IIIF_REGEX
     + IDENTIFIER_REGEX_REQUIRED_SLASH
     + REGION_REGEX
     + SIZE_REGEX
     + ROTATION_REGEX
-    + QUALTY_FORMAT_REGEX
+    + QUALITY_FORMAT_REGEX
     + STRING_END_REGEX
 )
 
@@ -445,7 +462,7 @@ FULL_IMAGE_API_URL_REGEX_NO_PREFIX = re.compile(
     + REGION_REGEX
     + SIZE_REGEX
     + ROTATION_REGEX
-    + QUALTY_FORMAT_REGEX
+    + QUALITY_FORMAT_REGEX
     + STRING_END_REGEX
 )
 
