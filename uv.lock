@@ -115,7 +115,7 @@ name = "click"
 version = "8.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "platform_system == 'Windows'" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/96/d3/f04c7bfcf5c1862a2a5b845c6b2b360488cf47af55dfa79c98f6a6bf98b5/click-8.1.7.tar.gz", hash = "sha256:ca9853ad459e787e2192211578cc907e7594e294c7ccc834310722b41b9ca6de", size = 336121 }
 wheels = [
@@ -183,6 +183,7 @@ dependencies = [
     { name = "pywikibot" },
     { name = "requests" },
     { name = "tqdm" },
+    { name = "types-boto3-s3" },
     { name = "validators" },
 ]
 
@@ -206,6 +207,7 @@ requires-dist = [
     { name = "pywikibot", specifier = ">=9.4.1" },
     { name = "requests", specifier = ">=2.32.3" },
     { name = "tqdm", specifier = ">=4.67.0" },
+    { name = "types-boto3-s3", specifier = ">=1.35.93" },
     { name = "validators", specifier = ">=0.34.0" },
 ]
 
@@ -461,7 +463,7 @@ name = "tqdm"
 version = "4.67.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "platform_system == 'Windows'" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e8/4f/0153c21dc5779a49a0598c445b1978126b1344bab9ee71e53e44877e14e0/tqdm-4.67.0.tar.gz", hash = "sha256:fe5a6f95e6fe0b9755e9469b77b9c3cf850048224ecaa8293d7d2d31f97d869a", size = 169739 }
 wheels = [
@@ -475,6 +477,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/dd/23/7de2052a76ec03cdc56cb425efbcb80e9d779a188cd1ae44e8524c717c35/types_awscrt-0.23.0.tar.gz", hash = "sha256:3fd1edeac923d1956c0e907c973fb83bda465beae7f054716b371b293f9b5fdc", size = 14942 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fc/05/155d84a2a73083bf3243584ae90d9710eac7d31f54362e35ca413bdaba39/types_awscrt-0.23.0-py3-none-any.whl", hash = "sha256:517d9d06f19cf58d778ca90ad01e52e0489466bf70dcf78c7f47f74fdf151a60", size = 18406 },
+]
+
+[[package]]
+name = "types-boto3-s3"
+version = "1.35.93"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/ee/f3fe35eb0d12d308d3029baa464f1d9a308250d1ff132231edb9e19c44e9/types_boto3_s3-1.35.93.tar.gz", hash = "sha256:fe2121fb231dac53e9ee65f82c2823bdd4024eadc72196470461a149da13003a", size = 72531 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8e/e7/dbb7a59f003da301ec070a7b6c1e2d285a4dcda8bebfa720fa1edf4a7505/types_boto3_s3-1.35.93-py3-none-any.whl", hash = "sha256:b6fb9b268aec947771c9f865f205be62371cc9c7662ed04bb58916d5603d6d37", size = 79318 },
 ]
 
 [[package]]

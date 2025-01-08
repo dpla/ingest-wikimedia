@@ -4,7 +4,6 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from mypy_boto3_s3 import S3ServiceResource
-
 from .common import CHECKSUM
 from .local import get_bytes_hash
 
@@ -20,6 +19,9 @@ S3_KEY_METADATA = "Metadata"
 # S3 resources are not thread safe, so make one per thread
 __thread_local = threading.local()
 __thread_local.s3 = None
+
+# This is here only to make the NoSuchKey exception be in scope.
+client = boto3.client("s3")
 
 
 def get_s3() -> S3ServiceResource:
@@ -84,7 +86,7 @@ def write_item_metadata(partner: str, dpla_id: str, item_metadata: str) -> None:
     write_item_file(partner, dpla_id, item_metadata, DPLA_MAP_FILENAME, TEXT_PLAIN)
 
 
-def get_item_metadata(partner: str, dpla_id: str) -> str:
+def get_item_metadata(partner: str, dpla_id: str) -> str | None:
     """
     Reads the metadata file back from s3.
     """
@@ -100,7 +102,11 @@ def write_file_list(partner: str, dpla_id: str, file_urls: list[str]) -> None:
 
 
 def get_file_list(partner: str, dpla_id: str) -> list[str]:
-    return get_item_file(partner, dpla_id, FILE_LIST_TXT).split("\n")
+    result = get_item_file(partner, dpla_id, FILE_LIST_TXT).split("\n")
+    if result is None:
+        return []
+    else:
+        return result
 
 
 def write_iiif_manifest(partner: str, dpla_id: str, manifest: str) -> None:
@@ -127,8 +133,14 @@ def write_item_file(
     s3_object.put(ContentType=content_type, Metadata={CHECKSUM: sha1}, Body=data)
 
 
-def get_item_file(partner, dpla_id, file_name) -> str:
+def get_item_file(partner, dpla_id, file_name) -> str | None:
     s3 = get_s3()
     s3_path = get_item_s3_path(dpla_id, file_name, partner)
-    s3_object = s3.Object(S3_BUCKET, s3_path)
-    return s3_object.get()["Body"].read().decode("utf-8")
+
+    try:
+        s3_object = s3.Object(S3_BUCKET, s3_path).get()
+
+    except client.exceptions.NoSuchKey:
+        return None
+
+    return s3_object["Body"].read().decode("utf-8")

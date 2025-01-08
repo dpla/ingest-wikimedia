@@ -183,7 +183,12 @@ def process_item(
     try:
         logging.info(f"DPLA ID: {dpla_id}")
 
-        item_metadata = json.loads(get_item_metadata(partner, dpla_id))
+        item_metadata_result = get_item_metadata(partner, dpla_id)
+        if not item_metadata_result:
+            tracker.increment(Result.ITEM_NOT_PRESENT)
+            return
+
+        item_metadata = json.loads(item_metadata_result)
 
         provider, data_provider = get_provider_and_data_provider(
             item_metadata, providers_json
