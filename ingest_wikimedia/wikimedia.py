@@ -141,9 +141,17 @@ def get_wiki_text(
     is_shown_at = escape_wiki_strings(get_str(item_metadata, EDM_IS_SHOWN_AT))
     local_id = extract_strings(source_resource, DC_IDENTIFIER_FIELD_NAME)
 
-    template_string = """== {{int:filedesc}} ==
-     {{ Artwork
-        | Other fields 1 = {{ InFi | Creator | $creator }}
+    if creator_string:
+        creator_template = """
+        | Other fields 1 = {{ InFi | Creator | $creator | id=fileinfotpl_aut}}"""
+    else:
+        creator_template = ""
+
+    template_string = (
+        """== {{int:filedesc}} ==
+     {{ Artwork"""
+        + creator_template
+        + """
         | title = $title
         | description = $description
         | date = $date_string
@@ -157,6 +165,7 @@ def get_wiki_text(
         }}
         | Institution = {{ Institution | wikidata = $data_provider }}
      }}"""
+    )
 
     return Template(template_string).substitute(
         creator=creator_string,
