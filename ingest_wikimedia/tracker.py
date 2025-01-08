@@ -8,6 +8,7 @@ class Result(Enum):
     SKIPPED = auto()
     UPLOADED = auto()
     BYTES = auto()
+    ITEM_NOT_PRESENT = auto()
     BAD_IIIF_MANIFEST = auto()
     NO_MEDIA = auto()
     BAD_IMAGE_API = auto()
