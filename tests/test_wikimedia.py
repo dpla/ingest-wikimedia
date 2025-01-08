@@ -143,7 +143,28 @@ def test_get_wiki_text():
     expected_text = (
         "== {{int:filedesc}} ==\n"
         "     {{ Artwork\n"
-        "        | Other fields 1 = {{ InFi | Creator | John Doe }}\n"
+        "        | Other fields 1 = {{ InFi | Creator | John Doe | id=fileinfotpl_aut}}\n"
+        "        | title = Sample Title\n"
+        "        | description = Sample Description\n"
+        "        | date = 2023\n"
+        "        | permission = {{NKC | Q12345}}\n"
+        "        | source = {{ DPLA\n"
+        "            | Q12345\n"
+        "            | hub = Q67890\n"
+        "            | url = http://example.com/item/12345\n"
+        "            | dpla_id = 12345\n"
+        "            | local_id = ID12345\n"
+        "        }}\n"
+        "        | Institution = {{ Institution | wikidata = Q12345 }}\n"
+        "     }}"
+    )
+    assert text == expected_text
+
+    item_metadata["sourceResource"].pop("creator")
+    text = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
+    expected_text = (
+        "== {{int:filedesc}} ==\n"
+        "     {{ Artwork\n"
         "        | title = Sample Title\n"
         "        | description = Sample Description\n"
         "        | date = 2023\n"
