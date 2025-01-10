@@ -11,7 +11,7 @@ __thread_local.http_session = None
 
 RETRY_COUNT = 3
 RETRY_BACKOUT_FACTOR = 1
-DEFAULT_CONN_TIMEOUT = 10
+DEFAULT_CONN_TIMEOUT = 45
 
 
 def get_http_session() -> requests.Session:
