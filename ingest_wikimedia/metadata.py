@@ -117,8 +117,8 @@ def provider_str(provider: dict) -> str:
         return "Provider: None"
     else:
         return (
-            f"Provider: {provider.get(WIKIDATA_FIELD_NAME, "")}, "
-            f"{provider.get(UPLOAD_FIELD_NAME, "")}"
+            f"Provider: {provider.get(WIKIDATA_FIELD_NAME, '')}, "
+            f"{provider.get(UPLOAD_FIELD_NAME, '')}"
         )
 
 
@@ -153,18 +153,17 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
     """
     urls = []
     sequences = get_list(iiif, IIIF_SEQUENCES)
-    sequence = sequences[0:1] if len(sequences) == 1 else None
-    canvases = get_list(sequence[0], IIIF_CANVASES)
-
-    for canvas in canvases:
-        for image in get_list(canvas, IIIF_IMAGES):
-            resource = get_dict(image, IIIF_RESOURCE)
-            service = get_dict(resource, IIIF_SERVICE)
-            url = get_str(service, JSON_LD_AT_ID)
-            if url:
-                urls.append(maximize_iiif_url(url))
-            else:
-                urls.append("")
+    for sequence in sequences:
+        canvases = get_list(sequence, IIIF_CANVASES)
+        for canvas in canvases:
+            for image in get_list(canvas, IIIF_IMAGES):
+                resource = get_dict(image, IIIF_RESOURCE)
+                service = get_dict(resource, IIIF_SERVICE)
+                url = get_str(service, JSON_LD_AT_ID)
+                if url:
+                    urls.append(maximize_iiif_url(url))
+                else:
+                    urls.append("")
     return urls
 
 
@@ -189,7 +188,7 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
             urls.append(new_url)
 
         except (IndexError, TypeError, KeyError) as e:
-            logging.warning("Unable to parse IIIF manifest.", str(e))
+            logging.warning("Unable to parse IIIF manifest.", exc_info=e)
             Tracker().increment(Result.BAD_IIIF_MANIFEST)
             return []
     return urls
