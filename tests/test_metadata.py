@@ -125,6 +125,29 @@ def test_iiif_v2_urls():
     assert result == ["http://server/iiif/identifier/full/max/0/default.jpg"]
 
 
+def test_iiif_v2_multiple_sequences():
+    iiif = {
+        "sequences": [
+            {
+                "canvases": [
+                    {
+                        "images": [
+                            {
+                                "resource": {
+                                    "service": {"@id": "http://server/iiif/identifier"}
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            {},
+        ]
+    }
+    result = iiif_v2_urls(iiif)
+    assert result == ["http://server/iiif/identifier/full/max/0/default.jpg"]
+
+
 def test_iiif_v3_urls():
     iiif = {
         "items": [
