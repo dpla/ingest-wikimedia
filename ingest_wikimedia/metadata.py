@@ -51,14 +51,14 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
     )
 
     if not provider_ok:
-        logging.warning("Bad provider.")
+        logging.info("Bad provider.")
 
     rights_category_ok = (
         get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
     )
 
     if not rights_category_ok:
-        logging.warning("Bad rights category.")
+        logging.info("Bad rights category.")
 
     is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
     media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
@@ -75,7 +75,7 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
     asset_ok = (media_master is not None) or (iiif_manifest is not None)
 
     if not asset_ok:
-        logging.warning("Bad asset.")
+        logging.info("Bad asset.")
 
     # todo create banlist. item based? sha based? local id based? all three?
     # todo don't re-upload if deleted

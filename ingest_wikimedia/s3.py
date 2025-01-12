@@ -102,11 +102,11 @@ def write_file_list(partner: str, dpla_id: str, file_urls: list[str]) -> None:
 
 
 def get_file_list(partner: str, dpla_id: str) -> list[str]:
-    result = get_item_file(partner, dpla_id, FILE_LIST_TXT).split("\n")
+    result = get_item_file(partner, dpla_id, FILE_LIST_TXT)
     if result is None:
         return []
     else:
-        return result
+        return result.split("\n")
 
 
 def write_iiif_manifest(partner: str, dpla_id: str, manifest: str) -> None:

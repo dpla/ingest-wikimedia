@@ -96,8 +96,7 @@ def process_file(
 
         if not ext:
             logging.info(
-                f"Skipping {dpla_id} {ordinal}: "
-                f"Unable to guess extension for {mime}"
+                f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
             )
             tracker.increment(Result.SKIPPED)
             return
@@ -195,6 +194,7 @@ def process_item(
         )
 
         if not is_wiki_eligible(item_metadata, provider, data_provider):
+            logging.info(f"Skipping {dpla_id}: Not eligible.")
             tracker.increment(Result.SKIPPED)
             return
 
