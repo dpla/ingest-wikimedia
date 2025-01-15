@@ -217,6 +217,9 @@ def process_item(
         elif IIIF_MANIFEST_FIELD_NAME in item_metadata:
             manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
             manifest = get_iiif_manifest(manifest_url)
+            if not manifest:
+                tracker.increment(Result.SKIPPED)
+                return
             write_iiif_manifest(partner, dpla_id, json.dumps(manifest))
             media_urls = get_iiif_urls(manifest)
 

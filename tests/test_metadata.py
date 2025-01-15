@@ -16,6 +16,7 @@ from ingest_wikimedia.metadata import (
     contentdm_iiif_url,
     check_record_partner,
     maximize_iiif_url,
+    IIIF_V3_FULL_RES_JPG_SUFFIX,
 )
 
 
@@ -216,16 +217,16 @@ def test_contentdm_iiif_url():
 def test_bpl_iiif_imageapi_url():
     url = "https://iiif.digitalcommonwealth.org/iiif/2/commonwealth:c534kh14z"
     expected_url = "https://iiif.digitalcommonwealth.org/iiif/2/commonwealth:c534kh14z/full/max/0/default.jpg"
-    assert maximize_iiif_url(url) == expected_url
+    assert maximize_iiif_url(url, IIIF_V3_FULL_RES_JPG_SUFFIX) == expected_url
 
 
 def test_colorado_imageapi_url():
     url = "https://cudl.colorado.edu/luna/servlet/iiif/UCBOULDERCB1~17~17~33595~102636"
     expected_url = "https://cudl.colorado.edu/luna/servlet/iiif/UCBOULDERCB1~17~17~33595~102636/full/max/0/default.jpg"
-    assert maximize_iiif_url(url) == expected_url
+    assert maximize_iiif_url(url, IIIF_V3_FULL_RES_JPG_SUFFIX) == expected_url
 
 
 def test_texas_imageapi_url():
     url = "https://texashistory.unt.edu/iiif/ark:/67531/metapth540971/m1/1"
     expected_url = "https://texashistory.unt.edu/iiif/ark:/67531/metapth540971/m1/1/full/max/0/default.jpg"
-    assert maximize_iiif_url(url) == expected_url
+    assert maximize_iiif_url(url, IIIF_V3_FULL_RES_JPG_SUFFIX) == expected_url
