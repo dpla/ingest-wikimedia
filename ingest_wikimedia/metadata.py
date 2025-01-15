@@ -159,11 +159,19 @@ def iiif_v2_urls(iiif: dict) -> list[str]:
             for image in get_list(canvas, IIIF_IMAGES):
                 resource = get_dict(image, IIIF_RESOURCE)
                 service = get_dict(resource, IIIF_SERVICE)
+                context = get_str(service, JSON_LD_AT_CONTEXT)
                 url = get_str(service, JSON_LD_AT_ID)
-                if url:
-                    urls.append(maximize_iiif_url(url))
+                if url and context == IIIF_IMAGE_API_V2:
+                    big_url = maximize_iiif_url(url, IIIF_V2_FULL_RES_JPG_SUFFIX)
+                    urls.append(big_url)
+                elif url:
+                    # guessing the v3 syntax will work even if we don't know it's v3.
+                    big_url = maximize_iiif_url(url, IIIF_V3_FULL_RES_JPG_SUFFIX)
+                    urls.append(big_url)
                 else:
+                    # we give up, but need to hold space so the numbering is right
                     urls.append("")
+
     return urls
 
 
@@ -180,7 +188,9 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
             )
             new_url = ""
             if url:
-                new_url = maximize_iiif_url(url)
+                # This might later need to sniff the profile level of the image API
+                # like we did in iiif_v2_urls()
+                new_url = maximize_iiif_url(url, IIIF_V3_FULL_RES_JPG_SUFFIX)
             # This always adds something to the list.
             # If we didn't get a URL, it's just an empty string.
             # This prevents getting the page order wrong if we don't
@@ -194,7 +204,7 @@ def iiif_v3_urls(iiif: dict) -> list[str]:
     return urls
 
 
-def maximize_iiif_url(url: str) -> str:
+def maximize_iiif_url(url: str, suffix: str) -> str:
     """
     This attempts to get whatever putative IIIF Image API URL and convert it to a
     request for the largest payload the server will deliver. Many times, URLs are
@@ -223,19 +233,19 @@ def maximize_iiif_url(url: str) -> str:
             SERVER_GROUP,
             IDENTIFIER_GROUP,
         )(inner_match.groupdict())
-        return f"{scheme}://{server}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+        return f"{scheme}://{server}/{identifier}{suffix}"
 
     def one_prefix(inner_match: re.Match) -> str:
         scheme, server, identifier, prefix1 = itemgetter(
             SCHEME_GROUP, SERVER_GROUP, IDENTIFIER_GROUP, PREFIX1_GROUP
         )(inner_match.groupdict())
-        return f"{scheme}://{server}/{prefix1}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+        return f"{scheme}://{server}/{prefix1}/{identifier}{suffix}"
 
     def two_prefixes(inner_match: re.Match) -> str:
         scheme, server, identifier, prefix1, prefix2 = itemgetter(
             SCHEME_GROUP, SERVER_GROUP, IDENTIFIER_GROUP, PREFIX1_GROUP, PREFIX2_GROUP
         )(inner_match.groupdict())
-        return f"{scheme}://{server}/{prefix1}/{prefix2}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+        return f"{scheme}://{server}/{prefix1}/{prefix2}/{identifier}{suffix}"
 
     def three_prefixes(inner_match: re.Match) -> str:
         scheme, server, identifier, prefix1, prefix2, prefix3 = itemgetter(
@@ -246,7 +256,7 @@ def maximize_iiif_url(url: str) -> str:
             PREFIX2_GROUP,
             PREFIX3_GROUP,
         )(inner_match.groupdict())
-        return f"{scheme}://{server}/{prefix1}/{prefix2}/{prefix3}/{identifier}{IIIF_FULL_RES_JPG_SUFFIX}"
+        return f"{scheme}://{server}/{prefix1}/{prefix2}/{prefix3}/{identifier}{suffix}"
 
     if match := IMAGE_API_UP_THROUGH_IDENTIFIER_REGEX_NO_PREFIX.match(url):
         return no_prefix(match)
@@ -276,6 +286,17 @@ def maximize_iiif_url(url: str) -> str:
         url
     ):
         return one_prefix(match)
+    else:
+        # try just whacking a max-res suffix on:
+        test_url = url + suffix
+        # test to make sure that has something at the end of it
+        http_session = get_http_session()
+        head_response = http_session.head(test_url)
+        if (
+            head_response.ok
+            and head_response.headers[HEADER_CONTENT_TYPE] == CONTENT_TYPE_JPEG
+        ):
+            return test_url
 
     logging.warning(f"Couldn't maximize IIIF URL: {url}")
     Tracker().increment(Result.BAD_IMAGE_API)
@@ -303,20 +324,22 @@ def get_iiif_urls(manifest: dict) -> list[str]:
             raise Exception(f"Unimplemented IIIF version: {x}")
 
 
-def get_iiif_manifest(url: str) -> dict:
+def get_iiif_manifest(url: str) -> dict | None:
     """
     Gets the IIIF manifest from the given url.
     """
     if not validators.url(url):
-        raise Exception(f"Invalid url {url}")
+        logging.warning(f"Invalid IIIF manifest url: {url}")
+        return None
+
     try:
         request = get_http_session().get(url, headers=HTTP_REQUEST_HEADERS)
         request.raise_for_status()
         return request.json()
 
-    except Exception as ex:
-        # todo maybe this should return None?
-        raise Exception(f"Error getting IIIF manifest at {url}") from ex
+    except Exception:
+        logging.info(f"Unable to read IIIF manifest at {url}")
+        return None
 
 
 def contentdm_iiif_url(is_shown_at: str) -> str | None:
@@ -465,6 +488,9 @@ FULL_IMAGE_API_URL_REGEX_NO_PREFIX = re.compile(
     + STRING_END_REGEX
 )
 
+HEADER_CONTENT_TYPE = "Content-Type"
+CONTENT_TYPE_JPEG = "image/jpeg"
+
 DPLA_API_URL_BASE = "https://api.dp.la/v2/items/"
 DPLA_API_DOCS = "docs"
 INSTITUTIONS_URL = (
@@ -503,14 +529,15 @@ IIIF_IMAGES = "images"
 IIIF_CANVASES = "canvases"
 IIIF_SEQUENCES = "sequences"
 IIIF_SERVICE = "service"
-IIIF_FULL_RES_JPG_SUFFIX = "/full/max/0/default.jpg"
+IIIF_V2_FULL_RES_JPG_SUFFIX = "/full/full/0/default.jpg"
+IIIF_V3_FULL_RES_JPG_SUFFIX = "/full/max/0/default.jpg"
 IIIF_PRESENTATION_API_MANIFEST_V2 = "http://iiif.io/api/presentation/2/context.json"
 IIIF_PRESENTATION_API_MANIFEST_V3 = "http://iiif.io/api/presentation/3/context.json"
 IIIF_IMAGE_API_V2 = "http://iiif.io/api/image/2/context.json"
 IIIF_IMAGE_API_V3 = "http://iiif.io/api/image/3/context.json"
 CONTENTDM_IIIF_MANIFEST_JSON = "/manifest.json"
 CONTENTDM_IIIF_INFO = "/iiif/info/"
-CONTENT_DM_ISSHOWNAT_REGEX = r"^/cdm/ref/collection/(.*)/id/(.*)$"  # todo
+CONTENT_DM_ISSHOWNAT_REGEX = r"^/cdm/ref/collection/(.*)/id/(.*)$"
 DPLA_PARTNERS = {
     "bpl": "Digital Commonwealth",
     "georgia": "Digital Library of Georgia",
