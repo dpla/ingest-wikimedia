@@ -130,7 +130,7 @@ def test_get_wiki_text():
             "creator": ["John Doe"],
             "title": ["Sample Title"],
             "description": ["Sample Description"],
-            "date": [{"prefLabel": "2023"}],
+            "date": [{"displayDate": "2023"}],
             "identifier": ["ID12345"],
         },
         "rights": "http://rightsstatements.org/vocab/NKC/1.0/",
