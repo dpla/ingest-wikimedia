@@ -15,7 +15,7 @@ from .metadata import (
     DC_TITLE_FIELD_NAME,
     DC_DESCRIPTION_FIELD_NAME,
     DC_DATE_FIELD_NAME,
-    EDM_TIMESPAN_PREF_LABEL,
+    EDM_TIMESPAN_DISPLAY_DATE,
     EDM_IS_SHOWN_AT,
     DC_IDENTIFIER_FIELD_NAME,
 )
@@ -136,7 +136,7 @@ def get_wiki_text(
     title_string = extract_strings(source_resource, DC_TITLE_FIELD_NAME)
     description_string = extract_strings(source_resource, DC_DESCRIPTION_FIELD_NAME)
     date_string = extract_strings_dict(
-        source_resource, DC_DATE_FIELD_NAME, EDM_TIMESPAN_PREF_LABEL
+        source_resource, DC_DATE_FIELD_NAME, EDM_TIMESPAN_DISPLAY_DATE
     )
     is_shown_at = escape_wiki_strings(get_str(item_metadata, EDM_IS_SHOWN_AT))
     local_id = extract_strings(source_resource, DC_IDENTIFIER_FIELD_NAME)
