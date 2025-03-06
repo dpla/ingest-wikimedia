@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from unittest.mock import patch, MagicMock
@@ -17,6 +19,10 @@ from ingest_wikimedia.metadata import (
     check_record_partner,
     maximize_iiif_url,
     IIIF_V3_FULL_RES_JPG_SUFFIX,
+    EDM_IS_SHOWN_AT,
+    MEDIA_MASTER_FIELD_NAME,
+    RIGHTS_CATEGORY_FIELD_NAME,
+    BANLIST_FILE_NAME,
 )
 
 
@@ -56,16 +62,96 @@ def test_get_item_metadata(mock_get_http_session):
     assert result == {"id": "test_id"}
 
 
-def test_is_wiki_eligible():
-    item_metadata = {
-        "rightsCategory": "Unlimited Re-Use",
-        "isShownAt": "http://example.com",
-        "mediaMaster": ["http://example.com/media"],
+@pytest.fixture
+def good_item_metadata():
+    return {
+        RIGHTS_CATEGORY_FIELD_NAME: "Unlimited Re-Use",
+        EDM_IS_SHOWN_AT: "https://example.com",
+        MEDIA_MASTER_FIELD_NAME: ["https://example.com/media"],
     }
-    provider = {"upload": True}
-    data_provider = {"upload": True}
 
-    assert is_wiki_eligible(item_metadata, provider, data_provider)
+
+@pytest.fixture
+def good_provider():
+    return {"upload": True, "Wikidata": "abcd"}
+
+
+@pytest.fixture
+def good_data_provider():
+    return {"upload": True, "Wikidata": "efgh"}
+
+
+@pytest.fixture
+def good_dpla_id():
+    return "12345"
+
+
+def test_is_wiki_eligible_yes(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    assert is_wiki_eligible(
+        good_dpla_id, good_item_metadata, good_provider, good_data_provider
+    )
+
+
+def test_not_wiki_eligible_provider_wikidata(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    del good_provider["Wikidata"]
+    assert not is_wiki_eligible(
+        good_dpla_id, good_item_metadata, good_provider, good_data_provider
+    )
+
+
+def test_not_wiki_eligible_dataprovider_wikidata(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    del good_data_provider["Wikidata"]
+    assert not is_wiki_eligible(
+        good_dpla_id, good_item_metadata, good_provider, good_data_provider
+    )
+
+
+def test_not_wiki_eligible_dpla_id(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    banlist_path = Path(__file__).parent.parent / BANLIST_FILE_NAME
+    with open(banlist_path, "r") as file:
+        banlist = file.readlines()
+
+    assert not is_wiki_eligible(
+        banlist[0], good_item_metadata, good_provider, good_data_provider
+    )
+
+
+def test_not_wiki_eligible_rights_category(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    good_item_metadata["rightsCategory"] = "On fire"
+    assert not is_wiki_eligible(
+        good_dpla_id, good_item_metadata, good_provider, good_data_provider
+    )
+
+
+def test_not_wiki_eligible_providers(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    good_provider["upload"] = False
+    good_data_provider["upload"] = False
+    assert not is_wiki_eligible(
+        good_dpla_id, good_item_metadata, good_provider, good_data_provider
+    )
+
+
+def test_not_wiki_eligible_media(
+    good_dpla_id, good_item_metadata, good_provider, good_data_provider
+):
+    del good_item_metadata[MEDIA_MASTER_FIELD_NAME]
+    del good_item_metadata[EDM_IS_SHOWN_AT]
+    eligible = is_wiki_eligible(
+        good_dpla_id, good_item_metadata, good_provider, good_data_provider
+    )
+    assert not eligible
 
 
 def test_get_provider_and_data_provider():
