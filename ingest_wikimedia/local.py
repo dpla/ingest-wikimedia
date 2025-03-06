@@ -35,7 +35,7 @@ def get_temp_file() -> tempfile.NamedTemporaryFile:
     """
     global __temp_dir
     if __temp_dir is None:
-        raise Exception("Temp dir not initialized.")
+        raise RuntimeError("Temp dir not initialized.")
     return tempfile.NamedTemporaryFile(delete=False, dir=__temp_dir.name)
 
 

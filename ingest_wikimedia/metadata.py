@@ -2,7 +2,9 @@ import json
 import logging
 import re
 from operator import itemgetter
+from typing import TypeVar, Callable
 from urllib.parse import urlparse
+from pathlib import Path
 
 import validators
 
@@ -11,13 +13,29 @@ from .s3 import write_iiif_manifest
 from .tracker import Tracker, Result
 from .web import get_http_session, HTTP_REQUEST_HEADERS
 
+__dpla_id_banlist: set[str] | None = None
+
+T = TypeVar("T")
+
+BANLIST_FILE_NAME = "dpla-id-banlist.txt"
+
+
+def setup_dpla_id_banlist() -> None:
+    """
+    Loads a list of banned dpla ids from disk
+    """
+    global __dpla_id_banlist
+    banlist_path = Path(__file__).parent.parent / BANLIST_FILE_NAME
+    with open(banlist_path, "r") as file:
+        __dpla_id_banlist = set(file.readlines())
+
 
 def check_partner(partner: str) -> None:
     """
     Blows up if we're working on a partner we shouldn't.
     """
     if partner not in DPLA_PARTNERS.keys():
-        raise Exception("Unrecognized partner.")
+        raise ValueError("Unrecognized partner.")
 
 
 def get_item_metadata(dpla_id: str, api_key: str) -> dict:
@@ -41,24 +59,60 @@ def check_record_partner(partner: str, item_metadata: dict) -> bool:
     return partner_long_name == record_partner_long_name
 
 
-def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -> bool:
+def is_wiki_eligible(
+    dpla_id: str, item_metadata: dict, provider: dict, data_provider: dict
+) -> bool:
     """
     Enforces a number of criteria for ensuring this is an item we should upload.
     """
 
-    provider_ok = null_safe(provider, UPLOAD_FIELD_NAME, False) or null_safe(
-        data_provider, UPLOAD_FIELD_NAME, False
+    global __dpla_id_banlist
+    if __dpla_id_banlist is None:
+        setup_dpla_id_banlist()
+
+    def value_ok(value: T, test: Callable[[T], bool], error_msg: str):
+        result = test(value)
+        if not result:
+            logging.info(error_msg)
+        return result
+
+    def non_empty_str(x: str) -> bool:
+        return x != ""
+
+    def not_false(x: bool) -> bool:
+        return x
+
+    def rights_category_ok(x: str) -> bool:
+        return x == UNLIMITED_RE_USE
+
+    provider_wikidata_id_ok = value_ok(
+        value=get_str(provider, WIKIDATA_FIELD_NAME),
+        test=non_empty_str,
+        error_msg="Missing wikidata id for provider.",
     )
 
-    if not provider_ok:
-        logging.info("Bad provider.")
-
-    rights_category_ok = (
-        get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME) == UNLIMITED_RE_USE
+    data_provider_wikidata_id_ok = value_ok(
+        value=get_str(data_provider, WIKIDATA_FIELD_NAME),
+        test=non_empty_str,
+        error_msg="Missing wikidata id for dataProvider.",
     )
 
-    if not rights_category_ok:
-        logging.info("Bad rights category.")
+    wikidata_ids_ok = data_provider_wikidata_id_ok and provider_wikidata_id_ok
+
+    provider_ok = value_ok(
+        value=(
+            null_safe(provider, UPLOAD_FIELD_NAME, False)
+            or null_safe(data_provider, UPLOAD_FIELD_NAME, False)
+        ),
+        test=not_false,
+        error_msg="Bad provider.",
+    )
+
+    rights_category_ok = value_ok(
+        value=get_str(item_metadata, RIGHTS_CATEGORY_FIELD_NAME),
+        test=rights_category_ok,
+        error_msg="Bad rights category.",
+    )
 
     is_shown_at = get_str(item_metadata, EDM_IS_SHOWN_AT)
     media_master = len(get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)) > 0
@@ -70,19 +124,27 @@ def is_wiki_eligible(item_metadata: dict, provider: dict, data_provider: dict) -
             response = get_http_session().head(iiif_url, allow_redirects=True)
             if response.status_code < 400:
                 item_metadata[IIIF_MANIFEST_FIELD_NAME] = iiif_url
-                iiif_manifest = True
+                iiif_manifest = iiif_url
 
-    asset_ok = (media_master is not None) or (iiif_manifest is not None)
+    asset_ok = value_ok(
+        value=(media_master or iiif_manifest),
+        test=not_false,
+        error_msg="Bad asset.",
+    )
 
-    if not asset_ok:
-        logging.info("Bad asset.")
+    dpla_id_ok = value_ok(
+        value=dpla_id not in __dpla_id_banlist,
+        test=not_false,
+        error_msg="DPLA ID in banlist.",
+    )
 
-    # todo create banlist. item based? sha based? local id based? all three?
-    # todo don't re-upload if deleted
-
-    id_ok = True
-
-    return rights_category_ok and asset_ok and provider_ok and id_ok
+    return (
+        rights_category_ok
+        and asset_ok
+        and provider_ok
+        and dpla_id_ok
+        and wikidata_ids_ok
+    )
 
 
 def get_provider_and_data_provider(
@@ -311,7 +373,7 @@ def get_iiif_urls(manifest: dict) -> list[str]:
     # v2 or v3?
     match manifest.get(JSON_LD_AT_CONTEXT, None):
         case None:
-            raise Exception("No IIIF version specified.")
+            raise ValueError("No IIIF version specified.")
         case x if x == IIIF_PRESENTATION_API_MANIFEST_V3:
             return iiif_v3_urls(manifest)
         case x if x == IIIF_PRESENTATION_API_MANIFEST_V2:
@@ -321,7 +383,7 @@ def get_iiif_urls(manifest: dict) -> list[str]:
         case x if type(x) is list and IIIF_PRESENTATION_API_MANIFEST_V2 in x:
             return iiif_v2_urls(manifest)
         case x:
-            raise Exception(f"Unimplemented IIIF version: {x}")
+            raise ValueError(f"Unimplemented IIIF version: {x}")
 
 
 def get_iiif_manifest(url: str) -> dict | None:
