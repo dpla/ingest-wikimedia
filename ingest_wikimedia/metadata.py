@@ -27,7 +27,7 @@ def setup_dpla_id_banlist() -> None:
     global __dpla_id_banlist
     banlist_path = Path(__file__).parent.parent / BANLIST_FILE_NAME
     with open(banlist_path, "r") as file:
-        __dpla_id_banlist = set(file.readlines())
+        __dpla_id_banlist = set([line.rstrip() for line in file])
 
 
 def check_partner(partner: str) -> None:

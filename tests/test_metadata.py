@@ -117,7 +117,7 @@ def test_not_wiki_eligible_dpla_id(
 ):
     banlist_path = Path(__file__).parent.parent / BANLIST_FILE_NAME
     with open(banlist_path, "r") as file:
-        banlist = file.readlines()
+        banlist = [line.rstrip() for line in file]
 
     assert not is_wiki_eligible(
         banlist[0], good_item_metadata, good_provider, good_data_provider
