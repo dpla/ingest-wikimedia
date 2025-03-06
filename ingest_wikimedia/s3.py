@@ -83,7 +83,9 @@ def write_item_metadata(partner: str, dpla_id: str, item_metadata: str) -> None:
     """
     Writes the metadata file for the item in S3.
     """
-    write_item_file(partner, dpla_id, item_metadata, DPLA_MAP_FILENAME, TEXT_PLAIN)
+    write_item_file(
+        partner, dpla_id, item_metadata, DPLA_MAP_FILENAME, APPLICATION_JSON
+    )
 
 
 def get_item_metadata(partner: str, dpla_id: str) -> str | None:

@@ -57,7 +57,7 @@ def test_s3_file_exists(mock_get_s3):
 def test_write_item_metadata(mock_write_item_file):
     write_item_metadata("partner", "abcd1234", "metadata")
     mock_write_item_file.assert_called_once_with(
-        "partner", "abcd1234", "metadata", "dpla-map.json", "text/plain"
+        "partner", "abcd1234", "metadata", "dpla-map.json", "application/json"
     )
 
 
