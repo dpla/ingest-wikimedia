@@ -97,7 +97,7 @@ def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1:
 
     except Exception as e:
         raise RuntimeError(
-            f"Error uploading to s3RuntimeError{S3_BUCKET}/{destination_path}"
+            f"Error uploading to s3://{S3_BUCKET}/{destination_path}"
         ) from e
 
 
