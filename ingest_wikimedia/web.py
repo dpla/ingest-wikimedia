@@ -33,10 +33,7 @@ def get_http_session() -> requests.Session:
     session = requests.Session()
     # To have a default session-level connection init timeout,
     # you have to result to this:
-    session.get_orig, session.get = (
-        session.get,
-        functools.partial(session.get, timeout=DEFAULT_CONN_TIMEOUT),
-    )
+    session.get = functools.partial(session.get, timeout=DEFAULT_CONN_TIMEOUT)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     __thread_local.http_session = session
@@ -44,6 +41,6 @@ def get_http_session() -> requests.Session:
 
 
 HTTP_REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-            (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
+    "Gecko/20100101 Firefox/135.0"
 }

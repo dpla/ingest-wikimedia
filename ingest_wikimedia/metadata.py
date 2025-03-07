@@ -410,9 +410,9 @@ def contentdm_iiif_url(is_shown_at: str) -> str | None:
     link to the object in ContentDM
 
     We want to go from
-    http://www.ohiomemory.org/cdm/ref/collection/p16007coll33/id/126923
+    https://www.ohiomemory.org/cdm/ref/collection/p16007coll33/id/126923
     to
-    http://www.ohiomemory.org/iiif/info/p16007coll33/126923/manifest.json
+    https://www.ohiomemory.org/iiif/info/p16007coll33/126923/manifest.json
 
     """
     parsed_url = urlparse(is_shown_at)

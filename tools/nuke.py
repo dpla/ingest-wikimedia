@@ -22,7 +22,7 @@ def main(ids_file: IO, partner: str, dry_run: bool):
     setup_logging(partner, "nuke-items", logging.INFO)
     logging.info(f"Nuking items for {partner}")
     dpla_ids = load_ids(ids_file)
-    for dpla_id in tqdm(dpla_ids, desc="Nuking Items", unit="Item"):
+    for dpla_id in tqdm(dpla_ids, desc="Nuking Items", unit="Item", ncols=100):
         logging.info(f"DPLA ID: {dpla_id}")
         s3_path = get_item_s3_path(dpla_id, "", partner)
         command = f"aws s3 rm s3://{S3_BUCKET}/{s3_path} --recursive"

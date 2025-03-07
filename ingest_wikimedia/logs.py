@@ -19,7 +19,7 @@ class TqdmLoggingHandler(logging.Handler):
             msg = self.format(record)
             tqdm.write(msg)
             self.flush()
-        except Exception:
+        except (IOError, OSError):
             self.handleError(record)
 
 
@@ -40,7 +40,7 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
             TqdmLoggingHandler(),
             logging.FileHandler(filename=filename, mode="w"),
         ],
-        format="[%(levelname)s] " "%(asctime)s: " "%(message)s",
+        format="[%(levelname)s] %(asctime)s: %(message)s",
     )
     logging.info(f"Logging to {filename}.")
     for d in logging.Logger.manager.loggerDict:

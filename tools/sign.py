@@ -34,6 +34,7 @@ def main(partner: str):
             bucket.objects.filter(Prefix=f"{partner}/images/").all(),
             "Signing files",
             unit="File",
+            ncols=100,
         ):
             temp_file = get_temp_file()
             temp_file_name = temp_file.name
@@ -52,10 +53,20 @@ def main(partner: str):
                     unit_divisor=1024,
                     unit_scale=True,
                     delay=2,
-                ) as t:
+                    ncols=100,
+                ) as progress_bar:
+                    # this is the first time I feel like I wrote something just to make
+                    # SonarQube happy.
+                    def make_progress_callback(progress):
+                        def update_progress(bytes_xfer):
+                            progress.update(bytes_xfer)
+
+                        return update_progress
+
+                    callback = make_progress_callback(progress_bar)
                     obj.download_file(
                         temp_file_name,
-                        Callback=lambda bytes_xfer: t.update(bytes_xfer),
+                        Callback=callback,
                     )
                 sha1 = get_file_hash(temp_file_name)
                 content_type = get_content_type(temp_file_name)
