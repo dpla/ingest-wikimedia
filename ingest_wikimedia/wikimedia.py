@@ -68,7 +68,8 @@ def get_page_title(
         return (
             f"{escaped_visible_title} - DPLA - {dpla_identifier} (page {page}){suffix}"
         )
-    return f"{escaped_visible_title} - DPLA - {dpla_identifier}{suffix}"
+    else:
+        return f"{escaped_visible_title} - DPLA - {dpla_identifier}{suffix}"
 
 
 def license_to_markup_code(rights_uri: str) -> str:
@@ -193,9 +194,9 @@ def get_page(site: pywikibot.Site, title: str) -> FilePage:
     try:
         return pywikibot.FilePage(site, title=title)
     except pywikibot.exceptions.InvalidTitleError as e:
-        raise Exception(f"Invalid title {title}: {str(e)}") from e
+        raise ValueError(f"Invalid title {title}: {str(e)}") from e
     except Exception as e:
-        raise Exception(f"Unable to create page {title}: {str(e)}") from e
+        raise RuntimeError(f"Unable to create page {title}: {str(e)}") from e
 
 
 def get_site() -> pywikibot.Site:
@@ -210,7 +211,7 @@ def wiki_file_exists(sha1: str) -> bool:
     response = get_http_session().get(FIND_BY_HASH_URL_PREFIX + sha1)
     sha1_response = response.json()
     if "error" in sha1_response:
-        raise Exception(
+        raise RuntimeError(
             f"Received bad response from find by hash endpoint.\n{str(sha1_response)}"
         )
 

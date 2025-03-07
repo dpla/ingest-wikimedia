@@ -135,6 +135,7 @@ def process_file(
                 unit_scale=1024,
                 unit_divisor=True,
                 delay=2,
+                ncols=100,
             ) as t:
                 s3_object.download_file(
                     temp_file.name,
@@ -158,7 +159,7 @@ def process_file(
                 # but File does exist and is linked to another Page
                 # (ex. DPLA ID drift)
                 tracker.increment(Result.FAILED)
-                raise Exception("File linked to another page (possible ID drift)")
+                raise RuntimeError("File linked to another page (possible ID drift)")
 
             logging.info(f"Uploaded to {wikimedia_url(page_title)}")
             tracker.increment(Result.UPLOADED)
@@ -193,7 +194,7 @@ def process_item(
             item_metadata, providers_json
         )
 
-        if not is_wiki_eligible(item_metadata, provider, data_provider):
+        if not is_wiki_eligible(dpla_id, item_metadata, provider, data_provider):
             logging.info(f"Skipping {dpla_id}: Not eligible.")
             tracker.increment(Result.SKIPPED)
             return
@@ -209,8 +210,10 @@ def process_item(
         ordinal = 0
         files = get_file_list(partner, dpla_id)
 
-        for _ in tqdm(files, desc="Uploading Files", leave=False, unit="File"):
-            ordinal += 1  # todo should this come from the list or the name?
+        for _ in tqdm(
+            files, desc="Uploading Files", leave=False, unit="File", ncols=100
+        ):
+            ordinal += 1
             logging.info(f"Page {ordinal}")
             # one-pagers don't have page numbers in their titles
             page_label = None if len(files) == 1 else ordinal
@@ -256,7 +259,7 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
 
         dpla_ids = load_ids(ids_file)
 
-        for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item"):
+        for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
             process_item(dpla_id, providers_json, partner, verbose, dry_run)
 
     finally:

@@ -66,7 +66,7 @@ def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1:
                 # this throws if obj doesn't exist yet
                 obj_metadata = obj.metadata
             except ClientError as e:
-                if not e.response["Error"]["Code"] == "404":
+                if e.response["Error"]["Code"] != "404":
                     raise e
 
             if obj_metadata and obj_metadata.get(CHECKSUM, None) == sha1:
@@ -83,6 +83,7 @@ def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1:
                 unit_divisor=1024,
                 unit_scale=True,
                 delay=2,
+                ncols=100,
             ) as t:
                 obj.upload_fileobj(
                     Fileobj=file,
@@ -95,8 +96,8 @@ def upload_file_to_s3(file: str, destination_path: str, content_type: str, sha1:
             tracker.increment(Result.DOWNLOADED)
 
     except Exception as e:
-        raise Exception(
-            f"Error uploading to s3://{S3_BUCKET}/{destination_path}"
+        raise RuntimeError(
+            f"Error uploading to s3RuntimeError{S3_BUCKET}/{destination_path}"
         ) from e
 
 
@@ -115,6 +116,7 @@ def download_file_to_temp_path(media_url: str, local_file: str):
             unit_divisor=1024,
             unit_scale=True,
             delay=2,
+            ncols=100,
         ) as t:
             with open(local_file, "wb") as f:
                 for chunk in response.iter_content(None):
@@ -122,7 +124,7 @@ def download_file_to_temp_path(media_url: str, local_file: str):
                     f.write(chunk)
 
     except Exception as e:
-        raise Exception(f"Failed downloading {media_url} to local") from e
+        raise RuntimeError(f"Failed downloading {media_url} to local") from e
 
 
 def process_media(
@@ -206,7 +208,7 @@ def process_item(
             tracker.increment(Result.SKIPPED)
             return
 
-        if not is_wiki_eligible(item_metadata, provider, data_provider):
+        if not is_wiki_eligible(dpla_id, item_metadata, provider, data_provider):
             logging.info(f"{dpla_id} is not eligible.")
             tracker.increment(Result.SKIPPED)
             return
@@ -246,7 +248,7 @@ def process_item(
         logging.info(f"Data Provider: {provider_str(data_provider)}")
 
     for media_url in tqdm(
-        media_urls, desc="Downloading Files", leave=False, unit="File"
+        media_urls, desc="Downloading Files", leave=False, unit="File", ncols=100
     ):
         count += 1
         # hack to fix bad nara data
@@ -293,7 +295,7 @@ def main(
 
         providers_json = get_providers_data()
         dpla_ids = load_ids(ids_file)
-        for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item"):
+        for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item", ncols=100):
             logging.info(f"DPLA ID: {dpla_id}")
             process_item(
                 overwrite,
