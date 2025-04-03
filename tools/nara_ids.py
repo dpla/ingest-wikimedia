@@ -2,20 +2,9 @@ import urllib
 from typing import IO
 
 import click
-import requests
 import urllib.parse
 
 from ingest_wikimedia.web import get_http_session
-
-
-def build_search(params: str) -> str:
-    return (
-        "https://api.dp.la/v2/items"
-        "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
-        "&page_size=5000"
-        "&rightsCategory=%22Unlimited+Re-Use%22"
-        "&fields=id&" + params
-    )
 
 
 def build_collections_params(api_key: str) -> list[str]:
@@ -109,7 +98,6 @@ def main(api_key: str, output: IO):
         has_results = True
         page = 0
         count = 0
-        query += "&api_key=" + api_key
         base_request_url = (
             "https://api.dp.la/v2/items"
             "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
@@ -122,7 +110,7 @@ def main(api_key: str, output: IO):
             page += 1
             request_url = base_request_url + "&page=" + str(page)
             try:
-                res = requests.get(request_url).json()
+                res = get_http_session().get(request_url).json()
 
                 for item in res["docs"]:
                     output.write(item["id"])
@@ -130,8 +118,8 @@ def main(api_key: str, output: IO):
                     count += 1
                 if res["count"] < (res["limit"] + res["start"]):
                     has_results = False
-            except TypeError:
-                raise TypeError(request_url)
+            except Exception as e:
+                raise RuntimeError("Error in request: " + request_url) from e
 
         print("  -- " + str(count) + " added!")
         output.flush()
