@@ -116,7 +116,7 @@ def main(api_key: str, output: IO):
                     output.write(item["id"])
                     output.write("\n")
                     count += 1
-                if res["count"] < (res["limit"] + res["start"]):
+                if res["count"] <= (res["limit"] + res["start"]):
                     has_results = False
             except Exception as e:
                 raise RuntimeError("Error in request: " + request_url) from e
