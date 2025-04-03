@@ -119,7 +119,9 @@ def main(api_key: str, output: IO):
                 if res["count"] <= (res["limit"] + res["start"]):
                     has_results = False
             except Exception as e:
-                raise RuntimeError("Error in request: " + request_url) from e
+                raise RuntimeError(
+                    "Error in request: " + request_url.replace(api_key, "[REDACTED]")
+                ) from e
 
         print("  -- " + str(count) + " added!")
         output.flush()
