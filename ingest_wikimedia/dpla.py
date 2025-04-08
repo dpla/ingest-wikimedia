@@ -35,7 +35,7 @@ class DPLA:
         Blows up if we're working on a partner we shouldn't.
         """
         if partner not in DPLA_PARTNERS.keys():
-            raise ValueError("Unrecognized partner.")
+            raise ValueError(f"Unrecognized partner: {partner}")
 
     def get_item_metadata(self, dpla_id: str, api_key: str) -> dict:
         """
