@@ -4,29 +4,24 @@ import time
 import click
 
 from ingest_wikimedia.logs import setup_logging
-from ingest_wikimedia.metadata import check_partner
-from ingest_wikimedia.s3 import get_s3
 from ingest_wikimedia.common import CHECKSUM
-from ingest_wikimedia.local import (
-    get_temp_file,
-    clean_up_tmp_file,
-    setup_temp_dir,
-    cleanup_temp_dir,
-    get_file_hash,
-    get_content_type,
-)
 from tqdm import tqdm
+
+from ingest_wikimedia.tools_context import ToolsContext
 
 
 @click.command()
 @click.argument("partner")
 def main(partner: str):
     start_time = time.time()
+    tools_context = ToolsContext.init()
+    dpla = tools_context.get_dpla()
     setup_logging(partner, "sign", logging.INFO)
-    check_partner(partner)
+    dpla.check_partner(partner)
     logging.info(f"Starting signing for {partner}")
-    s3 = get_s3()
-    setup_temp_dir()
+    s3 = tools_context.get_s3_client().get_s3()
+    local_fs = tools_context.get_local_fs()
+    local_fs.setup_temp_dir()
     bucket = s3.Bucket("dpla-wikimedia")
 
     try:
@@ -36,7 +31,7 @@ def main(partner: str):
             unit="File",
             ncols=100,
         ):
-            temp_file = get_temp_file()
+            temp_file = local_fs.get_temp_file()
             temp_file_name = temp_file.name
             try:
                 tqdm.write(object_summary.key)
@@ -68,8 +63,8 @@ def main(partner: str):
                         temp_file_name,
                         Callback=callback,
                     )
-                sha1 = get_file_hash(temp_file_name)
-                content_type = get_content_type(temp_file_name)
+                sha1 = local_fs.get_file_hash(temp_file_name)
+                content_type = local_fs.get_content_type(temp_file_name)
                 tqdm.write(f"{obj.key} {content_type} {sha1}")
                 obj.metadata.update({CHECKSUM: sha1})
                 obj.copy_from(
@@ -81,10 +76,10 @@ def main(partner: str):
             except Exception as e:
                 tqdm.write(str(e))
             finally:
-                clean_up_tmp_file(temp_file)
+                local_fs.clean_up_tmp_file(temp_file)
     finally:
         logging.info(f"{time.time() - start_time} seconds.")
-        cleanup_temp_dir()
+        local_fs.cleanup_temp_dir()
 
 
 if __name__ == "__main__":

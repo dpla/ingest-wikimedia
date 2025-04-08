@@ -4,10 +4,12 @@ from typing import IO
 import click
 import urllib.parse
 
-from ingest_wikimedia.web import get_http_session
+from requests import Session
+
+from ingest_wikimedia.tools_context import ToolsContext
 
 
-def build_collections_params(api_key: str) -> list[str]:
+def build_collections_params(http_session: Session, api_key: str) -> list[str]:
     request_url = (
         "https://api.dp.la/v2/items"
         "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
@@ -17,7 +19,7 @@ def build_collections_params(api_key: str) -> list[str]:
         '&sourceResource.collection.title=NOT%20"Records%20of*"%20NOT%20"Naval%20Records%20Collection%20of%20the%20Office%20of%20Naval%20Records%20and%20Library"%20NOT%20"War%20Department%20Collection%20of%20Confederate%20Records"'
         "&facets=sourceResource.collection.title"
     )
-    collection_facet_response = get_http_session().get(request_url).json()
+    collection_facet_response = http_session.get(request_url).json()
     return [
         "exact_field_match=true&sourceResource.collection.title="
         + urllib.parse.quote('"' + collection["term"] + '"', safe="")
@@ -35,7 +37,7 @@ def build_collections_params(api_key: str) -> list[str]:
     ]
 
 
-def build_languages_params(api_key: str) -> list[str]:
+def build_languages_params(http_session: Session, api_key: str) -> list[str]:
     request_url = (
         "https://api.dp.la/v2/items"
         "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
@@ -45,7 +47,7 @@ def build_languages_params(api_key: str) -> list[str]:
         "&facet_size=50000"
     )
 
-    lang_facet_response = get_http_session().get(request_url).json()
+    lang_facet_response = http_session.get(request_url).json()
 
     lang_values = [
         '"' + lang["term"] + '"'
@@ -61,7 +63,7 @@ def build_languages_params(api_key: str) -> list[str]:
     ]
 
 
-def build_formats_params(api_key: str) -> list[str]:
+def build_formats_params(http_session: Session, api_key: str) -> list[str]:
     request_url = (
         "https://api.dp.la/v2/items"
         "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
@@ -70,7 +72,7 @@ def build_formats_params(api_key: str) -> list[str]:
         "&facets=sourceResource.format"
         "&facet_size=50000"
     )
-    format_facet_response = get_http_session().get(request_url).json()
+    format_facet_response = http_session.get(request_url).json()
 
     format_values = [
         '"' + facet["term"] + '"'
@@ -88,10 +90,13 @@ def build_formats_params(api_key: str) -> list[str]:
 @click.argument("api_key")
 @click.argument("output", type=click.File("w"))
 def main(api_key: str, output: IO):
+    tools_context = ToolsContext.init()
+    http_session = tools_context.get_http_session()
+
     queries = []
-    queries.extend(build_languages_params(api_key))
-    queries.extend(build_formats_params(api_key))
-    queries.extend(build_collections_params(api_key))
+    queries.extend(build_languages_params(http_session, api_key))
+    queries.extend(build_formats_params(http_session, api_key))
+    queries.extend(build_collections_params(http_session, api_key))
 
     for query in queries:
         print("  Checking parameters: " + query)
@@ -110,7 +115,7 @@ def main(api_key: str, output: IO):
             page += 1
             request_url = base_request_url + "&page=" + str(page)
             try:
-                res = get_http_session().get(request_url).json()
+                res = http_session.get(request_url).json()
 
                 for item in res["docs"]:
                     output.write(item["id"])

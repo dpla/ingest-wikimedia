@@ -1,11 +1,9 @@
-import threading
-
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from mypy_boto3_s3 import S3ServiceResource
 from .common import CHECKSUM
-from .local import get_bytes_hash
+from .localfs import LocalFS
 
 IIIF_JSON = "iiif.json"
 FILE_LIST_TXT = "file-list.txt"
@@ -16,133 +14,136 @@ S3_RETRIES = 3
 S3_BUCKET = "dpla-wikimedia"
 S3_KEY_METADATA = "Metadata"
 
-# S3 resources are not thread safe, so make one per thread
-__thread_local = threading.local()
-__thread_local.s3 = None
 
-# This is here only to make the NoSuchKey exception be in scope.
-client = boto3.client("s3")
-
-
-def get_s3() -> S3ServiceResource:
+class S3Client:
     """
-    Gives you the S3ServiceResource for the thread you're on,
-    and makes it if it hasn't yet.
+    A wrapper around the S3 client to make it easier to mock in tests.
     """
-    if __thread_local.s3 is not None:
-        return __thread_local.s3
 
-    config = Config(
-        signature_version="s3v4",
-        max_pool_connections=25,
-        retries={"max_attempts": S3_RETRIES},
-    )
-    s3 = boto3.resource("s3", config=config)
-    __thread_local.s3 = s3
-    return s3
+    def __init__(self):
+        config = Config(
+            signature_version="s3v4",
+            max_pool_connections=25,
+            retries={"max_attempts": S3_RETRIES},
+        )
 
+        self.s3 = boto3.resource("s3", config=config)
 
-def get_item_s3_path(dpla_id: str, filename: str, partner: str) -> str:
-    """
-    Calculates the S3 path for a file related to an item in S3.
-    """
-    return (
-        f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
-        f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{filename}"
-    )
+    def get_s3(self) -> S3ServiceResource:
+        """
+        Gives you the S3ServiceResource for the thread you're on,
+        and makes it if it hasn't yet.
+        """
+        return self.s3
 
+    @staticmethod
+    def get_item_s3_path(dpla_id: str, filename: str, partner: str) -> str:
+        """
+        Calculates the S3 path for a file related to an item in S3.
+        """
+        return (
+            f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
+            f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{filename}"
+        )
 
-def get_media_s3_path(dpla_id: str, ordinal: int, partner: str) -> str:
-    """
-    Calculates the D3 path for an individual media file.
-    """
-    return (
-        f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
-        f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{ordinal}_{dpla_id}"
-    ).strip()
+    @staticmethod
+    def get_media_s3_path(dpla_id: str, ordinal: int, partner: str) -> str:
+        """
+        Calculates the D3 path for an individual media file.
+        """
+        return (
+            f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
+            f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{ordinal}_{dpla_id}"
+        ).strip()
 
+    def s3_file_exists(self, path: str):
+        """
+        Checks to see if something already exists in S3 for a path.
+        """
+        try:
+            self.s3.Object(S3_BUCKET, path).load()
+            return True
+        except ClientError as e:
+            if (
+                "Error" in e.response
+                and "Code" in e.response["Error"]
+                and e.response["Error"]["Code"] == "404"
+            ):
+                # The object does not exist.
+                return False
+            else:
+                # Something else has gone wrong.
+                raise
 
-def s3_file_exists(path: str):
-    """
-    Checks to see if something already exists in S3 for a path.
-    """
-    try:
-        s3 = get_s3()
-        s3.Object(S3_BUCKET, path).load()
-        return True
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "404":
-            # The object does not exist.
-            return False
+    def write_item_metadata(
+        self, partner: str, dpla_id: str, item_metadata: str
+    ) -> None:
+        """
+        Writes the metadata file for the item in S3.
+        """
+        self.write_item_file(
+            partner, dpla_id, item_metadata, DPLA_MAP_FILENAME, APPLICATION_JSON
+        )
+
+    def get_item_metadata(self, partner: str, dpla_id: str) -> str | None:
+        """
+        Reads the metadata file back from s3.
+        """
+        return self.get_item_file(partner, dpla_id, DPLA_MAP_FILENAME)
+
+    def write_file_list(self, partner: str, dpla_id: str, file_urls: list[str]) -> None:
+        """
+        Writes the list of media files for the item in S3.
+        """
+        data = "\n".join(file_urls)
+        self.write_item_file(partner, dpla_id, data, FILE_LIST_TXT, TEXT_PLAIN)
+
+    def get_file_list(self, partner: str, dpla_id: str) -> list[str]:
+        result = self.get_item_file(partner, dpla_id, FILE_LIST_TXT)
+        if result is None:
+            return []
         else:
-            # Something else has gone wrong.
-            raise
+            return result.split("\n")
 
+    def write_iiif_manifest(self, partner: str, dpla_id: str, manifest: str) -> None:
+        """
+        Writes the IIIF manifest for an item in S3.
+        """
+        self.write_item_file(partner, dpla_id, manifest, IIIF_JSON, APPLICATION_JSON)
 
-def write_item_metadata(partner: str, dpla_id: str, item_metadata: str) -> None:
-    """
-    Writes the metadata file for the item in S3.
-    """
-    write_item_file(
-        partner, dpla_id, item_metadata, DPLA_MAP_FILENAME, APPLICATION_JSON
-    )
+    def write_item_file(
+        self,
+        partner: str,
+        dpla_id: str,
+        data: str,
+        filename: str,
+        content_type: str,
+    ) -> None:
+        """
+        Writes a file for an item to the appropriate place in S3.
+        """
 
+        s3_path = self.get_item_s3_path(dpla_id, filename, partner)
+        s3_object = self.s3.Object(S3_BUCKET, s3_path)
+        sha1 = LocalFS.get_bytes_hash(data)
+        s3_object.put(ContentType=content_type, Metadata={CHECKSUM: sha1}, Body=data)
 
-def get_item_metadata(partner: str, dpla_id: str) -> str | None:
-    """
-    Reads the metadata file back from s3.
-    """
-    return get_item_file(partner, dpla_id, DPLA_MAP_FILENAME)
+    def get_item_file(self, partner, dpla_id, file_name) -> str | None:
+        s3_path = self.get_item_s3_path(dpla_id, file_name, partner)
 
+        try:
+            s3_object = self.s3.Object(S3_BUCKET, s3_path).get()
 
-def write_file_list(partner: str, dpla_id: str, file_urls: list[str]) -> None:
-    """
-    Writes the list of media files for the item in S3.
-    """
-    data = "\n".join(file_urls)
-    write_item_file(partner, dpla_id, data, FILE_LIST_TXT, TEXT_PLAIN)
+        except ClientError as e:
+            if (
+                "Error" in e.response
+                and "Code" in e.response["Error"]
+                and e.response["Error"]["Code"] == "404"
+            ):
+                # The object does not exist.
+                return None
+            else:
+                # Something else has gone wrong.
+                raise
 
-
-def get_file_list(partner: str, dpla_id: str) -> list[str]:
-    result = get_item_file(partner, dpla_id, FILE_LIST_TXT)
-    if result is None:
-        return []
-    else:
-        return result.split("\n")
-
-
-def write_iiif_manifest(partner: str, dpla_id: str, manifest: str) -> None:
-    """
-    Writes the IIIF manifest for an item in S3.
-    """
-    write_item_file(partner, dpla_id, manifest, IIIF_JSON, APPLICATION_JSON)
-
-
-def write_item_file(
-    partner: str,
-    dpla_id: str,
-    data: str,
-    filename: str,
-    content_type: str,
-) -> None:
-    """
-    Writes a file for an item to the appropriate place in S3.
-    """
-    s3 = get_s3()
-    s3_path = get_item_s3_path(dpla_id, filename, partner)
-    s3_object = s3.Object(S3_BUCKET, s3_path)
-    sha1 = get_bytes_hash(data)
-    s3_object.put(ContentType=content_type, Metadata={CHECKSUM: sha1}, Body=data)
-
-
-def get_item_file(partner, dpla_id, file_name) -> str | None:
-    s3 = get_s3()
-    s3_path = get_item_s3_path(dpla_id, file_name, partner)
-
-    try:
-        s3_object = s3.Object(S3_BUCKET, s3_path).get()
-
-    except client.exceptions.NoSuchKey:
-        return None
-
-    return s3_object["Body"].read().decode("utf-8")
+        return s3_object["Body"].read().decode("utf-8")

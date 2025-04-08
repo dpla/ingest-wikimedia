@@ -1,6 +1,6 @@
 import functools
 from unittest.mock import patch, MagicMock
-from ingest_wikimedia.web import get_http_session, __thread_local
+from ingest_wikimedia.web import get_http_session
 
 
 @patch("ingest_wikimedia.web.requests.Session")
@@ -12,8 +12,6 @@ def test_get_http_session(mock_session):
     assert session == mock_sess
     mock_session.assert_called_once()
     patch.stopall()
-    if hasattr(__thread_local, "http_session"):
-        __thread_local.http_session = None
 
 
 def test_exercise_monkey_patched_session():

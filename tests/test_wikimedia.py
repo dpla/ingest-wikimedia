@@ -94,17 +94,17 @@ def test_extract_strings_dict():
     assert extracted_string == expected_string
 
 
-@patch("ingest_wikimedia.wikimedia.get_http_session")
-def test_wiki_file_exists(mock_get_http_session):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
+def test_wiki_file_exists():
+    mock_http_response = MagicMock()
+    mock_http_response.json.return_value = {
         "query": {"allimages": [{"name": "file1"}, {"name": "file2"}]}
     }
-    mock_get_http_session.return_value.get.return_value = mock_response
+    mock_http_session = MagicMock()
+    mock_http_session.get.return_value = mock_http_response
 
-    exists = wiki_file_exists("fakehash")
+    exists = wiki_file_exists(mock_http_session, "fakehash")
     assert exists
-    mock_get_http_session.return_value.get.assert_called_once()
+    mock_http_session.get.assert_called_once()
 
 
 @patch("ingest_wikimedia.wikimedia.pywikibot.FilePage")

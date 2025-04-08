@@ -3,7 +3,7 @@ import sys
 import click
 import requests
 
-from ingest_wikimedia.metadata import DPLA_PARTNERS, check_partner
+from ingest_wikimedia.tools_context import ToolsContext
 
 
 def run_query(url):
@@ -28,8 +28,12 @@ def run_query(url):
 @click.option("--no-shard", is_flag=True)
 @click.option("--add-query")
 def main(partner: str, api_key: str, no_shard: bool, add_query: str):
-    check_partner(partner)
-    partner_string = DPLA_PARTNERS.get(partner).replace(" ", "+")
+    tools_context = ToolsContext.init()
+    dpla = tools_context.get_dpla()
+
+    dpla.check_partner(partner)
+    providers = dpla.get_providers_data()
+    partner_string = providers[partner].replace(" ", "+")
 
     api_query_base = (
         f"https://api.dp.la/v2/items?api_key={api_key}"

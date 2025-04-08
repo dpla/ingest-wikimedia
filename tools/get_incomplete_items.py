@@ -1,11 +1,12 @@
 import click
 
-from ingest_wikimedia.s3 import get_s3, S3_BUCKET
+from ingest_wikimedia.s3 import S3_BUCKET
+from ingest_wikimedia.tools_context import ToolsContext
 
 
-def get_incomplete_items(prefix) -> list[str]:
+def get_incomplete_items(s3, prefix) -> list[str]:
     """Gets a list of incomplete items from S3."""
-    s3 = get_s3()
+
     bucket = s3.Bucket(S3_BUCKET)
     incomplete_items = []
 
@@ -36,7 +37,10 @@ def get_incomplete_items(prefix) -> list[str]:
 @click.command()
 @click.argument("partner")
 def main(partner: str):
-    for item_id in get_incomplete_items(partner):
+    tools_context = ToolsContext.init()
+    s3 = tools_context.get_s3_client().get_s3()
+
+    for item_id in get_incomplete_items(s3, partner):
         print(item_id)
 
 
