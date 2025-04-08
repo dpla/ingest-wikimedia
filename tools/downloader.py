@@ -31,6 +31,8 @@ from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import check_content_type
 
+DOWNLOAD_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB
+
 
 class Downloader:
     """
@@ -128,7 +130,7 @@ class Downloader:
                 ncols=100,
             ) as t:
                 with open(local_file, "wb") as f:
-                    for chunk in response.iter_content(None):
+                    for chunk in response.iter_content(DOWNLOAD_BUFFER_SIZE):
                         t.update(len(chunk))
                         f.write(chunk)
 
