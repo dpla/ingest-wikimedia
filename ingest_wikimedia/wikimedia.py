@@ -3,11 +3,13 @@ from string import Template
 
 import pywikibot
 from pywikibot import FilePage
+from pywikibot.site import BaseSite
 
 from pywikibot.tools.chars import replace_invisible
+from requests import Session
 
 from .common import get_list, get_str, get_dict
-from .metadata import (
+from .dpla import (
     WIKIDATA_FIELD_NAME,
     EDM_RIGHTS_FIELD_NAME,
     SOURCE_RESOURCE_FIELD_NAME,
@@ -19,7 +21,6 @@ from .metadata import (
     EDM_IS_SHOWN_AT,
     DC_IDENTIFIER_FIELD_NAME,
 )
-from .web import get_http_session
 
 
 def get_permissions_template(rights_uri: str) -> str:
@@ -187,7 +188,7 @@ def wikimedia_url(title: str) -> str:
     return f"{COMMONS_URL_PREFIX}{title.replace(' ', '_')}"
 
 
-def get_page(site: pywikibot.Site, title: str) -> FilePage:
+def get_page(site: BaseSite, title: str) -> FilePage:
     """
     Get the pywikibot object representing the page on Commons.
     """
@@ -199,16 +200,16 @@ def get_page(site: pywikibot.Site, title: str) -> FilePage:
         raise RuntimeError(f"Unable to create page {title}: {str(e)}") from e
 
 
-def get_site() -> pywikibot.Site:
+def get_site() -> BaseSite:
     """Returns the Site object for wikimedia commons."""
     site = pywikibot.Site(COMMONS_SITE_NAME)
     site.login()
     return site
 
 
-def wiki_file_exists(sha1: str) -> bool:
+def wiki_file_exists(http_session: Session, sha1: str) -> bool:
     """Calls the find by hash api on commons to see if the file already exists."""
-    response = get_http_session().get(FIND_BY_HASH_URL_PREFIX + sha1)
+    response = http_session.get(FIND_BY_HASH_URL_PREFIX + sha1)
     sha1_response = response.json()
     if "error" in sha1_response:
         raise RuntimeError(

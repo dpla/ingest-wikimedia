@@ -13,7 +13,7 @@ def test_null_safe():
     assert null_safe(data, "key1", "") == "value1"
     assert null_safe(data, "key2", 0) == 2
     assert null_safe(data, "key3", "default") == "default"
-    assert null_safe(None, "key1", "default") == "default"
+    assert null_safe(None, "key1", "default") == "default"  # pyright: ignore [reportArgumentType] NOSONAR
     assert (
         null_safe(data, "key1", 0) == 0
     )  # Type mismatch, should return identity_element

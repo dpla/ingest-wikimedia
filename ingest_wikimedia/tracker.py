@@ -1,5 +1,4 @@
 from enum import Enum, auto
-from threading import Lock
 
 
 class Result(Enum):
@@ -14,33 +13,21 @@ class Result(Enum):
     BAD_IMAGE_API = auto()
 
 
-class Singleton(type):
-    _instances = {}
-
-    def __call__(cls, *args, **kwargs):
-        if cls not in cls._instances:
-            cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
-        return cls._instances[cls]
-
-
-class Tracker(metaclass=Singleton):
+class Tracker:
     def __init__(self):
         self.data = {}
         for value in Result:
             self.data[value] = 0
-        self.lock = Lock()
 
     def increment(self, status: Result, amount=1) -> None:
-        with self.lock:
-            self.data[status] = self.data[status] + amount
+        self.data[status] = self.data[status] + amount
 
     def count(self, status: Result) -> int:
         return self.data[status]
 
     def reset(self):
-        with self.lock:
-            for value in Result:
-                self.data[value] = 0
+        for value in Result:
+            self.data[value] = 0
 
     def __str__(self) -> str:
         result = "COUNTS:\n"
