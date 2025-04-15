@@ -45,7 +45,7 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
     logging.info(f"Logging to {filename}.")
     for d in logging.Logger.manager.loggerDict:
         if d.startswith("pywiki"):
-            logging.getLogger(d).setLevel(logging.ERROR)
+            logging.getLogger(d).setLevel(level)
 
 
 LOGS_DIR_BASE = "./logs"
