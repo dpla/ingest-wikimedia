@@ -9,10 +9,7 @@ from ingest_wikimedia.wikimedia import (
     join,
     extract_strings,
     extract_strings_dict,
-    get_page,
     wiki_file_exists,
-    wikimedia_url,
-    get_wiki_text,
     check_content_type,
 )
 
@@ -99,84 +96,16 @@ def test_wiki_file_exists():
     mock_http_response.json.return_value = {
         "query": {"allimages": [{"name": "file1"}, {"name": "file2"}]}
     }
-    mock_http_session = MagicMock()
-    mock_http_session.get.return_value = mock_http_response
-
-    exists = wiki_file_exists(mock_http_session, "fakehash")
-    assert exists
-    mock_http_session.get.assert_called_once()
-
-
-@patch("ingest_wikimedia.wikimedia.pywikibot.FilePage")
-def test_get_page(mock_file_page):
     mock_site = MagicMock()
-    title = "Sample Title"
-    page = get_page(mock_site, title)
-    assert page == mock_file_page.return_value
-    mock_file_page.assert_called_once_with(mock_site, title=title)
+    mock_site.allimages.return_value = []
 
+    exists = wiki_file_exists(mock_site, "fakehash")
+    assert not exists
+    mock_site.allimages.assert_called_once()
 
-def test_wikimedia_url():
-    title = "Sample Title"
-    url = wikimedia_url(title)
-    expected_url = "https://commons.wikimedia.org/wiki/File:Sample_Title"
-    assert url == expected_url
+    mock_site = MagicMock()
+    mock_site.allimages.return_value = ["foo"]
 
-
-def test_get_wiki_text():
-    dpla_id = "12345"
-    item_metadata = {
-        "sourceResource": {
-            "creator": ["John Doe"],
-            "title": ["Sample Title"],
-            "description": ["Sample Description"],
-            "date": [{"displayDate": "2023"}],
-            "identifier": ["ID12345"],
-        },
-        "rights": "http://rightsstatements.org/vocab/NKC/1.0/",
-        "isShownAt": "http://example.com/item/12345",
-    }
-    provider = {"Wikidata": "Q67890"}
-    data_provider = {"Wikidata": "Q12345"}
-
-    text = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
-    expected_text = (
-        "== {{int:filedesc}} ==\n"
-        "     {{ Artwork\n"
-        "        | Other fields 1 = {{ InFi | Creator | John Doe | id=fileinfotpl_aut}}\n"
-        "        | title = Sample Title\n"
-        "        | description = Sample Description\n"
-        "        | date = 2023\n"
-        "        | permission = {{NKC | Q12345}}\n"
-        "        | source = {{ DPLA\n"
-        "            | Q12345\n"
-        "            | hub = Q67890\n"
-        "            | url = http://example.com/item/12345\n"
-        "            | dpla_id = 12345\n"
-        "            | local_id = ID12345\n"
-        "        }}\n"
-        "        | Institution = {{ Institution | wikidata = Q12345 }}\n"
-        "     }}"
-    )
-    assert text == expected_text
-
-    item_metadata["sourceResource"].pop("creator")
-    text = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
-    expected_text = (
-        "== {{int:filedesc}} ==\n"
-        "     {{ Artwork\n"
-        "        | title = Sample Title\n"
-        "        | description = Sample Description\n"
-        "        | date = 2023\n"
-        "        | permission = {{NKC | Q12345}}\n"
-        "        | source = {{ DPLA\n"
-        "            | Q12345\n"
-        "            | hub = Q67890\n"
-        "            | url = http://example.com/item/12345\n"
-        "            | dpla_id = 12345\n"
-        "            | local_id = ID12345\n"
-        "        }}\n"
-        "        | Institution = {{ Institution | wikidata = Q12345 }}\n"
-        "     }}"
-    )
-    assert text == expected_text
+    exists = wiki_file_exists(mock_site, "fakehash")
+    assert exists
+    mock_site.allimages.assert_called_once()
