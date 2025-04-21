@@ -126,7 +126,7 @@ class Uploader:
                 logging.info(f"Upload comment: {upload_comment}")
                 logging.info(f"Wikitext: \n {wiki_markup}")
 
-            if wiki_file_exists(self.http_session, sha1):
+            if wiki_file_exists(self.site, sha1):
                 logging.info(
                     f"Skipping {dpla_id} {ordinal}: Already exists on commons."
                 )

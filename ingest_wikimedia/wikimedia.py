@@ -1,12 +1,14 @@
 import re
 from string import Template
+import typing
 
 import pywikibot
 from pywikibot import FilePage
-from pywikibot.site import BaseSite
+
+from pywikibot.site import APISite, BaseSite
 
 from pywikibot.tools.chars import replace_invisible
-from requests import Session
+
 
 from .common import get_list, get_str, get_dict
 from .dpla import (
@@ -207,20 +209,13 @@ def get_site() -> BaseSite:
     return site
 
 
-def wiki_file_exists(http_session: Session, sha1: str) -> bool:
+def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
     """Calls the find by hash api on commons to see if the file already exists."""
-    response = http_session.get(FIND_BY_HASH_URL_PREFIX + sha1)
-    sha1_response = response.json()
-    if "error" in sha1_response:
-        raise RuntimeError(
-            f"Received bad response from find by hash endpoint.\n{str(sha1_response)}"
-        )
 
-    all_images = get_list(
-        get_dict(sha1_response, FIND_BY_HASH_QUERY_FIELD_NAME),
-        FIND_BY_HASH_ALLIMAGES_FIELD_NAME,
-    )
-    return len(all_images) > 0
+    api_site = typing.cast(APISite, site)
+    for _ in api_site.allimages(sha1=sha1):
+        return True
+    return False
 
 
 INVALID_CONTENT_TYPES = [
