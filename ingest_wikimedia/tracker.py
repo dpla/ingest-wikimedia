@@ -11,6 +11,7 @@ class Result(Enum):
     BAD_IIIF_MANIFEST = auto()
     NO_MEDIA = auto()
     BAD_IMAGE_API = auto()
+    RETIRED = auto()
 
 
 class Tracker:

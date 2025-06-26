@@ -42,6 +42,7 @@ build-backend = "hatchling.build"
 [project.scripts]
 uploader = "tools.uploader:main"
 downloader = "tools.downloader:main"
+retirer = "tools.retirer:main"
 sign = "tools.sign:main"
 nuke = "tools.nuke:main"
 get-ids-api = "tools.get_ids_api:main"

@@ -89,6 +89,12 @@ class Uploader:
 
             s3_object = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
             file_size = s3_object.content_length
+
+            if file_size == 0:
+                logging.info(f"Skipping {dpla_id} {ordinal}: File size is 0.")
+                self.tracker.increment(Result.SKIPPED)
+                return
+
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
 
