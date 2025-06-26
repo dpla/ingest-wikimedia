@@ -128,8 +128,6 @@ class Retirer:
 
         if file_exists and page_exists:
             if not dry_run:
-                s3 = self.s3_client.get_s3()
-                s3.Object(S3_BUCKET, s3_path)
                 metadata = s3_object.metadata
                 s3_object.put(Body="", Metadata=metadata)
             self.tracker.increment(Result.RETIRED)
