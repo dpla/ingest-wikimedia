@@ -1,4 +1,7 @@
+from typing import Generator
+import logging
 import boto3
+import json
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from mypy_boto3_s3 import S3ServiceResource
@@ -147,3 +150,19 @@ class S3Client:
                 raise
 
         return s3_object["Body"].read().decode("utf-8")
+
+    def get_metadata_files_for_partner(
+        self, partner: str
+    ) -> Generator[dict, None, None]:
+        for obj_summary in self.s3.Bucket(S3_BUCKET).objects.filter(
+            Prefix=f"{partner}/images/"
+        ):
+            if obj_summary.key.endswith("/dpla-map.json"):
+                try:
+                    obj = self.s3.Object(S3_BUCKET, obj_summary.key)
+                    data = obj.get()["Body"].read()
+                    item_metadata = json.loads(data.decode("utf-8"))
+                    yield item_metadata
+                except Exception:
+                    logging.error(f"Error reading metadata for {obj_summary.key}")
+                    continue
