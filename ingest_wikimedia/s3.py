@@ -1,5 +1,5 @@
 from typing import Generator
-
+import logging
 import boto3
 import json
 from botocore.config import Config
@@ -158,7 +158,11 @@ class S3Client:
             Prefix=f"{partner}/images/"
         ):
             if obj_summary.key.endswith("/dpla-map.json"):
-                obj = self.s3.Object(S3_BUCKET, obj_summary.key)
-                data = obj.get()["Body"].read()
-                item_metadata = json.loads(data.decode("utf-8"))
-                yield item_metadata
+                try:
+                    obj = self.s3.Object(S3_BUCKET, obj_summary.key)
+                    data = obj.get()["Body"].read()
+                    item_metadata = json.loads(data.decode("utf-8"))
+                    yield item_metadata
+                except Exception:
+                    logging.error(f"Error reading metadata for {obj_summary.key}")
+                    continue
