@@ -44,12 +44,9 @@ class Retirer:
             item_metadata, providers_json
         )
 
-        if not self.dpla.is_wiki_eligible(
+        eligible = self.dpla.is_wiki_eligible(
             dpla_id, item_metadata, provider, data_provider
-        ):
-            logging.info(f"Skipping {dpla_id}: Not eligible.")
-            self.tracker.increment(Result.SKIPPED)
-            return
+        )
 
         titles = get_list(
             get_dict(item_metadata, "sourceResource"),
@@ -65,7 +62,9 @@ class Retirer:
         ):
             ordinal += 1
             page_label = "" if len(file_list) == 1 else str(ordinal)
-            self.process_file(page_label, dpla_id, ordinal, partner, title, dry_run)
+            self.process_file(
+                page_label, dpla_id, ordinal, partner, title, eligible, dry_run
+            )
 
     def process_file(
         self,
@@ -74,6 +73,7 @@ class Retirer:
         ordinal: int,
         partner: str,
         title: str,
+        eligible: bool,
         dry_run: bool,
     ) -> None:
         s3_path = self.s3_client.get_media_s3_path(dpla_id, ordinal, partner)
@@ -91,27 +91,26 @@ class Retirer:
             self.tracker.increment(Result.SKIPPED)
             return
 
+        if not eligible:
+            self.retire_file(s3_object, dry_run)
+            return
+
         sha1 = s3_object.metadata.get(CHECKSUM, "")
 
         if not sha1:
-            logging.info(f"{dpla_id} {ordinal} has no checksum.")
-            self.tracker.increment(Result.SKIPPED)
+            self.retire_file(s3_object, dry_run)
             return
 
         mime = s3_object.content_type
 
-        if not check_content_type(mime):
-            logging.info(f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}")
-            self.tracker.increment(Result.SKIPPED)
+        if not mime or not check_content_type(mime):
+            self.retire_file(s3_object, dry_run)
             return
 
         ext = mimetypes.guess_extension(mime)
 
         if not ext:
-            logging.info(
-                f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
-            )
-            self.tracker.increment(Result.SKIPPED)
+            self.retire_file(s3_object, dry_run)
             return
 
         page_title = get_page_title(
@@ -127,10 +126,17 @@ class Retirer:
         logging.info(f"Wiki page: {wiki_page}")
 
         if file_exists and page_exists:
-            if not dry_run:
-                metadata = s3_object.metadata
-                s3_object.put(Body="", Metadata=metadata)
-            self.tracker.increment(Result.RETIRED)
+            self.retire_file(s3_object, dry_run)
+
+    def retire_file(self, s3_object, dry_run: bool) -> None:
+        """
+        Retires the file by blanking it out in S3.
+        """
+        logging.info(f"Retiring {s3_object.key} in S3.")
+        if not dry_run:
+            metadata = s3_object.metadata
+            s3_object.put(Body="", Metadata=metadata)
+        self.tracker.increment(Result.RETIRED)
 
 
 @click.command()
