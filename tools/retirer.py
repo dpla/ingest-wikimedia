@@ -121,7 +121,14 @@ class Retirer:
         )
 
         file_exists = wiki_file_exists(self.site, sha1)
-        wiki_page = get_page(self.site, page_title)
+
+        try:
+            wiki_page = get_page(self.site, page_title)
+        except (RuntimeError, ValueError) as e:
+            logging.error(f"Error creating page title for {dpla_id}: {str(e)}")
+            self.retire_file(s3_object, dry_run)
+            return
+
         page_exists = False if wiki_page is None else True
         logging.info(f"Wiki page: {wiki_page}")
 
