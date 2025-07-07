@@ -222,6 +222,7 @@ INVALID_CONTENT_TYPES = [
     "text/html",
     "application/json",
     "application/xml",
+    "text/xml",
     "text/plain",
 ]
 COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
