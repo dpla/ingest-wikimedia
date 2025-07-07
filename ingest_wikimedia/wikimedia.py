@@ -224,6 +224,7 @@ INVALID_CONTENT_TYPES = [
     "application/xml",
     "text/xml",
     "text/plain",
+    "application/msword",
 ]
 COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
 ERROR_FILEEXISTS = "fileexists-shared-forbidden"
