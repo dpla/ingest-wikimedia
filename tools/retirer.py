@@ -124,7 +124,7 @@ class Retirer:
 
         try:
             wiki_page = get_page(self.site, page_title)
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             logging.error(f"Error creating page title for {dpla_id}: {str(e)}")
             self.retire_file(s3_object, dry_run)
             return
