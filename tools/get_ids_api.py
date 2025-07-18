@@ -3,6 +3,7 @@ import sys
 import click
 import requests
 
+from ingest_wikimedia.dpla import DPLA_PARTNERS
 from ingest_wikimedia.tools_context import ToolsContext
 
 
@@ -32,8 +33,8 @@ def main(partner: str, api_key: str, no_shard: bool, add_query: str):
     dpla = tools_context.get_dpla()
 
     dpla.check_partner(partner)
-    providers = dpla.get_providers_data()
-    partner_string = providers[partner].replace(" ", "+")
+    partner_full = DPLA_PARTNERS[partner]
+    partner_string = partner_full.replace(" ", "+")
 
     api_query_base = (
         f"https://api.dp.la/v2/items?api_key={api_key}"
