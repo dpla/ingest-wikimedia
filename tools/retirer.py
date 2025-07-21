@@ -62,9 +62,15 @@ class Retirer:
         ):
             ordinal += 1
             page_label = "" if len(file_list) == 1 else str(ordinal)
-            self.process_file(
-                page_label, dpla_id, ordinal, partner, title, eligible, dry_run
-            )
+            try:
+                self.process_file(
+                    page_label, dpla_id, ordinal, partner, title, eligible, dry_run
+                )
+            except Exception as e:
+                logging.error(
+                    f"Error processing file for {dpla_id} (ordinal {ordinal}): {str(e)}"
+                )
+                self.tracker.increment(Result.FAILED)
 
     def process_file(
         self,
@@ -143,7 +149,7 @@ class Retirer:
         if not dry_run:
             metadata = s3_object.metadata
             s3_object.put(Body="", Metadata=metadata)
-        self.tracker.increment(Result.RETIRED)
+            self.tracker.increment(Result.RETIRED)
 
 
 @click.command()
@@ -177,7 +183,13 @@ def main(partner: str, dry_run: bool) -> None:
             unit="Item",
             ncols=100,
         ):
-            retirer.process_item(providers_json, partner, dry_run, item_metadata)
+            try:
+                retirer.process_item(providers_json, partner, dry_run, item_metadata)
+            except Exception as e:
+                logging.error(
+                    f"Error processing item {item_metadata.get('id', 'unknown')}: {str(e)}"
+                )
+                tracker.increment(Result.FAILED)
 
     finally:
         logging.info("\n" + str(tracker))
