@@ -62,9 +62,15 @@ class Retirer:
         ):
             ordinal += 1
             page_label = "" if len(file_list) == 1 else str(ordinal)
-            self.process_file(
-                page_label, dpla_id, ordinal, partner, title, eligible, dry_run
-            )
+            try:
+                self.process_file(
+                    page_label, dpla_id, ordinal, partner, title, eligible, dry_run
+                )
+            except Exception:
+                logging.exception(
+                    "Error processing file for %s (ordinal %s)", dpla_id, ordinal
+                )
+                self.tracker.increment(Result.FAILED)
 
     def process_file(
         self,
@@ -124,8 +130,8 @@ class Retirer:
 
         try:
             wiki_page = get_page(self.site, page_title)
-        except (RuntimeError, ValueError) as e:
-            logging.error(f"Error creating page title for {dpla_id}: {str(e)}")
+        except (RuntimeError, ValueError):
+            logging.exception("Error creating page title for %s", dpla_id)
             self.retire_file(s3_object, dry_run)
             return
 
@@ -143,7 +149,7 @@ class Retirer:
         if not dry_run:
             metadata = s3_object.metadata
             s3_object.put(Body="", Metadata=metadata)
-        self.tracker.increment(Result.RETIRED)
+            self.tracker.increment(Result.RETIRED)
 
 
 @click.command()
@@ -177,7 +183,13 @@ def main(partner: str, dry_run: bool) -> None:
             unit="Item",
             ncols=100,
         ):
-            retirer.process_item(providers_json, partner, dry_run, item_metadata)
+            try:
+                retirer.process_item(providers_json, partner, dry_run, item_metadata)
+            except Exception:
+                logging.exception(
+                    "Error processing item %s", item_metadata.get("id", "unknown")
+                )
+                tracker.increment(Result.FAILED)
 
     finally:
         logging.info("\n" + str(tracker))
