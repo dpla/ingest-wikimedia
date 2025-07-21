@@ -66,9 +66,9 @@ class Retirer:
                 self.process_file(
                     page_label, dpla_id, ordinal, partner, title, eligible, dry_run
                 )
-            except Exception as e:
-                logging.error(
-                    f"Error processing file for {dpla_id} (ordinal {ordinal}): {str(e)}"
+            except Exception:
+                logging.exception(
+                    "Error processing file for %s (ordinal %s)", dpla_id, ordinal
                 )
                 self.tracker.increment(Result.FAILED)
 
@@ -130,8 +130,8 @@ class Retirer:
 
         try:
             wiki_page = get_page(self.site, page_title)
-        except (RuntimeError, ValueError) as e:
-            logging.error(f"Error creating page title for {dpla_id}: {str(e)}")
+        except (RuntimeError, ValueError):
+            logging.exception("Error creating page title for %s", dpla_id)
             self.retire_file(s3_object, dry_run)
             return
 
@@ -185,9 +185,9 @@ def main(partner: str, dry_run: bool) -> None:
         ):
             try:
                 retirer.process_item(providers_json, partner, dry_run, item_metadata)
-            except Exception as e:
-                logging.error(
-                    f"Error processing item {item_metadata.get('id', 'unknown')}: {str(e)}"
+            except Exception:
+                logging.exception(
+                    "Error processing item %s", item_metadata.get("id", "unknown")
                 )
                 tracker.increment(Result.FAILED)
 
