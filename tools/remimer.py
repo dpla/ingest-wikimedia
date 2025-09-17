@@ -26,7 +26,7 @@ def main(partner: str, dry_run: bool) -> None:
     dpla.check_partner(partner)
 
     try:
-        setup_logging(partner, "retirer", logging.INFO)
+        setup_logging(partner, "remimer", logging.INFO)
         if dry_run:
             logging.warning("---=== DRY RUN ===---")
 
@@ -44,7 +44,10 @@ def main(partner: str, dry_run: bool) -> None:
             key = object_summary.key
             if not key.endswith(".txt") and not key.endswith(".json"):
                 obj = object_summary.Object()
-                if obj.content_type == "binary/octet-stream":
+                if (
+                    obj.content_type == "binary/octet-stream"
+                    or obj.content_type == "application/octet-stream"
+                ):
                     with local_fs.get_temp_file() as data:
                         obj.download_fileobj(data)
                         content_type = local_fs.get_content_type(data.name)
@@ -57,7 +60,6 @@ def main(partner: str, dry_run: bool) -> None:
                                 MetadataDirective="REPLACE",
                                 CopySource=S3_BUCKET + "/" + key,
                             )
-                            break
 
     finally:
         logging.info("\n" + str(tracker))
