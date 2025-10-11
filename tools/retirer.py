@@ -157,7 +157,7 @@ class Retirer:
 @click.option("--dry-run", is_flag=True)
 def main(partner: str, dry_run: bool) -> None:
     start_time = time.time()
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
     retirer = Retirer(
         tools_context.get_tracker(),
         tools_context.get_s3_client(),

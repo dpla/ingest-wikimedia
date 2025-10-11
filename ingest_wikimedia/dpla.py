@@ -1,7 +1,10 @@
 import json
 import logging
+import sys
+from urllib import parse
 from typing import TypeVar, Callable
 
+import requests
 from requests import Session
 
 from .banlist import Banlist
@@ -17,12 +20,14 @@ T = TypeVar("T")
 class DPLA:
     def __init__(
         self,
+        api_key: str,
         tracker: Tracker,
         http_session: Session,
         s3_client: S3Client,
         banlist: Banlist,
         iiif: IIIF,
     ) -> None:
+        self.api_key = api_key
         self.tracker = tracker
         self.http_session = http_session
         self.s3_client = s3_client
@@ -37,12 +42,159 @@ class DPLA:
         if partner not in DPLA_PARTNERS.keys():
             raise ValueError(f"Unrecognized partner: {partner}")
 
-    def get_item_metadata(self, dpla_id: str, api_key: str) -> dict:
+    def get_nara_ids(self):
+        def build_collections_params(http_session: Session, api_key: str) -> list[str]:
+            _request_url = (
+                "https://api.dp.la/v2/items"
+                "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
+                f"&api_key={api_key}"
+                "&page_size=0"
+                "&facet_size=50000"
+                '&sourceResource.collection.title=NOT%20"Records%20of*"%20NOT%20"Naval%20Records%20Collection%20of%20the%20Office%20of%20Naval%20Records%20and%20Library"%20NOT%20"War%20Department%20Collection%20of%20Confederate%20Records"'
+                "&facets=sourceResource.collection.title"
+            )
+            collection_facet_response = http_session.get(_request_url).json()
+
+            return [
+                "exact_field_match=true&sourceResource.collection.title="
+                + parse.quote('"' + collection["term"] + '"', safe="")
+                for collection in collection_facet_response["facets"][
+                    "sourceResource.collection.title"
+                ]["terms"]
+                if (collection["count"] < 50000)
+                and ("Personnel" not in collection["term"])
+                and ("Military Files" not in collection["term"])
+                and ("Correspondence Files" not in collection["term"])
+                and (
+                    "War Department Collection of Revolutionary War Records"
+                    not in collection["term"]
+                )
+            ]
+
+        def build_languages_params(http_session: Session, api_key: str) -> list[str]:
+            _request_url = (
+                "https://api.dp.la/v2/items"
+                "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
+                f"&api_key={api_key}"
+                "&page_size=0"
+                "&facets=sourceResource.language.name"
+                "&facet_size=50000"
+            )
+
+            lang_facet_response = http_session.get(_request_url).json()
+
+            lang_values = [
+                '"' + lang["term"] + '"'
+                for lang in lang_facet_response["facets"][
+                    "sourceResource.language.name"
+                ]["terms"]
+                if lang["term"] != "English"
+            ]
+
+            return [
+                "sourceResource.language.name=" + "+OR+".join(lang_values[i : i + 10])
+                for i in range(0, len(lang_values), 10)
+            ]
+
+        def build_formats_params(http_session: Session, api_key: str) -> list[str]:
+            _request_url = (
+                "https://api.dp.la/v2/items"
+                "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
+                f"&api_key={api_key}"
+                "&page_size=0"
+                "&facets=sourceResource.format"
+                "&facet_size=50000"
+            )
+            format_facet_response = http_session.get(_request_url).json()
+
+            format_values = [
+                '"' + facet["term"] + '"'
+                for facet in format_facet_response["facets"]["sourceResource.format"][
+                    "terms"
+                ]
+                if facet["count"] < 12000
+            ]
+
+            return [
+                "sourceResource.format=" + "+OR+".join(format_values[i : i + 6])
+                for i in range(0, len(format_values), 6)
+            ]
+
+        queries = []
+        queries.extend(build_languages_params(self.http_session, self.api_key))
+        queries.extend(build_formats_params(self.http_session, self.api_key))
+        queries.extend(build_collections_params(self.http_session, self.api_key))
+
+        for query in queries:
+            has_results = True
+            page = 0
+            base_request_url = (
+                "https://api.dp.la/v2/items"
+                "?provider.name=%22National%20Archives%20and%20Records%20Administration%22"
+                "&page_size=5000"
+                f"&api_key={self.api_key}"
+                "&rightsCategory=%22Unlimited+Re-Use%22"
+                "&fields=id&" + query
+            )
+            while has_results:
+                page += 1
+                request_url = base_request_url + "&page=" + str(page)
+                try:
+                    res = self.http_session.get(request_url).json()
+
+                    for item in res["docs"]:
+                        yield item["id"]
+
+                    if res["count"] <= (res["limit"] + res["start"]):
+                        has_results = False
+                except Exception as e:
+                    raise RuntimeError(
+                        "Error in request: "
+                        + request_url.replace(self.api_key, "[REDACTED]")
+                    ) from e
+
+    def get_ids(self, partner: str, add_query: str | None, no_shard: bool):
+        partner_full = DPLA_PARTNERS[partner]
+        partner_string = partner_full.replace(" ", "+")
+
+        api_query_base = (
+            f"https://api.dp.la/v2/items?api_key={self.api_key}"
+            f"&provider.name={partner_string}"
+            "&rightsCategory=Unlimited+Re-Use"
+            "&fields=id"
+            "&page_size=500"
+        )
+
+        if add_query:
+            api_query_base += "&" + add_query
+
+        def run_query(query_url: str):
+            page = 0
+            while True:
+                page += 1
+                page_url = query_url + "&page=" + str(page)
+                print(page_url, file=sys.stderr)
+                response = requests.get(page_url)
+                response.raise_for_status()
+                data = response.json()
+                if not data.get("docs", None):
+                    break
+                for doc in data.get("docs"):
+                    dpla_id = doc.get("id")
+                    print(dpla_id)
+
+        if not no_shard:
+            for shard in [hex(i)[2:].zfill(2) for i in range(256)]:
+                run_query(f"{api_query_base}&id={shard}*")
+        else:
+            run_query(api_query_base)
+
+    def get_item_metadata(self, dpla_id: str) -> dict:
         """
         Retrieves a DPLA MAP record from the DPLA API for an item.
         """
         url = DPLA_API_URL_BASE + dpla_id
-        headers = {AUTHORIZATION_HEADER: api_key}
+        headers = {AUTHORIZATION_HEADER: self.api_key}
         response = self.http_session.get(url, headers=headers)
         response.raise_for_status()
         response_json = response.json()

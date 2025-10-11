@@ -10,7 +10,6 @@ from requests import Session
 
 from ingest_wikimedia.common import get_list, get_dict, get_str
 from ingest_wikimedia.tracker import Tracker, Result
-from ingest_wikimedia.web import HTTP_REQUEST_HEADERS
 
 
 class IIIF:
@@ -209,7 +208,7 @@ class IIIF:
             return None
 
         try:
-            request = self.http_session.get(url, headers=HTTP_REQUEST_HEADERS)
+            request = self.http_session.get(url)
             request.raise_for_status()
             return request.json()
 

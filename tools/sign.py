@@ -14,7 +14,7 @@ from ingest_wikimedia.tools_context import ToolsContext
 @click.argument("partner")
 def main(partner: str):
     start_time = time.time()
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
     dpla = tools_context.get_dpla()
     setup_logging(partner, "sign", logging.INFO)
     dpla.check_partner(partner)

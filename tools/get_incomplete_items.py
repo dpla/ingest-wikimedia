@@ -37,9 +37,8 @@ def get_incomplete_items(s3, prefix) -> list[str]:
 @click.command()
 @click.argument("partner")
 def main(partner: str):
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
     s3 = tools_context.get_s3_client().get_s3()
-
     for item_id in get_incomplete_items(s3, partner):
         print(item_id)
 
