@@ -12,6 +12,7 @@ def main(output: IO):
     dpla = tools_context.get_dpla()
     for nara_id in dpla.get_nara_ids():
         output.write(nara_id)
+        output.write("\n")
 
 
 if __name__ == "__main__":
