@@ -4,7 +4,6 @@ import sys
 from urllib import parse
 from typing import TypeVar, Callable
 
-import requests
 from requests import Session
 
 from .banlist import Banlist
@@ -173,8 +172,8 @@ class DPLA:
             while True:
                 page += 1
                 page_url = query_url + "&page=" + str(page)
-                print(page_url, file=sys.stderr)
-                response = requests.get(page_url)
+                print(page, file=sys.stderr)
+                response = self.http_session.get(page_url)
                 response.raise_for_status()
                 data = response.json()
                 if not data.get("docs", None):

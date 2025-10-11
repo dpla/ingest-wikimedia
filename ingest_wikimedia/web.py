@@ -35,7 +35,7 @@ class Web:
             "X-DPLA-Bot-ID": "wikimedia-ingest",
         }
         # To have a default session-level connection init timeout,
-        # you have to result to this:
+        # you have to resort to this:
         session.get = functools.partial(session.get, timeout=DEFAULT_CONN_TIMEOUT)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
