@@ -34,7 +34,7 @@ def dpla(
     banlist.is_banned = lambda dpla_id: False
     iiif.contentdm_iiif_url = MagicMock()
     iiif.contentdm_iiif_url.return_value = "http://example.com/iiif"
-    dpla = DPLA(tracker, http_session, s3_client, banlist, iiif)
+    dpla = DPLA("test_api_key", tracker, http_session, s3_client, banlist, iiif)
     dpla.http_session = MagicMock()
     dpla.http_session.head.return_value.status_code = 200
     return dpla
@@ -98,7 +98,7 @@ def test_get_item_metadata(dpla: DPLA):
     mock_http_session.get.return_value = mock_response
     dpla.http_session = mock_http_session
 
-    result = dpla.get_item_metadata("test_id", "test_api_key")
+    result = dpla.get_item_metadata("test_id")
     assert result == {"id": "test_id"}
 
 

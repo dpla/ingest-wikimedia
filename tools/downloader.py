@@ -3,8 +3,6 @@ import logging
 import os
 import time
 
-from requests import Session
-
 from ingest_wikimedia.dpla import (
     DPLA,
     MEDIA_MASTER_FIELD_NAME,
@@ -29,6 +27,7 @@ from ingest_wikimedia.common import (
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.web import Web
 from ingest_wikimedia.wikimedia import check_content_type
 
 DOWNLOAD_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB
@@ -41,16 +40,18 @@ class Downloader:
 
     def __init__(
         self,
+        provider: str,
         tracker: Tracker,
         s3_client: S3Client,
-        http_session: Session,
+        web: Web,
         local_fs: LocalFS,
         dpla: DPLA,
         iiif: IIIF,
     ):
+        self.provider = provider
         self.tracker = tracker
         self.s3_client = s3_client
-        self.http_session = http_session
+        self.web = web
         self.local_fs = local_fs
         self.dpla = dpla
         self.iiif = iiif
@@ -117,7 +118,9 @@ class Downloader:
         Tries to get a local copy of a file to stick in S3 later
         """
         try:
-            response = self.http_session.get(media_url, stream=True)
+            response = self.web.get_http_session(provider=self.provider).get(
+                media_url, stream=True
+            )
             total_size = int(response.headers.get("content-length", 0))
             with tqdm(
                 total=total_size,
@@ -192,7 +195,6 @@ class Downloader:
         partner: str,
         dpla_id: str,
         providers_json: dict,
-        api_key: str,
         sleep_secs: float,
     ) -> None:
         """
@@ -201,7 +203,7 @@ class Downloader:
         """
 
         try:
-            item_metadata = self.dpla.get_item_metadata(dpla_id, api_key)
+            item_metadata = self.dpla.get_item_metadata(dpla_id)
 
             if not item_metadata:
                 logging.info(f"{dpla_id} was not found in the DPLA API.")
@@ -284,9 +286,8 @@ class Downloader:
 
 
 @click.command()
-@click.argument("ids_file", type=click.File("r"))
+@click.argument("ids-file", type=click.File("r"))
 @click.argument("partner")
-@click.argument("api_key")
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
 @click.option("--overwrite", is_flag=True, help="Overwrite already downloaded media.")
@@ -298,7 +299,6 @@ class Downloader:
 def main(
     ids_file: IO,
     partner: str,
-    api_key: str,
     dry_run: bool,
     verbose: bool,
     overwrite: bool,
@@ -306,12 +306,13 @@ def main(
 ):
     setup_logging(partner, "download", logging.INFO)
     start_time = time.time()
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
 
     downloader = Downloader(
+        partner,
         tools_context.get_tracker(),
         tools_context.get_s3_client(),
-        tools_context.get_http_session(),
+        tools_context.get_web(),
         tools_context.get_local_fs(),
         tools_context.get_dpla(),
         tools_context.get_iiif(),
@@ -340,7 +341,6 @@ def main(
                 partner,
                 dpla_id,
                 providers_json,
-                api_key,
                 sleep,
             )
 

@@ -1,59 +1,17 @@
-import sys
-
 import click
-import requests
 
-from ingest_wikimedia.dpla import DPLA_PARTNERS
 from ingest_wikimedia.tools_context import ToolsContext
-
-
-def run_query(url):
-    page = 0
-    while True:
-        page += 1
-        page_url = url + "&page=" + str(page)
-        print(page_url, file=sys.stderr)
-        response = requests.get(page_url)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("docs", None):
-            break
-        for doc in data.get("docs"):
-            dpla_id = doc.get("id")
-            print(dpla_id)
 
 
 @click.command()
 @click.argument("partner")
-@click.argument("api_key")
 @click.option("--no-shard", is_flag=True)
 @click.option("--add-query")
-def main(partner: str, api_key: str, no_shard: bool, add_query: str):
-    tools_context = ToolsContext.init()
+def main(partner: str, no_shard: bool, add_query: str):
+    tools_context = ToolsContext.init(partner)
     dpla = tools_context.get_dpla()
-
     dpla.check_partner(partner)
-    partner_full = DPLA_PARTNERS[partner]
-    partner_string = partner_full.replace(" ", "+")
-
-    api_query_base = (
-        f"https://api.dp.la/v2/items?api_key={api_key}"
-        f"&provider.name={partner_string}"
-        "&rightsCategory=Unlimited+Re-Use"
-        "&fields=id"
-        "&page_size=500"
-    )
-
-    if add_query:
-        api_query_base += "&" + add_query
-
-    if not no_shard:
-        shards = [hex(i)[2:].zfill(2) for i in range(256)]
-        for shard in shards:
-            url = f"{api_query_base}&id={shard}*"
-            run_query(url)
-    else:
-        run_query(api_query_base)
+    dpla.get_ids(partner, add_query, no_shard)
 
 
 if __name__ == "__main__":

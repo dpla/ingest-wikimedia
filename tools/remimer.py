@@ -2,7 +2,6 @@ import click
 import time
 import logging
 
-
 from tqdm import tqdm
 
 
@@ -17,7 +16,7 @@ from ingest_wikimedia.logs import setup_logging
 @click.option("--dry-run", is_flag=True)
 def main(partner: str, dry_run: bool) -> None:
     start_time = time.time()
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
     dpla = tools_context.get_dpla()
     tracker = tools_context.get_tracker()
     local_fs = tools_context.get_local_fs()

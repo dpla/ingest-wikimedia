@@ -5,7 +5,6 @@ import time
 
 import click
 from pywikibot.site import BaseSite
-from requests import Session
 
 from tqdm import tqdm
 
@@ -53,7 +52,6 @@ class Uploader:
         local_fs: LocalFS,
         s3_client: S3Client,
         dpla: DPLA,
-        http_session: Session,
         site: BaseSite,
     ):
         self.tracker = tracker
@@ -61,7 +59,6 @@ class Uploader:
         self.s3_client = s3_client
         self.site = site
         self.dpla = dpla
-        self.http_session = http_session
 
     def process_file(
         self,
@@ -288,14 +285,13 @@ class Uploader:
 @click.option("--verbose", is_flag=True)
 def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     start_time = time.time()
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
 
     uploader = Uploader(
         tools_context.get_tracker(),
         tools_context.get_local_fs(),
         tools_context.get_s3_client(),
         tools_context.get_dpla(),
-        tools_context.get_http_session(),
         get_site(),
     )
 

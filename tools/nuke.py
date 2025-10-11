@@ -14,12 +14,12 @@ from ingest_wikimedia.tools_context import ToolsContext
 
 
 @click.command()
-@click.argument("ids_file", type=click.File("r"))
+@click.argument("ids-file", type=click.File("r"))
 @click.argument("partner")
 @click.option("--dry-run", is_flag=True)
 def main(ids_file: IO, partner: str, dry_run: bool):
     start_time = time.time()
-    tools_context = ToolsContext.init()
+    tools_context = ToolsContext.init(partner)
     s3 = tools_context.get_s3_client()
     dpla = tools_context.get_dpla()
     dpla.check_partner(partner)
