@@ -58,12 +58,14 @@ class ToolsContext:
 
         tracker = Tracker()
         s3_client = S3Client()
-        web = Web(config[provider].secret)
+        web = Web(config["dpla_secrets"])
         http_session = web.get_http_session(provider)
         local_fs = LocalFS()
         banlist = Banlist()
         iiif = IIIF(tracker, http_session)
-        dpla = DPLA(config["api_key"], tracker, http_session, s3_client, banlist, iiif)
+        dpla = DPLA(
+            config["dpla_api_key"], tracker, http_session, s3_client, banlist, iiif
+        )
 
         return ToolsContext(
             tracker=tracker,
