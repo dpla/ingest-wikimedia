@@ -1,10 +1,9 @@
 document.addEventListener('DOMContentLoaded', function() {    
     google.charts.load('current', {packages: ['corechart', 'line']});
 
-    fetch('https://public-paws.wmcloud.org/User:Dominic/commons_category_allow_list.tsv')
+    fetch('https://raw.githubusercontent.com/dpla/ingest-wikimedia/refs/heads/main/metrics/commons_category_allow_list.tsv')
         .then(response => response.text())
         .then(data => {
-            window.onload = function WindowLoad() {
                 
             params = window.location.search.substring(1).split("&");
         	console.log(params)
@@ -172,8 +171,7 @@ document.addEventListener('DOMContentLoaded', function() {
                       window.location.href = url.toString();
                     });
                 });
-            }
-        })
+            })
         .catch(error => {
             console.error('Error fetching TSV file:', error);
             var container = document.getElementById('sections-container');
