@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Collapsible Sections with Commons Impact Metrics API Data</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+
+<h2>Dynamic Collapsible Sections with Commons Impact Metrics API Data</h2>
+
+<form id="showForm">
+  <label for="showInput">Select category:</label>
+  <input
+    type="text"
+    id="showInput"
+    name="show"
+    list="showOptions"
+    autocomplete="off"
+    required
+  />
+  <datalist id="showOptions"></datalist>
+
+  <button type="submit">Submit</button>
+  <div id="errorMessage" style="color: red; display: none;"></div>
+
+</form>
+
+<form id="show">
+  <label for="showInput">Or:</label>
+  <button type="submit">Show all</button>
+</form>
+    
+<div style="display:none" id="sections-container" >
+    <!-- Collapsible sections will be injected here -->
+</div>
+
+<script type="text/javascript" src="https://www.gstatic.com/charts/loader.js"></script>
+<script type="text/javascript" src="metrics.js"></script>
+
+</body>
+</html>
