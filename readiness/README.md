@@ -4,10 +4,23 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 
 ## Inventories
 
-| Hub | File |
+| Hub | Inventory |
 |-----|------|
-| [Indiana Memory](https://dp.la/search?partner=%22Indiana+Memory%22) | [indiana_inventory.md](indiana_inventory.md) |
-| [Heartland Hub](https://dp.la/search?partner=%22Heartland+Hub%22) | [heartland_inventory.md](heartland_inventory.md) |
+| [Indiana Memory](https://dp.la/search?partner=%22Indiana+Memory%22) | [indiana_memory_inventory.md](indiana_memory_inventory.md) |
+| [Heartland Hub](https://dp.la/search?partner=%22Heartland+Hub%22) | [heartland_hub_inventory.md](heartland_hub_inventory.md) |
+| [California Digital Library](https://dp.la/search?partner=%22California+Digital+Library%22) | [california_digital_library_inventory.md](california_digital_library_inventory.md) |
+| [Digital Commonwealth](https://dp.la/search?partner=%22Digital+Commonwealth%22) | [digital_commonwealth_inventory.md](digital_commonwealth_inventory.md) |
+| [Minnesota Digital Library](https://dp.la/search?partner=%22Minnesota+Digital+Library%22) | [minnesota_digital_library_inventory.md](minnesota_digital_library_inventory.md) |
+| [Plains to Peaks Collective](https://dp.la/search?partner=%22Plains+to+Peaks+Collective%22) | [plains_to_peaks_collective_inventory.md](plains_to_peaks_collective_inventory.md) |
+| [Northwest Digital Heritage](https://dp.la/search?partner=%22Northwest+Digital+Heritage%22) | [northwest_digital_heritage_inventory.md](northwest_digital_heritage_inventory.md) |
+| [Digital Library of Georgia](https://dp.la/search?partner=%22Digital+Library+of+Georgia%22) | [digital_library_of_georgia_inventory.md](digital_library_of_georgia_inventory.md) |
+| [OKHub](https://dp.la/search?partner=%22OKHub%22) | [okhub_inventory.md](okhub_inventory.md) |
+| [Michigan Service Hub](https://dp.la/search?partner=%22Michigan+Service+Hub%22) | [michigan_service_hub_inventory.md](michigan_service_hub_inventory.md) |
+| [North Carolina Digital Heritage Center](https://dp.la/search?partner=%22North+Carolina+Digital+Heritage+Center%22) | [north_carolina_digital_heritage_center_inventory.md](north_carolina_digital_heritage_center_inventory.md) |
+| [Recollection Wisconsin](https://dp.la/search?partner=%22Recollection+Wisconsin%22) | [recollection_wisconsin_inventory.md](recollection_wisconsin_inventory.md) |
+| [PA Digital](https://dp.la/search?partner=%22PA+Digital%22) | [pa_digital_inventory.md](pa_digital_inventory.md) |
+| [Ohio Digital Network](https://dp.la/search?partner=%22Ohio+Digital+Network%22) | [ohio_digital_network_inventory.md](ohio_digital_network_inventory.md) |
+| [Empire State Digital Network](https://dp.la/search?partner=%22Empire+State+Digital+Network%22) | [empire_state_digital_network_inventory.md](empire_state_digital_network_inventory.md) |
 
 ## How readiness is assessed
 

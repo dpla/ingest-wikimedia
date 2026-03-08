@@ -1,0 +1,26 @@
+# Wikimedia Readiness for Plains to Peaks Collective
+
+- [By institution](#by-institution)
+- [By domain](#by-domain)
+
+## By institution
+
+- [go to top](#wikimedia-readiness-for-plains-to-peaks-collective)
+
+1. '[**Colorado Mesa University. Tomlinson Library**](https://dp.la/search?provider=%22Colorado+Mesa+University.+Tomlinson+Library%22&partner=%22Plains+to+Peaks+Collective%22)' *([cdm17393.contentdm.oclc.org](https://cdm17393.contentdm.oclc.org))* has a **low** readiness score because it has **9** eligible public domain items (**3%** of **351** total items) already in CONTENTdm.
+2. '[**Colorado State University-Pueblo. Library**](https://dp.la/search?provider=%22Colorado+State+University-Pueblo.+Library%22&partner=%22Plains+to+Peaks+Collective%22)' *([cdm17393.contentdm.oclc.org](https://cdm17393.contentdm.oclc.org))* has a **low** readiness score because it has **1** eligible public domain item (**0%** of **883** total items) already in CONTENTdm, and **6** additional items over 120 years old in other rights categories that could become eligible with rights review.
+3. '[**Douglas County Libraries. Archives and Local History**](https://dp.la/search?provider=%22Douglas+County+Libraries.+Archives+and+Local+History%22&partner=%22Plains+to+Peaks+Collective%22)' *([cdm17197.contentdm.oclc.org](https://cdm17197.contentdm.oclc.org))* has a **very low** readiness score with no public domain items, but has **717** items over 120 years old in other rights categories that could become eligible with rights review.
+4. '[**City of Greeley Museums**](https://dp.la/search?provider=%22City+of+Greeley+Museums%22&partner=%22Plains+to+Peaks+Collective%22)' *([cdm16720.contentdm.oclc.org](https://cdm16720.contentdm.oclc.org))* has a **very low** readiness score with no public domain items, but has **322** items over 120 years old in other rights categories that could become eligible with rights review.
+5. '[**Fort Collins History Connection**](https://dp.la/search?provider=%22Fort+Collins+History+Connection%22&partner=%22Plains+to+Peaks+Collective%22)' *([fchc.contentdm.oclc.org](https://fchc.contentdm.oclc.org))* has a **very low** readiness score with no public domain items, but has **283** items over 120 years old in other rights categories that could become eligible with rights review.
+6. '[**Pueblo City-County Library District**](https://dp.la/search?provider=%22Pueblo+City-County+Library+District%22&partner=%22Plains+to+Peaks+Collective%22)' *([cdm16620.contentdm.oclc.org](https://cdm16620.contentdm.oclc.org))* has a **very low** readiness score with no public domain items, but has **26** items over 120 years old in other rights categories that could become eligible with rights review.
+7. '[**High Plains Library District**](https://dp.la/search?provider=%22High+Plains+Library+District%22&partner=%22Plains+to+Peaks+Collective%22)' *([cdm16720.contentdm.oclc.org](https://cdm16720.contentdm.oclc.org))* has a **very low** readiness score with no public domain items and no items dated over 120 years old.
+
+## By domain
+
+- [go to top](#wikimedia-readiness-for-plains-to-peaks-collective)
+
+1. '[**cdm17393.contentdm.oclc.org**](https://cdm17393.contentdm.oclc.org)' *(e.g. '[Colorado State University-Pueblo. Library](https://dp.la/search?provider=%22Colorado+State+University-Pueblo.+Library%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **low** readiness score because it has **10** eligible public domain items (**1%** of **1,234** total items) across all collections hosted on this domain in CONTENTdm, and **6** additional items over 120 years old in other rights categories that could become eligible with rights review.
+2. '[**cdm17197.contentdm.oclc.org**](https://cdm17197.contentdm.oclc.org)' *(e.g. '[Douglas County Libraries. Archives and Local History](https://dp.la/search?provider=%22Douglas+County+Libraries.+Archives+and+Local+History%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **717** items over 120 years old in other rights categories that could become eligible with rights review.
+3. '[**cdm16720.contentdm.oclc.org**](https://cdm16720.contentdm.oclc.org)' *(e.g. '[City of Greeley Museums](https://dp.la/search?provider=%22City+of+Greeley+Museums%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **322** items over 120 years old in other rights categories that could become eligible with rights review.
+4. '[**fchc.contentdm.oclc.org**](https://fchc.contentdm.oclc.org)' *(e.g. '[Fort Collins History Connection](https://dp.la/search?provider=%22Fort+Collins+History+Connection%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **283** items over 120 years old in other rights categories that could become eligible with rights review.
+5. '[**cdm16620.contentdm.oclc.org**](https://cdm16620.contentdm.oclc.org)' *(e.g. '[Pueblo City-County Library District](https://dp.la/search?provider=%22Pueblo+City-County+Library+District%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **26** items over 120 years old in other rights categories that could become eligible with rights review.

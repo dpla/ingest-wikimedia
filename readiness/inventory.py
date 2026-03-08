@@ -5,7 +5,7 @@ import re
 import time
 
 import requests
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote, quote_plus
 
 API_KEY = os.environ.get('DPLA_API_KEY', 'YOUR_DPLA_API_KEY_HERE')
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,7 +31,7 @@ def fetch(url):
         except Exception as e:
             print(f"  Error: {e}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})")
         time.sleep(RETRY_SLEEP)
-    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {url}")
+    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {re.sub(r'api_key=[^&]*', 'api_key=REDACTED', url)}")
 
 
 def facet_to_dict(result):
@@ -110,7 +110,7 @@ def update_readme(hub, output_filename):
     in_inventories_table = False
 
     for i, line in enumerate(lines):
-        if '| Hub | File |' in line:
+        if '| Hub |' in line:
             in_inventories_table = True
         if in_inventories_table and line.startswith('|'):
             last_table_row_idx = i
@@ -204,7 +204,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
             continue
 
         print(f"  [{i + 1}/{total}] Fetching sample doc: {name}")
-        encoded = '"' + name.replace('&', '%26') + '"'
+        encoded = '"' + quote(name, safe=' ') + '"'
         sample = fetch(
             f'https://api.dp.la/v2/items?dataProvider={encoded}'
             f'&provider=%22{hub_encoded}%22&api_key={API_KEY}&page_size=1'
