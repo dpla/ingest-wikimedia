@@ -6,8 +6,8 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 
 | Hub | File |
 |-----|------|
-| [Indiana Memory](https://dp.la/search?partner=%22Indiana+Memory%22) | [indiana_memory_inventory.md](indiana_memory_inventory.md) |
-| [Heartland Hub](https://dp.la/search?partner=%22Heartland+Hub%22) | [heartland_hub_inventory.md](heartland_hub_inventory.md) |
+| [Indiana Memory](https://dp.la/search?partner=%22Indiana+Memory%22) | [indiana_inventory.md](indiana_inventory.md) |
+| [Heartland Hub](https://dp.la/search?partner=%22Heartland+Hub%22) | [heartland_inventory.md](heartland_inventory.md) |
 
 ## How readiness is assessed
 
