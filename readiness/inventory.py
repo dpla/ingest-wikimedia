@@ -65,7 +65,8 @@ def readiness_stmt(name, unlim, old_other, total, label="domain", parenthetical=
         paren_md = (f" *(e.g. '[{parenthetical}]({dpla_search_url(parenthetical, hub)})')*"
                     if parenthetical and hub else "")
     else:
-        name_md = f"'[**{name}**]({dpla_search_url(name, hub)})'" if hub else f"'**{name}**'"
+        safe_name = name.replace('|', r'\|').replace('[', r'\[').replace(']', r'\]')
+        name_md = f"'[**{safe_name}**]({dpla_search_url(name, hub)})'" if hub else f"'**{safe_name}**'"
         paren_md = f" *([{parenthetical}](https://{parenthetical}))*" if parenthetical else ""
 
     if unlim > 0:
@@ -138,8 +139,8 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         return
 
     hub_encoded = hub.replace(' ', '%20')
-    hub_file_slug = hub.lower().replace(' ', '_')
-    hub_md_slug = hub.lower().replace(' ', '-')
+    hub_file_slug = hub.lower().replace(' ', '_').replace('/', '_')
+    hub_md_slug = hub.lower().replace(' ', '-').replace('/', '-')
     output_file = os.path.join(SCRIPT_DIR, f'{hub_file_slug}_inventory.md')
 
     # Load or initialize cache for this hub
