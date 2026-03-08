@@ -31,7 +31,7 @@ def fetch(url):
         except Exception as e:
             print(f"  Error: {e}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})")
         time.sleep(RETRY_SLEEP)
-    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {url}")
+    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {re.sub(r'api_key=[^&]*', 'api_key=REDACTED', url)}")
 
 
 def facet_to_dict(result):
