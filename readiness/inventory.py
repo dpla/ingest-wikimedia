@@ -1,4 +1,10 @@
-import requests, json, re, datetime, time, os
+import datetime
+import json
+import os
+import re
+import time
+
+import requests
 from urllib.parse import urlparse, quote_plus
 
 API_KEY = os.environ.get('DPLA_API_KEY', 'YOUR_DPLA_API_KEY_HERE')
@@ -43,11 +49,16 @@ def readiness_stmt(name, unlim, old_other, total, label="domain", parenthetical=
     total_fmt = f"{total:,}"
     suffix = "across all collections hosted on this domain" if label == "domain" else "already"
 
-    if unlim >= 5000:   level = 'very high'
-    elif unlim >= 1000: level = 'high'
-    elif unlim >= 100:  level = 'moderate'
-    elif unlim > 0:     level = 'low'
-    else:               level = 'very low'
+    if unlim >= 5000:
+        level = 'very high'
+    elif unlim >= 1000:
+        level = 'high'
+    elif unlim >= 100:
+        level = 'moderate'
+    elif unlim > 0:
+        level = 'low'
+    else:
+        level = 'very low'
 
     if label == "domain":
         name_md = f"'[**{name}**](https://{name})'"
@@ -112,7 +123,7 @@ def update_readme(hub, output_filename):
             f.write('\n'.join(lines))
         print(f"  Updated README.md: added row for {hub}")
     else:
-        print(f"  WARNING: Could not find Inventories table in README.md")
+        print("  WARNING: Could not find Inventories table in README.md")
 
 
 def process_hub(hub, pipelinejson, all_data, cutoff_year):
@@ -169,7 +180,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     hub_institutions_pipeline = hub_pipeline_entry.get('institutions', {})
 
     # Phase 2: Institutions list
-    print(f"  Fetching institutions list...")
+    print("  Fetching institutions list...")
     institutionsjson = fetch(
         f'https://api.dp.la/v2/items?facets=dataProvider&provider=%22{hub_encoded}%22'
         f'&api_key={API_KEY}&page_size=0&facet_size=1000'
@@ -221,7 +232,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
                 json.dump(all_data, f, indent=2)
         return
 
-    print(f"\n  All data collected. Generating output...\n")
+    print("\n  All data collected. Generating output...\n")
 
     # Phase 4: Build per-institution records
     institutions_data = []
@@ -286,15 +297,15 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
 
     with open(output_file, 'w') as f:
         f.write(f"# Wikimedia Readiness for {hub}\n\n")
-        f.write(f"- [By institution](#by-institution)\n")
-        f.write(f"- [By domain](#by-domain)\n\n")
-        f.write(f"## By institution\n\n")
+        f.write("- [By institution](#by-institution)\n")
+        f.write("- [By domain](#by-domain)\n\n")
+        f.write("## By institution\n\n")
         f.write(f"- {top_link}\n\n")
         for rank, inst in enumerate(eligible, 1):
             stmt = readiness_stmt(inst['name'], inst['unlim'], inst['old_other'], inst['total'],
                                   label="institution", parenthetical=inst['domain'], hub=hub)
             f.write(str(rank) + ". " + stmt + "\n")
-        f.write(f"\n## By domain\n\n")
+        f.write("\n## By domain\n\n")
         f.write(f"- {top_link}\n\n")
         for rank, dom in enumerate(eligible_domains, 1):
             stmt = readiness_stmt(dom['domain'], dom['unlim'], dom['old_other'], dom['total'],
