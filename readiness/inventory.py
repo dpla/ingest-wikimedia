@@ -1,0 +1,337 @@
+import requests, json, re, datetime, time, os
+from urllib.parse import urlparse, quote_plus
+
+API_KEY = os.environ.get('DPLA_API_KEY', 'YOUR_DPLA_API_KEY_HERE')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(SCRIPT_DIR, 'inventory_data.json')
+README_FILE = os.path.join(SCRIPT_DIR, 'README.md')
+
+RETRY_LIMIT = 10
+RETRY_SLEEP = 60  # seconds between retries on failure
+
+contentdm_re = re.compile(
+    r'^https?://[^/]+/(?:digital|cdm(?:/ref)?)/collection/[^/]+/id/\d+(?:/.*)?$',
+    re.IGNORECASE,
+)
+
+
+def fetch(url):
+    for attempt in range(RETRY_LIMIT):
+        try:
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200:
+                return json.loads(r.text)
+            print(f"  HTTP {r.status_code}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})")
+        except Exception as e:
+            print(f"  Error: {e}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})")
+        time.sleep(RETRY_SLEEP)
+    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {url}")
+
+
+def facet_to_dict(result):
+    """Converts a dataProvider facet result into a {name: count} dict."""
+    return {term['term']: term['count'] for term in result['facets']['dataProvider']['terms']}
+
+
+def dpla_search_url(name, hub):
+    q = '"'
+    return f"https://dp.la/search?provider={quote_plus(q + name + q)}&partner={quote_plus(q + hub + q)}"
+
+
+def readiness_stmt(name, unlim, old_other, total, label="domain", parenthetical=None, hub=None):
+    pct = f"{round(unlim / total * 100)}%" if total > 0 and unlim > 0 else "0%"
+    total_fmt = f"{total:,}"
+    suffix = "across all collections hosted on this domain" if label == "domain" else "already"
+
+    if unlim >= 5000:   level = 'very high'
+    elif unlim >= 1000: level = 'high'
+    elif unlim >= 100:  level = 'moderate'
+    elif unlim > 0:     level = 'low'
+    else:               level = 'very low'
+
+    if label == "domain":
+        name_md = f"'[**{name}**](https://{name})'"
+        paren_md = (f" *(e.g. '[{parenthetical}]({dpla_search_url(parenthetical, hub)})')*"
+                    if parenthetical and hub else "")
+    else:
+        name_md = f"'[**{name}**]({dpla_search_url(name, hub)})'" if hub else f"'**{name}**'"
+        paren_md = f" *([{parenthetical}](https://{parenthetical}))*" if parenthetical else ""
+
+    if unlim > 0:
+        pd_items = "item" if unlim == 1 else "items"
+        stmt = (f"{name_md}{paren_md} has a **{level}** readiness score because it has "
+                f"**{unlim:,}** eligible public domain {pd_items} (**{pct}** of **{total_fmt}** total items) "
+                f"{suffix} in CONTENTdm")
+        if old_other > 0:
+            add_items = "item" if old_other == 1 else "items"
+            stmt += (f", and **{old_other:,}** additional {add_items} over 120 years old in other rights "
+                     f"categories that could become eligible with rights review")
+        stmt += "."
+    elif old_other > 0:
+        add_items = "item" if old_other == 1 else "items"
+        stmt = (f"{name_md}{paren_md} has a **very low** readiness score with no public domain items, "
+                f"but has **{old_other:,}** {add_items} over 120 years old in other rights categories "
+                f"that could become eligible with rights review.")
+    else:
+        stmt = (f"{name_md}{paren_md} has a **very low** readiness score with no public domain items "
+                f"and no items dated over 120 years old.")
+    return stmt
+
+
+def update_readme(hub, output_filename):
+    """Add a new row to the Inventories table in README.md if not already present."""
+    if not os.path.exists(README_FILE):
+        print(f"  WARNING: README.md not found at {README_FILE}")
+        return
+
+    with open(README_FILE, 'r') as f:
+        content = f.read()
+
+    if output_filename in content:
+        return  # Already present
+
+    q = '"'
+    hub_url = f"https://dp.la/search?partner={quote_plus(q + hub + q)}"
+    new_row = f"| [{hub}]({hub_url}) | [{output_filename}]({output_filename}) |"
+
+    lines = content.split('\n')
+    last_table_row_idx = None
+    in_inventories_table = False
+
+    for i, line in enumerate(lines):
+        if '| Hub | File |' in line:
+            in_inventories_table = True
+        if in_inventories_table and line.startswith('|'):
+            last_table_row_idx = i
+        elif in_inventories_table and not line.startswith('|'):
+            in_inventories_table = False
+
+    if last_table_row_idx is not None:
+        lines.insert(last_table_row_idx + 1, new_row)
+        with open(README_FILE, 'w') as f:
+            f.write('\n'.join(lines))
+        print(f"  Updated README.md: added row for {hub}")
+    else:
+        print(f"  WARNING: Could not find Inventories table in README.md")
+
+
+def process_hub(hub, pipelinejson, all_data, cutoff_year):
+    print(f"\n{'=' * 60}")
+    print(f"Processing hub: {hub}")
+    print(f"{'=' * 60}")
+
+    # Check hub-level pipeline skip
+    hub_pipeline_entry = pipelinejson.get(hub, {})
+    if hub_pipeline_entry.get('upload') is True:
+        print(f"  Skipping {hub}: hub-level upload=True (already a full pipeline partner)")
+        return
+
+    hub_encoded = hub.replace(' ', '%20')
+    hub_file_slug = hub.lower().replace(' ', '_')
+    hub_md_slug = hub.lower().replace(' ', '-')
+    output_file = os.path.join(SCRIPT_DIR, f'{hub_file_slug}_inventory.md')
+
+    # Load or initialize cache for this hub
+    if hub in all_data:
+        data = all_data[hub]
+        if '_domains' not in data:
+            data['_domains'] = {}
+        print(f"  Loaded cache: {len(data.get('_rights', {}))} rights queries, "
+              f"{len(data.get('contentdm', {}))} CONTENTdm checks, "
+              f"{len(data.get('_domains', {}))} domain checks.")
+    else:
+        data = {'_rights': {}, 'contentdm': {}, '_domains': {}}
+        print(f"  No cache found for {hub}, starting fresh.")
+
+    BASE = (f'https://api.dp.la/v2/items?provider=%22{hub_encoded}%22'
+            f'&api_key={API_KEY}&page_size=0&facets=dataProvider&facet_size=1000')
+
+    # Phase 1: Four global facet queries — one per rights category of interest.
+    # These return exact per-institution counts with no fuzzy-match conflation.
+    rights_queries = {
+        'unlim':      BASE + '&rightsCategory=%22Unlimited%20Re-Use%22',
+        'old_condit': BASE + f'&rightsCategory=%22Re-use%20With%20Conditions%22&sourceResource.date.before={cutoff_year}',
+        'old_nomod':  BASE + f'&rightsCategory=%22Re-use%2C%20No%20Modification%22&sourceResource.date.before={cutoff_year}',
+        'old_unspec': BASE + f'&rightsCategory=%22Unspecified%20Rights%20Status%22&sourceResource.date.before={cutoff_year}',
+    }
+
+    for key, url in rights_queries.items():
+        if key in data['_rights']:
+            print(f"  Cached rights data: {key} ({len(data['_rights'][key])} institutions)")
+        else:
+            print(f"  Fetching global rights data: {key}...")
+            data['_rights'][key] = facet_to_dict(fetch(url))
+            all_data[hub] = data
+            with open(DATA_FILE, 'w') as f:
+                json.dump(all_data, f, indent=2)
+            print(f"    Done. {len(data['_rights'][key])} institutions found.")
+
+    hub_institutions_pipeline = hub_pipeline_entry.get('institutions', {})
+
+    # Phase 2: Institutions list
+    print(f"  Fetching institutions list...")
+    institutionsjson = fetch(
+        f'https://api.dp.la/v2/items?facets=dataProvider&provider=%22{hub_encoded}%22'
+        f'&api_key={API_KEY}&page_size=0&facet_size=1000'
+    )
+    institutions = institutionsjson['facets']['dataProvider']['terms']
+    total = len(institutions)
+    need_sample = sum(
+        1 for inst in institutions
+        if inst['term'] not in data['contentdm'] or inst['term'] not in data['_domains']
+    )
+    print(f"  Found {total} institutions. {total - need_sample} fully cached, {need_sample} need sample doc fetch.\n")
+
+    # Phase 3: Per-institution CONTENTdm detection and domain extraction.
+    # Both come from the same sample doc fetch, so we check both caches together.
+    # Uses fuzzy dataProvider= which is fine — we only need yes/no platform detection,
+    # and hyphen-variant pairs are always the same library system using the same platform.
+    for i, institution in enumerate(institutions):
+        name = institution['term']
+        if name in data['contentdm'] and name in data['_domains']:
+            print(f"  [{i + 1}/{total}] Cached: {name}")
+            continue
+
+        print(f"  [{i + 1}/{total}] Fetching sample doc: {name}")
+        encoded = '"' + name.replace('&', '%26') + '"'
+        sample = fetch(
+            f'https://api.dp.la/v2/items?dataProvider={encoded}'
+            f'&provider=%22{hub_encoded}%22&api_key={API_KEY}&page_size=1'
+        )
+
+        if sample['docs']:
+            isShownAt = sample['docs'][0]['isShownAt']
+            data['contentdm'][name] = bool(contentdm_re.match(isShownAt))
+            data['_domains'][name] = urlparse(isShownAt).netloc
+        else:
+            data['contentdm'][name] = False
+            data['_domains'][name] = None
+
+        all_data[hub] = data
+        with open(DATA_FILE, 'w') as f:
+            json.dump(all_data, f, indent=2)
+
+    # If no CONTENTdm institutions found, skip output and clean up cache
+    any_contentdm = any(data['contentdm'].get(inst['term'], False) for inst in institutions)
+    if not any_contentdm:
+        print(f"\n  No CONTENTdm institutions found for {hub}. Skipping output and removing from cache.")
+        if hub in all_data:
+            del all_data[hub]
+            with open(DATA_FILE, 'w') as f:
+                json.dump(all_data, f, indent=2)
+        return
+
+    print(f"\n  All data collected. Generating output...\n")
+
+    # Phase 4: Build per-institution records
+    institutions_data = []
+    for institution in institutions:
+        name = institution['term']
+        unlim     = data['_rights']['unlim'].get(name, 0)
+        old_other = (data['_rights']['old_condit'].get(name, 0) +
+                     data['_rights']['old_nomod'].get(name, 0) +
+                     data['_rights']['old_unspec'].get(name, 0))
+        is_contentdm = data['contentdm'].get(name, False)
+        pipeline_entry = hub_institutions_pipeline.get(name)
+        is_partner = pipeline_entry is not None and pipeline_entry.get('upload') is True
+
+        institutions_data.append({
+            'name': name,
+            'is_contentdm': is_contentdm,
+            'is_partner': is_partner,
+            'domain': data['_domains'].get(name),
+            'total': institution['count'],
+            'unlim': unlim,
+            'old_other': old_other,
+        })
+
+    eligible = [i for i in institutions_data if not i['is_partner'] and i['is_contentdm']]
+    eligible.sort(key=lambda i: (-i['unlim'], -i['old_other']))
+
+    # Phase 5: Group by domain
+    domain_map = {}
+    for inst in institutions_data:
+        domain = inst['domain']
+        if not domain:
+            continue
+        if domain not in domain_map:
+            domain_map[domain] = {
+                'domain': domain,
+                'is_contentdm': False,
+                'all_partners': True,   # flipped to False as soon as one non-partner is found
+                'total': 0,
+                'unlim': 0,
+                'old_other': 0,
+                'largest_inst': '',
+                'largest_inst_total': 0,
+            }
+        domain_map[domain]['unlim']     += inst['unlim']
+        domain_map[domain]['old_other'] += inst['old_other']
+        domain_map[domain]['total']     += inst['total']
+        if inst['is_contentdm']:
+            domain_map[domain]['is_contentdm'] = True
+        if not inst['is_partner']:
+            domain_map[domain]['all_partners'] = False
+        if inst['total'] > domain_map[domain]['largest_inst_total']:
+            domain_map[domain]['largest_inst'] = inst['name']
+            domain_map[domain]['largest_inst_total'] = inst['total']
+
+    eligible_domains = [d for d in domain_map.values() if not d['all_partners'] and d['is_contentdm']]
+    eligible_domains.sort(key=lambda d: (-d['unlim'], -d['old_other']))
+
+    # Phase 6: Write consolidated Markdown report
+    is_new_hub = not os.path.exists(output_file)
+    output_basename = os.path.basename(output_file)
+    top_link = f"[go to top](#wikimedia-readiness-for-{hub_md_slug})"
+
+    with open(output_file, 'w') as f:
+        f.write(f"# Wikimedia Readiness for {hub}\n\n")
+        f.write(f"- [By institution](#by-institution)\n")
+        f.write(f"- [By domain](#by-domain)\n\n")
+        f.write(f"## By institution\n\n")
+        f.write(f"- {top_link}\n\n")
+        for rank, inst in enumerate(eligible, 1):
+            stmt = readiness_stmt(inst['name'], inst['unlim'], inst['old_other'], inst['total'],
+                                  label="institution", parenthetical=inst['domain'], hub=hub)
+            f.write(str(rank) + ". " + stmt + "\n")
+        f.write(f"\n## By domain\n\n")
+        f.write(f"- {top_link}\n\n")
+        for rank, dom in enumerate(eligible_domains, 1):
+            stmt = readiness_stmt(dom['domain'], dom['unlim'], dom['old_other'], dom['total'],
+                                  label="domain", parenthetical=dom['largest_inst'], hub=hub)
+            f.write(str(rank) + ". " + stmt + "\n")
+
+    print(f"  Report written to {output_basename}: {len(eligible)} institutions, {len(eligible_domains)} domains")
+
+    # Update README if this hub's output file is being created for the first time
+    if is_new_hub:
+        update_readme(hub, output_basename)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+print("Fetching hub list from DPLA API...")
+hub_list_result = fetch(
+    f'https://api.dp.la/v2/items?api_key={API_KEY}&facets=provider.name&page_size=0&facet_size=100'
+)
+hubs = [term['term'] for term in hub_list_result['facets']['provider.name']['terms']]
+print(f"Found {len(hubs)} hubs.\n")
+
+print("Fetching pipeline JSON...")
+pipelinejson = fetch(
+    'https://raw.githubusercontent.com/dpla/ingestion3/refs/heads/main/src/main/resources/wiki/institutions_v2.json'
+)
+
+# Load shared cache file, keyed by hub name
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, 'r') as f:
+        all_data = json.load(f)
+else:
+    all_data = {}
+
+cutoff_year = datetime.date.today().year - 120
+
+for hub in hubs:
+    process_hub(hub, pipelinejson, all_data, cutoff_year)
+
+print("\nDone.")
