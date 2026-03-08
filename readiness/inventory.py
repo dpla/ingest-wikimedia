@@ -110,7 +110,7 @@ def update_readme(hub, output_filename):
     in_inventories_table = False
 
     for i, line in enumerate(lines):
-        if '| Hub | File |' in line:
+        if '| Hub |' in line:
             in_inventories_table = True
         if in_inventories_table and line.startswith('|'):
             last_table_row_idx = i
