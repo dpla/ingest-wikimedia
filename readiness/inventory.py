@@ -5,7 +5,7 @@ import re
 import time
 
 import requests
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote, quote_plus
 
 API_KEY = os.environ.get('DPLA_API_KEY', 'YOUR_DPLA_API_KEY_HERE')
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -204,7 +204,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
             continue
 
         print(f"  [{i + 1}/{total}] Fetching sample doc: {name}")
-        encoded = '"' + name.replace('&', '%26') + '"'
+        encoded = '"' + quote(name, safe=' ') + '"'
         sample = fetch(
             f'https://api.dp.la/v2/items?dataProvider={encoded}'
             f'&provider=%22{hub_encoded}%22&api_key={API_KEY}&page_size=1'
