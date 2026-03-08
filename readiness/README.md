@@ -9,7 +9,7 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 | [Indiana Memory](https://dp.la/search?partner=%22Indiana+Memory%22) | [indiana_memory_inventory.md](indiana_memory_inventory.md) |
 | [Heartland Hub](https://dp.la/search?partner=%22Heartland+Hub%22) | [heartland_hub_inventory.md](heartland_hub_inventory.md) |
 | [California Digital Library](https://dp.la/search?partner=%22California+Digital+Library%22) | [california_digital_library_inventory.md](california_digital_library_inventory.md) |
-| [Digital Commonwealth](https://dp.la/search?partner=%22Digital+Commonwealth%22) | [digital_commonwealth_inventory.md](digital_commonwealth_inventory.md) |
+| [Digital Commonwealth](https://dp.la/search?partner=%22Digital+Commonwealth%22) | [digital_commonwealth_inventory.md](digital_commonwealth_inventory.md) 
 | [Minnesota Digital Library](https://dp.la/search?partner=%22Minnesota+Digital+Library%22) | [minnesota_digital_library_inventory.md](minnesota_digital_library_inventory.md) |
 | [Plains to Peaks Collective](https://dp.la/search?partner=%22Plains+to+Peaks+Collective%22) | [plains_to_peaks_collective_inventory.md](plains_to_peaks_collective_inventory.md) |
 | [Northwest Digital Heritage](https://dp.la/search?partner=%22Northwest+Digital+Heritage%22) | [northwest_digital_heritage_inventory.md](northwest_digital_heritage_inventory.md) |
