@@ -1,5 +1,6 @@
-# mine 
+# mine
 .DS_Store
+readiness/inventory_data.json
 .idea/
 apicache-py3/
 apicache/
