@@ -21,6 +21,10 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 | [PA Digital](https://dp.la/search?partner=%22PA+Digital%22) | [pa_digital_inventory.md](pa_digital_inventory.md) |
 | [Ohio Digital Network](https://dp.la/search?partner=%22Ohio+Digital+Network%22) | [ohio_digital_network_inventory.md](ohio_digital_network_inventory.md) |
 | [Empire State Digital Network](https://dp.la/search?partner=%22Empire+State+Digital+Network%22) | [empire_state_digital_network_inventory.md](empire_state_digital_network_inventory.md) |
+| [NJ/DE Digital Collective](https://dp.la/search?partner=%22NJ%2FDE+Digital+Collective%22) | [nj_de_digital_collective_inventory.md](nj_de_digital_collective_inventory.md) |
+| [Sunshine State Digital Network](https://dp.la/search?partner=%22Sunshine+State+Digital+Network%22) | [sunshine_state_digital_network_inventory.md](sunshine_state_digital_network_inventory.md) |
+| [South Carolina Digital Library](https://dp.la/search?partner=%22South+Carolina+Digital+Library%22) | [south_carolina_digital_library_inventory.md](south_carolina_digital_library_inventory.md) |
+| [Digital Library of Tennessee](https://dp.la/search?partner=%22Digital+Library+of+Tennessee%22) | [digital_library_of_tennessee_inventory.md](digital_library_of_tennessee_inventory.md) |
 
 ## How readiness is assessed
 
