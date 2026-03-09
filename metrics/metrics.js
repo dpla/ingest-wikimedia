@@ -100,15 +100,15 @@ document.addEventListener('DOMContentLoaded', function () {
 
             // ── Panel helpers ────────────────────────────────────────────────────────
 
-            // Appends the "Back" button (navigates to the base URL, stripping all params).
+            // Appends the "Back" button. `href` defaults to the base URL (no params).
             // Attached once per view, outside any loop, to avoid duplicate listeners.
-            function appendBackButton() {
+            function appendBackButton(href = window.location.href.split(/[?#]/)[0]) {
                 const back = document.createElement('button');
                 back.className    = 'back';
                 back.textContent  = 'BACK';
                 back.style.display = 'block';
                 back.addEventListener('click', function () {
-                    window.location.href = window.location.href.split(/[?#]/)[0];
+                    window.location.href = href;
                 });
                 container.appendChild(back);
             }
@@ -257,11 +257,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 allInstitutions.forEach(inst => addPanel(inst, false, instBody));
             }
 
-            // Hub view: a single hub panel followed by its child institutions.
-            // Used for ?hub=<name>.
+            // Hub view: a single hub panel, then a "Contributing Institutions" label,
+            // followed by child institution panels. Used for ?hub=<name>.
             function buildHubView(hubCat, institutions) {
-                appendBackButton();
+                appendBackButton('?show=dpla');
                 addPanel(hubCat, false);
+
+                const header = document.createElement('div');
+                header.className   = 'section-toggle section-header-static';
+                header.textContent = 'Contributing Institutions';
+                container.appendChild(header);
+
                 institutions.forEach(inst => addPanel(inst, false));
             }
 

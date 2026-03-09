@@ -174,6 +174,16 @@ button:active {
     border-bottom-color: #94a3b8;
 }
 
+/* Non-interactive variant (div) used in hub view — no hover effect */
+.section-header-static {
+    cursor: default;
+}
+
+.section-header-static:hover {
+    color: #627d98;
+    border-bottom-color: #e2e8f0;
+}
+
 .section-toggle.active {
     color: #2563eb;
     border-bottom-color: #2563eb;
