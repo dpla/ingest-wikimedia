@@ -13,6 +13,12 @@ document.addEventListener('DOMContentLoaded', function () {
     //   (no parameter)   → show the search/browse forms
     const id = new URLSearchParams(window.location.search).get('show') ?? 'none';
 
+    if (id === 'dpla') {
+        const dpla_title = 'DPLA Wikimedia Page Views';
+        document.title = dpla_title;
+        document.querySelector('h1').textContent = dpla_title;
+    }
+
     // Fetch the live allow-list of Wikimedia Commons categories (one category per line)
     // directly from the canonical source via the GitLab REST API.
     const ALLOW_LIST_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main';
