@@ -110,24 +110,34 @@ def update_readme(hub, output_filename):
     new_row = f"| [{hub}]({hub_url}) | [{output_filename}]({output_filename}) |"
 
     lines = content.split('\n')
-    last_table_row_idx = None
+    table_row_indices = []
     in_inventories_table = False
 
     for i, line in enumerate(lines):
         if '| Hub |' in line:
             in_inventories_table = True
         if in_inventories_table and line.startswith('|'):
-            last_table_row_idx = i
+            table_row_indices.append(i)
         elif in_inventories_table and not line.startswith('|'):
             in_inventories_table = False
 
-    if last_table_row_idx is not None:
-        lines.insert(last_table_row_idx + 1, new_row)
-        with open(README_FILE, 'w') as f:
-            f.write('\n'.join(lines))
-        print(f"  Updated README.md: added row for {hub}")
-    else:
+    if not table_row_indices:
         print("  WARNING: Could not find Inventories table in README.md")
+        return
+
+    # Find the alphabetically correct insertion point among data rows
+    # (skip the header row and separator row, which are the first two entries)
+    data_row_indices = table_row_indices[2:]
+    insert_after = table_row_indices[1]  # default: after separator, before first data row
+    for idx in data_row_indices:
+        existing_hub = re.search(r'\[([^\]]+)\]', lines[idx])
+        if existing_hub and existing_hub.group(1).lower() < hub.lower():
+            insert_after = idx
+
+    lines.insert(insert_after + 1, new_row)
+    with open(README_FILE, 'w') as f:
+        f.write('\n'.join(lines))
+    print(f"  Updated README.md: added row for {hub}")
 
 
 def process_hub(hub, pipelinejson, all_data, cutoff_year):
