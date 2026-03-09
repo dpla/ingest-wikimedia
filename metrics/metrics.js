@@ -8,6 +8,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // URL parameter contract:
     //   ?show=all        → render all categories as collapsible panels
+    //   ?show=dpla       → render only DPLA-institution categories
     //   ?show=<category> → render and auto-open a single specific category
     //   (no parameter)   → show the search/browse forms
     const id = new URLSearchParams(window.location.search).get('show') ?? 'none';
@@ -24,10 +25,6 @@ document.addEventListener('DOMContentLoaded', function () {
         .then(data => {
             const allLines = data.split('\n').filter(line => line.trim() !== '');
 
-            // For 'all' or no param, show every category.
-            // For a specific category, the render list contains only that entry.
-            const lines = (id === 'all' || id === 'none') ? allLines : [id];
-
             // Always populate the autocomplete datalist with every available
             // category so the search form works regardless of the current view.
             const datalist = document.getElementById('showOptions');
@@ -41,12 +38,21 @@ document.addEventListener('DOMContentLoaded', function () {
             const input        = document.getElementById('showInput');
             const errorMessage = document.getElementById('errorMessage');
             const showNow      = document.getElementById('show');
+            const showDpla     = document.getElementById('showDpla');
 
             // "Show all" redirects to ?show=all, which re-renders all categories.
             showNow.addEventListener('submit', function (event) {
                 event.preventDefault();
                 const url = new URL(window.location.href);
                 url.searchParams.set('show', 'all');
+                window.location.href = url.toString();
+            });
+
+            // "Show DPLA institutions only" redirects to ?show=dpla.
+            showDpla.addEventListener('submit', function (event) {
+                event.preventDefault();
+                const url = new URL(window.location.href);
+                url.searchParams.set('show', 'dpla');
                 window.location.href = url.toString();
             });
 
@@ -67,89 +73,116 @@ document.addEventListener('DOMContentLoaded', function () {
                 window.location.href = url.toString();
             });
 
-            // When a specific category or all categories are selected,
-            // hide the search forms and reveal the dashboard panels.
+            // When any display mode is active, hide all three forms and show the dashboard.
             if (id !== 'none') {
-                form.style.display    = 'none';
-                showNow.style.display = 'none';
+                form.style.display      = 'none';
+                showNow.style.display   = 'none';
+                showDpla.style.display  = 'none';
                 document.getElementById('sections-container').style.display = 'block';
             }
 
             const container = document.getElementById('sections-container');
 
-            // "Back" strips the ?show param and returns to the search forms.
-            // The listener is attached once here, outside the forEach loop,
-            // to avoid registering a duplicate listener for each category.
-            const back = document.createElement('button');
-            back.className   = 'back';
-            back.textContent = 'BACK';
-            back.style.display = 'block';
-            back.addEventListener('click', function () {
-                window.location.href = window.location.href.split(/[?#]/)[0];
-            });
-            container.appendChild(back);
+            // Builds the back button and a collapsible panel for each category in `lines`.
+            // Pass autoOpen=true only for the single-category view: the panel opens
+            // immediately and data is fetched without waiting for a user click.
+            function buildPanels(lines, autoOpen) {
+                // "Back" strips the ?show param and returns to the search forms.
+                // Attached once here rather than inside the loop to avoid duplicate listeners.
+                const back = document.createElement('button');
+                back.className   = 'back';
+                back.textContent = 'BACK';
+                back.style.display = 'block';
+                back.addEventListener('click', function () {
+                    window.location.href = window.location.href.split(/[?#]/)[0];
+                });
+                container.appendChild(back);
 
-            lines.forEach(line => {
-                const category = line.trim();
+                lines.forEach(line => {
+                    const category = line.trim();
 
-                // Collapsible header button — shows the human-readable category name.
-                const button = document.createElement('button');
-                button.className   = 'collapsible';
-                button.textContent = decodeURI(category).replaceAll('_', ' ');
-                container.appendChild(button);
+                    // Collapsible header button — shows the human-readable category name.
+                    const button = document.createElement('button');
+                    button.className   = 'collapsible';
+                    button.textContent = decodeURI(category).replaceAll('_', ' ');
+                    container.appendChild(button);
 
-                // Chart panel: Google Charts renders a line chart here.
-                const chartDiv = document.createElement('div');
-                chartDiv.className = 'chart_div';
-                container.appendChild(chartDiv);
+                    // Chart panel: Google Charts renders a line chart here.
+                    const chartDiv = document.createElement('div');
+                    chartDiv.className = 'chart_div';
+                    container.appendChild(chartDiv);
 
-                // Text panel: shows the lifetime total and a monthly breakdown list.
-                // max-height is driven by inline style rather than class alone because
-                // CSS transitions on max-height require a concrete pixel value to
-                // animate from 0 to open; setting it to null collapses back to the
-                // CSS default of 0.
-                const content = document.createElement('div');
-                content.className = 'content';
-                content.innerHTML = '<p>Loading...</p>';
-                container.appendChild(content);
+                    // Text panel: shows the lifetime total and a monthly breakdown list.
+                    // max-height is driven by inline style rather than class alone because
+                    // CSS transitions on max-height require a concrete pixel value to
+                    // animate from 0 to open; setting it to null collapses back to the
+                    // CSS default of 0.
+                    const content = document.createElement('div');
+                    content.className = 'content';
+                    content.innerHTML = '<p>Loading...</p>';
+                    container.appendChild(content);
 
-                // For a single specific category, auto-open and load data immediately.
-                if (id !== 'all' && id !== 'none') {
-                    button.classList.add('active');
-                    content.classList.add('open');
-                    chartDiv.classList.add('open');
-                    content.style.maxHeight = '800px';
-                    chartDiv.style.maxHeight = '800px';
-                    // Guard on chartsReady here: the Wikimedia API may respond before
-                    // google.visualization has finished loading on a cold page load.
-                    chartsReady.then(() => fetchData(content, category, chartDiv));
-                }
-
-                // Toggle panel open/closed on click; lazy-load data on first open.
-                // By the time a user can physically click a button, Google Charts
-                // has had ample time to load, so no chartsReady guard is needed here.
-                button.addEventListener('click', function () {
-                    this.classList.toggle('active');
-                    content.classList.toggle('open');
-                    chartDiv.classList.toggle('open');
-
-                    if (content.style.maxHeight) {
-                        // Closing: clear inline max-height so CSS default (0) takes over.
-                        content.style.maxHeight = null;
-                        chartDiv.style.maxHeight = null;
-                    } else {
-                        // Opening: set a concrete max-height so the CSS transition animates.
+                    // For a single specific category, auto-open and load data immediately.
+                    if (autoOpen) {
+                        button.classList.add('active');
+                        content.classList.add('open');
+                        chartDiv.classList.add('open');
                         content.style.maxHeight = '800px';
                         chartDiv.style.maxHeight = '800px';
-                        if (!content.dataset.loaded) {
-                            fetchData(content, category, chartDiv);
-                        }
+                        // Guard on chartsReady here: the Wikimedia API may respond before
+                        // google.visualization has finished loading on a cold page load.
+                        chartsReady.then(() => fetchData(content, category, chartDiv));
                     }
+
+                    // Toggle panel open/closed on click; lazy-load data on first open.
+                    // By the time a user can physically click a button, Google Charts
+                    // has had ample time to load, so no chartsReady guard is needed here.
+                    button.addEventListener('click', function () {
+                        this.classList.toggle('active');
+                        content.classList.toggle('open');
+                        chartDiv.classList.toggle('open');
+
+                        if (content.style.maxHeight) {
+                            // Closing: clear inline max-height so CSS default (0) takes over.
+                            content.style.maxHeight = null;
+                            chartDiv.style.maxHeight = null;
+                        } else {
+                            // Opening: set a concrete max-height so the CSS transition animates.
+                            content.style.maxHeight = '800px';
+                            chartDiv.style.maxHeight = '800px';
+                            if (!content.dataset.loaded) {
+                                fetchData(content, category, chartDiv);
+                            }
+                        }
+                    });
                 });
-            });
+            }
+
+            if (id === 'dpla') {
+                // Show a loading message while the Wikimedia Commons category tree is fetched.
+                // fetchDplaCategories makes ~20-50 parallel API calls (one per institution
+                // subcategory) to build the two-level category set, then intersects it with
+                // the allow list. Expect 300-400 matching categories.
+                container.innerHTML = '<p>Loading DPLA institutions…</p>';
+                fetchDplaCategories()
+                    .then(dplaSet => {
+                        const lines = allLines.filter(l => dplaSet.has(l.trim()));
+                        container.innerHTML = '';
+                        buildPanels(lines, false);
+                    })
+                    .catch(err => {
+                        container.innerHTML = '<p>Error loading DPLA category data.</p>';
+                        console.error('Error fetching DPLA categories:', err);
+                    });
+            } else {
+                // For 'all' or no param, render every category.
+                // For a specific category name, render only that one and auto-open it.
+                const lines = (id === 'all' || id === 'none') ? allLines : [id];
+                buildPanels(lines, id !== 'all' && id !== 'none');
+            }
         })
         .catch(error => {
-            console.error('Error fetching TSV file:', error);
+            console.error('Error fetching allow list:', error);
             document.getElementById('sections-container').innerHTML = '<p>Error loading categories.</p>';
         });
 });
@@ -212,4 +245,76 @@ function fetchData(content, category, chartDiv) {
             chartDiv.innerHTML = '';
             console.error('Error fetching data:', error);
         });
+}
+
+/**
+ * Builds the set of Wikimedia Commons category names associated with DPLA
+ * institutions by walking two levels of the subcategory tree under the root
+ * DPLA category. Both level-1 and level-2 subcategories are included.
+ *
+ * Category names are normalized to underscore form to match the allow-list
+ * (e.g. "Foo Bar" → "Foo_Bar").
+ *
+ * @returns {Promise<Set<string>>} Set of normalized category names
+ */
+async function fetchDplaCategories() {
+    const COMMONS_API = 'https://commons.wikimedia.org/w/api.php';
+    const DPLA_ROOT   = 'Category:Media contributed by the Digital Public Library of America';
+
+    // Level 1: direct subcategories of the DPLA root (typically ~20-50 institutions).
+    const level1 = await fetchSubcategories(COMMONS_API, DPLA_ROOT);
+
+    // Level 2: subcategories of each level-1 entry, fetched in parallel.
+    // These are the individual collection/partner categories (~300-400 total).
+    const level2Arrays = await Promise.all(
+        level1.map(cat => fetchSubcategories(COMMONS_API, cat))
+    );
+
+    // Combine both levels; strip the "Category:" prefix and normalize spaces to
+    // underscores so names can be compared directly against the allow-list.
+    const categorySet = new Set();
+    [...level1, ...level2Arrays.flat()].forEach(title => {
+        categorySet.add(title.replace(/^Category:/, '').replaceAll(' ', '_'));
+    });
+
+    return categorySet;
+}
+
+/**
+ * Fetches all subcategory titles (cmtype=subcat) of the given category from
+ * the Wikimedia Commons API, following continuation tokens to retrieve all pages.
+ *
+ * @param {string} apiUrl        - Wikimedia Commons API base URL
+ * @param {string} categoryTitle - Full category title including "Category:" prefix
+ * @returns {Promise<string[]>}  - Array of subcategory title strings
+ */
+async function fetchSubcategories(apiUrl, categoryTitle) {
+    const results = [];
+    let cmcontinue = null;
+
+    do {
+        const params = new URLSearchParams({
+            action:   'query',
+            list:     'categorymembers',
+            cmtitle:  categoryTitle,
+            cmtype:   'subcat',   // namespace 14 only — skips files and pages
+            cmlimit:  'max',      // up to 500 per request
+            format:   'json',
+            origin:   '*',        // required for cross-origin browser requests
+        });
+        if (cmcontinue) params.set('cmcontinue', cmcontinue);
+
+        const response = await fetch(`${apiUrl}?${params}`);
+        if (!response.ok) throw new Error(`Commons API returned HTTP ${response.status} for "${categoryTitle}"`);
+        const data = await response.json();
+
+        if (data.query?.categorymembers) {
+            results.push(...data.query.categorymembers.map(m => m.title));
+        }
+
+        // The API returns a `continue` object when there are more results to fetch.
+        cmcontinue = data.continue?.cmcontinue ?? null;
+    } while (cmcontinue);
+
+    return results;
 }
