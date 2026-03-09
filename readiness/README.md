@@ -30,7 +30,7 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 
 ## How readiness is assessed
 
-Each inventory ranks institutions and domains by their estimated readiness to have items uploaded to Wikimedia Commons. Readiness is determined by counting how many items a collection has that are both on CONTENTdm and marked with an **Unlimited Re-Use** rights status in the DPLA — meaning they are cleared as public domain with no upload restrictions.
+Each inventory ranks institutions and domains by their estimated readiness to have items uploaded to Wikimedia Commons. Readiness is determined by counting how many items a collection has that are eligible for upload — meaning they are on CONTENTdm, provide an `iiifManifest` URL, or provide a `mediaMaster` URL — and are marked with an **Unlimited Re-Use** rights status in the DPLA, meaning they are cleared as public domain with no upload restrictions.
 
 ### Readiness levels
 
@@ -55,7 +55,7 @@ Institutions and domains are sorted by:
 
 Two categories of institutions are excluded from the ranked lists:
 
-**Non-CONTENTdm institutions** — The current DPLA–Wikimedia upload pipeline only supports items hosted on [CONTENTdm](https://www.oclc.org/en/contentdm.html). Institutions whose items are served from other platforms are excluded for now, as they cannot be uploaded through the existing tooling regardless of their rights status.
+**Ineligible institutions** — Only institutions whose items are accessible via a supported media delivery method are included: [CONTENTdm](https://www.oclc.org/en/contentdm.html), IIIF (`iiifManifest`), or direct media URL (`mediaMaster`). Institutions with none of these are excluded, as their items cannot be uploaded through the existing tooling regardless of their rights status.
 
 **Existing pipeline partners** — Institutions that are already active upload partners (i.e., listed with `"upload": true` in the [DPLA pipeline configuration](https://github.com/dpla/ingestion3/blob/main/src/main/resources/wiki/institutions_v2.json)) are excluded, since their collections are already being handled.
 
@@ -63,13 +63,13 @@ Two categories of institutions are excluded from the ranked lists:
 
 Each inventory file contains two sections:
 
-**By institution** — Each entry represents a single DPLA data provider as it appears in the API. The institution name links to its DPLA search results. Where available, the CONTENTdm domain is shown in parentheses and links to the host site.
+**By institution** — Each entry represents a single DPLA data provider as it appears in the API. The institution name links to its DPLA search results. Where available, the media delivery domain is shown in parentheses and links to the host site.
 
-**By domain** — Institutions are grouped by their CONTENTdm domain and their counts are aggregated. This is useful for understanding the total opportunity across a library system that may contribute under multiple provider names, and for planning outreach at the platform/domain level rather than the individual institution level. Each domain entry notes the largest contributing institution as a representative example.
+**By domain** — Institutions are grouped by their media delivery domain and their counts are aggregated. This is useful for understanding the total opportunity across a library system that may contribute under multiple provider names, and for planning outreach at the platform/domain level rather than the individual institution level. Each domain entry notes the largest contributing institution as a representative example.
 
 ## Running the inventory script
 
-[`inventory.py`](inventory.py) is a self-contained Python script that automatically surveys all DPLA hubs and produces Wikimedia readiness inventories for hubs that use CONTENTdm and have not yet fully joined the upload pipeline.
+[`inventory.py`](inventory.py) is a self-contained Python script that automatically surveys all DPLA hubs and produces Wikimedia readiness inventories for hubs that have eligible institutions (CONTENTdm, IIIF, or direct media URL) and have not yet fully joined the upload pipeline.
 
 ### Usage
 
@@ -87,8 +87,8 @@ The only configuration required is a valid DPLA API key, available at [dp.la/inf
 3. For each hub:
    - Skips the hub entirely if `"upload": true` at the hub level (already a full pipeline partner)
    - Queries per-rights-category item counts for all institutions in the hub
-   - Fetches a sample item per institution to detect CONTENTdm hosting and extract the domain
-   - Skips hubs with no CONTENTdm institutions (no output file is created and no data is cached)
+   - Fetches a sample item per institution to detect eligible media delivery (CONTENTdm, `iiifManifest`, or `mediaMaster`) and extract the domain
+   - Skips hubs with no eligible institutions (no output file is created; result is cached to avoid re-fetching)
    - Writes a consolidated Markdown inventory file (`{hub_slug}_inventory.md`) to this directory
    - Automatically adds a new row to the Inventories table in this README when a hub is first processed
 4. Caches all API responses in `inventory_data.json` to allow interrupted runs to resume without re-fetching
@@ -112,6 +112,14 @@ The only configuration required is a valid DPLA API key, available at [dp.la/inf
       "Institution Name": true,
       ...
     },
+    "iiif_manifest": {
+      "Institution Name": false,
+      ...
+    },
+    "media_master": {
+      "Institution Name": false,
+      ...
+    },
     "_domains": {
       "Institution Name": "digital.example.org",
       ...
@@ -124,4 +132,6 @@ The only configuration required is a valid DPLA API key, available at [dp.la/inf
 
 - **`_rights`** — Item counts per institution, broken down by rights category. `unlim` = Unlimited Re-Use (public domain eligible). The `old_*` keys count items over 120 years old in other rights categories (conditional, no-modification, and unspecified), which are flagged as candidates for rights review.
 - **`contentdm`** — Boolean per institution: whether its sample item URL matched the CONTENTdm URL pattern.
+- **`iiif_manifest`** — Boolean per institution: whether its sample item contained an `iiifManifest` field.
+- **`media_master`** — Boolean per institution: whether its sample item contained a `mediaMaster` field.
 - **`_domains`** — The hostname extracted from the sample item URL for each institution.
