@@ -8,33 +8,37 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // URL parameter contract:
     //   ?show=all        → render all categories as collapsible panels
+    //   ?show=dpla       → render DPLA root + collapsible Hubs / Contributing Institutions sections
     //   ?show=<category> → render and auto-open a single specific category
+    //   ?hub=<name>      → render a single hub and its child institutions
     //   (no parameter)   → show the search/browse forms
-    const id = new URLSearchParams(window.location.search).get('show') ?? 'none';
+    const id       = new URLSearchParams(window.location.search).get('show') ?? 'none';
+    const hubParam = new URLSearchParams(window.location.search).get('hub');
 
-    // Fetch the allow-list of Wikimedia Commons categories (one category per line).
-    // The canonical source is the Wikimedia GitLab repo; we try it first via the
-    // GitLab REST API (which sets CORS headers for public projects).  If that
-    // request fails for any reason — CORS rejection, non-200 status, network error
-    // — we fall back to the bundled copy kept in this repo as a safety net.
-    const GITLAB_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main';
-    const FALLBACK_URL = 'https://raw.githubusercontent.com/dpla/ingest-wikimedia/refs/heads/main/metrics/commons_category_allow_list.tsv';
+    if (id === 'dpla') {
+        const dpla_title = 'DPLA Wikimedia Page Views';
+        document.title = dpla_title;
+        document.querySelector('h1').textContent = dpla_title;
+    }
+    if (hubParam) {
+        // Derive a display-friendly hub name from the URL parameter while the
+        // full category lookup is still in progress (avoids a blank title flash).
+        const hubTitle = hubParam.replaceAll('_', ' ') + ' Wikimedia Page Views';
+        document.title = hubTitle;
+        document.querySelector('h1').textContent = hubTitle;
+    }
 
-    fetch(GITLAB_URL)
+    // Fetch the live allow-list of Wikimedia Commons categories (one category per line)
+    // directly from the canonical source via the GitLab REST API.
+    const ALLOW_LIST_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main';
+
+    fetch(ALLOW_LIST_URL)
         .then(response => {
             if (!response.ok) throw new Error(`GitLab API returned HTTP ${response.status}`);
             return response.text();
         })
-        .catch(err => {
-            console.warn('Could not load allow list from GitLab, using bundled fallback:', err);
-            return fetch(FALLBACK_URL).then(response => response.text());
-        })
         .then(data => {
             const allLines = data.split('\n').filter(line => line.trim() !== '');
-
-            // For 'all' or no param, show every category.
-            // For a specific category, the render list contains only that entry.
-            const lines = (id === 'all' || id === 'none') ? allLines : [id];
 
             // Always populate the autocomplete datalist with every available
             // category so the search form works regardless of the current view.
@@ -49,12 +53,21 @@ document.addEventListener('DOMContentLoaded', function () {
             const input        = document.getElementById('showInput');
             const errorMessage = document.getElementById('errorMessage');
             const showNow      = document.getElementById('show');
+            const showDpla     = document.getElementById('showDpla');
 
             // "Show all" redirects to ?show=all, which re-renders all categories.
             showNow.addEventListener('submit', function (event) {
                 event.preventDefault();
                 const url = new URL(window.location.href);
                 url.searchParams.set('show', 'all');
+                window.location.href = url.toString();
+            });
+
+            // "Show DPLA institutions only" redirects to ?show=dpla.
+            showDpla.addEventListener('submit', function (event) {
+                event.preventDefault();
+                const url = new URL(window.location.href);
+                url.searchParams.set('show', 'dpla');
                 window.location.href = url.toString();
             });
 
@@ -75,89 +88,257 @@ document.addEventListener('DOMContentLoaded', function () {
                 window.location.href = url.toString();
             });
 
-            // When a specific category or all categories are selected,
-            // hide the search forms and reveal the dashboard panels.
-            if (id !== 'none') {
-                form.style.display    = 'none';
-                showNow.style.display = 'none';
-                document.getElementById('sections-container').style.display = 'block';
-            }
-
             const container = document.getElementById('sections-container');
 
-            // "Back" strips the ?show param and returns to the search forms.
-            // The listener is attached once here, outside the forEach loop,
-            // to avoid registering a duplicate listener for each category.
-            const back = document.createElement('button');
-            back.className   = 'back';
-            back.textContent = 'BACK';
-            back.style.display = 'block';
-            back.addEventListener('click', function () {
-                window.location.href = window.location.href.split(/[?#]/)[0];
-            });
-            container.appendChild(back);
+            // ── Panel helpers ────────────────────────────────────────────────────────
 
-            lines.forEach(line => {
-                const category = line.trim();
+            // Appends the "Back" button. `href` defaults to the base URL (no params).
+            // Attached once per view, outside any loop, to avoid duplicate listeners.
+            function appendBackButton(href = window.location.href.split(/[?#]/)[0]) {
+                const back = document.createElement('button');
+                back.className    = 'back';
+                back.textContent  = 'BACK';
+                back.style.display = 'block';
+                back.addEventListener('click', function () {
+                    window.location.href = href;
+                });
+                container.appendChild(back);
+            }
 
-                // Collapsible header button — shows the human-readable category name.
+            // Creates and appends one collapsible panel into `target` (defaults to
+            // the top-level container).
+            //
+            // options.displayName  - override the button label (default: categoryDisplayName)
+            // options.extraLink    - { text, href } — a link shown above the chart when open
+            //
+            // max-height is driven by inline style because CSS transitions on max-height
+            // require a concrete pixel value; setting it to null collapses to CSS default (0).
+            //
+            // autoOpen=true expands the panel immediately and fetches data without a click.
+            // For single-category cold loads, chartsReady guards against google.visualization
+            // not yet being available; user-initiated clicks need no guard.
+            function addPanel(category, autoOpen, target = container, options = {}) {
+                const { extraLink = null, displayName = null } = options;
+
+                // When a hub drill-down link is present, wrap the button + link bubble
+                // in a flex row so the link sits to the right of the panel header.
+                const buttonParent = extraLink ? document.createElement('div') : target;
+                if (extraLink) {
+                    buttonParent.className = 'panel-row';
+                    target.appendChild(buttonParent);
+                }
+
                 const button = document.createElement('button');
                 button.className   = 'collapsible';
-                button.textContent = decodeURI(category).replaceAll('_', ' ');
-                container.appendChild(button);
+                button.textContent = displayName || categoryDisplayName(category);
+                buttonParent.appendChild(button);
 
-                // Chart panel: Google Charts renders a line chart here.
+                // Hub drill-down link: rendered as a shaded bubble to the right of the
+                // panel header. Shown only when the panel is open.
+                let linkAnchor = null;
+                if (extraLink) {
+                    linkAnchor = document.createElement('a');
+                    linkAnchor.href        = extraLink.href;
+                    linkAnchor.textContent = '▾ ' + extraLink.text;
+                    linkAnchor.className   = 'hub-link-bubble';
+                    linkAnchor.style.display = 'none';
+                    buttonParent.appendChild(linkAnchor);
+                }
+
                 const chartDiv = document.createElement('div');
                 chartDiv.className = 'chart_div';
-                container.appendChild(chartDiv);
+                target.appendChild(chartDiv);
 
-                // Text panel: shows the lifetime total and a monthly breakdown list.
-                // max-height is driven by inline style rather than class alone because
-                // CSS transitions on max-height require a concrete pixel value to
-                // animate from 0 to open; setting it to null collapses back to the
-                // CSS default of 0.
                 const content = document.createElement('div');
                 content.className = 'content';
                 content.innerHTML = '<p>Loading...</p>';
-                container.appendChild(content);
+                target.appendChild(content);
 
-                // For a single specific category, auto-open and load data immediately.
-                if (id !== 'all' && id !== 'none') {
+                function openPanel() {
                     button.classList.add('active');
                     content.classList.add('open');
                     chartDiv.classList.add('open');
                     content.style.maxHeight = '800px';
                     chartDiv.style.maxHeight = '800px';
-                    // Guard on chartsReady here: the Wikimedia API may respond before
-                    // google.visualization has finished loading on a cold page load.
+                    if (linkAnchor) linkAnchor.style.display = 'inline-flex';
+                }
+
+                function closePanel() {
+                    button.classList.remove('active');
+                    content.classList.remove('open');
+                    chartDiv.classList.remove('open');
+                    content.style.maxHeight = null;
+                    chartDiv.style.maxHeight = null;
+                    if (linkAnchor) linkAnchor.style.display = 'none';
+                }
+
+                if (autoOpen) {
+                    openPanel();
                     chartsReady.then(() => fetchData(content, category, chartDiv));
                 }
 
-                // Toggle panel open/closed on click; lazy-load data on first open.
-                // By the time a user can physically click a button, Google Charts
-                // has had ample time to load, so no chartsReady guard is needed here.
                 button.addEventListener('click', function () {
-                    this.classList.toggle('active');
-                    content.classList.toggle('open');
-                    chartDiv.classList.toggle('open');
-
                     if (content.style.maxHeight) {
-                        // Closing: clear inline max-height so CSS default (0) takes over.
-                        content.style.maxHeight = null;
-                        chartDiv.style.maxHeight = null;
+                        closePanel();
                     } else {
-                        // Opening: set a concrete max-height so the CSS transition animates.
-                        content.style.maxHeight = '800px';
-                        chartDiv.style.maxHeight = '800px';
+                        openPanel();
                         if (!content.dataset.loaded) {
                             fetchData(content, category, chartDiv);
                         }
                     }
                 });
-            });
+            }
+
+            // Creates a collapsible section toggle button + hidden body div, appends
+            // both to the container, and returns the body div for adding panels into.
+            function appendSectionToggle(label) {
+                const toggle = document.createElement('button');
+                toggle.className   = 'section-toggle';
+                toggle.textContent = label;
+                container.appendChild(toggle);
+
+                const body = document.createElement('div');
+                body.className = 'section-body';
+                container.appendChild(body);
+
+                toggle.addEventListener('click', function () {
+                    const isOpen = body.classList.toggle('open');
+                    toggle.classList.toggle('active', isOpen);
+                });
+
+                return body;
+            }
+
+            // ── View builders ────────────────────────────────────────────────────────
+
+            // Flat view: all categories in a simple collapsible list.
+            // Used for ?show=all and single-category (?show=<category>).
+            function buildPanels(lines, autoOpen) {
+                appendBackButton();
+                lines.forEach(line => addPanel(line.trim(), autoOpen));
+            }
+
+            // DPLA view: root at top, then two collapsed group sections.
+            //   root         - the DPLA root category (or null)
+            //   hubs         - level-1 hub categories, alphabetically sorted
+            //   hubInstitutions - Map<hubName, institutionNames[]>
+            //   allowSet     - Set of allowed category names for filtering institutions
+            function buildDplaPanels(root, hubs, hubInstitutions, allowSet) {
+                appendBackButton();
+
+                // Root category — labeled explicitly, not auto-opened
+                if (root) {
+                    addPanel(root, false, container, {
+                        displayName: 'All data for the Digital Public Library of America'
+                    });
+                }
+
+                // "Hubs" section: one panel per hub, each with a drill-down link
+                const hubsBody = appendSectionToggle('List of Hubs');
+                hubs.forEach(hub => {
+                    const hubDisplayName = categoryDisplayName(hub);
+                    addPanel(hub, false, hubsBody, {
+                        extraLink: {
+                            text: `View data for all ${hubDisplayName} institutions`,
+                            href: `?hub=${hubDisplayName.replaceAll(' ', '_')}`
+                        }
+                    });
+                });
+
+                // "Contributing Institutions" section: flat alphabetical list of all
+                // level-2 categories, filtered by the allow list
+                const allInstitutions = [...hubInstitutions.values()]
+                    .flat()
+                    .filter(n => allowSet.has(n) && n.startsWith('Media_contributed_by_'))
+                    .sort((a, b) => categoryDisplayName(a).localeCompare(categoryDisplayName(b)));
+
+                const instBody = appendSectionToggle('List of Contributing Institutions');
+                allInstitutions.forEach(inst => addPanel(inst, false, instBody));
+            }
+
+            // Hub view: a single hub panel, then a "Contributing Institutions" label,
+            // followed by child institution panels. Used for ?hub=<name>.
+            function buildHubView(hubCat, institutions) {
+                appendBackButton('?show=dpla');
+                addPanel(hubCat, false);
+
+                const header = document.createElement('div');
+                header.className   = 'section-toggle section-header-static';
+                header.textContent = 'List of Contributing Institutions';
+                container.appendChild(header);
+
+                institutions.forEach(inst => addPanel(inst, false));
+            }
+
+            // ── Dispatch ─────────────────────────────────────────────────────────────
+
+            if (hubParam) {
+                container.innerHTML = '<p>Loading hub data…</p>';
+                fetchDplaCategories()
+                    .then(({ hubs, hubInstitutions }) => {
+                        const allowSet = new Set(allLines.map(l => l.trim()));
+
+                        // Reverse-lookup: find the hub whose display name matches the param
+                        const hubCat = hubs.find(
+                            h => categoryDisplayName(h).replaceAll(' ', '_') === hubParam
+                        );
+                        if (!hubCat) {
+                            container.innerHTML = '<p>Hub not found.</p>';
+                            return;
+                        }
+
+                        const institutions = (hubInstitutions.get(hubCat) || [])
+                            .filter(n => allowSet.has(n) && n.startsWith('Media_contributed_by_'))
+                            .sort((a, b) => categoryDisplayName(a).localeCompare(categoryDisplayName(b)));
+
+                        // Refine the page title now that we have the canonical display name
+                        const hubTitle = categoryDisplayName(hubCat) + ' Wikimedia Page Views';
+                        document.title = hubTitle;
+                        document.querySelector('h1').textContent = hubTitle;
+
+                        container.innerHTML = '';
+                        buildHubView(hubCat, institutions);
+                    })
+                    .catch(err => {
+                        container.innerHTML = '<p>Error loading hub data.</p>';
+                        console.error('Error fetching hub categories:', err);
+                    });
+
+            } else if (id === 'dpla') {
+                // Show a loading message while the Wikimedia Commons category tree is
+                // fetched. fetchDplaCategories makes ~20-50 parallel API calls (one per
+                // hub) and returns { root, hubs, hubInstitutions } grouped by depth.
+                container.innerHTML = '<p>Loading DPLA institutions…</p>';
+                fetchDplaCategories()
+                    .then(({ root, hubs, hubInstitutions }) => {
+                        const allowSet = new Set(allLines.map(l => l.trim()));
+
+                        const filteredHubs = hubs
+                            .filter(n => allowSet.has(n) && n.startsWith('Media_contributed_by_'))
+                            .sort((a, b) => categoryDisplayName(a).localeCompare(categoryDisplayName(b)));
+
+                        container.innerHTML = '';
+                        buildDplaPanels(
+                            allowSet.has(root) ? root : null,
+                            filteredHubs,
+                            hubInstitutions,
+                            allowSet
+                        );
+                    })
+                    .catch(err => {
+                        container.innerHTML = '<p>Error loading DPLA category data.</p>';
+                        console.error('Error fetching DPLA categories:', err);
+                    });
+
+            } else {
+                // For 'all' or no param, render every category.
+                // For a specific category name, render only that one and auto-open it.
+                const lines = (id === 'all' || id === 'none') ? allLines : [id];
+                buildPanels(lines, id !== 'all' && id !== 'none');
+            }
         })
         .catch(error => {
-            console.error('Error fetching TSV file:', error);
+            console.error('Error fetching allow list:', error);
             document.getElementById('sections-container').innerHTML = '<p>Error loading categories.</p>';
         });
 });
@@ -220,4 +401,117 @@ function fetchData(content, category, chartDiv) {
             chartDiv.innerHTML = '';
             console.error('Error fetching data:', error);
         });
+}
+
+/**
+ * Walks two levels of the Wikimedia Commons subcategory tree under the DPLA
+ * root category and returns names grouped by depth.
+ *
+ * Returns:
+ *   root            - normalized name of the DPLA root category
+ *   hubs            - level-1 subcategory names (direct children of root)
+ *   hubInstitutions - Map from each hub name to its level-2 institution names
+ *
+ * All names: "Category:" prefix stripped, spaces replaced with underscores.
+ *
+ * @returns {Promise<{ root: string, hubs: string[], hubInstitutions: Map<string, string[]> }>}
+ */
+async function fetchDplaCategories() {
+    const COMMONS_API = 'https://commons.wikimedia.org/w/api.php';
+    const DPLA_ROOT   = 'Category:Media contributed by the Digital Public Library of America';
+
+    function normalize(title) {
+        return title.replace(/^Category:/, '').replaceAll(' ', '_');
+    }
+
+    // Level 1: direct subcategories of the DPLA root (the "hub" categories).
+    const level1 = await fetchSubcategories(COMMONS_API, DPLA_ROOT);
+
+    // Level 2: subcategories of each hub, fetched in parallel.
+    // These are the individual partner/collection categories (~300-400 total).
+    const level2Arrays = await Promise.all(
+        level1.map(cat => fetchSubcategories(COMMONS_API, cat))
+    );
+
+    // Build a Map from each hub name to its list of institution names.
+    // Preserves the hub→institution relationship for the ?hub= drill-down view.
+    const hubInstitutions = new Map();
+    level1.forEach((hub, i) => {
+        hubInstitutions.set(normalize(hub), level2Arrays[i].map(normalize));
+    });
+
+    return {
+        root:            normalize(DPLA_ROOT),
+        hubs:            level1.map(normalize),
+        hubInstitutions,
+    };
+}
+
+/**
+ * Fetches all subcategory titles (cmtype=subcat) of the given category from
+ * the Wikimedia Commons API, following continuation tokens to retrieve all pages.
+ *
+ * @param {string} apiUrl        - Wikimedia Commons API base URL
+ * @param {string} categoryTitle - Full category title including "Category:" prefix
+ * @returns {Promise<string[]>}  - Array of subcategory title strings
+ */
+async function fetchSubcategories(apiUrl, categoryTitle) {
+    const results = [];
+    let cmcontinue = null;
+
+    do {
+        const params = new URLSearchParams({
+            action:   'query',
+            list:     'categorymembers',
+            cmtitle:  categoryTitle,
+            cmtype:   'subcat',   // namespace 14 only — skips files and pages
+            cmlimit:  'max',      // up to 500 per request
+            format:   'json',
+            origin:   '*',        // required for cross-origin browser requests
+        });
+        if (cmcontinue) params.set('cmcontinue', cmcontinue);
+
+        const response = await fetch(`${apiUrl}?${params}`);
+        if (!response.ok) throw new Error(`Commons API returned HTTP ${response.status} for "${categoryTitle}"`);
+        const data = await response.json();
+
+        if (data.query?.categorymembers) {
+            results.push(...data.query.categorymembers.map(m => m.title));
+        }
+
+        // The API returns a `continue` object when there are more results to fetch.
+        cmcontinue = data.continue?.cmcontinue ?? null;
+    } while (cmcontinue);
+
+    return results;
+}
+
+/**
+ * Returns the human-readable display name for a category.
+ *
+ * For "Media contributed by [the] X" categories, strips the common prefix so
+ * only the institution name is shown. The word "the" (lowercase only) immediately
+ * after the prefix is also stripped; uppercase "The" is treated as part of the
+ * institution name and kept.
+ *
+ * Examples:
+ *   "Media_contributed_by_the_Foo_Library" → "Foo Library"
+ *   "Media_contributed_by_The_Foo_Library" → "The Foo Library"
+ *   "Media_contributed_by_the_Digital_Public_Library_of_America" → "Digital Public Library of America"
+ *   "Some_Other_Category"                  → "Some Other Category"
+ *
+ * @param {string} category - Raw category name (underscores, may be URL-encoded)
+ * @returns {string}
+ */
+function categoryDisplayName(category) {
+    let name = decodeURI(category).replaceAll('_', ' ');
+    const prefix = 'Media contributed by ';
+    if (name.startsWith(prefix)) {
+        name = name.slice(prefix.length);
+        // Strip lowercase "the " but preserve uppercase "The" as part of the name.
+        if (name.startsWith('the ')) {
+            name = name.slice(4);
+        }
+    }
+    return name;
 }
