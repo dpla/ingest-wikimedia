@@ -146,6 +146,21 @@ button:active {
 }
 
 /* ========================================
+   DPLA View Section Headers
+======================================== */
+
+/* "Hubs" and "Contributing Institutions" headings injected by buildDplaPanels() */
+#sections-container h2.section-header {
+    margin-top: 48px;
+    margin-bottom: 4px;
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: #627d98;
+}
+
+/* ========================================
    Collapsible Dashboard Panels
 ======================================== */
 
