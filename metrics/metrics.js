@@ -102,9 +102,13 @@ document.addEventListener('DOMContentLoaded', function () {
                     const category = line.trim();
 
                     // Collapsible header button — shows the human-readable category name.
+                    // For "Media contributed by [the] X" categories, strip the common
+                    // prefix so only the institution name is displayed. Lowercase "the"
+                    // after the prefix is also stripped; uppercase "The" is kept as part
+                    // of the institution name.
                     const button = document.createElement('button');
                     button.className   = 'collapsible';
-                    button.textContent = decodeURI(category).replaceAll('_', ' ');
+                    button.textContent = categoryDisplayName(category);
                     container.appendChild(button);
 
                     // Chart panel: Google Charts renders a line chart here.
@@ -166,7 +170,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 container.innerHTML = '<p>Loading DPLA institutions…</p>';
                 fetchDplaCategories()
                     .then(dplaSet => {
-                        const lines = allLines.filter(l => dplaSet.has(l.trim()));
+                        // Intersect with the allow list, then keep only the
+                        // "Media contributed by" categories (the root and its
+                        // subcategory tree). Other DPLA-adjacent categories are excluded.
+                        const lines = allLines.filter(l => {
+                            const name = l.trim();
+                            return dplaSet.has(name) && name.startsWith('Media_contributed_by_');
+                        });
                         container.innerHTML = '';
                         buildPanels(lines, false);
                     })
@@ -270,10 +280,10 @@ async function fetchDplaCategories() {
         level1.map(cat => fetchSubcategories(COMMONS_API, cat))
     );
 
-    // Combine both levels; strip the "Category:" prefix and normalize spaces to
-    // underscores so names can be compared directly against the allow-list.
+    // Combine both levels plus the root itself; strip the "Category:" prefix and
+    // normalize spaces to underscores so names match the allow-list format.
     const categorySet = new Set();
-    [...level1, ...level2Arrays.flat()].forEach(title => {
+    [DPLA_ROOT, ...level1, ...level2Arrays.flat()].forEach(title => {
         categorySet.add(title.replace(/^Category:/, '').replaceAll(' ', '_'));
     });
 
@@ -317,4 +327,34 @@ async function fetchSubcategories(apiUrl, categoryTitle) {
     } while (cmcontinue);
 
     return results;
+}
+
+/**
+ * Returns the human-readable display name for a category.
+ *
+ * For "Media contributed by [the] X" categories, strips the common prefix so
+ * only the institution name is shown. The word "the" (lowercase only) immediately
+ * after the prefix is also stripped; uppercase "The" is treated as part of the
+ * institution name and kept.
+ *
+ * Examples:
+ *   "Media_contributed_by_the_Foo_Library" → "Foo Library"
+ *   "Media_contributed_by_The_Foo_Library" → "The Foo Library"
+ *   "Media_contributed_by_the_Digital_Public_Library_of_America" → "Digital Public Library of America"
+ *   "Some_Other_Category"                  → "Some Other Category"
+ *
+ * @param {string} category - Raw category name (underscores, may be URL-encoded)
+ * @returns {string}
+ */
+function categoryDisplayName(category) {
+    let name = decodeURI(category).replaceAll('_', ' ');
+    const prefix = 'Media contributed by ';
+    if (name.startsWith(prefix)) {
+        name = name.slice(prefix.length);
+        // Strip lowercase "the " but preserve uppercase "The" as part of the name.
+        if (name.startsWith('the ')) {
+            name = name.slice(4);
+        }
+    }
+    return name;
 }
