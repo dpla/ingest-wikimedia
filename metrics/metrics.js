@@ -142,13 +142,15 @@ document.addEventListener('DOMContentLoaded', function () {
                 buttonParent.appendChild(button);
 
                 // Hub drill-down link: rendered as a shaded bubble to the right of the
-                // panel header. Always visible (not toggled with panel open/close state).
+                // panel header. Shown only when the panel is open.
+                let linkAnchor = null;
                 if (extraLink) {
-                    const a = document.createElement('a');
-                    a.href        = extraLink.href;
-                    a.textContent = '▾ ' + extraLink.text;
-                    a.className   = 'hub-link-bubble';
-                    buttonParent.appendChild(a);
+                    linkAnchor = document.createElement('a');
+                    linkAnchor.href        = extraLink.href;
+                    linkAnchor.textContent = '▾ ' + extraLink.text;
+                    linkAnchor.className   = 'hub-link-bubble';
+                    linkAnchor.style.display = 'none';
+                    buttonParent.appendChild(linkAnchor);
                 }
 
                 const chartDiv = document.createElement('div');
@@ -166,6 +168,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     chartDiv.classList.add('open');
                     content.style.maxHeight = '800px';
                     chartDiv.style.maxHeight = '800px';
+                    if (linkAnchor) linkAnchor.style.display = 'inline-flex';
                 }
 
                 function closePanel() {
@@ -174,6 +177,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     chartDiv.classList.remove('open');
                     content.style.maxHeight = null;
                     chartDiv.style.maxHeight = null;
+                    if (linkAnchor) linkAnchor.style.display = 'none';
                 }
 
                 if (autoOpen) {
