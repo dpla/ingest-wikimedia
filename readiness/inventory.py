@@ -24,17 +24,17 @@ contentdm_re = re.compile(
 def fetch(url):
     for attempt in range(RETRY_LIMIT):
         try:
-            r = requests.get(url, timeout=30)
+            r = requests.get(url, params={'api_key': API_KEY}, timeout=30)
             if r.status_code == 200:
                 return json.loads(r.text)
             if r.status_code == 400:
-                print(f"  HTTP 400 (bad request, skipping — will not retry)")
+                print("  HTTP 400 (bad request, skipping — will not retry)")
                 return None
             print(f"  HTTP {r.status_code}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})")
         except Exception as e:
             print(f"  Error: {e}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})")
         time.sleep(RETRY_SLEEP)
-    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {re.sub(r'api_key=[^&]*', 'api_key=REDACTED', url)}")
+    raise Exception(f"Failed after {RETRY_LIMIT} attempts: {url}")
 
 
 def facet_to_dict(result):
@@ -158,7 +158,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
 
     # Load or initialize cache for this hub
     if all_data.get(hub, {}).get('_no_eligible'):
-        print(f"  Cached: no eligible institutions. Skipping.")
+        print("  Cached: no eligible institutions. Skipping.")
         return
     if hub in all_data:
         data = all_data[hub]
@@ -176,7 +176,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         print(f"  No cache found for {hub}, starting fresh.")
 
     BASE = (f'https://api.dp.la/v2/items?provider=%22{hub_encoded}%22'
-            f'&api_key={API_KEY}&page_size=0&facets=dataProvider&facet_size=2000')
+            f'&page_size=0&facets=dataProvider&facet_size=2000')
 
     # Phase 1: Four global facet queries — one per rights category of interest.
     # These return exact per-institution counts with no fuzzy-match conflation.
@@ -204,7 +204,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     print("  Fetching institutions list...")
     institutionsjson = fetch(
         f'https://api.dp.la/v2/items?facets=dataProvider&provider=%22{hub_encoded}%22'
-        f'&api_key={API_KEY}&page_size=0&facet_size=2000'
+        f'&page_size=0&facet_size=2000'
     )
     institutions = institutionsjson['facets']['dataProvider']['terms']
     total = len(institutions)
@@ -234,7 +234,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         encoded = '"' + quote(name, safe=' ') + '"'
         sample = fetch(
             f'https://api.dp.la/v2/items?dataProvider={encoded}'
-            f'&provider=%22{hub_encoded}%22&api_key={API_KEY}&page_size=1'
+            f'&provider=%22{hub_encoded}%22&page_size=1'
         )
 
         if sample and sample['docs']:
@@ -361,7 +361,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
 
 print("Fetching hub list from DPLA API...")
 hub_list_result = fetch(
-    f'https://api.dp.la/v2/items?api_key={API_KEY}&facets=provider.name&page_size=0&facet_size=100'
+    'https://api.dp.la/v2/items?facets=provider.name&page_size=0&facet_size=100'
 )
 hubs = [term['term'] for term in hub_list_result['facets']['provider.name']['terms']]
 print(f"Found {len(hubs)} hubs.\n")
