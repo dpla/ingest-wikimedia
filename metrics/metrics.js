@@ -12,22 +12,14 @@ document.addEventListener('DOMContentLoaded', function () {
     //   (no parameter)   → show the search/browse forms
     const id = new URLSearchParams(window.location.search).get('show') ?? 'none';
 
-    // Fetch the allow-list of Wikimedia Commons categories (one category per line).
-    // The canonical source is the Wikimedia GitLab repo; we try it first via the
-    // GitLab REST API (which sets CORS headers for public projects).  If that
-    // request fails for any reason — CORS rejection, non-200 status, network error
-    // — we fall back to the bundled copy kept in this repo as a safety net.
-    const GITLAB_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main';
-    const FALLBACK_URL = 'https://raw.githubusercontent.com/dpla/ingest-wikimedia/refs/heads/main/metrics/commons_category_allow_list.tsv';
+    // Fetch the live allow-list of Wikimedia Commons categories (one category per line)
+    // directly from the canonical source via the GitLab REST API.
+    const ALLOW_LIST_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main';
 
-    fetch(GITLAB_URL)
+    fetch(ALLOW_LIST_URL)
         .then(response => {
             if (!response.ok) throw new Error(`GitLab API returned HTTP ${response.status}`);
             return response.text();
-        })
-        .catch(err => {
-            console.warn('Could not load allow list from GitLab, using bundled fallback:', err);
-            return fetch(FALLBACK_URL).then(response => response.text());
         })
         .then(data => {
             const allLines = data.split('\n').filter(line => line.trim() !== '');
