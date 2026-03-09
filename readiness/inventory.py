@@ -93,8 +93,12 @@ def readiness_stmt(name, unlim, old_other, total, label="domain", parenthetical=
     return stmt
 
 
-def update_readme(hub, output_filename):
-    """Add a new row to the Inventories table in README.md if not already present."""
+def update_readme(hub, output_filename=None, note=None):
+    """Add a new row to the Inventories table in README.md if not already present,
+    inserting it at the correct alphabetical position.
+
+    Pass output_filename for a normal inventory link, or note for a plain-text
+    second column (e.g. hubs skipped because upload=True hub-wide)."""
     if not os.path.exists(README_FILE):
         print(f"  WARNING: README.md not found at {README_FILE}")
         return
@@ -102,12 +106,14 @@ def update_readme(hub, output_filename):
     with open(README_FILE, 'r') as f:
         content = f.read()
 
-    if output_filename in content:
-        return  # Already present
-
     q = '"'
     hub_url = f"https://dp.la/search?partner={quote_plus(q + hub + q)}"
-    new_row = f"| [{hub}]({hub_url}) | [{output_filename}]({output_filename}) |"
+
+    if hub_url in content:
+        return  # Already present
+
+    col2 = f"[{output_filename}]({output_filename})" if output_filename else (note or "already participating hub-wide")
+    new_row = f"| [{hub}]({hub_url}) | {col2} |"
 
     lines = content.split('\n')
     table_row_indices = []
@@ -149,6 +155,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     hub_pipeline_entry = pipelinejson.get(hub, {})
     if hub_pipeline_entry.get('upload') is True:
         print(f"  Skipping {hub}: hub-level upload=True (already a full pipeline partner)")
+        update_readme(hub, note="already participating hub-wide")
         return
 
     hub_encoded = hub.replace(' ', '%20')
@@ -159,9 +166,14 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     # Load or initialize cache for this hub
     if all_data.get(hub, {}).get('_no_eligible'):
         print("  Cached: no eligible institutions. Skipping.")
+        update_readme(hub, note="no eligible items")
         return
     if hub in all_data:
         data = all_data[hub]
+        if '_rights' not in data:
+            data['_rights'] = {}
+        if 'contentdm' not in data:
+            data['contentdm'] = {}
         if '_domains' not in data:
             data['_domains'] = {}
         if 'iiif_manifest' not in data:
@@ -208,6 +220,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     )
     institutions = institutionsjson['facets']['dataProvider']['terms']
     total = len(institutions)
+
     def is_fully_cached(name):
         """An institution is fully cached if contentdm=True (already eligible, no need to
         check iiif/media), or if all three media fields have been checked."""
@@ -266,6 +279,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         all_data[hub] = {'_no_eligible': True}
         with open(DATA_FILE, 'w') as f:
             json.dump(all_data, f, indent=2)
+        update_readme(hub, note="no eligible items")
         return
 
     print("\n  All data collected. Generating output...\n")
@@ -354,7 +368,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
 
     # Update README if this hub's output file is being created for the first time
     if is_new_hub:
-        update_readme(hub, output_basename)
+        update_readme(hub, output_filename=output_basename)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
