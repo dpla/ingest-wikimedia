@@ -183,7 +183,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     } else {
                         openPanel();
                         if (!content.dataset.loaded) {
-                            fetchData(content, category, chartDiv);
+                            chartsReady.then(() => fetchData(content, category, chartDiv));
                         }
                     }
                 });
@@ -215,7 +215,7 @@ document.addEventListener('DOMContentLoaded', function () {
             // Used for ?show=all and single-category (?show=<category>).
             function buildPanels(lines, autoOpen) {
                 appendBackButton();
-                lines.forEach(line => addPanel(line.trim(), autoOpen));
+                lines.forEach(line => { addPanel(line.trim(), autoOpen); });
             }
 
             // DPLA view: root at top, then two collapsed group sections.
@@ -253,7 +253,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     .sort((a, b) => categoryDisplayName(a).localeCompare(categoryDisplayName(b)));
 
                 const instBody = appendSectionToggle('List of Contributing Institutions');
-                allInstitutions.forEach(inst => addPanel(inst, false, instBody));
+                allInstitutions.forEach(inst => { addPanel(inst, false, instBody); });
             }
 
             // Hub view: a single hub panel, then a "Contributing Institutions" label,
@@ -267,7 +267,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 header.textContent = 'List of Contributing Institutions';
                 container.appendChild(header);
 
-                institutions.forEach(inst => addPanel(inst, false));
+                institutions.forEach(inst => { addPanel(inst, false); });
             }
 
             // ── Dispatch ─────────────────────────────────────────────────────────────
@@ -366,12 +366,13 @@ function fetchData(content, category, chartDiv) {
                 // API timestamps are in YYYYMM00 format; extract YYYY-MM for display.
                 // Each row is [displayMonth, viewCount], e.g. ["2023-04", 1234].
                 const pageviews = apiData.items.map(item => [
-                    item['timestamp'].substring(0, 4) + '-' + item['timestamp'].substring(5, 7),
+                    item['timestamp'].substring(0, 4) + '-' + item['timestamp'].substring(4, 6),
                     item['pageview-count']
                 ]);
 
                 // Sum all monthly counts for the lifetime total.
                 const total = pageviews.reduce((sum, [, count]) => sum + count, 0);
+                const oldest = pageviews[0][0];
 
                 // Build a Google Charts DataTable and draw the line chart.
                 const chartData = new google.visualization.DataTable();
@@ -388,7 +389,7 @@ function fetchData(content, category, chartDiv) {
                 const listItems = pageviews
                     .map(([month, count]) => `<li>${month}: ${count.toLocaleString()} views</li>`)
                     .join('');
-                content.innerHTML = `<p><strong>Total: ${total.toLocaleString()}</strong></p><ul>${listItems}</ul>`;
+                content.innerHTML = `<p><strong>Total (since ${oldest}): ${total.toLocaleString()}</strong></p><ul>${listItems}</ul>`;
             } else {
                 content.innerHTML = '<p>No data available.</p>';
                 chartDiv.style.display = 'none';
