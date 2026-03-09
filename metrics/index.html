@@ -6,6 +6,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Category Page Views - Commons Impact Metrics Data</title>
     <link rel="stylesheet" href="styles.css">
+    <!-- Runs synchronously before first paint: adds .filter-view to <html> when
+         a filter param is present so CSS can hide forms with zero flash. -->
+    <script>(function () {
+        var p = new URLSearchParams(location.search);
+        if (p.get('show') || p.get('hub')) document.documentElement.classList.add('filter-view');
+    }());</script>
 </head>
 
 <body>

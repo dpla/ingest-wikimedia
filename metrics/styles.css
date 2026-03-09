@@ -145,6 +145,12 @@ button:active {
     margin-bottom: 60px;
 }
 
+/* Hide forms and show the dashboard before first paint when a filter view
+   is active. The .filter-view class is set by an inline <head> script that
+   runs synchronously, eliminating any flash of the form UI on page load. */
+html.filter-view form            { display: none; }
+html.filter-view #sections-container { display: block; }
+
 /* ========================================
    DPLA Section Toggles & Bodies
 ======================================== */

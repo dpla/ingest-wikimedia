@@ -88,14 +88,6 @@ document.addEventListener('DOMContentLoaded', function () {
                 window.location.href = url.toString();
             });
 
-            // Hide forms and reveal the dashboard whenever any display mode is active.
-            if (id !== 'none' || hubParam) {
-                form.style.display      = 'none';
-                showNow.style.display   = 'none';
-                showDpla.style.display  = 'none';
-                document.getElementById('sections-container').style.display = 'block';
-            }
-
             const container = document.getElementById('sections-container');
 
             // ── Panel helpers ────────────────────────────────────────────────────────
