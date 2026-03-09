@@ -156,7 +156,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         print(f"  No cache found for {hub}, starting fresh.")
 
     BASE = (f'https://api.dp.la/v2/items?provider=%22{hub_encoded}%22'
-            f'&api_key={API_KEY}&page_size=0&facets=dataProvider&facet_size=1000')
+            f'&api_key={API_KEY}&page_size=0&facets=dataProvider&facet_size=2000')
 
     # Phase 1: Four global facet queries — one per rights category of interest.
     # These return exact per-institution counts with no fuzzy-match conflation.
@@ -184,7 +184,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     print("  Fetching institutions list...")
     institutionsjson = fetch(
         f'https://api.dp.la/v2/items?facets=dataProvider&provider=%22{hub_encoded}%22'
-        f'&api_key={API_KEY}&page_size=0&facet_size=1000'
+        f'&api_key={API_KEY}&page_size=0&facet_size=2000'
     )
     institutions = institutionsjson['facets']['dataProvider']['terms']
     total = len(institutions)

@@ -25,6 +25,8 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 | [Sunshine State Digital Network](https://dp.la/search?partner=%22Sunshine+State+Digital+Network%22) | [sunshine_state_digital_network_inventory.md](sunshine_state_digital_network_inventory.md) |
 | [South Carolina Digital Library](https://dp.la/search?partner=%22South+Carolina+Digital+Library%22) | [south_carolina_digital_library_inventory.md](south_carolina_digital_library_inventory.md) |
 | [Digital Library of Tennessee](https://dp.la/search?partner=%22Digital+Library+of+Tennessee%22) | [digital_library_of_tennessee_inventory.md](digital_library_of_tennessee_inventory.md) |
+| [Digital Maryland](https://dp.la/search?partner=%22Digital+Maryland%22) | [digital_maryland_inventory.md](digital_maryland_inventory.md) |
+| [Texas Digital Library](https://dp.la/search?partner=%22Texas+Digital+Library%22) | [texas_digital_library_inventory.md](texas_digital_library_inventory.md) |
 
 ## How readiness is assessed
 
