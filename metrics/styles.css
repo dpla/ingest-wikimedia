@@ -199,23 +199,44 @@ button:active {
 }
 
 /* ========================================
-   Panel Links (e.g. hub drill-down link)
+   Panel Row (hub header + drill-down bubble)
 ======================================== */
 
-/* Persistent link shown above the chart when a panel is open */
-.panel-links {
-    display: none;        /* shown/hidden by addPanel open/close logic */
-    padding: 8px 20px 0;
-    font-size: 14px;
+/* Flex wrapper that places the collapsible button and the hub link side-by-side */
+.panel-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 18px;
 }
 
-.panel-links a {
-    color: #2563eb;
+/* The button inside a row inherits its margin from the row wrapper */
+.panel-row .collapsible {
+    margin-top: 0;
+    flex: 1;
+}
+
+/* Shaded bubble link to the right of a hub panel header */
+.hub-link-bubble {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 10px 14px;
+    background-color: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #334e68;
     text-decoration: none;
+    white-space: nowrap;
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
-.panel-links a:hover {
-    text-decoration: underline;
+.hub-link-bubble:hover {
+    background-color: #e2e8f0;
+    border-color: #cbd5e1;
+    color: #102a43;
 }
 
 /* ========================================

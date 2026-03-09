@@ -128,22 +128,27 @@ document.addEventListener('DOMContentLoaded', function () {
             function addPanel(category, autoOpen, target = container, options = {}) {
                 const { extraLink = null, displayName = null } = options;
 
+                // When a hub drill-down link is present, wrap the button + link bubble
+                // in a flex row so the link sits to the right of the panel header.
+                const buttonParent = extraLink ? document.createElement('div') : target;
+                if (extraLink) {
+                    buttonParent.className = 'panel-row';
+                    target.appendChild(buttonParent);
+                }
+
                 const button = document.createElement('button');
                 button.className   = 'collapsible';
                 button.textContent = displayName || categoryDisplayName(category);
-                target.appendChild(button);
+                buttonParent.appendChild(button);
 
-                // Optional persistent link shown above the chart (e.g. hub drill-down).
-                // Visibility is managed alongside the panel open/close state.
-                let linksDiv = null;
+                // Hub drill-down link: rendered as a shaded bubble to the right of the
+                // panel header. Always visible (not toggled with panel open/close state).
                 if (extraLink) {
-                    linksDiv = document.createElement('div');
-                    linksDiv.className = 'panel-links';
                     const a = document.createElement('a');
                     a.href        = extraLink.href;
-                    a.textContent = extraLink.text;
-                    linksDiv.appendChild(a);
-                    target.appendChild(linksDiv);
+                    a.textContent = '▾ ' + extraLink.text;
+                    a.className   = 'hub-link-bubble';
+                    buttonParent.appendChild(a);
                 }
 
                 const chartDiv = document.createElement('div');
@@ -161,7 +166,6 @@ document.addEventListener('DOMContentLoaded', function () {
                     chartDiv.classList.add('open');
                     content.style.maxHeight = '800px';
                     chartDiv.style.maxHeight = '800px';
-                    if (linksDiv) linksDiv.style.display = 'block';
                 }
 
                 function closePanel() {
@@ -170,7 +174,6 @@ document.addEventListener('DOMContentLoaded', function () {
                     chartDiv.classList.remove('open');
                     content.style.maxHeight = null;
                     chartDiv.style.maxHeight = null;
-                    if (linksDiv) linksDiv.style.display = 'none';
                 }
 
                 if (autoOpen) {
@@ -235,7 +238,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
 
                 // "Hubs" section: one panel per hub, each with a drill-down link
-                const hubsBody = appendSectionToggle('Hubs');
+                const hubsBody = appendSectionToggle('List of Hubs');
                 hubs.forEach(hub => {
                     const hubDisplayName = categoryDisplayName(hub);
                     addPanel(hub, false, hubsBody, {
@@ -253,7 +256,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     .filter(n => allowSet.has(n) && n.startsWith('Media_contributed_by_'))
                     .sort((a, b) => categoryDisplayName(a).localeCompare(categoryDisplayName(b)));
 
-                const instBody = appendSectionToggle('Contributing Institutions');
+                const instBody = appendSectionToggle('List of Contributing Institutions');
                 allInstitutions.forEach(inst => addPanel(inst, false, instBody));
             }
 
@@ -265,7 +268,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
                 const header = document.createElement('div');
                 header.className   = 'section-toggle section-header-static';
-                header.textContent = 'Contributing Institutions';
+                header.textContent = 'List of Contributing Institutions';
                 container.appendChild(header);
 
                 institutions.forEach(inst => addPanel(inst, false));
