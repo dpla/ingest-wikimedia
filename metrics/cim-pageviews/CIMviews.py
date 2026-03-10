@@ -19,7 +19,12 @@
 #   python CIMviews.py --cat "Category:Foo"     # data mode, single category
 #   python CIMviews.py --mode categories        # category request management
 
-import json, requests, pywikibot, datetime, argparse
+import argparse
+import datetime
+import json
+
+import pywikibot
+import requests
 
 # --cat: run data mode on a single category instead of the full list
 # --mode: select workflow (data or categories); --cat is only valid with data mode
