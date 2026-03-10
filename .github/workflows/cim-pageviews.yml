@@ -1,0 +1,86 @@
+name: CIM Pageviews Bot
+
+on:
+  schedule:
+    - cron: '0 8 * * *'      # daily – categories mode
+    - cron: '0 8 1,7 * *'    # 1st and 7th of each month – data mode
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        default: 'data'
+        type: choice
+        options: [data, categories]
+
+permissions:
+  contents: read
+
+jobs:
+  categories:
+    name: Category request management
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'categories') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 8 * * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        with:
+          version: "0.5.3"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Create pywikibot password file
+        env:
+          PYWIKIBOT_PASSWORD: ${{ secrets.PYWIKIBOT_PASSWORD }}
+        run: |
+          printf "('DPLA bot', BotPassword('PARTNER_UPLOADS', '%s'))\n" \
+            "$PYWIKIBOT_PASSWORD" > metrics/cim-pageviews/user-password.py
+
+      - name: Run categories mode
+        env:
+          PYWIKIBOT_DIR: ${{ github.workspace }}/metrics/cim-pageviews
+        run: uv run python metrics/cim-pageviews/CIMviews.py --mode categories
+
+  data:
+    name: Update pageview data
+    if: >
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'data') ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 8 1,7 * *')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+        with:
+          version: "0.5.3"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Create pywikibot password file
+        env:
+          PYWIKIBOT_PASSWORD: ${{ secrets.PYWIKIBOT_PASSWORD }}
+        run: |
+          printf "('DPLA bot', BotPassword('PARTNER_UPLOADS', '%s'))\n" \
+            "$PYWIKIBOT_PASSWORD" > metrics/cim-pageviews/user-password.py
+
+      - name: Run data mode
+        env:
+          PYWIKIBOT_DIR: ${{ github.workspace }}/metrics/cim-pageviews
+        run: uv run python metrics/cim-pageviews/CIMviews.py

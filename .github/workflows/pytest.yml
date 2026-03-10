@@ -1,5 +1,7 @@
 name: Pytest
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   uv:
     name: python
