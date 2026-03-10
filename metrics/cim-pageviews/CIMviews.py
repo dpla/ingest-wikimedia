@@ -22,24 +22,27 @@
 import json, requests, pywikibot, datetime, argparse
 
 # --cat: run data mode on a single category instead of the full list
-# --mode: select workflow (data or categories)
+# --mode: select workflow (data or categories); --cat is only valid with data mode
 parse = argparse.ArgumentParser()
 parse.add_argument('--cat', dest='cat', metavar='CATEGORY',
                     action='store')
 parse.add_argument('--mode', dest='mode', choices=['data', 'categories'], default='data')
 arg = parse.parse_args()
 
+if arg.cat and arg.mode == 'categories':
+    parse.error('--cat is only valid with --mode data')
+
 # Connect and authenticate to Wikimedia Commons
 site = pywikibot.Site()
 site.login()
 
 # Counters for the summary report
-updated = 0   # data pages written/updated
-none = 0      # categories in allow list but data not yet generated
-exists = 0    # categories already up-to-date, skipped
-fulfilled = 0  # category requests removed (now in allow list)
-already = 0   # categories already pending a CIM request
-requested = 0  # new CIM category requests added
+updated = 0      # data pages written/updated
+generating = 0   # categories in allow list but data not yet generated
+exists = 0       # categories already up-to-date, skipped
+fulfilled = 0    # category requests removed (now in allow list)
+already = 0      # categories already pending a CIM request
+requested = 0    # new CIM category requests added
 
 # Template for tabular data pages (Data:Views/<category>.tab)
 # Schema defines the two columns: timestamp (YYYY-MM) and pageview count
@@ -59,13 +62,16 @@ HEADERS = {'User-Agent': 'DPLA-Bot/1.0 (https://dp.la; tech@dp.la) python-reques
 ALLOW_LIST_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main'
 
 # Fetch the allow list and normalise entries to match pywikibot category titles
-# (underscores to spaces, percent-encoded characters decoded)
-cimlist = []
+# (underscores to spaces, percent-encoded characters decoded).
+# Using a set for O(1) membership tests throughout the script.
 print('\n****\n')
 allow_list_response = requests.get(ALLOW_LIST_URL, headers=HEADERS, timeout=30)
-for line in allow_list_response.text.splitlines():
-    if line.strip():
-        cimlist.append('Category:' + line.strip().replace('_',' ').replace('%26', '&').replace('%27','\''))
+allow_list_response.raise_for_status()
+cimlist = set(
+    'Category:' + line.strip().replace('_', ' ').replace('%26', '&').replace('%27', '\'')
+    for line in allow_list_response.text.splitlines()
+    if line.strip()
+)
 
 # The category used to signal that a category has been requested for CIM
 cimcat = pywikibot.Category(site, 'Category requested for Commons Impact Metrics')
@@ -76,12 +82,12 @@ cimcat = pywikibot.Category(site, 'Category requested for Commons Impact Metrics
 if arg.mode == 'categories':
     cimreqs = cimcat.subcategories()
     for cimreq in cimreqs:
-        category = pywikibot.Page(site, cimreq.title())
-        cimreq = cimreq.title()
-        if cimreq in cimlist:
-            print(cimreq)
+        cimreq_title = cimreq.title()
+        category = pywikibot.Page(site, cimreq_title)
+        if cimreq_title in cimlist:
+            print(cimreq_title)
             category.change_category(cimcat, None, 'Remove category: [[Category:Category requested for Commons Impact Metrics]]')
-            print('Removed request for ' + cimreq)
+            print('Removed request for ' + cimreq_title)
             fulfilled += 1
 
 
@@ -90,6 +96,7 @@ def get_data(cat):
 
     Returns a list of [YYYY-MM, count] pairs. Raises KeyError if the
     category has no data yet (API response contains no 'items' key).
+    Raises requests.exceptions.RequestException on network or HTTP errors.
     """
     load = json.loads(requests.get('https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/' + cat + '/deep/all-wikis/00000101/99991231', headers=HEADERS, timeout=30).text)
 
@@ -115,6 +122,10 @@ else:
         cats.append(u.title())
     cats.remove('Category:Category page views need to be updated')
     print('{{views from category}} categories retrieved! (' + str(datetime.datetime.now()) + ')')
+
+# Compute last month's YYYY-MM string once; used in every iteration to check
+# whether a data page is already current
+now = (datetime.datetime.now().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
 
 for cat in cats:
     print('\n' + cat)
@@ -146,9 +157,7 @@ for cat in cats:
 
     # Check if the data page already contains last month's data; if so, skip
     if pagename.exists():
-        now = (datetime.datetime.now().replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
         if now in pagename.text:
-
             current = True
             print('   Data already up-to-date!')
             exists += 1
@@ -166,7 +175,12 @@ for cat in cats:
                 print('   Not found in Commons Impact Metrics.')
             else:
                 print('   Data still generating in Commons Impact Metrics.')
-                none += 1
+                generating += 1
+            continue
+        except requests.exceptions.RequestException as e:
+            # Network or HTTP error — log and skip this category rather than
+            # aborting the entire run
+            print(f'   Request error, skipping: {e}')
             continue
         pagename.text = json.dumps(datapage, indent=4)
         pagename.save('Adding tabular data for category page views from Commons Impact Metrics.')
@@ -175,8 +189,8 @@ for cat in cats:
         # Touch the category page to trigger template re-renders
         try:
             category.touch()
-        except:
-            pass
+        except Exception as e:
+            print(f'   Could not touch category page: {e}')
 
     # Create the chart page if the data page exists but the chart page doesn't
     if pagename.exists() and not chartpagename.exists():
@@ -192,7 +206,7 @@ print("""
 ****
 | -- Total categories currently in Commons Impact Metrics: """ + str(len(cimlist)) + """
 | -- Categories with updated data: """ + str(updated) + """
-| -- Categories with no data detected: """ + str(none) + """
+| -- Categories with no data detected: """ + str(generating) + """
 | -- Categories already up to date: """ + str(exists) + """
 | -- Category requests fulfilled: """ + str(fulfilled) + """
 | -- Categories already requested to be added: """ + str(already) + """
