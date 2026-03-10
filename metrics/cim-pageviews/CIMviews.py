@@ -101,9 +101,17 @@ def get_data(cat):
 
     Returns a list of [YYYY-MM, count] pairs. Raises KeyError if the
     category has no data yet (API response contains no 'items' key).
-    Raises requests.exceptions.RequestException on network or HTTP errors.
+    Raises requests.exceptions.HTTPError on non-2xx responses, or
+    requests.exceptions.RequestException on network errors.
     """
-    load = json.loads(requests.get('https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/' + cat + '/deep/all-wikis/00000101/99991231', headers=HEADERS, timeout=30).text)
+    response = requests.get(
+        'https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/'
+        + cat + '/deep/all-wikis/00000101/99991231',
+        headers=HEADERS,
+        timeout=30,
+    )
+    response.raise_for_status()
+    load = response.json()
 
     outputs = []
     for month in load['items']:
@@ -125,7 +133,8 @@ else:
 
     for u in update_cat.subcategories():
         cats.append(u.title())
-    cats.remove('Category:Category page views need to be updated')
+    if 'Category:Category page views need to be updated' in cats:
+        cats.remove('Category:Category page views need to be updated')
     print('{{views from category}} categories retrieved! (' + str(datetime.datetime.now()) + ')')
 
 # Compute last month's YYYY-MM string once; used in every iteration to check
