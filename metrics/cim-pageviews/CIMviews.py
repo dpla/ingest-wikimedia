@@ -1,4 +1,4 @@
-import json, requests, os, pywikibot, datetime, argparse
+import json, requests, pywikibot, datetime, argparse
 
 parse = argparse.ArgumentParser()
 parse.add_argument('--cat', dest='cat', metavar='CATEGORY',
@@ -21,12 +21,15 @@ datapage['schema'] = { 'fields': [ { 'name': 'timestamp', 'type': 'string', 'tit
 
 chartpage = { 'license': 'CC0-1.0', 'version': 1, "type": 'area', 'xAxis': { 'title': { 'en': 'Month' }, 'type': 'date' }, 'yAxis': { 'title': { 'en': 'Views' } } }
 
+HEADERS = {'User-Agent': 'DPLA-Bot/1.0 (https://dp.la; tech@dp.la) python-requests'}
+
+ALLOW_LIST_URL = 'https://gitlab.wikimedia.org/api/v4/projects/repos%2Fdata-engineering%2Fairflow-dags/repository/files/main%2Fdags%2Fcommons%2Fcommons_category_allow_list.tsv/raw?ref=main'
+
 cimlist = []
 print('\n****\n')
-os.system('curl -O "https://gitlab.wikimedia.org/repos/data-engineering/airflow-dags/-/raw/main/main/dags/commons/commons_category_allow_list.tsv"')
-
-with open('commons_category_allow_list.tsv', 'r') as cim:
-    for line in cim:
+allow_list_response = requests.get(ALLOW_LIST_URL, headers=HEADERS, timeout=30)
+for line in allow_list_response.text.splitlines():
+    if line.strip():
         cimlist.append('Category:' + line.strip().replace('_',' ').replace('%26', '&').replace('%27','\''))
 cimcat = pywikibot.Category(site, 'Category requested for Commons Impact Metrics')
 cimreqs = cimcat.subcategories()
@@ -38,8 +41,6 @@ for cimreq in cimreqs:
         category.change_category(cimcat, None, 'Remove category: [[Category:Category requested for Commons Impact Metrics]]')
         print('Removed request for ' + cimreq)
         fulfilled += 1
-
-HEADERS = {'User-Agent': 'DPLA-Bot/1.0 (https://dp.la; tech@dp.la) python-requests'}
 
 def get_data(cat):
     load = json.loads(requests.get('https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/' + cat + '/deep/all-wikis/00000101/99991231', headers=HEADERS, timeout=30).text)
