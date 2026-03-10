@@ -13,6 +13,9 @@ on:
         type: choice
         options: [data, categories]
 
+permissions:
+  contents: read
+
 jobs:
   categories:
     name: Category request management
