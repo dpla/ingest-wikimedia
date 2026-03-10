@@ -9,6 +9,7 @@ throttle.ctrl
 metastore_db/
 user-*.py
 *.csv
+*.tsv
 config.toml
 
 # Byte-compiled / optimized / DLL files
