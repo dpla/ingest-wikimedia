@@ -3,6 +3,7 @@ import json, requests, pywikibot, datetime, argparse
 parse = argparse.ArgumentParser()
 parse.add_argument('--cat', dest='cat', metavar='CATEGORY',
                     action='store')
+parse.add_argument('--mode', dest='mode', choices=['data', 'categories'], default='data')
 arg = parse.parse_args()
 
 site = pywikibot.Site()
@@ -32,15 +33,17 @@ for line in allow_list_response.text.splitlines():
     if line.strip():
         cimlist.append('Category:' + line.strip().replace('_',' ').replace('%26', '&').replace('%27','\''))
 cimcat = pywikibot.Category(site, 'Category requested for Commons Impact Metrics')
-cimreqs = cimcat.subcategories()
-for cimreq in cimreqs:
-    category = pywikibot.Page(site, cimreq.title())
-    cimreq = cimreq.title()
-    if cimreq in cimlist:
-        print(cimreq)
-        category.change_category(cimcat, None, 'Remove category: [[Category:Category requested for Commons Impact Metrics]]')
-        print('Removed request for ' + cimreq)
-        fulfilled += 1
+
+if arg.mode == 'categories':
+    cimreqs = cimcat.subcategories()
+    for cimreq in cimreqs:
+        category = pywikibot.Page(site, cimreq.title())
+        cimreq = cimreq.title()
+        if cimreq in cimlist:
+            print(cimreq)
+            category.change_category(cimcat, None, 'Remove category: [[Category:Category requested for Commons Impact Metrics]]')
+            print('Removed request for ' + cimreq)
+            fulfilled += 1
 
 def get_data(cat):
     load = json.loads(requests.get('https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/' + cat + '/deep/all-wikis/00000101/99991231', headers=HEADERS, timeout=30).text)
@@ -67,6 +70,19 @@ else:
 for cat in cats:
     print('\n' + cat)
 
+    if arg.mode == 'categories':
+        category = pywikibot.Page(site, cat)
+        if cat not in cimlist:
+            if cimcat not in category.categories():
+                category.text += '\n[[Category:Category requested for Commons Impact Metrics]]'
+                category.save(summary='Adding category: [[Category:Category requested for Commons Impact Metrics]]')
+                print('   Category requested for Commons Impact Metrics!')
+                requested += 1
+            else:
+                print('   Category already requested for Commons Impact Metrics.')
+                already += 1
+        continue
+
     datapage['sources'] = 'Copied from [https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/' + cat.replace(' ','_').replace('Category:','') + '/deep/all-wikis/00000101/99991231 Commons Impact Metrics].'
     datapage['description'] = {'en': 'Data from commons-analytics/pageviews-per-category-monthly endpoint for ' + cat.replace(' ','_')}
 
@@ -89,14 +105,6 @@ for cat in cats:
         except KeyError:
             if cat not in cimlist:
                 print('   Not found in Commons Impact Metrics.')
-                if cimcat not in category.categories():
-                    category.text += '\n[[Category:Category requested for Commons Impact Metrics]]'
-                    category.save(summary='Adding category: [[Category:Category requested for Commons Impact Metrics]]')
-                    print('   Category requested for Commons Impact Metrics!')
-                    requested += 1
-                else:
-                    print('   Category already requested for Commons Impact Metrics.')
-                    already += 1
             else:
                 print('   Data still generating in Commons Impact Metrics.')
                 none += 1
