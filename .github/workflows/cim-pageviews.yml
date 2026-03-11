@@ -43,8 +43,15 @@ jobs:
         env:
           PYWIKIBOT_PASSWORD: ${{ secrets.PYWIKIBOT_PASSWORD }}
         run: |
-          printf "('DPLA bot', BotPassword('PARTNER_UPLOADS', '%s'))\n" \
-            "$PYWIKIBOT_PASSWORD" > metrics/cim-pageviews/user-password.py
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          Path("metrics/cim-pageviews/user-password.py").write_text(
+              f"('DPLA bot', BotPassword('PARTNER_UPLOADS', {os.environ['PYWIKIBOT_PASSWORD']!r}))\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Run categories mode
         env:
@@ -77,8 +84,15 @@ jobs:
         env:
           PYWIKIBOT_PASSWORD: ${{ secrets.PYWIKIBOT_PASSWORD }}
         run: |
-          printf "('DPLA bot', BotPassword('PARTNER_UPLOADS', '%s'))\n" \
-            "$PYWIKIBOT_PASSWORD" > metrics/cim-pageviews/user-password.py
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          Path("metrics/cim-pageviews/user-password.py").write_text(
+              f"('DPLA bot', BotPassword('PARTNER_UPLOADS', {os.environ['PYWIKIBOT_PASSWORD']!r}))\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Run data mode
         env:
