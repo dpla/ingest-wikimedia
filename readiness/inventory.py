@@ -93,12 +93,14 @@ def readiness_stmt(name, unlim, old_other, total, label="domain", parenthetical=
     return stmt
 
 
-def update_readme(hub, output_filename=None, note=None):
+def update_readme(hub, output_filename=None, note=None, has_partners=False):
     """Add a new row to the Inventories table in README.md if not already present,
     inserting it at the correct alphabetical position.
 
     Pass output_filename for a normal inventory link, or note for a plain-text
-    second column (e.g. hubs skipped because upload=True hub-wide)."""
+    second column (e.g. hubs skipped because upload=True hub-wide).
+    has_partners=True prefixes an inventory link with 🤝 (some institutions already
+    uploading); False prefixes with 🔶 (eligible but not yet participating)."""
     if not os.path.exists(README_FILE):
         print(f"  WARNING: README.md not found at {README_FILE}")
         return
@@ -112,7 +114,15 @@ def update_readme(hub, output_filename=None, note=None):
     if hub_url in content:
         return  # Already present
 
-    col2 = f"[{output_filename}]({output_filename})" if output_filename else (note or "already participating hub-wide")
+    if output_filename:
+        emoji = "🤝" if has_partners else "🔶"
+        col2 = f"{emoji} [{output_filename}]({output_filename})"
+    elif note == "already participating hub-wide":
+        col2 = "✅ **already participating hub-wide**"
+    elif note == "no eligible items":
+        col2 = "➖ no eligible items"
+    else:
+        col2 = note or "already participating hub-wide"
     new_row = f"| [{hub}]({hub_url}) | {col2} |"
 
     lines = content.split('\n')
@@ -380,7 +390,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
 
     # Update README if this hub's output file is being created for the first time
     if is_new_hub:
-        update_readme(hub, output_filename=output_basename)
+        update_readme(hub, output_filename=output_basename, has_partners=bool(partners))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
