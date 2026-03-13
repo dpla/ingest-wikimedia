@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -29,3 +30,13 @@
 5. '[**cdm16720.contentdm.oclc.org**](https://cdm16720.contentdm.oclc.org)' *(e.g. '[City of Greeley Museums](https://dp.la/search?provider=%22City+of+Greeley+Museums%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **322** items over 120 years old in other rights categories that could become eligible with rights review.
 6. '[**fchc.contentdm.oclc.org**](https://fchc.contentdm.oclc.org)' *(e.g. '[Fort Collins History Connection](https://dp.la/search?provider=%22Fort+Collins+History+Connection%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **283** items over 120 years old in other rights categories that could become eligible with rights review.
 7. '[**cdm16620.contentdm.oclc.org**](https://cdm16620.contentdm.oclc.org)' *(e.g. '[Pueblo City-County Library District](https://dp.la/search?provider=%22Pueblo+City-County+Library+District%22&partner=%22Plains+to+Peaks+Collective%22)')* has a **very low** readiness score with no public domain items, but has **26** items over 120 years old in other rights categories that could become eligible with rights review.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-plains-to-peaks-collective)
+
+1. '[**University of Colorado Boulder University Libraries**](https://dp.la/search?provider=%22University+of+Colorado+Boulder+University+Libraries%22&partner=%22Plains+to+Peaks+Collective%22)' *([cudl.colorado.edu](https://cudl.colorado.edu))* has a **very high** readiness score because it has **9,182** eligible public domain items (**8%** of **118,623** total items) already in CONTENTdm or providing a media location, and **3,653** additional items over 120 years old in other rights categories that could become eligible with rights review.
+2. '[**Colorado State University. Libraries**](https://dp.la/search?provider=%22Colorado+State+University.+Libraries%22&partner=%22Plains+to+Peaks+Collective%22)' *([hdl.handle.net](https://hdl.handle.net))* has a **high** readiness score because it has **4,456** eligible public domain items (**3%** of **133,003** total items) already in CONTENTdm or providing a media location, and **88** additional items over 120 years old in other rights categories that could become eligible with rights review.
+3. '[**Park County Local History Digital Archive, Colorado**](https://dp.la/search?provider=%22Park+County+Local+History+Digital+Archive%2C+Colorado%22&partner=%22Plains+to+Peaks+Collective%22)' *([pclha.cvlcollections.org](https://pclha.cvlcollections.org))* has a **moderate** readiness score because it has **377** eligible public domain items (**17%** of **2,216** total items) already in CONTENTdm or providing a media location, and **39** additional items over 120 years old in other rights categories that could become eligible with rights review.
+4. '[**Denver Public Library**](https://dp.la/search?provider=%22Denver+Public+Library%22&partner=%22Plains+to+Peaks+Collective%22)' *([digital.denverlibrary.org](https://digital.denverlibrary.org))* has a **moderate** readiness score because it has **121** eligible public domain items (**0%** of **129,630** total items) already in CONTENTdm or providing a media location, and **22,479** additional items over 120 years old in other rights categories that could become eligible with rights review.
+5. '[**Pine River Library**](https://dp.la/search?provider=%22Pine+River+Library%22&partner=%22Plains+to+Peaks+Collective%22)' *([fortlewisarchive.marmot.org](https://fortlewisarchive.marmot.org))* has a **low** readiness score because it has **31** eligible public domain items (**5%** of **584** total items) already in CONTENTdm or providing a media location.

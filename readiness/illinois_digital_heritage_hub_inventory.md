@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -220,3 +221,9 @@
 4. '[**www.idaillinois.org**](https://www.idaillinois.org)' *(e.g. '[McLean County Museum of History](https://dp.la/search?provider=%22McLean+County+Museum+of+History%22&partner=%22Illinois+Digital+Heritage+Hub%22)')* has a **moderate** readiness score because it has **434** eligible public domain items (**0%** of **293,144** total items) across all collections hosted on this domain in CONTENTdm or providing a media location, and **7,951** additional items over 120 years old in other rights categories that could become eligible with rights review.
 5. '[**cdm16106.contentdm.oclc.org**](https://cdm16106.contentdm.oclc.org)' *(e.g. '[DePaul University. Special Collections and Archives](https://dp.la/search?provider=%22DePaul+University.+Special+Collections+and+Archives%22&partner=%22Illinois+Digital+Heritage+Hub%22)')* has a **moderate** readiness score because it has **246** eligible public domain items (**72%** of **342** total items) across all collections hosted on this domain in CONTENTdm or providing a media location.
 6. '[**desplainesmemory.org**](https://desplainesmemory.org)' *(e.g. '[Des Plaines Public Library](https://dp.la/search?provider=%22Des+Plaines+Public+Library%22&partner=%22Illinois+Digital+Heritage+Hub%22)')* has a **moderate** readiness score because it has **134** eligible public domain items (**12%** of **1,098** total items) across all collections hosted on this domain in CONTENTdm or providing a media location, and **7** additional items over 120 years old in other rights categories that could become eligible with rights review.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-illinois-digital-heritage-hub)
+
+1. '[**University of Illinois Urbana-Champaign Library**](https://dp.la/search?provider=%22University+of+Illinois+Urbana-Champaign+Library%22&partner=%22Illinois+Digital+Heritage+Hub%22)' *([digital.library.illinois.edu](https://digital.library.illinois.edu))* has a **very high** readiness score because it has **14,695** eligible public domain items (**63%** of **23,490** total items) already in CONTENTdm or providing a media location, and **383** additional items over 120 years old in other rights categories that could become eligible with rights review.
