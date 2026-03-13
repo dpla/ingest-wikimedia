@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -26,3 +27,11 @@
 - [go to top](#wikimedia-readiness-for-mountain-west-digital-library)
 
 1. '[**utah-primoprod.hosted.exlibrisgroup.com**](https://utah-primoprod.hosted.exlibrisgroup.com)' *(e.g. '[Utah Department of Cultural and Community Engagement](https://dp.la/search?provider=%22Utah+Department+of+Cultural+and+Community+Engagement%22&partner=%22Mountain+West+Digital+Library%22)')* has a **very high** readiness score because it has **39,371** eligible public domain items (**3%** of **1,152,673** total items) across all collections hosted on this domain in CONTENTdm or providing a media location, and **47,200** additional items over 120 years old in other rights categories that could become eligible with rights review.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-mountain-west-digital-library)
+
+1. '[**University of Oregon Libraries**](https://dp.la/search?provider=%22University+of+Oregon+Libraries%22&partner=%22Mountain+West+Digital+Library%22)' *([utah-primoprod.hosted.exlibrisgroup.com](https://utah-primoprod.hosted.exlibrisgroup.com))* has a **very high** readiness score because it has **11,154** eligible public domain items (**12%** of **96,829** total items) already in CONTENTdm or providing a media location, and **2,774** additional items over 120 years old in other rights categories that could become eligible with rights review.
+2. '[**Oregon State Highway Department**](https://dp.la/search?provider=%22Oregon+State+Highway+Department%22&partner=%22Mountain+West+Digital+Library%22)' *([utah-primoprod.hosted.exlibrisgroup.com](https://utah-primoprod.hosted.exlibrisgroup.com))* has a **moderate** readiness score because it has **196** eligible public domain items (**94%** of **209** total items) already in CONTENTdm or providing a media location.
+3. '[**Center for Asian Pacific Studies, University of Oregon**](https://dp.la/search?provider=%22Center+for+Asian+Pacific+Studies%2C+University+of+Oregon%22&partner=%22Mountain+West+Digital+Library%22)' *([utah-primoprod.hosted.exlibrisgroup.com](https://utah-primoprod.hosted.exlibrisgroup.com))* has a **moderate** readiness score because it has **131** eligible public domain items (**3%** of **4,852** total items) already in CONTENTdm or providing a media location.

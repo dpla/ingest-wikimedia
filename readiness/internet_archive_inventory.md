@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -727,3 +728,11 @@
 - [go to top](#wikimedia-readiness-for-internet-archive)
 
 1. '[**www.archive.org**](https://www.archive.org)' *(e.g. '[Wellcome Library](https://dp.la/search?provider=%22Wellcome+Library%22&partner=%22Internet+Archive%22)')* has a **very high** readiness score because it has **13,602** eligible public domain items (**2%** of **758,709** total items) across all collections hosted on this domain in CONTENTdm or providing a media location.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-internet-archive)
+
+1. '[**Phillips Academy Andover, The Robert S. Peabody Museum of Archaeology**](https://dp.la/search?provider=%22Phillips+Academy+Andover%2C+The+Robert+S.+Peabody+Museum+of+Archaeology%22&partner=%22Internet+Archive%22)' *([www.archive.org](https://www.archive.org))* has a **very low** readiness score with no public domain items and no items dated over 120 years old.
+2. '[**Phillips Academy**](https://dp.la/search?provider=%22Phillips+Academy%22&partner=%22Internet+Archive%22)' *([www.archive.org](https://www.archive.org))* has a **very low** readiness score with no public domain items and no items dated over 120 years old.
+3. '[**Phillips Academy, Archives and Special Collections**](https://dp.la/search?provider=%22Phillips+Academy%2C+Archives+and+Special+Collections%22&partner=%22Internet+Archive%22)' *([www.archive.org](https://www.archive.org))* has a **very low** readiness score with no public domain items and no items dated over 120 years old.

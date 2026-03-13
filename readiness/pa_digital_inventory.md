@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -32,3 +33,10 @@
 6. '[**digitalwolfgram.widener.edu**](https://digitalwolfgram.widener.edu)' *(e.g. '[Widener University](https://dp.la/search?provider=%22Widener+University%22&partner=%22PA+Digital%22)')* has a **very low** readiness score with no public domain items, but has **145** items over 120 years old in other rights categories that could become eligible with rights review.
 7. '[**cdm16667.contentdm.oclc.org**](https://cdm16667.contentdm.oclc.org)' *(e.g. '[Curtis Institute of Music](https://dp.la/search?provider=%22Curtis+Institute+of+Music%22&partner=%22PA+Digital%22)')* has a **very low** readiness score with no public domain items, but has **3** items over 120 years old in other rights categories that could become eligible with rights review.
 8. '[**cdm15860.contentdm.oclc.org**](https://cdm15860.contentdm.oclc.org)' *(e.g. '[La Salle University](https://dp.la/search?provider=%22La+Salle+University%22&partner=%22PA+Digital%22)')* has a **very low** readiness score with no public domain items and no items dated over 120 years old.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-pa-digital)
+
+1. '[**Science History Institute**](https://dp.la/search?provider=%22Science+History+Institute%22&partner=%22PA+Digital%22)' *([digital.sciencehistory.org](https://digital.sciencehistory.org))* has a **very high** readiness score because it has **8,688** eligible public domain items (**60%** of **14,385** total items) already in CONTENTdm or providing a media location.
+2. '[**Temple University**](https://dp.la/search?provider=%22Temple+University%22&partner=%22PA+Digital%22)' *([digital.library.temple.edu](https://digital.library.temple.edu))* has a **high** readiness score because it has **3,455** eligible public domain items (**3%** of **126,533** total items) already in CONTENTdm or providing a media location, and **873** additional items over 120 years old in other rights categories that could become eligible with rights review.

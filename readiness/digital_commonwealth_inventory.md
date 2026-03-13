@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -242,3 +243,14 @@
 2. '[**quod.lib.umich.edu**](https://quod.lib.umich.edu)' *(e.g. '[William L. Clements Library](https://dp.la/search?provider=%22William+L.+Clements+Library%22&partner=%22Digital+Commonwealth%22)')* has a **very low** readiness score with no public domain items, but has **784** items over 120 years old in other rights categories that could become eligible with rights review.
 3. '[**openarchives.umb.edu**](https://openarchives.umb.edu)' *(e.g. '[University of Massachusetts Boston, Joseph P. Healey Library](https://dp.la/search?provider=%22University+of+Massachusetts+Boston%2C+Joseph+P.+Healey+Library%22&partner=%22Digital+Commonwealth%22)')* has a **very low** readiness score with no public domain items, but has **193** items over 120 years old in other rights categories that could become eligible with rights review.
 4. '[**digital.americanancestors.org**](https://digital.americanancestors.org)' *(e.g. '[New England Historic Genealogical Society](https://dp.la/search?provider=%22New+England+Historic+Genealogical+Society%22&partner=%22Digital+Commonwealth%22)')* has a **very low** readiness score with no public domain items, but has **180** items over 120 years old in other rights categories that could become eligible with rights review.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-digital-commonwealth)
+
+1. '[**Boston Public Library**](https://dp.la/search?provider=%22Boston+Public+Library%22&partner=%22Digital+Commonwealth%22)' *([ark.digitalcommonwealth.org](https://ark.digitalcommonwealth.org))* has a **very high** readiness score because it has **263,362** eligible public domain items (**56%** of **466,427** total items) already in CONTENTdm or providing a media location, and **17,708** additional items over 120 years old in other rights categories that could become eligible with rights review.
+2. '[**Massachusetts Archives**](https://dp.la/search?provider=%22Massachusetts+Archives%22&partner=%22Digital+Commonwealth%22)' *([ark.digitalcommonwealth.org](https://ark.digitalcommonwealth.org))* has a **very high** readiness score because it has **27,246** eligible public domain items (**100%** of **27,263** total items) already in CONTENTdm or providing a media location, and **2** additional items over 120 years old in other rights categories that could become eligible with rights review.
+3. '[**National Archives at Boston**](https://dp.la/search?provider=%22National+Archives+at+Boston%22&partner=%22Digital+Commonwealth%22)' *([catalog.archives.gov](https://catalog.archives.gov))* has a **very high** readiness score because it has **5,207** eligible public domain items (**82%** of **6,373** total items) already in CONTENTdm or providing a media location.
+4. '[**Phillips Academy**](https://dp.la/search?provider=%22Phillips+Academy%22&partner=%22Digital+Commonwealth%22)' *([ark.digitalcommonwealth.org](https://ark.digitalcommonwealth.org))* has a **high** readiness score because it has **3,552** eligible public domain items (**87%** of **4,092** total items) already in CONTENTdm or providing a media location, and **254** additional items over 120 years old in other rights categories that could become eligible with rights review.
+5. '[**Massachusetts Department of Conservation and Recreation, Office of Watershed Management, Wachusett Watershed Office, West Boylston**](https://dp.la/search?provider=%22Massachusetts+Department+of+Conservation+and+Recreation%2C+Office+of+Watershed+Management%2C+Wachusett+Watershed+Office%2C+West+Boylston%22&partner=%22Digital+Commonwealth%22)' *([ark.digitalcommonwealth.org](https://ark.digitalcommonwealth.org))* has a **low** readiness score because it has **72** eligible public domain items (**100%** of **72** total items) already in CONTENTdm or providing a media location.
+6. '[**Massachusetts Department of Conservation and Recreation**](https://dp.la/search?provider=%22Massachusetts+Department+of+Conservation+and+Recreation%22&partner=%22Digital+Commonwealth%22)' *([ark.digitalcommonwealth.org](https://ark.digitalcommonwealth.org))* has a **low** readiness score because it has **2** eligible public domain items (**100%** of **2** total items) already in CONTENTdm or providing a media location.

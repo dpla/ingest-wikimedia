@@ -311,6 +311,9 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     eligible = [i for i in institutions_data if not i['is_partner'] and i['is_eligible']]
     eligible.sort(key=lambda i: (-i['unlim'], -i['old_other']))
 
+    partners = [i for i in institutions_data if i['is_partner']]
+    partners.sort(key=lambda i: (-i['unlim'], -i['old_other']))
+
     # Phase 5: Group by domain
     domain_map = {}
     for inst in institutions_data:
@@ -350,8 +353,10 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
     with open(output_file, 'w') as f:
         f.write(f"# Wikimedia Readiness for {hub}\n\n")
         f.write("- [By institution](#by-institution)\n")
-        f.write("- [By domain](#by-domain)\n\n")
-        f.write("## By institution\n\n")
+        f.write("- [By domain](#by-domain)\n")
+        if partners:
+            f.write("- [Participating institutions](#participating-institutions)\n")
+        f.write("\n## By institution\n\n")
         f.write(f"- {top_link}\n\n")
         for rank, inst in enumerate(eligible, 1):
             stmt = readiness_stmt(inst['name'], inst['unlim'], inst['old_other'], inst['total'],
@@ -363,6 +368,13 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
             stmt = readiness_stmt(dom['domain'], dom['unlim'], dom['old_other'], dom['total'],
                                   label="domain", parenthetical=dom['largest_inst'], hub=hub)
             f.write(str(rank) + ". " + stmt + "\n")
+        if partners:
+            f.write("\n## Participating institutions\n\n")
+            f.write(f"- {top_link}\n\n")
+            for rank, inst in enumerate(partners, 1):
+                stmt = readiness_stmt(inst['name'], inst['unlim'], inst['old_other'], inst['total'],
+                                      label="institution", parenthetical=inst['domain'], hub=hub)
+                f.write(str(rank) + ". " + stmt + "\n")
 
     print(f"  Report written to {output_basename}: {len(eligible)} institutions, {len(eligible_domains)} domains")
 

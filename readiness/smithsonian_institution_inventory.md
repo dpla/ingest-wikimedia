@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -46,3 +47,10 @@
 
 1. '[**n2t.net**](https://n2t.net)' *(e.g. '[NMNH - Botany Dept](https://dp.la/search?provider=%22NMNH+-+Botany+Dept%22&partner=%22Smithsonian+Institution%22)')* has a **very high** readiness score because it has **5,061,782** eligible public domain items (**69%** of **7,343,901** total items) across all collections hosted on this domain in CONTENTdm or providing a media location, and **198,903** additional items over 120 years old in other rights categories that could become eligible with rights review.
 2. '[**collections.si.edu**](https://collections.si.edu)' *(e.g. '[Archives of American Art](https://dp.la/search?provider=%22Archives+of+American+Art%22&partner=%22Smithsonian+Institution%22)')* has a **very high** readiness score because it has **35,276** eligible public domain items (**8%** of **462,754** total items) across all collections hosted on this domain in CONTENTdm or providing a media location, and **183** additional items over 120 years old in other rights categories that could become eligible with rights review.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-smithsonian-institution)
+
+1. '[**National Air and Space Museum**](https://dp.la/search?provider=%22National+Air+and+Space+Museum%22&partner=%22Smithsonian+Institution%22)' *([n2t.net](https://n2t.net))* has a **moderate** readiness score because it has **988** eligible public domain items (**3%** of **29,416** total items) already in CONTENTdm or providing a media location, and **443** additional items over 120 years old in other rights categories that could become eligible with rights review.
+2. '[**National Air and Space Museum Archives**](https://dp.la/search?provider=%22National+Air+and+Space+Museum+Archives%22&partner=%22Smithsonian+Institution%22)' *([collections.si.edu](https://collections.si.edu))* has a **very low** readiness score with no public domain items and no items dated over 120 years old.

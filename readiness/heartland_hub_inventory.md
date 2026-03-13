@@ -2,6 +2,7 @@
 
 - [By institution](#by-institution)
 - [By domain](#by-domain)
+- [Participating institutions](#participating-institutions)
 
 ## By institution
 
@@ -342,3 +343,9 @@
 5. '[**cdm17321.contentdm.oclc.org**](https://cdm17321.contentdm.oclc.org)' *(e.g. '[Saint Louis University](https://dp.la/search?provider=%22Saint+Louis+University%22&partner=%22Heartland+Hub%22)')* has a **very low** readiness score with no public domain items, but has **749** items over 120 years old in other rights categories that could become eligible with rights review.
 6. '[**cdm17307.contentdm.oclc.org**](https://cdm17307.contentdm.oclc.org)' *(e.g. '[Missouri State University](https://dp.la/search?provider=%22Missouri+State+University%22&partner=%22Heartland+Hub%22)')* has a **very low** readiness score with no public domain items, but has **310** items over 120 years old in other rights categories that could become eligible with rights review.
 7. '[**cdm16331.contentdm.oclc.org**](https://cdm16331.contentdm.oclc.org)' *(e.g. '[Drake University](https://dp.la/search?provider=%22Drake+University%22&partner=%22Heartland+Hub%22)')* has a **very low** readiness score with no public domain items, but has **18** items over 120 years old in other rights categories that could become eligible with rights review.
+
+## Participating institutions
+
+- [go to top](#wikimedia-readiness-for-heartland-hub)
+
+1. '[**Missouri Historical Society**](https://dp.la/search?provider=%22Missouri+Historical+Society%22&partner=%22Heartland+Hub%22)' *([mohistory.org](https://mohistory.org))* has a **very high** readiness score because it has **48,910** eligible public domain items (**43%** of **114,983** total items) already in CONTENTdm or providing a media location, and **209** additional items over 120 years old in other rights categories that could become eligible with rights review.
