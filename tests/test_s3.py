@@ -46,10 +46,14 @@ def test_s3_file_exists(s3_client: S3Client):
     s3_client.s3.Object = Mock(return_value=Mock(content_length=0))
     assert not s3_client.s3_file_exists("path/to/file")
 
-    # Object does not exist (404) → False
-    s3_client.s3.Object = Mock(
-        side_effect=ClientError({"Error": {"Code": "404"}}, "load")
-    )
+    # Object exists but content_length is malformed (None) → False
+    s3_client.s3.Object = Mock(return_value=Mock(content_length=None))
+    assert not s3_client.s3_file_exists("path/to/file")
+
+    # Object does not exist (404 raised by load()) → False
+    mock_obj = Mock()
+    mock_obj.load.side_effect = ClientError({"Error": {"Code": "404"}}, "load")
+    s3_client.s3.Object = Mock(return_value=mock_obj)
     assert not s3_client.s3_file_exists("path/to/file")
 
 
