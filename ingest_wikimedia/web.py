@@ -28,7 +28,7 @@ class Web:
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session = requests.Session()
-        secret = self.secrets[provider]
+        secret = self.secrets.get(provider, "")
         session.headers = {
             "User-Agent": USER_AGENT,
             "X-DPLA-Bot-Authorization": f"Basic {secret}",
