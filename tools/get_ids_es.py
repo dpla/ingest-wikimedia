@@ -127,11 +127,11 @@ def build_query(
 
 
 def stage_to_s3(s3_client: S3Client, partner: str, dpla_id: str, source: dict) -> None:
-    """Write the item's full metadata to S3 as dpla-map.json."""
-    try:
-        s3_client.write_item_metadata(partner, dpla_id, json.dumps(source))
-    except Exception as e:
-        logging.warning(f"S3 write failed for {dpla_id}: {e}")
+    """Write the item's full metadata to S3 as dpla-map.json.
+
+    Raises on failure so the caller's ThreadPoolExecutor can observe and count it.
+    """
+    s3_client.write_item_metadata(partner, dpla_id, json.dumps(source))
 
 
 @click.command()
@@ -196,6 +196,10 @@ def main(partner: str) -> None:
                     if iiif_url:
                         source[IIIF_MANIFEST_FIELD] = iiif_url
 
+                # Mark as staged by get-ids-es so the downloader can
+                # distinguish fresh ES-sourced objects from legacy API ones.
+                source["_staged_by_get_ids_es"] = True
+
                 # Stage full metadata to S3 asynchronously.
                 future = executor.submit(
                     stage_to_s3, s3_client, partner, dpla_id, source
@@ -207,7 +211,13 @@ def main(partner: str) -> None:
             search_after = hits[-1]["sort"]
 
         # Wait for all S3 writes and surface any errors.
-        failed = sum(1 for f in as_completed(futures) if f.exception() is not None)
+        failed = 0
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                failed += 1
+                logging.warning(f"S3 write failed for {futures[future]}: {e}")
         if failed:
             print(f"Warning: {failed} S3 writes failed", file=sys.stderr)
 
