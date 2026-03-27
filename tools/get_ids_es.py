@@ -50,7 +50,9 @@ def load_eligible_dp_uris(partner: str) -> list[str]:
         OR institution.upload=True  (this specific institution is approved)
     """
     hub_name = DPLA_PARTNERS[partner]
-    institutions = requests.get(INSTITUTIONS_URL, timeout=15).json()
+    resp = requests.get(INSTITUTIONS_URL, timeout=15)
+    resp.raise_for_status()
+    institutions = resp.json()
 
     hub = institutions.get(hub_name)
     if not hub:
@@ -114,7 +116,10 @@ def build_query(
 @click.argument("partner")
 def main(partner: str) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line."""
-    DPLA.check_partner(partner)
+    try:
+        DPLA.check_partner(partner)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
 
     provider_name = DPLA_PARTNERS[partner]
 
@@ -124,7 +129,7 @@ def main(partner: str) -> None:
             f"No eligible institutions found for {partner} in institutions_v2.json",
             file=sys.stderr,
         )
-        sys.exit(1)
+        sys.exit(0)
 
     banlist = Banlist()
     search_after = None
