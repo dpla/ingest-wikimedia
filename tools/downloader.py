@@ -121,6 +121,7 @@ class Downloader:
             response = self.web.get_http_session(provider=self.provider).get(
                 media_url, stream=True
             )
+            response.raise_for_status()
             total_size = int(response.headers.get("content-length", 0))
             with tqdm(
                 total=total_size,

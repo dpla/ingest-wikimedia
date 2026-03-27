@@ -59,13 +59,16 @@ class S3Client:
             f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/{ordinal}_{dpla_id}"
         ).strip()
 
-    def s3_file_exists(self, path: str):
+    def s3_file_exists(self, path: str) -> bool:
         """
-        Checks to see if something already exists in S3 for a path.
+        Returns True only if the object exists in S3 and has a non-zero size.
+        A zero-byte object is treated as absent so the downloader will replace
+        stubs left by interrupted or failed downloads.
         """
         try:
-            self.s3.Object(S3_BUCKET, path).load()
-            return True
+            obj = self.s3.Object(S3_BUCKET, path)
+            obj.load()
+            return obj.content_length > 0
         except ClientError as e:
             if (
                 "Error" in e.response
