@@ -396,6 +396,7 @@ DPLA_PARTNERS = {
     "ohio": "Ohio Digital Network",
     "p2p": "Plains to Peaks Collective",
     "pa": "PA Digital",
+    "si": "Smithsonian Institution",
     "texas": "The Portal to Texas History",
     "minnesota": "Minnesota Digital Library",
     "mwdl": "Mountain West Digital Library",
