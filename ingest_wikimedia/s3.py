@@ -68,7 +68,13 @@ class S3Client:
         try:
             obj = self.s3.Object(S3_BUCKET, path)
             obj.load()
-            return obj.content_length > 0
+            try:
+                return int(obj.content_length) > 0
+            except (TypeError, ValueError):
+                logging.warning(
+                    "Unexpected S3 content_length for key %s: %r", path, obj.content_length
+                )
+                return False
         except ClientError as e:
             if (
                 "Error" in e.response
