@@ -38,14 +38,19 @@ def test_get_media_s3_path(s3_client: S3Client):
 
 
 def test_s3_file_exists(s3_client: S3Client):
-    s3_client.s3.Object = Mock()
+    # Object exists with non-zero size → True
+    s3_client.s3.Object = Mock(return_value=Mock(content_length=1024))
     assert s3_client.s3_file_exists("path/to/file")
 
+    # Object exists but is zero bytes → False (treat as absent stub)
+    s3_client.s3.Object = Mock(return_value=Mock(content_length=0))
+    assert not s3_client.s3_file_exists("path/to/file")
+
+    # Object does not exist (404) → False
     s3_client.s3.Object = Mock(
         side_effect=ClientError({"Error": {"Code": "404"}}, "load")
     )
-    result = s3_client.s3_file_exists("path/to/file")
-    assert not result
+    assert not s3_client.s3_file_exists("path/to/file")
 
 
 def test_write_item_metadata(s3_client: S3Client):

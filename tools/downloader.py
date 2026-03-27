@@ -121,6 +121,7 @@ class Downloader:
             response = self.web.get_http_session(provider=self.provider).get(
                 media_url, stream=True
             )
+            response.raise_for_status()
             total_size = int(response.headers.get("content-length", 0))
             with tqdm(
                 total=total_size,
@@ -177,7 +178,6 @@ class Downloader:
 
             sha1 = self.local_fs.get_file_hash(temp_file_name)
             self.upload_file_to_s3(temp_file_name, destination_path, content_type, sha1)
-            self.tracker.increment(Result.DOWNLOADED)
             self.tracker.increment(Result.BYTES, os.stat(temp_file_name).st_size)
 
         except Exception as e:
