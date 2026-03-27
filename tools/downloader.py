@@ -203,16 +203,30 @@ class Downloader:
         """
 
         try:
-            item_metadata = self.dpla.get_item_metadata(dpla_id)
+            # Prefer metadata staged to S3 by get-ids-es (avoids DPLA API call).
+            # Only trust the cached object when it carries the staging marker —
+            # objects written by older downloader runs lack it and may be stale
+            # (e.g. missing a derived iiifManifest for CONTENTdm items).
+            item_metadata = None
+            item_metadata_str = self.s3_client.get_item_metadata(partner, dpla_id)
+            if item_metadata_str:
+                try:
+                    candidate = json.loads(item_metadata_str)
+                    if candidate.get("_staged_by_get_ids_es"):
+                        item_metadata = candidate
+                except (json.JSONDecodeError, AttributeError):
+                    pass
 
-            if not item_metadata:
-                logging.info(f"{dpla_id} was not found in the DPLA API.")
-                self.tracker.increment(Result.SKIPPED)
-                return
-
-            self.s3_client.write_item_metadata(
-                partner, dpla_id, json.dumps(item_metadata)
-            )
+            if item_metadata is None:
+                # Fallback: fetch from DPLA API and write to S3.
+                item_metadata = self.dpla.get_item_metadata(dpla_id)
+                if not item_metadata:
+                    logging.info(f"{dpla_id} was not found in the DPLA API.")
+                    self.tracker.increment(Result.SKIPPED)
+                    return
+                self.s3_client.write_item_metadata(
+                    partner, dpla_id, json.dumps(item_metadata)
+                )
 
             provider, data_provider = self.dpla.get_provider_and_data_provider(
                 item_metadata, providers_json
