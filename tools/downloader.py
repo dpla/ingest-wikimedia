@@ -203,16 +203,20 @@ class Downloader:
         """
 
         try:
-            item_metadata = self.dpla.get_item_metadata(dpla_id)
-
-            if not item_metadata:
-                logging.info(f"{dpla_id} was not found in the DPLA API.")
-                self.tracker.increment(Result.SKIPPED)
-                return
-
-            self.s3_client.write_item_metadata(
-                partner, dpla_id, json.dumps(item_metadata)
-            )
+            # Prefer metadata staged to S3 by get-ids-es (avoids DPLA API call).
+            item_metadata_str = self.s3_client.get_item_metadata(partner, dpla_id)
+            if item_metadata_str:
+                item_metadata = json.loads(item_metadata_str)
+            else:
+                # Fallback: fetch from DPLA API and write to S3.
+                item_metadata = self.dpla.get_item_metadata(dpla_id)
+                if not item_metadata:
+                    logging.info(f"{dpla_id} was not found in the DPLA API.")
+                    self.tracker.increment(Result.SKIPPED)
+                    return
+                self.s3_client.write_item_metadata(
+                    partner, dpla_id, json.dumps(item_metadata)
+                )
 
             provider, data_provider = self.dpla.get_provider_and_data_provider(
                 item_metadata, providers_json

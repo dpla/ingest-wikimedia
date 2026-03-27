@@ -13,23 +13,38 @@ Eligibility criteria applied:
 institutions_v2.json is fetched fresh from the GitHub main branch on each run
 so that recent eligibility changes are always reflected.
 
+For each eligible item, the full ES source document is written to S3 as
+dpla-map.json so the downloader can skip redundant DPLA API calls entirely.
+CONTENTdm items have their IIIF manifest URL derived from isShownAt and patched
+into the document before it is written.
+
 Output: one DPLA ID per line to stdout.  Redirect to produce the IDs CSV
 consumed by the downloader and uploader:
 
     get-ids-es pa > pa/pa.csv
 """
 
+import json
+import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import click
 import requests
 
 from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.dpla import DPLA, DPLA_PARTNERS, INSTITUTIONS_URL
+from ingest_wikimedia.iiif import IIIF
+from ingest_wikimedia.s3 import S3Client
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 WIKIDATA_BASE_URI = "http://www.wikidata.org/entity/"
 PAGE_SIZE = 500
+S3_WRITE_WORKERS = 10
+
+IIIF_MANIFEST_FIELD = "iiifManifest"
+MEDIA_MASTER_FIELD = "mediaMaster"
+IS_SHOWN_AT_FIELD = "isShownAt"
 
 # isShownAt URL patterns from which a IIIF manifest can be formulaically
 # derived, expressed as ES wildcard values.  Extend this list as new DAMs
@@ -84,7 +99,6 @@ def build_query(
     ]
 
     query: dict = {
-        "_source": ["id"],
         "size": PAGE_SIZE,
         "sort": ["id", "_doc"],
         "query": {
@@ -110,10 +124,22 @@ def build_query(
     return query
 
 
+def stage_to_s3(s3_client: S3Client, partner: str, dpla_id: str, source: dict) -> None:
+    """Write the item's full metadata to S3 as dpla-map.json."""
+    try:
+        s3_client.write_item_metadata(partner, dpla_id, json.dumps(source))
+    except Exception as e:
+        logging.warning(f"S3 write failed for {dpla_id}: {e}")
+
+
 @click.command()
 @click.argument("partner")
 def main(partner: str) -> None:
-    """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line."""
+    """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
+
+    Also stages each item's full metadata to S3 (dpla-map.json) so the
+    downloader can skip DPLA API calls entirely.
+    """
     DPLA.check_partner(partner)
 
     provider_name = DPLA_PARTNERS[partner]
@@ -127,29 +153,58 @@ def main(partner: str) -> None:
         sys.exit(1)
 
     banlist = Banlist()
+    s3_client = S3Client()
     search_after = None
 
-    while True:
-        query = build_query(provider_name, eligible_dp_uris, search_after)
-        response = requests.post(
-            ES_URL,
-            json=query,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        page = response.json()
-        hits = page["hits"]["hits"]
+    with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
+        futures: dict = {}
 
-        if not hits:
-            break
+        while True:
+            query = build_query(provider_name, eligible_dp_uris, search_after)
+            response = requests.post(
+                ES_URL,
+                json=query,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            page = response.json()
+            hits = page["hits"]["hits"]
 
-        for hit in hits:
-            dpla_id = hit["_source"]["id"]
-            if not banlist.is_banned(dpla_id):
+            if not hits:
+                break
+
+            for hit in hits:
+                source = hit["_source"]
+                dpla_id = source["id"]
+
+                if banlist.is_banned(dpla_id):
+                    continue
+
+                # Derive ContentDM IIIF manifest URL if the record has neither
+                # mediaMaster nor iiifManifest but has a derivable isShownAt.
+                if not source.get(IIIF_MANIFEST_FIELD) and not source.get(
+                    MEDIA_MASTER_FIELD
+                ):
+                    is_shown_at = source.get(IS_SHOWN_AT_FIELD, "")
+                    iiif_url = IIIF.contentdm_iiif_url(is_shown_at)
+                    if iiif_url:
+                        source[IIIF_MANIFEST_FIELD] = iiif_url
+
+                # Stage full metadata to S3 asynchronously.
+                future = executor.submit(
+                    stage_to_s3, s3_client, partner, dpla_id, source
+                )
+                futures[future] = dpla_id
+
                 print(dpla_id)
 
-        search_after = hits[-1]["sort"]
+            search_after = hits[-1]["sort"]
+
+        # Wait for all S3 writes and surface any errors.
+        failed = sum(1 for f in as_completed(futures) if f.exception() is not None)
+        if failed:
+            print(f"Warning: {failed} S3 writes failed", file=sys.stderr)
 
 
 if __name__ == "__main__":
