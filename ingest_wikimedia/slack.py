@@ -10,11 +10,12 @@ SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
 
 def _format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if num_bytes < 1024:
-            return f"{num_bytes:,.1f} {unit}"
-        num_bytes //= 1024
-    return f"{num_bytes:,.1f} PB"
+        if value < 1024:
+            return f"{value:,.1f} {unit}"
+        value /= 1024
+    return f"{value:,.1f} PB"
 
 
 def notify_upload_complete(
@@ -65,8 +66,11 @@ def notify_upload_complete(
             json=payload,
             timeout=10,
         )
+        response.raise_for_status()
         data = response.json()
         if not data.get("ok"):
             logging.warning(f"Slack notification failed: {data.get('error')}")
+    except requests.exceptions.HTTPError as ex:
+        logging.warning(f"Slack API returned HTTP {ex.response.status_code}")
     except Exception as ex:
         logging.warning("Failed to send Slack notification", exc_info=ex)
