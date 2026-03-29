@@ -27,6 +27,7 @@ from ingest_wikimedia.dpla import (
     DC_TITLE_FIELD_NAME,
     DPLA,
 )
+from ingest_wikimedia.slack import notify_upload_complete
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
@@ -316,9 +317,16 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
             uploader.process_item(dpla_id, providers_json, partner, verbose, dry_run)
 
     finally:
+        elapsed = time.time() - start_time
         logging.info("\n" + str(tracker))
-        logging.info(f"{time.time() - start_time} seconds.")
+        logging.info(f"{elapsed} seconds.")
         local_fs.cleanup_temp_dir()
+        notify_upload_complete(
+            tracker=tracker,
+            partner_label=f"wikimedia-{partner}",
+            elapsed_seconds=elapsed,
+            dry_run=dry_run,
+        )
 
 
 if __name__ == "__main__":
