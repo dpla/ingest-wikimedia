@@ -160,7 +160,7 @@ class Uploader:
                 self.tracker.increment(Result.SKIPPED)
                 return
 
-            if not dry_run:
+            if not dry_run and not file_downloaded:
                 with tqdm(
                     total=s3_object.content_length,
                     leave=False,
