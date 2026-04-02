@@ -55,6 +55,9 @@ def get_page_title(
     """
     escaped_title = (
         item_title[:181]
+        .replace("''", '"')    # titleblacklist: double-apostrophe rule → double-quote
+        .replace("&", "+")     # titleblacklist: query-string pattern (&...=)
+        .replace("=", "-")     # titleblacklist: query-string pattern (&...=)
         .replace("[", "(")
         .replace("]", ")")
         .replace("{", "(")
