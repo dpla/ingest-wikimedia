@@ -96,21 +96,26 @@ class Uploader:
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
 
+            file_downloaded = False
+
             if mime in ("application/octet-stream", "binary/octet-stream"):
-                with self.local_fs.get_temp_file() as tmp:
-                    s3_object.download_fileobj(tmp)
-                    detected = self.local_fs.get_content_type(tmp.name)
+                s3_object.download_file(temp_file.name)
+                file_downloaded = True
+                detected = self.local_fs.get_content_type(temp_file.name)
                 if detected not in ("application/octet-stream", "binary/octet-stream"):
+                    action = "would update S3" if dry_run else "updating S3"
                     logging.info(
-                        f"Re-detected {dpla_id} {ordinal}: {mime} -> {detected}; updating S3"
+                        f"Re-detected {dpla_id} {ordinal}: {mime} -> {detected}; {action}"
                     )
-                    self.s3_client.get_s3().meta.client.copy_object(
-                        Bucket=S3_BUCKET,
-                        Key=s3_path,
-                        ContentType=detected,
-                        MetadataDirective="REPLACE",
-                        CopySource=S3_BUCKET + "/" + s3_path,
-                    )
+                    if not dry_run:
+                        self.s3_client.get_s3().meta.client.copy_object(
+                            Bucket=S3_BUCKET,
+                            Key=s3_path,
+                            ContentType=detected,
+                            Metadata=dict(s3_object.metadata),
+                            MetadataDirective="REPLACE",
+                            CopySource=S3_BUCKET + "/" + s3_path,
+                        )
                     mime = detected
                 else:
                     logging.info(
