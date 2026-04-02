@@ -96,6 +96,29 @@ class Uploader:
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
 
+            if mime in ("application/octet-stream", "binary/octet-stream"):
+                with self.local_fs.get_temp_file() as tmp:
+                    s3_object.download_fileobj(tmp)
+                    detected = self.local_fs.get_content_type(tmp.name)
+                if detected not in ("application/octet-stream", "binary/octet-stream"):
+                    logging.info(
+                        f"Re-detected {dpla_id} {ordinal}: {mime} -> {detected}; updating S3"
+                    )
+                    self.s3_client.get_s3().meta.client.copy_object(
+                        Bucket=S3_BUCKET,
+                        Key=s3_path,
+                        ContentType=detected,
+                        MetadataDirective="REPLACE",
+                        CopySource=S3_BUCKET + "/" + s3_path,
+                    )
+                    mime = detected
+                else:
+                    logging.info(
+                        f"Skipping {dpla_id} {ordinal}: Unable to detect type beyond octet-stream"
+                    )
+                    self.tracker.increment(Result.SKIPPED)
+                    return
+
             if not check_content_type(mime):
                 logging.info(f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}")
                 self.tracker.increment(Result.SKIPPED)
