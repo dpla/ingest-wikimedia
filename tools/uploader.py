@@ -22,9 +22,13 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.categories import CategoryEnsurer
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
+    DATA_PROVIDER_FIELD_NAME,
+    EDM_AGENT_NAME,
+    WIKIDATA_FIELD_NAME,
     DPLA,
 )
 from ingest_wikimedia.slack import notify_upload_complete
@@ -43,6 +47,7 @@ from ingest_wikimedia.wikimedia import (
     ERROR_DUPLICATE,
     ERROR_NOCHANGE,
     get_site,
+    get_wikidata_site,
 )
 
 
@@ -54,12 +59,14 @@ class Uploader:
         s3_client: S3Client,
         dpla: DPLA,
         site: BaseSite,
+        category_ensurer: CategoryEnsurer | None = None,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
         self.s3_client = s3_client
         self.site = site
         self.dpla = dpla
+        self.category_ensurer = category_ensurer
 
     def process_file(
         self,
@@ -95,6 +102,33 @@ class Uploader:
 
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
+            file_downloaded = False
+
+            if mime in ("application/octet-stream", "binary/octet-stream"):
+                s3_object.download_file(temp_file.name)
+                file_downloaded = True
+                detected = self.local_fs.get_content_type(temp_file.name)
+                if detected not in ("application/octet-stream", "binary/octet-stream"):
+                    action = "would update S3" if dry_run else "updating S3"
+                    logging.info(
+                        f"Re-detected {dpla_id} {ordinal}: {mime} -> {detected}; {action}"
+                    )
+                    if not dry_run:
+                        self.s3_client.get_s3().meta.client.copy_object(
+                            Bucket=S3_BUCKET,
+                            Key=s3_path,
+                            ContentType=detected,
+                            Metadata=dict(s3_object.metadata),
+                            MetadataDirective="REPLACE",
+                            CopySource=S3_BUCKET + "/" + s3_path,
+                        )
+                    mime = detected
+                else:
+                    logging.info(
+                        f"Skipping {dpla_id} {ordinal}: Unable to detect type beyond octet-stream"
+                    )
+                    self.tracker.increment(Result.SKIPPED)
+                    return
 
             file_downloaded = False
 
@@ -241,6 +275,16 @@ class Uploader:
                 self.tracker.increment(Result.SKIPPED)
                 return
 
+            if self.category_ensurer:
+                institution_name = get_str(
+                    get_dict(item_metadata, DATA_PROVIDER_FIELD_NAME), EDM_AGENT_NAME
+                )
+                institution_qid = get_str(data_provider, WIKIDATA_FIELD_NAME)
+                hub_institution_qid = get_str(provider, WIKIDATA_FIELD_NAME)
+                self.category_ensurer.ensure(
+                    institution_qid, institution_name, hub_institution_qid
+                )
+
             titles = get_list(
                 get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
                 DC_TITLE_FIELD_NAME,
@@ -316,12 +360,17 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 
+    commons_site = get_site()
+    wikidata_site = get_wikidata_site()
+    category_ensurer = CategoryEnsurer(commons_site, wikidata_site, dry_run=dry_run)
+
     uploader = Uploader(
         tools_context.get_tracker(),
         tools_context.get_local_fs(),
         tools_context.get_s3_client(),
         tools_context.get_dpla(),
-        get_site(),
+        commons_site,
+        category_ensurer,
     )
 
     dpla = tools_context.get_dpla()
