@@ -55,6 +55,9 @@ def get_page_title(
     """
     escaped_title = (
         item_title[:181]
+        .replace("''", '"')    # titleblacklist: double-apostrophe rule → double-quote
+        .replace("&", "and")   # titleblacklist: query-string pattern (&...=)
+        .replace("=", "-")     # titleblacklist: query-string pattern (&...=)
         .replace("[", "(")
         .replace("]", ")")
         .replace("{", "(")
@@ -225,6 +228,7 @@ INVALID_CONTENT_TYPES = [
     "text/xml",
     "text/plain",
     "application/msword",
+    "application/octet-stream",
 ]
 COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
 ERROR_FILEEXISTS = "fileexists-shared-forbidden"
