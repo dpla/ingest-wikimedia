@@ -260,10 +260,12 @@ class Uploader:
                     )
                 else:
                     logging.warning(
-                        f"Skipping category ensure for {dpla_id}: "
+                        f"Skipping {dpla_id}: "
                         f"missing institution_qid={institution_qid!r} or "
                         f"hub_institution_qid={hub_institution_qid!r}"
                     )
+                    self.tracker.increment(Result.SKIPPED)
+                    return
 
             titles = get_list(
                 get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),

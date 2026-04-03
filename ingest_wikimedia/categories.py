@@ -142,9 +142,16 @@ class CategoryEnsurer:
             return existing.getID()
         except pywikibot.exceptions.NoWikidataItemError:
             pass
-        return self._create_wikidata_category_item(
-            institution_name, institution_qid, hub_category_qid, category_name
-        )
+        try:
+            return self._create_wikidata_category_item(
+                institution_name, institution_qid, hub_category_qid, category_name
+            )
+        except Exception as create_exc:
+            # Another process may have created the item concurrently. Re-read before failing.
+            try:
+                return commons_page.data_item().getID()
+            except pywikibot.exceptions.NoWikidataItemError:
+                raise create_exc
 
     def _item_claim(self, property_id: str, target_qid: str) -> pywikibot.Claim:
         claim = pywikibot.Claim(self._repo, property_id)

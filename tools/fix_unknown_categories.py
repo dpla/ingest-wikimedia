@@ -20,8 +20,6 @@ from ingest_wikimedia.categories import CategoryEnsurer
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.wikimedia import get_site, get_wikidata_site
 
-_MAX_BATCH_SIZE = 50  # cap on members fetched per iteration to avoid runaway growth
-
 UNKNOWN_INSTITUTION_CATEGORY = (
     "Category:Media contributed by the Digital Public Library of America"
     " with unknown institution"
@@ -72,17 +70,20 @@ def main(dry_run: bool, verbose: bool) -> None:
     cannot_process: set[str] = set()
 
     while True:
-        members = list(unknown_cat.members(total=_MAX_BATCH_SIZE, namespaces=[6]))
+        file_page = None
+        category_has_members = False
+        for page in unknown_cat.members(namespaces=[6]):
+            category_has_members = True
+            if page.title() not in cannot_process:
+                file_page = page
+                break
 
-        if not members:
+        if not category_has_members:
             logging.info("Category is empty. Done.")
             break
 
-        file_page = next((p for p in members if p.title() not in cannot_process), None)
         if file_page is None:
-            logging.warning(
-                f"All {len(members)} visible files could not be processed. Stopping."
-            )
+            logging.warning("All remaining files could not be processed. Stopping.")
             break
 
         title = file_page.title()
