@@ -11,6 +11,7 @@ from tqdm import tqdm
 from ingest_wikimedia.common import (
     get_list,
     get_dict,
+    get_str,
     load_ids,
     CHECKSUM,
 )
@@ -22,9 +23,13 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.categories import CategoryEnsurer
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
+    DATA_PROVIDER_FIELD_NAME,
+    EDM_AGENT_NAME,
+    WIKIDATA_FIELD_NAME,
     DPLA,
 )
 from ingest_wikimedia.slack import notify_upload_complete
@@ -43,6 +48,7 @@ from ingest_wikimedia.wikimedia import (
     ERROR_DUPLICATE,
     ERROR_NOCHANGE,
     get_site,
+    get_wikidata_site,
 )
 
 
@@ -54,12 +60,14 @@ class Uploader:
         s3_client: S3Client,
         dpla: DPLA,
         site: BaseSite,
+        category_ensurer: CategoryEnsurer | None = None,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
         self.s3_client = s3_client
         self.site = site
         self.dpla = dpla
+        self.category_ensurer = category_ensurer
 
     def process_file(
         self,
@@ -95,7 +103,6 @@ class Uploader:
 
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
-
             file_downloaded = False
 
             if mime in ("application/octet-stream", "binary/octet-stream"):
@@ -241,6 +248,25 @@ class Uploader:
                 self.tracker.increment(Result.SKIPPED)
                 return
 
+            if self.category_ensurer:
+                institution_name = get_str(
+                    get_dict(item_metadata, DATA_PROVIDER_FIELD_NAME), EDM_AGENT_NAME
+                )
+                institution_qid = get_str(data_provider, WIKIDATA_FIELD_NAME)
+                hub_institution_qid = get_str(provider, WIKIDATA_FIELD_NAME)
+                if institution_qid and hub_institution_qid:
+                    self.category_ensurer.ensure(
+                        institution_qid, institution_name, hub_institution_qid
+                    )
+                else:
+                    logging.warning(
+                        f"Skipping {dpla_id}: "
+                        f"missing institution_qid={institution_qid!r} or "
+                        f"hub_institution_qid={hub_institution_qid!r}"
+                    )
+                    self.tracker.increment(Result.SKIPPED)
+                    return
+
             titles = get_list(
                 get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
                 DC_TITLE_FIELD_NAME,
@@ -316,12 +342,17 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 
+    commons_site = get_site()
+    wikidata_site = get_wikidata_site()
+    category_ensurer = CategoryEnsurer(commons_site, wikidata_site, dry_run=dry_run)
+
     uploader = Uploader(
         tools_context.get_tracker(),
         tools_context.get_local_fs(),
         tools_context.get_s3_client(),
         tools_context.get_dpla(),
-        get_site(),
+        commons_site,
+        category_ensurer,
     )
 
     dpla = tools_context.get_dpla()

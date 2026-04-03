@@ -55,9 +55,9 @@ def get_page_title(
     """
     escaped_title = (
         item_title[:181]
-        .replace("''", '"')    # titleblacklist: double-apostrophe rule → double-quote
-        .replace("&", "+")     # titleblacklist: query-string pattern (&...=)
-        .replace("=", "-")     # titleblacklist: query-string pattern (&...=)
+        .replace("''", '"')  # titleblacklist: double-apostrophe rule → double-quote
+        .replace("&", "+")  # titleblacklist: query-string pattern (&...=)
+        .replace("=", "-")  # titleblacklist: query-string pattern (&...=)
         .replace("[", "(")
         .replace("]", ")")
         .replace("{", "(")
@@ -206,8 +206,15 @@ def get_page(site: BaseSite, title: str) -> FilePage:
 
 
 def get_site() -> BaseSite:
-    """Returns the Site object for wikimedia commons."""
+    """Returns the Site object for Wikimedia Commons."""
     site = pywikibot.Site(COMMONS_SITE_NAME)
+    site.login()
+    return site
+
+
+def get_wikidata_site() -> BaseSite:
+    """Returns the Site object for Wikidata."""
+    site = pywikibot.Site("wikidata", "wikidata")
     site.login()
     return site
 
