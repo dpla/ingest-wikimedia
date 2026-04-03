@@ -137,15 +137,19 @@ class CategoryEnsurer:
         """Return existing Wikidata item Q-ID for the Commons category if one exists,
         otherwise create it. Guards against duplicate item creation on retry."""
         commons_page = pywikibot.Page(self.commons_site, category_name)
-        if commons_page.exists():
-            try:
-                existing = commons_page.data_item()
-                return existing.getID()
-            except pywikibot.exceptions.NoWikidataItemError:
-                pass
+        try:
+            existing = commons_page.data_item()
+            return existing.getID()
+        except pywikibot.exceptions.NoWikidataItemError:
+            pass
         return self._create_wikidata_category_item(
             institution_name, institution_qid, hub_category_qid, category_name
         )
+
+    def _item_claim(self, property_id: str, target_qid: str) -> pywikibot.Claim:
+        claim = pywikibot.Claim(self._repo, property_id)
+        claim.setTarget(pywikibot.ItemPage(self._repo, target_qid))
+        return claim
 
     def _create_wikidata_category_item(
         self,
@@ -154,28 +158,19 @@ class CategoryEnsurer:
         hub_category_qid: str,
         category_name: str,
     ) -> str:
-        repo = self._repo
-        new_item = pywikibot.ItemPage(repo)
+        new_item = pywikibot.ItemPage(self._repo)
 
-        combines_partnership = pywikibot.Claim(repo, "P971")
-        combines_partnership.setTarget(
-            pywikibot.ItemPage(repo, WD_WIKIMEDIA_CONTENT_PARTNERSHIP)
+        combines_partnership = self._item_claim(
+            "P971", WD_WIKIMEDIA_CONTENT_PARTNERSHIP
         )
+        combines_institution = self._item_claim("P971", institution_qid)
+        instance_of = self._item_claim("P31", WD_WIKIMEDIA_CATEGORY)
 
-        combines_institution = pywikibot.Claim(repo, "P971")
-        combines_institution.setTarget(pywikibot.ItemPage(repo, institution_qid))
-
-        instance_of = pywikibot.Claim(repo, "P31")
-        instance_of.setTarget(pywikibot.ItemPage(repo, WD_WIKIMEDIA_CATEGORY))
-
-        commons_cat_claim = pywikibot.Claim(repo, "P373")
+        commons_cat_claim = pywikibot.Claim(self._repo, "P373")
         commons_cat_claim.setTarget(f"Media contributed by {institution_name}")
 
-        related_cat = pywikibot.Claim(repo, "P7084")
-        related_cat.setTarget(pywikibot.ItemPage(repo, hub_category_qid))
-
-        contains_qualifier = pywikibot.Claim(repo, "P4224")
-        contains_qualifier.setTarget(pywikibot.ItemPage(repo, WD_CONTAINS))
+        related_cat = self._item_claim("P7084", hub_category_qid)
+        contains_qualifier = self._item_claim("P4224", WD_CONTAINS)
         related_cat.addQualifier(contains_qualifier)
 
         data = {
@@ -201,8 +196,7 @@ class CategoryEnsurer:
     def _add_p8464_to_institution(
         self, institution_qid: str, category_qid: str
     ) -> None:
-        repo = self._repo
-        institution_item = pywikibot.ItemPage(repo, institution_qid)
+        institution_item = pywikibot.ItemPage(self._repo, institution_qid)
         institution_item.get()
 
         for existing_claim in institution_item.claims.get("P8464", []):
@@ -223,8 +217,7 @@ class CategoryEnsurer:
                 f"expected {category_qid}"
             )
 
-        claim = pywikibot.Claim(repo, "P8464")
-        claim.setTarget(pywikibot.ItemPage(repo, category_qid))
         institution_item.addClaim(
-            claim, summary="Add Commons content partnership category."
+            self._item_claim("P8464", category_qid),
+            summary="Add Commons content partnership category.",
         )
