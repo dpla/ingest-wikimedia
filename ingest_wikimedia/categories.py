@@ -153,7 +153,7 @@ class CategoryEnsurer:
         related_cat.addQualifier(contains_qualifier)
 
         data = {
-            "labels": {"en": category_name},
+            "labels": {"en": f"Media contributed by {institution_name}"},
             "sitelinks": {
                 "commonswiki": {
                     "site": "commonswiki",

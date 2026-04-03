@@ -282,9 +282,16 @@ class Uploader:
                 )
                 institution_qid = get_str(data_provider, WIKIDATA_FIELD_NAME)
                 hub_institution_qid = get_str(provider, WIKIDATA_FIELD_NAME)
-                self.category_ensurer.ensure(
-                    institution_qid, institution_name, hub_institution_qid
-                )
+                if institution_qid and hub_institution_qid:
+                    self.category_ensurer.ensure(
+                        institution_qid, institution_name, hub_institution_qid
+                    )
+                else:
+                    logging.warning(
+                        f"Skipping category ensure for {dpla_id}: "
+                        f"missing institution_qid={institution_qid!r} or "
+                        f"hub_institution_qid={hub_institution_qid!r}"
+                    )
 
             titles = get_list(
                 get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
