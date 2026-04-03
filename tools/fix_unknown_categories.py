@@ -33,7 +33,7 @@ _INSTITUTION_QID_RE = re.compile(
 
 # Matches: {{ DPLA | ... | hub = Q12345 | ... }} (multiline-safe)
 _HUB_QID_RE = re.compile(
-    r"\{\{\s*DPLA\b[^}]*?\|\s*hub\s*=\s*(Q\d+)", re.IGNORECASE | re.DOTALL
+    r"\{\{\s*DPLA\b(?:(?!\}\}).)*?\|\s*hub\s*=\s*(Q\d+)", re.IGNORECASE | re.DOTALL
 )
 
 

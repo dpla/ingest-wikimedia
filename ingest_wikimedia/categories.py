@@ -206,6 +206,7 @@ class CategoryEnsurer:
         institution_item = pywikibot.ItemPage(self._repo, institution_qid)
         institution_item.get()
 
+        existing_ids = []
         for existing_claim in institution_item.claims.get("P8464", []):
             target = existing_claim.getTarget()
             if (
@@ -214,14 +215,16 @@ class CategoryEnsurer:
             ):
                 logging.info(f"P8464 already set on {institution_qid} → {category_qid}")
                 return
-            existing_id = (
+            existing_ids.append(
                 target.getID()
                 if isinstance(target, pywikibot.ItemPage)
                 else repr(target)
             )
+
+        if existing_ids:
             raise ValueError(
-                f"Institution {institution_qid} already has P8464 → {existing_id}, "
-                f"expected {category_qid}"
+                f"Institution {institution_qid} already has P8464 → {existing_ids}, "
+                f"none match expected {category_qid}"
             )
 
         institution_item.addClaim(
