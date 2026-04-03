@@ -205,6 +205,24 @@ class CategoryEnsurer:
         institution_item = pywikibot.ItemPage(repo, institution_qid)
         institution_item.get()
 
+        for existing_claim in institution_item.claims.get("P8464", []):
+            target = existing_claim.getTarget()
+            if (
+                isinstance(target, pywikibot.ItemPage)
+                and target.getID() == category_qid
+            ):
+                logging.info(f"P8464 already set on {institution_qid} → {category_qid}")
+                return
+            existing_id = (
+                target.getID()
+                if isinstance(target, pywikibot.ItemPage)
+                else repr(target)
+            )
+            raise ValueError(
+                f"Institution {institution_qid} already has P8464 → {existing_id}, "
+                f"expected {category_qid}"
+            )
+
         claim = pywikibot.Claim(repo, "P8464")
         claim.setTarget(pywikibot.ItemPage(repo, category_qid))
         institution_item.addClaim(
