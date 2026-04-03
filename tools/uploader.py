@@ -11,6 +11,7 @@ from tqdm import tqdm
 from ingest_wikimedia.common import (
     get_list,
     get_dict,
+    get_str,
     load_ids,
     CHECKSUM,
 )

@@ -8,6 +8,7 @@ create the category infrastructure if needed, then touch all Commons file pages
 for that institution via search — which triggers the Wikidata Infobox template
 to re-evaluate and re-categorize them. Repeat until the category is empty.
 """
+
 import logging
 import re
 import time
@@ -79,9 +80,7 @@ def main(dry_run: bool, verbose: bool) -> None:
             logging.info("Category is empty. Done.")
             break
 
-        file_page = next(
-            (p for p in members if p.title() not in cannot_process), None
-        )
+        file_page = next((p for p in members if p.title() not in cannot_process), None)
         if file_page is None:
             logging.warning(
                 f"All {len(members)} visible files could not be processed. Stopping."
@@ -102,12 +101,12 @@ def main(dry_run: bool, verbose: bool) -> None:
         institution_item.get()
         institution_name = institution_item.labels.get("en", institution_qid)
 
-        logging.info(
-            f"Processing institution: {institution_name} ({institution_qid})"
-        )
+        logging.info(f"Processing institution: {institution_name} ({institution_qid})")
 
         try:
-            category_ensurer.ensure(institution_qid, institution_name, hub_institution_qid)
+            category_ensurer.ensure(
+                institution_qid, institution_name, hub_institution_qid
+            )
         except Exception as e:
             logging.error(
                 f"Failed to ensure category for {institution_name} ({institution_qid})",
@@ -126,7 +125,9 @@ def main(dry_run: bool, verbose: bool) -> None:
             namespaces=[6],
         ):
             if verbose:
-                logging.info(f"  {'Would touch' if dry_run else 'Touching'}: {page.title()}")
+                logging.info(
+                    f"  {'Would touch' if dry_run else 'Touching'}: {page.title()}"
+                )
             if not dry_run:
                 try:
                     page.touch()
