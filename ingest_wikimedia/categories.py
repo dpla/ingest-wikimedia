@@ -109,7 +109,12 @@ class CategoryEnsurer:
                 "cannot determine hub category item Q-ID"
             )
 
-        hub_category_qid = hub_item.claims["P8464"][0].getTarget().getID()
+        target = hub_item.claims["P8464"][0].getTarget()
+        if not isinstance(target, pywikibot.ItemPage):
+            raise ValueError(
+                f"Hub {hub_institution_qid} P8464 claim has unexpected target: {target!r}"
+            )
+        hub_category_qid = target.getID()
         self._hub_category_qids[hub_institution_qid] = hub_category_qid
         return hub_category_qid
 
