@@ -55,6 +55,12 @@ class CategoryEnsurer:
             self._ensured.add(institution_qid)
             return
 
+        institution_name = institution_name.strip()
+        if not institution_name:
+            raise ValueError(
+                f"Institution {institution_qid} has no usable name; cannot create category."
+            )
+
         category_name = COMMONS_CATEGORY_PREFIX + institution_name
         hub_category_qid = self._get_hub_category_qid(hub_institution_qid)
 
@@ -75,10 +81,10 @@ class CategoryEnsurer:
         else:
             logging.info(f"Commons category '{category_name}' already exists")
 
-        category_qid = self._create_wikidata_category_item(
+        category_qid = self._get_or_create_wikidata_category_item(
             institution_name, institution_qid, hub_category_qid, category_name
         )
-        logging.info(f"Created Wikidata item {category_qid} for '{category_name}'")
+        logging.info(f"Using Wikidata item {category_qid} for '{category_name}'")
 
         self._add_p8464_to_institution(institution_qid, category_qid)
         logging.info(f"Added P8464 to {institution_qid} → {category_qid}")
@@ -120,6 +126,26 @@ class CategoryEnsurer:
         page = pywikibot.Page(self.commons_site, category_name)
         page.text = "{{dpla cat}}"
         page.save(summary="Create institutional category")
+
+    def _get_or_create_wikidata_category_item(
+        self,
+        institution_name: str,
+        institution_qid: str,
+        hub_category_qid: str,
+        category_name: str,
+    ) -> str:
+        """Return existing Wikidata item Q-ID for the Commons category if one exists,
+        otherwise create it. Guards against duplicate item creation on retry."""
+        commons_page = pywikibot.Page(self.commons_site, category_name)
+        if commons_page.exists():
+            try:
+                existing = commons_page.data_item()
+                return existing.getID()
+            except pywikibot.exceptions.NoWikidataItemError:
+                pass
+        return self._create_wikidata_category_item(
+            institution_name, institution_qid, hub_category_qid, category_name
+        )
 
     def _create_wikidata_category_item(
         self,

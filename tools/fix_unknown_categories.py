@@ -27,9 +27,10 @@ UNKNOWN_INSTITUTION_CATEGORY = (
     " with unknown institution"
 )
 
-# Matches: {{ Institution | wikidata = Q12345 ... }}
+# Matches: {{ Institution | ... | wikidata = Q12345 | ... }} (parameter order–agnostic)
 _INSTITUTION_QID_RE = re.compile(
-    r"\{\{\s*Institution\s*\|\s*wikidata\s*=\s*(Q\d+)", re.IGNORECASE
+    r"\{\{\s*Institution\b(?:(?!\}\}).)*?\|\s*wikidata\s*=\s*(Q\d+)",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Matches: {{ DPLA | ... | hub = Q12345 | ... }} (multiline-safe)
@@ -71,10 +72,7 @@ def main(dry_run: bool, verbose: bool) -> None:
     cannot_process: set[str] = set()
 
     while True:
-        # Fetch enough members to skip any we already know are unprocessable,
-        # capped to avoid runaway API usage if many files are unparseable.
-        batch_size = min(len(cannot_process) + 1, _MAX_BATCH_SIZE)
-        members = list(unknown_cat.members(total=batch_size, namespaces=[6]))
+        members = list(unknown_cat.members(total=_MAX_BATCH_SIZE, namespaces=[6]))
 
         if not members:
             logging.info("Category is empty. Done.")
@@ -97,19 +95,21 @@ def main(dry_run: bool, verbose: bool) -> None:
             cannot_process.add(title)
             continue
 
-        institution_item = pywikibot.ItemPage(repo, institution_qid)
-        institution_item.get()
-        institution_name = institution_item.labels.get("en", institution_qid)
-
-        logging.info(f"Processing institution: {institution_name} ({institution_qid})")
-
         try:
+            institution_item = pywikibot.ItemPage(repo, institution_qid)
+            institution_item.get()
+            institution_name = institution_item.labels.get("en", institution_qid)
+
+            logging.info(
+                f"Processing institution: {institution_name} ({institution_qid})"
+            )
+
             category_ensurer.ensure(
                 institution_qid, institution_name, hub_institution_qid
             )
         except Exception as e:
             logging.error(
-                f"Failed to ensure category for {institution_name} ({institution_qid})",
+                f"Failed to process institution {institution_qid} from '{title}'",
                 exc_info=e,
             )
             cannot_process.add(title)
