@@ -125,9 +125,9 @@ def main(verbose: bool) -> None:
                 logging.info(f"  Touching: {page.title()}")
             try:
                 page.touch()
+                count += 1
             except Exception as e:
                 logging.warning(f"Failed to touch '{page.title()}'", exc_info=e)
-            count += 1
 
         files_touched += count
         logging.info(f"Touched {count} files for {institution_name}")
