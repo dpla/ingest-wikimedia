@@ -48,18 +48,14 @@ def _extract_hub_qid(wikitext: str) -> str | None:
 
 
 @click.command()
-@click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
-def main(dry_run: bool, verbose: bool) -> None:
+def main(verbose: bool) -> None:
     setup_logging("fix-unknown-categories", "fix", logging.INFO)
     start_time = time.time()
 
-    if dry_run:
-        logging.warning("---=== DRY RUN ===---")
-
     commons_site = get_site()
     wikidata_site = get_wikidata_site()
-    category_ensurer = CategoryEnsurer(commons_site, wikidata_site, dry_run=dry_run)
+    category_ensurer = CategoryEnsurer(commons_site, wikidata_site)
     repo = wikidata_site.data_repository()
 
     unknown_cat = pywikibot.Category(commons_site, UNKNOWN_INSTITUTION_CATEGORY)
@@ -68,19 +64,13 @@ def main(dry_run: bool, verbose: bool) -> None:
     files_touched = 0
     # Tracks files we cannot parse, so we don't loop on them forever
     cannot_process: set[str] = set()
-    # In dry-run mode, real touches are skipped so files never leave the category.
-    # Track titles already processed so we don't loop on the same institution forever.
-    dry_run_processed: set[str] = set()
 
     while True:
         file_page = None
         category_has_members = False
         for page in unknown_cat.members(namespaces=[6]):
             category_has_members = True
-            if (
-                page.title() not in cannot_process
-                and page.title() not in dry_run_processed
-            ):
+            if page.title() not in cannot_process:
                 file_page = page
                 break
 
@@ -131,29 +121,21 @@ def main(dry_run: bool, verbose: bool) -> None:
             f'insource:"Institution" insource:"wikidata = {institution_qid}"',
             namespaces=[6],
         ):
-            if dry_run:
-                dry_run_processed.add(page.title())
             if verbose:
-                logging.info(
-                    f"  {'Would touch' if dry_run else 'Touching'}: {page.title()}"
-                )
-            if not dry_run:
-                try:
-                    page.touch()
-                except Exception as e:
-                    logging.warning(f"Failed to touch '{page.title()}'", exc_info=e)
+                logging.info(f"  Touching: {page.title()}")
+            try:
+                page.touch()
+            except Exception as e:
+                logging.warning(f"Failed to touch '{page.title()}'", exc_info=e)
             count += 1
 
         files_touched += count
-        logging.info(
-            f"{'Would touch' if dry_run else 'Touched'} {count} files "
-            f"for {institution_name}"
-        )
+        logging.info(f"Touched {count} files for {institution_name}")
 
     elapsed = time.time() - start_time
     logging.info(
         f"Done. Institutions processed: {institutions_processed}, "
-        f"files {'would touch' if dry_run else 'touched'}: {files_touched}, "
+        f"files touched: {files_touched}, "
         f"elapsed: {elapsed:.1f}s"
     )
 
