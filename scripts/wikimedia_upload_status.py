@@ -44,8 +44,9 @@ def ssm_run(client, cmd: str) -> str:
 
 
 def get_phase_and_progress(client, partner: str) -> str:
-    base = f"/home/ec2-user/ingest-wikimedia/{shlex.quote(partner)}"
-    log_file = ssm_run(client, f"ls -t {base}/logs/ 2>/dev/null | head -1")
+    base = f"/home/ec2-user/ingest-wikimedia/{partner}"
+    log_dir = shlex.quote(f"{base}/logs")
+    log_file = ssm_run(client, f"ls -t {log_dir}/ 2>/dev/null | head -1")
     if not log_file:
         return "Generating IDs"
 
