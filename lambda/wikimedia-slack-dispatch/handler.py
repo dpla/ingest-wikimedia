@@ -71,9 +71,12 @@ def handler(event, context):
     if not timestamp or not signature:
         return {"statusCode": 400, "body": "Missing Slack headers"}
 
-    if not _verify_slack_signature(
-        os.environ["SLACK_SIGNING_SECRET"], timestamp, body, signature
-    ):
+    signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
+    if not signing_secret:
+        logging.error("Missing required environment variable: SLACK_SIGNING_SECRET")
+        return {"statusCode": 500, "body": "Server misconfiguration"}
+
+    if not _verify_slack_signature(signing_secret, timestamp, body, signature):
         return {"statusCode": 401, "body": "Invalid signature"}
 
     repo = os.environ.get("GH_REPO", "dpla/ingest-wikimedia")
