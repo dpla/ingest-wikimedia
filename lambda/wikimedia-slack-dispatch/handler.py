@@ -14,6 +14,7 @@ Environment variables (set on the Lambda function):
 """
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -59,7 +60,10 @@ def handler(event, context):
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     body = event.get("body") or ""
     if event.get("isBase64Encoded"):
-        body = base64.b64decode(body).decode("utf-8")
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return {"statusCode": 400, "body": "Invalid request body encoding"}
 
     timestamp = headers.get("x-slack-request-timestamp", "")
     signature = headers.get("x-slack-signature", "")
