@@ -10,6 +10,7 @@ import logging
 import os
 import shlex
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 import requests
@@ -30,12 +31,12 @@ def ssm_run(client, cmd: str) -> str:
     )
     cmd_id = resp["Command"]["CommandId"]
     for _ in range(SSM_MAX_POLLS):
-        time.sleep(SSM_POLL_INTERVAL)
         try:
             inv = client.get_command_invocation(
                 CommandId=cmd_id, InstanceId=INSTANCE_ID
             )
         except client.exceptions.InvocationDoesNotExist:
+            time.sleep(SSM_POLL_INTERVAL)
             continue
         status = inv["Status"]
         if status == "Success":
@@ -45,6 +46,7 @@ def ssm_run(client, cmd: str) -> str:
             raise RuntimeError(
                 f"SSM command {cmd_id} ended with {status}: {stderr or 'no stderr'}"
             )
+        time.sleep(SSM_POLL_INTERVAL)
     raise TimeoutError(f"SSM command {cmd_id} did not complete within polling window")
 
 
@@ -55,10 +57,9 @@ def get_phase_and_progress(client, partner: str) -> str:
     if not log_file:
         return "Generating IDs"
 
-    log_path = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{partner}/logs/{log_file}")
-    csv_path = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{partner}/{partner}.csv")
+    log_path = shlex.quote(f"{base}/logs/{log_file}")
+    csv_path = shlex.quote(f"{base}/{partner}.csv")
 
-    # Get tail + item count + CSV total in one round-trip
     out = ssm_run(
         client,
         f"tail -5 {log_path}; "
@@ -123,28 +124,35 @@ def post_to_slack(token: str, rows: list[tuple[str, str]]) -> None:
 def main() -> None:
     ssm = boto3.client("ssm", region_name=REGION)
 
-    session_out = ssm_run(ssm, "tmux ls 2>/dev/null | grep wikimedia- || echo NONE")
+    session_out = ssm_run(ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE")
     if not session_out or session_out == "NONE":
         print("No active wikimedia sessions — skipping Slack post.")
         return
 
-    sessions = [
-        line.split(":")[0].strip()
-        for line in session_out.splitlines()
-        if line.startswith("wikimedia-")
-    ]
+    sessions = [line.split(":")[0].strip() for line in session_out.splitlines()]
+    if not sessions:
+        print("No active wikimedia sessions — skipping Slack post.")
+        return
 
-    rows = []
-    for session in sessions:
+    results: dict[str, str] = {}
+
+    def fetch(session: str) -> tuple[str, str]:
         partner = session.removeprefix("wikimedia-")
         try:
             phase = get_phase_and_progress(ssm, partner)
         except Exception:
             logging.exception("Failed to get status for %s", session)
             phase = "Unknown (error)"
-        rows.append((session, phase))
-        print(f"{session}: {phase}")
+        return session, phase
 
+    with ThreadPoolExecutor(max_workers=len(sessions)) as executor:
+        futures = {executor.submit(fetch, s): s for s in sessions}
+        for future in as_completed(futures):
+            session, phase = future.result()
+            results[session] = phase
+            print(f"{session}: {phase}")
+
+    rows = [(s, results[s]) for s in sessions if s in results]
     token = os.environ["DPLA_SLACK_BOT_TOKEN"]
     post_to_slack(token, rows)
     print("Posted to Slack.")
