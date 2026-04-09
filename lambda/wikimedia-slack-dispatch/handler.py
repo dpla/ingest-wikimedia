@@ -13,6 +13,7 @@ Environment variables (set on the Lambda function):
   GH_WORKFLOW           — e.g. wikimedia-upload-status.yml
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -57,6 +58,8 @@ def _dispatch_workflow(token: str, repo: str, workflow: str) -> int:
 def handler(event, context):
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     body = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        body = base64.b64decode(body).decode("utf-8")
 
     timestamp = headers.get("x-slack-request-timestamp", "")
     signature = headers.get("x-slack-signature", "")

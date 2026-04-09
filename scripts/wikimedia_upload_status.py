@@ -31,7 +31,12 @@ def ssm_run(client, cmd: str) -> str:
     cmd_id = resp["Command"]["CommandId"]
     for _ in range(SSM_MAX_POLLS):
         time.sleep(SSM_POLL_INTERVAL)
-        inv = client.get_command_invocation(CommandId=cmd_id, InstanceId=INSTANCE_ID)
+        try:
+            inv = client.get_command_invocation(
+                CommandId=cmd_id, InstanceId=INSTANCE_ID
+            )
+        except client.exceptions.InvocationDoesNotExist:
+            continue
         status = inv["Status"]
         if status == "Success":
             return inv.get("StandardOutputContent", "").strip()
