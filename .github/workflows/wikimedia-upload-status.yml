@@ -1,0 +1,26 @@
+name: Wikimedia Upload Status
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+  workflow_dispatch:         # also triggerable via API (Slack slash command)
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install boto3 requests
+
+      - name: Check status and post to Slack
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.WIKIMEDIA_STATUS_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.WIKIMEDIA_STATUS_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          DPLA_SLACK_BOT_TOKEN: ${{ secrets.DPLA_SLACK_BOT_TOKEN }}
+        run: python scripts/wikimedia_upload_status.py
