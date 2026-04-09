@@ -60,6 +60,7 @@ def get_phase_and_progress(client, partner: str) -> str:
         f"echo '---'; "
         f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || echo 0; "
         f"grep -c 'Uploaded to' {log_path} 2>/dev/null || echo 0; "
+        f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || echo 0; "
         f"wc -l < {csv_path} 2>/dev/null || echo 0",
     )
 
@@ -69,7 +70,8 @@ def get_phase_and_progress(client, partner: str) -> str:
 
     dpla_id_count = int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = int(count_lines[1]) if len(count_lines) > 1 else 0
-    total = int(count_lines[2]) if len(count_lines) > 2 else 0
+    skipped_count = int(count_lines[2]) if len(count_lines) > 2 else 0
+    total = int(count_lines[3]) if len(count_lines) > 3 else 0
 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
@@ -80,9 +82,10 @@ def get_phase_and_progress(client, partner: str) -> str:
         return "Generating IDs"
 
     if "upload" in log_file:
-        if uploaded_count == 0:
+        processed_count = uploaded_count + skipped_count
+        if processed_count == 0:
             return "Uploading (starting...)"
-        return f"Uploading ({uploaded_count:,} / {total:,}, ~{pct(uploaded_count)}%)"
+        return f"Uploading ({processed_count:,} / {total:,}, ~{pct(processed_count)}%)"
 
     return "Unknown"
 
