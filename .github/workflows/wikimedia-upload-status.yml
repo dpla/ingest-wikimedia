@@ -5,6 +5,9 @@ on:
     - cron: "0 */6 * * *"  # every 6 hours
   workflow_dispatch:         # also triggerable via API (Slack slash command)
 
+permissions:
+  contents: read
+
 jobs:
   check-status:
     runs-on: ubuntu-latest
