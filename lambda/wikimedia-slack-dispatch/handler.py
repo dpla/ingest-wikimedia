@@ -16,6 +16,7 @@ Environment variables (set on the Lambda function):
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 import urllib.error
@@ -25,7 +26,11 @@ import urllib.request
 def _verify_slack_signature(
     signing_secret: str, timestamp: str, body: str, signature: str
 ) -> bool:
-    if abs(time.time() - int(timestamp)) > 300:
+    try:
+        ts = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(time.time() - ts) > 300:
         return False
     sig_base = f"v0:{timestamp}:{body}".encode()
     mac = hmac.new(signing_secret.encode(), sig_base, hashlib.sha256)
@@ -70,9 +75,11 @@ def handler(event, context):
     try:
         status = _dispatch_workflow(os.environ["GH_TOKEN"], repo, workflow)
     except urllib.error.HTTPError as e:
+        logging.error("GitHub API error: HTTP %s", e.code)
         msg = f"Failed to trigger workflow (HTTP {e.code})"
-    except Exception as e:
-        msg = f"Error: {e}"
+    except Exception:
+        logging.exception("Unexpected error dispatching workflow")
+        msg = "Failed to trigger workflow due to an internal error."
     else:
         msg = (
             "Checking Wikimedia upload status — results will post to #tech-alerts shortly."

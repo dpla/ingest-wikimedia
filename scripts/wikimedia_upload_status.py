@@ -6,7 +6,9 @@ the /wikimedia-status Slack slash command via Lambda).
 """
 
 import json
+import logging
 import os
+import shlex
 import time
 
 import boto3
@@ -30,21 +32,25 @@ def ssm_run(client, cmd: str) -> str:
     for _ in range(SSM_MAX_POLLS):
         time.sleep(SSM_POLL_INTERVAL)
         inv = client.get_command_invocation(CommandId=cmd_id, InstanceId=INSTANCE_ID)
-        if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
-            return inv["StandardOutputContent"].strip()
-    return ""
+        status = inv["Status"]
+        if status == "Success":
+            return inv.get("StandardOutputContent", "").strip()
+        if status in ("Failed", "TimedOut", "Cancelled"):
+            stderr = inv.get("StandardErrorContent", "").strip()
+            raise RuntimeError(
+                f"SSM command {cmd_id} ended with {status}: {stderr or 'no stderr'}"
+            )
+    raise TimeoutError(f"SSM command {cmd_id} did not complete within polling window")
 
 
 def get_phase_and_progress(client, partner: str) -> str:
-    log_file = ssm_run(
-        client,
-        f"ls -t /home/ec2-user/ingest-wikimedia/{partner}/logs/ 2>/dev/null | head -1",
-    )
+    base = f"/home/ec2-user/ingest-wikimedia/{shlex.quote(partner)}"
+    log_file = ssm_run(client, f"ls -t {base}/logs/ 2>/dev/null | head -1")
     if not log_file:
         return "Generating IDs"
 
-    log_path = f"/home/ec2-user/ingest-wikimedia/{partner}/logs/{log_file}"
-    csv_path = f"/home/ec2-user/ingest-wikimedia/{partner}/{partner}.csv"
+    log_path = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{partner}/logs/{log_file}")
+    csv_path = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{partner}/{partner}.csv")
 
     # Get tail + item count + CSV total in one round-trip
     out = ssm_run(
@@ -122,7 +128,11 @@ def main() -> None:
     rows = []
     for session in sessions:
         partner = session.removeprefix("wikimedia-")
-        phase = get_phase_and_progress(ssm, partner)
+        try:
+            phase = get_phase_and_progress(ssm, partner)
+        except Exception:
+            logging.exception("Failed to get status for %s", session)
+            phase = "Unknown (error)"
         rows.append((session, phase))
         print(f"{session}: {phase}")
 
