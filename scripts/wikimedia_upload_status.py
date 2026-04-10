@@ -128,7 +128,7 @@ def post_to_slack(token: str, rows: list[tuple[str, str]]) -> None:
 
 
 def main() -> None:
-    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     if not token:
         raise RuntimeError(
             "Missing required environment variable: DPLA_SLACK_BOT_TOKEN"
