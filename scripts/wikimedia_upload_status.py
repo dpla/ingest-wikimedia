@@ -64,9 +64,9 @@ def get_phase_and_progress(client, partner: str) -> str:
         client,
         f"tail -5 {log_path}; "
         f"echo '---'; "
-        f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || echo 0; "
-        f"grep -c 'Uploaded to' {log_path} 2>/dev/null || echo 0; "
-        f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || echo 0; "
+        f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || true; "
+        f"grep -c 'Uploaded to' {log_path} 2>/dev/null || true; "
+        f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || true; "
         f"wc -l < {csv_path} 2>/dev/null || echo 0",
     )
 
