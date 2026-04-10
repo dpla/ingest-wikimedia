@@ -82,12 +82,12 @@ def get_phase_and_progress(client, partner: str) -> str:
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
 
-    if "download" in log_file:
+    if log_file.endswith("-download.log"):
         if "Downloading" in tail or "Key already in S3" in tail:
             return f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%)"
         return "Generating IDs"
 
-    if "upload" in log_file:
+    if log_file.endswith("-upload.log"):
         processed_count = uploaded_count + skipped_count
         if processed_count == 0:
             return "Uploading (starting...)"

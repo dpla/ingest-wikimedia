@@ -60,7 +60,7 @@ def _dispatch_workflow(token: str, repo: str, workflow: str) -> int:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=2) as resp:
         return resp.status
 
 
