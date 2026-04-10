@@ -122,6 +122,12 @@ def post_to_slack(token: str, rows: list[tuple[str, str]]) -> None:
 
 
 def main() -> None:
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Missing required environment variable: DPLA_SLACK_BOT_TOKEN"
+        )
+
     ssm = boto3.client("ssm", region_name=REGION)
 
     session_out = ssm_run(ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE")
@@ -153,11 +159,6 @@ def main() -> None:
             print(f"{session}: {phase}")
 
     rows = [(s, results[s]) for s in sessions if s in results]
-    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
-    if not token:
-        raise RuntimeError(
-            "Missing required environment variable: DPLA_SLACK_BOT_TOKEN"
-        )
     post_to_slack(token, rows)
     print("Posted to Slack.")
 

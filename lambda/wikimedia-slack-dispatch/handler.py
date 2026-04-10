@@ -39,6 +39,14 @@ def _verify_slack_signature(
     return hmac.compare_digest("v0=" + mac.hexdigest(), signature)
 
 
+def _require_env(key: str) -> str:
+    value = os.environ.get(key)
+    if not value:
+        logging.error("Missing required environment variable: %s", key)
+        raise RuntimeError(key)
+    return value
+
+
 def _dispatch_workflow(token: str, repo: str, workflow: str) -> int:
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/dispatches"
     req = urllib.request.Request(
@@ -71,18 +79,14 @@ def handler(event, context):
     if not timestamp or not signature:
         return {"statusCode": 400, "body": "Missing Slack headers"}
 
-    signing_secret = os.environ.get("SLACK_SIGNING_SECRET")
-    if not signing_secret:
-        logging.error("Missing required environment variable: SLACK_SIGNING_SECRET")
+    try:
+        signing_secret = _require_env("SLACK_SIGNING_SECRET")
+        gh_token = _require_env("GH_TOKEN")
+    except RuntimeError:
         return {"statusCode": 500, "body": "Server misconfiguration"}
 
     if not _verify_slack_signature(signing_secret, timestamp, body, signature):
         return {"statusCode": 401, "body": "Invalid signature"}
-
-    gh_token = os.environ.get("GH_TOKEN")
-    if not gh_token:
-        logging.error("Missing required environment variable: GH_TOKEN")
-        return {"statusCode": 500, "body": "Server misconfiguration"}
 
     repo = os.environ.get("GH_REPO", "dpla/ingest-wikimedia")
     workflow = os.environ.get("GH_WORKFLOW", "wikimedia-upload-status.yml")
