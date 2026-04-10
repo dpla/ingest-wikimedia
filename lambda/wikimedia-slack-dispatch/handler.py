@@ -51,7 +51,7 @@ def _dispatch_workflow(token: str, repo: str, workflow: str) -> int:
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/dispatches"
     req = urllib.request.Request(
         url,
-        data=json.dumps({"ref": "main"}).encode(),
+        data=json.dumps({"ref": "main", "inputs": {"notify_if_idle": "true"}}).encode(),
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",

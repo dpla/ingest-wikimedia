@@ -130,14 +130,20 @@ def main() -> None:
 
     ssm = boto3.client("ssm", region_name=REGION)
 
-    session_out = ssm_run(ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE")
-    if not session_out or session_out == "NONE":
-        print("No active wikimedia sessions — skipping Slack post.")
-        return
+    notify_if_idle = os.environ.get("NOTIFY_IF_IDLE", "false").lower() == "true"
 
-    sessions = [line.split(":")[0].strip() for line in session_out.splitlines()]
+    session_out = ssm_run(ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE")
+    sessions = (
+        [line.split(":")[0].strip() for line in session_out.splitlines()]
+        if session_out and session_out != "NONE"
+        else []
+    )
+
     if not sessions:
-        print("No active wikimedia sessions — skipping Slack post.")
+        print("No active wikimedia sessions.")
+        if notify_if_idle:
+            post_to_slack(token, [("(none)", "No active Wikimedia upload sessions.")])
+            print("Posted idle status to Slack.")
         return
 
     results: dict[str, str] = {}
