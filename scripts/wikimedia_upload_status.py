@@ -74,10 +74,16 @@ def get_phase_and_progress(client, partner: str) -> str:
     tail = parts[0].strip()
     count_lines = parts[1].strip().splitlines() if len(parts) > 1 else []
 
-    dpla_id_count = int(count_lines[0]) if len(count_lines) > 0 else 0
-    uploaded_count = int(count_lines[1]) if len(count_lines) > 1 else 0
-    skipped_count = int(count_lines[2]) if len(count_lines) > 2 else 0
-    total = int(count_lines[3]) if len(count_lines) > 3 else 0
+    def _safe_int(s: str) -> int:
+        try:
+            return int(s)
+        except ValueError:
+            return 0
+
+    dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
+    uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
+    skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
+    total = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
