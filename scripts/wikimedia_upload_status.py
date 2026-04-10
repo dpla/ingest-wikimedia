@@ -157,7 +157,7 @@ def main() -> None:
             phase = "Unknown (error)"
         return session, phase
 
-    with ThreadPoolExecutor(max_workers=len(sessions)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(sessions), 8)) as executor:
         futures = {executor.submit(fetch, s): s for s in sessions}
         for future in as_completed(futures):
             session, phase = future.result()

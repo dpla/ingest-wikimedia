@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: wikimedia-upload-status
+  cancel-in-progress: false
+
 jobs:
   check-status:
     runs-on: ubuntu-latest
@@ -24,7 +28,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install boto3 requests
+      - run: pip install boto3==1.42.87 requests==2.32.5
 
       - name: Check status and post to Slack
         env:
