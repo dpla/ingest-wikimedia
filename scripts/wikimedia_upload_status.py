@@ -153,7 +153,11 @@ def main() -> None:
             print(f"{session}: {phase}")
 
     rows = [(s, results[s]) for s in sessions if s in results]
-    token = os.environ["DPLA_SLACK_BOT_TOKEN"]
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "Missing required environment variable: DPLA_SLACK_BOT_TOKEN"
+        )
     post_to_slack(token, rows)
     print("Posted to Slack.")
 

@@ -79,11 +79,16 @@ def handler(event, context):
     if not _verify_slack_signature(signing_secret, timestamp, body, signature):
         return {"statusCode": 401, "body": "Invalid signature"}
 
+    gh_token = os.environ.get("GH_TOKEN")
+    if not gh_token:
+        logging.error("Missing required environment variable: GH_TOKEN")
+        return {"statusCode": 500, "body": "Server misconfiguration"}
+
     repo = os.environ.get("GH_REPO", "dpla/ingest-wikimedia")
     workflow = os.environ.get("GH_WORKFLOW", "wikimedia-upload-status.yml")
 
     try:
-        status = _dispatch_workflow(os.environ["GH_TOKEN"], repo, workflow)
+        status = _dispatch_workflow(gh_token, repo, workflow)
     except urllib.error.HTTPError as e:
         logging.error("GitHub API error: HTTP %s", e.code)
         msg = f"Failed to trigger workflow (HTTP {e.code})"
