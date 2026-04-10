@@ -97,6 +97,10 @@ def get_phase_and_progress(client, partner: str) -> str:
         processed_count = uploaded_count + skipped_count
         if processed_count == 0:
             return "Uploading (starting...)"
+        # Log is cumulative across runs: processed_count can exceed total once a
+        # full pass completes.  Treat that as "done" rather than show >100%.
+        if total > 0 and processed_count >= total:
+            return f"Upload complete ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
         return f"Uploading ({processed_count:,} / {total:,}, ~{pct(processed_count)}%)"
 
     return "Unknown"
