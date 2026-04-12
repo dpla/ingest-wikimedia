@@ -1,6 +1,7 @@
 import json
 import logging
 import mimetypes
+import random
 import time
 
 import click
@@ -53,7 +54,8 @@ from ingest_wikimedia.wikimedia import (
 )
 
 MAX_UPLOAD_RETRIES = 3
-UPLOAD_RETRY_DELAY_SECS = 30
+UPLOAD_RETRY_BASE_DELAY_SECS = 5
+UPLOAD_RETRY_MAX_DELAY_SECS = 60
 
 
 class Uploader:
@@ -210,12 +212,16 @@ class Uploader:
                     except Exception as ex:
                         is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
                         if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
+                            delay = min(
+                                UPLOAD_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1)),
+                                UPLOAD_RETRY_MAX_DELAY_SECS,
+                            ) + random.uniform(0, 1.0)
                             logging.warning(
                                 f"Transient upload error on attempt {attempt}/"
                                 f"{MAX_UPLOAD_RETRIES}, retrying in "
-                                f"{UPLOAD_RETRY_DELAY_SECS}s: {ex}"
+                                f"{delay:.1f}s: {ex}"
                             )
-                            time.sleep(UPLOAD_RETRY_DELAY_SECS)
+                            time.sleep(delay)
                         else:
                             if is_backend_fail:
                                 self.tracker.increment(Result.FAILED)
