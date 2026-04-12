@@ -142,7 +142,23 @@ def main() -> None:
 
     notify_if_idle = os.environ.get("NOTIFY_IF_IDLE", "false").lower() == "true"
 
-    session_out = ssm_run(ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE")
+    try:
+        session_out = ssm_run(
+            ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE"
+        )
+    except TimeoutError as e:
+        logging.error("SSM poll timed out: %s", e)
+        post_to_slack(
+            token,
+            [
+                (
+                    "(error)",
+                    "Status check timed out — SSM did not respond. Try again shortly.",
+                )
+            ],
+        )
+        return
+
     sessions = (
         [line.split(":")[0].strip() for line in session_out.splitlines()]
         if session_out and session_out != "NONE"
