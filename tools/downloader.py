@@ -194,12 +194,14 @@ class Downloader:
         verbose: bool,
         partner: str,
         dpla_id: str,
-        providers_json: dict,
         sleep_secs: float,
     ) -> None:
         """
-        For every item, makes sure it's eligible, tries to get a list of files for it, and
-        stores the metadata in S3. Then calls process_media_file on the list.
+        For every item, tries to get a list of files for it and stores the
+        metadata in S3. Then calls process_media_file on the list.
+
+        Eligibility is enforced at ID generation time (get-ids-es), so no
+        runtime eligibility check is performed here.
         """
 
         try:
@@ -228,19 +230,8 @@ class Downloader:
                     partner, dpla_id, json.dumps(item_metadata)
                 )
 
-            provider, data_provider = self.dpla.get_provider_and_data_provider(
-                item_metadata, providers_json
-            )
-
             if not self.dpla.check_record_partner(partner, item_metadata):
                 logging.info(f"{dpla_id} is from the wrong partner.")
-                self.tracker.increment(Result.SKIPPED)
-                return
-
-            if not self.dpla.is_wiki_eligible(
-                dpla_id, item_metadata, provider, data_provider
-            ):
-                logging.info(f"{dpla_id} is not eligible.")
                 self.tracker.increment(Result.SKIPPED)
                 return
 
@@ -277,8 +268,6 @@ class Downloader:
         if verbose:
             logging.info(f"DPLA ID: {dpla_id}")
             logging.info(f"Metadata: {item_metadata}")
-            logging.info(f"Provider: {self.dpla.provider_str(provider)}")
-            logging.info(f"Data Provider: {self.dpla.provider_str(data_provider)}")
 
         for media_url in tqdm(
             media_urls, desc="Downloading Files", leave=False, unit="File", ncols=100
@@ -344,7 +333,6 @@ def main(
 
     try:
         local_fs.setup_temp_dir()
-        providers_json = dpla.get_providers_data()
         dpla_ids = load_ids(ids_file)
         for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item", ncols=100):
             logging.info(f"DPLA ID: {dpla_id}")
@@ -354,7 +342,6 @@ def main(
                 verbose,
                 partner,
                 dpla_id,
-                providers_json,
                 sleep,
             )
 
