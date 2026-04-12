@@ -94,14 +94,14 @@ def get_phase_and_progress(client, partner: str) -> str:
         return "Generating IDs"
 
     if log_file.endswith("-upload.log"):
-        processed_count = uploaded_count + skipped_count
-        if processed_count == 0:
+        if dpla_id_count == 0:
             return "Uploading (starting...)"
-        # Log is cumulative across runs: processed_count can exceed total once a
-        # full pass completes.  Treat that as "done" rather than show >100%.
-        if total > 0 and processed_count >= total:
+        # Use DPLA ID count (one per item) for progress and completion detection.
+        # uploaded_count + skipped_count overcounts multi-page items (one line per
+        # page) and triggers false "complete" status before the run finishes.
+        if total > 0 and dpla_id_count >= total:
             return f"Upload complete ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
-        return f"Uploading ({processed_count:,} / {total:,}, ~{pct(processed_count)}%)"
+        return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%)"
 
     return "Unknown"
 
