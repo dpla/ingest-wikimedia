@@ -1,6 +1,7 @@
 import json
 import logging
 import mimetypes
+import random
 import time
 
 import click
@@ -47,9 +48,14 @@ from ingest_wikimedia.wikimedia import (
     ERROR_BANNED,
     ERROR_DUPLICATE,
     ERROR_NOCHANGE,
+    ERROR_BACKEND_FAIL,
     get_site,
     get_wikidata_site,
 )
+
+MAX_UPLOAD_RETRIES = 3
+UPLOAD_RETRY_BASE_DELAY_SECS = 5
+UPLOAD_RETRY_MAX_DELAY_SECS = 60
 
 
 class Uploader:
@@ -190,15 +196,36 @@ class Uploader:
 
                 wiki_file_page = get_page(self.site, page_title)
 
-                result = self.site.upload(
-                    filepage=wiki_file_page,
-                    source_filename=temp_file.name,
-                    comment=upload_comment,
-                    text=wiki_markup,
-                    ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
-                    asynchronous=True,
-                    chunk_size=WMC_UPLOAD_CHUNK_SIZE,
-                )
+                result = None
+                for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                    try:
+                        result = self.site.upload(
+                            filepage=wiki_file_page,
+                            source_filename=temp_file.name,
+                            comment=upload_comment,
+                            text=wiki_markup,
+                            ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
+                            asynchronous=True,
+                            chunk_size=WMC_UPLOAD_CHUNK_SIZE,
+                        )
+                        break
+                    except Exception as ex:
+                        is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
+                        if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
+                            delay = min(
+                                UPLOAD_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1)),
+                                UPLOAD_RETRY_MAX_DELAY_SECS,
+                            ) + random.uniform(0, 1.0)
+                            logging.warning(
+                                f"Transient upload error on attempt {attempt}/"
+                                f"{MAX_UPLOAD_RETRIES}, retrying in "
+                                f"{delay:.1f}s: {ex}"
+                            )
+                            time.sleep(delay)
+                        else:
+                            if is_backend_fail:
+                                self.tracker.increment(Result.FAILED)
+                            raise
 
                 if not result:
                     # These error message accounts for Page does not exist,
@@ -272,7 +299,6 @@ class Uploader:
                 DC_TITLE_FIELD_NAME,
             )
 
-            # playing it safe in case titles is empty
             title = titles[0] if titles else ""
 
             ordinal = 0
@@ -326,6 +352,9 @@ class Uploader:
             message = f"File already exists, {error_string}"
         elif ERROR_NOCHANGE in error_string:
             message = f"File exists, no change, {error_string}"
+        elif ERROR_BACKEND_FAIL in error_string:
+            message = "Wikimedia storage backend error (retries exhausted)"
+            error = True
 
         if error:
             logging.error(f"Failed: {message}", exc_info=ex)

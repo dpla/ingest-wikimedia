@@ -65,6 +65,9 @@ def get_page_title(
         .replace("/", "-")
         .replace(":", "-")
         .replace("#", "-")
+        .replace(
+            "\ufffd", "\u2019"
+        )  # Unicode replacement char → right single quote (corrupted metadata)
     )
 
     escaped_visible_title = replace_invisible(escaped_title)
@@ -243,6 +246,7 @@ ERROR_MIME = "filetype-badmime"
 ERROR_BANNED = "filetype-banned"
 ERROR_DUPLICATE = "duplicate"
 ERROR_NOCHANGE = "no-change"
+ERROR_BACKEND_FAIL = "backend-fail-internal"
 COMMONS_SITE_NAME = "commons"
 WMC_UPLOAD_CHUNK_SIZE = 20_000_000  # 20 MB
 VALUE_JOIN_DELIMITER = "; "
