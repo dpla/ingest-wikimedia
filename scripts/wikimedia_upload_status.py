@@ -67,7 +67,8 @@ def get_phase_and_progress(client, partner: str) -> str:
         f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || true; "
         f"grep -c 'Uploaded to' {log_path} 2>/dev/null || true; "
         f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || true; "
-        f"wc -l < {csv_path} 2>/dev/null || echo 0",
+        f"wc -l < {csv_path} 2>/dev/null || echo 0; "
+        f"grep -c 'COUNTS:' {log_path} 2>/dev/null || true",
     )
 
     parts = out.split("---\n", 1)
@@ -84,6 +85,7 @@ def get_phase_and_progress(client, partner: str) -> str:
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
     total = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
+    counts_marker = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
@@ -96,10 +98,10 @@ def get_phase_and_progress(client, partner: str) -> str:
     if log_file.endswith("-upload.log"):
         if dpla_id_count == 0:
             return "Uploading (starting...)"
-        # Use DPLA ID count (one per item) for progress and completion detection.
-        # uploaded_count + skipped_count overcounts multi-page items (one line per
-        # page) and triggers false "complete" status before the run finishes.
-        if total > 0 and dpla_id_count >= total:
+        # Use the COUNTS: terminal marker as the definitive completion signal.
+        # dpla_id_count is logged at the start of each item, not after all its
+        # files finish, so count arithmetic alone can fire too early.
+        if counts_marker > 0:
             return f"Upload complete ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
         return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%)"
 
