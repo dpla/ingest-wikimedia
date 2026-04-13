@@ -67,7 +67,8 @@ def get_phase_and_progress(client, partner: str) -> str:
         f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || true; "
         f"grep -c 'Uploaded to' {log_path} 2>/dev/null || true; "
         f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || true; "
-        f"wc -l < {csv_path} 2>/dev/null || echo 0",
+        f"wc -l < {csv_path} 2>/dev/null || echo 0; "
+        f"grep -c 'COUNTS:' {log_path} 2>/dev/null || true",
     )
 
     parts = out.split("---\n", 1)
@@ -84,6 +85,7 @@ def get_phase_and_progress(client, partner: str) -> str:
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
     total = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
+    counts_marker = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
@@ -94,14 +96,14 @@ def get_phase_and_progress(client, partner: str) -> str:
         return "Generating IDs"
 
     if log_file.endswith("-upload.log"):
-        processed_count = uploaded_count + skipped_count
-        if processed_count == 0:
+        if dpla_id_count == 0:
             return "Uploading (starting...)"
-        # Log is cumulative across runs: processed_count can exceed total once a
-        # full pass completes.  Treat that as "done" rather than show >100%.
-        if total > 0 and processed_count >= total:
+        # Use the COUNTS: terminal marker as the definitive completion signal.
+        # dpla_id_count is logged at the start of each item, not after all its
+        # files finish, so count arithmetic alone can fire too early.
+        if counts_marker > 0:
             return f"Upload complete ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
-        return f"Uploading ({processed_count:,} / {total:,}, ~{pct(processed_count)}%)"
+        return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%)"
 
     return "Unknown"
 
