@@ -7,8 +7,11 @@ Eligibility criteria applied:
   3. Asset      — has mediaMaster, iiifManifest, or an isShownAt URL from which
                   a IIIF manifest can be formulaically derived (e.g. CONTENTdm)
   4. Institution — dataProvider.name matches an eligible name string from
-                   institutions_v2.json, where eligible means the institution has
-                   a Wikidata ID AND (hub.upload=True OR institution.upload=True).
+                   institutions_v2.json, where eligible means the hub has a
+                   Wikidata ID AND the institution has a Wikidata ID AND
+                   (hub.upload=True OR institution.upload=True).
+                   The hub Wikidata requirement ensures the hub-level Commons
+                   category can be created during upload.
                    Name strings are used (not Wikidata URIs) so that two name variants
                    mapping to the same Wikidata ID can have independent upload flags.
   5. Block list  — ID not present in dpla-id-banlist.txt
@@ -62,7 +65,8 @@ def load_eligible_dp_names(partner: str) -> list[str]:
     dataProvider name strings that are eligible for upload for the given hub.
 
     An institution is eligible when:
-      - it has a non-empty Wikidata ID, AND
+      - the hub has a non-empty Wikidata ID (required for hub Commons category), AND
+      - the institution has a non-empty Wikidata ID, AND
       - hub.upload=True  (the entire hub is open; every institution counts)
         OR institution.upload=True  (this specific institution is approved)
 
@@ -79,12 +83,13 @@ def load_eligible_dp_names(partner: str) -> list[str]:
         raise ValueError(f"Hub '{hub_name}' not found in institutions_v2.json")
 
     hub_upload = hub.get("upload", False)
+    hub_wikidata = hub.get("Wikidata", "")
 
     eligible = []
     for inst_name, inst_info in hub.get("institutions", {}).items():
         wikidata_id = inst_info.get("Wikidata", "")
         inst_upload = inst_info.get("upload", False)
-        if wikidata_id and (hub_upload or inst_upload):
+        if hub_wikidata and wikidata_id and (hub_upload or inst_upload):
             eligible.append(inst_name)
 
     return eligible
