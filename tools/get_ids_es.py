@@ -6,8 +6,14 @@ Eligibility criteria applied:
   2. Rights     — rightsCategory = "Unlimited Re-Use"
   3. Asset      — has mediaMaster, iiifManifest, or an isShownAt URL from which
                   a IIIF manifest can be formulaically derived (e.g. CONTENTdm)
-  4. Institution — dataProvider has a Wikidata ID AND
-                   (hub.upload=True OR institution.upload=True) per institutions_v2.json
+  4. Institution — dataProvider.name matches an eligible name string from
+                   institutions_v2.json, where eligible means the hub has a
+                   Wikidata ID AND the institution has a Wikidata ID AND
+                   (hub.upload=True OR institution.upload=True).
+                   The hub Wikidata requirement ensures the hub-level Commons
+                   category can be created during upload.
+                   Name strings are used (not Wikidata URIs) so that two name variants
+                   mapping to the same Wikidata ID can have independent upload flags.
   5. Block list  — ID not present in dpla-id-banlist.txt
 
 institutions_v2.json is fetched fresh from the GitHub main branch on each run
@@ -38,7 +44,6 @@ from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.s3 import S3Client
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
-WIKIDATA_BASE_URI = "http://www.wikidata.org/entity/"
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
 
@@ -54,15 +59,19 @@ IIIF_DERIVABLE_ISSHOWNAT_PATTERNS = [
 ]
 
 
-def load_eligible_dp_uris(partner: str) -> list[str]:
+def load_eligible_dp_names(partner: str) -> list[str]:
     """
     Fetch institutions_v2.json from GitHub and return the list of
-    dataProvider Wikidata URIs that are eligible for upload for the given hub.
+    dataProvider name strings that are eligible for upload for the given hub.
 
     An institution is eligible when:
-      - it has a non-empty Wikidata ID, AND
+      - the hub has a non-empty Wikidata ID (required for hub Commons category), AND
+      - the institution has a non-empty Wikidata ID, AND
       - hub.upload=True  (the entire hub is open; every institution counts)
         OR institution.upload=True  (this specific institution is approved)
+
+    Name strings are used rather than Wikidata URIs so that two provider name
+    variants mapping to the same Wikidata ID can carry independent upload flags.
     """
     hub_name = DPLA_PARTNERS[partner]
     resp = requests.get(INSTITUTIONS_URL, timeout=15)
@@ -74,20 +83,21 @@ def load_eligible_dp_uris(partner: str) -> list[str]:
         raise ValueError(f"Hub '{hub_name}' not found in institutions_v2.json")
 
     hub_upload = hub.get("upload", False)
+    hub_wikidata = hub.get("Wikidata", "")
 
     eligible = []
-    for inst_info in hub.get("institutions", {}).values():
+    for inst_name, inst_info in hub.get("institutions", {}).items():
         wikidata_id = inst_info.get("Wikidata", "")
         inst_upload = inst_info.get("upload", False)
-        if wikidata_id and (hub_upload or inst_upload):
-            eligible.append(f"{WIKIDATA_BASE_URI}{wikidata_id}")
+        if hub_wikidata and wikidata_id and (hub_upload or inst_upload):
+            eligible.append(inst_name)
 
     return eligible
 
 
 def build_query(
     provider_name: str,
-    eligible_dp_uris: list[str],
+    eligible_dp_names: list[str],
     search_after: list | None = None,
 ) -> dict:
     """Build the Elasticsearch boolean query for a single page."""
@@ -108,7 +118,7 @@ def build_query(
                 "filter": [
                     {"term": {"provider.name.not_analyzed": provider_name}},
                     {"term": {"rightsCategory": "Unlimited Re-Use"}},
-                    {"terms": {"dataProvider.exactMatch": eligible_dp_uris}},
+                    {"terms": {"dataProvider.name.not_analyzed": eligible_dp_names}},
                     {
                         "bool": {
                             "should": asset_should,
@@ -149,8 +159,8 @@ def main(partner: str) -> None:
 
     provider_name = DPLA_PARTNERS[partner]
 
-    eligible_dp_uris = load_eligible_dp_uris(partner)
-    if not eligible_dp_uris:
+    eligible_dp_names = load_eligible_dp_names(partner)
+    if not eligible_dp_names:
         print(
             f"No eligible institutions found for {partner} in institutions_v2.json",
             file=sys.stderr,
@@ -165,7 +175,7 @@ def main(partner: str) -> None:
         futures: dict = {}
 
         while True:
-            query = build_query(provider_name, eligible_dp_uris, search_after)
+            query = build_query(provider_name, eligible_dp_names, search_after)
             response = requests.post(
                 ES_URL,
                 json=query,

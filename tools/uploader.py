@@ -268,13 +268,6 @@ class Uploader:
                 item_metadata, providers_json
             )
 
-            if not self.dpla.is_wiki_eligible(
-                dpla_id, item_metadata, provider, data_provider
-            ):
-                logging.info(f"Skipping {dpla_id}: Not eligible.")
-                self.tracker.increment(Result.SKIPPED)
-                return
-
             if self.category_ensurer:
                 institution_name = get_str(
                     get_dict(item_metadata, DATA_PROVIDER_FIELD_NAME), EDM_AGENT_NAME

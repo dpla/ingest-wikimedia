@@ -4,7 +4,6 @@ import os
 import time
 
 from ingest_wikimedia.dpla import (
-    DPLA,
     MEDIA_MASTER_FIELD_NAME,
     IIIF_MANIFEST_FIELD_NAME,
 )
@@ -45,7 +44,6 @@ class Downloader:
         s3_client: S3Client,
         web: Web,
         local_fs: LocalFS,
-        dpla: DPLA,
         iiif: IIIF,
     ):
         self.provider = provider
@@ -53,7 +51,6 @@ class Downloader:
         self.s3_client = s3_client
         self.web = web
         self.local_fs = local_fs
-        self.dpla = dpla
         self.iiif = iiif
 
     def upload_file_to_s3(
@@ -194,21 +191,21 @@ class Downloader:
         verbose: bool,
         partner: str,
         dpla_id: str,
-        providers_json: dict,
         sleep_secs: float,
     ) -> None:
         """
-        For every item, makes sure it's eligible, tries to get a list of files for it, and
-        stores the metadata in S3. Then calls process_media_file on the list.
+        For every item, tries to get a list of files for it and stores the
+        metadata in S3. Then calls process_media_file on the list.
+
+        Eligibility is enforced at ID generation time (get-ids-es), so no
+        runtime eligibility check is performed here. If staged metadata is
+        missing or lacks the get-ids-es marker, the item is skipped — re-run
+        get-ids-es to regenerate it.
         """
 
         try:
-            # Prefer metadata staged to S3 by get-ids-es (avoids DPLA API call).
-            # Only trust the cached object when it carries the staging marker —
-            # objects written by older downloader runs lack it and may be stale
-            # (e.g. missing a derived iiifManifest for CONTENTdm items).
-            item_metadata = None
             item_metadata_str = self.s3_client.get_item_metadata(partner, dpla_id)
+            item_metadata = None
             if item_metadata_str:
                 try:
                     candidate = json.loads(item_metadata_str)
@@ -218,29 +215,9 @@ class Downloader:
                     pass
 
             if item_metadata is None:
-                # Fallback: fetch from DPLA API and write to S3.
-                item_metadata = self.dpla.get_item_metadata(dpla_id)
-                if not item_metadata:
-                    logging.info(f"{dpla_id} was not found in the DPLA API.")
-                    self.tracker.increment(Result.SKIPPED)
-                    return
-                self.s3_client.write_item_metadata(
-                    partner, dpla_id, json.dumps(item_metadata)
-                )
-
-            provider, data_provider = self.dpla.get_provider_and_data_provider(
-                item_metadata, providers_json
-            )
-
-            if not self.dpla.check_record_partner(partner, item_metadata):
-                logging.info(f"{dpla_id} is from the wrong partner.")
-                self.tracker.increment(Result.SKIPPED)
-                return
-
-            if not self.dpla.is_wiki_eligible(
-                dpla_id, item_metadata, provider, data_provider
-            ):
-                logging.info(f"{dpla_id} is not eligible.")
+                # Metadata missing or lacks the get-ids-es staging marker.
+                # Re-run get-ids-es to regenerate staged metadata for this partner.
+                logging.warning(f"{dpla_id} has no valid staged metadata; skipping.")
                 self.tracker.increment(Result.SKIPPED)
                 return
 
@@ -277,8 +254,6 @@ class Downloader:
         if verbose:
             logging.info(f"DPLA ID: {dpla_id}")
             logging.info(f"Metadata: {item_metadata}")
-            logging.info(f"Provider: {self.dpla.provider_str(provider)}")
-            logging.info(f"Data Provider: {self.dpla.provider_str(data_provider)}")
 
         for media_url in tqdm(
             media_urls, desc="Downloading Files", leave=False, unit="File", ncols=100
@@ -328,7 +303,6 @@ def main(
         tools_context.get_s3_client(),
         tools_context.get_web(),
         tools_context.get_local_fs(),
-        tools_context.get_dpla(),
         tools_context.get_iiif(),
     )
 
@@ -344,7 +318,6 @@ def main(
 
     try:
         local_fs.setup_temp_dir()
-        providers_json = dpla.get_providers_data()
         dpla_ids = load_ids(ids_file)
         for dpla_id in tqdm(dpla_ids, desc="Downloading Items", unit="Item", ncols=100):
             logging.info(f"DPLA ID: {dpla_id}")
@@ -354,7 +327,6 @@ def main(
                 verbose,
                 partner,
                 dpla_id,
-                providers_json,
                 sleep,
             )
 
