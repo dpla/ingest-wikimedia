@@ -29,10 +29,10 @@ def main(ids_file: IO, partner: str, dry_run: bool):
     for dpla_id in tqdm(dpla_ids, desc="Nuking Items", unit="Item", ncols=100):
         logging.info(f"DPLA ID: {dpla_id}")
         s3_path = s3.get_item_s3_path(dpla_id, "", partner)
-        command = f"aws s3 rm s3://{S3_BUCKET}/{s3_path} --recursive"
+        command = ["aws", "s3", "rm", f"s3://{S3_BUCKET}/{s3_path}", "--recursive"]
         if dry_run:
-            command = command + " --dryrun"
-        subprocess.run(command, shell=True, check=True)
+            command.append("--dryrun")
+        subprocess.run(command, check=True)
 
     logging.info(f"{time.time() - start_time} seconds.")
 
