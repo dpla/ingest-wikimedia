@@ -51,10 +51,30 @@ def ssm_run(client, cmd: str) -> str:
 
 
 def get_phase_and_progress(client, partner: str) -> str:
+    def _safe_int(s: str) -> int:
+        try:
+            return int(s)
+        except ValueError:
+            return 0
+
     base = f"/home/ec2-user/ingest-wikimedia/{partner}"
     log_dir = shlex.quote(f"{base}/logs")
-    log_file = ssm_run(client, f"ls -t {log_dir}/ 2>/dev/null | head -1")
-    if not log_file:
+    session_name = shlex.quote(f"wikimedia-{partner}")
+
+    # One round-trip: session creation time, most recent log filename, and its mtime.
+    precheck = ssm_run(
+        client,
+        f"tmux display-message -t {session_name} -p '#{{session_created}}' 2>/dev/null || echo 0; "
+        f'f=$(ls -t {log_dir}/ 2>/dev/null | head -1); echo "$f"; '
+        f'[ -n "$f" ] && stat -c %Y {log_dir}/"$f" 2>/dev/null || echo 0',
+    )
+    precheck_lines = precheck.splitlines()
+    session_created = _safe_int(precheck_lines[0]) if precheck_lines else 0
+    log_file = precheck_lines[1].strip() if len(precheck_lines) > 1 else ""
+    log_mtime = _safe_int(precheck_lines[2]) if len(precheck_lines) > 2 else 0
+
+    # Log predates this session → downloader hasn't started yet.
+    if not log_file or (session_created > 0 and log_mtime < session_created):
         return "Generating IDs"
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
@@ -74,12 +94,6 @@ def get_phase_and_progress(client, partner: str) -> str:
     parts = out.split("---\n", 1)
     tail = parts[0].strip()
     count_lines = parts[1].strip().splitlines() if len(parts) > 1 else []
-
-    def _safe_int(s: str) -> int:
-        try:
-            return int(s)
-        except ValueError:
-            return 0
 
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
