@@ -78,13 +78,13 @@ def get_phase_and_progress(client, partner: str) -> str:
     log_path = shlex.quote(f"{base}/logs/{log_file}")
     csv_path = shlex.quote(f"{base}/{partner}.csv")
 
-    # stat mtime first so we can detect logs from prior runs before reading content.
+    sep = "__WM_SEP__"
     out = ssm_run(
         client,
         f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
-        f"echo '---'; "
+        f"echo {sep}; "
         f"tail -5 {log_path}; "
-        f"echo '---'; "
+        f"echo {sep}; "
         f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || true; "
         f"grep -c 'Uploaded to' {log_path} 2>/dev/null || true; "
         f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || true; "
@@ -92,7 +92,7 @@ def get_phase_and_progress(client, partner: str) -> str:
         f"grep -c 'COUNTS:' {log_path} 2>/dev/null || true",
     )
 
-    sections = out.split("---\n", 2)
+    sections = out.split(f"{sep}\n", 2)
     log_mtime = _safe_int(sections[0].strip()) if sections else 0
 
     # Log predates this session → downloader hasn't started yet.
