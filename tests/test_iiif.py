@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 from requests import Session
 
-from ingest_wikimedia.iiif import IIIF, IIIF_V3_FULL_RES_JPG_SUFFIX
+from ingest_wikimedia.iiif import IIIF, IIIF_IMAGE_API_V2, IIIF_V3_FULL_RES_JPG_SUFFIX
 from ingest_wikimedia.tracker import Tracker
 
 
@@ -15,26 +15,30 @@ def iiif(tracker: Tracker, http_session: Session) -> IIIF:
     return IIIF(tracker, http_session)
 
 
-def test_iiif_v2_urls(iiif: IIIF):
-    iiif_record = {
-        "sequences": [
-            {
-                "canvases": [
-                    {
-                        "images": [
-                            {
-                                "resource": {
-                                    "service": {"@id": "http://server/iiif/identifier"}
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
+def _v2_record(service_id: str, context: str | None = None) -> dict:
+    service: dict = {"@id": service_id}
+    if context:
+        service["@context"] = context
+    return {
+        "sequences": [{"canvases": [{"images": [{"resource": {"service": service}}]}]}]
     }
-    result = iiif.iiif_v2_urls(iiif_record)
+
+
+def test_iiif_v2_urls(iiif: IIIF):
+    result = iiif.iiif_v2_urls(_v2_record("http://server/iiif/identifier"))
     assert result == ["http://server/iiif/identifier/full/max/0/default.jpg"]
+
+
+def test_iiif_v2_urls_image_api_v2_context(iiif: IIIF):
+    result = iiif.iiif_v2_urls(
+        _v2_record(
+            "https://cdm16022.contentdm.oclc.org/iiif/2/p16022coll664:80",
+            IIIF_IMAGE_API_V2,
+        )
+    )
+    assert result == [
+        "https://cdm16022.contentdm.oclc.org/iiif/2/p16022coll664:80/full/max/0/default.jpg"
+    ]
 
 
 def test_iiif_v2_multiple_sequences(iiif: IIIF):
