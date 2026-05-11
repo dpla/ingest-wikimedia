@@ -61,27 +61,28 @@ def get_phase_and_progress(client, partner: str) -> str:
     log_dir = shlex.quote(f"{base}/logs")
     session_name = shlex.quote(f"wikimedia-{partner}")
 
-    # One round-trip: session creation time, most recent log filename, and its mtime.
+    # Get session creation time and most recent log filename — no shell variables
+    # needed, avoiding outer-bash expansion of $f inside the bash -c double-quote.
     precheck = ssm_run(
         client,
         f"tmux display-message -t {session_name} -p '#{{session_created}}' 2>/dev/null || echo 0; "
-        f'f=$(ls -t {log_dir}/ 2>/dev/null | head -1); echo "$f"; '
-        f'[ -n "$f" ] && stat -c %Y {log_dir}/"$f" 2>/dev/null || echo 0',
+        f"ls -t {log_dir}/ 2>/dev/null | head -1",
     )
     precheck_lines = precheck.splitlines()
     session_created = _safe_int(precheck_lines[0]) if precheck_lines else 0
     log_file = precheck_lines[1].strip() if len(precheck_lines) > 1 else ""
-    log_mtime = _safe_int(precheck_lines[2]) if len(precheck_lines) > 2 else 0
 
-    # Log predates this session → downloader hasn't started yet.
-    if not log_file or (session_created > 0 and log_mtime < session_created):
+    if not log_file:
         return "Generating IDs"
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
     csv_path = shlex.quote(f"{base}/{partner}.csv")
 
+    # stat mtime first so we can detect logs from prior runs before reading content.
     out = ssm_run(
         client,
+        f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
+        f"echo '---'; "
         f"tail -5 {log_path}; "
         f"echo '---'; "
         f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || true; "
@@ -91,9 +92,15 @@ def get_phase_and_progress(client, partner: str) -> str:
         f"grep -c 'COUNTS:' {log_path} 2>/dev/null || true",
     )
 
-    parts = out.split("---\n", 1)
-    tail = parts[0].strip()
-    count_lines = parts[1].strip().splitlines() if len(parts) > 1 else []
+    sections = out.split("---\n", 2)
+    log_mtime = _safe_int(sections[0].strip()) if sections else 0
+
+    # Log predates this session → downloader hasn't started yet.
+    if session_created > 0 and log_mtime < session_created:
+        return "Generating IDs"
+
+    tail = sections[1].strip() if len(sections) > 1 else ""
+    count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
 
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
