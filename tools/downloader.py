@@ -49,9 +49,9 @@ class Downloader:
         self.provider = provider
         self.tracker = tracker
         self.s3_client = s3_client
-        self.web = web
         self.local_fs = local_fs
         self.iiif = iiif
+        self.http_session = web.get_http_session(provider=provider)
 
     def upload_file_to_s3(
         self,
@@ -79,11 +79,14 @@ class Downloader:
                         # Just in case (dunno why this would happen)
                         raise e
 
-                if obj_metadata and obj_metadata.get(CHECKSUM, None) == sha1:
-                    # Already uploaded, move on.
-                    logging.info("Already exists.")
-                    self.tracker.increment(Result.SKIPPED)
-                    return
+                if obj_metadata and obj_metadata.get(CHECKSUM) == sha1:
+                    try:
+                        if int(obj.content_length) > 0:
+                            logging.info("Already exists.")
+                            self.tracker.increment(Result.SKIPPED)
+                            return
+                    except (TypeError, ValueError):
+                        pass  # zero-byte stub or unreadable length — fall through to upload
 
                 with tqdm(
                     total=os.stat(f.name).st_size,
@@ -115,9 +118,7 @@ class Downloader:
         Tries to get a local copy of a file to stick in S3 later
         """
         try:
-            response = self.web.get_http_session(provider=self.provider).get(
-                media_url, stream=True
-            )
+            response = self.http_session.get(media_url, stream=True)
             response.raise_for_status()
             total_size = int(response.headers.get("content-length", 0))
             with tqdm(
@@ -223,24 +224,28 @@ class Downloader:
 
             if MEDIA_MASTER_FIELD_NAME in item_metadata:
                 media_urls = get_list(item_metadata, MEDIA_MASTER_FIELD_NAME)
+                self.s3_client.write_file_list(partner, dpla_id, media_urls)
 
             elif IIIF_MANIFEST_FIELD_NAME in item_metadata:
-                manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
-                manifest = self.iiif.get_iiif_manifest(manifest_url)
-                if not manifest:
-                    self.tracker.increment(Result.SKIPPED)
-                    return
-                self.s3_client.write_iiif_manifest(
-                    partner, dpla_id, json.dumps(manifest)
-                )
-                media_urls = self.iiif.get_iiif_urls(manifest)
+                cached_urls = self.s3_client.get_file_list(partner, dpla_id)
+                if not overwrite and cached_urls:
+                    media_urls = cached_urls
+                else:
+                    manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
+                    manifest = self.iiif.get_iiif_manifest(manifest_url)
+                    if not manifest:
+                        self.tracker.increment(Result.SKIPPED)
+                        return
+                    self.s3_client.write_iiif_manifest(
+                        partner, dpla_id, json.dumps(manifest)
+                    )
+                    media_urls = self.iiif.get_iiif_urls(manifest)
+                    self.s3_client.write_file_list(partner, dpla_id, media_urls)
 
             else:
-                # not sure how we got here
+                # item metadata has neither media_master nor IIIF manifest field
                 self.tracker.increment(Result.SKIPPED)
                 return
-
-            self.s3_client.write_file_list(partner, dpla_id, media_urls)
 
         except Exception as e:
             self.tracker.increment(Result.FAILED)
