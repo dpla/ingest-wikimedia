@@ -24,6 +24,7 @@ from ingest_wikimedia.common import (
     CONTENT_TYPE,
 )
 from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.web import Web
@@ -299,6 +300,7 @@ def main(
     sleep: float,
 ):
     setup_logging(partner, "download", logging.INFO)
+    notify_phase_start(partner, "download")
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 

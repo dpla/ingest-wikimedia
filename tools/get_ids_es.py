@@ -42,6 +42,7 @@ from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.dpla import DPLA, DPLA_PARTNERS, INSTITUTIONS_URL
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.s3 import S3Client
+from ingest_wikimedia.slack import notify_phase_start
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
@@ -157,6 +158,7 @@ def main(partner: str) -> None:
     except ValueError as e:
         raise click.BadParameter(str(e)) from e
 
+    notify_phase_start(partner, "id-generation")
     provider_name = DPLA_PARTNERS[partner]
 
     eligible_dp_names = load_eligible_dp_names(partner)
