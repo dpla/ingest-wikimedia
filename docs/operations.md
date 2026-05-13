@@ -23,7 +23,7 @@ This guide covers running, monitoring, and troubleshooting the DPLA Wikimedia up
 
 ## Architecture overview
 
-```
+```text
 Slack user
     │
     │  POST /wikimedia-upload bpl pa
@@ -59,7 +59,7 @@ Results (success or failure) post to **#tech-alerts** via the `DPLA_SLACK_BOT_TO
 
 Launches the full upload pipeline (ID generation → download → upload) for one or more targets. All targets run sequentially in a single tmux session. If any step fails, the chain stops.
 
-```
+```text
 /wikimedia-upload bpl
 /wikimedia-upload bpl pa
 /wikimedia-upload "indiana|Indiana State Library"
@@ -70,13 +70,14 @@ Launches the full upload pipeline (ID generation → download → upload) for on
 
 The immediate Slack reply confirms that the workflow was dispatched. A confirmation with the actual tmux session name posts to **#tech-alerts** once the session starts (~1–2 minutes later).
 
-### `/wikimedia-upload kill <hub> [<hub> ...]`
+### `/wikimedia-upload kill <label> [<label> ...]`
 
-Stops one or more running pipeline sessions. Kills any tmux session whose name contains the specified hub(s) as a `+`-delimited component.
+Stops one or more running pipeline sessions. Use the session label suffix shown by `/wikimedia-status` — for example, `indiana-state-library` kills `wikimedia-indiana-state-library`. Wikidata QIDs are also accepted and resolved to their label.
 
-```
+```text
 /wikimedia-upload kill bpl
 /wikimedia-upload kill bpl pa
+/wikimedia-upload kill indiana-state-library
 /wikimedia-upload kill Q72380652
 ```
 
@@ -98,7 +99,7 @@ Targets can be specified in three formats:
 
 A short identifier for a DPLA partner hub. Runs the full hub.
 
-```
+```text
 bpl          → Digital Commonwealth (full hub)
 pa           → PA Digital (full hub)
 indiana      → Indiana Memory (full hub)
@@ -110,7 +111,7 @@ See [Partner hub registry](#partner-hub-registry) for all valid slugs and aliase
 
 Runs only a specific institution within a hub. The institution name must match exactly as it appears in `institutions_v2.json`. Quote the argument in Slack if the institution name contains spaces.
 
-```
+```text
 indiana|Indiana State Library
 indiana|Indiana University
 "pa|Free Library of Philadelphia"
@@ -253,17 +254,19 @@ All three phases are idempotent — re-running is safe and picks up where it lef
 
 When multiple targets are specified, they all run in a single tmux session. The session name is:
 
+```text
+wikimedia-<label1>+<label2>+...
 ```
-wikimedia-<canonical1>+<canonical2>+...
-```
+
+The label for a full-hub target is its canonical slug. The label for an institution-level target is the institution name, lowercased with spaces replaced by hyphens. This is what `/wikimedia-status` reports and what `/wikimedia-upload kill` accepts.
 
 Examples:
 - `/wikimedia-upload bpl` → session `wikimedia-bpl`
 - `/wikimedia-upload bpl pa` → session `wikimedia-bpl+pa`
-- `/wikimedia-upload bpl "indiana|Indiana State Library"` → session `wikimedia-bpl+indiana`
-  (session name uses canonical slugs only; institution detail is in the pipeline command)
+- `/wikimedia-upload "indiana|Indiana State Library"` → session `wikimedia-indiana-state-library`
+- `/wikimedia-upload bpl "indiana|Indiana State Library"` → session `wikimedia-bpl+indiana-state-library`
 
-The `+` separator is unambiguous because canonical slugs use `-` as their only separator character.
+The `+` separator is unambiguous because labels use `-` as their only separator character.
 
 Within the session, targets run sequentially with `&&` chaining — if `bpl`'s upload fails, `pa` does not start.
 
@@ -300,10 +303,10 @@ Steps:
 Triggered by: Slack `/wikimedia-upload kill`, or manually from the Actions tab.
 
 Inputs:
-- `partner` (required): space-separated hub slugs or QIDs to kill
+- `partner` (required): space-separated session label suffixes or QIDs to kill (e.g. `bpl`, `indiana-state-library`, `Q72380652`)
 - `response_url` (optional): Slack response URL for ephemeral error feedback
 
-Steps: runs `scripts/wikimedia_kill.py`, which lists all `wikimedia-*` tmux sessions, kills any that contain the specified hub(s), and posts the result to #tech-alerts.
+Steps: runs `scripts/wikimedia_kill.py`, which lists all `wikimedia-*` tmux sessions, kills any whose `+`-delimited components intersect the specified labels, and posts the result to #tech-alerts.
 
 ### `wikimedia-upload-status.yml`
 
@@ -388,7 +391,7 @@ Or trigger `/wikimedia-status` from Slack.
 
 Logs are written to `/home/ec2-user/ingest-wikimedia/<partner>/logs/` with names like:
 
-```
+```text
 20240601-120000-bpl-download.log
 20240601-140000-bpl-upload.log
 ```
@@ -423,9 +426,9 @@ The hub exists in the registry but `institutions_v2.json` does not mark it (or a
 
 ### "Session already running" / conflict error
 
-A tmux session with an overlapping hub slug is already active. Options:
+A tmux session with an overlapping hub is already active. Options:
 1. Wait for it to finish
-2. Kill it with `/wikimedia-upload kill <hub>`
+2. Kill it with `/wikimedia-upload kill <label>` (use the label shown by `/wikimedia-status`)
 3. Re-trigger `wikimedia-launch.yml` from GitHub Actions with `force: true`
 
 ### "Only N% memory available" error
