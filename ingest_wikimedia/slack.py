@@ -9,6 +9,19 @@ SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
 
+def post_message(token: str, text: str) -> None:
+    resp = requests.post(
+        SLACK_API_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        json={"channel": SLACK_CHANNEL, "text": text},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error: {data.get('error')}")
+
+
 def _format_bytes(num_bytes: int) -> str:
     value = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
