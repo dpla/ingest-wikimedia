@@ -33,6 +33,17 @@ PARTNER_DIR = {
 }
 
 
+def _slack_fail(slack_token: str, msg: str) -> None:
+    """Print msg to stderr, optionally post to Slack, then exit 1."""
+    print(msg, file=sys.stderr)
+    if slack_token:
+        try:
+            post_to_slack(slack_token, msg)
+        except Exception as e:
+            logging.warning("Slack notification failed: %s", e)
+    sys.exit(1)
+
+
 def post_to_slack(token: str, text: str) -> None:
     resp = requests.post(
         SLACK_API_URL,
@@ -98,17 +109,11 @@ def main() -> None:
         sys.exit(1)
     print(f"Memory: {pct_available}% available ({available_mb} MB of {total_mb} MB).")
     if pct_available < MEMORY_HEADROOM_PCT:
-        msg = (
+        _slack_fail(
+            slack_token,
             f"⚠️ Cannot launch `wikimedia-{canonical}`: only {pct_available}% memory available"
-            f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%."
+            f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
         )
-        print(msg, file=sys.stderr)
-        if slack_token:
-            try:
-                post_to_slack(slack_token, msg)
-            except Exception as e:
-                logging.warning("Slack notification failed: %s", e)
-        sys.exit(1)
 
     print("Updating EC2 code...")
     update_cmd = (
@@ -135,12 +140,11 @@ def main() -> None:
             print("Existing session found; killing it (--force).")
             ssm_run(ssm, f"tmux kill-session -t wikimedia-{canonical}")
         else:
-            print(
-                f"Session wikimedia-{canonical} is already running. "
-                "Set force=true to override.",
-                file=sys.stderr,
+            _slack_fail(
+                slack_token,
+                f"⚠️ `wikimedia-{canonical}` is already running."
+                " To restart it, trigger the launch workflow from GitHub Actions with force=true.",
             )
-            sys.exit(1)
 
     print(f"Launching wikimedia-{canonical} pipeline...")
     pipeline_cmd = (
@@ -160,8 +164,11 @@ def main() -> None:
         ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
     )
     if f"wikimedia-{canonical}" not in result:
-        print(f"Session wikimedia-{canonical} did not start.", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(
+            slack_token,
+            f"⚠️ `wikimedia-{canonical}` failed to start — tmux session not found after launch."
+            " Check the GitHub Actions run for details.",
+        )
     print(f"Session wikimedia-{canonical} confirmed running.")
 
     if slack_token:
