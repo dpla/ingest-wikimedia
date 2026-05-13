@@ -62,7 +62,15 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    if not is_upload_eligible(canonical):
+    try:
+        eligible = is_upload_eligible(canonical)
+    except Exception as e:
+        print(
+            f"Failed to check upload eligibility for '{canonical}': {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not eligible:
         print(
             f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
             file=sys.stderr,
