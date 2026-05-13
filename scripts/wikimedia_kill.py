@@ -19,7 +19,12 @@ import sys
 import boto3
 import requests
 
-from ingest_wikimedia.partners import is_wikidata_id, resolve_slug, resolve_wikidata_id
+from ingest_wikimedia.partners import (
+    canonical_matches_session_component,
+    is_wikidata_id,
+    resolve_slug,
+    resolve_wikidata_id,
+)
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run
 
@@ -99,7 +104,11 @@ def main() -> None:
         if not session_name.startswith("wikimedia-"):
             continue
         session_hubs = set(session_name[len("wikimedia-") :].split("+"))
-        if canonical_set & session_hubs:
+        if any(
+            canonical_matches_session_component(c, comp)
+            for c in canonical_set
+            for comp in session_hubs
+        ):
             print(f"Killing session {session_name}...")
             try:
                 ssm_run(ssm, f"tmux kill-session -t {shlex.quote(session_name)}")

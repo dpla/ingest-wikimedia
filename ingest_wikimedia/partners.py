@@ -131,6 +131,26 @@ def is_wikidata_id(s: str) -> bool:
     return bool(_QID_RE.match(s))
 
 
+def canonical_matches_session_component(
+    canonical: str, component: str, timeout: int = 5
+) -> bool:
+    """Return True if a tmux session component represents the given canonical hub.
+
+    Components are either the canonical slug (full-hub sessions) or a
+    hyphenated-lowercase institution name (institution-level sessions).
+    """
+    if component == canonical:
+        return True
+    hub_name = PARTNER_HUBS.get(canonical)
+    if not hub_name:
+        return False
+    hub_data = _get_institutions(timeout).get(hub_name, {})
+    return any(
+        inst.lower().replace(" ", "-") == component
+        for inst in hub_data.get("institutions", {})
+    )
+
+
 def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | None]]:
     """Return (canonical_slug, institution_or_None) pairs matching a Wikidata QID.
 

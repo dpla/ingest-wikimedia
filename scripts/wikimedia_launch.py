@@ -26,6 +26,7 @@ import boto3
 import requests
 
 from ingest_wikimedia.partners import (
+    canonical_matches_session_component,
     is_upload_eligible,
     is_wikidata_id,
     resolve_slug,
@@ -85,7 +86,10 @@ def main() -> None:
     # Dedup by full target string so the same hub may appear with different institutions
     # (e.g. two QIDs that both resolve into the same hub but different institutions).
     seen_target_strs: set[str] = set()
-    seen_canonicals: dict[str, None] = {}  # insertion-ordered; drives session naming
+    seen_canonicals: dict[str, None] = {}  # insertion-ordered; for conflict detection
+    seen_session_labels: dict[
+        str, None
+    ] = {}  # insertion-ordered; drives session naming
     targets: list[tuple[str, str | None]] = []
 
     def _add_target(canonical: str, institution: str | None) -> None:
@@ -114,6 +118,8 @@ def main() -> None:
             )
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
+        label = institution.lower().replace(" ", "-") if institution else canonical
+        seen_session_labels[label] = None
         targets.append((canonical, institution))
 
     for token in target_tokens:
@@ -141,8 +147,10 @@ def main() -> None:
     if not targets:
         _slack_fail(response_url, "No targets specified.")
 
-    # Session name uses + as separator (unambiguous since slugs use -).
-    session_name = "wikimedia-" + "+".join(seen_canonicals)
+    # Session name uses + as separator (unambiguous since slugs/institution names use -).
+    # Institution-level targets use the institution name (hyphenated) rather than the
+    # hub slug, so "indiana|Indiana State Library" → wikimedia-indiana-state-library.
+    session_name = "wikimedia-" + "+".join(seen_session_labels)
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
@@ -180,7 +188,13 @@ def main() -> None:
         if not existing_name.startswith("wikimedia-"):
             continue
         existing_hubs = set(existing_name[len("wikimedia-") :].split("+"))
-        overlap = set(seen_canonicals) & existing_hubs
+        overlap = {
+            c
+            for c in seen_canonicals
+            if any(
+                canonical_matches_session_component(c, comp) for comp in existing_hubs
+            )
+        }
         if overlap:
             conflicts.append((existing_name, overlap))
     if conflicts:
