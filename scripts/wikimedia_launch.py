@@ -261,7 +261,7 @@ def main() -> None:
         try:
             post_message(
                 slack_token,
-                f"▶ Started `{session_name}` pipeline: {', '.join(target_labels)}"
+                f"▶ Launching `{session_name}` pipeline: {', '.join(target_labels)}"
                 " (ID generation → download → upload).",
             )
         except Exception as e:
