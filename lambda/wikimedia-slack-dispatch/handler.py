@@ -1,16 +1,19 @@
 """
-Lambda handler for the /wikimedia-status Slack slash command.
+Lambda handler for Wikimedia Slack slash commands.
 
-Validates the incoming Slack request signature, dispatches the
-wikimedia-upload-status GitHub Actions workflow, and returns an
-immediate acknowledgment to Slack (results post to #tech-alerts
-once the workflow completes, typically ~2 minutes later).
+Handles:
+  /wikimedia-status  — dispatches wikimedia-upload-status.yml; results post to
+                       #tech-alerts once the workflow completes (~2 minutes).
+  /wikimedia-upload <partner>
+                     — dispatches wikimedia-launch.yml with the given partner slug;
+                       a confirmation posts to #tech-alerts once the session starts.
+
+Validates the incoming Slack request signature before dispatching.
 
 Environment variables (set on the Lambda function):
   SLACK_SIGNING_SECRET  — from Slack app Basic Information page
-  GH_TOKEN              — GitHub fine-grained PAT with actions:write
-  GH_REPO               — e.g. dpla/ingest-wikimedia
-  GH_WORKFLOW           — e.g. wikimedia-upload-status.yml
+  GH_TOKEN              — GitHub fine-grained PAT with actions:write on dpla/ingest-wikimedia
+  GH_REPO               — e.g. dpla/ingest-wikimedia (optional, has default)
 """
 
 import base64
@@ -22,7 +25,25 @@ import logging
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+VALID_PARTNERS = frozenset(
+    {
+        "bpl",
+        "georgia",
+        "indiana",
+        "northwest-heritage",
+        "ohio",
+        "p2p",
+        "pa",
+        "si",
+        "texas",
+        "minnesota",
+        "mwdl",
+        "heartland",
+    }
+)
 
 
 def _verify_slack_signature(
@@ -47,11 +68,11 @@ def _require_env(key: str) -> str:
     return value
 
 
-def _dispatch_workflow(token: str, repo: str, workflow: str) -> int:
+def _dispatch_workflow(token: str, repo: str, workflow: str, inputs: dict) -> int:
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/dispatches"
     req = urllib.request.Request(
         url,
-        data=json.dumps({"ref": "main", "inputs": {"notify_if_idle": "true"}}).encode(),
+        data=json.dumps({"ref": "main", "inputs": inputs}).encode(),
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -62,6 +83,38 @@ def _dispatch_workflow(token: str, repo: str, workflow: str) -> int:
     )
     with urllib.request.urlopen(req, timeout=2) as resp:
         return resp.status
+
+
+def _slack_reply(text: str, ephemeral: bool = False) -> dict:
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(
+            {
+                "response_type": "ephemeral" if ephemeral else "in_channel",
+                "text": text,
+            }
+        ),
+    }
+
+
+def _dispatch_and_reply(
+    token: str, repo: str, workflow: str, inputs: dict, success_text: str
+) -> dict:
+    try:
+        status = _dispatch_workflow(token, repo, workflow, inputs)
+    except urllib.error.HTTPError as e:
+        logging.error("GitHub API error: HTTP %s", e.code)
+        return _slack_reply(f"Failed to trigger workflow (HTTP {e.code}).")
+    except Exception:
+        logging.exception("Unexpected error dispatching workflow")
+        return _slack_reply("Failed to trigger workflow due to an internal error.")
+    text = (
+        success_text
+        if status == 204
+        else f"Unexpected response from GitHub (HTTP {status})"
+    )
+    return _slack_reply(text)
 
 
 def handler(event, context):
@@ -89,25 +142,64 @@ def handler(event, context):
         return {"statusCode": 401, "body": "Invalid signature"}
 
     repo = os.environ.get("GH_REPO", "dpla/ingest-wikimedia")
-    workflow = os.environ.get("GH_WORKFLOW", "wikimedia-upload-status.yml")
+    fields = dict(urllib.parse.parse_qsl(body))
+    command = fields.get("command", "")
 
-    try:
-        status = _dispatch_workflow(gh_token, repo, workflow)
-    except urllib.error.HTTPError as e:
-        logging.error("GitHub API error: HTTP %s", e.code)
-        msg = f"Failed to trigger workflow (HTTP {e.code})"
-    except Exception:
-        logging.exception("Unexpected error dispatching workflow")
-        msg = "Failed to trigger workflow due to an internal error."
-    else:
-        msg = (
+    if command == "/wikimedia-status":
+        try:
+            status = _dispatch_workflow(
+                gh_token,
+                repo,
+                "wikimedia-upload-status.yml",
+                {"notify_if_idle": "true"},
+            )
+        except urllib.error.HTTPError as e:
+            logging.error("GitHub API error: HTTP %s", e.code)
+            return _slack_reply(f"Failed to trigger workflow (HTTP {e.code}).")
+        except Exception:
+            logging.exception("Unexpected error dispatching workflow")
+            return _slack_reply("Failed to trigger workflow due to an internal error.")
+        text = (
             "Checking Wikimedia upload status — results will post to #tech-alerts shortly."
             if status == 204
             else f"Unexpected response from GitHub (HTTP {status})"
         )
+        return _slack_reply(text)
 
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"response_type": "in_channel", "text": msg}),
-    }
+    if command == "/wikimedia-upload":
+        partner = fields.get("text", "").strip().lower()
+        if not partner:
+            return _slack_reply(
+                "Usage: `/wikimedia-upload <partner>`\n"
+                f"Valid partners: {', '.join(sorted(VALID_PARTNERS))}",
+                ephemeral=True,
+            )
+        if partner not in VALID_PARTNERS:
+            return _slack_reply(
+                f"Unknown partner: `{partner}`\n"
+                f"Valid partners: {', '.join(sorted(VALID_PARTNERS))}",
+                ephemeral=True,
+            )
+        try:
+            status = _dispatch_workflow(
+                gh_token,
+                repo,
+                "wikimedia-launch.yml",
+                {"partner": partner},
+            )
+        except urllib.error.HTTPError as e:
+            logging.error("GitHub API error: HTTP %s", e.code)
+            return _slack_reply(f"Failed to launch `{partner}` (HTTP {e.code}).")
+        except Exception:
+            logging.exception("Unexpected error dispatching workflow")
+            return _slack_reply(
+                f"Failed to launch `{partner}` due to an internal error."
+            )
+        text = (
+            f"Launching `wikimedia-{partner}` pipeline — confirmation will post to #tech-alerts shortly."
+            if status == 204
+            else f"Unexpected response from GitHub (HTTP {status})"
+        )
+        return _slack_reply(text)
+
+    return {"statusCode": 400, "body": f"Unknown command: {command}"}
