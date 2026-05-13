@@ -65,6 +65,7 @@ PARTNER_HUBS: dict[str, str] = {
 
 # Alternate slugs that map to a canonical slug in PARTNER_HUBS
 _SLUG_ALIASES: dict[str, str] = {
+    "nwdh": "northwest-heritage",
     "smithsonian": "si",
     "ms": "mississippi",
     "jhn": "jh3",
