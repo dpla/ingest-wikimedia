@@ -12,23 +12,18 @@ Environment variables:
 """
 
 import argparse
-import json
 import logging
 import os
 import sys
-import time
 
 import boto3
 import requests
 
 from ingest_wikimedia.dpla import DPLA_PARTNERS
+from ingest_wikimedia.ssm import REGION, ssm_run
 
-INSTANCE_ID = "i-033eff6c8c168f999"
-REGION = "us-east-1"
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
-SSM_POLL_INTERVAL = 5
-SSM_MAX_POLLS = 60  # 5 minutes
 
 # NARA requires a separate process and is excluded from automated launch
 VALID_PARTNERS = frozenset(DPLA_PARTNERS) - {"nara"}
@@ -37,33 +32,6 @@ VALID_PARTNERS = frozenset(DPLA_PARTNERS) - {"nara"}
 PARTNER_DIR = {
     "si": "smithsonian",
 }
-
-
-def ssm_run(client, cmd: str) -> str:
-    resp = client.send_command(
-        InstanceIds=[INSTANCE_ID],
-        DocumentName="AWS-RunShellScript",
-        Parameters={"commands": [f"sudo -u ec2-user bash -c {json.dumps(cmd)}"]},
-    )
-    cmd_id = resp["Command"]["CommandId"]
-    for attempt in range(SSM_MAX_POLLS):
-        if attempt > 0:
-            time.sleep(SSM_POLL_INTERVAL)
-        try:
-            inv = client.get_command_invocation(
-                CommandId=cmd_id, InstanceId=INSTANCE_ID
-            )
-        except client.exceptions.InvocationDoesNotExist:
-            continue
-        status = inv["Status"]
-        if status == "Success":
-            return inv.get("StandardOutputContent", "").strip()
-        if status in ("Failed", "TimedOut", "Cancelled"):
-            stderr = inv.get("StandardErrorContent", "").strip()
-            raise RuntimeError(
-                f"SSM command {cmd_id} ended with {status}: {stderr or 'no stderr'}"
-            )
-    raise TimeoutError(f"SSM command {cmd_id} did not complete within polling window")
 
 
 def post_to_slack(token: str, text: str) -> None:
