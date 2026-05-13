@@ -300,7 +300,6 @@ def main(
     sleep: float,
 ):
     setup_logging(partner, "download", logging.INFO)
-    notify_phase_start(partner, "download")
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 
@@ -321,6 +320,7 @@ def main(
     tracker = tools_context.get_tracker()
 
     dpla.check_partner(partner)
+    notify_phase_start(partner, "download")
     logging.info(f"Starting download for {partner}")
 
     try:
