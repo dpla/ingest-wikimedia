@@ -248,14 +248,6 @@ def main() -> None:
         ]
     pipeline_cmd = " && ".join(steps)
 
-    print(f"Launching {session_name} pipeline...")
-    # Use double quotes around the pipeline so single-quoted institution names inside are preserved.
-    tmux_cmd = (
-        f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
-        f' "{pipeline_cmd}"'
-    )
-    ssm_run(ssm, tmux_cmd)
-
     if slack_token:
         target_labels = [f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst in targets]
         try:
@@ -266,6 +258,14 @@ def main() -> None:
             )
         except Exception as e:
             logging.warning("Slack notification failed: %s", e)
+
+    print(f"Launching {session_name} pipeline...")
+    # Use double quotes around the pipeline so single-quoted institution names inside are preserved.
+    tmux_cmd = (
+        f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
+        f' "{pipeline_cmd}"'
+    )
+    ssm_run(ssm, tmux_cmd)
 
     print("Verifying session started...")
     result = ssm_run(
