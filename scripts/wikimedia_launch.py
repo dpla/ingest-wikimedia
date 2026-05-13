@@ -33,14 +33,19 @@ PARTNER_DIR = {
 }
 
 
-def _slack_fail(slack_token: str, msg: str) -> None:
-    """Print msg to stderr, optionally post to Slack, then exit 1."""
+def _slack_fail(response_url: str, msg: str) -> None:
+    """Print msg to stderr, post ephemeral reply to response_url if set, then exit 1."""
     print(msg, file=sys.stderr)
-    if slack_token:
+    if response_url:
         try:
-            post_to_slack(slack_token, msg)
+            resp = requests.post(
+                response_url,
+                json={"response_type": "ephemeral", "text": msg},
+                timeout=5,
+            )
+            resp.raise_for_status()
         except Exception as e:
-            logging.warning("Slack notification failed: %s", e)
+            logging.warning("Failed to post to Slack response_url: %s", e)
     sys.exit(1)
 
 
@@ -61,9 +66,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--partner", required=True)
     parser.add_argument("--force", default="false")
+    parser.add_argument("--response-url", default="")
     args = parser.parse_args()
 
     force = args.force.lower() == "true"
+    response_url = args.response_url.strip()
 
     canonical = resolve_slug(args.partner)
     if canonical is None:
@@ -110,7 +117,7 @@ def main() -> None:
     print(f"Memory: {pct_available}% available ({available_mb} MB of {total_mb} MB).")
     if pct_available < MEMORY_HEADROOM_PCT:
         _slack_fail(
-            slack_token,
+            response_url,
             f"⚠️ Cannot launch `wikimedia-{canonical}`: only {pct_available}% memory available"
             f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
         )
@@ -165,7 +172,7 @@ def main() -> None:
     )
     if f"wikimedia-{canonical}" not in result:
         _slack_fail(
-            slack_token,
+            response_url,
             f"⚠️ `wikimedia-{canonical}` failed to start — tmux session not found after launch."
             " Check the GitHub Actions run for details.",
         )

@@ -11,6 +11,11 @@ on:
         description: "Kill existing session if one is already running"
         type: boolean
         default: false
+      response_url:
+        description: "Slack response_url for ephemeral user feedback on failure"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -45,4 +50,5 @@ jobs:
         run: |
           python scripts/wikimedia_launch.py \
             --partner "${{ github.event.inputs.partner }}" \
-            --force "${{ github.event.inputs.force }}"
+            --force "${{ github.event.inputs.force }}" \
+            --response-url "${{ github.event.inputs.response_url }}"

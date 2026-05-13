@@ -178,11 +178,12 @@ def handler(event, context):
                 ephemeral=True,
             )
         try:
+            response_url = fields.get("response_url", "")
             status = _dispatch_workflow(
                 gh_token,
                 repo,
                 "wikimedia-launch.yml",
-                {"partner": canonical},
+                {"partner": canonical, "response_url": response_url},
             )
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
