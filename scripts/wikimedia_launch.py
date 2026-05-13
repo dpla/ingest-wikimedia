@@ -19,14 +19,28 @@ import sys
 import boto3
 import requests
 
-from ingest_wikimedia.dpla import DPLA_PARTNERS
 from ingest_wikimedia.ssm import REGION, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
 # NARA requires a separate process and is excluded from automated launch
-VALID_PARTNERS = frozenset(DPLA_PARTNERS) - {"nara"}
+VALID_PARTNERS = frozenset(
+    {
+        "bpl",
+        "georgia",
+        "indiana",
+        "northwest-heritage",
+        "ohio",
+        "p2p",
+        "pa",
+        "si",
+        "texas",
+        "minnesota",
+        "mwdl",
+        "heartland",
+    }
+)
 
 # Partners whose EC2 directory name differs from their partner key
 PARTNER_DIR = {
