@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ingest_wikimedia.partners import is_upload_eligible, resolve_slug
+from ingest_wikimedia.partners import resolve_slug
 
 
 def _verify_slack_signature(
@@ -66,7 +66,7 @@ def _dispatch_workflow(token: str, repo: str, workflow: str, inputs: dict) -> in
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=2) as resp:
         return resp.status
 
 
@@ -167,19 +167,6 @@ def handler(event, context):
         if canonical == "nara":
             return _slack_reply(
                 "NARA requires a separate process and cannot be launched here.",
-                ephemeral=True,
-            )
-        try:
-            eligible = is_upload_eligible(canonical, timeout=2)
-        except Exception:
-            logging.exception("Failed to check upload eligibility for %s", canonical)
-            return _slack_reply(
-                f"Could not verify upload eligibility for `{canonical}`. Try again shortly.",
-                ephemeral=True,
-            )
-        if not eligible:
-            return _slack_reply(
-                f"Hub `{canonical}` is not configured for Wikimedia upload.",
                 ephemeral=True,
             )
         try:
