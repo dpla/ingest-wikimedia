@@ -256,6 +256,17 @@ def main() -> None:
     )
     ssm_run(ssm, tmux_cmd)
 
+    if slack_token:
+        target_labels = [f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst in targets]
+        try:
+            post_message(
+                slack_token,
+                f"▶ Started `{session_name}` pipeline: {', '.join(target_labels)}"
+                " (ID generation → download → upload).",
+            )
+        except Exception as e:
+            logging.warning("Slack notification failed: %s", e)
+
     print("Verifying session started...")
     result = ssm_run(
         ssm,
@@ -268,17 +279,6 @@ def main() -> None:
             " Check the GitHub Actions run for details.",
         )
     print(f"Session {session_name} confirmed running.")
-
-    if slack_token:
-        target_labels = [f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst in targets]
-        try:
-            post_message(
-                slack_token,
-                f"▶ Started `{session_name}` pipeline: {', '.join(target_labels)}"
-                " (ID generation → download → upload).",
-            )
-        except Exception as e:
-            logging.warning("Slack notification failed: %s", e)
 
 
 if __name__ == "__main__":
