@@ -56,7 +56,13 @@ def main() -> None:
     args = parser.parse_args()
 
     force = args.force.lower() == "true"
-    response_url = args.response_url.strip()
+    raw_url = args.response_url.strip()
+    # Only accept genuine Slack response_url values — reject arbitrary POST targets.
+    response_url = (
+        raw_url if raw_url.startswith("https://hooks.slack.com/commands/") else ""
+    )
+    if raw_url and not response_url:
+        print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
 
     canonical = resolve_slug(args.partner)
     if canonical is None:
@@ -85,17 +91,18 @@ def main() -> None:
     ssm = boto3.client("ssm", region_name=REGION)
 
     print("Checking instance memory...")
-    mem_out = ssm_run(ssm, "free -m | awk 'NR==2{print $2, $7}'")
+    try:
+        mem_out = ssm_run(ssm, "free -m | awk 'NR==2{print $2, $7}'")
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to check instance memory: {e}")
     parts = mem_out.split()
     if len(parts) != 2:
-        print(f"Unexpected memory output: {mem_out!r}", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(response_url, f"⚠️ Unexpected memory output: {mem_out!r}")
     try:
         total_mb, available_mb = int(parts[0]), int(parts[1])
         pct_available = available_mb * 100 // total_mb
     except (ValueError, ZeroDivisionError) as e:
-        print(f"Could not parse memory output ({mem_out!r}): {e}", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(response_url, f"⚠️ Could not parse memory output ({mem_out!r}): {e}")
     print(f"Memory: {pct_available}% available ({available_mb} MB of {total_mb} MB).")
     if pct_available < MEMORY_HEADROOM_PCT:
         _slack_fail(
