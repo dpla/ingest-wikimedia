@@ -84,13 +84,21 @@ _SLUG_ALIASES: dict[str, str] = {
     "mass": "bpl",
 }
 
+# Reverse lookup: lowercase hub display name → canonical slug
+_SLUG_BY_HUB_NAME: dict[str, str] = {
+    name.lower(): slug for slug, name in PARTNER_HUBS.items()
+}
+
 
 def resolve_slug(slug: str) -> str | None:
     """Return canonical partner slug, or None if not recognised."""
     s = slug.strip().lower()
     if s in PARTNER_HUBS:
         return s
-    return _SLUG_ALIASES.get(s)
+    alias = _SLUG_ALIASES.get(s)
+    if alias is not None:
+        return alias
+    return _SLUG_BY_HUB_NAME.get(s)
 
 
 def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:

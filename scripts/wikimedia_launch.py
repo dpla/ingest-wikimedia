@@ -24,6 +24,8 @@ from ingest_wikimedia.ssm import REGION, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
+# Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
+MEMORY_HEADROOM_PCT = 30
 
 # Partners whose EC2 directory name differs from their partner key
 PARTNER_DIR = {
@@ -81,6 +83,32 @@ def main() -> None:
     base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
+
+    print("Checking instance memory...")
+    mem_out = ssm_run(ssm, "free -m | awk 'NR==2{print $2, $7}'")
+    parts = mem_out.split()
+    if len(parts) != 2:
+        print(f"Unexpected memory output: {mem_out!r}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        total_mb, available_mb = int(parts[0]), int(parts[1])
+        pct_available = available_mb * 100 // total_mb
+    except (ValueError, ZeroDivisionError) as e:
+        print(f"Could not parse memory output ({mem_out!r}): {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Memory: {pct_available}% available ({available_mb} MB of {total_mb} MB).")
+    if pct_available < MEMORY_HEADROOM_PCT:
+        msg = (
+            f"⚠️ Cannot launch `wikimedia-{canonical}`: only {pct_available}% memory available"
+            f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%."
+        )
+        print(msg, file=sys.stderr)
+        if slack_token:
+            try:
+                post_to_slack(slack_token, msg)
+            except Exception as e:
+                logging.warning("Slack notification failed: %s", e)
+        sys.exit(1)
 
     print("Updating EC2 code...")
     update_cmd = (
