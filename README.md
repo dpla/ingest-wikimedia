@@ -1,40 +1,66 @@
 ![Build Badge](https://github.com/dpla/ingest-wikimedia/actions/workflows/pytest.yml/badge.svg)
----
+
 # ingest-wikimedia
 
-PREREQUISITE: This project is managed with [uv](https://docs.astral.sh/uv/).
+Uploads public-domain media from DPLA partner collections to [Wikimedia Commons](https://commons.wikimedia.org/). Each pipeline run fetches item IDs from DPLA's Elasticsearch index, stages media files to S3, then uploads them to Commons with structured metadata.
 
-To set the project up for execution:
+## Development setup
 
-1. Run `uv build` 
-2. Run `source .venv/bin/activate`
+This project is managed with [uv](https://docs.astral.sh/uv/).
 
-```downloader [OPTIONS] IDS_FILE PARTNER API_KEY```
+```bash
+uv sync
+source .venv/bin/activate
+```
 
-```uploader [OPTIONS] IDS_FILE PARTNER```
+Pre-commit hooks use [ruff](https://docs.astral.sh/ruff/) for linting and formatting, and [ggshield](https://www.gitguardian.com/ggshield) for secret scanning. Install with `pre-commit install`.
 
+## Running the pipeline
 
-Options:
-- `--dry-run`: Does everything save for actually write to Commons.
-- `--verbose`: Logs all the data generated for each file for inspection.
+The pipeline has three sequential phases, each invoked as a CLI command:
 
-`IDS_FILE` is a simple text/csv file with one DPLA ID per line.
+```bash
+# 1. Generate IDs and stage metadata (writes <partner>.csv)
+get-ids-es <partner>
+get-ids-es <partner> --institution "Institution Name"   # institution-level run
 
-`PARTNER` is one of the strings in the `DPLA_PARTNERS` list in `constants.py`.
+# 2. Download media to S3
+downloader <partner>.csv <partner>
 
-`API_KEY` is a DPLA API key.
+# 3. Upload from S3 to Wikimedia Commons
+uploader <partner>.csv <partner>
+```
 
-You can provide `--help` to these commands to see more options.
+All three must run from the partner's working directory on EC2 (e.g. `/home/ec2-user/ingest-wikimedia/bpl/`), where `config.toml` is resolved from CWD.
 
-## Logs
+**In practice, pipelines are launched via Slack or GitHub Actions** — see [docs/operations.md](docs/operations.md) for the full operations guide.
 
-Log files are written out on the local file system in `logs`. This directory is specified in `logs.py`.
+## Project structure
 
-This project makes use of a temporary directory that it creates with a unique name locally.
+| Path | Purpose |
+|------|---------|
+| `ingest_wikimedia/` | Shared library (partner registry, S3, Slack, SSM, Wikimedia API) |
+| `tools/` | CLI entry points (`get-ids-es`, `downloader`, `uploader`) |
+| `scripts/` | GitHub Actions step scripts (`wikimedia_launch.py`, `wikimedia_kill.py`, `wikimedia_upload_status.py`) |
+| `lambda/wikimedia-slack-dispatch/` | Lambda handler for Slack slash commands |
+| `.github/workflows/` | Workflow definitions for launch, kill, and status checks |
 
-## Development
+## Options
 
-This project makes use of [ruff](https://docs.astral.sh/ruff/), 
-[ggshield](https://www.gitguardian.com/ggshield), and 
-[pre-commit](https://pre-commit.com/) to enforce standards prior to commits to source 
-control. You may want to configure your editor to run ruff on save, as well.
+```text
+get-ids-es <partner> [--institution NAME] [--dry-run]
+downloader <partner>.csv <partner> [--dry-run] [--verbose]
+uploader   <partner>.csv <partner> [--dry-run] [--verbose]
+```
+
+Pass `--help` to any command for full option details.
+
+## Operations
+
+See **[docs/operations.md](docs/operations.md)** for:
+- Slack slash command reference
+- Target formats (hub slugs, institution-level runs, Wikidata QIDs)
+- Partner hub registry
+- Upload eligibility system
+- EC2 infrastructure details
+- Monitoring and troubleshooting

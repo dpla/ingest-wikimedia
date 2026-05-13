@@ -1,6 +1,6 @@
 """Shared SSM helpers for Wikimedia pipeline scripts."""
 
-import json
+import shlex
 import time
 
 INSTANCE_ID = "i-033eff6c8c168f999"
@@ -13,7 +13,7 @@ def ssm_run(client, cmd: str) -> str:
     resp = client.send_command(
         InstanceIds=[INSTANCE_ID],
         DocumentName="AWS-RunShellScript",
-        Parameters={"commands": [f"sudo -u ec2-user bash -c {json.dumps(cmd)}"]},
+        Parameters={"commands": [f"sudo -u ec2-user bash -c {shlex.quote(cmd)}"]},
     )
     cmd_id = resp["Command"]["CommandId"]
     for attempt in range(SSM_MAX_POLLS):

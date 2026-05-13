@@ -147,7 +147,12 @@ def stage_to_s3(s3_client: S3Client, partner: str, dpla_id: str, source: dict) -
 
 @click.command()
 @click.argument("partner")
-def main(partner: str) -> None:
+@click.option(
+    "--institution",
+    default=None,
+    help="Restrict to a single institution name (must be upload-eligible).",
+)
+def main(partner: str, institution: str | None) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
     Also stages each item's full metadata to S3 (dpla-map.json) so the
@@ -168,6 +173,15 @@ def main(partner: str) -> None:
             file=sys.stderr,
         )
         sys.exit(0)
+
+    if institution is not None:
+        if institution not in eligible_dp_names:
+            print(
+                f"Institution '{institution}' is not upload-eligible for {partner}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        eligible_dp_names = [institution]
 
     banlist = Banlist()
     s3_client = S3Client()

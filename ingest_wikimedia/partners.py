@@ -5,6 +5,7 @@ GitHub Actions without installing the full ingest_wikimedia package dependencies
 """
 
 import json
+import re
 import urllib.request
 
 # Module-level cache so warm Lambda invocations skip repeated network fetches.
@@ -14,6 +15,9 @@ INSTITUTIONS_URL = (
     "https://raw.githubusercontent.com/dpla/ingestion3"
     "/refs/heads/main/src/main/resources/wiki/institutions_v2.json"
 )
+
+# Wikidata QID pattern (e.g. Q12345).
+_QID_RE = re.compile(r"^Q\d+$")
 
 # All DPLA partner hubs: canonical slug → hub display name (as used in institutions_v2.json)
 PARTNER_HUBS: dict[str, str] = {
@@ -102,16 +106,68 @@ def resolve_slug(slug: str) -> str | None:
     return _SLUG_BY_HUB_NAME.get(s)
 
 
-def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:
-    """Return True if institutions_v2.json marks this hub (or any child) upload=True."""
+def _get_institutions(timeout: int = 5) -> dict:
+    """Fetch institutions_v2.json from GitHub, caching after the first call."""
     global _institutions_cache
-    hub_name = PARTNER_HUBS.get(canonical_slug)
-    if not hub_name:
-        return False
     if _institutions_cache is None:
         with urllib.request.urlopen(INSTITUTIONS_URL, timeout=timeout) as resp:
             _institutions_cache = json.loads(resp.read())
-    hub = _institutions_cache.get(hub_name, {})
+    return _institutions_cache
+
+
+def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:
+    """Return True if institutions_v2.json marks this hub (or any child) upload=True."""
+    hub_name = PARTNER_HUBS.get(canonical_slug)
+    if not hub_name:
+        return False
+    hub = _get_institutions(timeout).get(hub_name, {})
     return hub.get("upload", False) or any(
         inst.get("upload", False) for inst in hub.get("institutions", {}).values()
     )
+
+
+def is_wikidata_id(s: str) -> bool:
+    """Return True if s is a Wikidata QID (e.g. 'Q12345')."""
+    return bool(_QID_RE.match(s))
+
+
+def canonical_matches_session_component(
+    canonical: str, component: str, timeout: int = 5
+) -> bool:
+    """Return True if a tmux session component represents the given canonical hub.
+
+    Components are either the canonical slug (full-hub sessions) or a
+    hyphenated-lowercase institution name (institution-level sessions).
+    """
+    if component == canonical:
+        return True
+    hub_name = PARTNER_HUBS.get(canonical)
+    if not hub_name:
+        return False
+    hub_data = _get_institutions(timeout).get(hub_name, {})
+    return any(
+        inst.lower().replace(" ", "-") == component
+        for inst in hub_data.get("institutions", {})
+    )
+
+
+def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | None]]:
+    """Return (canonical_slug, institution_or_None) pairs matching a Wikidata QID.
+
+    Searches hub-level and institution-level Wikidata fields in institutions_v2.json.
+    Returns an empty list if no match. Multiple matches are possible when the same
+    QID appears under different hubs or institutions in the JSON.
+    """
+    institutions = _get_institutions(timeout)
+    results: list[tuple[str, str | None]] = []
+    for hub_name, hub_data in institutions.items():
+        canonical = _SLUG_BY_HUB_NAME.get(hub_name.lower())
+        if canonical is None:
+            continue
+        if hub_data.get("Wikidata") == qid:
+            results.append((canonical, None))
+        else:
+            for inst_name, inst_data in hub_data.get("institutions", {}).items():
+                if inst_data.get("Wikidata") == qid:
+                    results.append((canonical, inst_name))
+    return results
