@@ -220,9 +220,21 @@ def handler(event, context):
                 seen_tokens.add(token)
                 launch_targets.append(token)
             else:
-                hub_part, institution = (
-                    token.split("|", 1) if "|" in token else (token, None)
-                )
+                if "|" in token:
+                    if token.count("|") != 1:
+                        return _slack_reply(
+                            f"Invalid target: `{token}`. Use `<hub>|<institution>`.",
+                            ephemeral=True,
+                        )
+                    hub_part, institution = token.split("|", 1)
+                    institution = institution.strip()
+                    if not institution:
+                        return _slack_reply(
+                            "Institution cannot be empty in `<hub>|<institution>`.",
+                            ephemeral=True,
+                        )
+                else:
+                    hub_part, institution = token, None
                 canonical = resolve_slug(hub_part)
                 if canonical is None:
                     return _slack_reply(

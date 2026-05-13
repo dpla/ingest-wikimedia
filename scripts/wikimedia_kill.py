@@ -100,6 +100,7 @@ def main() -> None:
 
     component_set = set(kill_components)
     killed: list[str] = []
+    failed: list[str] = []
     for line in tmux_list.splitlines():
         session_name = line.split(":")[0].strip()
         if not session_name.startswith("wikimedia-"):
@@ -112,10 +113,18 @@ def main() -> None:
                 killed.append(session_name)
             except Exception as e:
                 logging.warning("Failed to kill session %s: %s", session_name, e)
+                failed.append(session_name)
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
 
-    if killed:
+    if failed:
+        msg = (
+            f"⚠️ Failed to kill Wikimedia pipeline session(s): "
+            f"{', '.join(f'`{s}`' for s in failed)}"
+        )
+        if killed:
+            msg += f"\n🛑 Also killed: {', '.join(f'`{s}`' for s in killed)}"
+    elif killed:
         msg = f"🛑 Killed Wikimedia pipeline session(s): {', '.join(f'`{s}`' for s in killed)}"
     else:
         msg = f"No running Wikimedia sessions found matching: {', '.join(f'`{c}`' for c in kill_components)}"

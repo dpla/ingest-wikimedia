@@ -47,7 +47,7 @@ All three must run from the partner's working directory on EC2 (e.g. `/home/ec2-
 
 ## Options
 
-```
+```text
 get-ids-es <partner> [--institution NAME] [--dry-run]
 downloader <partner>.csv <partner> [--dry-run] [--verbose]
 uploader   <partner>.csv <partner> [--dry-run] [--verbose]
