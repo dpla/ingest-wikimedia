@@ -28,7 +28,7 @@ REGION = "us-east-1"
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 SSM_POLL_INTERVAL = 5
-SSM_MAX_POLLS = 24  # 2 minutes
+SSM_MAX_POLLS = 60  # 5 minutes
 
 # NARA requires a separate process and is excluded from automated launch
 VALID_PARTNERS = frozenset(DPLA_PARTNERS) - {"nara"}
@@ -118,7 +118,7 @@ def main() -> None:
 
     print(f"Checking for existing wikimedia-{partner} session...")
     existing = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep wikimedia-{partner} || echo NONE"
+        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{partner}(:|$)' || echo NONE"
     )
     if f"wikimedia-{partner}" in existing:
         if force:
@@ -145,7 +145,7 @@ def main() -> None:
 
     print("Verifying session started...")
     result = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep wikimedia-{partner} || echo NONE"
+        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{partner}(:|$)' || echo NONE"
     )
     if f"wikimedia-{partner}" not in result:
         print(f"Session wikimedia-{partner} did not start.", file=sys.stderr)
