@@ -183,37 +183,17 @@ def handler(event, context):
 
         response_url = fields.get("response_url", "")
 
-        # Kill subcommand: /wikimedia-upload kill <hub|QID|hub|institution> [...]
+        # Kill subcommand: /wikimedia-upload kill <label> [<label> ...]
+        # Targets are session label suffixes as shown by /wikimedia-status
+        # (e.g. "bpl", "indiana-state-library"). QIDs are also accepted.
         if tokens[0] == "kill":
-            kill_slugs = tokens[1:]
-            if not kill_slugs:
+            kill_targets = tokens[1:]
+            if not kill_targets:
                 return _slack_reply(
-                    "Usage: `/wikimedia-upload kill <hub> [<hub> ...]`"
-                    " or `/wikimedia-upload kill <hub>|<institution>`",
+                    "Usage: `/wikimedia-upload kill <label> [<label> ...]`"
+                    " — use the session label from `/wikimedia-status`",
                     ephemeral=True,
                 )
-            kill_targets: list[str] = []
-            for slug in kill_slugs:
-                if _QID_RE.match(slug):
-                    # QID: pass through; kill script resolves it
-                    kill_targets.append(slug)
-                elif "|" in slug:
-                    hub_part, institution = slug.split("|", 1)
-                    canonical = resolve_slug(hub_part)
-                    if canonical is None:
-                        return _slack_reply(
-                            f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
-                            ephemeral=True,
-                        )
-                    kill_targets.append(f"{canonical}|{institution}")
-                else:
-                    canonical = resolve_slug(slug)
-                    if canonical is None:
-                        return _slack_reply(
-                            f"Unknown hub: `{slug}`. Check the hub slug and try again.",
-                            ephemeral=True,
-                        )
-                    kill_targets.append(canonical)
             partner_input = shlex.join(kill_targets)
             label = ", ".join(f"`{t}`" for t in kill_targets)
             return _dispatch_and_reply(
