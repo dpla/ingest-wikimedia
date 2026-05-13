@@ -20,10 +20,11 @@ import boto3
 import requests
 
 from ingest_wikimedia.partners import is_upload_eligible, resolve_slug
+from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run
 
-SLACK_CHANNEL = "C02HEU2L3"
-SLACK_API_URL = "https://slack.com/api/chat.postMessage"
+# Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
+MEMORY_HEADROOM_PCT = 30
 
 # Partners whose EC2 directory name differs from their partner key
 PARTNER_DIR = {
@@ -31,56 +32,99 @@ PARTNER_DIR = {
 }
 
 
-def post_to_slack(token: str, text: str) -> None:
-    resp = requests.post(
-        SLACK_API_URL,
-        headers={"Authorization": f"Bearer {token}"},
-        json={"channel": SLACK_CHANNEL, "text": text},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Slack API error: {data.get('error')}")
+def _slack_fail(response_url: str, msg: str) -> None:
+    """Print msg to stderr, post ephemeral reply to response_url if set, then exit 1."""
+    print(msg, file=sys.stderr)
+    if response_url:
+        try:
+            resp = requests.post(
+                response_url,
+                json={"response_type": "ephemeral", "text": msg},
+                timeout=5,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logging.warning("Failed to post to Slack response_url: %s", e)
+    sys.exit(1)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--partner", required=True)
     parser.add_argument("--force", default="false")
+    parser.add_argument("--response-url", default="")
     args = parser.parse_args()
 
     force = args.force.lower() == "true"
+    raw_url = args.response_url.strip()
+    # Only accept genuine Slack response_url values — reject arbitrary POST targets.
+    response_url = (
+        raw_url if raw_url.startswith("https://hooks.slack.com/commands/") else ""
+    )
+    if raw_url and not response_url:
+        print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
 
     canonical = resolve_slug(args.partner)
     if canonical is None:
-        print(f"Unknown hub: {args.partner.strip()}", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(response_url, f"Unknown hub: {args.partner.strip()}")
     if canonical == "nara":
-        print(
+        _slack_fail(
+            response_url,
             "NARA requires a separate process and cannot be launched here.",
-            file=sys.stderr,
         )
-        sys.exit(1)
     try:
         eligible = is_upload_eligible(canonical)
     except Exception as e:
-        print(
+        _slack_fail(
+            response_url,
             f"Failed to check upload eligibility for '{canonical}': {e}",
-            file=sys.stderr,
         )
-        sys.exit(1)
     if not eligible:
-        print(
+        _slack_fail(
+            response_url,
             f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
-            file=sys.stderr,
         )
-        sys.exit(1)
 
     pdir = PARTNER_DIR.get(canonical, canonical)
     base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
+
+    print("Checking instance memory...")
+    try:
+        mem_out = ssm_run(ssm, "free -m | awk 'NR==2{print $2, $7}'")
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to check instance memory: {e}")
+    parts = mem_out.split()
+    if len(parts) != 2:
+        _slack_fail(response_url, f"⚠️ Unexpected memory output: {mem_out!r}")
+    try:
+        total_mb, available_mb = int(parts[0]), int(parts[1])
+        pct_available = available_mb * 100 // total_mb
+    except (ValueError, ZeroDivisionError) as e:
+        _slack_fail(response_url, f"⚠️ Could not parse memory output ({mem_out!r}): {e}")
+    print(f"Memory: {pct_available}% available ({available_mb} MB of {total_mb} MB).")
+    if pct_available < MEMORY_HEADROOM_PCT:
+        _slack_fail(
+            response_url,
+            f"⚠️ Cannot launch `wikimedia-{canonical}`: only {pct_available}% memory available"
+            f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
+        )
+
+    print(f"Checking for existing wikimedia-{canonical} session...")
+    existing = ssm_run(
+        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
+    )
+    if f"wikimedia-{canonical}" in existing:
+        if force:
+            print("Existing session found; killing it (--force).")
+            ssm_run(ssm, f"tmux kill-session -t wikimedia-{canonical}")
+        else:
+            _slack_fail(
+                response_url,
+                f"⚠️ `wikimedia-{canonical}` is already running."
+                " To restart it, trigger the launch workflow from GitHub Actions with force=true.",
+            )
 
     print("Updating EC2 code...")
     update_cmd = (
@@ -97,22 +141,6 @@ def main() -> None:
         print(f"EC2 update did not confirm completion. Output: {out}", file=sys.stderr)
         sys.exit(1)
     print("EC2 code updated.")
-
-    print(f"Checking for existing wikimedia-{canonical} session...")
-    existing = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
-    )
-    if f"wikimedia-{canonical}" in existing:
-        if force:
-            print("Existing session found; killing it (--force).")
-            ssm_run(ssm, f"tmux kill-session -t wikimedia-{canonical}")
-        else:
-            print(
-                f"Session wikimedia-{canonical} is already running. "
-                "Set force=true to override.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
     print(f"Launching wikimedia-{canonical} pipeline...")
     pipeline_cmd = (
@@ -132,13 +160,16 @@ def main() -> None:
         ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
     )
     if f"wikimedia-{canonical}" not in result:
-        print(f"Session wikimedia-{canonical} did not start.", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(
+            response_url,
+            f"⚠️ `wikimedia-{canonical}` failed to start — tmux session not found after launch."
+            " Check the GitHub Actions run for details.",
+        )
     print(f"Session wikimedia-{canonical} confirmed running.")
 
     if slack_token:
         try:
-            post_to_slack(
+            post_message(
                 slack_token,
                 f"▶ Started `wikimedia-{canonical}` pipeline (ID generation → download → upload).",
             )

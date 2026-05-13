@@ -24,6 +24,7 @@ from ingest_wikimedia.common import (
     CONTENT_TYPE,
 )
 from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.web import Web
@@ -319,6 +320,7 @@ def main(
     tracker = tools_context.get_tracker()
 
     dpla.check_partner(partner)
+    notify_phase_start(partner, "download")
     logging.info(f"Starting download for {partner}")
 
     try:

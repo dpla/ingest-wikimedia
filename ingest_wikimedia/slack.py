@@ -1,5 +1,6 @@
 import logging
 import os
+from typing import Literal
 
 import requests
 
@@ -7,6 +8,39 @@ from ingest_wikimedia.tracker import Result, Tracker
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
+
+Phase = Literal["id-generation", "download", "upload"]
+
+_PHASE_EMOJI: dict[str, str] = {
+    "id-generation": "🔍",
+    "download": "⬇",
+    "upload": "⬆",
+}
+
+
+def post_message(token: str, text: str) -> None:
+    resp = requests.post(
+        SLACK_API_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        json={"channel": SLACK_CHANNEL, "text": text},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error: {data.get('error')}")
+
+
+def notify_phase_start(partner: str, phase: Phase) -> None:
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+    emoji = _PHASE_EMOJI.get(phase, "▶")
+    try:
+        post_message(token, f"{emoji} `wikimedia-{partner}`: starting {phase}")
+    except Exception:
+        logging.warning("Slack phase notification failed", exc_info=True)
 
 
 def _format_bytes(num_bytes: int) -> str:

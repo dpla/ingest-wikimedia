@@ -18,6 +18,7 @@ from ingest_wikimedia.common import (
 )
 from ingest_wikimedia.localfs import LocalFS
 from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.s3 import (
     S3_BUCKET,
     S3Client,
@@ -386,6 +387,7 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     try:
         local_fs.setup_temp_dir()
         setup_logging(partner, "upload", logging.INFO)
+        notify_phase_start(partner, "upload")
         if dry_run:
             logging.warning("---=== DRY RUN ===---")
 

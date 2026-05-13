@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ingest_wikimedia.partners import is_upload_eligible, resolve_slug
+from ingest_wikimedia.partners import resolve_slug
 
 
 def _verify_slack_signature(
@@ -66,7 +66,7 @@ def _dispatch_workflow(token: str, repo: str, workflow: str, inputs: dict) -> in
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=2) as resp:
         return resp.status
 
 
@@ -141,6 +141,14 @@ def handler(event, context):
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
             return _slack_reply(f"Failed to trigger workflow (HTTP {e.code}).")
+        except TimeoutError:
+            logging.warning(
+                "Timeout waiting for GitHub dispatch response (wikimedia-upload-status)"
+            )
+            return _slack_reply(
+                "GitHub API was slow — status check may have been dispatched anyway. "
+                "Watch #tech-alerts for results or try again."
+            )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
             return _slack_reply("Failed to trigger workflow due to an internal error.")
@@ -170,28 +178,24 @@ def handler(event, context):
                 ephemeral=True,
             )
         try:
-            eligible = is_upload_eligible(canonical, timeout=2)
-        except Exception:
-            logging.exception("Failed to check upload eligibility for %s", canonical)
-            return _slack_reply(
-                f"Could not verify upload eligibility for `{canonical}`. Try again shortly.",
-                ephemeral=True,
-            )
-        if not eligible:
-            return _slack_reply(
-                f"Hub `{canonical}` is not configured for Wikimedia upload.",
-                ephemeral=True,
-            )
-        try:
+            response_url = fields.get("response_url", "")
             status = _dispatch_workflow(
                 gh_token,
                 repo,
                 "wikimedia-launch.yml",
-                {"partner": canonical},
+                {"partner": canonical, "response_url": response_url},
             )
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
             return _slack_reply(f"Failed to launch `{canonical}` (HTTP {e.code}).")
+        except TimeoutError:
+            logging.warning(
+                "Timeout waiting for GitHub dispatch response for %s", canonical
+            )
+            return _slack_reply(
+                f"GitHub API was slow — `wikimedia-{canonical}` may have been dispatched anyway. "
+                "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
+            )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
             return _slack_reply(
