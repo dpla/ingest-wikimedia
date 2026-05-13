@@ -183,19 +183,29 @@ def handler(event, context):
 
         response_url = fields.get("response_url", "")
 
-        # Kill subcommand: /wikimedia-upload kill <hub|QID> [<hub|QID> ...]
+        # Kill subcommand: /wikimedia-upload kill <hub|QID|hub|institution> [...]
         if tokens[0] == "kill":
             kill_slugs = tokens[1:]
             if not kill_slugs:
                 return _slack_reply(
-                    "Usage: `/wikimedia-upload kill <hub> [<hub> ...]`",
+                    "Usage: `/wikimedia-upload kill <hub> [<hub> ...]`"
+                    " or `/wikimedia-upload kill <hub>|<institution>`",
                     ephemeral=True,
                 )
-            kill_canonicals: list[str] = []
+            kill_targets: list[str] = []
             for slug in kill_slugs:
                 if _QID_RE.match(slug):
                     # QID: pass through; kill script resolves it
-                    kill_canonicals.append(slug)
+                    kill_targets.append(slug)
+                elif "|" in slug:
+                    hub_part, institution = slug.split("|", 1)
+                    canonical = resolve_slug(hub_part)
+                    if canonical is None:
+                        return _slack_reply(
+                            f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
+                            ephemeral=True,
+                        )
+                    kill_targets.append(f"{canonical}|{institution}")
                 else:
                     canonical = resolve_slug(slug)
                     if canonical is None:
@@ -203,9 +213,9 @@ def handler(event, context):
                             f"Unknown hub: `{slug}`. Check the hub slug and try again.",
                             ephemeral=True,
                         )
-                    kill_canonicals.append(canonical)
-            partner_input = shlex.join(kill_canonicals)
-            label = ", ".join(f"`{c}`" for c in kill_canonicals)
+                    kill_targets.append(canonical)
+            partner_input = shlex.join(kill_targets)
+            label = ", ".join(f"`{t}`" for t in kill_targets)
             return _dispatch_and_reply(
                 gh_token,
                 repo,

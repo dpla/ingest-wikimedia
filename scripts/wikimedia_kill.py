@@ -64,8 +64,13 @@ def main() -> None:
     except ValueError as e:
         _slack_fail(response_url, f"Could not parse --partner: {e}")
 
-    canonicals: list[str] = []
-    seen: set[str] = set()
+    # hub_canonicals: kill any session containing an institution from this hub
+    # inst_labels: kill only the session with this specific institution label
+    hub_canonicals: list[str] = []
+    inst_labels: list[str] = []
+    seen_canonicals: set[str] = set()
+    seen_labels: set[str] = set()
+
     for token in target_tokens:
         if is_wikidata_id(token):
             resolved = resolve_wikidata_id(token)
@@ -74,20 +79,35 @@ def main() -> None:
                     response_url,
                     f"No hub or institution found for Wikidata ID {token!r} in institutions_v2.json.",
                 )
-            for canonical, _ in resolved:
-                if canonical not in seen:
-                    seen.add(canonical)
-                    canonicals.append(canonical)
+            for canonical, institution in resolved:
+                if institution is not None:
+                    label = institution.lower().replace(" ", "-")
+                    if label not in seen_labels:
+                        seen_labels.add(label)
+                        inst_labels.append(label)
+                else:
+                    if canonical not in seen_canonicals:
+                        seen_canonicals.add(canonical)
+                        hub_canonicals.append(canonical)
+        elif "|" in token:
+            hub_part, institution = token.split("|", 1)
+            canonical = resolve_slug(hub_part)
+            if canonical is None:
+                _slack_fail(response_url, f"Unknown hub: {hub_part!r}")
+            label = institution.lower().replace(" ", "-")
+            if label not in seen_labels:
+                seen_labels.add(label)
+                inst_labels.append(label)
         else:
             canonical = resolve_slug(token)
             if canonical is None:
                 _slack_fail(response_url, f"Unknown hub: {token!r}")
-            if canonical not in seen:
-                seen.add(canonical)
-                canonicals.append(canonical)
+            if canonical not in seen_canonicals:
+                seen_canonicals.add(canonical)
+                hub_canonicals.append(canonical)
 
-    if not canonicals:
-        _slack_fail(response_url, "No hub slugs specified.")
+    if not hub_canonicals and not inst_labels:
+        _slack_fail(response_url, "No targets specified.")
 
     ssm = boto3.client("ssm", region_name=REGION)
 
@@ -97,17 +117,18 @@ def main() -> None:
     except Exception as e:
         _slack_fail(response_url, f"⚠️ Failed to list tmux sessions: {e}")
 
-    canonical_set = set(canonicals)
+    label_set = set(inst_labels)
+    canonical_set = set(hub_canonicals)
     killed: list[str] = []
     for line in tmux_list.splitlines():
         session_name = line.split(":")[0].strip()
         if not session_name.startswith("wikimedia-"):
             continue
-        session_hubs = set(session_name[len("wikimedia-") :].split("+"))
-        if any(
+        components = set(session_name[len("wikimedia-") :].split("+"))
+        if components & label_set or any(
             canonical_matches_session_component(c, comp)
             for c in canonical_set
-            for comp in session_hubs
+            for comp in components
         ):
             print(f"Killing session {session_name}...")
             try:
@@ -118,10 +139,11 @@ def main() -> None:
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
 
+    all_targets = [f"`{c}`" for c in hub_canonicals] + [f"`{lb}`" for lb in inst_labels]
     if killed:
         msg = f"🛑 Killed Wikimedia pipeline session(s): {', '.join(f'`{s}`' for s in killed)}"
     else:
-        msg = f"No running Wikimedia sessions found for: {', '.join(f'`{c}`' for c in canonicals)}"
+        msg = f"No running Wikimedia sessions found for: {', '.join(all_targets)}"
 
     print(msg)
     if slack_token:
