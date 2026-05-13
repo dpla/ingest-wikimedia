@@ -28,22 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VALID_PARTNERS = frozenset(
-    {
-        "bpl",
-        "georgia",
-        "indiana",
-        "northwest-heritage",
-        "ohio",
-        "p2p",
-        "pa",
-        "si",
-        "texas",
-        "minnesota",
-        "mwdl",
-        "heartland",
-    }
-)
+from ingest_wikimedia.partners import is_upload_eligible, resolve_slug
 
 
 def _verify_slack_signature(
@@ -167,17 +152,34 @@ def handler(event, context):
         return _slack_reply(text)
 
     if command == "/wikimedia-upload":
-        partner = fields.get("text", "").strip().lower()
-        if not partner:
+        raw = fields.get("text", "").strip()
+        if not raw:
             return _slack_reply(
-                "Usage: `/wikimedia-upload <partner>`\n"
-                f"Valid partners: {', '.join(sorted(VALID_PARTNERS))}",
+                "Usage: `/wikimedia-upload <partner>`",
                 ephemeral=True,
             )
-        if partner not in VALID_PARTNERS:
+        canonical = resolve_slug(raw)
+        if canonical is None:
             return _slack_reply(
-                f"Unknown partner: `{partner}`\n"
-                f"Valid partners: {', '.join(sorted(VALID_PARTNERS))}",
+                f"Unknown hub: `{raw}`. Check the hub slug and try again.",
+                ephemeral=True,
+            )
+        if canonical == "nara":
+            return _slack_reply(
+                "NARA requires a separate process and cannot be launched here.",
+                ephemeral=True,
+            )
+        try:
+            eligible = is_upload_eligible(canonical, timeout=2)
+        except Exception:
+            logging.exception("Failed to check upload eligibility for %s", canonical)
+            return _slack_reply(
+                f"Could not verify upload eligibility for `{canonical}`. Try again shortly.",
+                ephemeral=True,
+            )
+        if not eligible:
+            return _slack_reply(
+                f"Hub `{canonical}` is not configured for Wikimedia upload.",
                 ephemeral=True,
             )
         try:
@@ -185,18 +187,18 @@ def handler(event, context):
                 gh_token,
                 repo,
                 "wikimedia-launch.yml",
-                {"partner": partner},
+                {"partner": canonical},
             )
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
-            return _slack_reply(f"Failed to launch `{partner}` (HTTP {e.code}).")
+            return _slack_reply(f"Failed to launch `{canonical}` (HTTP {e.code}).")
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
             return _slack_reply(
-                f"Failed to launch `{partner}` due to an internal error."
+                f"Failed to launch `{canonical}` due to an internal error."
             )
         text = (
-            f"Launching `wikimedia-{partner}` pipeline — confirmation will post to #tech-alerts shortly."
+            f"Launching `wikimedia-{canonical}` pipeline — confirmation will post to #tech-alerts shortly."
             if status == 204
             else f"Unexpected response from GitHub (HTTP {status})"
         )
