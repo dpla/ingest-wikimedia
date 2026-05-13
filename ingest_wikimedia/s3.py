@@ -72,14 +72,16 @@ class S3Client:
                 return int(obj.content_length) > 0
             except (TypeError, ValueError):
                 logging.warning(
-                    "Unexpected S3 content_length for key %s: %r", path, obj.content_length
+                    "Unexpected S3 content_length for key %s: %r",
+                    path,
+                    obj.content_length,
                 )
                 return False
         except ClientError as e:
             if (
                 "Error" in e.response
                 and "Code" in e.response["Error"]
-                and e.response["Error"]["Code"] == "404"
+                and e.response["Error"]["Code"] in ("404", "NoSuchKey")
             ):
                 # The object does not exist.
                 return False
@@ -150,7 +152,7 @@ class S3Client:
             if (
                 "Error" in e.response
                 and "Code" in e.response["Error"]
-                and e.response["Error"]["Code"] == "404"
+                and e.response["Error"]["Code"] in ("404", "NoSuchKey")
             ):
                 # The object does not exist.
                 return None
