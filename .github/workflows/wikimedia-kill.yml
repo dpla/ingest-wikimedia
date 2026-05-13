@@ -1,16 +1,12 @@
-name: Wikimedia Upload Launch
+name: Wikimedia Upload Kill
 
 on:
   workflow_dispatch:
     inputs:
       partner:
-        description: "shlex-encoded target list, e.g. 'bpl' or 'bpl pa' or 'bpl \"indiana|Indiana State Library\"'"
+        description: "Hub slug(s) to kill (space-separated, e.g. 'bpl pa')"
         required: true
         type: string
-      force:
-        description: "Kill existing session if one is already running"
-        type: boolean
-        default: false
       response_url:
         description: "Slack response_url for ephemeral user feedback on failure"
         required: false
@@ -23,14 +19,10 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-concurrency:
-  group: wikimedia-launch-${{ github.event.inputs.partner }}
-  cancel-in-progress: false
-
 jobs:
-  launch:
+  kill:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +32,7 @@ jobs:
 
       - run: pip install boto3==1.42.87 requests==2.32.5
 
-      - name: Launch pipeline
+      - name: Kill pipeline
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.WIKIMEDIA_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.WIKIMEDIA_AWS_SECRET_ACCESS_KEY }}
@@ -48,7 +40,6 @@ jobs:
           DPLA_SLACK_BOT_TOKEN: ${{ secrets.DPLA_SLACK_BOT_TOKEN }}
           PYTHONPATH: .
         run: |
-          python scripts/wikimedia_launch.py \
+          python scripts/wikimedia_kill.py \
             --partner "${{ github.event.inputs.partner }}" \
-            --force "${{ github.event.inputs.force }}" \
             --response-url "${{ github.event.inputs.response_url }}"

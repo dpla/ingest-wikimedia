@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Launch a Wikimedia upload pipeline session on EC2 for a partner hub.
+"""Launch a Wikimedia upload pipeline session on EC2 for one or more partner hubs.
 
 Runs as a GitHub Actions workflow step triggered by workflow_dispatch or the
 /wikimedia-upload Slack slash command via Lambda. Updates EC2 code, checks for
-a conflicting session, launches the full pipeline in tmux, and posts a Slack
-confirmation to #tech-alerts on success.
+conflicting sessions, launches the full pipeline in a single tmux session (with
+all targets chained via &&), and posts a Slack confirmation to #tech-alerts.
+
+Each target in --partner is either a hub slug ("bpl") or a hub|institution pair
+("indiana|Indiana State Library"). Multiple targets run sequentially in one tmux
+session; if any step fails the chain stops.
 
 Environment variables:
   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — IAM credentials with ssm:SendCommand
@@ -14,6 +18,8 @@ Environment variables:
 import argparse
 import logging
 import os
+import re
+import shlex
 import sys
 
 import boto3
@@ -64,29 +70,56 @@ def main() -> None:
     if raw_url and not response_url:
         print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
 
-    canonical = resolve_slug(args.partner)
-    if canonical is None:
-        _slack_fail(response_url, f"Unknown hub: {args.partner.strip()}")
-    if canonical == "nara":
-        _slack_fail(
-            response_url,
-            "NARA requires a separate process and cannot be launched here.",
-        )
+    # --partner may be a shlex-encoded list: 'bpl "indiana|Indiana State Library"'
     try:
-        eligible = is_upload_eligible(canonical)
-    except Exception as e:
-        _slack_fail(
-            response_url,
-            f"Failed to check upload eligibility for '{canonical}': {e}",
-        )
-    if not eligible:
-        _slack_fail(
-            response_url,
-            f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
-        )
+        target_tokens = shlex.split(args.partner)
+    except ValueError as e:
+        _slack_fail(response_url, f"Could not parse --partner: {e}")
 
-    pdir = PARTNER_DIR.get(canonical, canonical)
-    base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
+    # Validate each target and build (canonical, institution_or_None) pairs.
+    seen_hubs: set[str] = set()
+    targets: list[tuple[str, str | None]] = []
+    for token in target_tokens:
+        if "|" in token:
+            hub_part, institution = token.split("|", 1)
+            canonical = resolve_slug(hub_part)
+        else:
+            canonical = resolve_slug(token)
+            institution = None
+
+        if canonical is None:
+            _slack_fail(response_url, f"Unknown hub: {token!r}")
+        if canonical == "nara":
+            _slack_fail(
+                response_url,
+                "NARA requires a separate process and cannot be launched here.",
+            )
+        try:
+            eligible = is_upload_eligible(canonical)
+        except Exception as e:
+            _slack_fail(
+                response_url,
+                f"Failed to check upload eligibility for '{canonical}': {e}",
+            )
+        if not eligible:
+            _slack_fail(
+                response_url,
+                f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
+            )
+        if canonical in seen_hubs:
+            _slack_fail(
+                response_url,
+                f"Hub '{canonical}' appears more than once in the target list.",
+            )
+        seen_hubs.add(canonical)
+        targets.append((canonical, institution))
+
+    if not targets:
+        _slack_fail(response_url, "No targets specified.")
+
+    # Session name uses + as separator (unambiguous since slugs use -).
+    session_name = "wikimedia-" + "+".join(c for c, _ in targets)
+
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
 
@@ -107,23 +140,36 @@ def main() -> None:
     if pct_available < MEMORY_HEADROOM_PCT:
         _slack_fail(
             response_url,
-            f"⚠️ Cannot launch `wikimedia-{canonical}`: only {pct_available}% memory available"
+            f"⚠️ Cannot launch `{session_name}`: only {pct_available}% memory available"
             f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
         )
 
-    print(f"Checking for existing wikimedia-{canonical} session...")
-    existing = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
-    )
-    if f"wikimedia-{canonical}" in existing:
+    # Check for any existing session that includes one of the requested hubs.
+    print(f"Checking for existing sessions that overlap with {session_name}...")
+    try:
+        tmux_list = ssm_run(ssm, "tmux ls 2>/dev/null || true")
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to list tmux sessions: {e}")
+    conflicts = []
+    for line in tmux_list.splitlines():
+        existing_name = line.split(":")[0].strip()
+        if not existing_name.startswith("wikimedia-"):
+            continue
+        existing_hubs = set(existing_name[len("wikimedia-") :].split("+"))
+        overlap = seen_hubs & existing_hubs
+        if overlap:
+            conflicts.append((existing_name, overlap))
+    if conflicts:
         if force:
-            print("Existing session found; killing it (--force).")
-            ssm_run(ssm, f"tmux kill-session -t wikimedia-{canonical}")
+            for existing_name, _ in conflicts:
+                print(f"Existing session found: {existing_name}; killing it (--force).")
+                ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
         else:
+            conflict_names = ", ".join(f"`{n}`" for n, _ in conflicts)
             _slack_fail(
                 response_url,
-                f"⚠️ `wikimedia-{canonical}` is already running."
-                " To restart it, trigger the launch workflow from GitHub Actions with force=true.",
+                f"⚠️ Session(s) already running with overlapping hubs: {conflict_names}."
+                " To restart, trigger the launch workflow from GitHub Actions with force=true.",
             )
 
     print("Updating EC2 code...")
@@ -142,36 +188,56 @@ def main() -> None:
         sys.exit(1)
     print("EC2 code updated.")
 
-    print(f"Launching wikimedia-{canonical} pipeline...")
-    pipeline_cmd = (
-        f"source ~/.bashrc && "
-        f"source /home/ec2-user/ingest-wikimedia/.venv/bin/activate && "
-        f"get-ids-es {canonical} > {canonical}.csv && "
-        f"downloader {canonical}.csv {canonical} && "
-        f"uploader {canonical}.csv {canonical}"
-    )
+    # Build a chained pipeline command for all targets.
+    # Each target block: cd into partner dir, run get-ids-es (with optional --institution),
+    # downloader, uploader. The cd is required because config.toml is read from CWD.
+    steps = [
+        "source ~/.bashrc",
+        "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate",
+    ]
+    for canonical, institution in targets:
+        pdir = PARTNER_DIR.get(canonical, canonical)
+        base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
+        get_ids_cmd = f"get-ids-es {canonical}"
+        if institution is not None:
+            get_ids_cmd += f" --institution {shlex.quote(institution)}"
+        get_ids_cmd += f" > {canonical}.csv"
+        steps += [
+            f"cd {base}",
+            get_ids_cmd,
+            f"downloader {canonical}.csv {canonical}",
+            f"uploader {canonical}.csv {canonical}",
+        ]
+    pipeline_cmd = " && ".join(steps)
+
+    print(f"Launching {session_name} pipeline...")
+    # Use double quotes around the pipeline so single-quoted institution names inside are preserved.
     tmux_cmd = (
-        f"tmux new-session -d -s wikimedia-{canonical} -c {base}/ '{pipeline_cmd}'"
+        f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
+        f' "{pipeline_cmd}"'
     )
     ssm_run(ssm, tmux_cmd)
 
     print("Verifying session started...")
     result = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
+        ssm,
+        f"tmux ls 2>/dev/null | grep -E '^{re.escape(session_name)}(:|$)' || echo NONE",
     )
-    if f"wikimedia-{canonical}" not in result:
+    if session_name not in result:
         _slack_fail(
             response_url,
-            f"⚠️ `wikimedia-{canonical}` failed to start — tmux session not found after launch."
+            f"⚠️ `{session_name}` failed to start — tmux session not found after launch."
             " Check the GitHub Actions run for details.",
         )
-    print(f"Session wikimedia-{canonical} confirmed running.")
+    print(f"Session {session_name} confirmed running.")
 
     if slack_token:
+        target_labels = [f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst in targets]
         try:
             post_message(
                 slack_token,
-                f"▶ Started `wikimedia-{canonical}` pipeline (ID generation → download → upload).",
+                f"▶ Started `{session_name}` pipeline: {', '.join(target_labels)}"
+                " (ID generation → download → upload).",
             )
         except Exception as e:
             logging.warning("Slack notification failed: %s", e)
