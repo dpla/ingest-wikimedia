@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install boto3==1.42.87 requests==2.32.5
+      - run: pip install boto3==1.42.87 requests==2.32.5 && pip install -e . --no-deps
 
       - name: Launch pipeline
         env:
