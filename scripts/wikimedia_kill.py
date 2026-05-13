@@ -19,7 +19,7 @@ import sys
 import boto3
 import requests
 
-from ingest_wikimedia.partners import resolve_slug
+from ingest_wikimedia.partners import is_wikidata_id, resolve_slug, resolve_wikidata_id
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run
 
@@ -60,11 +60,26 @@ def main() -> None:
         _slack_fail(response_url, f"Could not parse --partner: {e}")
 
     canonicals: list[str] = []
+    seen: set[str] = set()
     for token in target_tokens:
-        canonical = resolve_slug(token)
-        if canonical is None:
-            _slack_fail(response_url, f"Unknown hub: {token!r}")
-        canonicals.append(canonical)
+        if is_wikidata_id(token):
+            resolved = resolve_wikidata_id(token)
+            if not resolved:
+                _slack_fail(
+                    response_url,
+                    f"No hub or institution found for Wikidata ID {token!r} in institutions_v2.json.",
+                )
+            for canonical, _ in resolved:
+                if canonical not in seen:
+                    seen.add(canonical)
+                    canonicals.append(canonical)
+        else:
+            canonical = resolve_slug(token)
+            if canonical is None:
+                _slack_fail(response_url, f"Unknown hub: {token!r}")
+            if canonical not in seen:
+                seen.add(canonical)
+                canonicals.append(canonical)
 
     if not canonicals:
         _slack_fail(response_url, "No hub slugs specified.")

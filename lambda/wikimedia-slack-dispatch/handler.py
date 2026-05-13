@@ -26,6 +26,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shlex
 import time
 import urllib.error
@@ -33,6 +34,8 @@ import urllib.parse
 import urllib.request
 
 from ingest_wikimedia.partners import resolve_slug
+
+_QID_RE = re.compile(r"^Q\d+$")
 
 
 def _verify_slack_signature(
@@ -180,7 +183,7 @@ def handler(event, context):
 
         response_url = fields.get("response_url", "")
 
-        # Kill subcommand: /wikimedia-upload kill <hub> [<hub> ...]
+        # Kill subcommand: /wikimedia-upload kill <hub|QID> [<hub|QID> ...]
         if tokens[0] == "kill":
             kill_slugs = tokens[1:]
             if not kill_slugs:
@@ -190,13 +193,17 @@ def handler(event, context):
                 )
             kill_canonicals: list[str] = []
             for slug in kill_slugs:
-                canonical = resolve_slug(slug)
-                if canonical is None:
-                    return _slack_reply(
-                        f"Unknown hub: `{slug}`. Check the hub slug and try again.",
-                        ephemeral=True,
-                    )
-                kill_canonicals.append(canonical)
+                if _QID_RE.match(slug):
+                    # QID: pass through; kill script resolves it
+                    kill_canonicals.append(slug)
+                else:
+                    canonical = resolve_slug(slug)
+                    if canonical is None:
+                        return _slack_reply(
+                            f"Unknown hub: `{slug}`. Check the hub slug and try again.",
+                            ephemeral=True,
+                        )
+                    kill_canonicals.append(canonical)
             partner_input = shlex.join(kill_canonicals)
             label = ", ".join(f"`{c}`" for c in kill_canonicals)
             return _dispatch_and_reply(
@@ -208,36 +215,46 @@ def handler(event, context):
             )
 
         # Launch subcommand: /wikimedia-upload <target> [<target> ...]
+        # QIDs are passed through; the launch script resolves them.
         # Dict preserves insertion order for stable session naming.
-        seen_hubs: dict[str, None] = {}
+        seen_tokens: set[str] = set()
         launch_targets: list[str] = []
         for token in tokens:
-            hub_part, institution = (
-                token.split("|", 1) if "|" in token else (token, None)
-            )
-            canonical = resolve_slug(hub_part)
-            if canonical is None:
-                return _slack_reply(
-                    f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
-                    ephemeral=True,
+            if _QID_RE.match(token):
+                # Wikidata QID — validate format, pass through unchanged.
+                if token in seen_tokens:
+                    return _slack_reply(
+                        f"Target `{token}` appears more than once.",
+                        ephemeral=True,
+                    )
+                seen_tokens.add(token)
+                launch_targets.append(token)
+            else:
+                hub_part, institution = (
+                    token.split("|", 1) if "|" in token else (token, None)
                 )
-            if canonical == "nara":
-                return _slack_reply(
-                    "NARA requires a separate process and cannot be launched here.",
-                    ephemeral=True,
-                )
-            if canonical in seen_hubs:
-                return _slack_reply(
-                    f"Hub `{canonical}` appears more than once.",
-                    ephemeral=True,
-                )
-            seen_hubs[canonical] = None
-            launch_targets.append(
-                f"{canonical}|{institution}" if institution else canonical
-            )
+                canonical = resolve_slug(hub_part)
+                if canonical is None:
+                    return _slack_reply(
+                        f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
+                        ephemeral=True,
+                    )
+                if canonical == "nara":
+                    return _slack_reply(
+                        "NARA requires a separate process and cannot be launched here.",
+                        ephemeral=True,
+                    )
+                target_str = f"{canonical}|{institution}" if institution else canonical
+                if target_str in seen_tokens:
+                    return _slack_reply(
+                        f"Target `{target_str}` appears more than once.",
+                        ephemeral=True,
+                    )
+                seen_tokens.add(target_str)
+                launch_targets.append(target_str)
 
         partner_input = shlex.join(launch_targets)
-        session_label = "wikimedia-" + "+".join(seen_hubs)
+        targets_display = ", ".join(f"`{t}`" for t in launch_targets)
 
         try:
             status = _dispatch_workflow(
@@ -248,22 +265,25 @@ def handler(event, context):
             )
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
-            return _slack_reply(f"Failed to launch `{session_label}` (HTTP {e.code}).")
+            return _slack_reply(
+                f"Failed to launch pipeline for {targets_display} (HTTP {e.code})."
+            )
         except TimeoutError:
             logging.warning(
-                "Timeout waiting for GitHub dispatch response for %s", session_label
+                "Timeout waiting for GitHub dispatch response for targets: %s",
+                targets_display,
             )
             return _slack_reply(
-                f"GitHub API was slow — `{session_label}` may have been dispatched anyway. "
+                f"GitHub API was slow — pipeline for {targets_display} may have been dispatched anyway. "
                 "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
             )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
             return _slack_reply(
-                f"Failed to launch `{session_label}` due to an internal error."
+                f"Failed to launch pipeline for {targets_display} due to an internal error."
             )
         text = (
-            f"Launching `{session_label}` pipeline — confirmation will post to #tech-alerts shortly."
+            f"Launching pipeline for {targets_display} — confirmation will post to #tech-alerts shortly."
             if status == 204
             else f"Unexpected response from GitHub (HTTP {status})"
         )

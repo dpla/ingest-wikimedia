@@ -25,7 +25,12 @@ import sys
 import boto3
 import requests
 
-from ingest_wikimedia.partners import is_upload_eligible, resolve_slug
+from ingest_wikimedia.partners import (
+    is_upload_eligible,
+    is_wikidata_id,
+    resolve_slug,
+    resolve_wikidata_id,
+)
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run
 
@@ -77,18 +82,13 @@ def main() -> None:
         _slack_fail(response_url, f"Could not parse --partner: {e}")
 
     # Validate each target and build (canonical, institution_or_None) pairs.
-    seen_hubs: set[str] = set()
+    # Dedup by full target string so the same hub may appear with different institutions
+    # (e.g. two QIDs that both resolve into the same hub but different institutions).
+    seen_target_strs: set[str] = set()
+    seen_canonicals: dict[str, None] = {}  # insertion-ordered; drives session naming
     targets: list[tuple[str, str | None]] = []
-    for token in target_tokens:
-        if "|" in token:
-            hub_part, institution = token.split("|", 1)
-            canonical = resolve_slug(hub_part)
-        else:
-            canonical = resolve_slug(token)
-            institution = None
 
-        if canonical is None:
-            _slack_fail(response_url, f"Unknown hub: {token!r}")
+    def _add_target(canonical: str, institution: str | None) -> None:
         if canonical == "nara":
             _slack_fail(
                 response_url,
@@ -106,19 +106,43 @@ def main() -> None:
                 response_url,
                 f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
             )
-        if canonical in seen_hubs:
+        target_str = f"{canonical}|{institution}" if institution else canonical
+        if target_str in seen_target_strs:
             _slack_fail(
                 response_url,
-                f"Hub '{canonical}' appears more than once in the target list.",
+                f"Target '{target_str}' appears more than once in the target list.",
             )
-        seen_hubs.add(canonical)
+        seen_target_strs.add(target_str)
+        seen_canonicals[canonical] = None
         targets.append((canonical, institution))
+
+    for token in target_tokens:
+        if is_wikidata_id(token):
+            resolved = resolve_wikidata_id(token)
+            if not resolved:
+                _slack_fail(
+                    response_url,
+                    f"No hub or institution found for Wikidata ID {token!r} in institutions_v2.json.",
+                )
+            for canonical, institution in resolved:
+                _add_target(canonical, institution)
+        elif "|" in token:
+            hub_part, institution = token.split("|", 1)
+            canonical = resolve_slug(hub_part)
+            if canonical is None:
+                _slack_fail(response_url, f"Unknown hub: {token!r}")
+            _add_target(canonical, institution)
+        else:
+            canonical = resolve_slug(token)
+            if canonical is None:
+                _slack_fail(response_url, f"Unknown hub: {token!r}")
+            _add_target(canonical, None)
 
     if not targets:
         _slack_fail(response_url, "No targets specified.")
 
     # Session name uses + as separator (unambiguous since slugs use -).
-    session_name = "wikimedia-" + "+".join(c for c, _ in targets)
+    session_name = "wikimedia-" + "+".join(seen_canonicals)
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
@@ -156,7 +180,7 @@ def main() -> None:
         if not existing_name.startswith("wikimedia-"):
             continue
         existing_hubs = set(existing_name[len("wikimedia-") :].split("+"))
-        overlap = seen_hubs & existing_hubs
+        overlap = set(seen_canonicals) & existing_hubs
         if overlap:
             conflicts.append((existing_name, overlap))
     if conflicts:
