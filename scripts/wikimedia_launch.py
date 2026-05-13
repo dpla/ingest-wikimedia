@@ -19,28 +19,11 @@ import sys
 import boto3
 import requests
 
+from ingest_wikimedia.partners import is_upload_eligible, resolve_slug
 from ingest_wikimedia.ssm import REGION, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
-
-# NARA requires a separate process and is excluded from automated launch
-VALID_PARTNERS = frozenset(
-    {
-        "bpl",
-        "georgia",
-        "indiana",
-        "northwest-heritage",
-        "ohio",
-        "p2p",
-        "pa",
-        "si",
-        "texas",
-        "minnesota",
-        "mwdl",
-        "heartland",
-    }
-)
 
 # Partners whose EC2 directory name differs from their partner key
 PARTNER_DIR = {
@@ -67,17 +50,34 @@ def main() -> None:
     parser.add_argument("--force", default="false")
     args = parser.parse_args()
 
-    partner = args.partner.strip().lower()
     force = args.force.lower() == "true"
 
-    if partner not in VALID_PARTNERS:
+    canonical = resolve_slug(args.partner)
+    if canonical is None:
+        print(f"Unknown hub: {args.partner.strip()}", file=sys.stderr)
+        sys.exit(1)
+    if canonical == "nara":
         print(
-            f"Unknown partner: {partner}. Valid: {', '.join(sorted(VALID_PARTNERS))}",
+            "NARA requires a separate process and cannot be launched here.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        eligible = is_upload_eligible(canonical)
+    except Exception as e:
+        print(
+            f"Failed to check upload eligibility for '{canonical}': {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not eligible:
+        print(
+            f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    pdir = PARTNER_DIR.get(partner, partner)
+    pdir = PARTNER_DIR.get(canonical, canonical)
     base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
@@ -98,47 +98,49 @@ def main() -> None:
         sys.exit(1)
     print("EC2 code updated.")
 
-    print(f"Checking for existing wikimedia-{partner} session...")
+    print(f"Checking for existing wikimedia-{canonical} session...")
     existing = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{partner}(:|$)' || echo NONE"
+        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
     )
-    if f"wikimedia-{partner}" in existing:
+    if f"wikimedia-{canonical}" in existing:
         if force:
             print("Existing session found; killing it (--force).")
-            ssm_run(ssm, f"tmux kill-session -t wikimedia-{partner}")
+            ssm_run(ssm, f"tmux kill-session -t wikimedia-{canonical}")
         else:
             print(
-                f"Session wikimedia-{partner} is already running. "
+                f"Session wikimedia-{canonical} is already running. "
                 "Set force=true to override.",
                 file=sys.stderr,
             )
             sys.exit(1)
 
-    print(f"Launching wikimedia-{partner} pipeline...")
+    print(f"Launching wikimedia-{canonical} pipeline...")
     pipeline_cmd = (
         f"source ~/.bashrc && "
         f"source /home/ec2-user/ingest-wikimedia/.venv/bin/activate && "
-        f"get-ids-es {partner} > {partner}.csv && "
-        f"downloader {partner}.csv {partner} && "
-        f"uploader {partner}.csv {partner}"
+        f"get-ids-es {canonical} > {canonical}.csv && "
+        f"downloader {canonical}.csv {canonical} && "
+        f"uploader {canonical}.csv {canonical}"
     )
-    tmux_cmd = f"tmux new-session -d -s wikimedia-{partner} -c {base}/ '{pipeline_cmd}'"
+    tmux_cmd = (
+        f"tmux new-session -d -s wikimedia-{canonical} -c {base}/ '{pipeline_cmd}'"
+    )
     ssm_run(ssm, tmux_cmd)
 
     print("Verifying session started...")
     result = ssm_run(
-        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{partner}(:|$)' || echo NONE"
+        ssm, f"tmux ls 2>/dev/null | grep -E '^wikimedia-{canonical}(:|$)' || echo NONE"
     )
-    if f"wikimedia-{partner}" not in result:
-        print(f"Session wikimedia-{partner} did not start.", file=sys.stderr)
+    if f"wikimedia-{canonical}" not in result:
+        print(f"Session wikimedia-{canonical} did not start.", file=sys.stderr)
         sys.exit(1)
-    print(f"Session wikimedia-{partner} confirmed running.")
+    print(f"Session wikimedia-{canonical} confirmed running.")
 
     if slack_token:
         try:
             post_to_slack(
                 slack_token,
-                f"▶ Started `wikimedia-{partner}` pipeline (ID generation → download → upload).",
+                f"▶ Started `wikimedia-{canonical}` pipeline (ID generation → download → upload).",
             )
         except Exception as e:
             logging.warning("Slack notification failed: %s", e)
