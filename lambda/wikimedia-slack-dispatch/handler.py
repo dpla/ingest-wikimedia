@@ -141,6 +141,14 @@ def handler(event, context):
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
             return _slack_reply(f"Failed to trigger workflow (HTTP {e.code}).")
+        except TimeoutError:
+            logging.warning(
+                "Timeout waiting for GitHub dispatch response (wikimedia-upload-status)"
+            )
+            return _slack_reply(
+                "GitHub API was slow — status check may have been dispatched anyway. "
+                "Watch #tech-alerts for results or try again."
+            )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
             return _slack_reply("Failed to trigger workflow due to an internal error.")
@@ -179,6 +187,14 @@ def handler(event, context):
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
             return _slack_reply(f"Failed to launch `{canonical}` (HTTP {e.code}).")
+        except TimeoutError:
+            logging.warning(
+                "Timeout waiting for GitHub dispatch response for %s", canonical
+            )
+            return _slack_reply(
+                f"GitHub API was slow — `wikimedia-{canonical}` may have been dispatched anyway. "
+                "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
+            )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
             return _slack_reply(
