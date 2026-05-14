@@ -57,25 +57,30 @@ COLLECTION_SUBSTRING_EXCLUSIONS: tuple[str, ...] = (
     "Correspondence Files",
 )
 
-# Collections matching any of these exact titles are excluded entirely.
+# Exact collection title excluded as a post-filter on the facet results.
+# (The three item-level exclusions below are applied in ES; this one is Python-side.)
 COLLECTION_EXACT_EXCLUSIONS: frozenset[str] = frozenset(
     {
-        "Naval Records Collection of the Office of Naval Records and Library",
-        "War Department Collection of Confederate Records",
         "War Department Collection of Revolutionary War Records",
     }
 )
 
-# Items with any collection title starting with "Records of" belong to a major
-# agency record group and are excluded from the collection strategy entirely.
-# This matches the original DPLA API NOT "Records of*" filter behaviour.
-_RECORDS_OF_EXCLUSION: dict = {
-    "bool": {
-        "must_not": [
-            {"prefix": {"sourceResource.collection.title.not_analyzed": "Records of"}}
-        ]
-    }
-}
+# ES-level item exclusions — applied to both the facet aggregation and each collection
+# item query so items belonging to these collections cannot slip through via another
+# eligible collection title. Replicates the original DPLA API filter behaviour.
+_COLLECTION_MUST_NOT: list[dict] = [
+    {"prefix": {"sourceResource.collection.title.not_analyzed": "Records of"}},
+    {
+        "term": {
+            "sourceResource.collection.title.not_analyzed": "Naval Records Collection of the Office of Naval Records and Library"
+        }
+    },
+    {
+        "term": {
+            "sourceResource.collection.title.not_analyzed": "War Department Collection of Confederate Records"
+        }
+    },
+]
 
 
 def _fetch_buckets(field: str, extra_filters: list[dict] | None = None) -> list[dict]:
@@ -208,7 +213,7 @@ def build_collection_queries() -> list[str]:
     """
     buckets = _fetch_buckets(
         "sourceResource.collection.title.not_analyzed",
-        extra_filters=[_RECORDS_OF_EXCLUSION],
+        extra_filters=[{"bool": {"must_not": _COLLECTION_MUST_NOT}}],
     )
     titles = []
     for b in buckets:
@@ -281,13 +286,7 @@ def main() -> None:
                                 }
                             }
                         ],
-                        "must_not": [
-                            {
-                                "prefix": {
-                                    "sourceResource.collection.title.not_analyzed": "Records of"
-                                }
-                            }
-                        ],
+                        "must_not": _COLLECTION_MUST_NOT,
                     }
                 },
             )
