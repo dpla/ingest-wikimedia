@@ -55,14 +55,7 @@ COLLECTION_SUBSTRING_EXCLUSIONS: tuple[str, ...] = (
     "Personnel",
     "Military Files",
     "Correspondence Files",
-)
-
-# Exact collection title excluded as a post-filter on the facet results.
-# (The three item-level exclusions below are applied in ES; this one is Python-side.)
-COLLECTION_EXACT_EXCLUSIONS: frozenset[str] = frozenset(
-    {
-        "War Department Collection of Revolutionary War Records",
-    }
+    "Index to",
 )
 
 # ES-level item exclusions — applied to both the facet aggregation and each collection
@@ -70,6 +63,7 @@ COLLECTION_EXACT_EXCLUSIONS: frozenset[str] = frozenset(
 # eligible collection title. Replicates the original DPLA API filter behaviour.
 _COLLECTION_MUST_NOT: list[dict] = [
     {"prefix": {"sourceResource.collection.title.not_analyzed": "Records of"}},
+    {"prefix": {"sourceResource.collection.title.not_analyzed": "General Records of"}},
     {
         "term": {
             "sourceResource.collection.title.not_analyzed": "Naval Records Collection of the Office of Naval Records and Library"
@@ -78,6 +72,11 @@ _COLLECTION_MUST_NOT: list[dict] = [
     {
         "term": {
             "sourceResource.collection.title.not_analyzed": "War Department Collection of Confederate Records"
+        }
+    },
+    {
+        "term": {
+            "sourceResource.collection.title.not_analyzed": "War Department Collection of Revolutionary War Records"
         }
     },
 ]
@@ -186,46 +185,49 @@ def _paginate(extra_filter: dict):
 
 
 def build_language_queries() -> list[list[str]]:
-    """Return batches of non-English language values for NARA."""
+    """Return batches of non-English language values for NARA, smallest sets first."""
     buckets = _fetch_buckets("sourceResource.language.name")
-    langs = [b["key"] for b in buckets if b["key"] != "English"]
+    langs = sorted(
+        (b for b in buckets if b["key"] != "English"),
+        key=lambda b: b["doc_count"],
+    )
+    values = [b["key"] for b in langs]
     return [
-        langs[i : i + LANGUAGES_PER_QUERY]
-        for i in range(0, len(langs), LANGUAGES_PER_QUERY)
+        values[i : i + LANGUAGES_PER_QUERY]
+        for i in range(0, len(values), LANGUAGES_PER_QUERY)
     ]
 
 
 def build_format_queries() -> list[list[str]]:
-    """Return batches of format values with doc_count < FORMAT_COUNT_LIMIT."""
+    """Return batches of format values with doc_count < FORMAT_COUNT_LIMIT, smallest sets first."""
     buckets = _fetch_buckets("sourceResource.format")
-    formats = [b["key"] for b in buckets if b["doc_count"] < FORMAT_COUNT_LIMIT]
+    formats = sorted(
+        (b for b in buckets if b["doc_count"] < FORMAT_COUNT_LIMIT),
+        key=lambda b: b["doc_count"],
+    )
+    values = [b["key"] for b in formats]
     return [
-        formats[i : i + FORMATS_PER_QUERY]
-        for i in range(0, len(formats), FORMATS_PER_QUERY)
+        values[i : i + FORMATS_PER_QUERY]
+        for i in range(0, len(values), FORMATS_PER_QUERY)
     ]
 
 
 def build_collection_queries() -> list[str]:
-    """Return collection titles that pass all exclusion filters and size threshold.
-
-    Only considers items with no "Records of..." collection title — matching the
-    original NOT "Records of*" filter from the DPLA API version of this script.
-    """
+    """Return collection titles passing all exclusion filters and size threshold, smallest sets first."""
     buckets = _fetch_buckets(
         "sourceResource.collection.title.not_analyzed",
         extra_filters=[{"bool": {"must_not": _COLLECTION_MUST_NOT}}],
     )
-    titles = []
-    for b in buckets:
-        title = b["key"]
-        if b["doc_count"] >= COLLECTION_COUNT_LIMIT:
-            continue
-        if any(excl in title for excl in COLLECTION_SUBSTRING_EXCLUSIONS):
-            continue
-        if title in COLLECTION_EXACT_EXCLUSIONS:
-            continue
-        titles.append(title)
-    return titles
+    eligible = sorted(
+        (
+            b
+            for b in buckets
+            if b["doc_count"] < COLLECTION_COUNT_LIMIT
+            and not any(excl in b["key"] for excl in COLLECTION_SUBSTRING_EXCLUSIONS)
+        ),
+        key=lambda b: b["doc_count"],
+    )
+    return [b["key"] for b in eligible]
 
 
 def _stage_to_s3(s3_client: S3Client, dpla_id: str, source: dict) -> None:
