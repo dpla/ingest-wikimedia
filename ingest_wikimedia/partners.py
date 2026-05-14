@@ -67,6 +67,11 @@ PARTNER_HUBS: dict[str, str] = {
     "wisconsin": "Recollection Wisconsin",
 }
 
+# Partners whose EC2 directory name differs from their canonical slug.
+PARTNER_DIR: dict[str, str] = {
+    "si": "smithsonian",
+}
+
 # Alternate slugs that map to a canonical slug in PARTNER_HUBS
 _SLUG_ALIASES: dict[str, str] = {
     "nwdh": "northwest-heritage",
