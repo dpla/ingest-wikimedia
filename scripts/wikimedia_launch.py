@@ -26,6 +26,7 @@ import boto3
 import requests
 
 from ingest_wikimedia.partners import (
+    PARTNER_DIR,
     canonical_matches_session_component,
     is_upload_eligible,
     is_wikidata_id,
@@ -37,11 +38,6 @@ from ingest_wikimedia.ssm import REGION, ssm_run
 
 # Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
 MEMORY_HEADROOM_PCT = 30
-
-# Partners whose EC2 directory name differs from their partner key
-PARTNER_DIR = {
-    "si": "smithsonian",
-}
 
 
 def _slack_fail(response_url: str, msg: str) -> None:
@@ -90,7 +86,7 @@ def main() -> None:
     seen_session_labels: dict[
         str, None
     ] = {}  # insertion-ordered; drives session naming
-    targets: list[tuple[str, str | None]] = []
+    targets: list[tuple[str, str | None, str]] = []
 
     def _add_target(canonical: str, institution: str | None) -> None:
         if canonical == "nara":
@@ -118,9 +114,10 @@ def main() -> None:
             )
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
-        label = institution.lower().replace(" ", "-") if institution else canonical
+        inst_label = institution.lower().replace(" ", "-") if institution else None
+        label = f"{canonical}+{inst_label}" if inst_label else canonical
         seen_session_labels[label] = None
-        targets.append((canonical, institution))
+        targets.append((canonical, institution, label))
 
     for token in target_tokens:
         if is_wikidata_id(token):
@@ -148,8 +145,8 @@ def main() -> None:
         _slack_fail(response_url, "No targets specified.")
 
     # Session name uses + as separator (unambiguous since slugs/institution names use -).
-    # Institution-level targets use the institution name (hyphenated) rather than the
-    # hub slug, so "indiana|Indiana State Library" → wikimedia-indiana-state-library.
+    # Institution-level targets include the hub slug as a prefix so the status script
+    # can derive the EC2 directory: "indiana|Indiana State Library" → wikimedia-indiana+indiana-state-library.
     session_name = "wikimedia-" + "+".join(seen_session_labels)
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
@@ -233,7 +230,7 @@ def main() -> None:
         "source ~/.bashrc",
         "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate",
     ]
-    for canonical, institution in targets:
+    for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
         get_ids_cmd = f"get-ids-es {canonical}"
@@ -242,6 +239,7 @@ def main() -> None:
         get_ids_cmd += f" > {canonical}.csv"
         steps += [
             f"cd {base}",
+            f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}",
             get_ids_cmd,
             f"downloader {canonical}.csv {canonical}",
             f"uploader {canonical}.csv {canonical}",
@@ -249,7 +247,9 @@ def main() -> None:
     pipeline_cmd = " && ".join(steps)
 
     if slack_token:
-        target_labels = [f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst in targets]
+        target_labels = [
+            f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst, _ in targets
+        ]
         try:
             post_message(
                 slack_token,

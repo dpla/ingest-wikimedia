@@ -13,22 +13,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import requests
 
+from ingest_wikimedia.partners import PARTNER_DIR
 from ingest_wikimedia.ssm import REGION, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
 
-def get_phase_and_progress(client, partner: str) -> str:
+def get_phase_and_progress(client, session: str, hub: str) -> str:
     def _safe_int(s: str) -> int:
         try:
             return int(s)
         except ValueError:
             return 0
 
-    base = f"/home/ec2-user/ingest-wikimedia/{partner}"
+    pdir = PARTNER_DIR.get(hub, hub)
+    base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
     log_dir = shlex.quote(f"{base}/logs")
-    session_name = shlex.quote(f"wikimedia-{partner}")
+    session_name = shlex.quote(session)
 
     # Get session creation time and most recent log filename — no shell variables
     # needed, avoiding outer-bash expansion of $f inside the bash -c double-quote.
@@ -45,7 +47,7 @@ def get_phase_and_progress(client, partner: str) -> str:
         return "Generating IDs"
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
-    csv_path = shlex.quote(f"{base}/{partner}.csv")
+    csv_path = shlex.quote(f"{base}/{hub}.csv")
 
     sep = "__WM_SEP__"
     out = ssm_run(
@@ -167,9 +169,9 @@ def main() -> None:
     results: dict[str, str] = {}
 
     def fetch(session: str) -> tuple[str, str]:
-        partner = session.removeprefix("wikimedia-")
+        hub = session.removeprefix("wikimedia-").split("+")[0]
         try:
-            phase = get_phase_and_progress(ssm, partner)
+            phase = get_phase_and_progress(ssm, session, hub)
         except Exception:
             logging.exception("Failed to get status for %s", session)
             phase = "Unknown (error)"

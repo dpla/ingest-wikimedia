@@ -36,9 +36,10 @@ def notify_phase_start(partner: str, phase: Phase) -> None:
     if not token:
         logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
         return
+    session_label = os.environ.get("WIKIMEDIA_SESSION_LABEL") or partner
     emoji = _PHASE_EMOJI.get(phase, "▶")
     try:
-        post_message(token, f"{emoji} `wikimedia-{partner}`: starting {phase}")
+        post_message(token, f"{emoji} `wikimedia-{session_label}`: starting {phase}")
     except Exception:
         logging.warning("Slack phase notification failed", exc_info=True)
 
@@ -63,6 +64,9 @@ def notify_upload_complete(
         logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
         return
 
+    session_label = os.environ.get("WIKIMEDIA_SESSION_LABEL")
+    effective_label = f"wikimedia-{session_label}" if session_label else partner_label
+
     hours, remainder = divmod(int(elapsed_seconds), 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours:
@@ -73,7 +77,7 @@ def notify_upload_complete(
         runtime = f"{seconds}s"
 
     dry_run_note = " _(dry run)_" if dry_run else ""
-    header = f"*Wikimedia Upload Complete: {partner_label}*{dry_run_note}"
+    header = f"*Wikimedia Upload Complete: {effective_label}*{dry_run_note}"
 
     lines = [
         f"UPLOADED: {tracker.count(Result.UPLOADED):,}",
@@ -86,7 +90,7 @@ def notify_upload_complete(
 
     payload = {
         "channel": SLACK_CHANNEL,
-        "text": f"Wikimedia upload complete: {partner_label}",
+        "text": f"Wikimedia upload complete: {effective_label}",
         "blocks": [
             {"type": "section", "text": {"type": "mrkdwn", "text": header}},
             {"type": "section", "text": {"type": "mrkdwn", "text": body}},
