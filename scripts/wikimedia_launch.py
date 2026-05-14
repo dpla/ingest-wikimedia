@@ -96,23 +96,24 @@ def main() -> None:
                     response_url,
                     f"Target '{canonical}|' has an empty institution name.",
                 )
-        if canonical == "nara":
+        if canonical == "nara" and institution is not None:
             _slack_fail(
                 response_url,
-                "NARA requires a separate process and cannot be launched here.",
+                "NARA does not support institution-level launches. Use 'nara' without an institution.",
             )
-        try:
-            eligible = is_upload_eligible(canonical)
-        except Exception as e:
-            _slack_fail(
-                response_url,
-                f"Failed to check upload eligibility for '{canonical}': {e}",
-            )
-        if not eligible:
-            _slack_fail(
-                response_url,
-                f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
-            )
+        elif canonical != "nara":
+            try:
+                eligible = is_upload_eligible(canonical)
+            except Exception as e:
+                _slack_fail(
+                    response_url,
+                    f"Failed to check upload eligibility for '{canonical}': {e}",
+                )
+            if not eligible:
+                _slack_fail(
+                    response_url,
+                    f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
+                )
         target_str = (
             f"{canonical}|{institution}" if institution is not None else canonical
         )
@@ -244,10 +245,13 @@ def main() -> None:
     for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
-        get_ids_cmd = f"get-ids-es {canonical}"
-        if institution is not None:
-            get_ids_cmd += f" --institution {shlex.quote(institution)}"
-        get_ids_cmd += f" > {canonical}.csv"
+        if canonical == "nara":
+            get_ids_cmd = f"get-ids-nara > {canonical}.csv"
+        else:
+            get_ids_cmd = f"get-ids-es {canonical}"
+            if institution is not None:
+                get_ids_cmd += f" --institution {shlex.quote(institution)}"
+            get_ids_cmd += f" > {canonical}.csv"
         steps += [
             f"cd {base}",
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}",

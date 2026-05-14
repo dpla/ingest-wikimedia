@@ -44,6 +44,7 @@ FORMAT_COUNT_LIMIT = 12_000
 COLLECTION_COUNT_LIMIT = 50_000
 LANGUAGES_PER_QUERY = 10
 FORMATS_PER_QUERY = 6
+COLLECTIONS_PER_QUERY = 50
 
 # Collections containing any of these substrings are excluded entirely.
 COLLECTION_SUBSTRING_EXCLUSIONS: tuple[str, ...] = (
@@ -245,11 +246,12 @@ def main() -> None:
                 {"terms": {"sourceResource.format": batch}},
             )
         )
-    for title in collection_titles:
+    for i in range(0, len(collection_titles), COLLECTIONS_PER_QUERY):
+        batch = collection_titles[i : i + COLLECTIONS_PER_QUERY]
         queries.append(
             (
-                f"collection: {title[:60]}",
-                {"term": {"sourceResource.collection.title.not_analyzed": title}},
+                f"collections: {batch[0][:50]}{'...' if len(batch[0]) > 50 else ''}",
+                {"terms": {"sourceResource.collection.title.not_analyzed": batch}},
             )
         )
 
