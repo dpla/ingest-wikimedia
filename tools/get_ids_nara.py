@@ -63,42 +63,58 @@ COLLECTION_EXACT_EXCLUSIONS: frozenset[str] = frozenset(
 
 
 def _fetch_buckets(field: str) -> list[dict]:
-    """Return all ES aggregation buckets for `field` under NARA with Unlimited Re-Use."""
-    query = {
-        "size": 0,
-        "query": {
-            "bool": {
-                "filter": [
-                    {"term": {"provider.name.not_analyzed": NARA_PROVIDER}},
-                    {"term": {"rightsCategory": "Unlimited Re-Use"}},
-                ]
-            }
-        },
-        "aggs": {
-            "values": {
-                "terms": {
-                    "field": field,
-                    "size": 50000,
+    """Return all ES aggregation buckets for `field` under NARA with Unlimited Re-Use.
+
+    Uses composite aggregation to safely paginate through all values regardless of
+    cardinality — avoids the 503s that a large fixed-size terms aggregation causes
+    on high-cardinality fields like sourceResource.collection.title.not_analyzed.
+
+    Each returned bucket has the shape {"key": <field_value>, "doc_count": N}.
+    """
+    buckets: list[dict] = []
+    after_key: dict | None = None
+
+    while True:
+        composite_agg: dict = {
+            "size": 1000,
+            "sources": [{"key": {"terms": {"field": field}}}],
+        }
+        if after_key is not None:
+            composite_agg["after"] = after_key
+
+        query = {
+            "size": 0,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"provider.name.not_analyzed": NARA_PROVIDER}},
+                        {"term": {"rightsCategory": "Unlimited Re-Use"}},
+                    ]
                 }
-            }
-        },
-    }
-    response = requests.post(
-        ES_URL,
-        json=query,
-        headers={"Content-Type": "application/json"},
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    _check_es_response(data)
-    agg = data["aggregations"]["values"]
-    if agg.get("sum_other_doc_count", 0) > 0:
-        raise RuntimeError(
-            f"terms aggregation for '{field}' truncated — increase size "
-            f"(sum_other_doc_count={agg['sum_other_doc_count']})"
+            },
+            "aggs": {"values": {"composite": composite_agg}},
+        }
+        response = requests.post(
+            ES_URL,
+            json=query,
+            headers={"Content-Type": "application/json"},
+            timeout=60,
         )
-    return agg["buckets"]
+        response.raise_for_status()
+        data = response.json()
+        _check_es_response(data)
+
+        page = data["aggregations"]["values"]
+        # Composite agg buckets: {"key": {"key": <value>}, "doc_count": N}
+        # Normalize to {"key": <value>, "doc_count": N} to match the callers' expectations.
+        for b in page["buckets"]:
+            buckets.append({"key": b["key"]["key"], "doc_count": b["doc_count"]})
+
+        after_key = page.get("after_key")
+        if not after_key:
+            break
+
+    return buckets
 
 
 def _check_es_response(data: dict) -> None:
