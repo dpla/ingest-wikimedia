@@ -89,6 +89,13 @@ def main() -> None:
     targets: list[tuple[str, str | None, str]] = []
 
     def _add_target(canonical: str, institution: str | None) -> None:
+        if institution is not None:
+            institution = institution.strip()
+            if not institution:
+                _slack_fail(
+                    response_url,
+                    f"Target '{canonical}|' has an empty institution name.",
+                )
         if canonical == "nara":
             _slack_fail(
                 response_url,
@@ -106,7 +113,9 @@ def main() -> None:
                 response_url,
                 f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
             )
-        target_str = f"{canonical}|{institution}" if institution else canonical
+        target_str = (
+            f"{canonical}|{institution}" if institution is not None else canonical
+        )
         if target_str in seen_target_strs:
             _slack_fail(
                 response_url,
@@ -114,8 +123,10 @@ def main() -> None:
             )
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
-        inst_label = institution.lower().replace(" ", "-") if institution else None
-        label = f"{canonical}+{inst_label}" if inst_label else canonical
+        inst_label = (
+            institution.lower().replace(" ", "-") if institution is not None else None
+        )
+        label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
         seen_session_labels[label] = None
         targets.append((canonical, institution, label))
 
