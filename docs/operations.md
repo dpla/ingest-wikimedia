@@ -259,7 +259,7 @@ When multiple targets are specified, they all run in a single tmux session. The 
 wikimedia-<label1>+<label2>+...
 ```
 
-The label for a full-hub target is its canonical slug. The label for an institution-level target is `{canonical}+{institution}`, where the institution name is lowercased with spaces replaced by hyphens. The hub slug prefix lets the status script locate the correct EC2 directory and is also what `/wikimedia-upload kill` accepts.
+The label for a full-hub target is its canonical slug. The label for an institution-level target is `{canonical}+{institution}`, where the institution name is lowercased with spaces replaced by hyphens. The hub slug prefix lets the status script locate the correct EC2 directory. `/wikimedia-upload kill` accepts any `+`-delimited component of the session name (see kill command section above).
 
 Examples:
 - `/wikimedia-upload bpl` → session `wikimedia-bpl`
