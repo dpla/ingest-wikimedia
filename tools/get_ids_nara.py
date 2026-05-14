@@ -22,7 +22,8 @@ Output: one DPLA ID per line to stdout. Redirect to produce the IDs CSV:
 import json
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import click
 import requests
@@ -33,7 +34,10 @@ from ingest_wikimedia.slack import notify_phase_start
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
-S3_WRITE_WORKERS = 10
+S3_WRITE_WORKERS = 4
+# Max S3 writes queued + in-flight at once — prevents the executor queue from
+# growing unboundedly and holding thousands of ES source documents in memory.
+_S3_QUEUE_DEPTH = S3_WRITE_WORKERS * 4
 PARTNER = "nara"
 NARA_PROVIDER = "National Archives and Records Administration"
 
@@ -289,9 +293,20 @@ def main() -> None:
             )
         )
 
-    with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
-        futures: dict = {}
+    s3_sem = threading.BoundedSemaphore(_S3_QUEUE_DEPTH)
+    failed = [0]
 
+    def _on_s3_done(dpla_id: str):
+        def callback(future: Future) -> None:
+            s3_sem.release()
+            exc = future.exception()
+            if exc:
+                failed[0] += 1
+                logging.warning(f"S3 write failed for {dpla_id}: {exc}")
+
+        return callback
+
+    with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         for label, extra_filter in queries:
             print(f"Querying {label}", file=sys.stderr)
             for hit in _paginate(extra_filter):
@@ -304,20 +319,14 @@ def main() -> None:
                 seen_ids.add(dpla_id)
                 source["_staged_by_get_ids_es"] = True
 
+                s3_sem.acquire()
                 future = executor.submit(_stage_to_s3, s3_client, dpla_id, source)
-                futures[future] = dpla_id
+                future.add_done_callback(_on_s3_done(dpla_id))
 
                 print(dpla_id)
 
-        failed = 0
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                failed += 1
-                logging.warning(f"S3 write failed for {futures[future]}: {e}")
-        if failed:
-            print(f"Warning: {failed} S3 writes failed", file=sys.stderr)
+    if failed[0]:
+        print(f"Warning: {failed[0]} S3 writes failed", file=sys.stderr)
 
 
 if __name__ == "__main__":
