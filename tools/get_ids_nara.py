@@ -62,8 +62,19 @@ COLLECTION_EXACT_EXCLUSIONS: frozenset[str] = frozenset(
     }
 )
 
+# Items with any collection title starting with "Records of" belong to a major
+# agency record group and are excluded from the collection strategy entirely.
+# This matches the original DPLA API NOT "Records of*" filter behaviour.
+_RECORDS_OF_EXCLUSION: dict = {
+    "bool": {
+        "must_not": [
+            {"prefix": {"sourceResource.collection.title.not_analyzed": "Records of"}}
+        ]
+    }
+}
 
-def _fetch_buckets(field: str) -> list[dict]:
+
+def _fetch_buckets(field: str, extra_filters: list[dict] | None = None) -> list[dict]:
     """Return all ES aggregation buckets for `field` under NARA with Unlimited Re-Use.
 
     Uses composite aggregation to safely paginate through all values regardless of
@@ -90,6 +101,7 @@ def _fetch_buckets(field: str) -> list[dict]:
                     "filter": [
                         {"term": {"provider.name.not_analyzed": NARA_PROVIDER}},
                         {"term": {"rightsCategory": "Unlimited Re-Use"}},
+                        *(extra_filters or []),
                     ]
                 }
             },
@@ -185,14 +197,19 @@ def build_format_queries() -> list[list[str]]:
 
 
 def build_collection_queries() -> list[str]:
-    """Return collection titles that pass all exclusion filters and size threshold."""
-    buckets = _fetch_buckets("sourceResource.collection.title.not_analyzed")
+    """Return collection titles that pass all exclusion filters and size threshold.
+
+    Only considers items with no "Records of..." collection title — matching the
+    original NOT "Records of*" filter from the DPLA API version of this script.
+    """
+    buckets = _fetch_buckets(
+        "sourceResource.collection.title.not_analyzed",
+        extra_filters=[_RECORDS_OF_EXCLUSION],
+    )
     titles = []
     for b in buckets:
         title = b["key"]
         if b["doc_count"] >= COLLECTION_COUNT_LIMIT:
-            continue
-        if title.startswith("Records of"):
             continue
         if any(excl in title for excl in COLLECTION_SUBSTRING_EXCLUSIONS):
             continue
@@ -251,7 +268,24 @@ def main() -> None:
         queries.append(
             (
                 f"collections: {batch[0][:50]}{'...' if len(batch[0]) > 50 else ''}",
-                {"terms": {"sourceResource.collection.title.not_analyzed": batch}},
+                {
+                    "bool": {
+                        "filter": [
+                            {
+                                "terms": {
+                                    "sourceResource.collection.title.not_analyzed": batch
+                                }
+                            }
+                        ],
+                        "must_not": [
+                            {
+                                "prefix": {
+                                    "sourceResource.collection.title.not_analyzed": "Records of"
+                                }
+                            }
+                        ],
+                    }
+                },
             )
         )
 
