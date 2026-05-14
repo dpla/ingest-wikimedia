@@ -72,11 +72,12 @@ The immediate Slack reply confirms that the workflow was dispatched. A confirmat
 
 ### `/wikimedia-upload kill <label> [<label> ...]`
 
-Stops one or more running pipeline sessions. Use the session label suffix shown by `/wikimedia-status` — for example, `indiana-state-library` kills `wikimedia-indiana-state-library`. Wikidata QIDs are also accepted and resolved to their label.
+Stops one or more running pipeline sessions. Use any `+`-delimited component of the session name shown by `/wikimedia-status` — for example, both `indiana` and `indiana-state-library` match the session `wikimedia-indiana+indiana-state-library`. Wikidata QIDs are also accepted and resolved to their label components.
 
 ```text
 /wikimedia-upload kill bpl
 /wikimedia-upload kill bpl pa
+/wikimedia-upload kill indiana
 /wikimedia-upload kill indiana-state-library
 /wikimedia-upload kill Q72380652
 ```
@@ -258,13 +259,13 @@ When multiple targets are specified, they all run in a single tmux session. The 
 wikimedia-<label1>+<label2>+...
 ```
 
-The label for a full-hub target is its canonical slug. The label for an institution-level target is the institution name, lowercased with spaces replaced by hyphens. This is what `/wikimedia-status` reports and what `/wikimedia-upload kill` accepts.
+The label for a full-hub target is its canonical slug. The label for an institution-level target is `{canonical}+{institution}`, where the institution name is lowercased with spaces replaced by hyphens. The hub slug prefix lets the status script locate the correct EC2 directory and is also what `/wikimedia-upload kill` accepts.
 
 Examples:
 - `/wikimedia-upload bpl` → session `wikimedia-bpl`
 - `/wikimedia-upload bpl pa` → session `wikimedia-bpl+pa`
-- `/wikimedia-upload "indiana|Indiana State Library"` → session `wikimedia-indiana-state-library`
-- `/wikimedia-upload bpl "indiana|Indiana State Library"` → session `wikimedia-bpl+indiana-state-library`
+- `/wikimedia-upload "indiana|Indiana State Library"` → session `wikimedia-indiana+indiana-state-library`
+- `/wikimedia-upload bpl "indiana|Indiana State Library"` → session `wikimedia-bpl+indiana+indiana-state-library`
 
 The `+` separator is unambiguous because labels use `-` as their only separator character.
 
