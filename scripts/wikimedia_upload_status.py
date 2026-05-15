@@ -13,11 +13,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import requests
 
-from ingest_wikimedia.partners import PARTNER_DIR
+from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels
 from ingest_wikimedia.ssm import REGION, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
+_UPLOAD_COMPLETE_PREFIX = "Upload complete"
 
 
 def get_phase_and_progress(client, session: str, hub: str) -> str:
@@ -94,7 +95,7 @@ def get_phase_and_progress(client, session: str, hub: str) -> str:
         # dpla_id_count is logged at the start of each item, not after all its
         # files finish, so count arithmetic alone can fire too early.
         if counts_marker > 0:
-            return f"Upload complete ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
+            return f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
         return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%)"
 
     return "Unknown"
@@ -169,13 +170,26 @@ def main() -> None:
     results: dict[str, str] = {}
 
     def fetch(session: str) -> tuple[str, str]:
-        hub = session.removeprefix("wikimedia-").split("+")[0]
-        try:
-            phase = get_phase_and_progress(ssm, session, hub)
-        except Exception:
-            logging.exception("Failed to get status for %s", session)
-            phase = "Unknown (error)"
-        return session, phase
+        labels = parse_session_labels(session.removeprefix("wikimedia-"))
+        if not labels:
+            return session, "Unknown (unrecognised session name)"
+        multi = len(labels) > 1
+        hub_cache: dict[str, str] = {}
+        label, phase = labels[0], "Unknown"
+        for label in labels:
+            hub = label.split("+")[0]
+            if hub not in hub_cache:
+                try:
+                    hub_cache[hub] = get_phase_and_progress(ssm, session, hub)
+                except Exception:
+                    logging.exception(
+                        "Failed to get status for %s (%s)", session, label
+                    )
+                    hub_cache[hub] = "Unknown (error)"
+            phase = hub_cache[hub]
+            if not phase.startswith(_UPLOAD_COMPLETE_PREFIX):
+                break
+        return session, f"[{label}] {phase}" if multi else phase
 
     with ThreadPoolExecutor(max_workers=min(len(sessions), 8)) as executor:
         futures = {executor.submit(fetch, s): s for s in sessions}
