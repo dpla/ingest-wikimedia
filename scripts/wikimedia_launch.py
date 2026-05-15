@@ -98,11 +98,11 @@ def main() -> None:
                     response_url,
                     f"Target '{canonical}|' has an empty institution name.",
                 )
-        if institution is not None:
+        if institution is not None and canonical != "nara":
             # Institution-level target: check that specific institution's eligibility.
-            # This applies to all hubs including NARA, where individual institutions
-            # vary in eligibility. get-ids-es enforces the same check, so catching it
-            # here gives a clear error before the pipeline launches.
+            # NARA is excluded — all its institutions have upload=false in the JSON
+            # but the hub itself is eligible; get-ids-es handles per-institution
+            # filtering for NARA (based on Wikidata ID presence, not the upload flag).
             try:
                 inst_eligible = is_institution_upload_eligible(canonical, institution)
             except Exception as e:
@@ -116,7 +116,7 @@ def main() -> None:
                     f"Institution '{institution}' is not upload-eligible for hub"
                     f" '{canonical}' per institutions_v2.json.",
                 )
-        elif canonical != "nara":
+        elif institution is None and canonical != "nara":
             # Hub-level target: check that any institution in the hub is eligible.
             # NARA hub-level runs use get-ids-nara which filters eligibility itself.
             try:
