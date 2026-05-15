@@ -124,6 +124,11 @@ def main() -> None:
             if institution is not None
             else None
         )
+        if institution is not None and not inst_label:
+            _slack_fail(
+                response_url,
+                f"Target '{canonical}|{institution}' normalizes to an empty institution slug.",
+            )
         label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
         seen_session_labels[label] = None
         targets.append((canonical, institution, label))
