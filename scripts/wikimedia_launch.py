@@ -27,9 +27,9 @@ import requests
 
 from ingest_wikimedia.partners import (
     PARTNER_DIR,
-    canonical_matches_session_component,
     is_upload_eligible,
     is_wikidata_id,
+    parse_session_labels,
     resolve_slug,
     resolve_wikidata_id,
 )
@@ -120,8 +120,15 @@ def main() -> None:
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
         inst_label = (
-            institution.lower().replace(" ", "-") if institution is not None else None
+            re.sub(r"[^a-z0-9-]", "", institution.lower().replace(" ", "-"))
+            if institution is not None
+            else None
         )
+        if institution is not None and not inst_label:
+            _slack_fail(
+                response_url,
+                f"Target '{canonical}|{institution}' normalizes to an empty institution slug.",
+            )
         label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
         seen_session_labels[label] = None
         targets.append((canonical, institution, label))
@@ -191,21 +198,37 @@ def main() -> None:
         existing_name = line.split(":")[0].strip()
         if not existing_name.startswith("wikimedia-"):
             continue
-        existing_hubs = set(existing_name[len("wikimedia-") :].split("+"))
-        overlap = {
-            c
-            for c in seen_canonicals
-            if any(
-                canonical_matches_session_component(c, comp) for comp in existing_hubs
-            )
-        }
+        existing_labels = set(parse_session_labels(existing_name[len("wikimedia-") :]))
+        overlap: set[str] = set()
+        for canonical, institution, label in targets:
+            if institution is None:
+                # Hub-level request conflicts with any existing session touching this hub
+                # (hub-level or any institution-level for the same hub).
+                if any(
+                    lbl == canonical or lbl.startswith(f"{canonical}+")
+                    for lbl in existing_labels
+                ):
+                    overlap.add(canonical)
+            else:
+                # Institution-level request conflicts only with:
+                #   1. An existing hub-level session for the same hub (would run all institutions)
+                #   2. An existing session for the exact same hub+institution
+                # Two institution-level sessions for the same hub but different institutions
+                # do NOT conflict.
+                if canonical in existing_labels or label in existing_labels:
+                    overlap.add(canonical)
         if overlap:
             conflicts.append((existing_name, overlap))
     if conflicts:
         if force:
             for existing_name, _ in conflicts:
                 print(f"Existing session found: {existing_name}; killing it (--force).")
-                ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
+                try:
+                    ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
+                except Exception as e:
+                    _slack_fail(
+                        response_url, f"⚠️ Failed to kill session `{existing_name}`: {e}"
+                    )
         else:
             conflict_names = ", ".join(f"`{n}`" for n, _ in conflicts)
             _slack_fail(
@@ -224,10 +247,16 @@ def main() -> None:
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
         "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
     )
-    out = ssm_run(ssm, update_cmd)
+    out = ""
+    try:
+        out = ssm_run(ssm, update_cmd)
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to update EC2 code: {e}")
     if "UPDATE_DONE" not in out:
-        print(f"EC2 update did not confirm completion. Output: {out}", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(
+            response_url,
+            "⚠️ EC2 code update did not confirm completion. Check the GitHub Actions run for details.",
+        )
     print("EC2 code updated.")
 
     # Build a chained pipeline command for all targets.
@@ -275,13 +304,24 @@ def main() -> None:
         f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
         f' "{pipeline_cmd}"'
     )
-    ssm_run(ssm, tmux_cmd)
+    try:
+        ssm_run(ssm, tmux_cmd)
+    except Exception as e:
+        _slack_fail(
+            response_url, f"⚠️ Failed to launch tmux session `{session_name}`: {e}"
+        )
 
     print("Verifying session started...")
-    result = ssm_run(
-        ssm,
-        f"tmux ls 2>/dev/null | grep -E '^{re.escape(session_name)}(:|$)' || echo NONE",
-    )
+    result = ""
+    try:
+        result = ssm_run(
+            ssm,
+            f"tmux ls 2>/dev/null | grep -E '^{re.escape(session_name)}(:|$)' || echo NONE",
+        )
+    except Exception as e:
+        _slack_fail(
+            response_url, f"⚠️ Failed to verify session `{session_name}` started: {e}"
+        )
     if session_name not in result:
         _slack_fail(
             response_url,
