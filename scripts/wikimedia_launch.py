@@ -27,9 +27,9 @@ import requests
 
 from ingest_wikimedia.partners import (
     PARTNER_DIR,
-    canonical_matches_session_component,
     is_upload_eligible,
     is_wikidata_id,
+    parse_session_labels,
     resolve_slug,
     resolve_wikidata_id,
 )
@@ -191,14 +191,25 @@ def main() -> None:
         existing_name = line.split(":")[0].strip()
         if not existing_name.startswith("wikimedia-"):
             continue
-        existing_hubs = set(existing_name[len("wikimedia-") :].split("+"))
-        overlap = {
-            c
-            for c in seen_canonicals
-            if any(
-                canonical_matches_session_component(c, comp) for comp in existing_hubs
-            )
-        }
+        existing_labels = set(parse_session_labels(existing_name[len("wikimedia-") :]))
+        overlap: set[str] = set()
+        for canonical, institution, label in targets:
+            if institution is None:
+                # Hub-level request conflicts with any existing session touching this hub
+                # (hub-level or any institution-level for the same hub).
+                if any(
+                    lbl == canonical or lbl.startswith(f"{canonical}+")
+                    for lbl in existing_labels
+                ):
+                    overlap.add(canonical)
+            else:
+                # Institution-level request conflicts only with:
+                #   1. An existing hub-level session for the same hub (would run all institutions)
+                #   2. An existing session for the exact same hub+institution
+                # Two institution-level sessions for the same hub but different institutions
+                # do NOT conflict.
+                if canonical in existing_labels or label in existing_labels:
+                    overlap.add(canonical)
         if overlap:
             conflicts.append((existing_name, overlap))
     if conflicts:

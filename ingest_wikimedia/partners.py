@@ -136,6 +136,38 @@ def is_wikidata_id(s: str) -> bool:
     return bool(_QID_RE.match(s))
 
 
+def parse_session_labels(suffix: str) -> list[str]:
+    """Parse the part of a tmux session name after 'wikimedia-' into target labels.
+
+    Session names concatenate target labels with '+' as separator, but institution-level
+    labels themselves contain '+' (e.g. 'nara+herbert-hoover-library'). This function
+    uses PARTNER_HUBS keys as hub boundaries to unambiguously reconstruct labels:
+    a token that immediately follows a known hub slug and is not itself a known hub slug
+    is treated as that hub's institution slug.
+
+    Examples:
+        'bpl'                              → ['bpl']
+        'nara+herbert-hoover-library'      → ['nara+herbert-hoover-library']
+        'bpl+nara+herbert-hoover-library'  → ['bpl', 'nara+herbert-hoover-library']
+        'bpl+nara'                         → ['bpl', 'nara']
+    """
+    parts = suffix.split("+")
+    labels: list[str] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part in PARTNER_HUBS:
+            if i + 1 < len(parts) and parts[i + 1] not in PARTNER_HUBS:
+                labels.append(f"{part}+{parts[i + 1]}")
+                i += 2
+            else:
+                labels.append(part)
+                i += 1
+        else:
+            i += 1  # orphaned token (malformed session name); skip
+    return labels
+
+
 def canonical_matches_session_component(
     canonical: str, component: str, timeout: int = 5
 ) -> bool:
