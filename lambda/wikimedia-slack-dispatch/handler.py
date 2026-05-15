@@ -241,11 +241,6 @@ def handler(event, context):
                         f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
                         ephemeral=True,
                     )
-                if canonical == "nara":
-                    return _slack_reply(
-                        "NARA requires a separate process and cannot be launched here.",
-                        ephemeral=True,
-                    )
                 target_str = f"{canonical}|{institution}" if institution else canonical
                 if target_str in seen_tokens:
                     return _slack_reply(
