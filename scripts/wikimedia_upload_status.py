@@ -45,6 +45,17 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str:
     session_created = _safe_int(precheck_lines[0]) if precheck_lines else 0
     log_file = precheck_lines[1].strip() if len(precheck_lines) > 1 else ""
 
+    # Backward compat: sessions launched before the session-label log naming change
+    # use hub-slug-only filenames (e.g. nara-download.log). If no label-prefixed log
+    # is found, fall back to the most recent hub-slug log, excluding new-format files
+    # (which contain '+' in the name and belong to a different institution).
+    if not log_file:
+        hub_prefix = shlex.quote(hub + "-")
+        log_file = ssm_run(
+            client,
+            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' | head -1 || true",
+        ).strip()
+
     if not log_file:
         return "Generating IDs"
 
