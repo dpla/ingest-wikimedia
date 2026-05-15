@@ -134,11 +134,18 @@ def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:
 def is_institution_upload_eligible(
     canonical_slug: str, institution_name: str, timeout: int = 5
 ) -> bool:
-    """Return True if a specific institution has upload=True in institutions_v2.json."""
+    """Return True if a specific institution is upload-eligible.
+
+    An institution is eligible if its parent hub has upload=True (hub-level
+    eligibility cascades to all child institutions), or if the institution
+    itself has upload=True.
+    """
     hub_name = PARTNER_HUBS.get(canonical_slug)
     if not hub_name:
         return False
     hub = _get_institutions(timeout).get(hub_name, {})
+    if hub.get("upload", False):
+        return True
     inst_data = hub.get("institutions", {}).get(institution_name, {})
     return inst_data.get("upload", False)
 
