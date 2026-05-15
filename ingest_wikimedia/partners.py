@@ -157,9 +157,15 @@ def parse_session_labels(suffix: str) -> list[str]:
     while i < len(parts):
         part = parts[i]
         if part in PARTNER_HUBS:
-            if i + 1 < len(parts) and parts[i + 1] not in PARTNER_HUBS:
-                labels.append(f"{part}+{parts[i + 1]}")
-                i += 2
+            # Consume all consecutive non-hub tokens as the institution suffix.
+            # Institution names can contain '+' (e.g. "LGBTQ+ Archives"), producing
+            # multiple tokens here. Greedily take everything up to the next hub slug.
+            j = i + 1
+            while j < len(parts) and parts[j] not in PARTNER_HUBS:
+                j += 1
+            if j > i + 1:
+                labels.append("+".join(parts[i:j]))
+                i = j
             else:
                 labels.append(part)
                 i += 1
