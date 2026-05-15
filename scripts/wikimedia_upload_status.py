@@ -176,7 +176,7 @@ def main() -> None:
         multi = len(labels) > 1
         hub_cache: dict[str, str] = {}
         label, phase = labels[0], "Unknown"
-        for label in labels:
+        for i, label in enumerate(labels):
             hub = label.split("+")[0]
             if hub not in hub_cache:
                 try:
@@ -188,6 +188,15 @@ def main() -> None:
                     hub_cache[hub] = "Unknown (error)"
             phase = hub_cache[hub]
             if not phase.startswith(_UPLOAD_COMPLETE_PREFIX):
+                # get_phase_and_progress reads the most recent log for this hub,
+                # which reflects the last institution currently running. When the
+                # same hub appears multiple times (e.g. chained NARA institutions),
+                # attribute the phase to the last label for this hub rather than
+                # the first one we encounter.
+                for j in range(len(labels) - 1, i, -1):
+                    if labels[j].split("+")[0] == hub:
+                        label = labels[j]
+                        break
                 break
         return session, f"[{label}] {phase}" if multi else phase
 
