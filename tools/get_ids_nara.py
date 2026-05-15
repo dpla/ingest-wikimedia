@@ -379,7 +379,8 @@ def main() -> None:
                 print(dpla_id)
 
     if failed[0]:
-        print(f"Warning: {failed[0]} S3 writes failed", file=sys.stderr)
+        print(f"Error: {failed[0]} S3 writes failed", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -96,12 +96,7 @@ def main() -> None:
                     response_url,
                     f"Target '{canonical}|' has an empty institution name.",
                 )
-        if canonical == "nara" and institution is not None:
-            _slack_fail(
-                response_url,
-                "NARA does not support institution-level launches. Use 'nara' without an institution.",
-            )
-        elif canonical != "nara":
+        if canonical != "nara":
             try:
                 eligible = is_upload_eligible(canonical)
             except Exception as e:
@@ -245,7 +240,7 @@ def main() -> None:
     for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
-        if canonical == "nara":
+        if canonical == "nara" and institution is None:
             get_ids_cmd = f"get-ids-nara > {canonical}.csv"
         else:
             get_ids_cmd = f"get-ids-es {canonical}"
