@@ -120,7 +120,9 @@ def main() -> None:
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
         inst_label = (
-            institution.lower().replace(" ", "-") if institution is not None else None
+            re.sub(r"[^a-z0-9-]", "", institution.lower().replace(" ", "-"))
+            if institution is not None
+            else None
         )
         label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
         seen_session_labels[label] = None
