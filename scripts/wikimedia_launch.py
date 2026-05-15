@@ -28,7 +28,6 @@ import requests
 
 from ingest_wikimedia.partners import (
     PARTNER_DIR,
-    is_institution_upload_eligible,
     is_upload_eligible,
     is_wikidata_id,
     parse_session_labels,
@@ -98,26 +97,11 @@ def main() -> None:
                     response_url,
                     f"Target '{canonical}|' has an empty institution name.",
                 )
-        if institution is not None:
-            # Institution-level target: check that specific institution's eligibility.
-            # This applies to all hubs including NARA, where individual institutions
-            # vary in eligibility. get-ids-es enforces the same check, so catching it
-            # here gives a clear error before the pipeline launches.
-            try:
-                inst_eligible = is_institution_upload_eligible(canonical, institution)
-            except Exception as e:
-                _slack_fail(
-                    response_url,
-                    f"Failed to check upload eligibility for '{canonical}|{institution}': {e}",
-                )
-            if not inst_eligible:
-                _slack_fail(
-                    response_url,
-                    f"Institution '{institution}' is not upload-eligible for hub"
-                    f" '{canonical}' per institutions_v2.json.",
-                )
-        elif canonical != "nara":
+        if canonical != "nara" and institution is None:
             # Hub-level target: check that any institution in the hub is eligible.
+            # Institution-level eligibility is not checked here — get-ids-es enforces
+            # it at runtime, and the per-target failure handler (notify_pipeline_fail)
+            # catches any rejection and continues with remaining targets.
             # NARA hub-level runs use get-ids-nara which filters eligibility itself.
             try:
                 eligible = is_upload_eligible(canonical)
