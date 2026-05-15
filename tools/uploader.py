@@ -3,6 +3,7 @@ import logging
 import mimetypes
 import random
 import time
+from collections import Counter
 
 import click
 from pywikibot.site import BaseSite
@@ -295,16 +296,39 @@ class Uploader:
 
             title = titles[0] if titles else ""
 
-            ordinal = 0
             files = self.s3_client.get_file_list(partner, dpla_id)
 
-            for _ in tqdm(
-                files, desc="Uploading Files", leave=False, unit="File", ncols=100
+            # Pre-scan to resolve each file's extension from S3 content-type metadata.
+            # Files with distinct extensions represent the same content in different
+            # formats, not separate pages — page numbers are only assigned within
+            # groups that share the same extension and contain more than one file.
+            # Single-file items never need pagination so we skip the pre-scan for them.
+            ordinal_exts: dict[int, str] = {}
+            if len(files) > 1:
+                for i in range(1, len(files) + 1):
+                    s3_path = self.s3_client.get_media_s3_path(dpla_id, i, partner)
+                    if self.s3_client.s3_file_exists(s3_path):
+                        s3_obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
+                        ordinal_exts[i] = (
+                            mimetypes.guess_extension(s3_obj.content_type) or ""
+                        )
+
+            ext_counts: Counter[str] = Counter(ordinal_exts.values())
+            ext_seen: Counter[str] = Counter()
+
+            for ordinal, _ in enumerate(
+                tqdm(
+                    files, desc="Uploading Files", leave=False, unit="File", ncols=100
+                ),
+                start=1,
             ):
-                ordinal += 1
                 logging.info(f"Page {ordinal}")
-                # one-pagers don't have page numbers in their titles
-                page_label = "" if len(files) == 1 else str(ordinal)
+                ext = ordinal_exts.get(ordinal, "")
+                if ext_counts[ext] > 1:
+                    ext_seen[ext] += 1
+                    page_label = str(ext_seen[ext])
+                else:
+                    page_label = ""
                 self.process_file(
                     dpla_id,
                     title,
