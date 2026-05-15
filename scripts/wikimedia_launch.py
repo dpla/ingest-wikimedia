@@ -4,11 +4,11 @@
 Runs as a GitHub Actions workflow step triggered by workflow_dispatch or the
 /wikimedia-upload Slack slash command via Lambda. Updates EC2 code, checks for
 conflicting sessions, launches the full pipeline in a single tmux session (with
-all targets chained via &&), and posts a Slack confirmation to #tech-alerts.
+all targets run sequentially), and posts a Slack confirmation to #tech-alerts.
 
 Each target in --partner is either a hub slug ("bpl") or a hub|institution pair
 ("indiana|Indiana State Library"). Multiple targets run sequentially in one tmux
-session; if any step fails the chain stops.
+session; a failing target posts a Slack error and continues with the next target.
 
 Environment variables:
   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — IAM credentials with ssm:SendCommand
@@ -281,13 +281,27 @@ def main() -> None:
         )
     print("EC2 code updated.")
 
-    # Build a chained pipeline command for all targets.
-    # Each target block: cd into partner dir, run get-ids-es (with optional --institution),
-    # downloader, uploader. The cd is required because config.toml is read from CWD.
-    steps = [
-        "source ~/.bashrc",
-        "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate",
-    ]
+    # Build the pipeline command for all targets.
+    # Setup (sourcing) runs once and gates all targets via &&.
+    # Each target block runs its three steps (get-ids, downloader, uploader)
+    # chained with &&. A failing block posts a Slack error notification then
+    # continues to the next target (|| handler + ; separator).
+    # The cd is required because config.toml is read from CWD.
+    #
+    # notify_fail_cmd uses single-quoted Python inside a double-quoted tmux argument.
+    # Single quotes are literal characters inside double-quoted bash strings, so the
+    # inner Python code reaches the interpreter verbatim without needing any escaping.
+    notify_fail_cmd = (
+        "python3 -c "
+        "'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'"
+    )
+    setup = " && ".join(
+        [
+            "source ~/.bashrc",
+            "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate",
+        ]
+    )
+    target_blocks = []
     for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
@@ -298,14 +312,22 @@ def main() -> None:
             if institution is not None:
                 get_ids_cmd += f" --institution {shlex.quote(institution)}"
             get_ids_cmd += f" > {canonical}.csv"
-        steps += [
-            f"cd {base}",
-            f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}",
-            get_ids_cmd,
-            f"downloader {canonical}.csv {canonical}",
-            f"uploader {canonical}.csv {canonical}",
-        ]
-    pipeline_cmd = " && ".join(steps)
+        # Export the session label before the group so the failure handler has the
+        # correct label even when cd itself fails.
+        label_export = f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}"
+        target_steps = " && ".join(
+            [
+                f"cd {base}",
+                get_ids_cmd,
+                f"downloader {canonical}.csv {canonical}",
+                f"uploader {canonical}.csv {canonical}",
+            ]
+        )
+        target_blocks.append(
+            f"{label_export}; {{ {target_steps}; }}"
+            f" || {{ {notify_fail_cmd} >/dev/null 2>&1 || true; }}"
+        )
+    pipeline_cmd = f"{setup} && {{ {'; '.join(target_blocks)}; }}"
 
     if slack_token:
         target_labels = [

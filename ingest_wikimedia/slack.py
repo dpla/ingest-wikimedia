@@ -31,6 +31,31 @@ def post_message(token: str, text: str) -> None:
         raise RuntimeError(f"Slack API error: {data.get('error')}")
 
 
+def notify_pipeline_fail() -> None:
+    """Post a pipeline-step failure notification to Slack.
+
+    Reads DPLA_SLACK_BOT_TOKEN and WIKIMEDIA_SESSION_LABEL from the environment.
+    Designed to be called as a one-liner from a shell failure handler:
+        python3 -c 'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'
+    """
+    token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
+    if not token:
+        logging.warning(
+            "DPLA_SLACK_BOT_TOKEN not set — skipping pipeline failure notification"
+        )
+        return
+    label = os.environ.get("WIKIMEDIA_SESSION_LABEL") or "unknown"
+    try:
+        post_message(
+            token,
+            f"❌ `wikimedia-{label}`: pipeline step failed — skipping to next target",
+        )
+    except Exception:
+        logging.warning(
+            "Failed to post pipeline failure notification to Slack", exc_info=True
+        )
+
+
 def notify_phase_start(partner: str, phase: Phase) -> None:
     token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
     if not token:
