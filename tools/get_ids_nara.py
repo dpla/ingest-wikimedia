@@ -285,9 +285,11 @@ def main() -> None:
     format_batches = build_format_queries()
     print(f"  {len(format_batches)} format batches", file=sys.stderr)
 
-    print("Fetching eligible collections...", file=sys.stderr)
-    collection_titles = build_collection_queries()
-    print(f"  {len(collection_titles)} collections", file=sys.stderr)
+    # Collection phase temporarily disabled — re-enable after the first upload run
+    # completes with phases 1–4 (format, mediaMaster, identifier, language) fully uploaded.
+    # print("Fetching eligible collections...", file=sys.stderr)
+    # collection_titles = build_collection_queries()
+    # print(f"  {len(collection_titles)} collections", file=sys.stderr)
 
     print("Fetching language query batches...", file=sys.stderr)
     lang_batches = build_language_queries()
@@ -317,27 +319,29 @@ def main() -> None:
         )
     )
 
-    for i in range(0, len(collection_titles), COLLECTIONS_PER_QUERY):
-        batch = collection_titles[i : i + COLLECTIONS_PER_QUERY]
-        queries.append(
-            (
-                f"collections: {batch[0][:50]}{'...' if len(batch[0]) > 50 else ''}",
-                {
-                    "bool": {
-                        "filter": [
-                            {
-                                "terms": {
-                                    "sourceResource.collection.title.not_analyzed": batch
-                                }
-                            }
-                        ],
-                        "must_not": _COLLECTION_MUST_NOT,
-                    }
-                },
-            )
-        )
+    # Collection phase temporarily disabled — re-enable after the first upload run
+    # completes with phases 1–4 (format, mediaMaster, identifier, language) fully uploaded.
+    # for i in range(0, len(collection_titles), COLLECTIONS_PER_QUERY):
+    #     batch = collection_titles[i : i + COLLECTIONS_PER_QUERY]
+    #     queries.append(
+    #         (
+    #             f"collections: {batch[0][:50]}{'...' if len(batch[0]) > 50 else ''}",
+    #             {
+    #                 "bool": {
+    #                     "filter": [
+    #                         {
+    #                             "terms": {
+    #                                 "sourceResource.collection.title.not_analyzed": batch
+    #                             }
+    #                         }
+    #                     ],
+    #                     "must_not": _COLLECTION_MUST_NOT,
+    #                 }
+    #             },
+    #         )
+    #     )
 
-    # Phase 5: language — non-English languages, smallest first
+    # Phase 5 (active as phase 4 until collections re-enabled): language — non-English languages, smallest first
     for batch in lang_batches:
         queries.append(
             (
