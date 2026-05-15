@@ -309,9 +309,17 @@ class Uploader:
                     s3_path = self.s3_client.get_media_s3_path(dpla_id, i, partner)
                     if self.s3_client.s3_file_exists(s3_path):
                         s3_obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
-                        ordinal_exts[i] = (
-                            mimetypes.guess_extension(s3_obj.content_type) or ""
-                        )
+                        mime = s3_obj.content_type
+                        # Skip generic MIME types — process_file re-detects these
+                        # via libmagic, so the real extension isn't known yet.
+                        # Excluding them avoids grouping files whose true types differ.
+                        if mime not in (
+                            "application/octet-stream",
+                            "binary/octet-stream",
+                        ):
+                            ext = mimetypes.guess_extension(mime)
+                            if ext:
+                                ordinal_exts[i] = ext
 
             ext_counts: Counter[str] = Counter(ordinal_exts.values())
             ext_seen: Counter[str] = Counter()
