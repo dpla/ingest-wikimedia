@@ -2,10 +2,12 @@
 Query Elasticsearch for wiki-eligible NARA DPLA IDs, applying NARA-specific
 priority filters to produce a manageable subset of the 18M+ NARA items.
 
-Three query strategies, run in order:
-  1. Language   — all non-English language values, batched LANGUAGES_PER_QUERY at a time
-  2. Format     — all formats with < FORMAT_COUNT_LIMIT items, batched FORMATS_PER_QUERY at a time
-  3. Collection — all collections with < COLLECTION_COUNT_LIMIT items (after exclusions)
+Five query strategies, run in order:
+  1. Format     — all formats with < FORMAT_COUNT_LIMIT items, batched FORMATS_PER_QUERY at a time
+  2. mediaMaster extension — items whose mediaMaster URL ends with a known media file extension
+  3. Identifier — items with a sourceResource.identifier that is a numeric string of ≤ 6 digits
+  4. Collection — all collections with < COLLECTION_COUNT_LIMIT items (after exclusions)
+  5. Language   — all non-English language values, batched LANGUAGES_PER_QUERY at a time
 
 The count limits are intentional: they ensure small, high-priority collections are
 fully processed before the enormous ones, since a complete run of all 18M+ NARA
@@ -51,6 +53,9 @@ COLLECTION_COUNT_LIMIT = 50_000
 LANGUAGES_PER_QUERY = 10
 FORMATS_PER_QUERY = 6
 COLLECTIONS_PER_QUERY = 50
+# Plain lowercase extensions, no dots or globs — joined directly into an ES regexp.
+MEDIAMASTER_EXTENSIONS: tuple[str, ...] = ("mp3", "mpg", "png", "gif", "wav")
+_MEDIAMASTER_REGEXP = ".+\\.(" + "|".join(MEDIAMASTER_EXTENSIONS) + ")"
 
 # Collections containing any of these substrings are excluded entirely.
 COLLECTION_SUBSTRING_EXCLUSIONS: tuple[str, ...] = (
@@ -276,10 +281,6 @@ def main() -> None:
     s3_client = S3Client()
     seen_ids: set[str] = set()
 
-    print("Fetching language query batches...", file=sys.stderr)
-    lang_batches = build_language_queries()
-    print(f"  {len(lang_batches)} language batches", file=sys.stderr)
-
     print("Fetching format query batches...", file=sys.stderr)
     format_batches = build_format_queries()
     print(f"  {len(format_batches)} format batches", file=sys.stderr)
@@ -288,14 +289,12 @@ def main() -> None:
     collection_titles = build_collection_queries()
     print(f"  {len(collection_titles)} collections", file=sys.stderr)
 
+    print("Fetching language query batches...", file=sys.stderr)
+    lang_batches = build_language_queries()
+    print(f"  {len(lang_batches)} language batches", file=sys.stderr)
+
     queries: list[tuple[str, dict]] = []
-    for batch in lang_batches:
-        queries.append(
-            (
-                f"languages: {batch[0]}...",
-                {"terms": {"sourceResource.language.name": batch}},
-            )
-        )
+
     for batch in format_batches:
         queries.append(
             (
@@ -303,6 +302,21 @@ def main() -> None:
                 {"terms": {"sourceResource.format": batch}},
             )
         )
+
+    queries.append(
+        (
+            f"mediaMaster extension: {', '.join(MEDIAMASTER_EXTENSIONS)}",
+            {"regexp": {"mediaMaster": _MEDIAMASTER_REGEXP}},
+        )
+    )
+
+    queries.append(
+        (
+            "identifier: ≤6-digit numeric",
+            {"regexp": {"sourceResource.identifier": "[0-9]{1,6}"}},
+        )
+    )
+
     for i in range(0, len(collection_titles), COLLECTIONS_PER_QUERY):
         batch = collection_titles[i : i + COLLECTIONS_PER_QUERY]
         queries.append(
@@ -320,6 +334,15 @@ def main() -> None:
                         "must_not": _COLLECTION_MUST_NOT,
                     }
                 },
+            )
+        )
+
+    # Phase 5: language — non-English languages, smallest first
+    for batch in lang_batches:
+        queries.append(
+            (
+                f"languages: {batch[0]}...",
+                {"terms": {"sourceResource.language.name": batch}},
             )
         )
 
