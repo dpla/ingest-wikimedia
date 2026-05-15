@@ -216,7 +216,12 @@ def main() -> None:
         if force:
             for existing_name, _ in conflicts:
                 print(f"Existing session found: {existing_name}; killing it (--force).")
-                ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
+                try:
+                    ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
+                except Exception as e:
+                    _slack_fail(
+                        response_url, f"⚠️ Failed to kill session `{existing_name}`: {e}"
+                    )
         else:
             conflict_names = ", ".join(f"`{n}`" for n, _ in conflicts)
             _slack_fail(
@@ -235,10 +240,16 @@ def main() -> None:
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
         "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
     )
-    out = ssm_run(ssm, update_cmd)
+    out = ""
+    try:
+        out = ssm_run(ssm, update_cmd)
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to update EC2 code: {e}")
     if "UPDATE_DONE" not in out:
-        print(f"EC2 update did not confirm completion. Output: {out}", file=sys.stderr)
-        sys.exit(1)
+        _slack_fail(
+            response_url,
+            "⚠️ EC2 code update did not confirm completion. Check the GitHub Actions run for details.",
+        )
     print("EC2 code updated.")
 
     # Build a chained pipeline command for all targets.
@@ -286,13 +297,24 @@ def main() -> None:
         f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
         f' "{pipeline_cmd}"'
     )
-    ssm_run(ssm, tmux_cmd)
+    try:
+        ssm_run(ssm, tmux_cmd)
+    except Exception as e:
+        _slack_fail(
+            response_url, f"⚠️ Failed to launch tmux session `{session_name}`: {e}"
+        )
 
     print("Verifying session started...")
-    result = ssm_run(
-        ssm,
-        f"tmux ls 2>/dev/null | grep -E '^{re.escape(session_name)}(:|$)' || echo NONE",
-    )
+    result = ""
+    try:
+        result = ssm_run(
+            ssm,
+            f"tmux ls 2>/dev/null | grep -E '^{re.escape(session_name)}(:|$)' || echo NONE",
+        )
+    except Exception as e:
+        _slack_fail(
+            response_url, f"⚠️ Failed to verify session `{session_name}` started: {e}"
+        )
     if session_name not in result:
         _slack_fail(
             response_url,
