@@ -31,7 +31,8 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
     """
     os.makedirs(LOGS_DIR_BASE, exist_ok=True)
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_file_name = f"{time_str}-{partner}-{event_type}.log"
+    session_label = os.environ.get("WIKIMEDIA_SESSION_LABEL") or partner
+    log_file_name = f"{time_str}-{session_label}-{event_type}.log"
     filename = f"{LOGS_DIR_BASE}/{log_file_name}"
     logging.basicConfig(
         level=level,
