@@ -131,6 +131,18 @@ def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:
     )
 
 
+def is_institution_upload_eligible(
+    canonical_slug: str, institution_name: str, timeout: int = 5
+) -> bool:
+    """Return True if a specific institution has upload=True in institutions_v2.json."""
+    hub_name = PARTNER_HUBS.get(canonical_slug)
+    if not hub_name:
+        return False
+    hub = _get_institutions(timeout).get(hub_name, {})
+    inst_data = hub.get("institutions", {}).get(institution_name, {})
+    return inst_data.get("upload", False)
+
+
 def is_wikidata_id(s: str) -> bool:
     """Return True if s is a Wikidata QID (e.g. 'Q12345')."""
     return bool(_QID_RE.match(s))

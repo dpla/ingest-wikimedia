@@ -21,12 +21,14 @@ import os
 import re
 import shlex
 import sys
+from typing import NoReturn
 
 import boto3
 import requests
 
 from ingest_wikimedia.partners import (
     PARTNER_DIR,
+    is_institution_upload_eligible,
     is_upload_eligible,
     is_wikidata_id,
     parse_session_labels,
@@ -40,7 +42,7 @@ from ingest_wikimedia.ssm import REGION, ssm_run
 MEMORY_HEADROOM_PCT = 30
 
 
-def _slack_fail(response_url: str, msg: str) -> None:
+def _slack_fail(response_url: str, msg: str) -> NoReturn:
     """Print msg to stderr, post ephemeral reply to response_url if set, then exit 1."""
     print(msg, file=sys.stderr)
     if response_url:
@@ -96,7 +98,27 @@ def main() -> None:
                     response_url,
                     f"Target '{canonical}|' has an empty institution name.",
                 )
-        if canonical != "nara":
+        if institution is not None:
+            # Institution-level target: check that specific institution's eligibility.
+            # This applies to all hubs including NARA, where individual institutions
+            # vary in eligibility. get-ids-es enforces the same check, so catching it
+            # here gives a clear error before the pipeline launches.
+            try:
+                inst_eligible = is_institution_upload_eligible(canonical, institution)
+            except Exception as e:
+                _slack_fail(
+                    response_url,
+                    f"Failed to check upload eligibility for '{canonical}|{institution}': {e}",
+                )
+            if not inst_eligible:
+                _slack_fail(
+                    response_url,
+                    f"Institution '{institution}' is not upload-eligible for hub"
+                    f" '{canonical}' per institutions_v2.json.",
+                )
+        elif canonical != "nara":
+            # Hub-level target: check that any institution in the hub is eligible.
+            # NARA hub-level runs use get-ids-nara which filters eligibility itself.
             try:
                 eligible = is_upload_eligible(canonical)
             except Exception as e:
@@ -299,33 +321,25 @@ def main() -> None:
             logging.warning("Slack notification failed: %s", e)
 
     print(f"Launching {session_name} pipeline...")
-    # Use double quotes around the pipeline so single-quoted institution names inside are preserved.
+    # Use double quotes around the pipeline so single-quoted institution names inside are
+    # preserved when the outer shell (bash -c) processes the tmux command. The sentinel
+    # echo runs immediately after tmux creates the detached session — before any pipeline
+    # commands execute — so it is not subject to a race with fast-completing pipelines.
     tmux_cmd = (
         f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
-        f' "{pipeline_cmd}"'
+        f' "{pipeline_cmd}" && echo SESSION_STARTED'
     )
+    out = ""
     try:
-        ssm_run(ssm, tmux_cmd)
+        out = ssm_run(ssm, tmux_cmd)
     except Exception as e:
         _slack_fail(
             response_url, f"⚠️ Failed to launch tmux session `{session_name}`: {e}"
         )
-
-    print("Verifying session started...")
-    result = ""
-    try:
-        result = ssm_run(
-            ssm,
-            f"tmux ls 2>/dev/null | grep -E '^{re.escape(session_name)}(:|$)' || echo NONE",
-        )
-    except Exception as e:
-        _slack_fail(
-            response_url, f"⚠️ Failed to verify session `{session_name}` started: {e}"
-        )
-    if session_name not in result:
+    if "SESSION_STARTED" not in out:
         _slack_fail(
             response_url,
-            f"⚠️ `{session_name}` failed to start — tmux session not found after launch."
+            f"⚠️ `{session_name}` failed to start — tmux could not create session."
             " Check the GitHub Actions run for details.",
         )
     print(f"Session {session_name} confirmed running.")
