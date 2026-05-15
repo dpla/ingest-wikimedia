@@ -21,7 +21,7 @@ SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
 
 
-def get_phase_and_progress(client, session: str, hub: str) -> str:
+def get_phase_and_progress(client, session: str, hub: str, label: str) -> str:
     def _safe_int(s: str) -> int:
         try:
             return int(s)
@@ -33,12 +33,13 @@ def get_phase_and_progress(client, session: str, hub: str) -> str:
     log_dir = shlex.quote(f"{base}/logs")
     session_name = shlex.quote(session)
 
-    # Get session creation time and most recent log filename — no shell variables
-    # needed, avoiding outer-bash expansion of $f inside the bash -c double-quote.
+    # Get session creation time and most recent log for this label — no shell
+    # variables needed, avoiding outer-bash expansion of $f inside bash -c.
+    label_prefix = shlex.quote(label + "-")
     precheck = ssm_run(
         client,
         f"tmux display-message -t {session_name} -p '#{{session_created}}' 2>/dev/null || echo 0; "
-        f"ls -t {log_dir}/ 2>/dev/null | head -1",
+        f"ls -t {log_dir}/ 2>/dev/null | grep -F {label_prefix} | head -1",
     )
     precheck_lines = precheck.splitlines()
     session_created = _safe_int(precheck_lines[0]) if precheck_lines else 0
@@ -174,29 +175,15 @@ def main() -> None:
         if not labels:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
-        hub_cache: dict[str, str] = {}
-        label, phase = labels[0], "Unknown"
-        for i, label in enumerate(labels):
+        label, phase = labels[-1], "Unknown"
+        for label in labels:
             hub = label.split("+")[0]
-            if hub not in hub_cache:
-                try:
-                    hub_cache[hub] = get_phase_and_progress(ssm, session, hub)
-                except Exception:
-                    logging.exception(
-                        "Failed to get status for %s (%s)", session, label
-                    )
-                    hub_cache[hub] = "Unknown (error)"
-            phase = hub_cache[hub]
+            try:
+                phase = get_phase_and_progress(ssm, session, hub, label)
+            except Exception:
+                logging.exception("Failed to get status for %s (%s)", session, label)
+                phase = "Unknown (error)"
             if not phase.startswith(_UPLOAD_COMPLETE_PREFIX):
-                # get_phase_and_progress reads the most recent log for this hub,
-                # which reflects the last institution currently running. When the
-                # same hub appears multiple times (e.g. chained NARA institutions),
-                # attribute the phase to the last label for this hub rather than
-                # the first one we encounter.
-                for j in range(len(labels) - 1, i, -1):
-                    if labels[j].split("+")[0] == hub:
-                        label = labels[j]
-                        break
                 break
         return session, f"[{label}] {phase}" if multi else phase
 
