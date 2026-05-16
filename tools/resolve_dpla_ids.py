@@ -2,9 +2,10 @@
 
 Used by wikimedia_launch.py to handle single-item upload targets.  All IDs are
 resolved in a single Elasticsearch request.  For each ID, applies the same
-upload-eligibility criteria as get-ids-es (rights, media presence, known hub),
-stages the full item metadata to S3 as dpla-map.json, and writes one status
-line to stdout for the launch script to parse.
+upload-eligibility criteria as get-ids-es (rights, media presence, hub known,
+institution has Wikidata ID and upload=True per institutions_v2.json), stages
+the full item metadata to S3 as dpla-map.json, and writes one status line to
+stdout for the launch script to parse.
 
 Output format (one line per ID):
   {id} HUB={canonical}       item is eligible; metadata has been staged to S3
@@ -20,7 +21,7 @@ import requests
 
 from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.iiif import IIIF
-from ingest_wikimedia.partners import resolve_slug
+from ingest_wikimedia.partners import is_item_upload_eligible, resolve_slug
 from ingest_wikimedia.s3 import S3Client
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
@@ -93,6 +94,19 @@ def _process_one(
     canonical = resolve_slug(provider_name)
     if not canonical:
         print(f"{dpla_id} INELIGIBLE:unknown hub {provider_name!r}", flush=True)
+        return
+
+    # Check institution-level eligibility per institutions_v2.json:
+    # hub must have a Wikidata ID (required for hub Commons category), institution
+    # must have a Wikidata ID (required for institution Commons category), and
+    # either hub.upload=True or institution.upload=True.  Mirrors get-ids-es.
+    dp_name = (source.get("dataProvider") or {}).get("name", "")
+    if not is_item_upload_eligible(canonical, dp_name):
+        print(
+            f"{dpla_id} INELIGIBLE:institution {dp_name!r} not eligible per"
+            " institutions_v2.json (missing Wikidata ID or upload flag)",
+            flush=True,
+        )
         return
 
     # Derive CONTENTdm IIIF manifest URL if needed (mirrors get-ids-es behaviour).

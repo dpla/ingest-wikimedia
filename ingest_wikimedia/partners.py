@@ -153,6 +153,28 @@ def is_institution_upload_eligible(
     return inst_data.get("upload", False)
 
 
+def is_item_upload_eligible(
+    canonical_slug: str, institution_name: str, timeout: int = 5
+) -> bool:
+    """Return True if an item from this institution is fully eligible for upload.
+
+    Mirrors the per-institution check performed by get-ids-es: requires that
+    the hub has a Wikidata ID (needed for the hub-level Commons category), the
+    institution has a Wikidata ID (needed for the institution-level Commons
+    category), and either the hub or the institution has upload=True.
+    """
+    hub_name = PARTNER_HUBS.get(canonical_slug)
+    if not hub_name:
+        return False
+    hub = _get_institutions(timeout).get(hub_name, {})
+    if not hub.get("Wikidata", ""):
+        return False
+    inst_data = hub.get("institutions", {}).get(institution_name, {})
+    if not inst_data.get("Wikidata", ""):
+        return False
+    return hub.get("upload", False) or inst_data.get("upload", False)
+
+
 def is_wikidata_id(s: str) -> bool:
     """Return True if s is a Wikidata QID (e.g. 'Q12345')."""
     return bool(_QID_RE.match(s))
