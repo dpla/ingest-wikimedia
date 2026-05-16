@@ -88,15 +88,17 @@ def main() -> None:
         str, None
     ] = {}  # insertion-ordered; drives session naming
     targets: list[tuple[str, str | None, str]] = []
+    # Per-target validation warnings; populated by _add_target and the conflict
+    # check. If some targets are skipped but others remain valid, a summary is
+    # posted to the caller before launch rather than aborting the whole run.
+    skipped_warnings: list[str] = []
 
     def _add_target(canonical: str, institution: str | None) -> None:
         if institution is not None:
             institution = institution.strip()
             if not institution:
-                _slack_fail(
-                    response_url,
-                    f"Target '{canonical}|' has an empty institution name.",
-                )
+                skipped_warnings.append(f"'{canonical}|': empty institution name.")
+                return
         if canonical != "nara" and institution is None:
             # Hub-level target: check that any institution in the hub is eligible.
             # Institution-level eligibility is not checked here — get-ids-es enforces
@@ -106,23 +108,21 @@ def main() -> None:
             try:
                 eligible = is_upload_eligible(canonical)
             except Exception as e:
-                _slack_fail(
-                    response_url,
-                    f"Failed to check upload eligibility for '{canonical}': {e}",
+                skipped_warnings.append(
+                    f"'{canonical}': failed to check upload eligibility: {e}"
                 )
+                return
             if not eligible:
-                _slack_fail(
-                    response_url,
-                    f"Hub '{canonical}' is not upload-eligible per institutions_v2.json.",
+                skipped_warnings.append(
+                    f"'{canonical}': not upload-eligible per institutions_v2.json."
                 )
+                return
         target_str = (
             f"{canonical}|{institution}" if institution is not None else canonical
         )
         if target_str in seen_target_strs:
-            _slack_fail(
-                response_url,
-                f"Target '{target_str}' appears more than once in the target list.",
-            )
+            skipped_warnings.append(f"'{target_str}': duplicate target.")
+            return
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
         inst_label = (
@@ -131,11 +131,16 @@ def main() -> None:
             else None
         )
         if institution is not None and not inst_label:
-            _slack_fail(
-                response_url,
-                f"Target '{canonical}|{institution}' normalizes to an empty institution slug.",
+            skipped_warnings.append(
+                f"'{canonical}|{institution}': institution name normalizes to an empty slug."
             )
+            return
         label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
+        if label in seen_session_labels:
+            skipped_warnings.append(
+                f"'{target_str}': normalizes to the same session label ('{label}') as a previous target."
+            )
+            return
         seen_session_labels[label] = None
         targets.append((canonical, institution, label))
 
@@ -143,26 +148,29 @@ def main() -> None:
         if is_wikidata_id(token):
             resolved = resolve_wikidata_id(token)
             if not resolved:
-                _slack_fail(
-                    response_url,
-                    f"No hub or institution found for Wikidata ID {token!r} in institutions_v2.json.",
+                skipped_warnings.append(
+                    f"Wikidata ID {token!r}: not found in institutions_v2.json."
                 )
+                continue
             for canonical, institution in resolved:
                 _add_target(canonical, institution)
         elif "|" in token:
             hub_part, institution = token.split("|", 1)
             canonical = resolve_slug(hub_part)
             if canonical is None:
-                _slack_fail(response_url, f"Unknown hub: {token!r}")
+                skipped_warnings.append(f"'{token}': unknown hub '{hub_part}'.")
+                continue
             _add_target(canonical, institution)
         else:
             canonical = resolve_slug(token)
             if canonical is None:
-                _slack_fail(response_url, f"Unknown hub: {token!r}")
+                skipped_warnings.append(f"'{token}': unknown hub slug.")
+                continue
             _add_target(canonical, None)
 
     if not targets:
-        _slack_fail(response_url, "No targets specified.")
+        detail = ("\n• " + "\n• ".join(skipped_warnings)) if skipped_warnings else ""
+        _slack_fail(response_url, f"No valid targets to launch.{detail}")
 
     # Session name uses + as separator (unambiguous since slugs/institution names use -).
     # Institution-level targets include the hub slug as a prefix so the status script
@@ -193,41 +201,44 @@ def main() -> None:
             f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
         )
 
-    # Check for any existing session that includes one of the requested hubs.
+    # Check for any existing session that includes one of the requested targets.
+    # Maps each requested label to the existing session name(s) it conflicts with.
     print(f"Checking for existing sessions that overlap with {session_name}...")
     try:
         tmux_list = ssm_run(ssm, "tmux ls 2>/dev/null || true")
     except Exception as e:
         _slack_fail(response_url, f"⚠️ Failed to list tmux sessions: {e}")
-    conflicts = []
+    label_conflicts: dict[str, list[str]] = {}
     for line in tmux_list.splitlines():
         existing_name = line.split(":")[0].strip()
         if not existing_name.startswith("wikimedia-"):
             continue
         existing_labels = set(parse_session_labels(existing_name[len("wikimedia-") :]))
-        overlap: set[str] = set()
         for canonical, institution, label in targets:
             if institution is None:
                 # Hub-level request conflicts with any existing session touching this hub
                 # (hub-level or any institution-level for the same hub).
-                if any(
+                conflicts_this = any(
                     lbl == canonical or lbl.startswith(f"{canonical}+")
                     for lbl in existing_labels
-                ):
-                    overlap.add(canonical)
+                )
             else:
                 # Institution-level request conflicts only with:
                 #   1. An existing hub-level session for the same hub (would run all institutions)
                 #   2. An existing session for the exact same hub+institution
                 # Two institution-level sessions for the same hub but different institutions
                 # do NOT conflict.
-                if canonical in existing_labels or label in existing_labels:
-                    overlap.add(canonical)
-        if overlap:
-            conflicts.append((existing_name, overlap))
-    if conflicts:
+                conflicts_this = (
+                    canonical in existing_labels or label in existing_labels
+                )
+            if conflicts_this:
+                label_conflicts.setdefault(label, []).append(existing_name)
+    if label_conflicts:
         if force:
-            for existing_name, _ in conflicts:
+            sessions_to_kill = {
+                name for names in label_conflicts.values() for name in names
+            }
+            for existing_name in sessions_to_kill:
                 print(f"Existing session found: {existing_name}; killing it (--force).")
                 try:
                     ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
@@ -236,12 +247,41 @@ def main() -> None:
                         response_url, f"⚠️ Failed to kill session `{existing_name}`: {e}"
                     )
         else:
-            conflict_names = ", ".join(f"`{n}`" for n, _ in conflicts)
-            _slack_fail(
-                response_url,
-                f"⚠️ Session(s) already running with overlapping hubs: {conflict_names}."
-                " To restart, trigger the launch workflow from GitHub Actions with force=true.",
-            )
+            for label, existing_names in label_conflicts.items():
+                existing_str = ", ".join(f"`{n}`" for n in existing_names)
+                skipped_warnings.append(
+                    f"`{label}`: conflicts with already-running session(s) {existing_str}."
+                    " Use force=true to restart."
+                )
+            conflicting_labels = set(label_conflicts)
+            targets[:] = [
+                (c, i, lbl) for c, i, lbl in targets if lbl not in conflicting_labels
+            ]
+            for lbl in conflicting_labels:
+                seen_session_labels.pop(lbl, None)
+            if not targets:
+                detail = "\n• " + "\n• ".join(skipped_warnings)
+                _slack_fail(
+                    response_url,
+                    f"No valid targets remain — all conflict with running sessions.{detail}",
+                )
+
+    if skipped_warnings:
+        warning_text = "⚠️ Skipped targets:\n• " + "\n• ".join(skipped_warnings)
+        print(warning_text, file=sys.stderr)
+        if response_url:
+            try:
+                requests.post(
+                    response_url,
+                    json={"response_type": "ephemeral", "text": warning_text},
+                    timeout=5,
+                ).raise_for_status()
+            except Exception as e:
+                logging.warning("Failed to post skip warnings to Slack: %s", e)
+
+    # Recompute after conflict filtering — derive from targets to guarantee
+    # the label order in the session name matches the surviving target list.
+    session_name = "wikimedia-" + "+".join(lbl for _, _, lbl in targets)
 
     print("Updating EC2 code...")
     update_cmd = (
@@ -289,13 +329,17 @@ def main() -> None:
     for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
+        # Use a per-target CSV filename so concurrent institution-level sessions
+        # for the same hub don't clobber each other's ID lists between the
+        # get-ids and downloader/uploader steps.
+        csv_file = f"{session_label}.csv"
         if canonical == "nara" and institution is None:
-            get_ids_cmd = f"get-ids-nara > {canonical}.csv"
+            get_ids_cmd = f"get-ids-nara > {csv_file}"
         else:
             get_ids_cmd = f"get-ids-es {canonical}"
             if institution is not None:
                 get_ids_cmd += f" --institution {shlex.quote(institution)}"
-            get_ids_cmd += f" > {canonical}.csv"
+            get_ids_cmd += f" > {csv_file}"
         # Export the session label before the group so the failure handler has the
         # correct label even when cd itself fails.
         label_export = f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}"
@@ -303,8 +347,8 @@ def main() -> None:
             [
                 f"cd {base}",
                 get_ids_cmd,
-                f"downloader {canonical}.csv {canonical}",
-                f"uploader {canonical}.csv {canonical}",
+                f"downloader {csv_file} {canonical}",
+                f"uploader {csv_file} {canonical}",
             ]
         )
         target_blocks.append(

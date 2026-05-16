@@ -60,7 +60,7 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str:
         return "Generating IDs"
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
-    csv_path = shlex.quote(f"{base}/{hub}.csv")
+    csv_path = shlex.quote(f"{base}/{label}.csv")
 
     sep = "__WM_SEP__"
     out = ssm_run(
