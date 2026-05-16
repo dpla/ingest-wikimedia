@@ -83,9 +83,9 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
     sections = out.split(f"{sep}\n", 2)
     log_mtime = _safe_int(sections[0].strip()) if sections else 0
 
-    # Log predates this session → downloader hasn't started yet.
+    # Log predates this session — no new log yet, treat same as no log.
     if session_created > 0 and log_mtime < session_created:
-        return "Generating IDs"
+        return None
 
     tail = sections[1].strip() if len(sections) > 1 else ""
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []

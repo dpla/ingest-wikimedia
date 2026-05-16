@@ -275,6 +275,7 @@ def main() -> None:
             "/home/ec2-user/ingest-wikimedia/.venv/bin/resolve-dpla-ids "
             + " ".join(shlex.quote(i) for i in dpla_id_tokens)
         )
+        resolve_out = None
         try:
             resolve_out = ssm_run(ssm, resolve_cmd)
         except Exception as e:
@@ -282,36 +283,36 @@ def main() -> None:
                 skipped_warnings.append(
                     f"DPLA ID `{item_id}`: could not resolve ({e})."
                 )
-            resolve_out = ""
-        unresolved_ids = set(dpla_id_tokens)
-        for line in resolve_out.splitlines():
-            parts = line.strip().split(" ", 1)
-            if len(parts) < 2:
-                skipped_warnings.append(f"Unexpected resolver output: {line!r}.")
-                continue
-            item_id, status = parts
-            unresolved_ids.discard(item_id)
-            if status == "NOT_FOUND":
-                skipped_warnings.append(f"DPLA ID `{item_id}`: not found in index.")
-            elif status.startswith("INELIGIBLE:"):
-                reason = status.removeprefix("INELIGIBLE:")
+        if resolve_out is not None:
+            unresolved_ids = set(dpla_id_tokens)
+            for line in resolve_out.splitlines():
+                parts = line.strip().split(" ", 1)
+                if len(parts) < 2:
+                    skipped_warnings.append(f"Unexpected resolver output: {line!r}.")
+                    continue
+                item_id, status = parts
+                unresolved_ids.discard(item_id)
+                if status == "NOT_FOUND":
+                    skipped_warnings.append(f"DPLA ID `{item_id}`: not found in index.")
+                elif status.startswith("INELIGIBLE:"):
+                    reason = status.removeprefix("INELIGIBLE:")
+                    skipped_warnings.append(
+                        f"DPLA ID `{item_id}`: not eligible ({reason})."
+                    )
+                elif status.startswith("HUB="):
+                    _add_target(status.removeprefix("HUB="), None, dpla_id=item_id)
+                elif status.startswith("ERROR:"):
+                    skipped_warnings.append(
+                        f"DPLA ID `{item_id}`: resolve error — {status.removeprefix('ERROR:')}."
+                    )
+                else:
+                    skipped_warnings.append(
+                        f"DPLA ID `{item_id}`: unexpected resolver status `{status}`."
+                    )
+            for item_id in sorted(unresolved_ids):
                 skipped_warnings.append(
-                    f"DPLA ID `{item_id}`: not eligible ({reason})."
+                    f"DPLA ID `{item_id}`: resolver returned no status."
                 )
-            elif status.startswith("HUB="):
-                _add_target(status.removeprefix("HUB="), None, dpla_id=item_id)
-            elif status.startswith("ERROR:"):
-                skipped_warnings.append(
-                    f"DPLA ID `{item_id}`: resolve error — {status.removeprefix('ERROR:')}."
-                )
-            else:
-                skipped_warnings.append(
-                    f"DPLA ID `{item_id}`: unexpected resolver status `{status}`."
-                )
-        for item_id in sorted(unresolved_ids):
-            skipped_warnings.append(
-                f"DPLA ID `{item_id}`: resolver returned no status."
-            )
 
     if not targets:
         detail = ("\n• " + "\n• ".join(skipped_warnings)) if skipped_warnings else ""
