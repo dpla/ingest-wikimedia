@@ -19,6 +19,9 @@ INSTITUTIONS_URL = (
 # Wikidata QID pattern (e.g. Q12345).
 _QID_RE = re.compile(r"^Q\d+$")
 
+# DPLA item ID: 32-character lowercase hex string (MD5 hash).
+_DPLA_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
 # All DPLA partner hubs: canonical slug → hub display name (as used in institutions_v2.json)
 PARTNER_HUBS: dict[str, str] = {
     "artstor": "Artstor",
@@ -153,6 +156,11 @@ def is_institution_upload_eligible(
 def is_wikidata_id(s: str) -> bool:
     """Return True if s is a Wikidata QID (e.g. 'Q12345')."""
     return bool(_QID_RE.match(s))
+
+
+def is_dpla_id(s: str) -> bool:
+    """Return True if s is a 32-hex-char DPLA item ID."""
+    return bool(_DPLA_ID_RE.match(s))
 
 
 def parse_session_labels(suffix: str) -> list[str]:

@@ -57,6 +57,10 @@ def notify_pipeline_fail() -> None:
 
 
 def notify_phase_start(partner: str, phase: Phase) -> None:
+    # Single-item targets post only one launch notification and one completion
+    # notification; suppress per-phase messages to avoid cluttering #tech-alerts.
+    if os.environ.get("WIKIMEDIA_SINGLE_ITEM") == "1":
+        return
     token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
     if not token:
         logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")

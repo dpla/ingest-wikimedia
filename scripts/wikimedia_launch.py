@@ -6,9 +6,16 @@ Runs as a GitHub Actions workflow step triggered by workflow_dispatch or the
 conflicting sessions, launches the full pipeline in a single tmux session (with
 all targets run sequentially), and posts a Slack confirmation to #tech-alerts.
 
-Each target in --partner is either a hub slug ("bpl") or a hub|institution pair
-("indiana|Indiana State Library"). Multiple targets run sequentially in one tmux
-session; a failing target posts a Slack error and continues with the next target.
+Each target in --partner is a hub slug ("bpl"), a hub|institution pair
+("indiana|Indiana State Library"), a Wikidata QID ("Q1234567"), or a 32-hex-char
+DPLA item ID ("abc123def456789012345678901234ab").  Multiple targets run
+sequentially in one tmux session; a failing target posts a Slack error and
+continues with the next target.
+
+For DPLA item ID targets the ID generation phase is skipped — the ID is written
+directly to the CSV.  Eligibility (rights statement + media presence) is verified
+on EC2 before launch.  Per-phase Slack notifications are suppressed; only one
+launch message and one completion message are posted.
 
 Environment variables:
   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — IAM credentials with ssm:SendCommand
@@ -28,6 +35,7 @@ import requests
 
 from ingest_wikimedia.partners import (
     PARTNER_DIR,
+    is_dpla_id,
     is_upload_eligible,
     is_wikidata_id,
     parse_session_labels,
@@ -79,7 +87,7 @@ def main() -> None:
     except ValueError as e:
         _slack_fail(response_url, f"Could not parse --partner: {e}")
 
-    # Validate each target and build (canonical, institution_or_None) pairs.
+    # Validate each target and build (canonical, institution_or_None, label, dpla_id_or_None) tuples.
     # Dedup by full target string so the same hub may appear with different institutions
     # (e.g. two QIDs that both resolve into the same hub but different institutions).
     seen_target_strs: set[str] = set()
@@ -87,20 +95,26 @@ def main() -> None:
     seen_session_labels: dict[
         str, None
     ] = {}  # insertion-ordered; drives session naming
-    targets: list[tuple[str, str | None, str]] = []
+    targets: list[tuple[str, str | None, str, str | None]] = []
+    # DPLA item ID tokens collected separately; resolved via EC2 before target building.
+    dpla_id_tokens: list[str] = []
     # Per-target validation warnings; populated by _add_target and the conflict
     # check. If some targets are skipped but others remain valid, a summary is
     # posted to the caller before launch rather than aborting the whole run.
     skipped_warnings: list[str] = []
 
-    def _add_target(canonical: str, institution: str | None) -> None:
+    def _add_target(
+        canonical: str, institution: str | None, dpla_id: str | None = None
+    ) -> None:
         if institution is not None:
             institution = institution.strip()
             if not institution:
                 skipped_warnings.append(f"'{canonical}|': empty institution name.")
                 return
-        if canonical != "nara" and institution is None:
+        if dpla_id is None and canonical != "nara" and institution is None:
             # Hub-level target: check that any institution in the hub is eligible.
+            # Skipped for DPLA item ID targets — item-level eligibility (rights
+            # statement + media presence) was already verified by resolve-dpla-ids.
             # Institution-level eligibility is not checked here — get-ids-es enforces
             # it at runtime, and the per-target failure handler (notify_pipeline_fail)
             # catches any rejection and continues with remaining targets.
@@ -117,24 +131,35 @@ def main() -> None:
                     f"'{canonical}': not upload-eligible per institutions_v2.json."
                 )
                 return
+        # For DPLA item ID targets the target_str is the full ID (globally unique).
         target_str = (
-            f"{canonical}|{institution}" if institution is not None else canonical
+            f"{canonical}|{institution}"
+            if institution is not None
+            else dpla_id
+            if dpla_id is not None
+            else canonical
         )
         if target_str in seen_target_strs:
             skipped_warnings.append(f"'{target_str}': duplicate target.")
             return
         seen_target_strs.add(target_str)
         seen_canonicals[canonical] = None
-        inst_label = (
-            re.sub(r"[^a-z0-9-]", "", institution.lower().replace(" ", "-"))
-            if institution is not None
-            else None
-        )
-        if institution is not None and not inst_label:
-            skipped_warnings.append(
-                f"'{canonical}|{institution}': institution name normalizes to an empty slug."
+        if dpla_id is not None:
+            # Use the first 8 hex chars of the ID as the label's institution component.
+            # This is long enough to distinguish concurrent single-item sessions for
+            # the same hub while keeping session names readable.
+            inst_label: str | None = dpla_id[:8]
+        elif institution is not None:
+            inst_label = re.sub(
+                r"[^a-z0-9-]", "", institution.lower().replace(" ", "-")
             )
-            return
+            if not inst_label:
+                skipped_warnings.append(
+                    f"'{canonical}|{institution}': institution name normalizes to an empty slug."
+                )
+                return
+        else:
+            inst_label = None
         label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
         if label in seen_session_labels:
             skipped_warnings.append(
@@ -142,7 +167,7 @@ def main() -> None:
             )
             return
         seen_session_labels[label] = None
-        targets.append((canonical, institution, label))
+        targets.append((canonical, institution, label, dpla_id))
 
     for token in target_tokens:
         if is_wikidata_id(token):
@@ -154,6 +179,9 @@ def main() -> None:
                 continue
             for canonical, institution in resolved:
                 _add_target(canonical, institution)
+        elif is_dpla_id(token):
+            # Collect for batch resolution via EC2 after local parsing is done.
+            dpla_id_tokens.append(token)
         elif "|" in token:
             hub_part, institution = token.split("|", 1)
             canonical = resolve_slug(hub_part)
@@ -168,6 +196,44 @@ def main() -> None:
                 continue
             _add_target(canonical, None)
 
+    slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
+    ssm = boto3.client("ssm", region_name=REGION)
+
+    # Resolve any DPLA item ID tokens via EC2. resolve-dpla-ids checks the ES index
+    # for rights eligibility and media presence, then stages the item metadata to S3
+    # (same as get-ids-es) so the downloader and uploader can proceed without changes.
+    if dpla_id_tokens:
+        print(f"Resolving {len(dpla_id_tokens)} DPLA ID(s)...")
+        resolve_cmd = "resolve-dpla-ids " + " ".join(
+            shlex.quote(i) for i in dpla_id_tokens
+        )
+        try:
+            resolve_out = ssm_run(ssm, resolve_cmd)
+        except Exception as e:
+            for item_id in dpla_id_tokens:
+                skipped_warnings.append(
+                    f"DPLA ID `{item_id}`: could not resolve ({e})."
+                )
+            resolve_out = ""
+        for line in resolve_out.splitlines():
+            parts = line.strip().split(" ", 1)
+            if len(parts) < 2:
+                continue
+            item_id, status = parts
+            if status == "NOT_FOUND":
+                skipped_warnings.append(f"DPLA ID `{item_id}`: not found in index.")
+            elif status.startswith("INELIGIBLE:"):
+                reason = status.removeprefix("INELIGIBLE:")
+                skipped_warnings.append(
+                    f"DPLA ID `{item_id}`: not eligible ({reason})."
+                )
+            elif status.startswith("HUB="):
+                _add_target(status.removeprefix("HUB="), None, dpla_id=item_id)
+            elif status.startswith("ERROR:"):
+                skipped_warnings.append(
+                    f"DPLA ID `{item_id}`: resolve error — {status.removeprefix('ERROR:')}."
+                )
+
     if not targets:
         detail = ("\n• " + "\n• ".join(skipped_warnings)) if skipped_warnings else ""
         _slack_fail(response_url, f"No valid targets to launch.{detail}")
@@ -175,10 +241,7 @@ def main() -> None:
     # Session name uses + as separator (unambiguous since slugs/institution names use -).
     # Institution-level targets include the hub slug as a prefix so the status script
     # can derive the EC2 directory: "indiana|Indiana State Library" → wikimedia-indiana+indiana-state-library.
-    session_name = "wikimedia-" + "+".join(seen_session_labels)
-
-    slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
-    ssm = boto3.client("ssm", region_name=REGION)
+    session_name = "wikimedia-" + "+".join(lbl for _, _, lbl, _ in targets)
 
     print("Checking instance memory...")
     try:
@@ -214,8 +277,8 @@ def main() -> None:
         if not existing_name.startswith("wikimedia-"):
             continue
         existing_labels = set(parse_session_labels(existing_name[len("wikimedia-") :]))
-        for canonical, institution, label in targets:
-            if institution is None:
+        for canonical, institution, label, dpla_id in targets:
+            if institution is None and dpla_id is None:
                 # Hub-level request conflicts with any existing session touching this hub
                 # (hub-level or any institution-level for the same hub).
                 conflicts_this = any(
@@ -223,11 +286,11 @@ def main() -> None:
                     for lbl in existing_labels
                 )
             else:
-                # Institution-level request conflicts only with:
-                #   1. An existing hub-level session for the same hub (would run all institutions)
-                #   2. An existing session for the exact same hub+institution
-                # Two institution-level sessions for the same hub but different institutions
-                # do NOT conflict.
+                # Institution-level and single-item requests conflict only with:
+                #   1. An existing hub-level session for the same hub
+                #   2. An existing session for the exact same label
+                # Two institution-level (or item-level) sessions for the same hub
+                # but different labels do NOT conflict.
                 conflicts_this = (
                     canonical in existing_labels or label in existing_labels
                 )
@@ -255,7 +318,9 @@ def main() -> None:
                 )
             conflicting_labels = set(label_conflicts)
             targets[:] = [
-                (c, i, lbl) for c, i, lbl in targets if lbl not in conflicting_labels
+                (c, i, lbl, did)
+                for c, i, lbl, did in targets
+                if lbl not in conflicting_labels
             ]
             for lbl in conflicting_labels:
                 seen_session_labels.pop(lbl, None)
@@ -281,7 +346,7 @@ def main() -> None:
 
     # Recompute after conflict filtering — derive from targets to guarantee
     # the label order in the session name matches the surviving target list.
-    session_name = "wikimedia-" + "+".join(lbl for _, _, lbl in targets)
+    session_name = "wikimedia-" + "+".join(lbl for _, _, lbl, _ in targets)
 
     print("Updating EC2 code...")
     update_cmd = (
@@ -307,9 +372,12 @@ def main() -> None:
 
     # Build the pipeline command for all targets.
     # Setup (sourcing) runs once and gates all targets via &&.
-    # Each target block runs its three steps (get-ids, downloader, uploader)
-    # chained with &&. A failing block posts a Slack error notification then
-    # continues to the next target (|| handler + ; separator).
+    # Each target block runs its steps chained with &&. For hub targets these are
+    # get-ids, downloader, and uploader. For DPLA item ID targets, the ID is written
+    # directly to the CSV (metadata was staged by resolve-dpla-ids), so only
+    # downloader and uploader run.
+    # A failing block posts a Slack error notification then continues to the next
+    # target (|| handler + ; separator).
     # The cd is required because config.toml is read from CWD.
     #
     # notify_fail_cmd uses single-quoted Python inside a double-quoted tmux argument.
@@ -326,23 +394,37 @@ def main() -> None:
         ]
     )
     target_blocks = []
-    for canonical, institution, session_label in targets:
+    for canonical, institution, session_label, dpla_id in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
         # Use a per-target CSV filename so concurrent institution-level sessions
         # for the same hub don't clobber each other's ID lists between the
         # get-ids and downloader/uploader steps.
         csv_file = f"{session_label}.csv"
-        if canonical == "nara" and institution is None:
+        if dpla_id is not None:
+            # Single-item target: metadata was already staged to S3 by resolve-dpla-ids.
+            # Write the one ID directly to the CSV; no ID-generation phase needed.
+            get_ids_cmd = f"printf '%s\\n' {shlex.quote(dpla_id)} > {csv_file}"
+        elif canonical == "nara" and institution is None:
             get_ids_cmd = f"get-ids-nara > {csv_file}"
         else:
             get_ids_cmd = f"get-ids-es {canonical}"
             if institution is not None:
                 get_ids_cmd += f" --institution {shlex.quote(institution)}"
             get_ids_cmd += f" > {csv_file}"
-        # Export the session label before the group so the failure handler has the
-        # correct label even when cd itself fails.
-        label_export = f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}"
+        # Export the session label (and single-item flag) before the group so the
+        # failure handler and logging have the correct context even if cd itself fails.
+        # WIKIMEDIA_SINGLE_ITEM must be explicitly unset for hub targets so that it
+        # does not bleed across blocks when targets are mixed in the same session.
+        single_item_env = (
+            "export WIKIMEDIA_SINGLE_ITEM=1"
+            if dpla_id is not None
+            else "unset WIKIMEDIA_SINGLE_ITEM"
+        )
+        label_export = (
+            f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
+            f"{single_item_env}"
+        )
         target_steps = " && ".join(
             [
                 f"cd {base}",
@@ -358,15 +440,34 @@ def main() -> None:
     pipeline_cmd = f"{setup} && {{ {'; '.join(target_blocks)}; }}"
 
     if slack_token:
-        target_labels = [
-            f"`{c}|{inst}`" if inst else f"`{c}`" for c, inst, _ in targets
+        single_item_targets = [
+            (c, lbl, did) for c, _, lbl, did in targets if did is not None
         ]
-        try:
-            post_message(
-                slack_token,
-                f"▶ Launching `{session_name}` pipeline: {', '.join(target_labels)}"
-                " (ID generation → download → upload).",
+        hub_targets = [(c, i, lbl) for c, i, lbl, did in targets if did is None]
+        if single_item_targets and not hub_targets:
+            # All single-item targets: use the eligibility-confirmed format.
+            item_descs = [f"`{did}` ({c})" for c, _, did in single_item_targets]
+            msg = f"✅ {', '.join(item_descs)} — eligible, download + upload starting."
+        elif hub_targets and not single_item_targets:
+            # All hub targets: existing format.
+            hub_labels = [f"`{c}|{i}`" if i else f"`{c}`" for c, i, _ in hub_targets]
+            msg = (
+                f"▶ Launching `{session_name}` pipeline: {', '.join(hub_labels)}"
+                " (ID generation → download → upload)."
             )
+        else:
+            # Mixed: list all targets with a note distinguishing items from hubs.
+            all_descs = []
+            for c, i, lbl, did in targets:
+                if did is not None:
+                    all_descs.append(f"`{did[:8]}…` ({c}, item)")
+                elif i:
+                    all_descs.append(f"`{c}|{i}`")
+                else:
+                    all_descs.append(f"`{c}`")
+            msg = f"▶ Launching `{session_name}` pipeline: {', '.join(all_descs)}."
+        try:
+            post_message(slack_token, msg)
         except Exception as e:
             logging.warning("Slack notification failed: %s", e)
 
