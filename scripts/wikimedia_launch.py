@@ -289,13 +289,17 @@ def main() -> None:
     for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
+        # Use a per-target CSV filename so concurrent sessions sharing the same
+        # partner directory (e.g. multiple NARA institution runs) don't clobber
+        # each other's ID lists between the get-ids and downloader/uploader steps.
+        csv_file = f"{session_label}.csv"
         if canonical == "nara" and institution is None:
-            get_ids_cmd = f"get-ids-nara > {canonical}.csv"
+            get_ids_cmd = f"get-ids-nara > {csv_file}"
         else:
             get_ids_cmd = f"get-ids-es {canonical}"
             if institution is not None:
                 get_ids_cmd += f" --institution {shlex.quote(institution)}"
-            get_ids_cmd += f" > {canonical}.csv"
+            get_ids_cmd += f" > {csv_file}"
         # Export the session label before the group so the failure handler has the
         # correct label even when cd itself fails.
         label_export = f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}"
@@ -303,8 +307,8 @@ def main() -> None:
             [
                 f"cd {base}",
                 get_ids_cmd,
-                f"downloader {canonical}.csv {canonical}",
-                f"uploader {canonical}.csv {canonical}",
+                f"downloader {csv_file} {canonical}",
+                f"uploader {csv_file} {canonical}",
             ]
         )
         target_blocks.append(
