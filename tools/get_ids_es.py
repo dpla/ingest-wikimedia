@@ -124,7 +124,7 @@ def build_query(
         },
     ]
 
-    if collection:
+    if collection is not None:
         filters.append(
             {"term": {"sourceResource.collection.title.not_analyzed": collection}}
         )
@@ -167,9 +167,14 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
     Also stages each item's full metadata to S3 (dpla-map.json) so the
     downloader can skip DPLA API calls entirely.
     """
-    if collection is not None and institution is None:
-        print("--collection requires --institution to be specified.", file=sys.stderr)
-        sys.exit(1)
+    if collection is not None:
+        collection = collection.strip()
+        if not collection:
+            print("--collection cannot be empty.", file=sys.stderr)
+            sys.exit(1)
+        if institution is None:
+            print("--collection requires --institution to be specified.", file=sys.stderr)
+            sys.exit(1)
 
     try:
         DPLA.check_partner(partner)

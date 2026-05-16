@@ -232,11 +232,23 @@ def main() -> None:
 
     # Update EC2 code first so that resolve-dpla-ids and the pipeline both run
     # the latest version from this branch, not whatever was previously deployed.
+    # Pin to GITHUB_SHA when available (always set in GitHub Actions) so that
+    # feature-branch dispatches deploy the branch code, not the default branch.
     print("Updating EC2 code...")
+    github_sha = (os.environ.get("GITHUB_SHA") or "").strip()
+    pin_step = (
+        f"cd /tmp/ingest-wikimedia-update && "
+        f"git fetch --depth 1 origin {shlex.quote(github_sha)} && "
+        f"git checkout --detach {shlex.quote(github_sha)} && "
+        "cd /tmp && "
+        if github_sha
+        else ""
+    )
     update_cmd = (
         "cd /tmp && rm -rf ingest-wikimedia-update && "
         "git clone --depth 1 https://github.com/dpla/ingest-wikimedia.git ingest-wikimedia-update && "
-        "cp -r ingest-wikimedia-update/ingest_wikimedia/* /home/ec2-user/ingest-wikimedia/ingest_wikimedia/ && "
+        + pin_step
+        + "cp -r ingest-wikimedia-update/ingest_wikimedia/* /home/ec2-user/ingest-wikimedia/ingest_wikimedia/ && "
         "cp -r ingest-wikimedia-update/tools/* /home/ec2-user/ingest-wikimedia/tools/ && "
         "cp ingest-wikimedia-update/pyproject.toml /home/ec2-user/ingest-wikimedia/pyproject.toml && "
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
