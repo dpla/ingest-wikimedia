@@ -136,6 +136,11 @@ def main() -> None:
                 f"Target '{canonical}|{institution}' normalizes to an empty institution slug.",
             )
         label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
+        if label in seen_session_labels:
+            _slack_fail(
+                response_url,
+                f"Target '{target_str}' normalizes to a duplicate session label '{label}'.",
+            )
         seen_session_labels[label] = None
         targets.append((canonical, institution, label))
 
