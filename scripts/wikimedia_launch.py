@@ -271,8 +271,9 @@ def main() -> None:
     # (same as get-ids-es) so the downloader and uploader can proceed without changes.
     if dpla_id_tokens:
         print(f"Resolving {len(dpla_id_tokens)} DPLA ID(s)...")
-        resolve_cmd = "resolve-dpla-ids " + " ".join(
-            shlex.quote(i) for i in dpla_id_tokens
+        resolve_cmd = (
+            "/home/ec2-user/ingest-wikimedia/.venv/bin/resolve-dpla-ids "
+            + " ".join(shlex.quote(i) for i in dpla_id_tokens)
         )
         try:
             resolve_out = ssm_run(ssm, resolve_cmd)
