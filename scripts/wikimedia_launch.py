@@ -289,9 +289,9 @@ def main() -> None:
     for canonical, institution, session_label in targets:
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
-        # Use a per-target CSV filename so concurrent sessions sharing the same
-        # partner directory (e.g. multiple NARA institution runs) don't clobber
-        # each other's ID lists between the get-ids and downloader/uploader steps.
+        # Use a per-target CSV filename so concurrent institution-level sessions
+        # for the same hub don't clobber each other's ID lists between the
+        # get-ids and downloader/uploader steps.
         csv_file = f"{session_label}.csv"
         if canonical == "nara" and institution is None:
             get_ids_cmd = f"get-ids-nara > {csv_file}"
