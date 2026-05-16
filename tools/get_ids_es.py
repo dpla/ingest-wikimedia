@@ -99,6 +99,7 @@ def load_eligible_dp_names(partner: str) -> list[str]:
 def build_query(
     provider_name: str,
     eligible_dp_names: list[str],
+    collection: str | None = None,
     search_after: list | None = None,
 ) -> dict:
     """Build the Elasticsearch boolean query for a single page."""
@@ -111,24 +112,27 @@ def build_query(
         ],
     ]
 
+    filters: list[dict] = [
+        {"term": {"provider.name.not_analyzed": provider_name}},
+        {"term": {"rightsCategory": "Unlimited Re-Use"}},
+        {"terms": {"dataProvider.name.not_analyzed": eligible_dp_names}},
+        {
+            "bool": {
+                "should": asset_should,
+                "minimum_should_match": 1,
+            }
+        },
+    ]
+
+    if collection:
+        filters.append(
+            {"term": {"sourceResource.collection.title.not_analyzed": collection}}
+        )
+
     query: dict = {
         "size": PAGE_SIZE,
         "sort": ["id", "_doc"],
-        "query": {
-            "bool": {
-                "filter": [
-                    {"term": {"provider.name.not_analyzed": provider_name}},
-                    {"term": {"rightsCategory": "Unlimited Re-Use"}},
-                    {"terms": {"dataProvider.name.not_analyzed": eligible_dp_names}},
-                    {
-                        "bool": {
-                            "should": asset_should,
-                            "minimum_should_match": 1,
-                        }
-                    },
-                ]
-            }
-        },
+        "query": {"bool": {"filter": filters}},
     }
 
     if search_after:
@@ -152,12 +156,21 @@ def stage_to_s3(s3_client: S3Client, partner: str, dpla_id: str, source: dict) -
     default=None,
     help="Restrict to a single institution name (must be upload-eligible).",
 )
-def main(partner: str, institution: str | None) -> None:
+@click.option(
+    "--collection",
+    default=None,
+    help="Restrict to items in a specific collection title (requires --institution).",
+)
+def main(partner: str, institution: str | None, collection: str | None) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
     Also stages each item's full metadata to S3 (dpla-map.json) so the
     downloader can skip DPLA API calls entirely.
     """
+    if collection is not None and institution is None:
+        print("--collection requires --institution to be specified.", file=sys.stderr)
+        sys.exit(1)
+
     try:
         DPLA.check_partner(partner)
     except ValueError as e:
@@ -191,7 +204,9 @@ def main(partner: str, institution: str | None) -> None:
         futures: dict = {}
 
         while True:
-            query = build_query(provider_name, eligible_dp_names, search_after)
+            query = build_query(
+                provider_name, eligible_dp_names, collection, search_after
+            )
             response = requests.post(
                 ES_URL,
                 json=query,
