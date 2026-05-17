@@ -29,7 +29,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
-  group: "wikimedia-launch-${{ github.event.inputs.concurrency_key != '' ? github.event.inputs.concurrency_key : github.run_id }}"
+  group: "wikimedia-launch-${{ github.event.inputs.concurrency_key != '' && github.event.inputs.concurrency_key || github.run_id }}"
   cancel-in-progress: false
 
 jobs:
