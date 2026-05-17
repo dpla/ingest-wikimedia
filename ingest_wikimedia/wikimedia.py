@@ -46,6 +46,11 @@ def check_content_type(content_type: str) -> bool:
     return content_type not in INVALID_CONTENT_TYPES
 
 
+def is_download_only(content_type: str) -> bool:
+    """Returns True for types staged to S3 but not uploaded to Commons (e.g. video)."""
+    return content_type in DOWNLOAD_ONLY_CONTENT_TYPES
+
+
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
@@ -232,15 +237,38 @@ def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
     return False
 
 
-INVALID_CONTENT_TYPES = [
-    "text/html",
-    "application/json",
-    "application/xml",
-    "text/xml",
-    "text/plain",
-    "application/msword",
-    "application/octet-stream",
-]
+INVALID_CONTENT_TYPES = frozenset(
+    [
+        "text/html",
+        "application/json",
+        "application/xml",
+        "text/xml",
+        "text/plain",
+        "application/msword",
+        "application/octet-stream",
+        # Rich-text and Office XML formats — not accepted by Commons
+        "application/rtf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+    ]
+)
+# Video/audio types downloaded to S3 for future conversion but never uploaded directly.
+# Commons does not accept these container formats; .ogv/.webm conversion is needed first.
+DOWNLOAD_ONLY_CONTENT_TYPES = frozenset(
+    [
+        "video/mp4",
+        "video/x-msvideo",  # .avi
+        "video/quicktime",  # .mov
+        "audio/x-ms-wma",  # .wma
+        "video/x-ms-wmv",  # .wmv
+    ]
+)
+# mimetypes.guess_extension() returns this sentinel for MIME types it cannot map to a
+# known file extension. Commons rejects files with this extension unconditionally.
+MIME_UNKNOWN_EXT = ".bin"
 COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
 ERROR_FILEEXISTS = "fileexists-shared-forbidden"
 ERROR_MIME = "filetype-badmime"

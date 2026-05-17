@@ -13,6 +13,7 @@ from ingest_wikimedia.dpla import DPLA
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import (
+    MIME_UNKNOWN_EXT,
     wiki_file_exists,
     get_page_title,
     check_content_type,
@@ -115,7 +116,7 @@ class Retirer:
 
         ext = mimetypes.guess_extension(mime)
 
-        if not ext:
+        if not ext or ext == MIME_UNKNOWN_EXT:
             self.retire_file(s3_object, dry_run)
             return
 
