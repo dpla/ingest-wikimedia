@@ -13,7 +13,7 @@ from ingest_wikimedia.s3 import S3_BUCKET, S3_KEY_METADATA, S3Client
 from typing import IO
 
 import click
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, CredentialRetrievalError
 from tqdm import tqdm
 
 from ingest_wikimedia.common import (
@@ -31,6 +31,8 @@ from ingest_wikimedia.web import Web
 from ingest_wikimedia.wikimedia import check_content_type
 
 DOWNLOAD_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MB
+CREDENTIAL_RETRY_MAX = 3
+CREDENTIAL_RETRY_BASE_DELAY_SECS = 5
 
 
 class Downloader:
@@ -152,6 +154,11 @@ class Downloader:
         """
         For a given capture for a given item, downloads it if we don't have it or are
         overwriting, gets the mime and sha1, and sticks it in S3.
+
+        upload_file_to_s3() is retried on CredentialRetrievalError: EC2 instance profile
+        credentials occasionally fail to refresh from IMDS, causing a brief blip that
+        resolves within seconds. Only the S3 upload is retried — the HTTP download is
+        not repeated, since the file is already on disk when the upload step fails.
         """
         temp_file = self.local_fs.get_temp_file()
         temp_file_name = temp_file.name
@@ -176,8 +183,27 @@ class Downloader:
                 return
 
             sha1 = self.local_fs.get_file_hash(temp_file_name)
-            self.upload_file_to_s3(temp_file_name, destination_path, content_type, sha1)
-            self.tracker.increment(Result.BYTES, os.stat(temp_file_name).st_size)
+
+            for attempt in range(1, CREDENTIAL_RETRY_MAX + 1):
+                try:
+                    self.upload_file_to_s3(
+                        temp_file_name, destination_path, content_type, sha1
+                    )
+                    self.tracker.increment(
+                        Result.BYTES, os.stat(temp_file_name).st_size
+                    )
+                    return
+                except CredentialRetrievalError as e:
+                    if attempt < CREDENTIAL_RETRY_MAX:
+                        delay = CREDENTIAL_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1))
+                        logging.warning(
+                            f"IAM credential refresh failed for {dpla_id} {ordinal} "
+                            f"(attempt {attempt}/{CREDENTIAL_RETRY_MAX}), "
+                            f"retrying in {delay}s: {e}"
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
 
         except Exception as e:
             self.tracker.increment(Result.FAILED)
