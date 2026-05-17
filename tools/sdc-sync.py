@@ -370,6 +370,9 @@ def check(mediaid, qid, prop):
         except KeyError:
             return True, ref
     # Unrecognized qid type — treat claim as absent; no existing ref to update.
+    print(
+        f" -- check() fallback: unrecognized qid type '{qid[0]}' for {mediaid}, {prop}"
+    )
     return True, ""
 
 
