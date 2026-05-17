@@ -135,9 +135,13 @@ class Uploader:
                         )
                     mime = detected
                 else:
-                    logging.info(
-                        f"Skipping {dpla_id} {ordinal}: Unable to detect type beyond octet-stream"
+                    action = "would delete from S3" if dry_run else "deleting from S3"
+                    logging.warning(
+                        f"Skipping {dpla_id} {ordinal}: Unable to detect type beyond "
+                        f"octet-stream; {action} so downloader can retry."
                     )
+                    if not dry_run:
+                        self.s3_client.get_s3().Object(S3_BUCKET, s3_path).delete()
                     self.tracker.increment(Result.SKIPPED)
                     return
 
@@ -329,7 +333,7 @@ class Uploader:
                             "binary/octet-stream",
                         ) and not is_download_only(mime):
                             ext = mimetypes.guess_extension(mime)
-                            if ext and ext != ".bin":
+                            if ext and ext != MIME_UNKNOWN_EXT:
                                 ordinal_exts[i] = ext
 
             ext_counts: Counter[str] = Counter(ordinal_exts.values())
