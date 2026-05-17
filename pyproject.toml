@@ -53,3 +53,5 @@ nara-ids = "tools.nara_ids:main"
 get-ids-nara = "tools.get_ids_nara:main"
 resolve-dpla-ids = "tools.resolve_dpla_ids:main"
 fix-unknown-categories = "tools.fix_unknown_categories:main"
+get-ids-retry = "tools.get_ids_retry:main"
+
