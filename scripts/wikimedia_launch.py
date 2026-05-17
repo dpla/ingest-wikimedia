@@ -206,7 +206,8 @@ def main() -> None:
                 _add_target(canonical, institution)
         elif is_dpla_id(token):
             # Collect for batch resolution via EC2 after local parsing is done.
-            dpla_id_tokens.append(token)
+            # Normalise to lowercase — ES and S3 paths expect the canonical form.
+            dpla_id_tokens.append(token.strip().lower())
         elif "|" in token:
             token_parts = token.split("|", 2)
             hub_part = token_parts[0]
