@@ -206,7 +206,7 @@ class IIIF:
             return request.json()
 
         except (requests.RequestException, json.JSONDecodeError):
-            logging.info(f"Unable to read IIIF manifest at {url}")
+            logging.warning(f"Unable to read IIIF manifest at {url}")
             return None
 
     @staticmethod
