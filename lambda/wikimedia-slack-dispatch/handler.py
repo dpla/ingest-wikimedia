@@ -177,6 +177,8 @@ def handler(event, context):
                 "Usage: `/wikimedia-upload <target> [<target> ...]`\n"
                 "Targets: hub slug, `hub|institution`, `hub|institution|collection`,"
                 " DPLA item ID, or Wikidata QID.\n"
+                "Wrap targets containing spaces in quotes:"
+                ' `/wikimedia-upload "indiana|Indiana State Library"`\n'
                 "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`",
                 ephemeral=True,
             )
@@ -245,7 +247,7 @@ def handler(event, context):
                         ephemeral=True,
                     )
                 parts = token.split("|", 2)
-                hub_part = parts[0]
+                hub_part = parts[0].strip()
                 institution = parts[1].strip() if pipe_count >= 1 else None
                 collection = parts[2].strip() if pipe_count >= 2 else None
                 if institution is not None and not institution:
