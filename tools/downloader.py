@@ -62,9 +62,10 @@ class Downloader:
         destination_path: str,
         content_type: str,
         sha1: str,
-    ):
+    ) -> bool:
         """
-        Once we have a valid file to store in S3, this puts it there.
+        Uploads the file to S3. Returns True if the file was uploaded, False if it
+        already existed with a matching checksum and was skipped.
         """
         try:
             with open(file, "rb") as f:
@@ -87,7 +88,7 @@ class Downloader:
                         if int(obj.content_length) > 0:
                             logging.info("Already exists.")
                             self.tracker.increment(Result.SKIPPED)
-                            return
+                            return False
                     except (TypeError, ValueError):
                         pass  # zero-byte stub or unreadable length — fall through to upload
 
@@ -110,6 +111,7 @@ class Downloader:
                         Callback=lambda bytes_xfer: t.update(bytes_xfer),
                     )
                 self.tracker.increment(Result.DOWNLOADED)
+                return True
 
         except CredentialRetrievalError:
             raise  # let the caller's retry loop handle transient credential blips
@@ -188,12 +190,12 @@ class Downloader:
 
             for attempt in range(1, CREDENTIAL_RETRY_MAX + 1):
                 try:
-                    self.upload_file_to_s3(
+                    if self.upload_file_to_s3(
                         temp_file_name, destination_path, content_type, sha1
-                    )
-                    self.tracker.increment(
-                        Result.BYTES, os.stat(temp_file_name).st_size
-                    )
+                    ):
+                        self.tracker.increment(
+                            Result.BYTES, os.stat(temp_file_name).st_size
+                        )
                     return
                 except CredentialRetrievalError as e:
                     if attempt < CREDENTIAL_RETRY_MAX:
