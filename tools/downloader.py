@@ -111,6 +111,8 @@ class Downloader:
                     )
                 self.tracker.increment(Result.DOWNLOADED)
 
+        except CredentialRetrievalError:
+            raise  # let the caller's retry loop handle transient credential blips
         except Exception as e:
             raise RuntimeError(
                 f"Error uploading to s3://{S3_BUCKET}/{destination_path}"
