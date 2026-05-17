@@ -39,11 +39,13 @@ from ingest_wikimedia.slack import notify_upload_complete
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
+    MIME_UNKNOWN_EXT,
     get_page_title,
     get_wiki_text,
     wikimedia_url,
     wiki_file_exists,
     check_content_type,
+    is_download_only,
     get_page,
     ERROR_FILEEXISTS,
     ERROR_MIME,
@@ -144,9 +146,16 @@ class Uploader:
                 self.tracker.increment(Result.SKIPPED)
                 return
 
+            if is_download_only(mime):
+                logging.info(
+                    f"Skipping {dpla_id} {ordinal}: {mime} staged for conversion, not uploaded."
+                )
+                self.tracker.increment(Result.SKIPPED)
+                return
+
             ext = mimetypes.guess_extension(mime)
 
-            if not ext:
+            if not ext or ext == MIME_UNKNOWN_EXT:
                 logging.info(
                     f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
                 )
@@ -313,12 +322,14 @@ class Uploader:
                         # Skip generic MIME types — process_file re-detects these
                         # via libmagic, so the real extension isn't known yet.
                         # Excluding them avoids grouping files whose true types differ.
+                        # Also skip download-only types (e.g. video) — they are never
+                        # uploaded so they should not influence page numbering.
                         if mime not in (
                             "application/octet-stream",
                             "binary/octet-stream",
-                        ):
+                        ) and not is_download_only(mime):
                             ext = mimetypes.guess_extension(mime)
-                            if ext:
+                            if ext and ext != ".bin":
                                 ordinal_exts[i] = ext
 
             ext_counts: Counter[str] = Counter(ordinal_exts.values())
