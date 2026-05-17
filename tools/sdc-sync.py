@@ -963,7 +963,7 @@ def dpla_claims(
                                     }
                                 )
                             except Exception as _:
-                                pass
+                                pass  # P973 qualifier missing or malformed — skip this source statement.
                         elif type == "wikibase-entityid":
                             dpla_claims.append(
                                 {
