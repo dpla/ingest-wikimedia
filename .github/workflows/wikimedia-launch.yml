@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: ""
+      concurrency_key:
+        description: "Short SHA256 prefix of the partner string, used as the concurrency group key (set by dispatcher to avoid the 400-char GitHub limit)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -24,7 +29,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
-  group: wikimedia-launch-${{ github.event.inputs.partner }}
+  group: wikimedia-launch-${{ github.event.inputs.concurrency_key || github.run_id }}
   cancel-in-progress: false
 
 jobs:
