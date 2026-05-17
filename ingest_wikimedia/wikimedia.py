@@ -65,6 +65,7 @@ def get_page_title(
         .replace("/", "-")
         .replace(":", "-")
         .replace("#", "-")
+        .replace("|", "-")  # wikitext table/link syntax; breaks Commons extension detection
         .replace(
             "\ufffd", "\u2019"
         )  # Unicode replacement char → right single quote (corrupted metadata)

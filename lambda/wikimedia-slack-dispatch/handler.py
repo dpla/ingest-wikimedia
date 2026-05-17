@@ -6,8 +6,12 @@ Handles:
                        #tech-alerts once the workflow completes (~2 minutes).
   /wikimedia-upload <target> [<target> ...]
                      — dispatches wikimedia-launch.yml; one tmux session runs all
-                       targets sequentially. Each target is a hub slug ("bpl") or
-                       a hub|institution pair ("indiana|Indiana State Library").
+                       targets sequentially. Each target is one of:
+                         hub slug            e.g. "bpl"
+                         hub|institution     e.g. "indiana|Indiana State Library"
+                         hub|institution|collection
+                         DPLA item ID        e.g. "087a554ba5d8feb82b1d9c26380d7d0f"
+                         Wikidata QID        e.g. "Q12345"
   /wikimedia-upload kill <hub> [<hub> ...]
                      — dispatches wikimedia-kill.yml to stop running sessions.
 
@@ -33,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ingest_wikimedia.partners import resolve_slug
+from ingest_wikimedia.partners import is_dpla_id, resolve_slug
 
 _QID_RE = re.compile(r"^Q\d+$")
 
@@ -170,9 +174,12 @@ def handler(event, context):
         raw = fields.get("text", "").strip()
         if not raw:
             return _slack_reply(
-                "Usage: `/wikimedia-upload <hub> [<hub> ...]` or"
-                " `/wikimedia-upload <hub>|<institution>` or"
-                " `/wikimedia-upload kill <hub> [<hub> ...]`",
+                "Usage: `/wikimedia-upload <target> [<target> ...]`\n"
+                "Targets: hub slug, `hub|institution`, `hub|institution|collection`,"
+                " DPLA item ID, or Wikidata QID.\n"
+                "Wrap targets containing spaces in quotes:"
+                ' `/wikimedia-upload "indiana|Indiana State Library"`\n'
+                "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`",
                 ephemeral=True,
             )
 
@@ -205,13 +212,13 @@ def handler(event, context):
             )
 
         # Launch subcommand: /wikimedia-upload <target> [<target> ...]
-        # QIDs are passed through; the launch script resolves them.
-        # Dict preserves insertion order for stable session naming.
+        # QIDs and DPLA IDs are passed through; the launch script resolves them.
+        # Hub-based targets are validated here for fast Slack feedback.
         seen_tokens: set[str] = set()
         launch_targets: list[str] = []
         for token in tokens:
             if _QID_RE.match(token):
-                # Wikidata QID — validate format, pass through unchanged.
+                # Wikidata QID — pass through unchanged.
                 if token in seen_tokens:
                     return _slack_reply(
                         f"Target `{token}` appears more than once.",
@@ -219,29 +226,46 @@ def handler(event, context):
                     )
                 seen_tokens.add(token)
                 launch_targets.append(token)
+            elif is_dpla_id(token):
+                # DPLA item ID — normalise to lowercase and pass through for
+                # resolution by the launch script on EC2.
+                normalised = token.lower()
+                if normalised in seen_tokens:
+                    return _slack_reply(
+                        f"Target `{normalised}` appears more than once.",
+                        ephemeral=True,
+                    )
+                seen_tokens.add(normalised)
+                launch_targets.append(normalised)
             else:
-                if "|" in token:
-                    if token.count("|") != 1:
-                        return _slack_reply(
-                            f"Invalid target: `{token}`. Use `<hub>|<institution>`.",
-                            ephemeral=True,
-                        )
-                    hub_part, institution = token.split("|", 1)
-                    institution = institution.strip()
-                    if not institution:
-                        return _slack_reply(
-                            "Institution cannot be empty in `<hub>|<institution>`.",
-                            ephemeral=True,
-                        )
-                else:
-                    hub_part, institution = token, None
+                pipe_count = token.count("|")
+                if pipe_count > 2:
+                    return _slack_reply(
+                        f"Invalid target: `{token}`."
+                        " Use `<hub>`, `<hub>|<institution>`,"
+                        " or `<hub>|<institution>|<collection>`.",
+                        ephemeral=True,
+                    )
+                parts = token.split("|", 2)
+                hub_part = parts[0].strip()
+                institution = parts[1].strip() if pipe_count >= 1 else None
+                collection = parts[2].strip() if pipe_count >= 2 else None
+                if institution is not None and not institution:
+                    return _slack_reply("Institution cannot be empty.", ephemeral=True)
+                if collection is not None and not collection:
+                    return _slack_reply("Collection cannot be empty.", ephemeral=True)
                 canonical = resolve_slug(hub_part)
                 if canonical is None:
                     return _slack_reply(
                         f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
                         ephemeral=True,
                     )
-                target_str = f"{canonical}|{institution}" if institution else canonical
+                if collection is not None:
+                    target_str = f"{canonical}|{institution}|{collection}"
+                elif institution is not None:
+                    target_str = f"{canonical}|{institution}"
+                else:
+                    target_str = canonical
                 if target_str in seen_tokens:
                     return _slack_reply(
                         f"Target `{target_str}` appears more than once.",
