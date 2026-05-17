@@ -20,6 +20,7 @@ Usage:
 
 import csv
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -28,7 +29,7 @@ from pathlib import Path
 import click
 
 
-BASE_DIR = Path("/home/ec2-user/ingest-wikimedia")
+BASE_DIR = Path(os.environ.get("INGEST_WIKIMEDIA_DIR", "/home/ec2-user/ingest-wikimedia"))
 
 UPLOAD_TRANSIENT_ERRORS = (
     "lockmanager-fail-conflict",
