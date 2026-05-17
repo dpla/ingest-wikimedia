@@ -265,6 +265,10 @@ class Downloader:
             media_urls, desc="Downloading Files", leave=False, unit="File", ncols=100
         ):
             count += 1
+            if not media_url:
+                logging.warning(f"Skipping {dpla_id} ordinal {count}: empty URL.")
+                self.tracker.increment(Result.SKIPPED)
+                continue
             # hack to fix bad nara data
             if media_url.startswith("https/"):
                 media_url = media_url.replace("https/", "https:/")

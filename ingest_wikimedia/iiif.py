@@ -31,20 +31,16 @@ class IIIF:
                     service = get_dict(resource, IIIF_SERVICE)
                     context = get_str(service, JSON_LD_AT_CONTEXT)
                     url = get_str(service, JSON_LD_AT_ID)
-                    if url and context == IIIF_IMAGE_API_V2:
-                        big_url = self.maximize_iiif_url(
-                            url, IIIF_V2_FULL_RES_JPG_SUFFIX
+                    if url:
+                        # Use v2 suffix when the service context is known v2;
+                        # otherwise guess v3 syntax works (usually does).
+                        suffix = (
+                            IIIF_V2_FULL_RES_JPG_SUFFIX
+                            if context == IIIF_IMAGE_API_V2
+                            else IIIF_V3_FULL_RES_JPG_SUFFIX
                         )
-                        urls.append(big_url)
-                    elif url:
-                        # guessing the v3 syntax will work even if we don't know it's v3.
-                        big_url = self.maximize_iiif_url(
-                            url, IIIF_V3_FULL_RES_JPG_SUFFIX
-                        )
-                        urls.append(big_url)
-                    else:
-                        # we give up, but need to hold space so the numbering is right
-                        urls.append("")
+                        if big_url := self.maximize_iiif_url(url, suffix):
+                            urls.append(big_url)
 
         return urls
 
@@ -59,16 +55,13 @@ class IIIF:
                 url = get_str(
                     get_dict(item[IIIF_ITEMS][0][IIIF_ITEMS][0], IIIF_BODY), IIIF_ID
                 )
-                new_url = ""
                 if url:
                     # This might later need to sniff the profile level of the image API
                     # like we did in iiif_v2_urls()
-                    new_url = self.maximize_iiif_url(url, IIIF_V3_FULL_RES_JPG_SUFFIX)
-                # This always adds something to the list.
-                # If we didn't get a URL, it's just an empty string.
-                # This prevents getting the page order wrong if we don't
-                # figure out the URL one time and fix it later.
-                urls.append(new_url)
+                    if new_url := self.maximize_iiif_url(
+                        url, IIIF_V3_FULL_RES_JPG_SUFFIX
+                    ):
+                        urls.append(new_url)
 
             except (IndexError, TypeError, KeyError) as e:
                 logging.warning("Unable to parse IIIF manifest.", exc_info=e)
