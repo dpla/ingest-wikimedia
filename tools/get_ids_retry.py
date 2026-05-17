@@ -23,13 +23,15 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
 
 
-BASE_DIR = Path(os.environ.get("INGEST_WIKIMEDIA_DIR", "/home/ec2-user/ingest-wikimedia"))
+BASE_DIR = Path(
+    os.environ.get("INGEST_WIKIMEDIA_DIR", "/home/ec2-user/ingest-wikimedia")
+)
 
 UPLOAD_TRANSIENT_ERRORS = (
     "lockmanager-fail-conflict",
@@ -92,7 +94,10 @@ def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[s
         ("*-download.log", parse_download_log, download_failures),
     ):
         for log_file in sorted(log_dir.glob(pattern)):
-            if datetime.fromtimestamp(log_file.stat().st_mtime) < cutoff:
+            if (
+                datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc)
+                < cutoff
+            ):
                 continue
             target.update(parser(log_file))
 
@@ -137,7 +142,7 @@ def main(days: int, partner: str | None, output_dir: str) -> None:
       <partner>-upload-retry.csv   — run uploader only
       <partner>-download-retry.csv — run downloader then uploader
     """
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -172,4 +177,3 @@ def main(days: int, partner: str | None, output_dir: str) -> None:
 
 if __name__ == "__main__":
     main()
-
