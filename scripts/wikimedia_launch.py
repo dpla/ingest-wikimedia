@@ -380,14 +380,23 @@ def main() -> None:
                     or inst_label in existing_labels
                     or label in existing_labels
                 )
-            else:
-                # Institution-level and single-item requests conflict only with:
+            elif dpla_id is None:
+                # Institution-level requests conflict with:
                 #   1. An existing hub-level session for the same hub
-                #   2. An existing session for the exact same label
-                # Two institution-level (or item-level) sessions for the same hub
-                # but different labels do NOT conflict. An institution-level session
-                # does NOT conflict with a collection-level session for the same
-                # institution — they use separate CSVs and idempotent operations.
+                #   2. An existing session for the exact same institution label
+                #   3. Any existing collection-level session for the same institution
+                #      (the collection is a strict subset; the institution run would
+                #      duplicate work on those items, symmetric with collection→institution)
+                # Two institution-level sessions for different institutions within
+                # the same hub do NOT conflict.
+                conflicts_this = (
+                    canonical in existing_labels
+                    or label in existing_labels
+                    or any(lbl.startswith(f"{label}+") for lbl in existing_labels)
+                )
+            else:
+                # Single-item requests conflict only with a hub-wide session for the
+                # same hub or an exact duplicate single-item label.
                 conflicts_this = (
                     canonical in existing_labels or label in existing_labels
                 )
