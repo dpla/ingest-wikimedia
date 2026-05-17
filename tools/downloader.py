@@ -244,7 +244,7 @@ class Downloader:
                     if candidate.get("_staged_by_get_ids_es"):
                         item_metadata = candidate
                 except (json.JSONDecodeError, AttributeError):
-                    pass
+                    pass  # Malformed metadata — treated as absent; handled below.
 
             if item_metadata is None:
                 # Metadata missing or lacks the get-ids-es staging marker.

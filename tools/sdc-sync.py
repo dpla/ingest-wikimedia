@@ -369,6 +369,11 @@ def check(mediaid, qid, prop):
                 return True, ref
         except KeyError:
             return True, ref
+    # Unrecognized qid type — treat claim as absent; no existing ref to update.
+    print(
+        f" -- check() fallback: unrecognized qid type '{qid[0]}' for {mediaid}, {prop}"
+    )
+    return True, ""
 
 
 # The following functions define specific statements to add, and uses formattedclaim() to append them to the "claims" array. It first uses the check() to check if the statement is not yet in the item, and appends it the list of statements to add in the edit if not. For now, we are just hardcoding actual values which are the same for all edits. check() returns True, False, or the string value of a statement id.
@@ -422,7 +427,6 @@ def add_rs(mediaid, rs, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_collection(mediaid, hub, institution, dpla_id):
@@ -444,7 +448,6 @@ def add_collection(mediaid, hub, institution, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_access(mediaid, access, dpla_id):
@@ -464,7 +467,6 @@ def add_access(mediaid, access, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_level(mediaid, level, dpla_id):
@@ -484,7 +486,6 @@ def add_level(mediaid, level, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_parent(mediaid, parent, dpla_id):
@@ -504,7 +505,6 @@ def add_parent(mediaid, parent, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_id(mediaid, id):
@@ -517,7 +517,6 @@ def add_id(mediaid, id):
     if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
-        return claim
 
 
 def add_naid(mediaid, naid, dpla_id):
@@ -530,7 +529,6 @@ def add_naid(mediaid, naid, dpla_id):
     if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
-        return claim
 
 
 def add_subject(mediaid, subject, dpla_id):
@@ -543,7 +541,6 @@ def add_subject(mediaid, subject, dpla_id):
     if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
-        return claim
 
 
 def add_subject_entity(mediaid, qid, dpla_id):
@@ -562,7 +559,6 @@ def add_subject_entity(mediaid, qid, dpla_id):
     if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
-        return claim
 
 
 def add_title(mediaid, title, dpla_id):
@@ -582,7 +578,6 @@ def add_title(mediaid, title, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_desc(mediaid, desc, dpla_id):
@@ -602,7 +597,6 @@ def add_desc(mediaid, desc, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_creator(mediaid, creator, dpla_id):
@@ -623,7 +617,6 @@ def add_creator(mediaid, creator, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 # This will catch when displayDate is a single year or a date.
@@ -641,7 +634,6 @@ def add_date(mediaid, date, dpla_id):
     if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
-        return claim
 
 
 def add_contributed(mediaid, hub, institution, dpla_id):
@@ -790,7 +782,6 @@ def add_local_id(mediaid, id, institution, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-            return claim
 
 
 def add_source(mediaid, hub, url, dpla_id):
@@ -830,7 +821,6 @@ def add_source(mediaid, hub, url, dpla_id):
     if checkclaim[0] is True:
         pywikibot.output(summary)
         claims["claims"].append(claim)
-        return claim
 
 
 def add_det(claimid):
@@ -976,7 +966,7 @@ def dpla_claims(
                                     }
                                 )
                             except Exception as _:
-                                pass
+                                pass  # P973 qualifier missing or malformed — skip this source statement.
                         elif type == "wikibase-entityid":
                             dpla_claims.append(
                                 {
