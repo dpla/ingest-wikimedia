@@ -276,13 +276,20 @@ def handler(event, context):
 
         partner_input = shlex.join(launch_targets)
         targets_display = ", ".join(f"`{t}`" for t in launch_targets)
+        # Keep the concurrency group name well under GitHub's 400-char limit by
+        # hashing the full partner string down to a 16-char hex prefix.
+        concurrency_key = hashlib.sha256(partner_input.encode()).hexdigest()[:16]
 
         try:
             status = _dispatch_workflow(
                 gh_token,
                 repo,
                 "wikimedia-launch.yml",
-                {"partner": partner_input, "response_url": response_url},
+                {
+                    "partner": partner_input,
+                    "response_url": response_url,
+                    "concurrency_key": concurrency_key,
+                },
             )
         except urllib.error.HTTPError as e:
             logging.error("GitHub API error: HTTP %s", e.code)
