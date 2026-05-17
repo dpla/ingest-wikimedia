@@ -21,7 +21,7 @@ SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
 
 
-def get_phase_and_progress(client, session: str, hub: str, label: str) -> str:
+def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | None:
     def _safe_int(s: str) -> int:
         try:
             return int(s)
@@ -57,7 +57,11 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str:
         ).strip()
 
     if not log_file:
-        return "Generating IDs"
+        # No log file at all: the label may not have started yet, or it may have
+        # been skipped (e.g. ineligible institution — get-ids-es exits 1 without
+        # ever launching the downloader). Return None so the caller can decide
+        # whether to keep looking at later labels.
+        return None
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
     csv_path = shlex.quote(f"{base}/{label}.csv")
@@ -79,9 +83,9 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str:
     sections = out.split(f"{sep}\n", 2)
     log_mtime = _safe_int(sections[0].strip()) if sections else 0
 
-    # Log predates this session → downloader hasn't started yet.
+    # Log predates this session — no new log yet, treat same as no log.
     if session_created > 0 and log_mtime < session_created:
-        return "Generating IDs"
+        return None
 
     tail = sections[1].strip() if len(sections) > 1 else ""
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
@@ -186,7 +190,16 @@ def main() -> None:
         if not labels:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
-        label, phase = labels[-1], "Unknown"
+
+        # Walk labels in pipeline order. Skip past labels with no log file — they
+        # may have been skipped (e.g. ineligible institution errored during ID
+        # generation). Track the first no-log label after the last completed one
+        # as a fallback in case all remaining labels lack logs (meaning the session
+        # genuinely hasn't started the next phase yet).
+        first_pending: str | None = None
+        last_complete_label: str | None = None
+        last_complete_phase: str = ""
+
         for label in labels:
             hub = label.split("+")[0]
             try:
@@ -194,9 +207,39 @@ def main() -> None:
             except Exception:
                 logging.exception("Failed to get status for %s (%s)", session, label)
                 phase = "Unknown (error)"
+
+            if phase is None:
+                # No log: either skipped or not yet started. Keep looking at
+                # later labels — if any of them have a log, this one was skipped.
+                if first_pending is None:
+                    first_pending = label
+                continue
+
+            # This label has a log. Any earlier no-log labels were skipped.
+            first_pending = None
+
             if not phase.startswith(_UPLOAD_COMPLETE_PREFIX):
-                break
-        return session, f"[{label}] {phase}" if multi else phase
+                # Active label — this is the one to report.
+                return session, f"[{label}] {phase}" if multi else phase
+
+            last_complete_label = label
+            last_complete_phase = phase
+
+        # Loop exhausted. Either the pipeline is waiting to start the next phase
+        # (first_pending), or everything finished (last_complete_label).
+        if first_pending is not None:
+            return (
+                session,
+                f"[{first_pending}] Generating IDs" if multi else "Generating IDs",
+            )
+        if last_complete_label is not None:
+            return (
+                session,
+                f"[{last_complete_label}] {last_complete_phase}"
+                if multi
+                else last_complete_phase,
+            )
+        return session, "Generating IDs"
 
     with ThreadPoolExecutor(max_workers=min(len(sessions), 8)) as executor:
         futures = {executor.submit(fetch, s): s for s in sessions}
