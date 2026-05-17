@@ -265,12 +265,21 @@ class Downloader:
                     manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
                     manifest = self.iiif.get_iiif_manifest(manifest_url)
                     if not manifest:
-                        self.tracker.increment(Result.SKIPPED)
+                        logging.warning(
+                            f"Could not retrieve IIIF manifest for {dpla_id}: {manifest_url}"
+                        )
+                        self.tracker.increment(Result.FAILED)
                         return
                     self.s3_client.write_iiif_manifest(
                         partner, dpla_id, json.dumps(manifest)
                     )
                     media_urls = self.iiif.get_iiif_urls(manifest)
+                    if not media_urls:
+                        logging.warning(
+                            f"No image URLs extracted from IIIF manifest for {dpla_id}: {manifest_url}"
+                        )
+                        self.tracker.increment(Result.FAILED)
+                        return
                     self.s3_client.write_file_list(partner, dpla_id, media_urls)
 
             else:
