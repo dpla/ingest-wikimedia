@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
@@ -137,7 +137,7 @@ def main(days: int, partner: str | None, output_dir: str) -> None:
       <partner>-upload-retry.csv   — run uploader only
       <partner>-download-retry.csv — run downloader then uploader
     """
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
