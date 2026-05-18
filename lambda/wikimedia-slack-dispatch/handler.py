@@ -95,22 +95,32 @@ def _slack_reply(text: str, ephemeral: bool = False) -> dict:
 
 
 def _dispatch_and_reply(
-    token: str, repo: str, workflow: str, inputs: dict, success_text: str
+    token: str,
+    repo: str,
+    workflow: str,
+    inputs: dict,
+    success_text: str,
+    *,
+    ephemeral: bool = False,
 ) -> dict:
     try:
         status = _dispatch_workflow(token, repo, workflow, inputs)
     except urllib.error.HTTPError as e:
         logging.error("GitHub API error: HTTP %s", e.code)
-        return _slack_reply(f"Failed to trigger workflow (HTTP {e.code}).")
+        return _slack_reply(
+            f"Failed to trigger workflow (HTTP {e.code}).", ephemeral=ephemeral
+        )
     except Exception:
         logging.exception("Unexpected error dispatching workflow")
-        return _slack_reply("Failed to trigger workflow due to an internal error.")
+        return _slack_reply(
+            "Failed to trigger workflow due to an internal error.", ephemeral=ephemeral
+        )
     text = (
         success_text
         if status == 204
         else f"Unexpected response from GitHub (HTTP {status})"
     )
-    return _slack_reply(text)
+    return _slack_reply(text, ephemeral=ephemeral)
 
 
 def handler(event, context):
@@ -234,6 +244,11 @@ def handler(event, context):
                     f"`{days_str}` is not a valid number of days. Provide a positive integer.",
                     ephemeral=True,
                 )
+            if len(retry_tokens) > 2:
+                return _slack_reply(
+                    "Too many arguments. Usage: `/wikimedia-upload retry <days> [<partner>]`",
+                    ephemeral=True,
+                )
             retry_partner = ""
             if len(retry_tokens) > 1:
                 hub = retry_tokens[1]
@@ -256,6 +271,7 @@ def handler(event, context):
                 f"Scanning the last {days} day{'s' if days != 1 else ''} of logs"
                 f" for retryable failures{f' for `{retry_partner}`' if retry_partner else ''}"
                 " — results will post to #tech-alerts shortly.",
+                ephemeral=True,
             )
 
         # Launch subcommand: /wikimedia-upload <target> [<target> ...]

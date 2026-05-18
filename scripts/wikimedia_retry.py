@@ -51,6 +51,9 @@ def main() -> None:
     args = parser.parse_args()
 
     days = args.days
+    if days <= 0:
+        print("--days must be a positive integer.", file=sys.stderr)
+        sys.exit(1)
     partner = args.partner.strip()
     raw_url = args.response_url.strip()
     # Only accept genuine Slack response_url values — reject arbitrary POST targets.
@@ -58,7 +61,7 @@ def main() -> None:
         raw_url if raw_url.startswith("https://hooks.slack.com/commands/") else ""
     )
     if raw_url and not response_url:
-        print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
+        print("Ignoring invalid response_url (not a Slack hooks URL).", file=sys.stderr)
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
