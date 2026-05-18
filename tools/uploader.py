@@ -1,7 +1,11 @@
 import json
 import logging
 import mimetypes
+import random
 import time
+from collections import Counter
+
+from botocore.exceptions import ClientError
 
 import click
 from pywikibot.site import BaseSite
@@ -11,38 +15,53 @@ from tqdm import tqdm
 from ingest_wikimedia.common import (
     get_list,
     get_dict,
+    get_str,
     load_ids,
     CHECKSUM,
 )
 from ingest_wikimedia.localfs import LocalFS
 from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.s3 import (
     S3_BUCKET,
     S3Client,
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.categories import CategoryEnsurer
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
+    DATA_PROVIDER_FIELD_NAME,
+    EDM_AGENT_NAME,
+    WIKIDATA_FIELD_NAME,
     DPLA,
 )
+from ingest_wikimedia.slack import notify_upload_complete
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
+    MIME_UNKNOWN_EXT,
     get_page_title,
     get_wiki_text,
     wikimedia_url,
     wiki_file_exists,
     check_content_type,
+    is_download_only,
     get_page,
     ERROR_FILEEXISTS,
     ERROR_MIME,
     ERROR_BANNED,
     ERROR_DUPLICATE,
     ERROR_NOCHANGE,
+    ERROR_BACKEND_FAIL,
     get_site,
+    get_wikidata_site,
 )
+
+MAX_UPLOAD_RETRIES = 3
+UPLOAD_RETRY_BASE_DELAY_SECS = 5
+UPLOAD_RETRY_MAX_DELAY_SECS = 60
 
 
 class Uploader:
@@ -53,12 +72,14 @@ class Uploader:
         s3_client: S3Client,
         dpla: DPLA,
         site: BaseSite,
+        category_ensurer: CategoryEnsurer | None = None,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
         self.s3_client = s3_client
         self.site = site
         self.dpla = dpla
+        self.category_ensurer = category_ensurer
 
     def process_file(
         self,
@@ -94,15 +115,53 @@ class Uploader:
 
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
+            file_downloaded = False
+
+            if mime in ("application/octet-stream", "binary/octet-stream"):
+                s3_object.download_file(temp_file.name)
+                file_downloaded = True
+                detected = self.local_fs.get_content_type(temp_file.name)
+                if detected not in ("application/octet-stream", "binary/octet-stream"):
+                    action = "would update S3" if dry_run else "updating S3"
+                    logging.info(
+                        f"Re-detected {dpla_id} {ordinal}: {mime} -> {detected}; {action}"
+                    )
+                    if not dry_run:
+                        self.s3_client.get_s3().meta.client.copy_object(
+                            Bucket=S3_BUCKET,
+                            Key=s3_path,
+                            ContentType=detected,
+                            Metadata=dict(s3_object.metadata),
+                            MetadataDirective="REPLACE",
+                            CopySource=S3_BUCKET + "/" + s3_path,
+                        )
+                    mime = detected
+                else:
+                    action = "would delete from S3" if dry_run else "deleting from S3"
+                    logging.warning(
+                        f"Skipping {dpla_id} {ordinal}: Unable to detect type beyond "
+                        f"octet-stream; {action} so downloader can retry."
+                    )
+                    if not dry_run:
+                        self.s3_client.get_s3().Object(S3_BUCKET, s3_path).delete()
+                    self.tracker.increment(Result.SKIPPED)
+                    return
 
             if not check_content_type(mime):
                 logging.info(f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}")
                 self.tracker.increment(Result.SKIPPED)
                 return
 
+            if is_download_only(mime):
+                logging.info(
+                    f"Skipping {dpla_id} {ordinal}: {mime} staged for conversion, not uploaded."
+                )
+                self.tracker.increment(Result.SKIPPED)
+                return
+
             ext = mimetypes.guess_extension(mime)
 
-            if not ext:
+            if not ext or ext == MIME_UNKNOWN_EXT:
                 logging.info(
                     f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
                 )
@@ -136,7 +195,7 @@ class Uploader:
                 self.tracker.increment(Result.SKIPPED)
                 return
 
-            if not dry_run:
+            if not dry_run and not file_downloaded:
                 with tqdm(
                     total=s3_object.content_length,
                     leave=False,
@@ -154,15 +213,44 @@ class Uploader:
 
                 wiki_file_page = get_page(self.site, page_title)
 
-                result = self.site.upload(
-                    filepage=wiki_file_page,
-                    source_filename=temp_file.name,
-                    comment=upload_comment,
-                    text=wiki_markup,
-                    ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
-                    asynchronous=True,
-                    chunk_size=WMC_UPLOAD_CHUNK_SIZE,
-                )
+                # Stash-commit raises fileexists-shared-forbidden on existing titles
+                # even with ignorewarnings=1. A warning on direct upload also triggers
+                # a stash-commit internally. Fix: chunk_size=0 + ignore_warnings=True
+                # so the first request sends ignorewarnings=1 with no stash path.
+                file_exists = wiki_file_page.exists()
+                chunk_size = 0 if file_exists else WMC_UPLOAD_CHUNK_SIZE
+                upload_warnings = True if file_exists else IGNORE_WIKIMEDIA_WARNINGS
+
+                result = None
+                for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                    try:
+                        result = self.site.upload(
+                            filepage=wiki_file_page,
+                            source_filename=temp_file.name,
+                            comment=upload_comment,
+                            text=wiki_markup,
+                            ignore_warnings=upload_warnings,
+                            asynchronous=True,
+                            chunk_size=chunk_size,
+                        )
+                        break
+                    except Exception as ex:
+                        is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
+                        if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
+                            delay = min(
+                                UPLOAD_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1)),
+                                UPLOAD_RETRY_MAX_DELAY_SECS,
+                            ) + random.uniform(0, 1.0)
+                            logging.warning(
+                                f"Transient upload error on attempt {attempt}/"
+                                f"{MAX_UPLOAD_RETRIES}, retrying in "
+                                f"{delay:.1f}s: {ex}"
+                            )
+                            time.sleep(delay)
+                        else:
+                            if is_backend_fail:
+                                self.tracker.increment(Result.FAILED)
+                            raise
 
                 if not result:
                     # These error message accounts for Page does not exist,
@@ -178,7 +266,11 @@ class Uploader:
                 self.tracker.increment(Result.BYTES, file_size)
 
         except Exception as ex:
-            self.handle_upload_exception(ex)
+            if ERROR_FILEEXISTS in str(ex):
+                logging.info("Skipping: File already exists on Commons")
+                self.tracker.increment(Result.SKIPPED)
+            else:
+                self.handle_upload_exception(ex)
 
         finally:
             self.local_fs.clean_up_tmp_file(temp_file)
@@ -205,31 +297,79 @@ class Uploader:
                 item_metadata, providers_json
             )
 
-            if not self.dpla.is_wiki_eligible(
-                dpla_id, item_metadata, provider, data_provider
-            ):
-                logging.info(f"Skipping {dpla_id}: Not eligible.")
-                self.tracker.increment(Result.SKIPPED)
-                return
+            if self.category_ensurer:
+                institution_name = get_str(
+                    get_dict(item_metadata, DATA_PROVIDER_FIELD_NAME), EDM_AGENT_NAME
+                )
+                institution_qid = get_str(data_provider, WIKIDATA_FIELD_NAME)
+                hub_institution_qid = get_str(provider, WIKIDATA_FIELD_NAME)
+                if institution_qid and hub_institution_qid:
+                    self.category_ensurer.ensure(
+                        institution_qid, institution_name, hub_institution_qid
+                    )
+                else:
+                    logging.warning(
+                        f"Skipping {dpla_id}: "
+                        f"missing institution_qid={institution_qid!r} or "
+                        f"hub_institution_qid={hub_institution_qid!r}"
+                    )
+                    self.tracker.increment(Result.SKIPPED)
+                    return
 
             titles = get_list(
                 get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
                 DC_TITLE_FIELD_NAME,
             )
 
-            # playing it safe in case titles is empty
             title = titles[0] if titles else ""
 
-            ordinal = 0
             files = self.s3_client.get_file_list(partner, dpla_id)
 
-            for _ in tqdm(
-                files, desc="Uploading Files", leave=False, unit="File", ncols=100
+            # Pre-scan to resolve each file's extension from S3 content-type metadata.
+            # Files with distinct extensions represent the same content in different
+            # formats, not separate pages — page numbers are only assigned within
+            # groups that share the same extension and contain more than one file.
+            # Single-file items never need pagination so we skip the pre-scan for them.
+            ordinal_exts: dict[int, str] = {}
+            if len(files) > 1:
+                for i in range(1, len(files) + 1):
+                    s3_path = self.s3_client.get_media_s3_path(dpla_id, i, partner)
+                    try:
+                        s3_obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
+                        mime = s3_obj.content_type
+                    except ClientError:
+                        continue
+                    # Skip download-only types (e.g. video) — they are never
+                    # uploaded so they should not influence page numbering.
+                    if is_download_only(mime):
+                        continue
+                    # Use "" for octet-stream and unresolvable extensions so that
+                    # multiple such files still get distinct page labels, preventing
+                    # page-title collisions when process_file re-detects their type.
+                    if mime in ("application/octet-stream", "binary/octet-stream"):
+                        ordinal_exts[i] = ""
+                    else:
+                        ext = mimetypes.guess_extension(mime)
+                        ordinal_exts[i] = (
+                            ext if (ext and ext != MIME_UNKNOWN_EXT) else ""
+                        )
+
+            ext_counts: Counter[str] = Counter(ordinal_exts.values())
+            ext_seen: Counter[str] = Counter()
+
+            for ordinal, _ in enumerate(
+                tqdm(
+                    files, desc="Uploading Files", leave=False, unit="File", ncols=100
+                ),
+                start=1,
             ):
-                ordinal += 1
                 logging.info(f"Page {ordinal}")
-                # one-pagers don't have page numbers in their titles
-                page_label = "" if len(files) == 1 else str(ordinal)
+                ext = ordinal_exts.get(ordinal, "")
+                if ext_counts[ext] > 1:
+                    ext_seen[ext] += 1
+                    page_label = str(ext_seen[ext])
+                else:
+                    page_label = ""
                 self.process_file(
                     dpla_id,
                     title,
@@ -255,11 +395,7 @@ class Uploader:
         message = "Unknown"
         error = False
 
-        if ERROR_FILEEXISTS in error_string:
-            # A file with this name exists at the Wikimedia Commons.
-            message = "File already uploaded"
-            error = True
-        elif ERROR_MIME in error_string:
+        if ERROR_MIME in error_string:
             message = "Invalid MIME type"
             error = True
         elif ERROR_BANNED in error_string:
@@ -271,6 +407,9 @@ class Uploader:
             message = f"File already exists, {error_string}"
         elif ERROR_NOCHANGE in error_string:
             message = f"File exists, no change, {error_string}"
+        elif ERROR_BACKEND_FAIL in error_string:
+            message = "Wikimedia storage backend error (retries exhausted)"
+            error = True
 
         if error:
             logging.error(f"Failed: {message}", exc_info=ex)
@@ -287,12 +426,17 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 
+    commons_site = get_site()
+    wikidata_site = get_wikidata_site()
+    category_ensurer = CategoryEnsurer(commons_site, wikidata_site, dry_run=dry_run)
+
     uploader = Uploader(
         tools_context.get_tracker(),
         tools_context.get_local_fs(),
         tools_context.get_s3_client(),
         tools_context.get_dpla(),
-        get_site(),
+        commons_site,
+        category_ensurer,
     )
 
     dpla = tools_context.get_dpla()
@@ -304,6 +448,7 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     try:
         local_fs.setup_temp_dir()
         setup_logging(partner, "upload", logging.INFO)
+        notify_phase_start(partner, "upload")
         if dry_run:
             logging.warning("---=== DRY RUN ===---")
 
@@ -316,9 +461,16 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
             uploader.process_item(dpla_id, providers_json, partner, verbose, dry_run)
 
     finally:
+        elapsed = time.time() - start_time
         logging.info("\n" + str(tracker))
-        logging.info(f"{time.time() - start_time} seconds.")
+        logging.info(f"{elapsed} seconds.")
         local_fs.cleanup_temp_dir()
+        notify_upload_complete(
+            tracker=tracker,
+            partner_label=f"wikimedia-{partner}",
+            elapsed_seconds=elapsed,
+            dry_run=dry_run,
+        )
 
 
 if __name__ == "__main__":

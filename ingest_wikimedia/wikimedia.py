@@ -46,6 +46,11 @@ def check_content_type(content_type: str) -> bool:
     return content_type not in INVALID_CONTENT_TYPES
 
 
+def is_download_only(content_type: str) -> bool:
+    """Returns True for types staged to S3 but not uploaded to Commons (e.g. video)."""
+    return content_type in DOWNLOAD_ONLY_CONTENT_TYPES
+
+
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
@@ -55,6 +60,9 @@ def get_page_title(
     """
     escaped_title = (
         item_title[:181]
+        .replace("''", '"')  # titleblacklist: double-apostrophe rule → double-quote
+        .replace("&", "+")  # titleblacklist: query-string pattern (&...=)
+        .replace("=", "-")  # titleblacklist: query-string pattern (&...=)
         .replace("[", "(")
         .replace("]", ")")
         .replace("{", "(")
@@ -62,6 +70,12 @@ def get_page_title(
         .replace("/", "-")
         .replace(":", "-")
         .replace("#", "-")
+        .replace(
+            "|", "-"
+        )  # wikitext table/link syntax; breaks Commons extension detection
+        .replace(
+            "\ufffd", "\u2019"
+        )  # Unicode replacement char → right single quote (corrupted metadata)
     )
 
     escaped_visible_title = replace_invisible(escaped_title)
@@ -203,8 +217,15 @@ def get_page(site: BaseSite, title: str) -> FilePage:
 
 
 def get_site() -> BaseSite:
-    """Returns the Site object for wikimedia commons."""
+    """Returns the Site object for Wikimedia Commons."""
     site = pywikibot.Site(COMMONS_SITE_NAME)
+    site.login()
+    return site
+
+
+def get_wikidata_site() -> BaseSite:
+    """Returns the Site object for Wikidata."""
+    site = pywikibot.Site("wikidata", "wikidata")
     site.login()
     return site
 
@@ -218,20 +239,45 @@ def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
     return False
 
 
-INVALID_CONTENT_TYPES = [
-    "text/html",
-    "application/json",
-    "application/xml",
-    "text/xml",
-    "text/plain",
-    "application/msword",
-]
+INVALID_CONTENT_TYPES = frozenset(
+    [
+        "text/html",
+        "application/json",
+        "application/xml",
+        "text/xml",
+        "text/plain",
+        "application/msword",
+        "application/octet-stream",
+        # Rich-text and Office XML formats — not accepted by Commons
+        "application/rtf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+    ]
+)
+# Video/audio types downloaded to S3 for future conversion but never uploaded directly.
+# Commons does not accept these container formats; .ogv/.webm conversion is needed first.
+DOWNLOAD_ONLY_CONTENT_TYPES = frozenset(
+    [
+        "video/mp4",
+        "video/x-msvideo",  # .avi
+        "video/quicktime",  # .mov
+        "audio/x-ms-wma",  # .wma
+        "video/x-ms-wmv",  # .wmv
+    ]
+)
+# mimetypes.guess_extension() returns this sentinel for MIME types it cannot map to a
+# known file extension. Commons rejects files with this extension unconditionally.
+MIME_UNKNOWN_EXT = ".bin"
 COMMONS_URL_PREFIX = "https://commons.wikimedia.org/wiki/File:"
 ERROR_FILEEXISTS = "fileexists-shared-forbidden"
 ERROR_MIME = "filetype-badmime"
 ERROR_BANNED = "filetype-banned"
 ERROR_DUPLICATE = "duplicate"
 ERROR_NOCHANGE = "no-change"
+ERROR_BACKEND_FAIL = "backend-fail-internal"
 COMMONS_SITE_NAME = "commons"
 WMC_UPLOAD_CHUNK_SIZE = 20_000_000  # 20 MB
 VALUE_JOIN_DELIMITER = "; "

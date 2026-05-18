@@ -35,6 +35,11 @@ def test_check_content_type_invalid():
     assert not check_content_type(content_type)
 
 
+def test_check_content_type_octet_stream_invalid():
+    content_type = "application/octet-stream"
+    assert not check_content_type(content_type)
+
+
 def test_get_page_title():
     title = get_page_title("Sample Title", "abcd1234", ".jpg", 1)
     expected_title = "Sample Title - DPLA - abcd1234 (page 1).jpg"
