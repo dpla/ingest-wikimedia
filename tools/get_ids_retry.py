@@ -1,12 +1,13 @@
 """
 Extract DPLA IDs from recent upload/download logs for items that failed due to
-transient issues and should be retried.
+transient or now-resolvable issues and should be retried.
 
 Two failure types are identified:
 
   upload   — Wikimedia-side transient errors (lock contention, backend storage
-              failures).  S3 assets are already present; only the uploader
-              needs to run.
+              failures) and title/hash-drift errors that the uploader can now
+              correct.  S3 assets are already present; only the uploader needs
+              to run.
 
   download — Media-server HTTP failures after all retries are exhausted.  Both
               the downloader and uploader need to run.
@@ -34,12 +35,18 @@ BASE_DIR = Path(
 )
 
 UPLOAD_TRANSIENT_ERRORS = (
+    # Wikimedia API / storage transient errors
     "lockmanager-fail-conflict",
     "lockmanager-fail-svr-acquire",
     "stashfailed: Could not acquire lock",
     "stashfailed: Server failed to publish temporary file",
     "backend-fail-internal",
     "uploadstash-exception",
+    # Title / hash drift errors — the uploader's drift-correction logic resolves
+    # these on retry.  Both appear in log tracebacks (via exc_info=) attached to
+    # "Failed: Unknown" warnings, where the line-by-line regex below matches them.
+    "File linked to another page",  # RuntimeError: file exists on Commons at wrong title
+    "ArticleExistsConflictError",  # pywikibot: move-over-redirect blocked by insufficient rights
 )
 
 UPLOAD_TRANSIENT_RE = re.compile(
