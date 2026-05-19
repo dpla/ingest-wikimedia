@@ -396,6 +396,7 @@ class Uploader:
                         s3_obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
                         mime = s3_obj.content_type
                     except ClientError:
+                        ordinal_exts[i] = ""
                         continue
                     # Download-only types (e.g. video) are never uploaded, so they
                     # should not influence page numbering.
