@@ -95,8 +95,10 @@ def parse_download_log(path: Path) -> set[str]:
 def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[str]]:
     """Scan logs for *partner* and return (upload_failures, download_failures).
 
-    IDs that were successfully uploaded within the window are excluded from both
-    sets — they are already on Commons and retrying them would only produce skips.
+    Only IDs with zero transient upload errors AND at least one successful upload
+    are excluded — they are confirmed fully on Commons.  An ID whose log shows
+    both a success and a transient failure (partial run, or failure then success
+    in the same window) is kept: at least one file may still be missing.
     """
     log_dir = BASE_DIR / partner / "logs"
     upload_failures: set[str] = set()
@@ -115,8 +117,10 @@ def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[s
             continue
         download_failures.update(parse_download_log(log_file))
 
-    upload_failures -= upload_successes
-    download_failures -= upload_successes
+    # IDs confirmed fully on Commons: succeeded with no transient errors anywhere in
+    # the window.  IDs in both sets had mixed results — keep them for retry.
+    fully_uploaded = upload_successes - upload_failures
+    download_failures -= fully_uploaded
     # Avoid scheduling the same ID for both retry types.
     upload_failures -= download_failures
     return upload_failures, download_failures
