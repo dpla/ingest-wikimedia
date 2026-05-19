@@ -1,12 +1,13 @@
 """
 Extract DPLA IDs from recent upload/download logs for items that failed due to
-transient issues and should be retried.
+transient or now-resolvable issues and should be retried.
 
 Two failure types are identified:
 
   upload   — Wikimedia-side transient errors (lock contention, backend storage
-              failures).  S3 assets are already present; only the uploader
-              needs to run.
+              failures) and title/hash-drift errors that the uploader can now
+              correct.  S3 assets are already present; only the uploader needs
+              to run.
 
   download — Media-server HTTP failures after all retries are exhausted.  Both
               the downloader and uploader need to run.
@@ -34,12 +35,19 @@ BASE_DIR = Path(
 )
 
 UPLOAD_TRANSIENT_ERRORS = (
+    # Wikimedia API / storage transient errors
     "lockmanager-fail-conflict",
     "lockmanager-fail-svr-acquire",
     "stashfailed: Could not acquire lock",
     "stashfailed: Server failed to publish temporary file",
     "backend-fail-internal",
     "uploadstash-exception",
+    # Title / hash drift errors — the uploader's drift-correction logic resolves
+    # these on retry.  Both appear in log tracebacks (via exc_info=) attached to
+    # "Failed: Unknown" warnings, where the line-by-line regex below matches them.
+    "File linked to another page",  # RuntimeError: file exists on Commons at wrong title
+    "ArticleExistsConflictError",  # pywikibot: move-over-redirect blocked by insufficient rights
+    "fileexists-shared-forbidden",  # Wikimedia API: different file already at intended title
 )
 
 UPLOAD_TRANSIENT_RE = re.compile(
@@ -56,8 +64,10 @@ EMPTY_URL_FAILURE = "Failed downloading  to"
 def parse_upload_log(path: Path) -> tuple[set[str], set[str]]:
     """Return (transient_failure_ids, successfully_uploaded_ids) from an upload log.
 
-    transient_failure_ids  — IDs that hit lock-contention or backend-storage errors;
-                             the S3 asset is present but the upload didn't land on Commons.
+    transient_failure_ids  — IDs that hit lock-contention, backend-storage, or
+                             title/hash-drift errors; S3 assets are present but
+                             the upload didn't land on Commons (or landed at the
+                             wrong title).
     successfully_uploaded_ids — IDs for which at least one file reached Commons ("Uploaded to").
     """
     failures: set[str] = set()
