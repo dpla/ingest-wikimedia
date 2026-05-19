@@ -195,7 +195,9 @@ class Uploader:
             # Check whether this file's hash already exists on Commons.
             # If it's at the correct title, skip. If it's at a different title,
             # attempt drift correction before uploading.
-            existing_file = find_file_by_hash(self.site, sha1)
+            existing_file = find_file_by_hash(
+                self.site, sha1, preferred_title=page_title
+            )
             if existing_file is not None:
                 if existing_file.title(with_ns=False) == page_title:
                     logging.info(
@@ -427,8 +429,13 @@ class Uploader:
         if existing_dpla_id and existing_dpla_id != dpla_id:
             try:
                 other_item = self.dpla.get_item_metadata(existing_dpla_id)
-            except Exception:
-                other_item = {}
+            except Exception as ex:
+                logging.warning(
+                    f"Hash drift for {dpla_id} {ordinal}: failed to verify "
+                    f"colliding DPLA item {existing_dpla_id}: {ex}; "
+                    f"falling back to upload_only."
+                )
+                return "upload_only"
             if other_item:
                 logging.info(
                     f"Hash drift for {dpla_id} {ordinal}: "
@@ -446,9 +453,9 @@ class Uploader:
 
         if intended_page.isRedirectPage():
             # Case 1 (via hash lookup): intended title is a redirect. If it
-            # redirects to our existing file (same DPLA ID), move over it.
+            # redirects to exactly our existing file (same filename), move over it.
             redirect_target = intended_page.getRedirectTarget()
-            if dpla_id in redirect_target.title():
+            if redirect_target.title(with_ns=False) == actual_filename:
                 self._move_to_correct_title(
                     existing_file, intended_page, dpla_id, "Case 1"
                 )

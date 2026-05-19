@@ -266,12 +266,24 @@ def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
     return False
 
 
-def find_file_by_hash(site: BaseSite, sha1: str) -> FilePage | None:
-    """Return the first Commons FilePage with the given SHA1, or None."""
+def find_file_by_hash(
+    site: BaseSite, sha1: str, preferred_title: str | None = None
+) -> FilePage | None:
+    """Return the Commons FilePage with the given SHA1, or None.
+
+    If preferred_title is given and a file with that title (without namespace)
+    shares the hash, it is returned immediately. Otherwise the first result
+    returned by the API (alphabetical) is returned. This handles the rare case
+    where multiple files share a SHA1 and we want the one at the correct title.
+    """
     api_site = typing.cast(APISite, site)
+    first: FilePage | None = None
     for img in api_site.allimages(sha1=sha1):
-        return img
-    return None
+        if preferred_title and img.title(with_ns=False) == preferred_title:
+            return img
+        if first is None:
+            first = img
+    return first
 
 
 _DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
