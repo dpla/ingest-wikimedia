@@ -53,18 +53,27 @@ DOWNLOAD_FAILED_RE = re.compile(r"Failed: ([0-9a-f]{32})")
 EMPTY_URL_FAILURE = "Failed downloading  to"
 
 
-def parse_upload_log(path: Path) -> set[str]:
-    """Return DPLA IDs that hit transient Wikimedia errors."""
-    failed: set[str] = set()
+def parse_upload_log(path: Path) -> tuple[set[str], set[str]]:
+    """Return (transient_failure_ids, successfully_uploaded_ids) from an upload log.
+
+    transient_failure_ids  — IDs that hit lock-contention or backend-storage errors;
+                             the S3 asset is present but the upload didn't land on Commons.
+    successfully_uploaded_ids — IDs for which at least one file reached Commons ("Uploaded to").
+    """
+    failures: set[str] = set()
+    successes: set[str] = set()
     current_id: str | None = None
     with open(path, errors="replace") as f:
         for line in f:
             m = DPLA_ID_RE.search(line)
             if m:
                 current_id = m.group(1)
-            elif current_id and UPLOAD_TRANSIENT_RE.search(line):
-                failed.add(current_id)
-    return failed
+            elif current_id:
+                if UPLOAD_TRANSIENT_RE.search(line):
+                    failures.add(current_id)
+                elif "Uploaded to" in line:
+                    successes.add(current_id)
+    return failures, successes
 
 
 def parse_download_log(path: Path) -> set[str]:
@@ -84,23 +93,30 @@ def parse_download_log(path: Path) -> set[str]:
 
 
 def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[str]]:
-    """Scan logs for *partner* and return (upload_failures, download_failures)."""
+    """Scan logs for *partner* and return (upload_failures, download_failures).
+
+    IDs that were successfully uploaded within the window are excluded from both
+    sets — they are already on Commons and retrying them would only produce skips.
+    """
     log_dir = BASE_DIR / partner / "logs"
     upload_failures: set[str] = set()
+    upload_successes: set[str] = set()
     download_failures: set[str] = set()
 
-    for pattern, parser, target in (
-        ("*-upload.log", parse_upload_log, upload_failures),
-        ("*-download.log", parse_download_log, download_failures),
-    ):
-        for log_file in sorted(log_dir.glob(pattern)):
-            if (
-                datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc)
-                < cutoff
-            ):
-                continue
-            target.update(parser(log_file))
+    for log_file in sorted(log_dir.glob("*-upload.log")):
+        if datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc) < cutoff:
+            continue
+        failures, successes = parse_upload_log(log_file)
+        upload_failures.update(failures)
+        upload_successes.update(successes)
 
+    for log_file in sorted(log_dir.glob("*-download.log")):
+        if datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc) < cutoff:
+            continue
+        download_failures.update(parse_download_log(log_file))
+
+    upload_failures -= upload_successes
+    download_failures -= upload_successes
     # Avoid scheduling the same ID for both retry types.
     upload_failures -= download_failures
     return upload_failures, download_failures
