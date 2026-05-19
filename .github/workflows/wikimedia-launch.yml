@@ -61,10 +61,15 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           DPLA_SLACK_BOT_TOKEN: ${{ secrets.DPLA_SLACK_BOT_TOKEN }}
           PYTHONPATH: .
+          INPUT_PARTNER: ${{ github.event.inputs.partner }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+          INPUT_RESPONSE_URL: ${{ github.event.inputs.response_url }}
+          INPUT_MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days }}
+          INPUT_REFRESH_ONLY: ${{ github.event.inputs.refresh_only }}
         run: |
           python scripts/wikimedia_launch.py \
-            --partner "${{ github.event.inputs.partner }}" \
-            --force "${{ github.event.inputs.force }}" \
-            --response-url "${{ github.event.inputs.response_url }}" \
-            --max-age-days "${{ github.event.inputs.max_age_days }}" \
-            --refresh-only "${{ github.event.inputs.refresh_only }}"
+            --partner "$INPUT_PARTNER" \
+            --force "$INPUT_FORCE" \
+            --response-url "$INPUT_RESPONSE_URL" \
+            --max-age-days "$INPUT_MAX_AGE_DAYS" \
+            --refresh-only "$INPUT_REFRESH_ONLY"

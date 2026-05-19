@@ -86,7 +86,14 @@ class Downloader:
 
                 # Don't overwrite a valid existing S3 file with a 0-byte download
                 # (e.g. a transient empty HTTP response from the source server).
-                if obj_metadata and os.stat(file).st_size == 0:
+                # Use `is not None` rather than truthiness — empty metadata dicts ({})
+                # are falsy but still indicate the object exists.
+                existing_size = int(obj.content_length or 0)
+                if (
+                    obj_metadata is not None
+                    and existing_size > 0
+                    and os.stat(file).st_size == 0
+                ):
                     logging.warning(
                         f"New download is 0 bytes; keeping existing file at "
                         f"s3://{S3_BUCKET}/{destination_path}"
@@ -373,7 +380,7 @@ class Downloader:
 @click.option(
     "--max-age-days",
     default=365,
-    type=int,
+    type=click.IntRange(min=0),
     help="Re-download files already in S3 if older than N days (default: 365).",
 )
 def main(
