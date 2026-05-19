@@ -107,6 +107,7 @@ def main() -> None:
         f"Scanning logs for retryable failures in the last {days} day(s){partner_desc}..."
     )
     scan_cmd = (
+        f"mkdir -p {shlex.quote(RETRY_DIR)} && "
         "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate && "
         "cd /home/ec2-user/ingest-wikimedia && "
         f"get-ids-retry {days}"
