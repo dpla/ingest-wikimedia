@@ -30,16 +30,13 @@ import hmac
 import json
 import logging
 import os
-import re
 import shlex
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from ingest_wikimedia.partners import is_dpla_id, resolve_slug
-
-_QID_RE = re.compile(r"^Q\d+$")
+from ingest_wikimedia.partners import is_dpla_id, is_wikidata_id, resolve_slug
 
 
 def _verify_slack_signature(
@@ -123,6 +120,84 @@ def _dispatch_and_reply(
     return _slack_reply(text, ephemeral=ephemeral)
 
 
+def _parse_positive_int(value: str) -> tuple[int, dict | None]:
+    """Parse a positive integer. Returns (n, None) on success or (0, error_reply)."""
+    try:
+        n = int(value)
+        if n <= 0:
+            raise ValueError
+    except ValueError:
+        return 0, _slack_reply(
+            f"`{value}` is not a valid number of days. Provide a positive integer.",
+            ephemeral=True,
+        )
+    return n, None
+
+
+def _validate_launch_targets(
+    tokens: list[str],
+) -> tuple[list[str], dict | None]:
+    """
+    Validate a list of target tokens (hub slugs, DPLA IDs, QIDs, pipe-separated).
+    Returns (launch_targets, None) on success, or ([], error_reply) on the first
+    invalid token.
+    """
+    seen_tokens: set[str] = set()
+    launch_targets: list[str] = []
+    for token in tokens:
+        if is_wikidata_id(token):
+            if token in seen_tokens:
+                return [], _slack_reply(
+                    f"Target `{token}` appears more than once.", ephemeral=True
+                )
+            seen_tokens.add(token)
+            launch_targets.append(token)
+        elif is_dpla_id(token):
+            normalised = token.lower()
+            if normalised in seen_tokens:
+                return [], _slack_reply(
+                    f"Target `{normalised}` appears more than once.", ephemeral=True
+                )
+            seen_tokens.add(normalised)
+            launch_targets.append(normalised)
+        else:
+            pipe_count = token.count("|")
+            if pipe_count > 2:
+                return [], _slack_reply(
+                    f"Invalid target: `{token}`."
+                    " Use `<hub>`, `<hub>|<institution>`,"
+                    " or `<hub>|<institution>|<collection>`.",
+                    ephemeral=True,
+                )
+            parts = token.split("|", 2)
+            hub_part = parts[0].strip()
+            institution = parts[1].strip() if pipe_count >= 1 else None
+            collection = parts[2].strip() if pipe_count >= 2 else None
+            if institution is not None and not institution:
+                return [], _slack_reply("Institution cannot be empty.", ephemeral=True)
+            if collection is not None and not collection:
+                return [], _slack_reply("Collection cannot be empty.", ephemeral=True)
+            canonical = resolve_slug(hub_part)
+            if canonical is None:
+                return [], _slack_reply(
+                    f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
+                    ephemeral=True,
+                )
+            if collection is not None:
+                target_str = f"{canonical}|{institution}|{collection}"
+            elif institution is not None:
+                target_str = f"{canonical}|{institution}"
+            else:
+                target_str = canonical
+            if target_str in seen_tokens:
+                return [], _slack_reply(
+                    f"Target `{target_str}` appears more than once.", ephemeral=True
+                )
+            seen_tokens.add(target_str)
+            launch_targets.append(target_str)
+    return launch_targets, None
+
+
 def handler(event, context):
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     body = event.get("body") or ""
@@ -190,7 +265,8 @@ def handler(event, context):
                 "Wrap targets containing spaces in quotes:"
                 ' `/wikimedia-upload "indiana|Indiana State Library"`\n'
                 "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`\n"
-                "To retry transient failures: `/wikimedia-upload retry <days> [<partner>]`",
+                "To retry transient failures: `/wikimedia-upload retry <days> [<partner>]`\n"
+                "To refresh S3 files: `/wikimedia-upload refresh <target> <days>`",
                 ephemeral=True,
             )
 
@@ -234,16 +310,9 @@ def handler(event, context):
                     "Example: `/wikimedia-upload retry 7` or `/wikimedia-upload retry 14 nara`",
                     ephemeral=True,
                 )
-            days_str = retry_tokens[0]
-            try:
-                days = int(days_str)
-                if days <= 0:
-                    raise ValueError
-            except ValueError:
-                return _slack_reply(
-                    f"`{days_str}` is not a valid number of days. Provide a positive integer.",
-                    ephemeral=True,
-                )
+            days, err = _parse_positive_int(retry_tokens[0])
+            if err is not None:
+                return err
             if len(retry_tokens) > 2:
                 return _slack_reply(
                     "Too many arguments. Usage: `/wikimedia-upload retry <days> [<partner>]`",
@@ -274,68 +343,52 @@ def handler(event, context):
                 ephemeral=True,
             )
 
+        # Refresh subcommand: /wikimedia-upload refresh <target> [<target> ...] <days>
+        # Re-downloads files older than DAYS days without running the uploader.
+        if tokens[0] == "refresh":
+            refresh_tokens = tokens[1:]
+            if len(refresh_tokens) < 2:
+                return _slack_reply(
+                    "Usage: `/wikimedia-upload refresh <target> <days>`\n"
+                    "Re-downloads files already in S3 that are older than DAYS days,"
+                    " without re-uploading to Commons.\n"
+                    "Example: `/wikimedia-upload refresh ohio 90`\n"
+                    'Example: `/wikimedia-upload refresh "indiana|Indiana State Library" 30`',
+                    ephemeral=True,
+                )
+            days, err = _parse_positive_int(refresh_tokens[-1])
+            if err is not None:
+                return err
+            refresh_targets, err = _validate_launch_targets(refresh_tokens[:-1])
+            if err is not None:
+                return err
+            if not refresh_targets:
+                return _slack_reply("No valid targets provided.", ephemeral=True)
+            partner_input = shlex.join(refresh_targets)
+            targets_display = ", ".join(f"`{t}`" for t in refresh_targets)
+            concurrency_key = hashlib.sha256(partner_input.encode()).hexdigest()[:16]
+            return _dispatch_and_reply(
+                gh_token,
+                repo,
+                "wikimedia-launch.yml",
+                {
+                    "partner": partner_input,
+                    "response_url": response_url,
+                    "concurrency_key": concurrency_key,
+                    "max_age_days": str(days),
+                    "refresh_only": "true",
+                },
+                f"Launching download refresh for {targets_display}"
+                f" — re-downloading files older than {days} day{'s' if days != 1 else ''}"
+                ", no upload. Confirmation will post to #tech-alerts shortly.",
+            )
+
         # Launch subcommand: /wikimedia-upload <target> [<target> ...]
         # QIDs and DPLA IDs are passed through; the launch script resolves them.
         # Hub-based targets are validated here for fast Slack feedback.
-        seen_tokens: set[str] = set()
-        launch_targets: list[str] = []
-        for token in tokens:
-            if _QID_RE.match(token):
-                # Wikidata QID — pass through unchanged.
-                if token in seen_tokens:
-                    return _slack_reply(
-                        f"Target `{token}` appears more than once.",
-                        ephemeral=True,
-                    )
-                seen_tokens.add(token)
-                launch_targets.append(token)
-            elif is_dpla_id(token):
-                # DPLA item ID — normalise to lowercase and pass through for
-                # resolution by the launch script on EC2.
-                normalised = token.lower()
-                if normalised in seen_tokens:
-                    return _slack_reply(
-                        f"Target `{normalised}` appears more than once.",
-                        ephemeral=True,
-                    )
-                seen_tokens.add(normalised)
-                launch_targets.append(normalised)
-            else:
-                pipe_count = token.count("|")
-                if pipe_count > 2:
-                    return _slack_reply(
-                        f"Invalid target: `{token}`."
-                        " Use `<hub>`, `<hub>|<institution>`,"
-                        " or `<hub>|<institution>|<collection>`.",
-                        ephemeral=True,
-                    )
-                parts = token.split("|", 2)
-                hub_part = parts[0].strip()
-                institution = parts[1].strip() if pipe_count >= 1 else None
-                collection = parts[2].strip() if pipe_count >= 2 else None
-                if institution is not None and not institution:
-                    return _slack_reply("Institution cannot be empty.", ephemeral=True)
-                if collection is not None and not collection:
-                    return _slack_reply("Collection cannot be empty.", ephemeral=True)
-                canonical = resolve_slug(hub_part)
-                if canonical is None:
-                    return _slack_reply(
-                        f"Unknown hub: `{hub_part}`. Check the hub slug and try again.",
-                        ephemeral=True,
-                    )
-                if collection is not None:
-                    target_str = f"{canonical}|{institution}|{collection}"
-                elif institution is not None:
-                    target_str = f"{canonical}|{institution}"
-                else:
-                    target_str = canonical
-                if target_str in seen_tokens:
-                    return _slack_reply(
-                        f"Target `{target_str}` appears more than once.",
-                        ephemeral=True,
-                    )
-                seen_tokens.add(target_str)
-                launch_targets.append(target_str)
+        launch_targets, err = _validate_launch_targets(tokens)
+        if err is not None:
+            return err
 
         partner_input = shlex.join(launch_targets)
         targets_display = ", ".join(f"`{t}`" for t in launch_targets)

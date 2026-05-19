@@ -21,6 +21,15 @@ on:
         required: false
         type: string
         default: ""
+      max_age_days:
+        description: "For refresh runs: re-download files already in S3 if older than N days"
+        required: false
+        type: string
+        default: ""
+      refresh_only:
+        description: "Download-only refresh run — skip upload phase"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -56,4 +65,6 @@ jobs:
           python scripts/wikimedia_launch.py \
             --partner "${{ github.event.inputs.partner }}" \
             --force "${{ github.event.inputs.force }}" \
-            --response-url "${{ github.event.inputs.response_url }}"
+            --response-url "${{ github.event.inputs.response_url }}" \
+            --max-age-days "${{ github.event.inputs.max_age_days }}" \
+            --refresh-only "${{ github.event.inputs.refresh_only }}"

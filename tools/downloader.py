@@ -258,7 +258,7 @@ class Downloader:
         partner: str,
         dpla_id: str,
         sleep_secs: float,
-        max_age_days: int | None = None,
+        max_age_days: int | None = 365,
     ) -> None:
         """
         For every item, tries to get a list of files for it and stores the
@@ -372,9 +372,9 @@ class Downloader:
 )
 @click.option(
     "--max-age-days",
-    default=None,
+    default=365,
     type=int,
-    help="Re-download files already in S3 if older than N days (default: always skip existing files).",
+    help="Re-download files already in S3 if older than N days (default: 365).",
 )
 def main(
     ids_file: IO,
