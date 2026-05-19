@@ -155,10 +155,11 @@ def main() -> None:
         _slack_fail(response_url, "⚠️ Unexpected output from find + memory check.")
     find_part, _, mem_out = combined_out.partition("__MEM_CHECK__")
 
-    # Parse (canonical_slug, retry_type, csv_path) from filenames.
+    # Parse retry CSVs into a per-hub map: slug → {retry_type: csv_path}.
     # Filenames use EC2 directory names (e.g. "smithsonian-upload-retry.csv") which may
     # differ from canonical slugs (e.g. "si"); resolve via alias table.
-    retry_targets: list[tuple[str, str, str]] = []
+    # Insertion order is preserved (find | sort), so hubs run in a stable sequence.
+    hub_csvs: dict[str, dict[str, str]] = {}
     for line in find_part.splitlines():
         csv_path = line.strip()
         if not csv_path:
@@ -179,9 +180,9 @@ def main() -> None:
                 "Unknown partner in retry CSV filename: %s", csv_partner_dir
             )
             continue
-        retry_targets.append((slug, retry_type, csv_path))
+        hub_csvs.setdefault(slug, {})[retry_type] = csv_path
 
-    if not retry_targets:
+    if not hub_csvs:
         _slack_fail(
             response_url,
             "⚠️ Log scan found failures but no retry CSVs were created.",
@@ -222,27 +223,27 @@ def main() -> None:
         ]
     )
 
+    # Build one tmux block per hub. Download and upload failures for the same hub
+    # are combined: downloader runs on the download CSV, then uploader runs on each
+    # CSV in turn. The uploader is idempotent (skips already-uploaded files), so
+    # running it on the download CSV then the upload CSV is always safe.
     target_blocks = []
-    for slug, retry_type, csv_path in retry_targets:
+    for slug, type_csvs in hub_csvs.items():
         pdir = PARTNER_DIR.get(slug, slug)
         base = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{pdir}")
-        session_label = f"retry-{slug}-{retry_type}"
+        session_label = f"retry-{slug}"
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
             "unset WIKIMEDIA_SINGLE_ITEM"
         )
-        quoted_csv = shlex.quote(csv_path)
-        if retry_type == "download":
-            steps = [
-                f"cd {base}",
-                f"downloader {quoted_csv} {slug}",
-                f"uploader {quoted_csv} {slug}",
-            ]
-        else:
-            steps = [
-                f"cd {base}",
-                f"uploader {quoted_csv} {slug}",
-            ]
+        download_csv = type_csvs.get("download")
+        upload_csv = type_csvs.get("upload")
+        steps = [f"cd {base}"]
+        if download_csv:
+            steps.append(f"downloader {shlex.quote(download_csv)} {slug}")
+            steps.append(f"uploader {shlex.quote(download_csv)} {slug}")
+        if upload_csv:
+            steps.append(f"uploader {shlex.quote(upload_csv)} {slug}")
         target_steps = " && ".join(steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"
@@ -253,9 +254,7 @@ def main() -> None:
 
     # Post launch notification before starting the session.
     if slack_token:
-        target_summary = ", ".join(
-            f"`{slug}` ({rtype})" for slug, rtype, _ in retry_targets
-        )
+        target_summary = ", ".join(f"`{slug}`" for slug in hub_csvs)
         msg = (
             f"🔁 Launching `{session_name}`: {target_summary}"
             f" ({days} day{'s' if days != 1 else ''} of log history)."
