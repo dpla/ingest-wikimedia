@@ -54,9 +54,7 @@ def main(verbose: bool) -> None:
     start_time = time.time()
 
     commons_site = get_site()
-    wikidata_site = get_wikidata_site()
     category_ensurer = CategoryEnsurer(commons_site)
-    repo = wikidata_site.data_repository()
 
     unknown_cat = pywikibot.Category(commons_site, UNKNOWN_INSTITUTION_CATEGORY)
 
@@ -64,6 +62,8 @@ def main(verbose: bool) -> None:
     files_touched = 0
     # Tracks files we cannot parse, so we don't loop on them forever
     cannot_process: set[str] = set()
+    # Lazily initialised on first use so a startup maxlag error doesn't abort the run.
+    repo = None
 
     while True:
         file_page = None
@@ -93,6 +93,8 @@ def main(verbose: bool) -> None:
             continue
 
         try:
+            if repo is None:
+                repo = get_wikidata_site().data_repository()
             institution_item = pywikibot.ItemPage(repo, institution_qid)
             institution_item.get()
             institution_name = institution_item.labels.get("en", institution_qid)

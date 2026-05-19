@@ -60,13 +60,6 @@ class CategoryEnsurer:
         if institution_qid in self._ensured:
             return
 
-        if self._institution_has_category(institution_qid):
-            logging.info(
-                f"Category already set up for {institution_name} ({institution_qid})"
-            )
-            self._ensured.add(institution_qid)
-            return
-
         institution_name = institution_name.strip()
         if not institution_name:
             raise ValueError(
@@ -74,6 +67,26 @@ class CategoryEnsurer:
             )
 
         category_name = COMMONS_CATEGORY_PREFIX + institution_name
+
+        # Fast path: Commons category already exists — no Wikidata connection needed.
+        # The Wikidata P8464 link was created when the category was, so skipping the
+        # check here is safe and keeps uploads working when Wikidata is lagged.
+        if self._commons_category_exists(category_name):
+            logging.info(
+                f"Category already set up for {institution_name} ({institution_qid})"
+            )
+            self._ensured.add(institution_qid)
+            return
+
+        # Commons category absent — check whether Wikidata already has P8464 set
+        # (e.g. category exists under a different name or was created out-of-band).
+        if self._institution_has_category(institution_qid):
+            logging.info(
+                f"Category already set up for {institution_name} ({institution_qid})"
+            )
+            self._ensured.add(institution_qid)
+            return
+
         hub_category_qid = self._get_hub_category_qid(hub_institution_qid)
 
         logging.info(
