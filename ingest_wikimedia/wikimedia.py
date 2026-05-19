@@ -70,7 +70,9 @@ def get_page_title(
         .replace("/", "-")
         .replace(":", "-")
         .replace("#", "-")
-        .replace("|", "-")  # wikitext table/link syntax; breaks Commons extension detection
+        .replace(
+            "|", "-"
+        )  # wikitext table/link syntax; breaks Commons extension detection
         .replace(
             "\ufffd", "\u2019"
         )  # Unicode replacement char → right single quote (corrupted metadata)
@@ -226,6 +228,33 @@ def get_wikidata_site() -> BaseSite:
     site = pywikibot.Site("wikidata", "wikidata")
     site.login()
     return site
+
+
+COMMONSDELINKER_PAGE = "User:CommonsDelinker/commands/filemovers"
+_COMMONSDELINKER_REASON = (
+    "[[COM:FR|File renamed]]: [[COM:FR#FR1|Criterion 1]] (original uploader's request)"
+)
+
+
+def post_commonsdelinker_request(
+    site: BaseSite, old_filename: str, new_filename: str
+) -> None:
+    """Append a universal-replace request to CommonsDelinker's filemovers page.
+
+    Both filenames should be bare (without the 'File:' namespace prefix).
+    Each call makes one edit, matching the one-request-per-edit convention
+    used by other editors on that page.
+    """
+    page = pywikibot.Page(site, COMMONSDELINKER_PAGE)
+    template = (
+        f"{{{{universal replace"
+        f"|{old_filename}"
+        f"|{new_filename}"
+        f"|reason={_COMMONSDELINKER_REASON}}}}}"
+    )
+    summary = f"universal replace: [[File:{old_filename}]] → [[File:{new_filename}]]"
+    page.text = page.text.rstrip("\n") + "\n" + template
+    page.save(summary=summary, minor=False)
 
 
 def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
