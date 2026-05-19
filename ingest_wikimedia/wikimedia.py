@@ -266,6 +266,40 @@ def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
     return False
 
 
+def find_file_by_hash(site: BaseSite, sha1: str) -> FilePage | None:
+    """Return the first Commons FilePage with the given SHA1, or None."""
+    api_site = typing.cast(APISite, site)
+    for img in api_site.allimages(sha1=sha1):
+        return img
+    return None
+
+
+_DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
+
+
+def extract_dpla_id_from_commons_title(title: str) -> str | None:
+    """Extract the DPLA ID from a Commons filename, or None if not present."""
+    m = _DPLA_ID_RE.search(title)
+    return m.group(1) if m else None
+
+
+def tag_as_duplicate(
+    site: BaseSite,
+    file_page: FilePage,
+    correct_filename: str,
+    reason: str,
+) -> None:
+    """Prepend {{Duplicate}} to file_page, flagging it for speedy deletion.
+
+    correct_filename should be bare (no 'File:' prefix).
+    reason is the free-text reason shown in the template.
+    """
+    tag = f"{{{{Duplicate|{correct_filename}|{reason}}}}}"
+    summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
+    file_page.text = tag + "\n" + file_page.text
+    file_page.save(summary=summary, minor=False)
+
+
 INVALID_CONTENT_TYPES = frozenset(
     [
         "text/html",
