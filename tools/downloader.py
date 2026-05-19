@@ -25,7 +25,7 @@ from ingest_wikimedia.common import (
     CONTENT_TYPE,
 )
 from ingest_wikimedia.logs import setup_logging
-from ingest_wikimedia.slack import notify_phase_start
+from ingest_wikimedia.slack import notify_download_complete, notify_phase_start
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.web import Web
@@ -392,6 +392,11 @@ class Downloader:
     type=click.IntRange(min=0),
     help="Re-download files already in S3 if older than N days (default: 365).",
 )
+@click.option(
+    "--notify-complete",
+    is_flag=True,
+    help="Post a download-complete summary to Slack when finished (used for refresh runs).",
+)
 def main(
     ids_file: IO,
     partner: str,
@@ -400,6 +405,7 @@ def main(
     overwrite: bool,
     sleep: float,
     max_age_days: int | None,
+    notify_complete: bool,
 ):
     setup_logging(partner, "download", logging.INFO)
     start_time = time.time()
@@ -441,9 +447,17 @@ def main(
             )
 
     finally:
+        elapsed = time.time() - start_time
         logging.info("\n" + str(tracker))
-        logging.info(f"{time.time() - start_time} seconds.")
+        logging.info(f"{elapsed} seconds.")
         local_fs.cleanup_temp_dir()
+        if notify_complete:
+            notify_download_complete(
+                tracker=tracker,
+                partner_label=partner,
+                elapsed_seconds=elapsed,
+                dry_run=dry_run,
+            )
 
 
 if __name__ == "__main__":

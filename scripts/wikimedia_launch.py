@@ -529,10 +529,11 @@ def main() -> None:
         dl_age_opt = (
             f"--max-age-days {max_age_days} " if max_age_days is not None else ""
         )
+        dl_notify_opt = "--notify-complete " if refresh_only else ""
         pipeline_steps = [
             f"cd {base}",
             get_ids_cmd,
-            f"downloader {dl_age_opt}{csv_file} {canonical}",
+            f"downloader {dl_age_opt}{dl_notify_opt}{csv_file} {canonical}",
         ]
         if not refresh_only:
             pipeline_steps.append(f"uploader {csv_file} {canonical}")
