@@ -47,6 +47,7 @@ UPLOAD_TRANSIENT_ERRORS = (
     # "Failed: Unknown" warnings, where the line-by-line regex below matches them.
     "File linked to another page",  # RuntimeError: file exists on Commons at wrong title
     "ArticleExistsConflictError",  # pywikibot: move-over-redirect blocked by insufficient rights
+    "fileexists-shared-forbidden",  # Wikimedia API: different file already at intended title
 )
 
 UPLOAD_TRANSIENT_RE = re.compile(
