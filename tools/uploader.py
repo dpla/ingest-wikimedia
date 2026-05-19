@@ -46,7 +46,9 @@ from ingest_wikimedia.wikimedia import (
     get_page_title,
     get_wiki_text,
     wikimedia_url,
-    wiki_file_exists,
+    find_file_by_hash,
+    extract_dpla_id_from_commons_title,
+    tag_as_duplicate,
     check_content_type,
     is_download_only,
     get_page,
@@ -190,14 +192,47 @@ class Uploader:
                 logging.info(f"Upload comment: {upload_comment}")
                 logging.info(f"Wikitext: \n {wiki_markup}")
 
-            if wiki_file_exists(self.site, sha1):
+            # Check whether this file's hash already exists on Commons.
+            # If it's at the correct title, skip. If it's at a different title,
+            # attempt drift correction before uploading.
+            existing_file = find_file_by_hash(
+                self.site, sha1, preferred_title=page_title
+            )
+            if existing_file is not None:
+                if existing_file.title(with_ns=False) == page_title:
+                    logging.info(
+                        f"Skipping {dpla_id} {ordinal}: Already exists on commons."
+                    )
+                    self.tracker.increment(Result.SKIPPED)
+                    return
                 logging.info(
-                    f"Skipping {dpla_id} {ordinal}: Already exists on commons."
+                    f"Hash drift detected for {dpla_id} {ordinal}: "
+                    f"SHA1 found at [[File:{existing_file.title(with_ns=False)}]]"
                 )
-                self.tracker.increment(Result.SKIPPED)
-                return
 
             if not dry_run and not file_downloaded:
+                # Resolve hash drift before downloading — Case 3 (simple move)
+                # needs no file download, so detecting it first avoids wasted I/O.
+                drift_old_filename: str | None = None
+                drift_action: str | None = None
+                force_ignore_warnings = False
+                if existing_file is not None:
+                    drift_action = self._resolve_hash_drift(
+                        existing_file=existing_file,
+                        page_title=page_title,
+                        dpla_id=dpla_id,
+                        ordinal=ordinal,
+                        wiki_markup=wiki_markup,
+                    )
+                    if drift_action == "moved":
+                        self.tracker.increment(Result.UPLOADED)
+                        return
+                    elif drift_action == "upload_and_tag":
+                        drift_old_filename = existing_file.title(with_ns=False)
+                        force_ignore_warnings = True
+                    else:  # "upload_only"
+                        force_ignore_warnings = True
+
                 with tqdm(
                     total=s3_object.content_length,
                     leave=False,
@@ -217,13 +252,18 @@ class Uploader:
 
                 # If the intended title is a redirect caused by title drift,
                 # move the file there first so the upload lands at the right name.
-                if wiki_file_page.isRedirectPage():
+                # This path is reached when the hash is new (not yet on Commons)
+                # and the intended title is a redirect from a prior drift correction.
+                # Skip when drift resolution returned "upload_only" — in that case
+                # we've decided not to touch any other file; just upload directly.
+                if wiki_file_page.isRedirectPage() and drift_action != "upload_only":
                     resolved = self._resolve_redirect_move(wiki_file_page, dpla_id)
                     if resolved:
                         wiki_file_page = resolved
 
                 # Use direct upload (chunk_size=0) + ignore_warnings=True when the
-                # file page already exists. The stash-commit path raises
+                # file page already exists, or when the hash already lives elsewhere
+                # on Commons (drift case). The stash-commit path raises
                 # fileexists-shared-forbidden even on valid overwrites; the direct
                 # path with ignorewarnings=1 bypasses it. True (vs IGNORE_WIKIMEDIA_WARNINGS)
                 # is intentional — for an overwrite we want to suppress all warnings,
@@ -231,8 +271,16 @@ class Uploader:
                 file_exists = (
                     wiki_file_page.exists() and not wiki_file_page.isRedirectPage()
                 )
-                chunk_size = 0 if file_exists else WMC_UPLOAD_CHUNK_SIZE
-                upload_warnings = True if file_exists else IGNORE_WIKIMEDIA_WARNINGS
+                chunk_size = (
+                    0
+                    if (file_exists or force_ignore_warnings)
+                    else WMC_UPLOAD_CHUNK_SIZE
+                )
+                upload_warnings = (
+                    True
+                    if (file_exists or force_ignore_warnings)
+                    else IGNORE_WIKIMEDIA_WARNINGS
+                )
 
                 result = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
@@ -275,6 +323,8 @@ class Uploader:
                     )
 
                 logging.info(f"Uploaded to {wikimedia_url(page_title)}")
+                if drift_old_filename:
+                    self._tag_drift_duplicate(drift_old_filename, page_title, dpla_id)
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
 
@@ -325,6 +375,152 @@ class Uploader:
 
         # Fresh FilePage for the now-real file page at the intended title
         return get_page(self.site, wiki_file_page.title())
+
+    def _move_to_correct_title(
+        self,
+        existing_file: pywikibot.FilePage,
+        intended_page: pywikibot.FilePage,
+        dpla_id: str,
+        case_label: str,
+        wiki_markup: str | None = None,
+    ) -> None:
+        """Move existing_file to intended_page and post a CommonsDelinker request.
+
+        If wiki_markup is provided, the moved page's description is updated to
+        reflect current DPLA metadata after the move.
+        """
+        actual_filename = existing_file.title(with_ns=False)
+        intended_filename = intended_page.title(with_ns=False)
+        reason = (
+            f"Title drift correction: updating to current DPLA title "
+            f"(DPLA ID {dpla_id})"
+        )
+        logging.info(
+            f"Title drift ({case_label}): moving "
+            f"[[File:{actual_filename}]] → [[File:{intended_filename}]]"
+        )
+        existing_file.move(
+            intended_page.title(),
+            reason=reason,
+            movetalk=False,
+            noredirect=False,
+        )
+        post_commonsdelinker_request(self.site, actual_filename, intended_filename)
+
+        if wiki_markup:
+            moved_page = get_page(self.site, intended_page.title())
+            if moved_page.exists() and not moved_page.isRedirectPage():
+                moved_page.text = wiki_markup
+                moved_page.save(
+                    summary=(
+                        f"Update description after title drift correction "
+                        f"(DPLA ID {dpla_id})"
+                    ),
+                    minor=False,
+                )
+
+    def _resolve_hash_drift(
+        self,
+        existing_file: pywikibot.FilePage,
+        page_title: str,
+        dpla_id: str,
+        ordinal: int,
+        wiki_markup: str | None = None,
+    ) -> str:
+        """
+        Determine and where possible resolve the case where our file's SHA1
+        already lives on Commons at a different title than intended.
+
+        Returns one of:
+          "moved"          — Case 1/3: file moved to correct title; caller should
+                             increment UPLOADED and return (no upload needed).
+          "upload_and_tag" — Case 2: correct title has a different file; caller
+                             should upload (ignore_warnings=True) then tag the
+                             orphaned old title as a duplicate.
+          "upload_only"    — Cross-item hash collision with a still-valid DPLA ID;
+                             upload to the correct title but leave the other file alone.
+        """
+        actual_filename = existing_file.title(with_ns=False)
+
+        # --- Hash collision safety check ---
+        # If the file at the wrong title was uploaded for a different DPLA ID
+        # and that ID is still a valid item, don't move or tag it — just upload
+        # our hash to the correct title and leave their file alone. This prevents
+        # ping-pong renaming between two valid items that happen to share a hash.
+        existing_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
+        if existing_dpla_id and existing_dpla_id != dpla_id:
+            try:
+                other_item = self.dpla.get_item_metadata(existing_dpla_id)
+            except Exception as ex:
+                logging.warning(
+                    f"Hash drift for {dpla_id} {ordinal}: failed to verify "
+                    f"colliding DPLA item {existing_dpla_id}: {ex}; "
+                    f"falling back to upload_only."
+                )
+                return "upload_only"
+            if other_item:
+                logging.info(
+                    f"Hash drift for {dpla_id} {ordinal}: "
+                    f"[[File:{actual_filename}]] belongs to valid DPLA item "
+                    f"{existing_dpla_id}; uploading to correct title only."
+                )
+                return "upload_only"
+
+        intended_page = get_page(self.site, page_title)
+
+        if not intended_page.exists():
+            # Case 3: nothing at the intended title — simple move.
+            self._move_to_correct_title(
+                existing_file, intended_page, dpla_id, "Case 3", wiki_markup
+            )
+            return "moved"
+
+        if intended_page.isRedirectPage():
+            # Case 1 (via hash lookup): intended title is a redirect. If it
+            # redirects to exactly our existing file (same filename), move over it.
+            redirect_target = intended_page.getRedirectTarget()
+            if redirect_target.title(with_ns=False) == actual_filename:
+                self._move_to_correct_title(
+                    existing_file, intended_page, dpla_id, "Case 1", wiki_markup
+                )
+                return "moved"
+            logging.warning(
+                f"Hash drift for {dpla_id} {ordinal}: intended title "
+                f"[[File:{intended_page.title(with_ns=False)}]] redirects to "
+                f"{redirect_target.title(with_ns=False)!r}, "
+                f"which does not share DPLA ID {dpla_id}; uploading anyway."
+            )
+            return "upload_only"
+
+        # Case 2: intended title has real content with a different hash.
+        logging.info(
+            f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
+            f"has a different hash; will upload correct hash and tag "
+            f"[[File:{actual_filename}]] as duplicate."
+        )
+        return "upload_and_tag"
+
+    def _tag_drift_duplicate(
+        self,
+        old_filename: str,
+        new_filename: str,
+        dpla_id: str,
+    ) -> None:
+        """Tag a stranded file page as a duplicate after its hash was uploaded elsewhere."""
+        try:
+            old_page = get_page(self.site, f"File:{old_filename}")
+            tag_as_duplicate(
+                self.site,
+                old_page,
+                correct_filename=new_filename,
+                reason="Other file has the correct title.",
+            )
+            logging.info(
+                f"Tagged [[File:{old_filename}]] as duplicate of "
+                f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
+            )
+        except Exception as ex:
+            logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
 
     def process_item(
         self,
