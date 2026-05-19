@@ -214,6 +214,7 @@ class Uploader:
                 # Resolve hash drift before downloading — Case 3 (simple move)
                 # needs no file download, so detecting it first avoids wasted I/O.
                 drift_old_filename: str | None = None
+                drift_action: str | None = None
                 force_ignore_warnings = False
                 if existing_file is not None:
                     drift_action = self._resolve_hash_drift(
@@ -221,6 +222,7 @@ class Uploader:
                         page_title=page_title,
                         dpla_id=dpla_id,
                         ordinal=ordinal,
+                        wiki_markup=wiki_markup,
                     )
                     if drift_action == "moved":
                         self.tracker.increment(Result.UPLOADED)
@@ -252,7 +254,9 @@ class Uploader:
                 # move the file there first so the upload lands at the right name.
                 # This path is reached when the hash is new (not yet on Commons)
                 # and the intended title is a redirect from a prior drift correction.
-                if wiki_file_page.isRedirectPage():
+                # Skip when drift resolution returned "upload_only" — in that case
+                # we've decided not to touch any other file; just upload directly.
+                if wiki_file_page.isRedirectPage() and drift_action != "upload_only":
                     resolved = self._resolve_redirect_move(wiki_file_page, dpla_id)
                     if resolved:
                         wiki_file_page = resolved
@@ -378,8 +382,13 @@ class Uploader:
         intended_page: pywikibot.FilePage,
         dpla_id: str,
         case_label: str,
+        wiki_markup: str | None = None,
     ) -> None:
-        """Move existing_file to intended_page and post a CommonsDelinker request."""
+        """Move existing_file to intended_page and post a CommonsDelinker request.
+
+        If wiki_markup is provided, the moved page's description is updated to
+        reflect current DPLA metadata after the move.
+        """
         actual_filename = existing_file.title(with_ns=False)
         intended_filename = intended_page.title(with_ns=False)
         reason = (
@@ -398,12 +407,25 @@ class Uploader:
         )
         post_commonsdelinker_request(self.site, actual_filename, intended_filename)
 
+        if wiki_markup:
+            moved_page = get_page(self.site, intended_page.title())
+            if moved_page.exists() and not moved_page.isRedirectPage():
+                moved_page.text = wiki_markup
+                moved_page.save(
+                    summary=(
+                        f"Update description after title drift correction "
+                        f"(DPLA ID {dpla_id})"
+                    ),
+                    minor=False,
+                )
+
     def _resolve_hash_drift(
         self,
         existing_file: pywikibot.FilePage,
         page_title: str,
         dpla_id: str,
         ordinal: int,
+        wiki_markup: str | None = None,
     ) -> str:
         """
         Determine and where possible resolve the case where our file's SHA1
@@ -448,7 +470,9 @@ class Uploader:
 
         if not intended_page.exists():
             # Case 3: nothing at the intended title — simple move.
-            self._move_to_correct_title(existing_file, intended_page, dpla_id, "Case 3")
+            self._move_to_correct_title(
+                existing_file, intended_page, dpla_id, "Case 3", wiki_markup
+            )
             return "moved"
 
         if intended_page.isRedirectPage():
@@ -457,7 +481,7 @@ class Uploader:
             redirect_target = intended_page.getRedirectTarget()
             if redirect_target.title(with_ns=False) == actual_filename:
                 self._move_to_correct_title(
-                    existing_file, intended_page, dpla_id, "Case 1"
+                    existing_file, intended_page, dpla_id, "Case 1", wiki_markup
                 )
                 return "moved"
             logging.warning(
