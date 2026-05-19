@@ -225,8 +225,9 @@ def main() -> None:
 
     # Build one tmux block per hub. Download and upload failures for the same hub
     # are combined: downloader runs on the download CSV, then uploader runs on each
-    # CSV in turn. The uploader is idempotent (skips already-uploaded files), so
-    # running it on the download CSV then the upload CSV is always safe.
+    # CSV in turn. Running the uploader on the download CSV then the upload CSV is
+    # safe: the uploader checks each file's SHA-1 against Commons before uploading
+    # and skips files already present, so re-running on overlapping IDs is harmless.
     target_blocks = []
     for slug, type_csvs in hub_csvs.items():
         pdir = PARTNER_DIR.get(slug, slug)
