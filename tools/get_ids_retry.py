@@ -53,18 +53,27 @@ DOWNLOAD_FAILED_RE = re.compile(r"Failed: ([0-9a-f]{32})")
 EMPTY_URL_FAILURE = "Failed downloading  to"
 
 
-def parse_upload_log(path: Path) -> set[str]:
-    """Return DPLA IDs that hit transient Wikimedia errors."""
-    failed: set[str] = set()
+def parse_upload_log(path: Path) -> tuple[set[str], set[str]]:
+    """Return (transient_failure_ids, successfully_uploaded_ids) from an upload log.
+
+    transient_failure_ids  — IDs that hit lock-contention or backend-storage errors;
+                             the S3 asset is present but the upload didn't land on Commons.
+    successfully_uploaded_ids — IDs for which at least one file reached Commons ("Uploaded to").
+    """
+    failures: set[str] = set()
+    successes: set[str] = set()
     current_id: str | None = None
     with open(path, errors="replace") as f:
         for line in f:
             m = DPLA_ID_RE.search(line)
             if m:
                 current_id = m.group(1)
-            elif current_id and UPLOAD_TRANSIENT_RE.search(line):
-                failed.add(current_id)
-    return failed
+            elif current_id:
+                if UPLOAD_TRANSIENT_RE.search(line):
+                    failures.add(current_id)
+                elif "Uploaded to" in line:
+                    successes.add(current_id)
+    return failures, successes
 
 
 def parse_download_log(path: Path) -> set[str]:
@@ -84,23 +93,44 @@ def parse_download_log(path: Path) -> set[str]:
 
 
 def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[str]]:
-    """Scan logs for *partner* and return (upload_failures, download_failures)."""
+    """Scan logs for *partner* and return (upload_failures, download_failures).
+
+    Upload logs are processed oldest-first so each run's outcome can supersede
+    the previous one.  For each run an ID is classified as:
+
+      "retry" — had any transient error (even alongside per-file successes);
+                at least one file may be missing from Commons.
+      "done"  — clean upload (no transient errors, at least one success);
+                confirmed fully on Commons for this run.
+
+    An ID that fails in an early run but uploads cleanly in a later run ends up
+    as "done" and is excluded.  An ID with partial success in a single run
+    (some files fail, some succeed) stays "retry".
+    """
     log_dir = BASE_DIR / partner / "logs"
-    upload_failures: set[str] = set()
+    # id → "retry" | "done"; later log files (by mtime) overwrite earlier ones.
+    outcomes: dict[str, str] = {}
     download_failures: set[str] = set()
 
-    for pattern, parser, target in (
-        ("*-upload.log", parse_upload_log, upload_failures),
-        ("*-download.log", parse_download_log, download_failures),
+    for log_file in sorted(
+        log_dir.glob("*-upload.log"), key=lambda f: f.stat().st_mtime
     ):
-        for log_file in sorted(log_dir.glob(pattern)):
-            if (
-                datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc)
-                < cutoff
-            ):
-                continue
-            target.update(parser(log_file))
+        if datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc) < cutoff:
+            continue
+        file_failures, file_successes = parse_upload_log(log_file)
+        for dpla_id in file_failures:
+            outcomes[dpla_id] = "retry"
+        for dpla_id in file_successes - file_failures:
+            outcomes[dpla_id] = "done"
 
+    for log_file in sorted(log_dir.glob("*-download.log")):
+        if datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc) < cutoff:
+            continue
+        download_failures.update(parse_download_log(log_file))
+
+    upload_failures = {dpla_id for dpla_id, o in outcomes.items() if o == "retry"}
+    fully_uploaded = {dpla_id for dpla_id, o in outcomes.items() if o == "done"}
+    download_failures -= fully_uploaded
     # Avoid scheduling the same ID for both retry types.
     upload_failures -= download_failures
     return upload_failures, download_failures
