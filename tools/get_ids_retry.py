@@ -64,8 +64,10 @@ EMPTY_URL_FAILURE = "Failed downloading  to"
 def parse_upload_log(path: Path) -> tuple[set[str], set[str]]:
     """Return (transient_failure_ids, successfully_uploaded_ids) from an upload log.
 
-    transient_failure_ids  — IDs that hit lock-contention or backend-storage errors;
-                             the S3 asset is present but the upload didn't land on Commons.
+    transient_failure_ids  — IDs that hit lock-contention, backend-storage, or
+                             title/hash-drift errors; S3 assets are present but
+                             the upload didn't land on Commons (or landed at the
+                             wrong title).
     successfully_uploaded_ids — IDs for which at least one file reached Commons ("Uploaded to").
     """
     failures: set[str] = set()
