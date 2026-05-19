@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import requests
 
-from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels
+from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.ssm import REGION, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
@@ -186,7 +186,50 @@ def main() -> None:
     results: dict[str, str] = {}
 
     def fetch(session: str) -> tuple[str, str]:
-        labels = parse_session_labels(session.removeprefix("wikimedia-"))
+        suffix = session.removeprefix("wikimedia-")
+
+        # Retry sessions are named wikimedia-retry-<days>d[-<partner>].
+        # parse_session_labels doesn't recognise the retry- prefix, so resolve
+        # the active hub by finding the most recently modified retry-* log.
+        if suffix.startswith("retry-"):
+            try:
+                find_out = ssm_run(
+                    ssm,
+                    "find /home/ec2-user/ingest-wikimedia"
+                    " -mindepth 3 -maxdepth 3 -path '*/logs/retry-*'"
+                    r" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1",
+                )
+            except Exception:
+                logging.exception("Failed to find retry logs for %s", session)
+                return session, "Unknown (error)"
+            line = find_out.strip()
+            if not line:
+                return session, "Starting..."
+            # Output format: "<epoch.ns> <absolute-path>"
+            # e.g. "1747601234.0000000000 /home/ec2-user/ingest-wikimedia/indiana/logs/retry-indiana-upload.log"
+            _, _, log_path = line.partition(" ")
+            log_filename = log_path.rsplit("/", 1)[-1]
+            if log_filename.endswith("-download.log"):
+                label = log_filename[: -len("-download.log")]
+            elif log_filename.endswith("-upload.log"):
+                label = log_filename[: -len("-upload.log")]
+            else:
+                return session, f"Unknown (unrecognised log: {log_filename!r})"
+            raw_hub = label.removeprefix("retry-")
+            hub = resolve_slug(raw_hub) or raw_hub
+            try:
+                phase = get_phase_and_progress(ssm, session, hub, label)
+            except Exception:
+                logging.exception(
+                    "Failed to get retry status for %s (%s)", session, label
+                )
+                return session, "Unknown (error)"
+            return (
+                session,
+                f"[{label}] {phase}" if phase is not None else f"[{label}] Starting...",
+            )
+
+        labels = parse_session_labels(suffix)
         if not labels:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
