@@ -5,7 +5,10 @@ import random
 import time
 from collections import Counter
 
+from botocore.exceptions import ClientError
+
 import click
+import pywikibot
 from pywikibot.site import BaseSite
 
 from tqdm import tqdm
@@ -55,6 +58,7 @@ from ingest_wikimedia.wikimedia import (
     ERROR_BACKEND_FAIL,
     get_site,
     get_wikidata_site,
+    post_commonsdelinker_request,
 )
 
 MAX_UPLOAD_RETRIES = 3
@@ -211,6 +215,25 @@ class Uploader:
 
                 wiki_file_page = get_page(self.site, page_title)
 
+                # If the intended title is a redirect caused by title drift,
+                # move the file there first so the upload lands at the right name.
+                if wiki_file_page.isRedirectPage():
+                    resolved = self._resolve_redirect_move(wiki_file_page, dpla_id)
+                    if resolved:
+                        wiki_file_page = resolved
+
+                # Use direct upload (chunk_size=0) + ignore_warnings=True when the
+                # file page already exists. The stash-commit path raises
+                # fileexists-shared-forbidden even on valid overwrites; the direct
+                # path with ignorewarnings=1 bypasses it. True (vs IGNORE_WIKIMEDIA_WARNINGS)
+                # is intentional — for an overwrite we want to suppress all warnings,
+                # including 'exists' variants that would fire on the direct path.
+                file_exists = (
+                    wiki_file_page.exists() and not wiki_file_page.isRedirectPage()
+                )
+                chunk_size = 0 if file_exists else WMC_UPLOAD_CHUNK_SIZE
+                upload_warnings = True if file_exists else IGNORE_WIKIMEDIA_WARNINGS
+
                 result = None
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
                     try:
@@ -219,9 +242,9 @@ class Uploader:
                             source_filename=temp_file.name,
                             comment=upload_comment,
                             text=wiki_markup,
-                            ignore_warnings=IGNORE_WIKIMEDIA_WARNINGS,
+                            ignore_warnings=upload_warnings,
                             asynchronous=True,
-                            chunk_size=WMC_UPLOAD_CHUNK_SIZE,
+                            chunk_size=chunk_size,
                         )
                         break
                     except Exception as ex:
@@ -261,6 +284,48 @@ class Uploader:
         finally:
             self.local_fs.clean_up_tmp_file(temp_file)
 
+    def _resolve_redirect_move(
+        self,
+        wiki_file_page: pywikibot.FilePage,
+        dpla_id: str,
+    ) -> pywikibot.FilePage | None:
+        """
+        If wiki_file_page is a redirect whose target filename contains dpla_id,
+        this is a title-drift case: move the file to the intended title and post
+        a CommonsDelinker request. Returns a fresh FilePage for the intended title
+        on success, or None if the redirect is not a title-drift case.
+        """
+        redirect_target = wiki_file_page.getRedirectTarget()
+        if dpla_id not in redirect_target.title():
+            logging.warning(
+                f"Redirect at intended title {wiki_file_page.title()} points to "
+                f"{redirect_target.title()} which does not share DPLA ID {dpla_id} "
+                f"— cannot auto-resolve; upload will fail"
+            )
+            return None
+
+        old_filename = redirect_target.title(with_ns=False)
+        new_filename = wiki_file_page.title(with_ns=False)
+        reason = (
+            f"Title drift correction: updating to current DPLA title "
+            f"(DPLA ID {dpla_id})"
+        )
+
+        logging.info(
+            f"Title drift redirect detected — moving "
+            f"[[File:{old_filename}]] → [[File:{new_filename}]]"
+        )
+        redirect_target.move(
+            wiki_file_page.title(),
+            reason=reason,
+            movetalk=False,
+            noredirect=False,  # leave a redirect at the old title
+        )
+        post_commonsdelinker_request(self.site, old_filename, new_filename)
+
+        # Fresh FilePage for the now-real file page at the intended title
+        return get_page(self.site, wiki_file_page.title())
+
     def process_item(
         self,
         dpla_id: str,
@@ -282,6 +347,13 @@ class Uploader:
             provider, data_provider = self.dpla.get_provider_and_data_provider(
                 item_metadata, providers_json
             )
+
+            if not self.dpla.is_wiki_eligible(
+                dpla_id, item_metadata, provider, data_provider
+            ):
+                logging.info(f"Skipping {dpla_id}: Not eligible.")
+                self.tracker.increment(Result.SKIPPED)
+                return
 
             if self.category_ensurer:
                 institution_name = get_str(
@@ -320,21 +392,24 @@ class Uploader:
             if len(files) > 1:
                 for i in range(1, len(files) + 1):
                     s3_path = self.s3_client.get_media_s3_path(dpla_id, i, partner)
-                    if self.s3_client.s3_file_exists(s3_path):
+                    try:
                         s3_obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
                         mime = s3_obj.content_type
-                        # Skip generic MIME types — process_file re-detects these
-                        # via libmagic, so the real extension isn't known yet.
-                        # Excluding them avoids grouping files whose true types differ.
-                        # Also skip download-only types (e.g. video) — they are never
-                        # uploaded so they should not influence page numbering.
-                        if mime not in (
-                            "application/octet-stream",
-                            "binary/octet-stream",
-                        ) and not is_download_only(mime):
-                            ext = mimetypes.guess_extension(mime)
-                            if ext and ext != MIME_UNKNOWN_EXT:
-                                ordinal_exts[i] = ext
+                    except ClientError:
+                        continue
+                    # Download-only types (e.g. video) are never uploaded, so they
+                    # should not influence page numbering.
+                    if is_download_only(mime):
+                        continue
+                    # Generic MIME types are re-detected by libmagic in process_file;
+                    # use "" as a placeholder so they still get unique page labels.
+                    if mime in ("application/octet-stream", "binary/octet-stream"):
+                        ordinal_exts[i] = ""
+                        continue
+                    ext = mimetypes.guess_extension(mime)
+                    # Use "" for unresolvable extensions — process_file will skip
+                    # them, but the placeholder prevents page-title collisions.
+                    ordinal_exts[i] = ext if ext and ext != MIME_UNKNOWN_EXT else ""
 
             ext_counts: Counter[str] = Counter(ordinal_exts.values())
             ext_seen: Counter[str] = Counter()
