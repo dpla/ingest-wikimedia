@@ -10,7 +10,7 @@ from ingest_wikimedia.dpla import (
 )
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.localfs import LocalFS
-from ingest_wikimedia.s3 import S3_BUCKET, S3_KEY_METADATA, S3Client
+from ingest_wikimedia.s3 import S3_BUCKET, S3_KEY_METADATA, S3Client, FILE_LIST_TXT
 from typing import IO
 
 import click
@@ -88,18 +88,17 @@ class Downloader:
                 # (e.g. a transient empty HTTP response from the source server).
                 # Use `is not None` rather than truthiness — empty metadata dicts ({})
                 # are falsy but still indicate the object exists.
-                existing_size = int(obj.content_length or 0)
-                if (
-                    obj_metadata is not None
-                    and existing_size > 0
-                    and os.stat(file).st_size == 0
-                ):
-                    logging.warning(
-                        f"New download is 0 bytes; keeping existing file at "
-                        f"s3://{S3_BUCKET}/{destination_path}"
-                    )
-                    self.tracker.increment(Result.SKIPPED)
-                    return False
+                # Only access obj.content_length when obj_metadata is not None: accessing
+                # it on a non-existent object triggers a second HEAD request (another 404).
+                if obj_metadata is not None and os.stat(file).st_size == 0:
+                    existing_size = int(obj.content_length or 0)
+                    if existing_size > 0:
+                        logging.warning(
+                            f"New download is 0 bytes; keeping existing file at "
+                            f"s3://{S3_BUCKET}/{destination_path}"
+                        )
+                        self.tracker.increment(Result.SKIPPED)
+                        return False
 
                 if obj_metadata and obj_metadata.get(CHECKSUM) == sha1:
                     try:
@@ -301,7 +300,17 @@ class Downloader:
 
             elif IIIF_MANIFEST_FIELD_NAME in item_metadata:
                 cached_urls = self.s3_client.get_file_list(partner, dpla_id)
-                if not overwrite and cached_urls:
+                use_cache = not overwrite and bool(cached_urls)
+                if use_cache and max_age_days is not None:
+                    file_list_path = self.s3_client.get_item_s3_path(
+                        dpla_id, FILE_LIST_TXT, partner
+                    )
+                    cache_age = self._s3_key_age_days(file_list_path)
+                    # cache_age is None means the key vanished since get_file_list
+                    # read it (TOCTOU); treat as stale so the manifest is re-fetched.
+                    if cache_age is None or cache_age >= max_age_days:
+                        use_cache = False
+                if use_cache:
                     media_urls = cached_urls
                 else:
                     manifest_url = get_str(item_metadata, IIIF_MANIFEST_FIELD_NAME)
