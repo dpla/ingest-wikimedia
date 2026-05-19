@@ -79,9 +79,13 @@ def main() -> None:
     parser.add_argument("--partner", required=True)
     parser.add_argument("--force", default="false")
     parser.add_argument("--response-url", default="")
+    parser.add_argument("--max-age-days", default="")
+    parser.add_argument("--refresh-only", default="false")
     args = parser.parse_args()
 
     force = args.force.lower() == "true"
+    # GitHub Actions passes boolean inputs as the strings "true"/"false" — same as --force.
+    refresh_only = args.refresh_only.lower() == "true"
     raw_url = args.response_url.strip()
     # Only accept genuine Slack response_url values — reject arbitrary POST targets.
     response_url = (
@@ -89,6 +93,17 @@ def main() -> None:
     )
     if raw_url and not response_url:
         print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
+    max_age_days: int | None = None
+    if args.max_age_days.strip():
+        try:
+            max_age_days = int(args.max_age_days)
+            if max_age_days <= 0:
+                raise ValueError
+        except ValueError:
+            _slack_fail(
+                response_url,
+                f"Invalid --max-age-days value: {args.max_age_days!r} (must be a positive integer).",
+            )
 
     # --partner may be a shlex-encoded list: 'bpl "indiana|Indiana State Library"'
     try:
@@ -511,14 +526,17 @@ def main() -> None:
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
             f"{single_item_env}"
         )
-        target_steps = " && ".join(
-            [
-                f"cd {base}",
-                get_ids_cmd,
-                f"downloader {csv_file} {canonical}",
-                f"uploader {csv_file} {canonical}",
-            ]
+        dl_age_opt = (
+            f"--max-age-days {max_age_days} " if max_age_days is not None else ""
         )
+        pipeline_steps = [
+            f"cd {base}",
+            get_ids_cmd,
+            f"downloader {dl_age_opt}{csv_file} {canonical}",
+        ]
+        if not refresh_only:
+            pipeline_steps.append(f"uploader {csv_file} {canonical}")
+        target_steps = " && ".join(pipeline_steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"
             f" || {{ {notify_fail_cmd} >/dev/null 2>&1 || true; }}"
@@ -541,17 +559,27 @@ def main() -> None:
         batch_targets = [
             (c, i, lbl, col) for c, i, lbl, did, col in targets if did is None
         ]
+        refresh_suffix = ""
+        if refresh_only:
+            age_note = f">{max_age_days}d" if max_age_days is not None else ">365d"
+            refresh_suffix = f" (ID generation → download, refreshing files {age_note})"
         if single_item_targets and not batch_targets:
             # All single-item targets: use the eligibility-confirmed format.
             item_descs = [f"`{did}` ({c})" for c, _, did in single_item_targets]
-            msg = f"✅ {', '.join(item_descs)} — eligible, download + upload starting."
+            if refresh_only:
+                msg = f"✅ {', '.join(item_descs)} — eligible, download refresh starting{refresh_suffix}."
+            else:
+                msg = f"✅ {', '.join(item_descs)} — eligible, download + upload starting."
         elif batch_targets and not single_item_targets:
             # All batch targets (hub, institution, or collection).
             batch_labels = [_target_label(c, i, col) for c, i, _, col in batch_targets]
-            msg = (
-                f"▶ Launching `{session_name}` pipeline: {', '.join(batch_labels)}"
-                " (ID generation → download → upload)."
-            )
+            if refresh_only:
+                msg = f"▶ Launching `{session_name}` refresh: {', '.join(batch_labels)}{refresh_suffix}."
+            else:
+                msg = (
+                    f"▶ Launching `{session_name}` pipeline: {', '.join(batch_labels)}"
+                    " (ID generation → download → upload)."
+                )
         else:
             # Mixed: list all targets with a note distinguishing items from batches.
             all_descs = []
@@ -560,7 +588,10 @@ def main() -> None:
                     all_descs.append(f"`{did[:8]}…` ({c}, item)")
                 else:
                     all_descs.append(_target_label(c, i, col))
-            msg = f"▶ Launching `{session_name}` pipeline: {', '.join(all_descs)}."
+            if refresh_only:
+                msg = f"▶ Launching `{session_name}` refresh: {', '.join(all_descs)}{refresh_suffix}."
+            else:
+                msg = f"▶ Launching `{session_name}` pipeline: {', '.join(all_descs)}."
         try:
             post_message(slack_token, msg)
         except Exception as e:
