@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 from ingest_wikimedia.dpla import (
     MEDIA_MASTER_FIELD_NAME,
@@ -83,6 +84,16 @@ class Downloader:
                         # Just in case (dunno why this would happen)
                         raise e
 
+                # Don't overwrite a valid existing S3 file with a 0-byte download
+                # (e.g. a transient empty HTTP response from the source server).
+                if obj_metadata and os.stat(file).st_size == 0:
+                    logging.warning(
+                        f"New download is 0 bytes; keeping existing file at "
+                        f"s3://{S3_BUCKET}/{destination_path}"
+                    )
+                    self.tracker.increment(Result.SKIPPED)
+                    return False
+
                 if obj_metadata and obj_metadata.get(CHECKSUM) == sha1:
                     try:
                         if int(obj.content_length) > 0:
@@ -146,6 +157,17 @@ class Downloader:
         except Exception as e:
             raise RuntimeError(f"Failed downloading {media_url} to local") from e
 
+    def _s3_key_age_days(self, s3_path: str) -> float | None:
+        """Return the age in days of an S3 object, or None if it does not exist."""
+        try:
+            obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
+            age = datetime.now(tz=timezone.utc) - obj.last_modified
+            return age.total_seconds() / 86400
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "404":
+                return None
+            raise
+
     def process_media(
         self,
         partner: str,
@@ -153,11 +175,16 @@ class Downloader:
         ordinal: int,
         media_url: str,
         overwrite: bool,
+        max_age_days: int | None,
         sleep_secs: float,
     ) -> None:
         """
         For a given capture for a given item, downloads it if we don't have it or are
         overwriting, gets the mime and sha1, and sticks it in S3.
+
+        If max_age_days is set, files already in S3 are re-downloaded once they are
+        older than that threshold. The existing S3 file is kept if the new download
+        is 0 bytes (see upload_file_to_s3).
 
         upload_file_to_s3() is retried on CredentialRetrievalError: EC2 instance profile
         credentials occasionally fail to refresh from IMDS, causing a brief blip that
@@ -171,10 +198,17 @@ class Downloader:
             destination_path = self.s3_client.get_media_s3_path(
                 dpla_id, ordinal, partner
             )
-            if not overwrite and self.s3_client.s3_file_exists(destination_path):
-                logging.info("Key already in S3.")
-                self.tracker.increment(Result.SKIPPED)
-                return
+            if not overwrite:
+                age_days = self._s3_key_age_days(destination_path)
+                if age_days is not None:
+                    if max_age_days is None or age_days < max_age_days:
+                        logging.info("Key already in S3.")
+                        self.tracker.increment(Result.SKIPPED)
+                        return
+                    logging.info(
+                        f"Refreshing {dpla_id} {ordinal}: S3 file is "
+                        f"{age_days:.0f} days old (threshold: {max_age_days})."
+                    )
 
             if sleep_secs != 0:
                 time.sleep(sleep_secs)
@@ -224,6 +258,7 @@ class Downloader:
         partner: str,
         dpla_id: str,
         sleep_secs: float,
+        max_age_days: int | None = None,
     ) -> None:
         """
         For every item, tries to get a list of files for it and stores the
@@ -319,6 +354,7 @@ class Downloader:
                     count,
                     media_url,
                     overwrite,
+                    max_age_days,
                     sleep_secs,
                 )
 
@@ -334,6 +370,12 @@ class Downloader:
     default=0.0,
     help="Interval to wait in between http requests in float seconds.",
 )
+@click.option(
+    "--max-age-days",
+    default=None,
+    type=int,
+    help="Re-download files already in S3 if older than N days (default: always skip existing files).",
+)
 def main(
     ids_file: IO,
     partner: str,
@@ -341,6 +383,7 @@ def main(
     verbose: bool,
     overwrite: bool,
     sleep: float,
+    max_age_days: int | None,
 ):
     setup_logging(partner, "download", logging.INFO)
     start_time = time.time()
@@ -378,6 +421,7 @@ def main(
                 partner,
                 dpla_id,
                 sleep,
+                max_age_days,
             )
 
     finally:
