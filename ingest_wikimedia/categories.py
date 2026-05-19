@@ -3,6 +3,8 @@ import logging
 import pywikibot
 from pywikibot.site import BaseSite
 
+from ingest_wikimedia.wikimedia import get_wikidata_site
+
 # Stable Wikimedia ontology constants — these items will not change
 WD_WIKIMEDIA_CONTENT_PARTNERSHIP = "Q97580368"  # "Wikimedia content partnership"
 WD_WIKIMEDIA_CATEGORY = "Q4167836"  # "Wikimedia category"
@@ -24,15 +26,25 @@ class CategoryEnsurer:
     def __init__(
         self,
         commons_site: BaseSite,
-        wikidata_site: BaseSite,
         dry_run: bool = False,
     ):
         self.commons_site = commons_site
-        self.wikidata_site = wikidata_site
         self.dry_run = dry_run
         self._ensured: set[str] = set()
         self._hub_category_qids: dict[str, str] = {}
-        self._repo = wikidata_site.data_repository()
+        self._wikidata_repo: BaseSite | None = None
+
+    @property
+    def _repo(self) -> BaseSite:
+        """Connect to Wikidata on first use, not at construction time.
+
+        Deferring this avoids a MaxlagTimeoutError crash at uploader startup
+        when Wikimedia is under load — the connection is only attempted when a
+        category actually needs to be created or verified.
+        """
+        if self._wikidata_repo is None:
+            self._wikidata_repo = get_wikidata_site().data_repository()
+        return self._wikidata_repo
 
     def ensure(
         self,

@@ -59,7 +59,6 @@ from ingest_wikimedia.wikimedia import (
     ERROR_NOCHANGE,
     ERROR_BACKEND_FAIL,
     get_site,
-    get_wikidata_site,
     post_commonsdelinker_request,
 )
 
@@ -685,8 +684,7 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
     tools_context = ToolsContext.init(partner)
 
     commons_site = get_site()
-    wikidata_site = get_wikidata_site()
-    category_ensurer = CategoryEnsurer(commons_site, wikidata_site, dry_run=dry_run)
+    category_ensurer = CategoryEnsurer(commons_site, dry_run=dry_run)
 
     uploader = Uploader(
         tools_context.get_tracker(),

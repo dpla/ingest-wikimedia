@@ -55,7 +55,7 @@ def main(verbose: bool) -> None:
 
     commons_site = get_site()
     wikidata_site = get_wikidata_site()
-    category_ensurer = CategoryEnsurer(commons_site, wikidata_site)
+    category_ensurer = CategoryEnsurer(commons_site)
     repo = wikidata_site.data_repository()
 
     unknown_cat = pywikibot.Category(commons_site, UNKNOWN_INSTITUTION_CATEGORY)
