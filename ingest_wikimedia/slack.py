@@ -82,50 +82,32 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:,.1f} PB"
 
 
-def notify_upload_complete(
-    tracker: Tracker,
-    partner_label: str,
-    elapsed_seconds: float,
-    dry_run: bool = False,
-) -> None:
-    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
-    if not token:
-        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
-        return
-
-    session_label = os.environ.get("WIKIMEDIA_SESSION_LABEL")
-    effective_label = f"wikimedia-{session_label}" if session_label else partner_label
-
+def _format_runtime(elapsed_seconds: float) -> str:
     hours, remainder = divmod(int(elapsed_seconds), 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours:
-        runtime = f"{hours}h {minutes}m {seconds}s"
-    elif minutes:
-        runtime = f"{minutes}m {seconds}s"
-    else:
-        runtime = f"{seconds}s"
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
-    dry_run_note = " _(dry run)_" if dry_run else ""
-    header = f"*Wikimedia Upload Complete: {effective_label}*{dry_run_note}"
 
-    lines = [
-        f"UPLOADED: {tracker.count(Result.UPLOADED):,}",
-        f"SKIPPED:  {tracker.count(Result.SKIPPED):,}",
-        f"FAILED:   {tracker.count(Result.FAILED):,}",
-        f"BYTES:    {_format_bytes(tracker.count(Result.BYTES))}",
-        f"Runtime:  {runtime}",
-    ]
-    body = "```" + "\n".join(lines) + "```"
-
+def _post_completion_notice(
+    token: str,
+    header: str,
+    plain_text: str,
+    stats_lines: list[str],
+) -> None:
+    """Post a completion summary block to #tech-alerts. Logs warnings on failure."""
+    body = "```" + "\n".join(stats_lines) + "```"
     payload = {
         "channel": SLACK_CHANNEL,
-        "text": f"Wikimedia upload complete: {effective_label}",
+        "text": plain_text,
         "blocks": [
             {"type": "section", "text": {"type": "mrkdwn", "text": header}},
             {"type": "section", "text": {"type": "mrkdwn", "text": body}},
         ],
     }
-
     try:
         response = requests.post(
             SLACK_API_URL,
@@ -141,3 +123,65 @@ def notify_upload_complete(
         logging.warning(f"Slack API returned HTTP {ex.response.status_code}")
     except Exception as ex:
         logging.warning("Failed to send Slack notification", exc_info=ex)
+
+
+def notify_download_complete(
+    tracker: Tracker,
+    partner_label: str,
+    elapsed_seconds: float,
+    dry_run: bool = False,
+) -> None:
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+
+    effective_label = (
+        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
+    )
+    runtime = _format_runtime(elapsed_seconds)
+    dry_run_note = " _(dry run)_" if dry_run else ""
+
+    _post_completion_notice(
+        token=token,
+        header=f"*Wikimedia Download Refresh Complete: {effective_label}*{dry_run_note}",
+        plain_text=f"Wikimedia download refresh complete: {effective_label}",
+        stats_lines=[
+            f"REFRESHED: {tracker.count(Result.DOWNLOADED):,}",
+            f"SKIPPED:   {tracker.count(Result.SKIPPED):,}",
+            f"FAILED:    {tracker.count(Result.FAILED):,}",
+            f"BYTES:     {_format_bytes(tracker.count(Result.BYTES))}",
+            f"Runtime:   {runtime}",
+        ],
+    )
+
+
+def notify_upload_complete(
+    tracker: Tracker,
+    partner_label: str,
+    elapsed_seconds: float,
+    dry_run: bool = False,
+) -> None:
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+
+    effective_label = (
+        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
+    )
+    runtime = _format_runtime(elapsed_seconds)
+    dry_run_note = " _(dry run)_" if dry_run else ""
+
+    _post_completion_notice(
+        token=token,
+        header=f"*Wikimedia Upload Complete: {effective_label}*{dry_run_note}",
+        plain_text=f"Wikimedia upload complete: {effective_label}",
+        stats_lines=[
+            f"UPLOADED: {tracker.count(Result.UPLOADED):,}",
+            f"SKIPPED:  {tracker.count(Result.SKIPPED):,}",
+            f"FAILED:   {tracker.count(Result.FAILED):,}",
+            f"BYTES:    {_format_bytes(tracker.count(Result.BYTES))}",
+            f"Runtime:  {runtime}",
+        ],
+    )
