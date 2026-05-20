@@ -304,8 +304,11 @@ def main() -> None:
             # This label has a log. Any earlier no-log labels were skipped.
             first_pending = None
 
-            if not phase.startswith(_UPLOAD_COMPLETE_PREFIX):
-                # Active label — this is the one to report.
+            if not (
+                phase.startswith(_UPLOAD_COMPLETE_PREFIX)
+                or phase.startswith(_DOWNLOAD_COMPLETE_PREFIX)
+            ):
+                # Active or stalled label — this is the one to report.
                 return session, f"[{label}] {phase}" if multi else phase
 
             last_complete_label = label
