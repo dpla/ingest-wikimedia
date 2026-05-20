@@ -20,6 +20,9 @@ SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
 _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
+# A session that hasn't written a log line in this many seconds is considered hung.
+# Uploads normally complete items in seconds; downloads in seconds to low minutes.
+_STALE_SECONDS = 1800  # 30 minutes
 
 
 def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | None:
@@ -70,6 +73,7 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
     sep = "__WM_SEP__"
     out = ssm_run(
         client,
+        f"date +%s; "
         f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
         f"echo {sep}; "
         f"tail -5 {log_path}; "
@@ -82,7 +86,9 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
     )
 
     sections = out.split(f"{sep}\n", 2)
-    log_mtime = _safe_int(sections[0].strip()) if sections else 0
+    pre_sep = sections[0].strip().splitlines() if sections else []
+    now = _safe_int(pre_sep[0]) if pre_sep else 0
+    log_mtime = _safe_int(pre_sep[1]) if len(pre_sep) > 1 else 0
 
     # Log predates this session — no new log yet, treat same as no log.
     if session_created > 0 and log_mtime < session_created:
@@ -100,25 +106,41 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
 
+    # Append a staleness warning to any active (non-complete) phase whose log
+    # hasn't been updated in _STALE_SECONDS. Completed phases never get this.
+    stale_suffix = ""
+    if counts_marker == 0 and now > 0 and log_mtime > 0:
+        idle = now - log_mtime
+        if idle > _STALE_SECONDS:
+            idle_min = idle // 60
+            idle_str = (
+                f"{idle_min // 60}h{idle_min % 60:02d}m"
+                if idle_min >= 60
+                else f"{idle_min}m"
+            )
+            stale_suffix = f" ⚠ idle {idle_str}"
+
     if log_file.endswith("-download.log"):
         if "Downloading" in tail or "Key already in S3" in tail:
-            return f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%)"
+            return f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
         if counts_marker > 0:
             return f"{_DOWNLOAD_COMPLETE_PREFIX} ({dpla_id_count:,} / {total:,} items)"
         # Log exists for this session but no active download indicators and no COUNTS
         # marker — downloader likely crashed. Report item count without implying
         # get-ids-es is running (the old "Generating IDs" fallback was wrong here).
-        return f"Stalled ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%)"
+        return f"Stalled ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
 
     if log_file.endswith("-upload.log"):
         if dpla_id_count == 0:
+            # dpla_id_count == 0 means no items logged yet — uploader just started.
+            # Staleness here would be a false positive from the normal start-up lag.
             return "Uploading (starting...)"
         # Use the COUNTS: terminal marker as the definitive completion signal.
         # dpla_id_count is logged at the start of each item, not after all its
         # files finish, so count arithmetic alone can fire too early.
         if counts_marker > 0:
             return f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
-        return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%)"
+        return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){stale_suffix}"
 
     return "Unknown"
 

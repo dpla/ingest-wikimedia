@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import logging
 import mimetypes
@@ -65,6 +66,9 @@ from ingest_wikimedia.wikimedia import (
 MAX_UPLOAD_RETRIES = 3
 UPLOAD_RETRY_BASE_DELAY_SECS = 5
 UPLOAD_RETRY_MAX_DELAY_SECS = 60
+# pywikibot's async upload polls Commons indefinitely when the job queue is stuck.
+# This cap ensures a single hung upload never freezes the whole session.
+UPLOAD_TIMEOUT_SECS = 3600  # 1 hour
 
 
 class Uploader:
@@ -300,9 +304,14 @@ class Uploader:
                 )
 
                 result = None
+                # Avoid the `with executor:` context manager — its __exit__ calls
+                # shutdown(wait=True), which would block until pywikibot's stuck
+                # polling thread exits on its own, defeating the timeout entirely.
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
                     try:
-                        result = self.site.upload(
+                        future = executor.submit(
+                            self.site.upload,
                             filepage=wiki_file_page,
                             source_filename=temp_file.name,
                             comment=upload_comment,
@@ -311,6 +320,14 @@ class Uploader:
                             asynchronous=True,
                             chunk_size=chunk_size,
                         )
+                        try:
+                            result = future.result(timeout=UPLOAD_TIMEOUT_SECS)
+                        except concurrent.futures.TimeoutError:
+                            executor.shutdown(wait=False)
+                            raise RuntimeError(
+                                f"Upload timed out after {UPLOAD_TIMEOUT_SECS // 3600}h "
+                                f"— Commons job queue likely stuck"
+                            )
                         break
                     except Exception as ex:
                         is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
@@ -329,11 +346,11 @@ class Uploader:
                             if is_backend_fail:
                                 self.tracker.increment(Result.FAILED)
                             raise
+                executor.shutdown(wait=False)
 
                 if not result:
-                    # These error message accounts for Page does not exist,
-                    # but File does exist and is linked to another Page
-                    # (ex. DPLA ID drift)
+                    # upload() returned None — file exists under a different page
+                    # title, likely due to DPLA ID drift between runs.
                     self.tracker.increment(Result.FAILED)
                     raise RuntimeError(
                         "File linked to another page (possible ID drift)"
