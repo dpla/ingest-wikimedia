@@ -71,6 +71,15 @@ UPLOAD_RETRY_MAX_DELAY_SECS = 60
 UPLOAD_TIMEOUT_SECS = 3600  # 1 hour
 
 
+class UploadTimeoutError(RuntimeError):
+    """Raised when a single file upload exceeds UPLOAD_TIMEOUT_SECS.
+
+    Distinct from RuntimeError so it can escape process_file()'s catch-all
+    and break the remaining-files loop in process_item() — no point attempting
+    further pages when Commons' job queue is stuck.
+    """
+
+
 class Uploader:
     def __init__(
         self,
@@ -326,7 +335,12 @@ class Uploader:
                                 result = future.result(timeout=UPLOAD_TIMEOUT_SECS)
                             except concurrent.futures.TimeoutError:
                                 self.tracker.increment(Result.FAILED)
-                                raise RuntimeError(
+                                # Note: the worker thread keeps running until
+                                # pywikibot's own socket timeout fires (~11 min
+                                # max). This is acceptable — UploadTimeoutError
+                                # skips the remaining files for this item, so
+                                # at most one orphaned thread exists per item.
+                                raise UploadTimeoutError(
                                     f"Upload timed out after {UPLOAD_TIMEOUT_SECS // 3600}h "
                                     f"— Commons job queue likely stuck"
                                 )
@@ -365,6 +379,8 @@ class Uploader:
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
 
+        except UploadTimeoutError:
+            raise
         except Exception as ex:
             self.handle_upload_exception(ex)
 
@@ -707,18 +723,22 @@ class Uploader:
                     page_label = str(ext_seen[ext])
                 else:
                     page_label = ""
-                self.process_file(
-                    dpla_id,
-                    title,
-                    item_metadata,
-                    provider,
-                    data_provider,
-                    ordinal,
-                    partner,
-                    page_label,
-                    verbose,
-                    dry_run,
-                )
+                try:
+                    self.process_file(
+                        dpla_id,
+                        title,
+                        item_metadata,
+                        provider,
+                        data_provider,
+                        ordinal,
+                        partner,
+                        page_label,
+                        verbose,
+                        dry_run,
+                    )
+                except UploadTimeoutError as ex:
+                    self.handle_upload_exception(ex)
+                    break
 
         except Exception as ex:
             logging.warning(
