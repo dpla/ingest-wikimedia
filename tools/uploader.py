@@ -49,6 +49,7 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
+    merge_preserved_wikitext,
     tag_as_duplicate,
     check_content_type,
     is_download_only,
@@ -464,7 +465,12 @@ class Uploader:
             f"— replacing with wikitext so upload can proceed "
             f"(will tag [[File:{old_filename}]] as duplicate)"
         )
-        wiki_file_page.text = wiki_markup
+        # Preserve license, Image-extracted, and category metadata from the
+        # redirect target (which holds the original file's wikitext and will
+        # be tagged as a duplicate after the upload).
+        wiki_file_page.text = merge_preserved_wikitext(
+            redirect_target.text or "", wiki_markup
+        )
         wiki_file_page.save(
             summary=(
                 f"Replacing redirect with DPLA metadata for title drift "
@@ -509,7 +515,12 @@ class Uploader:
         if wiki_markup:
             moved_page = get_page(self.site, intended_page.title())
             if moved_page.exists() and not moved_page.isRedirectPage():
-                moved_page.text = wiki_markup
+                # After the move, moved_page carries the original page's
+                # wikitext. Preserve license, Image-extracted, and category
+                # metadata from it before replacing with the DPLA Artwork block.
+                moved_page.text = merge_preserved_wikitext(
+                    moved_page.text or "", wiki_markup
+                )
                 moved_page.save(
                     summary=(
                         f"Update description after title drift correction "
