@@ -287,12 +287,66 @@ def find_file_by_hash(
 
 
 _DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
+# Anchored to the DPLA filename suffix: "... - DPLA - <id> (page N)<.ext>$".
+# Prevents false matches when "(page N)" appears in the descriptive title text
+# (e.g. titles where source brackets were normalised to parens by get_page_title).
+_PAGE_ORDINAL_RE = re.compile(r"- DPLA - [0-9a-f]{32} \(page (\d+)\)(?=\.[^.]+$)")
 
 
 def extract_dpla_id_from_commons_title(title: str) -> str | None:
     """Extract the DPLA ID from a Commons filename, or None if not present."""
     m = _DPLA_ID_RE.search(title)
     return m.group(1) if m else None
+
+
+def extract_page_ordinal_from_commons_title(title: str) -> int | None:
+    """Extract the `(page N)` ordinal from a Commons filename.
+
+    Returns None for single-page items (no page suffix) and for any title
+    that doesn't follow the DPLA `... (page N)<ext>` format.
+    """
+    m = _PAGE_ORDINAL_RE.search(title)
+    return int(m.group(1)) if m else None
+
+
+# Patterns for metadata we preserve from the original page wikitext when
+# rewriting a file description after a title-drift move.
+#
+# - PD-USGov family: {{PD-USGov}}, {{PD-USGov-Military-Army}}, {{PD-USGov-NARA}},
+#   with optional |params. Allowed name chars match Commons template-name rules.
+# - Image extracted: {{Image extracted|<params>}} — links the file back to the
+#   parent page it was extracted from. Anchored anywhere in the text (including
+#   inside |other versions= of an {{Information}} template).
+# - Category links: [[Category:Name]] or [[Category:Name|sort key]].
+_PD_USGOV_RE = re.compile(r"\{\{PD-USGov(?:-[A-Za-z0-9_-]+)?(?:\|[^{}]*)?\}\}")
+_IMAGE_EXTRACTED_RE = re.compile(r"\{\{Image extracted\|[^{}]*\}\}", re.IGNORECASE)
+_CATEGORY_RE = re.compile(r"\[\[Category:[^\]\n]+\]\]")
+
+
+def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
+    """Append preserved metadata from existing_text to new_artwork.
+
+    Used when the uploader rewrites a file description after a title-drift
+    move or redirect-overwrite. The new {{Artwork}} wikitext is authoritative
+    for the file's description, but page-level metadata that pre-existed —
+    PD-USGov license tags, Image-extracted parent links, and category
+    membership — must survive the rewrite.
+
+    Result order:
+        1. new_artwork (the freshly generated {{Artwork}} block)
+        2. preserved {{PD-USGov...}} templates (license, above categories)
+        3. preserved {{Image extracted|...}} templates (above categories)
+        4. preserved [[Category:...]] links
+
+    Duplicates within each preserved group are collapsed.
+    """
+    parts: list[str] = [new_artwork.rstrip()]
+    for pattern in (_PD_USGOV_RE, _IMAGE_EXTRACTED_RE, _CATEGORY_RE):
+        group = list(dict.fromkeys(pattern.findall(existing_text)))
+        if group:
+            parts.append("")
+            parts.extend(group)
+    return "\n".join(parts) + "\n"
 
 
 def tag_as_duplicate(

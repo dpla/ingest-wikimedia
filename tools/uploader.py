@@ -49,6 +49,8 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
+    extract_page_ordinal_from_commons_title,
+    merge_preserved_wikitext,
     tag_as_duplicate,
     check_content_type,
     is_download_only,
@@ -415,7 +417,7 @@ class Uploader:
         new_filename = wiki_file_page.title(with_ns=False)
         reason = (
             f"Title drift correction: updating to current DPLA title "
-            f"(DPLA ID {dpla_id})"
+            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
         )
         logging.info(
             f"Title drift redirect detected — moving "
@@ -464,11 +466,16 @@ class Uploader:
             f"— replacing with wikitext so upload can proceed "
             f"(will tag [[File:{old_filename}]] as duplicate)"
         )
-        wiki_file_page.text = wiki_markup
+        # Preserve license, Image-extracted, and category metadata from the
+        # redirect target (which holds the original file's wikitext and will
+        # be tagged as a duplicate after the upload).
+        wiki_file_page.text = merge_preserved_wikitext(
+            redirect_target.text or "", wiki_markup
+        )
         wiki_file_page.save(
             summary=(
                 f"Replacing redirect with DPLA metadata for title drift "
-                f"correction (DPLA ID {dpla_id})"
+                f"correction (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
             ),
             minor=False,
         )
@@ -492,7 +499,7 @@ class Uploader:
         intended_filename = intended_page.title(with_ns=False)
         reason = (
             f"Title drift correction: updating to current DPLA title "
-            f"(DPLA ID {dpla_id})"
+            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
         )
         logging.info(
             f"Title drift ({case_label}): moving "
@@ -509,11 +516,16 @@ class Uploader:
         if wiki_markup:
             moved_page = get_page(self.site, intended_page.title())
             if moved_page.exists() and not moved_page.isRedirectPage():
-                moved_page.text = wiki_markup
+                # After the move, moved_page carries the original page's
+                # wikitext. Preserve license, Image-extracted, and category
+                # metadata from it before replacing with the DPLA Artwork block.
+                moved_page.text = merge_preserved_wikitext(
+                    moved_page.text or "", wiki_markup
+                )
                 moved_page.save(
                     summary=(
                         f"Update description after title drift correction "
-                        f"(DPLA ID {dpla_id})"
+                        f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
                     ),
                     minor=False,
                 )
@@ -547,6 +559,29 @@ class Uploader:
         # our hash to the correct title and leave their file alone. This prevents
         # ping-pong renaming between two valid items that happen to share a hash.
         existing_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
+        if existing_dpla_id == dpla_id:
+            # Same DPLA item — distinguish two cases:
+            #   (a) different page of a multi-page item carrying a coincident
+            #       sha1 (e.g. source-institution re-scan whose new page-N hash
+            #       matches what was uploaded as page-M last run). Don't move
+            #       or tag — the right ordinal will be uploaded directly.
+            #   (b) same logical page but the free-text portion of the title
+            #       changed across runs (a legitimate rename). Fall through so
+            #       Case 1/3 can move the existing file to the new title.
+            actual_page = extract_page_ordinal_from_commons_title(actual_filename)
+            intended_page = extract_page_ordinal_from_commons_title(page_title)
+            # Compare the two parsed ordinals so the decision is based on logical
+            # Commons page numbering rather than the S3 iteration index (which
+            # can diverge from intended_page in edge cases). None==None for a
+            # single-page item title-text rename falls through to Case 1/3.
+            if actual_page != intended_page:
+                logging.info(
+                    f"Hash drift for {dpla_id} {ordinal}: SHA1 found at "
+                    f"same-item page {actual_page} [[File:{actual_filename}]]; "
+                    f"uploading to correct title only."
+                )
+                return "upload_only"
+
         if existing_dpla_id and existing_dpla_id != dpla_id:
             try:
                 other_item = self.dpla.get_item_metadata(existing_dpla_id)
@@ -591,7 +626,10 @@ class Uploader:
             )
             return "upload_only"
 
-        # Case 2: intended title has real content with a different hash.
+        # Case 2: intended title has real content with a different hash, and the
+        # file found at the wrong title belongs to a different item (or has no
+        # recognisable DPLA ID). Upload the correct hash and tag the orphaned
+        # old title as a duplicate so it can be cleaned up.
         logging.info(
             f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
             f"has a different hash; will upload correct hash and tag "
