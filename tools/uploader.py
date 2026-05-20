@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import logging
 import mimetypes
@@ -65,6 +66,18 @@ from ingest_wikimedia.wikimedia import (
 MAX_UPLOAD_RETRIES = 3
 UPLOAD_RETRY_BASE_DELAY_SECS = 5
 UPLOAD_RETRY_MAX_DELAY_SECS = 60
+# pywikibot's async upload polls Commons indefinitely when the job queue is stuck.
+# This cap ensures a single hung upload never freezes the whole session.
+UPLOAD_TIMEOUT_SECS = 3600  # 1 hour
+
+
+class UploadTimeoutError(RuntimeError):
+    """Raised when a single file upload exceeds UPLOAD_TIMEOUT_SECS.
+
+    Distinct from RuntimeError so it can escape process_file()'s catch-all
+    and break the remaining-files loop in process_item() — no point attempting
+    further pages when Commons' job queue is stuck.
+    """
 
 
 class Uploader:
@@ -300,40 +313,61 @@ class Uploader:
                 )
 
                 result = None
-                for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
-                    try:
-                        result = self.site.upload(
-                            filepage=wiki_file_page,
-                            source_filename=temp_file.name,
-                            comment=upload_comment,
-                            text=wiki_markup,
-                            ignore_warnings=upload_warnings,
-                            asynchronous=True,
-                            chunk_size=chunk_size,
-                        )
-                        break
-                    except Exception as ex:
-                        is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
-                        if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
-                            delay = min(
-                                UPLOAD_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1)),
-                                UPLOAD_RETRY_MAX_DELAY_SECS,
-                            ) + random.uniform(0, 1.0)
-                            logging.warning(
-                                f"Transient upload error on attempt {attempt}/"
-                                f"{MAX_UPLOAD_RETRIES}, retrying in "
-                                f"{delay:.1f}s: {ex}"
+                # Avoid the `with executor:` context manager — its __exit__ calls
+                # shutdown(wait=True), which would block until pywikibot's stuck
+                # polling thread exits on its own, defeating the timeout entirely.
+                # Use try/finally to guarantee shutdown(wait=False) on all paths.
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                        try:
+                            future = executor.submit(
+                                self.site.upload,
+                                filepage=wiki_file_page,
+                                source_filename=temp_file.name,
+                                comment=upload_comment,
+                                text=wiki_markup,
+                                ignore_warnings=upload_warnings,
+                                asynchronous=True,
+                                chunk_size=chunk_size,
                             )
-                            time.sleep(delay)
-                        else:
-                            if is_backend_fail:
+                            try:
+                                result = future.result(timeout=UPLOAD_TIMEOUT_SECS)
+                            except concurrent.futures.TimeoutError:
                                 self.tracker.increment(Result.FAILED)
-                            raise
+                                # Note: the worker thread keeps running until
+                                # pywikibot's own socket timeout fires (~11 min
+                                # max). This is acceptable — UploadTimeoutError
+                                # skips the remaining files for this item, so
+                                # at most one orphaned thread exists per item.
+                                raise UploadTimeoutError(
+                                    f"Upload timed out after {UPLOAD_TIMEOUT_SECS // 3600}h "
+                                    f"— Commons job queue likely stuck"
+                                )
+                            break
+                        except Exception as ex:
+                            is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
+                            if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
+                                delay = min(
+                                    UPLOAD_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1)),
+                                    UPLOAD_RETRY_MAX_DELAY_SECS,
+                                ) + random.uniform(0, 1.0)
+                                logging.warning(
+                                    f"Transient upload error on attempt {attempt}/"
+                                    f"{MAX_UPLOAD_RETRIES}, retrying in "
+                                    f"{delay:.1f}s: {ex}"
+                                )
+                                time.sleep(delay)
+                            else:
+                                if is_backend_fail:
+                                    self.tracker.increment(Result.FAILED)
+                                raise
+                finally:
+                    executor.shutdown(wait=False)
 
                 if not result:
-                    # These error message accounts for Page does not exist,
-                    # but File does exist and is linked to another Page
-                    # (ex. DPLA ID drift)
+                    # upload() returned None — file exists under a different page
+                    # title, likely due to DPLA ID drift between runs.
                     self.tracker.increment(Result.FAILED)
                     raise RuntimeError(
                         "File linked to another page (possible ID drift)"
@@ -345,6 +379,8 @@ class Uploader:
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
 
+        except UploadTimeoutError:
+            raise
         except Exception as ex:
             self.handle_upload_exception(ex)
 
@@ -687,18 +723,22 @@ class Uploader:
                     page_label = str(ext_seen[ext])
                 else:
                     page_label = ""
-                self.process_file(
-                    dpla_id,
-                    title,
-                    item_metadata,
-                    provider,
-                    data_provider,
-                    ordinal,
-                    partner,
-                    page_label,
-                    verbose,
-                    dry_run,
-                )
+                try:
+                    self.process_file(
+                        dpla_id,
+                        title,
+                        item_metadata,
+                        provider,
+                        data_provider,
+                        ordinal,
+                        partner,
+                        page_label,
+                        verbose,
+                        dry_run,
+                    )
+                except UploadTimeoutError as ex:
+                    self.handle_upload_exception(ex)
+                    break
 
         except Exception as ex:
             logging.warning(
