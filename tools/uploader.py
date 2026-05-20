@@ -415,7 +415,7 @@ class Uploader:
         new_filename = wiki_file_page.title(with_ns=False)
         reason = (
             f"Title drift correction: updating to current DPLA title "
-            f"(DPLA ID {dpla_id})"
+            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
         )
         logging.info(
             f"Title drift redirect detected — moving "
@@ -468,7 +468,7 @@ class Uploader:
         wiki_file_page.save(
             summary=(
                 f"Replacing redirect with DPLA metadata for title drift "
-                f"correction (DPLA ID {dpla_id})"
+                f"correction (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
             ),
             minor=False,
         )
@@ -492,7 +492,7 @@ class Uploader:
         intended_filename = intended_page.title(with_ns=False)
         reason = (
             f"Title drift correction: updating to current DPLA title "
-            f"(DPLA ID {dpla_id})"
+            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
         )
         logging.info(
             f"Title drift ({case_label}): moving "
@@ -513,7 +513,7 @@ class Uploader:
                 moved_page.save(
                     summary=(
                         f"Update description after title drift correction "
-                        f"(DPLA ID {dpla_id})"
+                        f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
                     ),
                     minor=False,
                 )
