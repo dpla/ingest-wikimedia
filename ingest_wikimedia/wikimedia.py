@@ -322,8 +322,9 @@ def is_same_item_redirect_relic(
     same shuffle would be reversed when the iteration later reaches the
     other ordinal, producing an oscillation that destroys uploaded content.
     """
+    intended_dpla_id = extract_dpla_id_from_commons_title(intended_title)
     target_dpla_id = extract_dpla_id_from_commons_title(target_title)
-    if target_dpla_id != dpla_id:
+    if intended_dpla_id != dpla_id or target_dpla_id != dpla_id:
         return False
     intended_page = extract_page_ordinal_from_commons_title(intended_title)
     target_page = extract_page_ordinal_from_commons_title(target_title)
