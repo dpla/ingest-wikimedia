@@ -22,7 +22,7 @@ import sys
 import boto3
 import requests
 
-from ingest_wikimedia.partners import is_wikidata_id, resolve_wikidata_id
+from ingest_wikimedia.partners import is_wikidata_id, resolve_slug, resolve_wikidata_id
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run
 
@@ -83,9 +83,10 @@ def main() -> None:
                     seen.add(component)
                     kill_components.append(component)
         else:
-            if token not in seen:
-                seen.add(token)
-                kill_components.append(token)
+            component = resolve_slug(token) or token
+            if component not in seen:
+                seen.add(component)
+                kill_components.append(component)
 
     if not kill_components:
         _slack_fail(response_url, "No targets specified.")
