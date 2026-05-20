@@ -547,6 +547,16 @@ class Uploader:
         # our hash to the correct title and leave their file alone. This prevents
         # ping-pong renaming between two valid items that happen to share a hash.
         existing_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
+        if existing_dpla_id == dpla_id:
+            # Same-item hash coincidence: the hash lives at a different page of
+            # this item. Don't tag it as a duplicate — it belongs to this item
+            # and will be overwritten by its own ordinal in the current run.
+            logging.info(
+                f"Hash drift for {dpla_id} {ordinal}: SHA1 found at same-item "
+                f"title [[File:{actual_filename}]]; uploading to correct title only."
+            )
+            return "upload_only"
+
         if existing_dpla_id and existing_dpla_id != dpla_id:
             try:
                 other_item = self.dpla.get_item_metadata(existing_dpla_id)
@@ -591,7 +601,10 @@ class Uploader:
             )
             return "upload_only"
 
-        # Case 2: intended title has real content with a different hash.
+        # Case 2: intended title has real content with a different hash, and the
+        # file found at the wrong title belongs to a different item (or has no
+        # recognisable DPLA ID). Upload the correct hash and tag the orphaned
+        # old title as a duplicate so it can be cleaned up.
         logging.info(
             f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
             f"has a different hash; will upload correct hash and tag "
