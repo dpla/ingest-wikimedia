@@ -7,6 +7,7 @@ from ingest_wikimedia.wikimedia import (
     get_permissions,
     escape_wiki_strings,
     join,
+    extract_page_ordinal_from_commons_title,
     extract_strings,
     extract_strings_dict,
     merge_preserved_wikitext,
@@ -231,3 +232,25 @@ def test_merge_preserved_wikitext_no_metadata_returns_artwork_unchanged():
     )
     result = merge_preserved_wikitext(existing, ARTWORK)
     assert result == ARTWORK + "\n"
+
+
+def test_extract_page_ordinal_multipage():
+    title = "Plant Life - DPLA - 002b0f7ad761858506721b83e3370c5f (page 17).jpg"
+    assert extract_page_ordinal_from_commons_title(title) == 17
+
+
+def test_extract_page_ordinal_single_page():
+    # Single-page DPLA items have no (page N) suffix
+    title = "President Ronald Reagan - DPLA - b3fb229b867046ddd9418c00289245ce.jpg"
+    assert extract_page_ordinal_from_commons_title(title) is None
+
+
+def test_extract_page_ordinal_no_dpla_format():
+    # Non-DPLA titles also return None
+    title = "President Ronald Reagan talking aboard Air Force One.jpg"
+    assert extract_page_ordinal_from_commons_title(title) is None
+
+
+def test_extract_page_ordinal_high_page_number():
+    title = "Pennsylvania Company Volume - DPLA - 148712806694602ddddfdec4a84e0229 (page 700).jpg"
+    assert extract_page_ordinal_from_commons_title(title) == 700

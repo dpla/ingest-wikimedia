@@ -287,12 +287,23 @@ def find_file_by_hash(
 
 
 _DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
+_PAGE_ORDINAL_RE = re.compile(r"\(page (\d+)\)")
 
 
 def extract_dpla_id_from_commons_title(title: str) -> str | None:
     """Extract the DPLA ID from a Commons filename, or None if not present."""
     m = _DPLA_ID_RE.search(title)
     return m.group(1) if m else None
+
+
+def extract_page_ordinal_from_commons_title(title: str) -> int | None:
+    """Extract the `(page N)` ordinal from a Commons filename.
+
+    Returns None for single-page items (no page suffix) and for any title
+    that doesn't follow the DPLA `... (page N)<ext>` format.
+    """
+    m = _PAGE_ORDINAL_RE.search(title)
+    return int(m.group(1)) if m else None
 
 
 # Patterns for metadata we preserve from the original page wikitext when

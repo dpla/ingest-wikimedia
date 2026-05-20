@@ -49,6 +49,7 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
+    extract_page_ordinal_from_commons_title,
     merge_preserved_wikitext,
     tag_as_duplicate,
     check_content_type,
@@ -559,14 +560,22 @@ class Uploader:
         # ping-pong renaming between two valid items that happen to share a hash.
         existing_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
         if existing_dpla_id == dpla_id:
-            # Same-item hash coincidence: the hash lives at a different page of
-            # this item. Don't tag it as a duplicate — it belongs to this item
-            # and will be overwritten by its own ordinal in the current run.
-            logging.info(
-                f"Hash drift for {dpla_id} {ordinal}: SHA1 found at same-item "
-                f"title [[File:{actual_filename}]]; uploading to correct title only."
-            )
-            return "upload_only"
+            # Same DPLA item — distinguish two cases:
+            #   (a) different page of a multi-page item carrying a coincident
+            #       sha1 (e.g. source-institution re-scan whose new page-N hash
+            #       matches what was uploaded as page-M last run). Don't move
+            #       or tag — the right ordinal will be uploaded directly.
+            #   (b) same logical page but the free-text portion of the title
+            #       changed across runs (a legitimate rename). Fall through so
+            #       Case 1/3 can move the existing file to the new title.
+            actual_page = extract_page_ordinal_from_commons_title(actual_filename)
+            if actual_page is not None and actual_page != ordinal:
+                logging.info(
+                    f"Hash drift for {dpla_id} {ordinal}: SHA1 found at "
+                    f"same-item page {actual_page} [[File:{actual_filename}]]; "
+                    f"uploading to correct title only."
+                )
+                return "upload_only"
 
         if existing_dpla_id and existing_dpla_id != dpla_id:
             try:
