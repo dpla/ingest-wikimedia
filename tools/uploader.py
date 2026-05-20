@@ -323,6 +323,7 @@ class Uploader:
                         try:
                             result = future.result(timeout=UPLOAD_TIMEOUT_SECS)
                         except concurrent.futures.TimeoutError:
+                            self.tracker.increment(Result.FAILED)
                             executor.shutdown(wait=False)
                             raise RuntimeError(
                                 f"Upload timed out after {UPLOAD_TIMEOUT_SECS // 3600}h "

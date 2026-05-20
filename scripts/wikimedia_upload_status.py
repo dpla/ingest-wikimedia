@@ -121,10 +121,12 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
             stale_suffix = f" ⚠ idle {idle_str}"
 
     if log_file.endswith("-download.log"):
-        if "Downloading" in tail or "Key already in S3" in tail:
-            return f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
+        # Use the COUNTS: terminal marker as the definitive completion signal —
+        # "Downloading" may still appear in the tail even after the run finishes.
         if counts_marker > 0:
             return f"{_DOWNLOAD_COMPLETE_PREFIX} ({dpla_id_count:,} / {total:,} items)"
+        if "Downloading" in tail or "Key already in S3" in tail:
+            return f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
         # Log exists for this session but no active download indicators and no COUNTS
         # marker — downloader likely crashed. Report item count without implying
         # get-ids-es is running (the old "Generating IDs" fallback was wrong here).
