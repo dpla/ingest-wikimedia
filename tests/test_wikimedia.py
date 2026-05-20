@@ -254,3 +254,19 @@ def test_extract_page_ordinal_no_dpla_format():
 def test_extract_page_ordinal_high_page_number():
     title = "Pennsylvania Company Volume - DPLA - 148712806694602ddddfdec4a84e0229 (page 700).jpg"
     assert extract_page_ordinal_from_commons_title(title) == 700
+
+
+def test_extract_page_ordinal_ignores_non_suffix_page_token():
+    # "(page 12)" embedded in the descriptive title text — not the DPLA
+    # filename suffix — must not be parsed as the ordinal.
+    title = "Diary notes (page 12) - DPLA - 002b0f7ad761858506721b83e3370c5f.jpg"
+    assert extract_page_ordinal_from_commons_title(title) is None
+
+
+def test_extract_page_ordinal_ignores_non_suffix_with_multipage():
+    # Same as above but the file IS multi-page; ordinal must come from the
+    # tail, not from the spurious "(page 12)" in the title text.
+    title = (
+        "Diary notes (page 12) - DPLA - 002b0f7ad761858506721b83e3370c5f (page 5).jpg"
+    )
+    assert extract_page_ordinal_from_commons_title(title) == 5

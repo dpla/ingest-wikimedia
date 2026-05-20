@@ -287,7 +287,10 @@ def find_file_by_hash(
 
 
 _DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
-_PAGE_ORDINAL_RE = re.compile(r"\(page (\d+)\)")
+# Anchored to the DPLA filename suffix: "... - DPLA - <id> (page N)<.ext>$".
+# Prevents false matches when "(page N)" appears in the descriptive title text
+# (e.g. titles where source brackets were normalised to parens by get_page_title).
+_PAGE_ORDINAL_RE = re.compile(r"- DPLA - [0-9a-f]{32} \(page (\d+)\)(?=\.[^.]+$)")
 
 
 def extract_dpla_id_from_commons_title(title: str) -> str | None:

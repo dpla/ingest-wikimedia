@@ -569,7 +569,12 @@ class Uploader:
             #       changed across runs (a legitimate rename). Fall through so
             #       Case 1/3 can move the existing file to the new title.
             actual_page = extract_page_ordinal_from_commons_title(actual_filename)
-            if actual_page is not None and actual_page != ordinal:
+            intended_page = extract_page_ordinal_from_commons_title(page_title)
+            # Compare the two parsed ordinals so the decision is based on logical
+            # Commons page numbering rather than the S3 iteration index (which
+            # can diverge from intended_page in edge cases). None==None for a
+            # single-page item title-text rename falls through to Case 1/3.
+            if actual_page != intended_page:
                 logging.info(
                     f"Hash drift for {dpla_id} {ordinal}: SHA1 found at "
                     f"same-item page {actual_page} [[File:{actual_filename}]]; "
