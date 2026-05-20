@@ -309,6 +309,32 @@ def extract_page_ordinal_from_commons_title(title: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def is_same_item_redirect_relic(
+    intended_title: str, target_title: str, dpla_id: str
+) -> bool:
+    """True if a redirect from intended_title → target_title is a relic of a
+    prior bad move within the same multi-page DPLA item.
+
+    Both titles must carry the same DPLA ID matching the current item, and
+    both must have parseable but different page ordinals. When this is True
+    the uploader must NOT call _resolve_redirect_move — doing so would just
+    shuffle content between two valid ordinals of the same item, and the
+    same shuffle would be reversed when the iteration later reaches the
+    other ordinal, producing an oscillation that destroys uploaded content.
+    """
+    intended_dpla_id = extract_dpla_id_from_commons_title(intended_title)
+    target_dpla_id = extract_dpla_id_from_commons_title(target_title)
+    if intended_dpla_id != dpla_id or target_dpla_id != dpla_id:
+        return False
+    intended_page = extract_page_ordinal_from_commons_title(intended_title)
+    target_page = extract_page_ordinal_from_commons_title(target_title)
+    return (
+        intended_page is not None
+        and target_page is not None
+        and intended_page != target_page
+    )
+
+
 # Patterns for metadata we preserve from the original page wikitext when
 # rewriting a file description after a title-drift move.
 #

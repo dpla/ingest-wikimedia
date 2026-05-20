@@ -50,6 +50,7 @@ from ingest_wikimedia.wikimedia import (
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
     extract_page_ordinal_from_commons_title,
+    is_same_item_redirect_relic,
     merge_preserved_wikitext,
     tag_as_duplicate,
     check_content_type,
@@ -271,27 +272,54 @@ class Uploader:
                 # Skip when drift resolution returned "upload_only" — in that case
                 # we've decided not to touch any other file; just upload directly.
                 if wiki_file_page.isRedirectPage() and drift_action != "upload_only":
-                    try:
-                        resolved = self._resolve_redirect_move(wiki_file_page, dpla_id)
-                        if resolved:
-                            wiki_file_page = resolved
-                    except pywikibot.exceptions.ArticleExistsConflictError:
-                        # Move is blocked because the redirect page itself has
-                        # page history or structured data that Commons won't let
-                        # us overwrite via a move. Fall back to replacing the
-                        # redirect text in-place and uploading directly.
+                    target_title = wiki_file_page.getRedirectTarget().title(
+                        with_ns=False
+                    )
+                    if is_same_item_redirect_relic(
+                        wiki_file_page.title(with_ns=False), target_title, dpla_id
+                    ):
+                        # Same-item different-page redirect — relic of a prior
+                        # bad move. Don't move (would oscillate); overwrite the
+                        # redirect in place and let the upload land here.
                         logging.info(
-                            f"Move blocked (ArticleExistsConflictError) for "
-                            f"{dpla_id}; falling back to redirect-overwrite"
+                            f"Same-item redirect relic for {dpla_id}: "
+                            f"[[File:{wiki_file_page.title(with_ns=False)}]] → "
+                            f"[[File:{target_title}]]; overwriting redirect "
+                            f"without moving sibling page."
                         )
                         resolved = self._resolve_redirect_overwrite(
                             wiki_file_page, dpla_id, wiki_markup
                         )
                         if resolved:
-                            wiki_file_page, redirect_old_filename = resolved
+                            wiki_file_page, _ = resolved
                             force_ignore_warnings = True
-                            if not drift_old_filename:
-                                drift_old_filename = redirect_old_filename
+                            # Intentionally NOT setting drift_old_filename:
+                            # the sibling page is a valid file at its own
+                            # ordinal and must not be tagged as a duplicate.
+                    else:
+                        try:
+                            resolved = self._resolve_redirect_move(
+                                wiki_file_page, dpla_id
+                            )
+                            if resolved:
+                                wiki_file_page = resolved
+                        except pywikibot.exceptions.ArticleExistsConflictError:
+                            # Move is blocked because the redirect page itself has
+                            # page history or structured data that Commons won't let
+                            # us overwrite via a move. Fall back to replacing the
+                            # redirect text in-place and uploading directly.
+                            logging.info(
+                                f"Move blocked (ArticleExistsConflictError) for "
+                                f"{dpla_id}; falling back to redirect-overwrite"
+                            )
+                            resolved = self._resolve_redirect_overwrite(
+                                wiki_file_page, dpla_id, wiki_markup
+                            )
+                            if resolved:
+                                wiki_file_page, redirect_old_filename = resolved
+                                force_ignore_warnings = True
+                                if not drift_old_filename:
+                                    drift_old_filename = redirect_old_filename
 
                 # Use direct upload (chunk_size=0) + ignore_warnings=True when the
                 # file page already exists, or when the hash already lives elsewhere

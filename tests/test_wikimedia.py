@@ -10,6 +10,7 @@ from ingest_wikimedia.wikimedia import (
     extract_page_ordinal_from_commons_title,
     extract_strings,
     extract_strings_dict,
+    is_same_item_redirect_relic,
     merge_preserved_wikitext,
     wiki_file_exists,
     check_content_type,
@@ -270,3 +271,64 @@ def test_extract_page_ordinal_ignores_non_suffix_with_multipage():
         "Diary notes (page 12) - DPLA - 002b0f7ad761858506721b83e3370c5f (page 5).jpg"
     )
     assert extract_page_ordinal_from_commons_title(title) == 5
+
+
+# is_same_item_redirect_relic — the oscillation guard for redirect handling
+ITEM = "190aa1b74ca34559e61c25e9dbb97a61"
+PHYS = "Physical Apparatus for Universities and Colleges Manufactured and Imported by Central Scientific Co."
+
+
+def test_relic_same_item_different_pages_is_true():
+    intended = f"{PHYS} - DPLA - {ITEM} (page 83).jpg"
+    target = f"{PHYS} - DPLA - {ITEM} (page 103).jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is True
+
+
+def test_relic_same_item_same_page_is_false():
+    # Same DPLA ID and same ordinal — legitimate title-text rename, let
+    # _resolve_redirect_move handle it.
+    intended = f"New text - DPLA - {ITEM} (page 5).jpg"
+    target = f"Old text - DPLA - {ITEM} (page 5).jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is False
+
+
+def test_relic_different_item_is_false():
+    # Different DPLA IDs — not a same-item case at all.
+    other_id = "fe9a56003cde86d71a7f68bcc42c9216"
+    intended = f"Foo - DPLA - {ITEM} (page 1).jpg"
+    target = f"Emblema XIII - DPLA - {other_id}.jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is False
+
+
+def test_relic_single_page_item_is_false():
+    # No (page N) suffix on either side — single-page item, title-text
+    # rename. Let _resolve_redirect_move handle it.
+    intended = f"New title - DPLA - {ITEM}.jpg"
+    target = f"Old title - DPLA - {ITEM}.jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is False
+
+
+def test_relic_target_lacks_dpla_id_is_false():
+    # Target was uploaded under an institutional title (no DPLA ID) — that
+    # IS the legitimate Case 1 title-drift scenario; allow the move.
+    intended = f"Reagan - DPLA - {ITEM}.jpg"
+    target = "President Ronald Reagan original NARA title.jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is False
+
+
+def test_relic_only_one_side_has_page_ordinal_is_false():
+    # Target has (page N) but intended doesn't (or vice versa). Treat as
+    # not-a-relic — let the existing move path handle it.
+    intended = f"Foo - DPLA - {ITEM}.jpg"
+    target = f"Foo - DPLA - {ITEM} (page 5).jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is False
+
+
+def test_relic_intended_belongs_to_different_item_is_false():
+    # intended_title carries a parseable (page N) ordinal but its DPLA ID
+    # is a third item, not the one being processed. Must not be classified
+    # as a same-item relic.
+    other_id = "fe9a56003cde86d71a7f68bcc42c9216"
+    intended = f"Foo - DPLA - {other_id} (page 1).jpg"
+    target = f"Foo - DPLA - {ITEM} (page 3).jpg"
+    assert is_same_item_redirect_relic(intended, target, ITEM) is False
