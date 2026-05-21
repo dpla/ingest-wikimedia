@@ -306,6 +306,58 @@ _COMMONSDELINKER_REASON = (
     "(harmonize the names of a set of images)"
 )
 
+# MediaWiki's stored comment field is capped at 500 bytes
+# (CommentStore::COMMENT_CHARACTER_LIMIT). Comments longer than this are
+# truncated mid-string on save, which produces unreadable summaries like
+# "...(DPLA ID [[dpla:093..." with the link unterminated.
+MAX_COMMENT_BYTES = 500
+
+# For a move, MediaWiki composes the stored comment as
+#   "$user moved page [[File:$old]] to [[File:$new]]: $reason"
+# Fixed-overhead pieces:
+#   " moved page [[File:"  = 19
+#   "]] to [[File:"        = 13
+#   "]]: "                 = 4
+# Total non-variable overhead, excluding the username and filenames: 36 bytes.
+_MOVE_AUTO_PREFIX_OVERHEAD = 36
+
+
+def build_title_drift_move_reason(
+    old_filename: str, new_filename: str, dpla_id: str, username: str
+) -> str:
+    """Return the longest title-drift move reason that fits MediaWiki's
+    500-byte comment limit, given the filenames and bot username that will
+    be auto-prefixed.
+
+    MediaWiki truncates the composed comment at MAX_COMMENT_BYTES bytes; for
+    long filenames the default reason (which includes a [[dpla:...]]
+    interwiki link) can push the comment over the limit and lose its closing
+    brackets. We degrade by first dropping the link wrapper, then the
+    descriptive text, keeping the DPLA ID visible at every step so the
+    comment remains traceable.
+    """
+    prefix_len = (
+        len(username.encode("utf-8"))
+        + _MOVE_AUTO_PREFIX_OVERHEAD
+        + len(old_filename.encode("utf-8"))
+        + len(new_filename.encode("utf-8"))
+    )
+    budget = MAX_COMMENT_BYTES - prefix_len
+    candidates = (
+        f"Title drift correction: updating to current DPLA title "
+        f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])",
+        f"Title drift correction: updating to current DPLA title (DPLA ID {dpla_id})",
+        f"Title drift correction (DPLA ID {dpla_id})",
+        f"Title drift correction ({dpla_id})",
+        "Title drift correction",
+    )
+    for reason in candidates:
+        if len(reason.encode("utf-8")) <= budget:
+            return reason
+    # Filenames so long that even the shortest reason won't fit — return
+    # it anyway; MediaWiki will still truncate, but we've done our best.
+    return candidates[-1]
+
 
 def post_commonsdelinker_request(
     site: BaseSite, old_filename: str, new_filename: str
