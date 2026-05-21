@@ -240,3 +240,61 @@ def test_process_item_media_master_skips_manifest(downloader):
     )
 
     downloader.iiif.get_iiif_manifest.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fix: _s3_key_age_days treats 0-byte stubs as absent so the downloader
+# re-attempts them instead of leaving the stub forever (the persistent stub
+# previously poisoned the uploader's gap-squashing page-label counter).
+# ---------------------------------------------------------------------------
+
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def _age_obj(content_length, days_old):
+    obj = MagicMock()
+    obj.content_length = content_length
+    obj.last_modified = datetime.now(tz=timezone.utc) - timedelta(days=days_old)
+    return obj
+
+
+def test_s3_key_age_days_returns_none_for_zero_byte_stub(downloader):
+    obj = _age_obj(content_length=0, days_old=10)
+    downloader.s3_client.get_s3.return_value.Object.return_value = obj
+    assert downloader._s3_key_age_days("any/path") is None
+
+
+def test_s3_key_age_days_returns_age_for_real_file(downloader):
+    obj = _age_obj(content_length=12345, days_old=3)
+    downloader.s3_client.get_s3.return_value.Object.return_value = obj
+    age = downloader._s3_key_age_days("any/path")
+    assert age is not None
+    assert 2.9 < age < 3.1
+
+
+def test_s3_key_age_days_returns_none_for_missing(downloader):
+    from botocore.exceptions import ClientError
+
+    downloader.s3_client.get_s3.return_value.Object.return_value.content_length = (
+        MagicMock(
+            side_effect=ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+            )
+        )
+    )
+    # Simpler: set Object() itself to raise
+    downloader.s3_client.get_s3.return_value.Object.side_effect = ClientError(
+        {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+    )
+    assert downloader._s3_key_age_days("missing/path") is None
+
+
+def test_s3_key_age_days_propagates_non_404_errors(downloader):
+    from botocore.exceptions import ClientError
+
+    downloader.s3_client.get_s3.return_value.Object.side_effect = ClientError(
+        {"Error": {"Code": "InternalError", "Message": "boom"}}, "HeadObject"
+    )
+    with pytest.raises(ClientError):
+        downloader._s3_key_age_days("any/path")
