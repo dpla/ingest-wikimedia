@@ -42,7 +42,7 @@ import urllib.request
 
 import boto3
 
-from ingest_wikimedia.s3 import S3_BUCKET
+from ingest_wikimedia.s3 import S3_BUCKET, S3Client
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.wikimedia import extract_strings, get_page_title
 
@@ -68,13 +68,6 @@ def _parse_retry_after(value: str | None) -> int:
         return max(0, int((when - now).total_seconds()))
     except (TypeError, ValueError):
         return DEFAULT_RETRY_AFTER_SECS
-
-
-def s3_path_prefix(dpla_id: str, partner: str) -> str:
-    return (
-        f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
-        f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/"
-    )
 
 
 def commons_api(params: dict) -> dict:
@@ -111,7 +104,7 @@ def list_s3_ordinals(dpla_id: str, partner: str) -> dict[int, tuple[str, str, st
     """Return {ordinal: (key, sha1, content_type)} for every media file under
     the item's S3 prefix."""
     s3 = boto3.client("s3")
-    prefix = s3_path_prefix(dpla_id, partner)
+    prefix = S3Client.get_item_s3_path(dpla_id, "", partner)
     out: dict[int, tuple[str, str, str]] = {}
     name_re = re.compile(r"^(\d+)_" + re.escape(dpla_id) + r"$")
     paginator = s3.get_paginator("list_objects_v2")
@@ -146,7 +139,10 @@ def main() -> None:
 
     s3_files = list_s3_ordinals(dpla_id, partner)
     if not s3_files:
-        sys.exit(f"No S3 ordinals under prefix {s3_path_prefix(dpla_id, partner)}")
+        sys.exit(
+            f"No S3 ordinals under prefix "
+            f"{S3Client.get_item_s3_path(dpla_id, '', partner)}"
+        )
     ordinals = sorted(s3_files)
     multipage = len(ordinals) > 1
     logging.info(
