@@ -302,7 +302,8 @@ def get_wikidata_site() -> BaseSite:
 
 COMMONSDELINKER_PAGE = "User:CommonsDelinker/commands/filemovers"
 _COMMONSDELINKER_REASON = (
-    "[[COM:FR|File renamed]]: [[COM:FR#FR1|Criterion 1]] (original uploader's request)"
+    "[[COM:FR|File renamed]]: [[COM:FR#FR4|Criterion 4]] "
+    "(harmonize the names of a set of images)"
 )
 
 
