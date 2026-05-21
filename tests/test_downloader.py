@@ -134,6 +134,8 @@ def test_upload_refuses_zero_byte_local_file_no_existing(downloader):
     assert result is False
     obj.upload_fileobj.assert_not_called()
     downloader.tracker.increment.assert_any_call(Result.FAILED)
+    # Lock in "at the source" — guard fires before any S3 lookup.
+    downloader.s3_client.get_s3.assert_not_called()
 
 
 def test_upload_refuses_zero_byte_local_file_over_existing_valid(downloader):
@@ -154,6 +156,9 @@ def test_upload_refuses_zero_byte_local_file_over_existing_valid(downloader):
     assert result is False
     obj.upload_fileobj.assert_not_called()
     downloader.tracker.increment.assert_any_call(Result.FAILED)
+    # Lock in "at the source" — guard fires before any S3 lookup, even
+    # when an existing object would otherwise be queried.
+    downloader.s3_client.get_s3.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
