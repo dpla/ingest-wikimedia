@@ -41,6 +41,7 @@ from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
     MIME_UNKNOWN_EXT,
+    build_title_drift_move_reason,
     compute_ordinal_exts_and_page_labels,
     get_page_title,
     get_wiki_text,
@@ -457,9 +458,8 @@ class Uploader:
         redirect_target = wiki_file_page.getRedirectTarget()
         old_filename = redirect_target.title(with_ns=False)
         new_filename = wiki_file_page.title(with_ns=False)
-        reason = (
-            f"Title drift correction: updating to current DPLA title "
-            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+        reason = build_title_drift_move_reason(
+            old_filename, new_filename, dpla_id, self.site.user()
         )
         logging.info(
             f"Title drift redirect detected — moving "
@@ -538,9 +538,8 @@ class Uploader:
         """
         actual_filename = existing_file.title(with_ns=False)
         intended_filename = intended_page.title(with_ns=False)
-        reason = (
-            f"Title drift correction: updating to current DPLA title "
-            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+        reason = build_title_drift_move_reason(
+            actual_filename, intended_filename, dpla_id, self.site.user()
         )
         logging.info(
             f"Title drift ({case_label}): moving "

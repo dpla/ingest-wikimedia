@@ -1,5 +1,7 @@
 from unittest.mock import patch, MagicMock
 from ingest_wikimedia.wikimedia import (
+    MAX_COMMENT_BYTES,
+    build_title_drift_move_reason,
     get_site,
     get_page_title,
     license_to_markup_code,
@@ -457,3 +459,82 @@ def test_page_labels_unique_extension_gets_empty_label():
     assert exts == {1: ".jpg", 2: ".jpg", 3: ".pdf"}
     # ext_counts: .jpg→2, .pdf→1. Only .jpg gets page numbers.
     assert labels == {1: "1", 2: "2", 3: ""}
+
+
+# ---------------------------------------------------------------------------
+# build_title_drift_move_reason
+# ---------------------------------------------------------------------------
+
+_DPLA_ID = "093240d1a832ebe2a5fe2af4f5847762"
+_USERNAME = "DPLA bot"
+
+
+def _composed_move_comment(old: str, new: str, reason: str, user: str) -> str:
+    """Mirror MediaWiki's auto-composed move comment for length verification."""
+    return f"{user} moved page [[File:{old}]] to [[File:{new}]]: {reason}"
+
+
+def test_move_reason_short_filenames_keeps_link():
+    """Default reason (with [[dpla:...|...]] link) is used when there is room."""
+    old = "Short - NARA - 123.gif"
+    new = f"Short - DPLA - {_DPLA_ID}.gif"
+    reason = build_title_drift_move_reason(old, new, _DPLA_ID, _USERNAME)
+    assert "[[dpla:" in reason
+    assert _DPLA_ID in reason
+    assert (
+        len(_composed_move_comment(old, new, reason, _USERNAME).encode("utf-8"))
+        <= MAX_COMMENT_BYTES
+    )
+
+
+def test_move_reason_long_filenames_drops_link():
+    """When the link would push the comment over 500 bytes, drop the link
+    wrapper but keep the bare DPLA ID."""
+    # Filenames from the real overflow case (revid 1218006806).
+    long_title = (
+        "Undated typescript copy of the citation as signed by President "
+        "Franklin D. Roosevelt awarding the Medal of Honor to Major Gregory "
+        "Boyington."
+    )
+    old = f"{long_title} - NARA - 299738.gif"
+    new = f"{long_title} - DPLA - {_DPLA_ID}.gif"
+    reason = build_title_drift_move_reason(old, new, _DPLA_ID, _USERNAME)
+    assert "[[dpla:" not in reason
+    assert _DPLA_ID in reason
+    assert reason.startswith("Title drift correction")
+    composed = _composed_move_comment(old, new, reason, _USERNAME)
+    assert len(composed.encode("utf-8")) <= MAX_COMMENT_BYTES
+
+
+def test_move_reason_picks_longest_that_fits():
+    """When the link form is just over budget, the next-longest variant
+    (link dropped, full descriptive text kept) is selected."""
+    # Construct filenames so that the full link form is exactly 1 byte over
+    # budget but the no-link form fits.
+    link_reason = (
+        f"Title drift correction: updating to current DPLA title "
+        f"(DPLA ID [[dpla:{_DPLA_ID}|{_DPLA_ID}]])"
+    )
+    no_link_reason = (
+        f"Title drift correction: updating to current DPLA title (DPLA ID {_DPLA_ID})"
+    )
+    # Per the helper: prefix_len = len(user) + 36 + len(old) + len(new).
+    # Pick filename lengths so total comment with link is 501 bytes.
+    overhead = len(_USERNAME) + 36
+    target_filename_total = MAX_COMMENT_BYTES + 1 - overhead - len(link_reason)
+    old = "a" * (target_filename_total // 2)
+    new = "b" * (target_filename_total - len(old))
+    reason = build_title_drift_move_reason(old, new, _DPLA_ID, _USERNAME)
+    assert reason == no_link_reason
+    composed = _composed_move_comment(old, new, reason, _USERNAME)
+    assert len(composed.encode("utf-8")) <= MAX_COMMENT_BYTES
+
+
+def test_move_reason_extreme_filenames_falls_back_to_minimum():
+    """When filenames alone consume the entire budget, the shortest reason
+    is returned (helper does its best; MW will still truncate)."""
+    # Pick filenames so even "Title drift correction" doesn't fit.
+    old = "x" * 240
+    new = "y" * 240
+    reason = build_title_drift_move_reason(old, new, _DPLA_ID, _USERNAME)
+    assert reason == "Title drift correction"
