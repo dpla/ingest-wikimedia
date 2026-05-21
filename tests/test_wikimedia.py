@@ -406,6 +406,24 @@ def test_page_labels_clienterror_treated_as_stub_placeholder():
     assert labels == {1: "1", 2: "", 3: "2"}
 
 
+def test_page_labels_non_404_clienterror_propagates():
+    # Transient S3 failures (AccessDenied, InternalError, throttling) must
+    # not be silently swallowed as "object missing" — that would corrupt
+    # the page-label assignment on what's actually a valid file.
+    import pytest
+    from botocore.exceptions import ClientError
+
+    s3 = MagicMock()
+    s3.get_media_s3_path.side_effect = lambda d, i, p: (
+        f"{p}/images/{d[0]}/{d[1]}/{d[2]}/{d[3]}/{d}/{i}_{d}"
+    )
+    s3.get_s3.return_value.Object.side_effect = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "nope"}}, "HeadObject"
+    )
+    with pytest.raises(ClientError):
+        compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
+
+
 def test_page_labels_single_file_item_no_pagination():
     # num_files == 1 → no pre-scan, no page label, no (page N) suffix.
     s3 = _fake_s3_client({1: "image/jpeg"})

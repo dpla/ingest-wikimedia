@@ -128,9 +128,15 @@ def compute_ordinal_exts_and_page_labels(
             try:
                 s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
                 mime = s3_obj.content_type
-            except ClientError:
-                ordinal_exts[i] = ""
-                continue
+            except ClientError as e:
+                # Only treat "object not found" as a stub placeholder.
+                # Anything else (AccessDenied, InternalError, throttling) must
+                # surface so we never silently corrupt the page-label
+                # assignment on a transient S3 failure.
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    ordinal_exts[i] = ""
+                    continue
+                raise
             if is_download_only(mime):
                 continue
             if mime in ("application/octet-stream", "binary/octet-stream"):

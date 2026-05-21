@@ -276,14 +276,6 @@ def test_s3_key_age_days_returns_age_for_real_file(downloader):
 def test_s3_key_age_days_returns_none_for_missing(downloader):
     from botocore.exceptions import ClientError
 
-    downloader.s3_client.get_s3.return_value.Object.return_value.content_length = (
-        MagicMock(
-            side_effect=ClientError(
-                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
-            )
-        )
-    )
-    # Simpler: set Object() itself to raise
     downloader.s3_client.get_s3.return_value.Object.side_effect = ClientError(
         {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
     )

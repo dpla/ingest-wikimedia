@@ -45,12 +45,13 @@ import urllib.request
 import boto3
 from botocore.exceptions import ClientError
 
+from ingest_wikimedia.common import get_dict, get_list
+from ingest_wikimedia.dpla import DC_TITLE_FIELD_NAME, SOURCE_RESOURCE_FIELD_NAME
 from ingest_wikimedia.s3 import S3_BUCKET, S3Client
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.wikimedia import (
     check_content_type,
     compute_ordinal_exts_and_page_labels,
-    extract_strings,
     get_page_title,
     is_download_only,
 )
@@ -59,7 +60,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 BATCH = 50
-DC_TITLE_FIELD = "title"  # under sourceResource
 DEFAULT_RETRY_AFTER_SECS = 30
 
 
@@ -146,9 +146,15 @@ def main() -> None:
     item_metadata = ctx.get_dpla().get_item_metadata(dpla_id)
     if not item_metadata:
         sys.exit(f"DPLA item {dpla_id} not found")
-    title_string = extract_strings(
-        item_metadata.get("sourceResource", {}), DC_TITLE_FIELD
+    # Use the same title selection as Uploader.process_item(): the FIRST
+    # value of sourceResource.title, not the joined extract_strings(...)
+    # representation. The uploader feeds titles[0] to get_page_title, so
+    # the verifier must do the same to reconstruct the exact filename.
+    titles = get_list(
+        get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
+        DC_TITLE_FIELD_NAME,
     )
+    title_string = titles[0] if titles else ""
     logging.info(f"  item title: {title_string}")
 
     s3_client_obj = ctx.get_s3_client()
