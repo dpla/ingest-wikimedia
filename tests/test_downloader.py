@@ -106,6 +106,99 @@ def test_upload_proceeds_when_content_length_unreadable(downloader):
     obj.upload_fileobj.assert_called_once()
 
 
+def test_upload_refuses_zero_byte_local_file_no_existing(downloader):
+    # Defense in depth: even if download_file_to_temp_path's raise-on-empty
+    # check were to be bypassed, upload_file_to_s3 must not write a 0-byte
+    # object to S3. This is the bug that created stubs in the first place.
+    from botocore.exceptions import ClientError
+
+    mock_s3 = MagicMock()
+    # Existing object doesn't exist → 404 when .metadata is read
+    obj = MagicMock()
+    type(obj).metadata = property(
+        lambda _: (_ for _ in ()).throw(
+            ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+            )
+        )
+    )
+    mock_s3.Object.return_value = obj
+    downloader.s3_client.get_s3.return_value = mock_s3
+
+    with patch("os.stat") as mock_stat:
+        mock_stat.return_value.st_size = 0  # 0-byte local file
+        result = downloader.upload_file_to_s3(
+            "/tmp/empty", "dest/path", "image/jpeg", "abc123"
+        )
+
+    assert result is False
+    obj.upload_fileobj.assert_not_called()
+    downloader.tracker.increment.assert_any_call(Result.FAILED)
+
+
+def test_upload_refuses_zero_byte_local_file_over_existing_valid(downloader):
+    # Existing S3 has valid content; new download is 0 bytes — must not
+    # overwrite, and must not silently SKIP either (FAILED is the honest
+    # signal — the download produced no usable content).
+    obj = _make_s3_obj("existing_sha", 1024)
+    mock_s3 = MagicMock()
+    mock_s3.Object.return_value = obj
+    downloader.s3_client.get_s3.return_value = mock_s3
+
+    with patch("os.stat") as mock_stat:
+        mock_stat.return_value.st_size = 0
+        result = downloader.upload_file_to_s3(
+            "/tmp/empty", "dest/path", "image/jpeg", "new_sha"
+        )
+
+    assert result is False
+    obj.upload_fileobj.assert_not_called()
+    downloader.tracker.increment.assert_any_call(Result.FAILED)
+
+
+# ---------------------------------------------------------------------------
+# download_file_to_temp_path raises on empty body (HTTP 200 + 0 bytes)
+# ---------------------------------------------------------------------------
+
+
+def test_download_raises_on_zero_byte_response(downloader, tmp_path):
+    # Simulates the OCLC ContentDM scenario that originally created the stubs:
+    # HTTP 200 OK from the source, but the body delivers zero chunks (clean
+    # close after headers, or empty content). The download must raise so
+    # process_media skips the upload and the FAILED tracker fires.
+    response = MagicMock()
+    response.raise_for_status = MagicMock()  # no exception
+    response.headers = {"content-length": "0"}
+    response.iter_content.return_value = []  # no chunks delivered
+    downloader.http_session.get.return_value = response
+
+    local_file = tmp_path / "empty.jpg"
+    import pytest
+
+    with pytest.raises(RuntimeError, match="0 bytes"):
+        downloader.download_file_to_temp_path(
+            "http://example.com/x.jpg", str(local_file)
+        )
+
+    # The on-disk file should have been created (open(... "wb")) but stay empty
+    assert local_file.exists()
+    assert local_file.stat().st_size == 0
+
+
+def test_download_succeeds_on_nonempty_response(downloader, tmp_path):
+    # Sanity check: when chunks are delivered, no exception, file contains content.
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.headers = {"content-length": "12"}
+    response.iter_content.return_value = [b"hello ", b"world!"]
+    downloader.http_session.get.return_value = response
+
+    local_file = tmp_path / "good.jpg"
+    downloader.download_file_to_temp_path("http://example.com/x.jpg", str(local_file))
+
+    assert local_file.read_bytes() == b"hello world!"
+
+
 # ---------------------------------------------------------------------------
 # Fix 2: HTTP session created once at init, reused per download
 # ---------------------------------------------------------------------------
