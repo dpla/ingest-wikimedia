@@ -69,6 +69,23 @@ class Downloader:
         already existed with a matching checksum and was skipped.
         """
         try:
+            # Defence-in-depth: refuse to upload a 0-byte local file regardless
+            # of whether an S3 object already exists. The primary check lives
+            # in download_file_to_temp_path (which raises before reaching this
+            # point), but if anything ever calls upload_file_to_s3 with a
+            # 0-byte file, we must not turn it into a stub. Stubs poison the
+            # uploader's page-label counter and require a subsequent re-run
+            # to heal — see the "Graceful failure handling: audit ALL code
+            # paths" lesson.
+            if os.stat(file).st_size == 0:
+                logging.warning(
+                    f"Refusing to upload 0-byte file to "
+                    f"s3://{S3_BUCKET}/{destination_path}; "
+                    f"treat as failed download"
+                )
+                self.tracker.increment(Result.FAILED)
+                return False
+
             with open(file, "rb") as f:
                 s3 = self.s3_client.get_s3()
                 obj = s3.Object(S3_BUCKET, destination_path)
@@ -83,22 +100,6 @@ class Downloader:
                     else:
                         # Just in case (dunno why this would happen)
                         raise e
-
-                # Don't overwrite a valid existing S3 file with a 0-byte download
-                # (e.g. a transient empty HTTP response from the source server).
-                # Use `is not None` rather than truthiness — empty metadata dicts ({})
-                # are falsy but still indicate the object exists.
-                # Only access obj.content_length when obj_metadata is not None: accessing
-                # it on a non-existent object triggers a second HEAD request (another 404).
-                if obj_metadata is not None and os.stat(file).st_size == 0:
-                    existing_size = int(obj.content_length or 0)
-                    if existing_size > 0:
-                        logging.warning(
-                            f"New download is 0 bytes; keeping existing file at "
-                            f"s3://{S3_BUCKET}/{destination_path}"
-                        )
-                        self.tracker.increment(Result.SKIPPED)
-                        return False
 
                 if obj_metadata and obj_metadata.get(CHECKSUM) == sha1:
                     try:
@@ -139,8 +140,19 @@ class Downloader:
 
     def download_file_to_temp_path(self, media_url: str, local_file: str):
         """
-        Tries to get a local copy of a file to stick in S3 later
+        Tries to get a local copy of a file to stick in S3 later.
+
+        Raises RuntimeError if the download fails OR if the response body
+        was empty. A 0-byte download (HTTP 200 + empty body, or a clean
+        close after the headers with no chunks) must be treated as a
+        failure: silently accepting it would cause upload_file_to_s3 to
+        write a 0-byte stub to S3 (the existing 0-byte guard there only
+        protects against overwriting an *existing* non-zero S3 file,
+        not against creating a stub from scratch). Stubs in S3 then
+        poison the uploader's page-label counter and have to be healed
+        on a subsequent run.
         """
+        bytes_written = 0
         try:
             response = self.http_session.get(media_url, stream=True)
             response.raise_for_status()
@@ -159,9 +171,16 @@ class Downloader:
                     for chunk in response.iter_content(DOWNLOAD_BUFFER_SIZE):
                         t.update(len(chunk))
                         f.write(chunk)
+                        bytes_written += len(chunk)
 
         except Exception as e:
             raise RuntimeError(f"Failed downloading {media_url} to local") from e
+
+        if bytes_written == 0:
+            raise RuntimeError(
+                f"Downloaded 0 bytes from {media_url} — treating as failure "
+                f"(HTTP 200 + empty body or stalled stream)"
+            )
 
     def _s3_key_age_days(self, s3_path: str) -> float | None:
         """Return the age in days of an S3 object, or None if it does not exist
