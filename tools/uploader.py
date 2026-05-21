@@ -275,51 +275,72 @@ class Uploader:
                     target_title = wiki_file_page.getRedirectTarget().title(
                         with_ns=False
                     )
-                    if is_same_item_redirect_relic(
+                    target_dpla_id = extract_dpla_id_from_commons_title(target_title)
+                    is_relic = is_same_item_redirect_relic(
                         wiki_file_page.title(with_ns=False), target_title, dpla_id
-                    ):
-                        # Same-item different-page redirect — relic of a prior
-                        # bad move. Don't move (would oscillate); overwrite the
-                        # redirect in place and let the upload land here.
-                        logging.info(
-                            f"Same-item redirect relic for {dpla_id}: "
-                            f"[[File:{wiki_file_page.title(with_ns=False)}]] → "
-                            f"[[File:{target_title}]]; overwriting redirect "
-                            f"without moving sibling page."
-                        )
-                        resolved = self._resolve_redirect_overwrite(
-                            wiki_file_page, dpla_id, wiki_markup
-                        )
-                        if resolved:
-                            wiki_file_page, _ = resolved
-                            force_ignore_warnings = True
-                            # Intentionally NOT setting drift_old_filename:
-                            # the sibling page is a valid file at its own
-                            # ordinal and must not be tagged as a duplicate.
-                    else:
+                    )
+                    # A move only makes sense when the redirect target carries
+                    # this item's DPLA ID at the same logical page (title-text
+                    # drift). For everything else — same-item different-page
+                    # relics, cross-item dedups, or no-DPLA-ID legacy redirects
+                    # — we overwrite the redirect in place so the upload lands
+                    # at our intended title without touching the target.
+                    if target_dpla_id == dpla_id and not is_relic:
                         try:
-                            resolved = self._resolve_redirect_move(
+                            wiki_file_page = self._resolve_redirect_move(
                                 wiki_file_page, dpla_id
                             )
-                            if resolved:
-                                wiki_file_page = resolved
                         except pywikibot.exceptions.ArticleExistsConflictError:
-                            # Move is blocked because the redirect page itself has
-                            # page history or structured data that Commons won't let
-                            # us overwrite via a move. Fall back to replacing the
-                            # redirect text in-place and uploading directly.
+                            # Move is blocked because the redirect page itself
+                            # has page history or structured data Commons won't
+                            # let us overwrite via a move. Fall back to
+                            # replacing the redirect text in-place.
                             logging.info(
                                 f"Move blocked (ArticleExistsConflictError) for "
                                 f"{dpla_id}; falling back to redirect-overwrite"
                             )
-                            resolved = self._resolve_redirect_overwrite(
-                                wiki_file_page, dpla_id, wiki_markup
+                            wiki_file_page, redirect_old_filename = (
+                                self._resolve_redirect_overwrite(
+                                    wiki_file_page, dpla_id, wiki_markup
+                                )
                             )
-                            if resolved:
-                                wiki_file_page, redirect_old_filename = resolved
-                                force_ignore_warnings = True
-                                if not drift_old_filename:
-                                    drift_old_filename = redirect_old_filename
+                            force_ignore_warnings = True
+                            if not drift_old_filename:
+                                drift_old_filename = redirect_old_filename
+                    else:
+                        # Same-item relic: target is a sibling page of this
+                        # item — preserve its metadata, since license tags
+                        # and categories carry meaning across pages of the
+                        # same multi-page item.
+                        # Cross-item / no-DPLA-ID: don't pull metadata from
+                        # a foreign page; we'd inherit its Image-extracted
+                        # link and unrelated categories.
+                        preserve = is_relic
+                        if is_relic:
+                            logging.info(
+                                f"Same-item redirect relic for {dpla_id}: "
+                                f"[[File:{wiki_file_page.title(with_ns=False)}]] → "
+                                f"[[File:{target_title}]]; overwriting without "
+                                f"moving sibling page."
+                            )
+                        else:
+                            logging.info(
+                                f"Cross-item or no-DPLA redirect for {dpla_id}: "
+                                f"[[File:{wiki_file_page.title(with_ns=False)}]] → "
+                                f"[[File:{target_title}]]; overwriting redirect "
+                                f"with fresh wikitext (no metadata preservation)."
+                            )
+                        wiki_file_page, _ = self._resolve_redirect_overwrite(
+                            wiki_file_page,
+                            dpla_id,
+                            wiki_markup,
+                            preserve_from_target=preserve,
+                        )
+                        force_ignore_warnings = True
+                        # Intentionally NOT setting drift_old_filename in
+                        # either of these paths: the target is either a
+                        # valid sibling (same-item relic) or a foreign file
+                        # (cross-item) and must not be tagged as a duplicate.
 
                 # Use direct upload (chunk_size=0) + ignore_warnings=True when the
                 # file page already exists, or when the hash already lives elsewhere
@@ -421,26 +442,21 @@ class Uploader:
         self,
         wiki_file_page: pywikibot.FilePage,
         dpla_id: str,
-    ) -> pywikibot.FilePage | None:
+    ) -> pywikibot.FilePage:
         """
-        If wiki_file_page is a redirect whose target filename contains dpla_id,
-        this is a title-drift case: move the file to the intended title and post
-        a CommonsDelinker request. Returns a fresh FilePage for the intended title
-        on success, or None if the redirect is not a title-drift case.
+        Title-text-drift correction: the redirect at our intended title points
+        to the same item's file under a slightly different title. Move the
+        target file to the intended title and post a CommonsDelinker request.
+
+        Caller must verify the redirect target carries the same DPLA ID and
+        same logical page (i.e. not a same-item different-page relic, where
+        moving would oscillate); see is_same_item_redirect_relic.
 
         Raises ArticleExistsConflictError if the move is blocked (e.g. the
-        redirect page has history/structured data). Caller should fall back to
+        redirect page has history/structured data). Caller falls back to
         _resolve_redirect_overwrite in that case.
         """
         redirect_target = wiki_file_page.getRedirectTarget()
-        if dpla_id not in redirect_target.title():
-            logging.warning(
-                f"Redirect at intended title {wiki_file_page.title()} points to "
-                f"{redirect_target.title()} which does not share DPLA ID {dpla_id} "
-                f"— cannot auto-resolve; upload will fail"
-            )
-            return None
-
         old_filename = redirect_target.title(with_ns=False)
         new_filename = wiki_file_page.title(with_ns=False)
         reason = (
@@ -467,39 +483,38 @@ class Uploader:
         wiki_file_page: pywikibot.FilePage,
         dpla_id: str,
         wiki_markup: str,
-    ) -> tuple[pywikibot.FilePage, str] | None:
+        preserve_from_target: bool = True,
+    ) -> tuple[pywikibot.FilePage, str]:
         """
-        Fallback for when _resolve_redirect_move raises ArticleExistsConflictError.
+        Replace a redirect at our intended title with wikitext so the
+        subsequent upload can land the new S3 file there.
 
-        Replaces the redirect page text with the correct DPLA Artwork wikitext
-        so the upload API no longer sees a file conflict, then uploads directly.
-        The redirect target (wrong-title file) is returned as old_filename for
-        later duplicate-tagging.
+        Works for *any* redirect target — same-item different-page relic,
+        cross-item dedup (e.g. a 2022 human "redirecting to duplicate file"
+        edit), or a no-DPLA-ID legacy title. The S3 sha1 must land at the
+        intended title regardless of where the redirect points.
 
-        Returns (updated_file_page, old_filename) on success, or None if the
-        redirect does not share the DPLA ID (cannot auto-resolve).
+        When `preserve_from_target` is True (default), license/Image-extracted/
+        category metadata from the redirect target is carried into the new
+        page. Callers should pass False when the target is a foreign DPLA
+        item, since its categories and Image-extracted parent link don't
+        apply to our page.
+
+        Returns (updated_file_page, old_filename).
         """
         redirect_target = wiki_file_page.getRedirectTarget()
-        if dpla_id not in redirect_target.title():
-            logging.warning(
-                f"Redirect at intended title {wiki_file_page.title()} points to "
-                f"{redirect_target.title()} which does not share DPLA ID {dpla_id} "
-                f"— cannot auto-resolve; upload will fail"
-            )
-            return None
-
         old_filename = redirect_target.title(with_ns=False)
         logging.info(
-            f"Title drift redirect at [[File:{wiki_file_page.title(with_ns=False)}]] "
-            f"— replacing with wikitext so upload can proceed "
-            f"(will tag [[File:{old_filename}]] as duplicate)"
+            f"Replacing redirect at "
+            f"[[File:{wiki_file_page.title(with_ns=False)}]] "
+            f"(target [[File:{old_filename}]], "
+            f"preserve_metadata={preserve_from_target})"
         )
-        # Preserve license, Image-extracted, and category metadata from the
-        # redirect target (which holds the original file's wikitext and will
-        # be tagged as a duplicate after the upload).
-        wiki_file_page.text = merge_preserved_wikitext(
-            redirect_target.text or "", wiki_markup
-        )
+        if preserve_from_target:
+            new_text = merge_preserved_wikitext(redirect_target.text or "", wiki_markup)
+        else:
+            new_text = wiki_markup
+        wiki_file_page.text = new_text
         wiki_file_page.save(
             summary=(
                 f"Replacing redirect with DPLA metadata for title drift "
