@@ -28,6 +28,8 @@ Output:
     /tmp/verify_<dpla_id>.json for follow-up.
 """
 
+import datetime
+import email.utils
 import json
 import logging
 import mimetypes
@@ -49,6 +51,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 BATCH = 50
 DC_TITLE_FIELD = "title"  # under sourceResource
+DEFAULT_RETRY_AFTER_SECS = 30
+
+
+def _parse_retry_after(value: str | None) -> int:
+    """Parse a Retry-After header (delay-seconds or HTTP-date, RFC 7231)."""
+    if not value:
+        return DEFAULT_RETRY_AFTER_SECS
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+        now = datetime.datetime.now(tz=when.tzinfo)
+        return max(0, int((when - now).total_seconds()))
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_AFTER_SECS
 
 
 def s3_path_prefix(dpla_id: str, partner: str) -> str:
@@ -74,14 +93,17 @@ def commons_api(params: dict) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 time.sleep(0.4)
-                return json.loads(resp.read())
+                data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code in (429, 503):
-                wait = int(e.headers.get("Retry-After", 30))
+                wait = _parse_retry_after(e.headers.get("Retry-After"))
                 logging.warning(f"rate-limited; sleeping {wait}s")
                 time.sleep(wait)
                 continue
             raise
+        if "error" in data:
+            raise RuntimeError(f"Commons API error: {data['error']}")
+        return data
     raise RuntimeError("Commons API retries exhausted")
 
 
