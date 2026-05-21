@@ -9,6 +9,7 @@ from ingest_wikimedia.wikimedia import (
     join,
     compute_ordinal_exts_and_page_labels,
     extract_page_ordinal_from_commons_title,
+    extract_preserved_metadata,
     extract_strings,
     extract_strings_dict,
     is_same_item_redirect_relic,
@@ -457,3 +458,53 @@ def test_page_labels_unique_extension_gets_empty_label():
     assert exts == {1: ".jpg", 2: ".jpg", 3: ".pdf"}
     # ext_counts: .jpg→2, .pdf→1. Only .jpg gets page numbers.
     assert labels == {1: "1", 2: "2", 3: ""}
+
+
+# extract_preserved_metadata — the underlying helper used by both
+# merge_preserved_wikitext and the rescue script
+def test_extract_preserved_metadata_empty_text():
+    pd, ie, cat = extract_preserved_metadata("")
+    assert pd == []
+    assert ie == []
+    assert cat == []
+
+
+def test_extract_preserved_metadata_each_category():
+    text = (
+        "Some prose.\n"
+        "{{PD-USGov}}\n"
+        "{{PD-USGov-NARA}}\n"
+        "|other versions={{Image extracted|1=Parent.jpg}}\n"
+        "[[Category:Foo]]\n"
+        "[[Category:Bar|sort]]\n"
+    )
+    pd, ie, cat = extract_preserved_metadata(text)
+    assert pd == ["{{PD-USGov}}", "{{PD-USGov-NARA}}"]
+    assert ie == ["{{Image extracted|1=Parent.jpg}}"]
+    assert cat == ["[[Category:Foo]]", "[[Category:Bar|sort]]"]
+
+
+def test_extract_preserved_metadata_dedupes_in_order():
+    # Duplicates within the same category are collapsed in first-occurrence order.
+    text = (
+        "[[Category:Foo]] [[Category:Bar]] [[Category:Foo]]\n"
+        "{{PD-USGov}} {{PD-USGov}}\n"
+    )
+    pd, ie, cat = extract_preserved_metadata(text)
+    assert pd == ["{{PD-USGov}}"]
+    assert ie == []
+    assert cat == ["[[Category:Foo]]", "[[Category:Bar]]"]
+
+
+def test_extract_preserved_metadata_returns_what_merge_uses():
+    # Sanity: merge_preserved_wikitext must produce the same items in
+    # the same order as extract_preserved_metadata. This pins them
+    # together — if anyone refactors the regexes on one side only, this
+    # fails fast (see lessons.md "Don't normalize on one side of a
+    # producer/consumer pair").
+    existing = "[[Category:Foo]]\n{{PD-USGov}}\n{{Image extracted|1=Parent.jpg}}\n"
+    artwork = "== {{int:filedesc}} ==\n{{Artwork|title=Example}}"
+    merged = merge_preserved_wikitext(existing, artwork)
+    pd, ie, cat = extract_preserved_metadata(existing)
+    for item in pd + ie + cat:
+        assert item in merged, f"merge_preserved_wikitext lost {item!r}"

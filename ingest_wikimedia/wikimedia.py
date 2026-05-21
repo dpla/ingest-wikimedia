@@ -419,6 +419,24 @@ _IMAGE_EXTRACTED_RE = re.compile(r"\{\{Image extracted\|[^{}]*\}\}", re.IGNORECA
 _CATEGORY_RE = re.compile(r"\[\[Category:[^\]\n]+\]\]")
 
 
+def extract_preserved_metadata(
+    text: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """Extract preserved-metadata items from a wikitext blob.
+
+    Returns three lists of matched template/link strings in
+    (pd_usgov, image_extracted, categories) order. Each list is
+    deduplicated in first-occurrence order. Used by both the uploader
+    (to merge into a freshly-generated Artwork block) and the rescue
+    tool (to diff against current page text and add back what was
+    stripped by an earlier title-drift overwrite).
+    """
+    pd = list(dict.fromkeys(_PD_USGOV_RE.findall(text)))
+    ie = list(dict.fromkeys(_IMAGE_EXTRACTED_RE.findall(text)))
+    cat = list(dict.fromkeys(_CATEGORY_RE.findall(text)))
+    return pd, ie, cat
+
+
 def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     """Append preserved metadata from existing_text to new_artwork.
 
@@ -437,8 +455,7 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     Duplicates within each preserved group are collapsed.
     """
     parts: list[str] = [new_artwork.rstrip()]
-    for pattern in (_PD_USGOV_RE, _IMAGE_EXTRACTED_RE, _CATEGORY_RE):
-        group = list(dict.fromkeys(pattern.findall(existing_text)))
+    for group in extract_preserved_metadata(existing_text):
         if group:
             parts.append("")
             parts.extend(group)
