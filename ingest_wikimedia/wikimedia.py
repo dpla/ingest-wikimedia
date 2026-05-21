@@ -1,8 +1,11 @@
+import mimetypes
 import re
-from string import Template
 import typing
+from collections import Counter
+from string import Template
 
 import pywikibot
+from botocore.exceptions import ClientError
 from pywikibot import FilePage
 
 from pywikibot.site import APISite, BaseSite
@@ -11,6 +14,7 @@ from pywikibot.tools.chars import replace_invisible
 
 
 from .common import get_list, get_str, get_dict
+from .s3 import S3_BUCKET, S3Client
 from .dpla import (
     WIKIDATA_FIELD_NAME,
     EDM_RIGHTS_FIELD_NAME,
@@ -87,6 +91,72 @@ def get_page_title(
         )
     else:
         return f"{escaped_visible_title} - DPLA - {dpla_identifier}{suffix}"
+
+
+def compute_ordinal_exts_and_page_labels(
+    s3_client: S3Client,
+    dpla_id: str,
+    partner: str,
+    num_files: int,
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Compute per-ordinal extension and page-label for a multi-file DPLA item.
+
+    Mirrors the uploader's pre-scan + per-extension counter logic so any code
+    that needs to predict the Commons title an S3 ordinal will land at can
+    reconstruct it without duplicating the (subtle) accounting. Producer
+    (uploader) and consumer (verifier) MUST share this helper so they never
+    diverge — see lessons.md "Don't normalize platform-dependent values on
+    one side of a producer/consumer pair".
+
+    Returns:
+        ordinal_exts: {ordinal: extension} for ordinals the uploader has
+            classified during pre-scan.
+              - real ext (e.g. ".jpg") means a normal uploadable file.
+              - "" means a stub or octet-stream placeholder; process_file
+                may still upload it after content-type re-detection but
+                without a (page N) suffix.
+              - ordinals absent from the dict are download-only files
+                (e.g. videos) — staged to S3 but never uploaded.
+        page_labels: {ordinal: page_label_string} for every ordinal in
+            1..num_files. Pass to get_page_title(page=...). Empty string
+            means no (page N) suffix on the Commons title.
+    """
+    ordinal_exts: dict[int, str] = {}
+    if num_files > 1:
+        for i in range(1, num_files + 1):
+            s3_path = s3_client.get_media_s3_path(dpla_id, i, partner)
+            try:
+                s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
+                mime = s3_obj.content_type
+            except ClientError as e:
+                # Only treat "object not found" as a stub placeholder.
+                # Anything else (AccessDenied, InternalError, throttling) must
+                # surface so we never silently corrupt the page-label
+                # assignment on a transient S3 failure.
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    ordinal_exts[i] = ""
+                    continue
+                raise
+            if is_download_only(mime):
+                continue
+            if mime in ("application/octet-stream", "binary/octet-stream"):
+                ordinal_exts[i] = ""
+                continue
+            ext = mimetypes.guess_extension(mime)
+            ordinal_exts[i] = ext if ext and ext != MIME_UNKNOWN_EXT else ""
+
+    ext_counts: Counter[str] = Counter(ordinal_exts.values())
+    ext_seen: Counter[str] = Counter()
+    page_labels: dict[int, str] = {}
+    for ordinal in range(1, num_files + 1):
+        ext = ordinal_exts.get(ordinal, "")
+        if ext_counts[ext] > 1:
+            ext_seen[ext] += 1
+            page_labels[ordinal] = str(ext_seen[ext])
+        else:
+            page_labels[ordinal] = ""
+
+    return ordinal_exts, page_labels
 
 
 def license_to_markup_code(rights_uri: str) -> str:

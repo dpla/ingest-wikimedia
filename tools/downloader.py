@@ -164,9 +164,19 @@ class Downloader:
             raise RuntimeError(f"Failed downloading {media_url} to local") from e
 
     def _s3_key_age_days(self, s3_path: str) -> float | None:
-        """Return the age in days of an S3 object, or None if it does not exist."""
+        """Return the age in days of an S3 object, or None if it does not exist
+        or is a 0-byte stub left by a failed/interrupted download.
+
+        Treating 0-byte stubs as absent forces the downloader to re-attempt,
+        matching the design intent documented on S3Client.s3_file_exists.
+        Without this, a single corrupted download persists forever — the
+        uploader's pre-scan classifies the stub as "" placeholder, which
+        shifts every subsequent page-label and corrupts Commons numbering.
+        """
         try:
             obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
+            if int(obj.content_length or 0) == 0:
+                return None
             age = datetime.now(tz=timezone.utc) - obj.last_modified
             return age.total_seconds() / 86400
         except ClientError as e:

@@ -3,22 +3,25 @@
 End-to-end verification that every S3 file for a DPLA item has its exact
 sha1 landed at its intended Commons title.
 
-For each ordinal under the item's S3 prefix this script:
-  1. reads the S3 object's sha1 from the CHECKSUM metadata,
-  2. reconstructs the intended Commons title via get_page_title() using
-     the DPLA item's source title and the S3 object's MIME-derived
-     extension,
-  3. queries the Commons MediaWiki API for the file at that intended
-     title and compares its sha1 to S3.
+For each ordinal in the item's file_list this script:
+  1. reads the S3 object's sha1 + size + content-type,
+  2. uses compute_ordinal_exts_and_page_labels() — the same helper the
+     uploader uses — to determine the Commons page_label the bot would
+     have assigned to that ordinal (gap-squashing logic and all),
+  3. queries the Commons MediaWiki API for the file at the resulting
+     intended title and compares its sha1 to S3.
 
 Outcomes per ordinal:
   CORRECT  — Commons file at the intended title has sha1 == S3 sha1
   MISMATCH — file exists at the intended title with a different sha1
   REDIRECT — intended title is a redirect (S3 sha1 isn't at the right name)
   MISSING  — intended title has no page on Commons
+  SKIPPED  — the uploader would not have uploaded this ordinal (0-byte
+             stub, download-only mime, missing from S3, etc.). Reported
+             with a reason but does not count as a failure.
 
-Exits 0 only when every ordinal is CORRECT. Anything else exits 1 so the
-script can be wired into a CI gate or a deploy verification loop.
+Exits 0 only when every uploadable ordinal is CORRECT. Anything else
+exits 1 so the script can be wired into a deploy-verification loop.
 
 Usage:
     python3 tools/verify_item.py <dpla_id> <partner>
@@ -33,7 +36,6 @@ import email.utils
 import json
 import logging
 import mimetypes
-import re
 import sys
 import time
 import urllib.error
@@ -41,16 +43,23 @@ import urllib.parse
 import urllib.request
 
 import boto3
+from botocore.exceptions import ClientError
 
-from ingest_wikimedia.s3 import S3_BUCKET
+from ingest_wikimedia.common import get_dict, get_list
+from ingest_wikimedia.dpla import DC_TITLE_FIELD_NAME, SOURCE_RESOURCE_FIELD_NAME
+from ingest_wikimedia.s3 import S3_BUCKET, S3Client
 from ingest_wikimedia.tools_context import ToolsContext
-from ingest_wikimedia.wikimedia import extract_strings, get_page_title
+from ingest_wikimedia.wikimedia import (
+    check_content_type,
+    compute_ordinal_exts_and_page_labels,
+    get_page_title,
+    is_download_only,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 BATCH = 50
-DC_TITLE_FIELD = "title"  # under sourceResource
 DEFAULT_RETRY_AFTER_SECS = 30
 
 
@@ -68,13 +77,6 @@ def _parse_retry_after(value: str | None) -> int:
         return max(0, int((when - now).total_seconds()))
     except (TypeError, ValueError):
         return DEFAULT_RETRY_AFTER_SECS
-
-
-def s3_path_prefix(dpla_id: str, partner: str) -> str:
-    return (
-        f"{partner}/images/{dpla_id[0]}/{dpla_id[1]}/"
-        f"{dpla_id[2]}/{dpla_id[3]}/{dpla_id}/"
-    )
 
 
 def commons_api(params: dict) -> dict:
@@ -107,25 +109,31 @@ def commons_api(params: dict) -> dict:
     raise RuntimeError("Commons API retries exhausted")
 
 
-def list_s3_ordinals(dpla_id: str, partner: str) -> dict[int, tuple[str, str, str]]:
-    """Return {ordinal: (key, sha1, content_type)} for every media file under
-    the item's S3 prefix."""
-    s3 = boto3.client("s3")
-    prefix = s3_path_prefix(dpla_id, partner)
-    out: dict[int, tuple[str, str, str]] = {}
-    name_re = re.compile(r"^(\d+)_" + re.escape(dpla_id) + r"$")
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            m = name_re.match(key.rsplit("/", 1)[-1])
-            if not m:
-                continue
-            head = s3.head_object(Bucket=S3_BUCKET, Key=key)
-            sha1 = head.get("Metadata", {}).get("sha1", "")
-            ct = head.get("ContentType", "")
-            out[int(m.group(1))] = (key, sha1, ct)
-    return out
+def classify_ordinal(head: dict) -> tuple[str | None, str, str]:
+    """Inspect an S3 object's HEAD metadata and decide whether the uploader
+    would upload it. Returns (skip_reason_or_None, sha1, content_type).
+
+    Mirrors the runtime checks process_file() performs. When skip_reason is
+    None, the uploader would proceed and upload; otherwise the ordinal is
+    skipped and no Commons title should be checked.
+    """
+    sha1 = head.get("Metadata", {}).get("sha1", "")
+    ct = head.get("ContentType", "")
+    size = int(head.get("ContentLength", 0))
+    if size == 0:
+        return "zero_byte_stub", sha1, ct
+    if not check_content_type(ct):
+        return f"bad_content_type:{ct}", sha1, ct
+    if is_download_only(ct):
+        return "download_only", sha1, ct
+    if ct in ("application/octet-stream", "binary/octet-stream"):
+        # process_file does runtime libmagic re-detection; we can't predict
+        # its outcome without downloading the file.
+        return "octet_stream_needs_redetect", sha1, ct
+    ext = mimetypes.guess_extension(ct)
+    if not ext or ext == ".bin":
+        return f"unresolvable_ext:{ct}", sha1, ct
+    return None, sha1, ct
 
 
 def main() -> None:
@@ -134,50 +142,76 @@ def main() -> None:
     dpla_id, partner = sys.argv[1], sys.argv[2]
     logging.info(f"Verifying {dpla_id} (partner={partner})…")
 
-    # DPLA item title (needed to reconstruct the intended Commons titles)
     ctx = ToolsContext.init(partner)
     item_metadata = ctx.get_dpla().get_item_metadata(dpla_id)
     if not item_metadata:
         sys.exit(f"DPLA item {dpla_id} not found")
-    title_string = extract_strings(
-        item_metadata.get("sourceResource", {}), DC_TITLE_FIELD
+    # Use the same title selection as Uploader.process_item(): the FIRST
+    # value of sourceResource.title, not the joined extract_strings(...)
+    # representation. The uploader feeds titles[0] to get_page_title, so
+    # the verifier must do the same to reconstruct the exact filename.
+    titles = get_list(
+        get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME),
+        DC_TITLE_FIELD_NAME,
     )
+    title_string = titles[0] if titles else ""
     logging.info(f"  item title: {title_string}")
 
-    s3_files = list_s3_ordinals(dpla_id, partner)
-    if not s3_files:
-        sys.exit(f"No S3 ordinals under prefix {s3_path_prefix(dpla_id, partner)}")
-    ordinals = sorted(s3_files)
-    multipage = len(ordinals) > 1
-    logging.info(
-        f"  S3: {len(ordinals)} ordinals, range {ordinals[0]}..{ordinals[-1]}; "
-        f"{'multi-page' if multipage else 'single-page'}"
+    s3_client_obj = ctx.get_s3_client()
+    files = s3_client_obj.get_file_list(partner, dpla_id)
+    num_files = len(files)
+    if num_files == 0:
+        sys.exit(f"No files listed in file_list.txt for {dpla_id}")
+    logging.info(f"  total files in source list: {num_files}")
+
+    # Use the same helper the uploader uses to compute per-ordinal page labels
+    # so the intended Commons titles match exactly what the bot uploads to,
+    # including the gap-squashing per-extension counter logic.
+    _, page_labels = compute_ordinal_exts_and_page_labels(
+        s3_client_obj, dpla_id, partner, num_files
     )
 
-    def expected_title(ord_num: int, content_type: str) -> str:
-        ext = mimetypes.guess_extension(content_type) or ".jpg"
-        if ext == ".bin":
-            ext = ".jpg"
-        return get_page_title(
-            title_string, dpla_id, ext, ord_num if multipage else None
-        )
-
+    s3 = boto3.client("s3")
     correct = 0
     mismatches: list[dict] = []
     redirects: list[dict] = []
     missing: list[dict] = []
+    skipped: list[dict] = []  # uploader-skipped ordinals (stub, video, etc.)
+    title_to_ord: dict[str, tuple[int, str]] = {}
 
-    for i in range(0, len(ordinals), BATCH):
-        batch = ordinals[i : i + BATCH]
-        title_to_ord: dict[str, tuple[int, str]] = {}
-        for o in batch:
-            _, sha1, ct = s3_files[o]
-            title_to_ord[f"File:{expected_title(o, ct)}"] = (o, sha1)
+    for ord_num in range(1, num_files + 1):
+        s3_path = S3Client.get_media_s3_path(dpla_id, ord_num, partner)
+        try:
+            head = s3.head_object(Bucket=S3_BUCKET, Key=s3_path)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey"):
+                skipped.append({"ordinal": ord_num, "reason": "missing_in_s3"})
+                continue
+            raise
 
+        skip_reason, sha1, ct = classify_ordinal(head)
+        if skip_reason:
+            skipped.append({"ordinal": ord_num, "reason": skip_reason})
+            continue
+
+        ext = mimetypes.guess_extension(ct)
+        page_label = page_labels.get(ord_num, "")
+        title = get_page_title(title_string, dpla_id, ext, page_label or None)
+        title_to_ord[f"File:{title}"] = (ord_num, sha1)
+
+    logging.info(
+        f"  ordinals to verify: {len(title_to_ord)}  "
+        f"skipped by uploader: {len(skipped)}"
+    )
+
+    titles = list(title_to_ord.keys())
+    for i in range(0, len(titles), BATCH):
+        batch = titles[i : i + BATCH]
         data = commons_api(
             {
                 "action": "query",
-                "titles": "|".join(title_to_ord),
+                "titles": "|".join(batch),
                 "prop": "imageinfo|info",
                 "iiprop": "sha1",
             }
@@ -185,13 +219,14 @@ def main() -> None:
         pages = {p["title"]: p for p in data["query"]["pages"]}
         norm = {n["from"]: n["to"] for n in data["query"].get("normalized", [])}
 
-        for sent, (o, s3_sha1) in title_to_ord.items():
+        for sent in batch:
+            (ord_num, s3_sha1) = title_to_ord[sent]
             page = pages.get(norm.get(sent, sent))
             if not page or page.get("missing"):
-                missing.append({"ordinal": o, "title": sent})
+                missing.append({"ordinal": ord_num, "title": sent})
                 continue
             if page.get("redirect"):
-                redirects.append({"ordinal": o, "title": sent})
+                redirects.append({"ordinal": ord_num, "title": sent})
                 continue
             info = page.get("imageinfo") or []
             c_sha1 = info[0].get("sha1", "") if info else ""
@@ -200,7 +235,7 @@ def main() -> None:
             else:
                 mismatches.append(
                     {
-                        "ordinal": o,
+                        "ordinal": ord_num,
                         "title": sent,
                         "s3_sha1": s3_sha1,
                         "commons_sha1": c_sha1,
@@ -208,21 +243,27 @@ def main() -> None:
                 )
 
         logging.info(
-            f"  scanned {min(i + BATCH, len(ordinals))}/{len(ordinals)}  "
+            f"  scanned {min(i + BATCH, len(titles))}/{len(titles)}  "
             f"correct={correct} mismatch={len(mismatches)} "
             f"redirect={len(redirects)} missing={len(missing)}"
         )
 
-    total = len(ordinals)
-    all_correct = correct == total
+    all_correct = (
+        correct == len(title_to_ord)
+        and not mismatches
+        and not redirects
+        and not missing
+    )
     print("\n" + "=" * 70)
     print(f"VERIFICATION REPORT: {dpla_id}")
-    print(f"  item title:  {title_string}")
-    print(f"  S3 ordinals: {total}")
+    print(f"  item title:        {title_string}")
+    print(f"  total files in source list: {num_files}")
+    print(f"  ordinals checked:  {len(title_to_ord)}")
     print(f"  CORRECT (S3 sha1 == Commons sha1 at intended title): {correct}")
     print(f"  MISMATCH (different content):                        {len(mismatches)}")
     print(f"  REDIRECT at intended title:                          {len(redirects)}")
     print(f"  MISSING on Commons:                                  {len(missing)}")
+    print(f"  SKIPPED by uploader (stub/video/etc):                {len(skipped)}")
     print(f"  {'PASS ✓' if all_correct else 'FAIL ✗'}")
     print("=" * 70)
 
@@ -237,9 +278,19 @@ def main() -> None:
                 s3s = it.get("s3_sha1", "")
                 cs = it.get("commons_sha1", "")
                 detail = f"  S3 {s3s[:12]}…  Commons {cs[:12]}…" if s3s else ""
-                print(f"  page {it['ordinal']:4d}  {it['title']}{detail}")
+                print(f"  ord {it['ordinal']:4d}  {it['title']}{detail}")
             if len(items) > 40:
                 print(f"  …and {len(items) - 40} more")
+
+    if skipped:
+        print("\nSkipped by uploader (informational, not failures):")
+        by_reason: dict[str, list[int]] = {}
+        for s in skipped:
+            by_reason.setdefault(s["reason"], []).append(s["ordinal"])
+        for reason, ords in sorted(by_reason.items()):
+            preview = ", ".join(str(o) for o in ords[:10])
+            more = f" …and {len(ords) - 10} more" if len(ords) > 10 else ""
+            print(f"  {reason}: ords [{preview}{more}]")
 
     out_path = f"/tmp/verify_{dpla_id}.json"
     with open(out_path, "w") as f:
@@ -248,11 +299,13 @@ def main() -> None:
                 "dpla_id": dpla_id,
                 "partner": partner,
                 "title": title_string,
-                "total_ordinals": total,
+                "num_files": num_files,
+                "ordinals_checked": len(title_to_ord),
                 "correct": correct,
                 "mismatches": mismatches,
                 "redirects": redirects,
                 "missing": missing,
+                "skipped": skipped,
                 "pass": all_correct,
             },
             f,

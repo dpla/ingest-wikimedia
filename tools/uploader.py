@@ -4,9 +4,6 @@ import logging
 import mimetypes
 import random
 import time
-from collections import Counter
-
-from botocore.exceptions import ClientError
 
 import click
 import pywikibot
@@ -44,6 +41,7 @@ from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
     MIME_UNKNOWN_EXT,
+    compute_ordinal_exts_and_page_labels,
     get_page_title,
     get_wiki_text,
     wikimedia_url,
@@ -759,37 +757,11 @@ class Uploader:
 
             files = self.s3_client.get_file_list(partner, dpla_id)
 
-            # Pre-scan to resolve each file's extension from S3 content-type metadata.
-            # Files with distinct extensions represent the same content in different
-            # formats, not separate pages — page numbers are only assigned within
-            # groups that share the same extension and contain more than one file.
-            # Single-file items never need pagination so we skip the pre-scan for them.
-            ordinal_exts: dict[int, str] = {}
-            if len(files) > 1:
-                for i in range(1, len(files) + 1):
-                    s3_path = self.s3_client.get_media_s3_path(dpla_id, i, partner)
-                    try:
-                        s3_obj = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
-                        mime = s3_obj.content_type
-                    except ClientError:
-                        ordinal_exts[i] = ""
-                        continue
-                    # Download-only types (e.g. video) are never uploaded, so they
-                    # should not influence page numbering.
-                    if is_download_only(mime):
-                        continue
-                    # Generic MIME types are re-detected by libmagic in process_file;
-                    # use "" as a placeholder so they still get unique page labels.
-                    if mime in ("application/octet-stream", "binary/octet-stream"):
-                        ordinal_exts[i] = ""
-                        continue
-                    ext = mimetypes.guess_extension(mime)
-                    # Use "" for unresolvable extensions — process_file will skip
-                    # them, but the placeholder prevents page-title collisions.
-                    ordinal_exts[i] = ext if ext and ext != MIME_UNKNOWN_EXT else ""
-
-            ext_counts: Counter[str] = Counter(ordinal_exts.values())
-            ext_seen: Counter[str] = Counter()
+            # Pre-scan via the shared helper so the verifier can reconstruct
+            # the same page-label assignments without duplicating the logic.
+            _, page_labels = compute_ordinal_exts_and_page_labels(
+                self.s3_client, dpla_id, partner, len(files)
+            )
 
             for ordinal, _ in enumerate(
                 tqdm(
@@ -798,12 +770,7 @@ class Uploader:
                 start=1,
             ):
                 logging.info(f"Page {ordinal}")
-                ext = ordinal_exts.get(ordinal, "")
-                if ext_counts[ext] > 1:
-                    ext_seen[ext] += 1
-                    page_label = str(ext_seen[ext])
-                else:
-                    page_label = ""
+                page_label = page_labels.get(ordinal, "")
                 try:
                     self.process_file(
                         dpla_id,
