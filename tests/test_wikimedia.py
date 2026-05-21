@@ -7,6 +7,7 @@ from ingest_wikimedia.wikimedia import (
     get_permissions,
     escape_wiki_strings,
     join,
+    compute_ordinal_exts_and_page_labels,
     extract_page_ordinal_from_commons_title,
     extract_strings,
     extract_strings_dict,
@@ -332,3 +333,109 @@ def test_relic_intended_belongs_to_different_item_is_false():
     intended = f"Foo - DPLA - {other_id} (page 1).jpg"
     target = f"Foo - DPLA - {ITEM} (page 3).jpg"
     assert is_same_item_redirect_relic(intended, target, ITEM) is False
+
+
+# compute_ordinal_exts_and_page_labels — uploader-side gap-squashing
+def _fake_s3_client(mime_by_ord: dict[int, str | None]) -> MagicMock:
+    """Build a mock S3Client whose Object().content_type returns the configured
+    MIME per ordinal. None means the object doesn't exist (raises ClientError)."""
+    from botocore.exceptions import ClientError
+
+    s3_client = MagicMock()
+
+    def get_obj(bucket, path):
+        ord_num = int(path.rsplit("/", 1)[-1].split("_", 1)[0])
+        mime = mime_by_ord.get(ord_num)
+        if mime is None:
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "404"}}, "HeadObject"
+            )
+        obj = MagicMock()
+        obj.content_type = mime
+        return obj
+
+    boto3_resource = MagicMock()
+    boto3_resource.Object.side_effect = get_obj
+    s3_client.get_s3.return_value = boto3_resource
+    s3_client.get_media_s3_path.side_effect = lambda d, i, p: (
+        f"{p}/images/{d[0]}/{d[1]}/{d[2]}/{d[3]}/{d}/{i}_{d}"
+    )
+    return s3_client
+
+
+def test_page_labels_dense_jpegs_match_ordinal():
+    # Happy path: all 5 ordinals are valid jpegs → page_label == ordinal.
+    s3 = _fake_s3_client(
+        {
+            1: "image/jpeg",
+            2: "image/jpeg",
+            3: "image/jpeg",
+            4: "image/jpeg",
+            5: "image/jpeg",
+        }
+    )
+    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 5)
+    assert exts == {1: ".jpg", 2: ".jpg", 3: ".jpg", 4: ".jpg", 5: ".jpg"}
+    assert labels == {1: "1", 2: "2", 3: "3", 4: "4", 5: "5"}
+
+
+def test_page_labels_zero_byte_stub_squashes():
+    # Stub at ord 3 (octet-stream) shifts subsequent .jpg labels back by 1.
+    # This is the gap-squashing behavior the bot intentionally uses.
+    s3 = _fake_s3_client(
+        {
+            1: "image/jpeg",
+            2: "image/jpeg",
+            3: "binary/octet-stream",
+            4: "image/jpeg",
+            5: "image/jpeg",
+        }
+    )
+    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 5)
+    assert exts == {1: ".jpg", 2: ".jpg", 3: "", 4: ".jpg", 5: ".jpg"}
+    # ord 1-2 = "1","2"; ord 3 ext="" only one, page_label=""; ord 4-5 = "3","4"
+    assert labels == {1: "1", 2: "2", 3: "", 4: "3", 5: "4"}
+
+
+def test_page_labels_clienterror_treated_as_stub_placeholder():
+    # Missing S3 object — ordinal_exts gets "" placeholder per the
+    # "every continue path must write a placeholder slot" lesson.
+    s3 = _fake_s3_client({1: "image/jpeg", 2: None, 3: "image/jpeg"})
+    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
+    assert exts == {1: ".jpg", 2: "", 3: ".jpg"}
+    assert labels == {1: "1", 2: "", 3: "2"}
+
+
+def test_page_labels_single_file_item_no_pagination():
+    # num_files == 1 → no pre-scan, no page label, no (page N) suffix.
+    s3 = _fake_s3_client({1: "image/jpeg"})
+    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 1)
+    assert exts == {}
+    assert labels == {1: ""}
+
+
+def test_page_labels_mixed_extensions_per_ext_counter():
+    # 3 jpegs and 2 pdfs → each extension gets its own 1..N counter.
+    s3 = _fake_s3_client(
+        {
+            1: "image/jpeg",
+            2: "application/pdf",
+            3: "image/jpeg",
+            4: "application/pdf",
+            5: "image/jpeg",
+        }
+    )
+    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 5)
+    assert exts == {1: ".jpg", 2: ".pdf", 3: ".jpg", 4: ".pdf", 5: ".jpg"}
+    # jpg counter: ord 1→"1", ord 3→"2", ord 5→"3"
+    # pdf counter: ord 2→"1", ord 4→"2"
+    assert labels == {1: "1", 2: "1", 3: "2", 4: "2", 5: "3"}
+
+
+def test_page_labels_unique_extension_gets_empty_label():
+    # When only one file has a given extension, no (page N) suffix.
+    s3 = _fake_s3_client({1: "image/jpeg", 2: "image/jpeg", 3: "application/pdf"})
+    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
+    assert exts == {1: ".jpg", 2: ".jpg", 3: ".pdf"}
+    # ext_counts: .jpg→2, .pdf→1. Only .jpg gets page numbers.
+    assert labels == {1: "1", 2: "2", 3: ""}
