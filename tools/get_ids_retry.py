@@ -73,7 +73,7 @@ def parse_upload_log(path: Path) -> tuple[set[str], set[str]]:
     failures: set[str] = set()
     successes: set[str] = set()
     current_id: str | None = None
-    with open(path, errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = DPLA_ID_RE.search(line)
             if m:
@@ -90,7 +90,7 @@ def parse_download_log(path: Path) -> set[str]:
     """Return DPLA IDs that hit media-server download failures (non-empty URL)."""
     failed: set[str] = set()
     current_id: str | None = None
-    with open(path, errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = DOWNLOAD_FAILED_RE.search(line)
             if m:
@@ -148,7 +148,7 @@ def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[s
 
 def write_ids(path: Path, ids: set[str]) -> None:
     # Write-side counterpart to ingest_wikimedia.common.load_ids.
-    with open(path, "w", newline="") as f:
+    with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         for dpla_id in sorted(ids):
             writer.writerow([dpla_id])

@@ -59,8 +59,16 @@ from ingest_wikimedia.wikimedia import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+# Commons accepts up to 50 titles per query for unauthenticated requests;
+# matching that cap minimizes round-trips without triggering API limits.
 BATCH = 50
+# Fallback when a 429/503 response carries no Retry-After header. 30s is
+# Commons' usual maxlag retry window; long enough to clear most throttles.
 DEFAULT_RETRY_AFTER_SECS = 30
+# Inter-request courtesy delay between Commons API calls. Keeps sustained
+# request rate well under the unauthenticated ceiling so we never trigger
+# the per-IP limiter on long verification runs.
+INTER_REQUEST_SLEEP_SECS = 0.4
 
 
 def _parse_retry_after(value: str | None) -> int:
@@ -94,7 +102,7 @@ def commons_api(params: dict) -> dict:
     for attempt in range(8):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                time.sleep(0.4)
+                time.sleep(INTER_REQUEST_SLEEP_SECS)
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code in (429, 503):
