@@ -47,6 +47,10 @@ from ingest_wikimedia.slack import notify_phase_start
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
+# Maximum S3-write futures kept in memory at once. When the limit is reached
+# the ES scan pauses until one write completes, keeping peak RAM bounded
+# regardless of hub size.
+MAX_IN_FLIGHT = S3_WRITE_WORKERS * 20
 
 IIIF_MANIFEST_FIELD = "iiifManifest"
 MEDIA_MASTER_FIELD = "mediaMaster"
@@ -173,7 +177,9 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
             print("--collection cannot be empty.", file=sys.stderr)
             sys.exit(1)
         if institution is None:
-            print("--collection requires --institution to be specified.", file=sys.stderr)
+            print(
+                "--collection requires --institution to be specified.", file=sys.stderr
+            )
             sys.exit(1)
 
     try:
@@ -207,6 +213,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         futures: dict = {}
+        failed = 0
 
         while True:
             query = build_query(
@@ -254,10 +261,21 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
                 print(dpla_id)
 
+                # Keep the in-flight dict bounded so peak RAM stays constant
+                # regardless of hub size. When full, block until the earliest
+                # write completes before accepting more work.
+                if len(futures) >= MAX_IN_FLIGHT:
+                    done = next(as_completed(futures))
+                    try:
+                        done.result()
+                    except Exception as e:
+                        failed += 1
+                        logging.warning(f"S3 write failed for {futures[done]}: {e}")
+                    del futures[done]
+
             search_after = hits[-1]["sort"]
 
-        # Wait for all S3 writes and surface any errors.
-        failed = 0
+        # Drain remaining in-flight writes.
         for future in as_completed(futures):
             try:
                 future.result()
@@ -265,7 +283,8 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
                 failed += 1
                 logging.warning(f"S3 write failed for {futures[future]}: {e}")
         if failed:
-            print(f"Warning: {failed} S3 writes failed", file=sys.stderr)
+            print(f"Error: {failed} S3 writes failed", file=sys.stderr)
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
