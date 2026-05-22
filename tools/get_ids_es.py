@@ -30,11 +30,8 @@ consumed by the downloader and uploader:
     get-ids-es pa > pa/pa.csv
 """
 
-import json
-import logging
 import sys
-import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 import click
 import requests
@@ -44,13 +41,11 @@ from ingest_wikimedia.dpla import DPLA, DPLA_PARTNERS, INSTITUTIONS_URL
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.slack import notify_phase_start
+from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
-# Prevents the executor queue from growing unboundedly and holding thousands of
-# ES source documents in memory.
-_S3_QUEUE_DEPTH = S3_WRITE_WORKERS * 4
 
 IIIF_MANIFEST_FIELD = "iiifManifest"
 MEDIA_MASTER_FIELD = "mediaMaster"
@@ -145,10 +140,6 @@ def build_query(
     return query
 
 
-def _stage_to_s3(s3_client: S3Client, partner: str, dpla_id: str, source: dict) -> None:
-    s3_client.write_item_metadata(partner, dpla_id, json.dumps(source))
-
-
 @click.command()
 @click.argument("partner")
 @click.option(
@@ -207,20 +198,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
     s3_client = S3Client()
     search_after = None
 
-    s3_sem = threading.BoundedSemaphore(_S3_QUEUE_DEPTH)
-    failed = [0]
-    failed_lock = threading.Lock()
-
-    def _on_s3_done(dpla_id: str):
-        def callback(future: Future) -> None:
-            s3_sem.release()
-            exc = future.exception()
-            if exc:
-                with failed_lock:
-                    failed[0] += 1
-                logging.warning(f"S3 write failed for {dpla_id}: {exc}")
-
-        return callback
+    s3_sem, failed, _on_s3_done = make_s3_stage_context(S3_WRITE_WORKERS)
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         while True:
@@ -263,7 +241,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
                 s3_sem.acquire()
                 future = executor.submit(
-                    _stage_to_s3, s3_client, partner, dpla_id, source
+                    stage_item_to_s3, s3_client, partner, dpla_id, source
                 )
                 future.add_done_callback(_on_s3_done(dpla_id))
 
