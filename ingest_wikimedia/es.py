@@ -45,12 +45,7 @@ def post_es(query: dict) -> requests.Response:
     """
     signal.alarm(ES_HARD_TIMEOUT)
     try:
-        return requests.post(
-            ES_URL,
-            json=query,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
+        return requests.post(ES_URL, json=query, timeout=30)
     finally:
         signal.alarm(0)
 
