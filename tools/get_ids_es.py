@@ -209,13 +209,15 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
     s3_sem = threading.BoundedSemaphore(_S3_QUEUE_DEPTH)
     failed = [0]
+    failed_lock = threading.Lock()
 
     def _on_s3_done(dpla_id: str):
         def callback(future: Future) -> None:
             s3_sem.release()
             exc = future.exception()
             if exc:
-                failed[0] += 1
+                with failed_lock:
+                    failed[0] += 1
                 logging.warning(f"S3 write failed for {dpla_id}: {exc}")
 
         return callback
