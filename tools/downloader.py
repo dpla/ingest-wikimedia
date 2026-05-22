@@ -38,7 +38,9 @@ CREDENTIAL_RETRY_BASE_DELAY_SECS = 5
 
 class Downloader:
     """
-    A class to handle uploading files to S3.
+    Downloads partner media files from remote sources (IIIF manifests or
+    direct URLs in DPLA item metadata) and stages them to S3 for the
+    uploader to consume.
     """
 
     def __init__(
@@ -388,7 +390,11 @@ class Downloader:
                 logging.warning(f"Skipping {dpla_id} ordinal {count}: empty URL.")
                 self.tracker.increment(Result.SKIPPED)
                 continue
-            # hack to fix bad nara data
+            # NARA item URLs sporadically arrive with a malformed scheme of
+            # "https/..." (missing the colon) — repair before requesting.
+            # Root cause is upstream NARA metadata; safe to patch here because
+            # any genuine non-URL starting with "https/" would already be
+            # rejected by the HTTP fetch below.
             if media_url.startswith("https/"):
                 media_url = media_url.replace("https/", "https:/")
             logging.info(f"Downloading {partner} {dpla_id} {count} from {media_url}")

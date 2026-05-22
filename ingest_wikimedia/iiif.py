@@ -174,23 +174,20 @@ class IIIF:
 
     def get_iiif_urls(self, manifest: dict) -> list[str]:
         """
-        Extracts image URLs from IIIF manifest and returns them as a list
-        Currently only supports IIIF v2 and v3
+        Extracts image URLs from IIIF manifest and returns them as a list.
+        Currently only supports IIIF v2 and v3.
         """
-        # v2 or v3?
-        match manifest.get(JSON_LD_AT_CONTEXT, None):
-            case None:
-                raise ValueError("No IIIF version specified.")
-            case x if x == IIIF_PRESENTATION_API_MANIFEST_V3:
-                return self.iiif_v3_urls(manifest)
-            case x if x == IIIF_PRESENTATION_API_MANIFEST_V2:
-                return self.iiif_v2_urls(manifest)
-            case x if type(x) is list and IIIF_PRESENTATION_API_MANIFEST_V3 in x:
-                return self.iiif_v3_urls(manifest)
-            case x if type(x) is list and IIIF_PRESENTATION_API_MANIFEST_V2 in x:
-                return self.iiif_v2_urls(manifest)
-            case x:
-                raise ValueError(f"Unimplemented IIIF version: {x}")
+        context = manifest.get(JSON_LD_AT_CONTEXT)
+        if context is None:
+            raise ValueError("No IIIF version specified.")
+        # The @context can be a single URL or a list; normalize so we can
+        # check version membership uniformly.
+        contexts = context if isinstance(context, list) else [context]
+        if IIIF_PRESENTATION_API_MANIFEST_V3 in contexts:
+            return self.iiif_v3_urls(manifest)
+        if IIIF_PRESENTATION_API_MANIFEST_V2 in contexts:
+            return self.iiif_v2_urls(manifest)
+        raise ValueError(f"Unimplemented IIIF version: {context}")
 
     def get_iiif_manifest(self, url: str) -> dict | None:
         """
