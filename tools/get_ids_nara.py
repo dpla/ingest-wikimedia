@@ -21,12 +21,10 @@ Output: one DPLA ID per line to stdout. Redirect to produce the IDs CSV:
     get-ids-nara > nara/nara.csv
 """
 
-import json
 import logging
 import signal
 import sys
-import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 import click
 import requests
@@ -34,13 +32,11 @@ import requests
 from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.slack import notify_phase_start
+from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
 
 ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 4
-# Max S3 writes queued + in-flight at once — prevents the executor queue from
-# growing unboundedly and holding thousands of ES source documents in memory.
-_S3_QUEUE_DEPTH = S3_WRITE_WORKERS * 4
 PARTNER = "nara"
 NARA_PROVIDER = "National Archives and Records Administration"
 _ES_HARD_TIMEOUT = 120
@@ -264,10 +260,6 @@ def build_collection_queries() -> list[str]:
     return [b["key"] for b in eligible]
 
 
-def _stage_to_s3(s3_client: S3Client, dpla_id: str, source: dict) -> None:
-    s3_client.write_item_metadata(PARTNER, dpla_id, json.dumps(source))
-
-
 @click.command()
 def main() -> None:
     """Print wiki-eligible NARA DPLA IDs to stdout, one per line.
@@ -350,20 +342,7 @@ def main() -> None:
             )
         )
 
-    s3_sem = threading.BoundedSemaphore(_S3_QUEUE_DEPTH)
-    failed = [0]
-    failed_lock = threading.Lock()
-
-    def _on_s3_done(dpla_id: str):
-        def callback(future: Future) -> None:
-            s3_sem.release()
-            exc = future.exception()
-            if exc:
-                with failed_lock:
-                    failed[0] += 1
-                logging.warning(f"S3 write failed for {dpla_id}: {exc}")
-
-        return callback
+    s3_sem, failed, _on_s3_done = make_s3_stage_context(S3_WRITE_WORKERS)
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         for label, extra_filter in queries:
@@ -379,7 +358,9 @@ def main() -> None:
                 source["_staged_by_get_ids_es"] = True
 
                 s3_sem.acquire()
-                future = executor.submit(_stage_to_s3, s3_client, dpla_id, source)
+                future = executor.submit(
+                    stage_item_to_s3, s3_client, PARTNER, dpla_id, source
+                )
                 future.add_done_callback(_on_s3_done(dpla_id))
 
                 print(dpla_id)
