@@ -17,6 +17,7 @@ requirement.
 """
 
 import signal
+import threading
 from typing import Any
 
 import requests
@@ -42,7 +43,15 @@ def post_es(query: dict) -> requests.Response:
     main thread, providing a true ceiling on total request time.
 
     Raises TimeoutError if the request exceeds ES_HARD_TIMEOUT seconds.
+    Raises RuntimeError if called from a non-main thread — `signal.alarm()` is
+    a no-op from worker threads but the alarm still fires on the main thread,
+    silently corrupting whatever the main thread is doing.
     """
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError(
+            "post_es() must be called from the main thread "
+            "(SIGALRM-based timeout only works on the main thread)"
+        )
     signal.alarm(ES_HARD_TIMEOUT)
     try:
         return requests.post(ES_URL, json=query, timeout=30)
