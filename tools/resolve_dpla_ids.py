@@ -17,10 +17,9 @@ Output format (one line per ID):
 import json
 
 import click
-import requests
 
 from ingest_wikimedia.banlist import Banlist
-from ingest_wikimedia.es import ES_URL, check_es_response
+from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.partners import is_item_upload_eligible, resolve_slug
 from ingest_wikimedia.s3 import S3Client
@@ -38,13 +37,11 @@ def main(dpla_ids: tuple[str, ...]) -> None:
     s3_client = S3Client()
 
     # Single batched ES query for all IDs — avoids N round-trips.
-    resp = requests.post(
-        ES_URL,
-        json={
+    resp = post_es(
+        {
             "query": {"terms": {"id": list(dpla_ids)}},
             "size": len(dpla_ids),
-        },
-        timeout=10,
+        }
     )
     resp.raise_for_status()
     data = resp.json()
