@@ -360,6 +360,38 @@ def main() -> None:
             f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
         )
 
+    # Verify every requested partner has a working directory on EC2. Pywikibot
+    # expects per-partner config.toml / user-config.py / user-password.py /
+    # apicache; without them the pipeline's first `cd {base}` silently fails
+    # and Slack only sees the generic "pipeline step failed" message. Catching
+    # this here gives a clear, actionable error before any tmux work starts.
+    unique_pdirs = sorted({PARTNER_DIR.get(c, c) for c, _, _, _, _ in targets})
+    print(f"Checking partner directories exist: {unique_pdirs}")
+    check_cmd = "; ".join(
+        f"test -d /home/ec2-user/ingest-wikimedia/{shlex.quote(d)} || echo MISSING:{d}"
+        for d in unique_pdirs
+    )
+    try:
+        dir_check_out = ssm_run(ssm, check_cmd)
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to check partner directories: {e}")
+    missing_dirs = sorted(
+        line.split(":", 1)[1]
+        for line in dir_check_out.splitlines()
+        if line.startswith("MISSING:")
+    )
+    if missing_dirs:
+        missing_list = ", ".join(f"`{d}`" for d in missing_dirs)
+        _slack_fail(
+            response_url,
+            f"⚠️ Cannot launch `{session_name}`: partner directory missing on EC2"
+            f" for {missing_list}. Initialize each one by copying config.toml,"
+            f" user-config.py, and user-password.py from an existing partner dir"
+            f" (e.g. `cp -p /home/ec2-user/ingest-wikimedia/bpl/{{config.toml,"
+            f"user-config.py,user-password.py}} /home/ec2-user/ingest-wikimedia/"
+            f"<new-partner>/`).",
+        )
+
     # Check for any existing session that includes one of the requested targets.
     # Maps each requested label to the existing session name(s) it conflicts with.
     print(f"Checking for existing sessions that overlap with {session_name}...")
