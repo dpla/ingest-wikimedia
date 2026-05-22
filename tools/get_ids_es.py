@@ -38,12 +38,12 @@ import requests
 
 from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.dpla import DPLA, DPLA_PARTNERS, INSTITUTIONS_URL
+from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
 
-ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
 
@@ -205,14 +205,10 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
             query = build_query(
                 provider_name, eligible_dp_names, collection, search_after
             )
-            response = requests.post(
-                ES_URL,
-                json=query,
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            )
+            response = post_es(query)
             response.raise_for_status()
             page = response.json()
+            check_es_response(page)
             hits = page["hits"]["hits"]
 
             if not hits:

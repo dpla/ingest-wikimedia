@@ -22,24 +22,21 @@ Output: one DPLA ID per line to stdout. Redirect to produce the IDs CSV:
 """
 
 import logging
-import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import click
-import requests
 
 from ingest_wikimedia.banlist import Banlist
+from ingest_wikimedia.es import ES_HARD_TIMEOUT, check_es_response, post_es
 from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
 
-ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 4
 PARTNER = "nara"
 NARA_PROVIDER = "National Archives and Records Administration"
-_ES_HARD_TIMEOUT = 120
 
 # --- Tunable priority thresholds ---
 # Collections or formats exceeding these counts are deferred to future runs,
@@ -118,10 +115,10 @@ def _fetch_buckets(field: str, extra_filters: list[dict] | None = None) -> list[
             },
             "aggs": {"values": {"composite": composite_agg}},
         }
-        response = _post_es(query)
+        response = post_es(query)
         response.raise_for_status()
         data = response.json()
-        _check_es_response(data)
+        check_es_response(data)
 
         page = data["aggregations"]["values"]
         # Composite agg buckets: {"key": {"key": <value>}, "doc_count": N}
@@ -134,46 +131,6 @@ def _fetch_buckets(field: str, extra_filters: list[dict] | None = None) -> list[
             break
 
     return buckets
-
-
-def _es_alarm_handler(signum: int, frame: object) -> None:
-    raise TimeoutError(f"ES query exceeded {_ES_HARD_TIMEOUT}s")
-
-
-# Registered once at import time; only signal.alarm() is toggled per request.
-signal.signal(signal.SIGALRM, _es_alarm_handler)
-
-
-def _post_es(query: dict) -> requests.Response:
-    """POST to ES_URL with a hard wall-clock timeout via SIGALRM.
-
-    requests timeout=30 fires only when no bytes arrive for 30s — it cannot
-    catch ES stalling mid-response (drip-feeding bytes or holding an open
-    connection indefinitely). SIGALRM interrupts the blocked socket read in the
-    main thread, providing a true ceiling on total request time.
-
-    Raises TimeoutError if the request exceeds _ES_HARD_TIMEOUT seconds.
-    """
-    signal.alarm(_ES_HARD_TIMEOUT)
-    try:
-        return requests.post(
-            ES_URL,
-            json=query,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-    finally:
-        signal.alarm(0)
-
-
-def _check_es_response(data: dict) -> None:
-    if data.get("timed_out"):
-        raise RuntimeError("Elasticsearch query timed out — results may be incomplete")
-    shards = data.get("_shards", {})
-    if shards.get("failed", 0) > 0:
-        raise RuntimeError(
-            f"Elasticsearch query had {shards['failed']} shard failure(s)"
-        )
 
 
 def _paginate(extra_filter: dict):
@@ -197,16 +154,16 @@ def _paginate(extra_filter: dict):
         if search_after is not None:
             query["search_after"] = search_after
         try:
-            response = _post_es(query)
+            response = post_es(query)
         except TimeoutError:
             logging.warning(
                 "ES paginate query timed out after %ds — skipping remaining pages for this batch",
-                _ES_HARD_TIMEOUT,
+                ES_HARD_TIMEOUT,
             )
             return
         response.raise_for_status()
         data = response.json()
-        _check_es_response(data)
+        check_es_response(data)
         hits = data["hits"]["hits"]
         if not hits:
             break

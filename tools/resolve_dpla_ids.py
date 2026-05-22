@@ -20,11 +20,11 @@ import click
 import requests
 
 from ingest_wikimedia.banlist import Banlist
+from ingest_wikimedia.es import ES_URL, check_es_response
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.partners import is_item_upload_eligible, resolve_slug
 from ingest_wikimedia.s3 import S3Client
 
-ES_URL = "http://search-prod1.internal.dp.la:9200/dpla_alias/_search"
 _IIIF_MANIFEST_FIELD = "iiifManifest"
 _MEDIA_MASTER_FIELD = "mediaMaster"
 _IS_SHOWN_AT_FIELD = "isShownAt"
@@ -48,13 +48,7 @@ def main(dpla_ids: tuple[str, ...]) -> None:
     )
     resp.raise_for_status()
     data = resp.json()
-    if data.get("timed_out"):
-        raise RuntimeError("Elasticsearch query timed out — results may be incomplete")
-    shards = data.get("_shards", {})
-    if shards.get("failed", 0) > 0:
-        raise RuntimeError(
-            f"Elasticsearch query had {shards['failed']} shard failure(s)"
-        )
+    check_es_response(data)
     hits = data.get("hits", {}).get("hits", [])
     found: dict[str, dict] = {hit["_source"]["id"]: hit["_source"] for hit in hits}
 
