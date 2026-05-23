@@ -55,6 +55,104 @@ def is_download_only(content_type: str) -> bool:
     return content_type in DOWNLOAD_ONLY_CONTENT_TYPES
 
 
+def _break_query_string_pattern(title: str) -> str:
+    """Break the `&...=` query-string blacklist pattern only when both chars
+    are present.
+
+    The bot's older "always replace `&` with `+` and `=` with `-`" behavior
+    was over-eager: titles containing only one of the two are not rejected
+    by Commons (the blacklist rule the lesson cites needs both, in order,
+    to look like a URL query string). Over-replacing forced drift-correction
+    renames of perfectly good Commons titles like
+    `... suffragiis & orationibus. - DPLA - …` into the uglier
+    `... suffragiis + orationibus. - DPLA - …` form.
+
+    Only when both characters appear in the same title do we substitute, so
+    legitimate use of either character alone is preserved.
+    """
+    if "&" in title and "=" in title:
+        return title.replace("&", "+").replace("=", "-")
+    return title
+
+
+# All Commons namespace canonical names + aliases as of 2026-05-23 (snapshot of
+# `action=query&meta=siteinfo&siprop=namespaces|namespacealiases`). If the
+# prefix of an item title (before the first `:`) matches one of these, the
+# API would mis-route the upload into that namespace. The list is stable in
+# practice; if Commons adds a namespace later, the worst case is the new
+# prefix is treated as title text rather than a namespace alias — same as
+# the old unconditional `:` → `-` replacement, never worse.
+_MW_NAMESPACE_PREFIXES: frozenset[str] = frozenset(
+    [
+        "campaign",
+        "campaign talk",
+        "cat",
+        "category",
+        "category talk",
+        "com",
+        "commons",
+        "commons talk",
+        "creator",
+        "creator talk",
+        "data",
+        "data talk",
+        "event",
+        "event talk",
+        "file",
+        "file talk",
+        "help",
+        "help talk",
+        "image",
+        "image talk",
+        "institution",
+        "institution talk",
+        "media",
+        "mediawiki",
+        "mediawiki talk",
+        "module",
+        "module talk",
+        "museum",
+        "museum talk",
+        "project",
+        "project talk",
+        "sequence",
+        "sequence talk",
+        "special",
+        "talk",
+        "template",
+        "template talk",
+        "timedtext",
+        "timedtext talk",
+        "topic",
+        "translations",
+        "translations talk",
+        "user",
+        "user talk",
+    ]
+)
+
+
+def _break_namespace_prefix_colon(title: str) -> str:
+    """If a title begins with `<namespace>:`, replace just that first colon
+    with `-` so the API doesn't mis-parse the upload as a `<namespace>:<rest>`
+    page in the wrong namespace. Mid-title colons (which Commons accepts
+    fine — e.g. `Boston, Mass.: City Hall`) are left intact.
+
+    DPLA records occasionally start with strings like `Image: …` or
+    `Media: …`; under the old unconditional `:` → `-` rule these were
+    correctly safe but every *other* mid-title colon got mangled too.
+    """
+    head, sep, _tail = title.partition(":")
+    if not sep:
+        return title
+    # MediaWiki treats spaces and underscores as equivalent in namespace
+    # names, and case-folds the first letter; normalise both before lookup.
+    normalised = head.strip().replace("_", " ").lower()
+    if normalised in _MW_NAMESPACE_PREFIXES:
+        return title.replace(":", "-", 1)
+    return title
+
+
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
@@ -63,17 +161,13 @@ def get_page_title(
     the title of the image.
     """
     escaped_title = (
-        item_title[:181]
+        _break_namespace_prefix_colon(_break_query_string_pattern(item_title[:181]))
         .replace("''", '"')  # titleblacklist: double-apostrophe rule → double-quote
-        .replace("&", "+")  # titleblacklist: query-string pattern (&...=)
-        .replace("=", "-")  # titleblacklist: query-string pattern (&...=)
-        .replace("[", "(")
-        .replace("]", ")")
-        .replace("{", "(")
-        .replace("}", ")")
-        .replace("/", "-")
-        .replace(":", "-")
-        .replace("#", "-")
+        .replace("[", "(")  # MediaWiki: forbidden in page names
+        .replace("]", ")")  # MediaWiki: forbidden in page names
+        .replace("{", "(")  # MediaWiki: forbidden in page names
+        .replace("}", ")")  # MediaWiki: forbidden in page names
+        .replace("#", "-")  # MediaWiki: forbidden (URL fragment separator)
         .replace(
             "|", "-"
         )  # wikitext table/link syntax; breaks Commons extension detection
