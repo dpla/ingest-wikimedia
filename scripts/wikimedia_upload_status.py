@@ -7,6 +7,7 @@ the /wikimedia-status Slack slash command via Lambda).
 
 import logging
 import os
+import re
 import shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,6 +20,21 @@ from ingest_wikimedia.ssm import REGION, ssm_run
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
+
+
+def log_filename_pattern_for_label(label: str) -> str:
+    """Anchored regex matching log filenames for exactly this label.
+
+    Log filenames follow "{YYYYMMDD}-{HHMMSS}-{label}-(download|upload).log".
+    The pattern must match `…-bpl+phillips-academy-download.log` and NOT
+    `…-bpl+phillips-academy-andover-download.log` — otherwise sibling
+    labels whose names extend this one steal the log selection and the
+    status report sticks on the wrong target. See lessons.md
+    "Log filename phase detection".
+    """
+    return rf"-{re.escape(label)}-(download|upload)\.log$"
+
+
 _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 # A session that hasn't written a log line in this many seconds is considered hung.
 # Uploads normally complete items in seconds; downloads in seconds to low minutes.
@@ -39,11 +55,11 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
 
     # Get session creation time and most recent log for this label — no shell
     # variables needed, avoiding outer-bash expansion of $f inside bash -c.
-    label_prefix = shlex.quote(label + "-")
+    label_pattern = shlex.quote(log_filename_pattern_for_label(label))
     precheck = ssm_run(
         client,
         f"tmux display-message -t {session_name} -p '#{{session_created}}' 2>/dev/null || echo 0; "
-        f"ls -t {log_dir}/ 2>/dev/null | grep -F {label_prefix} | head -1",
+        f"ls -t {log_dir}/ 2>/dev/null | grep -E {label_pattern} | head -1",
     )
     precheck_lines = precheck.splitlines()
     session_created = _safe_int(precheck_lines[0]) if precheck_lines else 0
