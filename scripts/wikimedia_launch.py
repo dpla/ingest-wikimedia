@@ -515,8 +515,10 @@ def main() -> None:
     # notify_fail_cmd uses single-quoted Python inside a double-quoted tmux argument.
     # Single quotes are literal characters inside double-quoted bash strings, so the
     # inner Python code reaches the interpreter verbatim without needing any escaping.
+    # `rc=$?` captures the failing step's exit code so the Slack message can decode
+    # signals like 137 (SIGKILL / probable OOM) and 143 (SIGTERM).
     notify_fail_cmd = (
-        "python3 -c "
+        "rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c "
         "'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'"
     )
     setup = " && ".join(
@@ -526,7 +528,10 @@ def main() -> None:
         ]
     )
     target_blocks = []
-    for canonical, institution, session_label, dpla_id, collection in targets:
+    last_idx = len(targets) - 1
+    for idx, (canonical, institution, session_label, dpla_id, collection) in enumerate(
+        targets
+    ):
         pdir = PARTNER_DIR.get(canonical, canonical)
         base = f"/home/ec2-user/ingest-wikimedia/{pdir}"
         # Use a per-target CSV filename so concurrent institution-level and
@@ -554,8 +559,21 @@ def main() -> None:
             if dpla_id is not None
             else "unset WIKIMEDIA_SINGLE_ITEM"
         )
+        # WIKIMEDIA_PARTNER_DIR is read by notify_pipeline_fail() to locate
+        # the most recent log for this target and include a tail + counts in
+        # the Slack failure message.  WIKIMEDIA_TARGET_IS_LAST switches the
+        # failure suffix language ("no further targets in batch" vs
+        # "skipping to next target"); the unset is required so a failure
+        # earlier in the batch doesn't inherit a stale "is last" flag.
+        is_last_env = (
+            "export WIKIMEDIA_TARGET_IS_LAST=1"
+            if idx == last_idx
+            else "unset WIKIMEDIA_TARGET_IS_LAST"
+        )
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
+            f"export WIKIMEDIA_PARTNER_DIR={shlex.quote(base)}; "
+            f"{is_last_env}; "
             f"{single_item_env}"
         )
         dl_age_opt = (
