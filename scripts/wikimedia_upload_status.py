@@ -55,11 +55,17 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
 
     # Get session creation time and most recent log for this label — no shell
     # variables needed, avoiding outer-bash expansion of $f inside bash -c.
+    #
+    # The anchored regex from log_filename_pattern_for_label starts with `-`,
+    # which without `--` makes grep interpret the pattern as a command-line
+    # option flag (e.g. `-b`/`-p`/`-l`...) and emit "invalid option" errors.
+    # The `--` terminator forces grep to treat the next argument as the
+    # pattern. See lessons.md "grep patterns starting with `-`".
     label_pattern = shlex.quote(log_filename_pattern_for_label(label))
     precheck = ssm_run(
         client,
         f"tmux display-message -t {session_name} -p '#{{session_created}}' 2>/dev/null || echo 0; "
-        f"ls -t {log_dir}/ 2>/dev/null | grep -E {label_pattern} | head -1",
+        f"ls -t {log_dir}/ 2>/dev/null | grep -E -- {label_pattern} | head -1",
     )
     precheck_lines = precheck.splitlines()
     session_created = _safe_int(precheck_lines[0]) if precheck_lines else 0
