@@ -66,14 +66,21 @@ def _find_latest_log(partner_dir: str, label: str) -> str | None:
     """Return the most recently modified log file matching this label, or None.
 
     Logs are named `{timestamp}-{label}-{phase}.log` under `<partner_dir>/logs/`.
+    Tolerates the rare race where a candidate disappears between glob and stat —
+    raising OSError here would suppress the Slack failure notification entirely.
     """
     if not partner_dir or not os.path.isdir(partner_dir):
         return None
     pattern = os.path.join(partner_dir, "logs", f"*-{label}-*.log")
-    candidates = glob.glob(pattern)
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getmtime)
+    newest: tuple[float, str] | None = None
+    for path in glob.glob(pattern):
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, path)
+    return newest[1] if newest is not None else None
 
 
 # Counted markers shown in the failure summary.  Patterns match what the
