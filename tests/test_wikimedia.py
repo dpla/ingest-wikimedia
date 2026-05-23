@@ -95,6 +95,55 @@ def test_get_page_title_breaks_query_string_when_both_present():
     assert "filter-value+other-thing" in title
 
 
+def test_get_page_title_preserves_slash():
+    """Slashes are valid in Commons File: titles — no subpage handling in
+    File namespace — and must NOT be rewritten to `-`."""
+    title = get_page_title("Page 1/2 of the survey", "abcd" * 8, ".jpg")
+    assert "/" in title
+    assert "Page 1/2 of the survey" in title
+
+
+def test_get_page_title_preserves_mid_title_colon():
+    """Colons mid-title are valid on Commons (e.g. `Boston, Mass.: City Hall`)
+    and must NOT be rewritten when there's no namespace prefix."""
+    title = get_page_title("Boston, Mass.: City Hall", "abcd" * 8, ".jpg")
+    assert ":" in title
+    assert "Boston, Mass.: City Hall" in title
+
+
+def test_get_page_title_breaks_namespace_prefix_colon():
+    """When a title begins with `<namespace>:`, the first colon must be
+    replaced so the API doesn't mis-route the upload into that namespace."""
+    # `Image:` is a File namespace alias on Commons — would re-route the upload.
+    title = get_page_title("Image: New England farmhouse", "abcd" * 8, ".jpg")
+    # First colon (the namespace-collision one) → `-`
+    assert title.startswith("Image- New England farmhouse")
+
+
+def test_get_page_title_namespace_prefix_check_is_case_insensitive():
+    """MediaWiki case-folds the first letter of namespace names."""
+    for prefix in ("image:", "IMAGE:", "Image :", "image  :"):
+        title = get_page_title(f"{prefix} test", "abcd" * 8, ".jpg")
+        assert ":" not in title.split(" - DPLA -")[0], (
+            f"Namespace prefix {prefix!r} should have triggered colon replacement"
+        )
+
+
+def test_get_page_title_only_breaks_first_colon_when_namespace_match():
+    """Even when the prefix matches a namespace, only the FIRST colon is
+    replaced — any later colons in the title are mid-title and preserved."""
+    title = get_page_title("Image: Boston, Mass.: City Hall", "abcd" * 8, ".jpg")
+    # First `:` after `Image` is replaced, but the mid-title `:` after `Mass.` survives.
+    assert title.startswith("Image- Boston, Mass.:")
+
+
+def test_get_page_title_passes_through_non_namespace_prefix():
+    """A `:` after non-namespace text must be preserved."""
+    title = get_page_title("Notes:1865 inventory", "abcd" * 8, ".jpg")
+    # `Notes` is not a namespace; the `:` stays.
+    assert title.startswith("Notes:1865 inventory")
+
+
 def test_license_to_markup_code():
     rights_uri = "http://creativecommons.org/licenses/by/4.0/"
     markup_code = license_to_markup_code(rights_uri)

@@ -75,6 +75,84 @@ def _break_query_string_pattern(title: str) -> str:
     return title
 
 
+# All Commons namespace canonical names + aliases as of 2026-05-23 (snapshot of
+# `action=query&meta=siteinfo&siprop=namespaces|namespacealiases`). If the
+# prefix of an item title (before the first `:`) matches one of these, the
+# API would mis-route the upload into that namespace. The list is stable in
+# practice; if Commons adds a namespace later, the worst case is the new
+# prefix is treated as title text rather than a namespace alias — same as
+# the old unconditional `:` → `-` replacement, never worse.
+_MW_NAMESPACE_PREFIXES: frozenset[str] = frozenset(
+    [
+        "campaign",
+        "campaign talk",
+        "cat",
+        "category",
+        "category talk",
+        "com",
+        "commons",
+        "commons talk",
+        "creator",
+        "creator talk",
+        "data",
+        "data talk",
+        "event",
+        "event talk",
+        "file",
+        "file talk",
+        "help",
+        "help talk",
+        "image",
+        "image talk",
+        "institution",
+        "institution talk",
+        "media",
+        "mediawiki",
+        "mediawiki talk",
+        "module",
+        "module talk",
+        "museum",
+        "museum talk",
+        "project",
+        "project talk",
+        "sequence",
+        "sequence talk",
+        "special",
+        "talk",
+        "template",
+        "template talk",
+        "timedtext",
+        "timedtext talk",
+        "topic",
+        "translations",
+        "translations talk",
+        "user",
+        "user talk",
+    ]
+)
+
+
+def _break_namespace_prefix_colon(title: str) -> str:
+    """If a title begins with `<namespace>:`, replace just that first colon
+    with `-` so the API doesn't mis-parse the upload as a `<namespace>:<rest>`
+    page in the wrong namespace. Mid-title colons (which Commons accepts
+    fine — e.g. `Boston, Mass.: City Hall`) are left intact.
+
+    DPLA records occasionally start with strings like `Image: …` or
+    `Media: …`; under the old unconditional `:` → `-` rule these were
+    correctly safe but every *other* mid-title colon got mangled too.
+    """
+    head, sep, _tail = title.partition(":")
+    if not sep:
+        return title
+    # MediaWiki treats spaces and underscores as equivalent in namespace
+    # names, and case-folds the first letter; normalise both before lookup.
+    normalised = head.strip().replace("_", " ").lower()
+    if normalised in _MW_NAMESPACE_PREFIXES:
+        return title.replace(":", "-", 1)
+    return title
+
+
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
@@ -83,15 +161,13 @@ def get_page_title(
     the title of the image.
     """
     escaped_title = (
-        _break_query_string_pattern(item_title[:181])
+        _break_namespace_prefix_colon(_break_query_string_pattern(item_title[:181]))
         .replace("''", '"')  # titleblacklist: double-apostrophe rule → double-quote
-        .replace("[", "(")
-        .replace("]", ")")
-        .replace("{", "(")
-        .replace("}", ")")
-        .replace("/", "-")
-        .replace(":", "-")
-        .replace("#", "-")
+        .replace("[", "(")  # MediaWiki: forbidden in page names
+        .replace("]", ")")  # MediaWiki: forbidden in page names
+        .replace("{", "(")  # MediaWiki: forbidden in page names
+        .replace("}", ")")  # MediaWiki: forbidden in page names
+        .replace("#", "-")  # MediaWiki: forbidden (URL fragment separator)
         .replace(
             "|", "-"
         )  # wikitext table/link syntax; breaks Commons extension detection
