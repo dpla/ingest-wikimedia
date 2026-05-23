@@ -27,7 +27,7 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
-from ingest_wikimedia.categories import CategoryEnsurer
+from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
@@ -863,12 +863,56 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
         logging.info("\n" + str(tracker))
         logging.info(f"{elapsed} seconds.")
         local_fs.cleanup_temp_dir()
+        # Touch files for any institutions we set up this session.  Closes the
+        # Wikidata-replication-lag race that lands first-batch files in the
+        # "unknown institution" category; without this we rely on a periodic
+        # run of fix-unknown-categories to clean up after the fact.  The 10s
+        # pause is a cheap belt-and-suspenders against very-late ensure()
+        # calls — for typical runs replication has settled long before this.
+        _post_upload_touch_new_institutions(commons_site, category_ensurer, dry_run)
         notify_upload_complete(
             tracker=tracker,
             partner_label=f"wikimedia-{partner}",
             elapsed_seconds=elapsed,
             dry_run=dry_run,
         )
+
+
+# Wait between the last ensure() and the first touch.  Wikidata→Commons
+# replication is usually sub-second but we've seen first-file misses in
+# practice, so give it real headroom.  Only paid when there's something to
+# touch, which is the rare "new institution this session" case.
+_REPLICATION_SETTLE_SECS = 10
+
+
+def _post_upload_touch_new_institutions(
+    commons_site, category_ensurer: CategoryEnsurer, dry_run: bool
+) -> None:
+    """At end-of-run, force-rerender files for any institutions whose P8464
+    was first added this session — see touch_institution_files() docstring."""
+    if not category_ensurer or dry_run:
+        return
+    newly_created = category_ensurer.newly_created
+    if not newly_created:
+        return
+    logging.info(
+        f"Touching files for {len(newly_created)} newly-created institution(s) "
+        f"to clear any Wikidata-replication race; sleeping "
+        f"{_REPLICATION_SETTLE_SECS}s first..."
+    )
+    time.sleep(_REPLICATION_SETTLE_SECS)
+    total = 0
+    for inst_qid in sorted(newly_created):
+        try:
+            n = touch_institution_files(commons_site, inst_qid)
+        except Exception as e:
+            logging.warning(f"Search/touch for {inst_qid} failed: {e}")
+            continue
+        logging.info(f"  Touched {n} files for {inst_qid}")
+        total += n
+    logging.info(
+        f"Post-upload touch complete: {total} files across {len(newly_created)} institution(s)"
+    )
 
 
 if __name__ == "__main__":

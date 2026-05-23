@@ -16,7 +16,7 @@ import time
 import click
 import pywikibot
 
-from ingest_wikimedia.categories import CategoryEnsurer
+from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.wikimedia import get_site, get_wikidata_site
 
@@ -118,19 +118,7 @@ def main(verbose: bool) -> None:
 
         # Touch all Commons file pages for this institution so the Wikidata Infobox
         # template re-evaluates and moves them out of the unknown-institution category.
-        count = 0
-        for page in commons_site.search(
-            f'insource:"Institution" insource:"wikidata = {institution_qid}"',
-            namespaces=[6],
-        ):
-            if verbose:
-                logging.info(f"  Touching: {page.title()}")
-            try:
-                page.touch()
-                count += 1
-            except Exception as e:
-                logging.warning(f"Failed to touch '{page.title()}'", exc_info=e)
-
+        count = touch_institution_files(commons_site, institution_qid, log_each=verbose)
         files_touched += count
         logging.info(f"Touched {count} files for {institution_name}")
 

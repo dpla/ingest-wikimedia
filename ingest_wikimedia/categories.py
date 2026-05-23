@@ -31,8 +31,24 @@ class CategoryEnsurer:
         self.commons_site = commons_site
         self.dry_run = dry_run
         self._ensured: set[str] = set()
+        # Institutions for which this session actually created new P8464
+        # infrastructure (i.e. took the slow path in ensure()).  Callers can read
+        # this to know whose files may have lost the race against Wikidata
+        # replication lag and should be touched after upload to force re-render.
+        self._newly_created: set[str] = set()
         self._hub_category_qids: dict[str, str] = {}
         self._wikidata_repo: BaseSite | None = None
+
+    @property
+    def newly_created(self) -> set[str]:
+        """Q-IDs of institutions whose P8464 was first added in this session.
+
+        Subsequent uploads of these institutions' files can race Wikidata's
+        replication to Commons and land in `Media contributed by the Digital
+        Public Library of America with unknown institution`.  See
+        :func:`touch_institution_files`.
+        """
+        return self._newly_created.copy()
 
     @property
     def _repo(self) -> BaseSite:
@@ -115,6 +131,10 @@ class CategoryEnsurer:
         logging.info(f"Added P8464 to {institution_qid} → {category_qid}")
 
         self._ensured.add(institution_qid)
+        # Reaching this point means we actually wrote new infrastructure this
+        # session.  Track separately so callers can force-rerender the
+        # institution's files once Wikidata replication has settled.
+        self._newly_created.add(institution_qid)
 
     def _get_hub_category_qid(self, hub_institution_qid: str) -> str:
         """
@@ -261,3 +281,42 @@ class CategoryEnsurer:
             self._item_claim("P8464", category_qid),
             summary="Add Commons content partnership category.",
         )
+
+
+def touch_institution_files(
+    commons_site: BaseSite,
+    institution_qid: str,
+    log_each: bool = False,
+) -> int:
+    """Force-rerender all Commons file pages that reference this institution.
+
+    Used to clear the Wikidata-replication-lag race: when CategoryEnsurer first
+    adds a ``P8464`` claim to an institution's Wikidata item, files uploaded in
+    the seconds immediately after may have rendered before the claim
+    propagated to Commons' Wikibase client cache.  Those files land in
+    ``Category:Media contributed by the Digital Public Library of America with
+    unknown institution`` and stay there until something forces re-render.
+
+    A null edit (``page.touch()``) is enough — MediaWiki re-expands the
+    ``{{ Institution | wikidata = Q… }}`` template, picks up the now-visible
+    ``P8464``, and the file moves to the correct category.
+
+    If ``log_each`` is True, every touched file is logged at INFO level (used
+    by ``fix-unknown-categories --verbose``).  Per-page errors are always
+    logged as warnings and counted as failures but don't abort the loop.
+
+    Returns the number of files successfully touched.
+    """
+    count = 0
+    for page in commons_site.search(
+        f'insource:"Institution" insource:"wikidata = {institution_qid}"',
+        namespaces=[6],
+    ):
+        if log_each:
+            logging.info(f"  Touching: {page.title()}")
+        try:
+            page.touch()
+            count += 1
+        except Exception as e:
+            logging.warning(f"Failed to touch '{page.title()}'", exc_info=e)
+    return count
