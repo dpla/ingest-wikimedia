@@ -125,11 +125,16 @@ def notify_pipeline_fail() -> None:
     """Post a pipeline-step failure notification to Slack.
 
     Reads from the environment:
-      DPLA_SLACK_BOT_TOKEN   — required to post
-      WIKIMEDIA_SESSION_LABEL — identifies the target in the message
-      WIKIMEDIA_LAST_EXIT    — exit code of the failed step (best-effort)
-      WIKIMEDIA_PARTNER_DIR  — absolute path to the partner dir, used to
-                               locate the most recent log for tailing
+      DPLA_SLACK_BOT_TOKEN     — required to post
+      WIKIMEDIA_SESSION_LABEL  — identifies the target in the message
+      WIKIMEDIA_LAST_EXIT      — exit code of the failed step (best-effort)
+      WIKIMEDIA_PARTNER_DIR    — absolute path to the partner dir, used to
+                                 locate the most recent log for tailing
+      WIKIMEDIA_TARGET_IS_LAST — "1" iff this is the final target in the
+                                 batch; switches the message suffix from
+                                 "skipping to next target" to "no further
+                                 targets in batch", which is accurate even
+                                 for single-target sessions
 
     Designed to be called as a one-liner from a shell failure handler:
         rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c \\
@@ -144,10 +149,11 @@ def notify_pipeline_fail() -> None:
     label = os.environ.get("WIKIMEDIA_SESSION_LABEL") or "unknown"
     rc_suffix = _decode_exit_code(os.environ.get("WIKIMEDIA_LAST_EXIT"))
 
-    msg = (
-        f"❌ `wikimedia-{label}`: pipeline step failed{rc_suffix}"
-        " — skipping to next target"
+    is_last = os.environ.get("WIKIMEDIA_TARGET_IS_LAST") == "1"
+    tail_phrase = (
+        "no further targets in batch" if is_last else "skipping to next target"
     )
+    msg = f"❌ `wikimedia-{label}`: pipeline step failed{rc_suffix} — {tail_phrase}"
 
     log_path = _find_latest_log(os.environ.get("WIKIMEDIA_PARTNER_DIR", ""), label)
     if log_path is not None:

@@ -8,6 +8,7 @@ log-summary logic that produces the message body.
 import os
 import tempfile
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -15,6 +16,7 @@ from ingest_wikimedia.slack import (
     _decode_exit_code,
     _find_latest_log,
     _summarize_log,
+    notify_pipeline_fail,
 )
 
 
@@ -103,3 +105,61 @@ def test_summarize_log_counts_markers_and_tails_last_lines(tmp_path):
 
 def test_summarize_log_missing_file_returns_none(tmp_path):
     assert _summarize_log(str(tmp_path / "nope.log")) is None
+
+
+def _capture_message(env: dict) -> str:
+    """Run notify_pipeline_fail() with `env` and return the posted message."""
+    sent = {}
+
+    def fake_post(token, text):
+        sent["text"] = text
+
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch("ingest_wikimedia.slack.post_message", side_effect=fake_post),
+    ):
+        notify_pipeline_fail()
+    return sent.get("text", "")
+
+
+def test_notify_pipeline_fail_says_skipping_to_next_when_not_last():
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "nara+foo",
+            "WIKIMEDIA_LAST_EXIT": "1",
+        }
+    )
+    assert "skipping to next target" in msg
+    assert "no further targets in batch" not in msg
+
+
+def test_notify_pipeline_fail_says_no_further_when_last():
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "nara+foo",
+            "WIKIMEDIA_LAST_EXIT": "137",
+            "WIKIMEDIA_TARGET_IS_LAST": "1",
+        }
+    )
+    assert "no further targets in batch" in msg
+    assert "skipping to next target" not in msg
+    # The OOM hint should still be included.
+    assert "SIGKILL" in msg
+
+
+def test_notify_pipeline_fail_treats_any_value_other_than_1_as_not_last():
+    # Defensive: an empty or "0" value should be treated as "not last" so a
+    # half-set env doesn't accidentally claim there are no more targets.
+    for value in ("", "0", "false", "no"):
+        msg = _capture_message(
+            {
+                "DPLA_SLACK_BOT_TOKEN": "x",
+                "WIKIMEDIA_SESSION_LABEL": "x",
+                "WIKIMEDIA_TARGET_IS_LAST": value,
+            }
+        )
+        assert "skipping to next target" in msg, (
+            f"value {value!r} should be treated as not-last"
+        )

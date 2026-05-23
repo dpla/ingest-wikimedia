@@ -231,16 +231,26 @@ def main() -> None:
     # safe: the uploader checks each file's SHA-1 against Commons before uploading
     # and skips files already present, so re-running on overlapping IDs is harmless.
     target_blocks = []
-    for slug, type_csvs in hub_csvs.items():
+    hub_items = list(hub_csvs.items())
+    last_idx = len(hub_items) - 1
+    for idx, (slug, type_csvs) in enumerate(hub_items):
         pdir = PARTNER_DIR.get(slug, slug)
         base = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{pdir}")
         session_label = f"retry-{slug}"
         # WIKIMEDIA_PARTNER_DIR is read by notify_pipeline_fail() to locate the
         # most recent log for this target and include a tail + counts in the
-        # Slack failure message.
+        # Slack failure message.  WIKIMEDIA_TARGET_IS_LAST switches the failure
+        # suffix language for the last target so single-target retries don't
+        # claim to be "skipping to next target" when there isn't one.
+        is_last_env = (
+            "export WIKIMEDIA_TARGET_IS_LAST=1"
+            if idx == last_idx
+            else "unset WIKIMEDIA_TARGET_IS_LAST"
+        )
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
             f"export WIKIMEDIA_PARTNER_DIR={base}; "
+            f"{is_last_env}; "
             "unset WIKIMEDIA_SINGLE_ITEM"
         )
         download_csv = type_csvs.get("download")
