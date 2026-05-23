@@ -212,8 +212,10 @@ def main() -> None:
     if partner:
         session_name += f"-{partner}"
 
+    # `rc=$?` captures the failing step's exit code so the Slack message can
+    # decode signals like 137 (SIGKILL / probable OOM) and 143 (SIGTERM).
     notify_fail_cmd = (
-        "python3 -c "
+        "rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c "
         "'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'"
     )
     setup = " && ".join(
@@ -233,8 +235,12 @@ def main() -> None:
         pdir = PARTNER_DIR.get(slug, slug)
         base = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{pdir}")
         session_label = f"retry-{slug}"
+        # WIKIMEDIA_PARTNER_DIR is read by notify_pipeline_fail() to locate the
+        # most recent log for this target and include a tail + counts in the
+        # Slack failure message.
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
+            f"export WIKIMEDIA_PARTNER_DIR={base}; "
             "unset WIKIMEDIA_SINGLE_ITEM"
         )
         download_csv = type_csvs.get("download")
