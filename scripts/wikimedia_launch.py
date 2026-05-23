@@ -362,9 +362,11 @@ def main() -> None:
 
     # Verify every requested partner has a working directory on EC2. Pywikibot
     # expects per-partner config.toml / user-config.py / user-password.py /
-    # apicache; without them the pipeline's first `cd {base}` silently fails
-    # and Slack only sees the generic "pipeline step failed" message. Catching
-    # this here gives a clear, actionable error before any tmux work starts.
+    # apicache/; without them the pipeline's first `cd {base}` silently fails.
+    # Any missing partner dir is auto-initialized by copying the required
+    # pywikibot config from a template partner (bpl) — the bot account and
+    # config are the same across all partners, so this is a safe one-shot
+    # bootstrap. apicache/ is populated by pywikibot at first login.
     unique_pdirs = sorted({PARTNER_DIR.get(c, c) for c, _, _, _, _ in targets})
     print(f"Checking partner directories exist: {unique_pdirs}")
     check_cmd = "; ".join(
@@ -381,16 +383,50 @@ def main() -> None:
         if line.startswith("MISSING:")
     )
     if missing_dirs:
-        missing_list = ", ".join(f"`{d}`" for d in missing_dirs)
-        _slack_fail(
-            response_url,
-            f"⚠️ Cannot launch `{session_name}`: partner directory missing on EC2"
-            f" for {missing_list}. Initialize each one by copying config.toml,"
-            f" user-config.py, and user-password.py from an existing partner dir"
-            f" (e.g. `cp -p /home/ec2-user/ingest-wikimedia/bpl/{{config.toml,"
-            f"user-config.py,user-password.py}} /home/ec2-user/ingest-wikimedia/"
-            f"<new-partner>/`).",
+        # The bpl directory is the bootstrap template — it's a primary partner
+        # that always exists in practice. Refuse to bootstrap if even bpl is
+        # missing; that's a much bigger setup problem worth surfacing loudly.
+        if "bpl" in missing_dirs:
+            _slack_fail(
+                response_url,
+                f"⚠️ Cannot launch `{session_name}`: template partner directory"
+                f" `bpl` is missing on EC2. The bot relies on it as the source"
+                f" of pywikibot configuration when bootstrapping new partner"
+                f" directories. Manual setup required.",
+            )
+        print(f"Bootstrapping missing partner directories: {missing_dirs}")
+        # Single SSM round-trip: mkdir + cp -np for each missing dir. -n
+        # ("no-clobber") makes the copy idempotent if a config file already
+        # happens to be in place.
+        init_cmd = " && ".join(
+            f"mkdir -p /home/ec2-user/ingest-wikimedia/{shlex.quote(d)} && "
+            f"cp -np /home/ec2-user/ingest-wikimedia/bpl/config.toml"
+            f" /home/ec2-user/ingest-wikimedia/bpl/user-config.py"
+            f" /home/ec2-user/ingest-wikimedia/bpl/user-password.py"
+            f" /home/ec2-user/ingest-wikimedia/{shlex.quote(d)}/"
+            for d in missing_dirs
         )
+        try:
+            ssm_run(ssm, init_cmd)
+        except Exception as e:
+            _slack_fail(
+                response_url,
+                f"⚠️ Cannot launch `{session_name}`: failed to bootstrap"
+                f" partner directories {missing_dirs}: {e}",
+            )
+        bootstrapped_list = ", ".join(f"`{d}`" for d in missing_dirs)
+        print(f"Auto-bootstrapped partner directories: {bootstrapped_list}")
+        # Surface the bootstrap to Slack so the user sees what was created.
+        if slack_token:
+            try:
+                post_message(
+                    slack_token,
+                    f"🛠️ Bootstrapped new partner directories on EC2 for"
+                    f" `{session_name}`: {bootstrapped_list} (copied pywikibot"
+                    f" config from `bpl`).",
+                )
+            except Exception as e:
+                print(f"Failed to post bootstrap notification: {e}")
 
     # Check for any existing session that includes one of the requested targets.
     # Maps each requested label to the existing session name(s) it conflicts with.
