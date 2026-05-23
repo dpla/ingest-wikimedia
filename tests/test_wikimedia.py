@@ -52,6 +52,49 @@ def test_get_page_title():
     assert title == expected_title
 
 
+def test_get_page_title_preserves_ampersand_when_no_equals():
+    """Regression: titles containing `&` alone (no `=`) must NOT be rewritten.
+
+    Replacing `&` unconditionally caused drift-correction renames of good
+    Commons titles like `... suffragiis & orationibus. - DPLA - ...` into
+    the uglier `... suffragiis + orationibus. - DPLA - ...` form.
+    """
+    title = get_page_title(
+        "Hore beate Marie - cum multis suffragiis & orationibus.",
+        "e01f0774b6ae80e4745504ab554f93b5",
+        ".jpg",
+        205,
+    )
+    assert "&" in title
+    assert "+" not in title
+
+
+def test_get_page_title_preserves_equals_when_no_ampersand():
+    """`=` alone (no `&`) is fine — only the joint pattern is blacklisted."""
+    title = get_page_title(
+        "E=mc² and other formulas",
+        "abcd" * 8,
+        ".jpg",
+    )
+    assert "=" in title
+    # `-` may appear in the DPLA-ID/extension fragments but not from `=` rewriting.
+    # Verify the original character is preserved.
+    assert "E=mc" in title
+
+
+def test_get_page_title_breaks_query_string_when_both_present():
+    """When both `&` and `=` appear, substitute to break the blacklist pattern."""
+    title = get_page_title(
+        "filter=value&other=thing",
+        "abcd" * 8,
+        ".jpg",
+    )
+    # Both characters get rewritten so the title no longer matches `&...=`.
+    assert "&" not in title
+    assert "=" not in title
+    assert "filter-value+other-thing" in title
+
+
 def test_license_to_markup_code():
     rights_uri = "http://creativecommons.org/licenses/by/4.0/"
     markup_code = license_to_markup_code(rights_uri)

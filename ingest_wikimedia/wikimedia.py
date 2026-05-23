@@ -55,6 +55,26 @@ def is_download_only(content_type: str) -> bool:
     return content_type in DOWNLOAD_ONLY_CONTENT_TYPES
 
 
+def _break_query_string_pattern(title: str) -> str:
+    """Break the `&...=` query-string blacklist pattern only when both chars
+    are present.
+
+    The bot's older "always replace `&` with `+` and `=` with `-`" behavior
+    was over-eager: titles containing only one of the two are not rejected
+    by Commons (the blacklist rule the lesson cites needs both, in order,
+    to look like a URL query string). Over-replacing forced drift-correction
+    renames of perfectly good Commons titles like
+    `... suffragiis & orationibus. - DPLA - …` into the uglier
+    `... suffragiis + orationibus. - DPLA - …` form.
+
+    Only when both characters appear in the same title do we substitute, so
+    legitimate use of either character alone is preserved.
+    """
+    if "&" in title and "=" in title:
+        return title.replace("&", "+").replace("=", "-")
+    return title
+
+
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
@@ -63,10 +83,8 @@ def get_page_title(
     the title of the image.
     """
     escaped_title = (
-        item_title[:181]
+        _break_query_string_pattern(item_title[:181])
         .replace("''", '"')  # titleblacklist: double-apostrophe rule → double-quote
-        .replace("&", "+")  # titleblacklist: query-string pattern (&...=)
-        .replace("=", "-")  # titleblacklist: query-string pattern (&...=)
         .replace("[", "(")
         .replace("]", ")")
         .replace("{", "(")
