@@ -38,22 +38,32 @@ def test_get_media_s3_path(s3_client: S3Client):
 
 
 def test_s3_file_exists(s3_client: S3Client):
+    # Build the s3.Object(...) return value via explicit attribute assignment
+    # rather than Mock(content_length=...).  Under Python 3.13's unittest.mock,
+    # passing the attribute as a kwarg to Mock() doesn't reliably configure it
+    # on the return value — accessing `obj.content_length` returns an auto-
+    # generated child Mock instead of the expected int, and the production
+    # code's `int(obj.content_length)` falls through to the TypeError branch.
+    # Setting `.content_length` directly on the mock instance always works.
+    obj = Mock()
+    s3_client.s3.Object.return_value = obj
+
     # Object exists with non-zero size → True
-    s3_client.s3.Object = Mock(return_value=Mock(content_length=1024))
+    obj.content_length = 1024
     assert s3_client.s3_file_exists("path/to/file")
 
     # Object exists but is zero bytes → False (treat as absent stub)
-    s3_client.s3.Object = Mock(return_value=Mock(content_length=0))
+    obj.content_length = 0
     assert not s3_client.s3_file_exists("path/to/file")
 
     # Object exists but content_length is malformed (None) → False
-    s3_client.s3.Object = Mock(return_value=Mock(content_length=None))
+    obj.content_length = None
     assert not s3_client.s3_file_exists("path/to/file")
 
     # Object does not exist (404 raised by load()) → False
-    mock_obj = Mock()
-    mock_obj.load.side_effect = ClientError({"Error": {"Code": "404"}}, "load")
-    s3_client.s3.Object = Mock(return_value=mock_obj)
+    obj404 = Mock()
+    obj404.load.side_effect = ClientError({"Error": {"Code": "404"}}, "load")
+    s3_client.s3.Object.return_value = obj404
     assert not s3_client.s3_file_exists("path/to/file")
 
 
