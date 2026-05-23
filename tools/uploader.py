@@ -48,7 +48,6 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
-    extract_page_ordinal_from_commons_title,
     is_same_item_redirect_relic,
     merge_preserved_wikitext,
     tag_as_duplicate,
@@ -594,33 +593,25 @@ class Uploader:
         actual_filename = existing_file.title(with_ns=False)
 
         # --- Hash collision safety check ---
-        # If the file at the wrong title was uploaded for a different DPLA ID
-        # and that ID is still a valid item, don't move or tag it — just upload
-        # our hash to the correct title and leave their file alone. This prevents
-        # ping-pong renaming between two valid items that happen to share a hash.
+        # Cross-item collision: the file at the wrong title was uploaded for a
+        # different DPLA ID.  If that other ID is still a valid item, we don't
+        # move or tag — just upload our hash to the correct title and leave
+        # their file alone.  This prevents ping-pong renaming between two
+        # valid items that happen to share a hash.
+        #
+        # Same-item collision (same DPLA ID, different title) — including the
+        # post-PR-#173 case where the page-suffix on the existing file no
+        # longer matches the new naming scheme — always falls through to the
+        # Case 1/2/3 migration logic below.  A previous version of this code
+        # special-cased "same DPLA ID, different parsed ordinal" by returning
+        # "upload_only" to avoid disturbing a hypothetical hash-coincidence
+        # between two pages of the same item, but that branch fired routinely
+        # whenever PR #173's per-extension page-label scheme produced a
+        # different (or no) (page N) suffix from the existing Commons file —
+        # creating a silent duplicate at the new title while the old file
+        # stayed orphaned.  The invariant is: a given SHA1 should live at
+        # exactly one Commons title for a given DPLA ID, so always migrate.
         existing_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
-        if existing_dpla_id == dpla_id:
-            # Same DPLA item — distinguish two cases:
-            #   (a) different page of a multi-page item carrying a coincident
-            #       sha1 (e.g. source-institution re-scan whose new page-N hash
-            #       matches what was uploaded as page-M last run). Don't move
-            #       or tag — the right ordinal will be uploaded directly.
-            #   (b) same logical page but the free-text portion of the title
-            #       changed across runs (a legitimate rename). Fall through so
-            #       Case 1/3 can move the existing file to the new title.
-            actual_page = extract_page_ordinal_from_commons_title(actual_filename)
-            intended_page = extract_page_ordinal_from_commons_title(page_title)
-            # Compare the two parsed ordinals so the decision is based on logical
-            # Commons page numbering rather than the S3 iteration index (which
-            # can diverge from intended_page in edge cases). None==None for a
-            # single-page item title-text rename falls through to Case 1/3.
-            if actual_page != intended_page:
-                logging.info(
-                    f"Hash drift for {dpla_id} {ordinal}: SHA1 found at "
-                    f"same-item page {actual_page} [[File:{actual_filename}]]; "
-                    f"uploading to correct title only."
-                )
-                return "upload_only"
 
         if existing_dpla_id and existing_dpla_id != dpla_id:
             try:
