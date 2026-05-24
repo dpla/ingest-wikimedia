@@ -10,13 +10,18 @@ import random
 import os
 import sys
 import time
+import tomllib
+import urllib.parse
 from bs4 import BeautifulSoup
 from pywikibot.comms import http
-from pywikibot.pagegenerators import TextIOPageGenerator
+from pywikibot import pagegenerators
+from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
 
+with open("config.toml", "rb") as _f:
+    key = tomllib.load(_f)["dpla_api_key"]
 
-# DPLA API key
-key = "XXX"
+site = pywikibot.Site()
+site.login()
 
 # When running manually, sometimes it is helpful to specify the category to work on in the command line, using --cat "<category>".
 
@@ -24,6 +29,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--cat", dest="cat", metavar="CAT", action="store")
 parser.add_argument("--method", dest="method", metavar="METHOD", action="store")
 parser.add_argument("--lists", dest="lists", metavar="LISTS", action="store")
+parser.add_argument(
+    "--file",
+    dest="files",
+    metavar="FILE",
+    action="append",
+    help="Commons file title to process directly (repeatable)",
+)
 args = parser.parse_args()
 
 method = "livecat"
@@ -125,7 +137,7 @@ def formattedclaim(prop, value, type, dpla_id):
     return claim
 
 
-# This is the function that will perform the POST to the Wikimedia Commons API, when passed all necessary parameters, to add a qualifier if it is missing for anexisting claim. Currently, this is only used for P459. It creates a JSON object to send in the body of the request with the data to post and the login token.
+# This is the function that will perform the POST to the Wikimedia Commons API, when passed all necessary parameters, to add a qualifier if it is missing for an existing claim. Currently, this is only used for P459. It creates a JSON object to send in the body of the request with the data to post and the login token.
 
 
 def postqual(claimid, prop, value):
@@ -176,11 +188,10 @@ def check(mediaid, qid, prop):
             statements = existing_data.get("statements").get(prop)
         else:
             return True, ""
-    except Exception as _:
+    except Exception:
         return True, ""
 
     # The following code is used to check the existing statements that match the prop. If any statement matches the prop and qid but has no qualifiers, the statement id is returned. If there is a matching statement with qualifiers, return False. Otherwise (statements with matching prop have no matching qid) return True. This logic is not complete: it will return a statement id for a statement with no qualifier, even if another statement already has the desired qualifier. Also, it would return False even in cases where the qualifier value is different from the desired qualifier, in cases where there there is a matching qid and prop with qualifiers.
-    #     statement['mainsnak']['datavalue']['value'] == qid
     if qid[0] == "item":
         if any(
             statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
@@ -216,7 +227,6 @@ def check(mediaid, qid, prop):
                 + mediaid
                 + "."
             )
-            #         print(existing_data.get('statements'))
             return False, ref
 
         else:
@@ -256,7 +266,6 @@ def check(mediaid, qid, prop):
                 + mediaid
                 + "."
             )
-            #         print(existing_data.get('statements'))
             return False, ref
 
         else:
@@ -296,23 +305,23 @@ def check(mediaid, qid, prop):
                 + mediaid
                 + "."
             )
-            #         print(existing_data.get('statements'))
             return False, ref
 
         else:
             return True, ref
     if qid[0] == "somevalue":
+        p = "P1932" if prop == "P571" else "P2093"
         try:
-            if any(statement["qualifiers"].get("P2093") for statement in statements):
+            if any(statement["qualifiers"].get(p) for statement in statements):
                 for statement in statements:
-                    if statement["qualifiers"]["P2093"][0]["datavalue"]["value"] == qid[
+                    if statement["qualifiers"][p][0]["datavalue"]["value"] == qid[
                         1
                     ] and not statement.get("references"):
                         ref = statement["id"]
                 for statement in statements:
                     try:
                         if (
-                            statement["qualifiers"]["P2093"][0]["datavalue"]["value"]
+                            statement["qualifiers"][p][0]["datavalue"]["value"]
                             == qid[1]
                         ):
                             print(
@@ -324,12 +333,11 @@ def check(mediaid, qid, prop):
                                 + mediaid
                                 + "."
                             )
-                            #         print(existing_data.get('statements'))
                             return False, ref
 
                         else:
                             return True, ref
-                    except Exception as _:
+                    except Exception:
                         pass
             else:
                 return True, ref
@@ -358,12 +366,11 @@ def check(mediaid, qid, prop):
                                 + mediaid
                                 + "."
                             )
-                            #         print(existing_data.get('statements'))
                             return False, ref
 
                         else:
                             return True, ref
-                    except Exception as _:
+                    except Exception:
                         pass
             else:
                 return True, ref
@@ -376,10 +383,12 @@ def check(mediaid, qid, prop):
     return True, ""
 
 
-# The following functions define specific statements to add, and uses formattedclaim() to append them to the "claims" array. It first uses the check() to check if the statement is not yet in the item, and appends it the list of statements to add in the edit if not. For now, we are just hardcoding actual values which are the same for all edits. check() returns True, False, or the string value of a statement id.
+# The following functions define specific statements to add, and uses formattedclaim() to append them to the "claims" array. It first uses the check() to check if the statement is not yet in the item, and appends it the list of statements to add in the edit if not. check() returns True, False, or the string value of a statement id.
 
 
 def add_rs(mediaid, rs, dpla_id):
+    prop = None
+    qid = None
     if rights.get(rs):
         prop = list(rights[rs].keys())[0]
         qid = rights[rs][prop]
@@ -396,7 +405,6 @@ def add_rs(mediaid, rs, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-        #             return claim
         if prop == "P275" and not qid == "Q6938433":
             prop = "P6216"
             qid = "Q50423863"
@@ -413,7 +421,7 @@ def add_rs(mediaid, rs, dpla_id):
         prop = "P6216"
         qid = "Q19652"
 
-    if rs:
+    if rs and prop is not None:
         summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
         claim = formattedclaim(
             prop,
@@ -488,25 +496,6 @@ def add_level(mediaid, level, dpla_id):
             claims["claims"].append(claim)
 
 
-def add_parent(mediaid, parent, dpla_id):
-    if institution:
-        qid = institution
-        prop = "P195"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
-        claim = formattedclaim(
-            prop,
-            {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
-            "wikibase-entityid",
-            dpla_id,
-        )
-        checkclaim = check(mediaid, ("item", qid), prop)
-        if checkclaim[1]:
-            add_ref(checkclaim[1], claim)
-        if checkclaim[0] is True:
-            pywikibot.output(summary)
-            claims["claims"].append(claim)
-
-
 def add_id(mediaid, id):
     prop = "P760"
     summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
@@ -546,7 +535,6 @@ def add_subject(mediaid, subject, dpla_id):
 def add_subject_entity(mediaid, qid, dpla_id):
     prop = "P921"
     summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
-
     claim = formattedclaim(
         prop,
         {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -563,7 +551,6 @@ def add_subject_entity(mediaid, qid, dpla_id):
 
 def add_title(mediaid, title, dpla_id):
     if title:
-        title = title
         prop = "P1476"
         summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
         claim = formattedclaim(
@@ -582,7 +569,6 @@ def add_title(mediaid, title, dpla_id):
 
 def add_desc(mediaid, desc, dpla_id):
     if desc:
-        desc = desc
         prop = "P10358"
         summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
         claim = formattedclaim(
@@ -619,16 +605,18 @@ def add_creator(mediaid, creator, dpla_id):
             claims["claims"].append(claim)
 
 
-# This will catch when displayDate is a single year or a date.
 def add_date(mediaid, date, dpla_id):
-    prop = "P170"
+    prop = "P571"
     summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
-    if re.match("^[0-9]{1,4}$", str(date)):
-        if int(date) < 2025:
-            datetime.datetime.strptime("%Y")
-            claim = formattedclaim(prop, date, "time", dpla_id)
-            checkclaim = check(mediaid, ("time", date), prop)
-
+    claim = formattedclaim(prop, "somevalue", "time", dpla_id)
+    claim["qualifiers"]["P1932"] = [
+        {
+            "snaktype": "value",
+            "property": "P1932",
+            "datavalue": {"value": date[:1499].rstrip(), "type": "string"},
+        }
+    ]
+    checkclaim = check(mediaid, ("somevalue", date), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
     if checkclaim[0] is True:
@@ -866,11 +854,11 @@ def dpla_claims(
                 + ".json"
             ).text
         )
-    except Exception as _:
+    except Exception:
         file_claims = {}
         file_claims["entities"] = {mediaid: {"statements": {}}}
     print(" -- Accessed Commons ID " + mediaid)
-    dpla_claims = []
+    dpla_claim_list = []
     removals = []
     if rights.get(rs):
         rightsprop = list(rights[rs].keys())[0]
@@ -907,26 +895,7 @@ def dpla_claims(
     creators = parsecreators
     descs = parsedescs
     subjects = parsesubjects
-    # props = [ # currently unused
-    #     "P6216",
-    #     "P275",
-    #     "P217",
-    #     "P6426",
-    #     "P760",
-    #     "P1476",
-    #     "P195",
-    #     "P170",
-    #     "P9126",
-    #     "P7482",
-    #     "P4272",
-    #     "P571",
-    #     "P10358",
-    #     "P1225",
-    #     "P7228",
-    #     "P6224",
-    #     "P921",
-    # ]
-    claims = {
+    expected = {
         "P6216": statusvalue,
         rightsprop: rightsvalue,
         "P217": local_ids,
@@ -947,77 +916,82 @@ def dpla_claims(
     for prop in file_claims["entities"][mediaid]["statements"].keys():
         for stmt in file_claims["entities"][mediaid]["statements"][prop]:
             if stmt.get("references"):
-                if any(
-                    pub["snaks"]["P123"][0]["datavalue"]["value"]["id"] == "Q2944483"
-                    for pub in stmt["references"]
-                ):
-                    if stmt["mainsnak"]["snaktype"] == "value":
-                        type = stmt["mainsnak"]["datavalue"]["type"]
-                        if stmt["mainsnak"]["property"] == "P7482":
-                            try:
-                                dpla_claims.append(
+                if any(pubprop["snaks"].get("P123") for pubprop in stmt["references"]):
+                    if any(
+                        pubcheck["snaks"]["P123"][0]["datavalue"]["value"]["id"]
+                        == "Q2944483"
+                        for pubcheck in stmt["references"]
+                        if pubcheck["snaks"].get("P123")
+                    ):
+                        if stmt["mainsnak"]["snaktype"] == "value":
+                            dtype = stmt["mainsnak"]["datavalue"]["type"]
+                            if stmt["mainsnak"]["property"] == "P7482":
+                                try:
+                                    dpla_claim_list.append(
+                                        {
+                                            stmt["mainsnak"]["property"]: {
+                                                "id": stmt["id"],
+                                                "value": stmt["qualifiers"]["P973"][0][
+                                                    "datavalue"
+                                                ]["value"],
+                                            }
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                            elif dtype == "wikibase-entityid":
+                                dpla_claim_list.append(
                                     {
                                         stmt["mainsnak"]["property"]: {
                                             "id": stmt["id"],
-                                            "value": stmt["qualifiers"]["P973"][0][
+                                            "value": stmt["mainsnak"]["datavalue"][
+                                                "value"
+                                            ]["id"],
+                                        }
+                                    }
+                                )
+                            elif dtype == "string":
+                                dpla_claim_list.append(
+                                    {
+                                        stmt["mainsnak"]["property"]: {
+                                            "id": stmt["id"],
+                                            "value": stmt["mainsnak"]["datavalue"][
+                                                "value"
+                                            ],
+                                        }
+                                    }
+                                )
+                            elif dtype == "monolingualtext":
+                                dpla_claim_list.append(
+                                    {
+                                        stmt["mainsnak"]["property"]: {
+                                            "id": stmt["id"],
+                                            "value": stmt["mainsnak"]["datavalue"][
+                                                "value"
+                                            ]["text"],
+                                        }
+                                    }
+                                )
+                        if stmt["mainsnak"]["snaktype"] == "somevalue":
+                            p = "P1932" if prop == "P571" else "P2093"
+                            try:
+                                dpla_claim_list.append(
+                                    {
+                                        stmt["mainsnak"]["property"]: {
+                                            "id": stmt["id"],
+                                            "value": stmt["qualifiers"][p][0][
                                                 "datavalue"
                                             ]["value"],
                                         }
                                     }
                                 )
-                            except Exception as _:
-                                pass  # P973 qualifier missing or malformed — skip this source statement.
-                        elif type == "wikibase-entityid":
-                            dpla_claims.append(
-                                {
-                                    stmt["mainsnak"]["property"]: {
-                                        "id": stmt["id"],
-                                        "value": stmt["mainsnak"]["datavalue"]["value"][
-                                            "id"
-                                        ],
-                                    }
-                                }
-                            )
-                        elif type == "string":
-                            dpla_claims.append(
-                                {
-                                    stmt["mainsnak"]["property"]: {
-                                        "id": stmt["id"],
-                                        "value": stmt["mainsnak"]["datavalue"]["value"],
-                                    }
-                                }
-                            )
-                        elif type == "monolingualtext":
-                            dpla_claims.append(
-                                {
-                                    stmt["mainsnak"]["property"]: {
-                                        "id": stmt["id"],
-                                        "value": stmt["mainsnak"]["datavalue"]["value"][
-                                            "text"
-                                        ],
-                                    }
-                                }
-                            )
-                    if stmt["mainsnak"]["snaktype"] == "somevalue":
-                        try:
-                            dpla_claims.append(
-                                {
-                                    stmt["mainsnak"]["property"]: {
-                                        "id": stmt["id"],
-                                        "value": stmt["qualifiers"]["P2093"][0][
-                                            "datavalue"
-                                        ]["value"],
-                                    }
-                                }
-                            )
-                        except Exception:
-                            removals.append(stmt["id"])
-    for claim in dpla_claims:
+                            except Exception:
+                                removals.append(stmt["id"])
+    for claim in dpla_claim_list:
         for prop in claim.keys():
-            if prop not in claims.keys():
+            if prop not in expected.keys():
                 removals.append(claim[prop]["id"])
-            elif claim[prop]["value"] not in claims[prop]:
-                #                 if any(clm[:1499].replace('\xa0',' ').rstrip() == claim[prop]['value'] for clm in claims[prop]):
+            elif claim[prop]["value"] not in expected[prop]:
                 removals.append(claim[prop]["id"])
     if len(removals) > 0:
         rmdata = {
@@ -1033,7 +1007,6 @@ def dpla_claims(
             + dpla_id
             + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
         }
-
         http.fetch(
             "https://commons.wikimedia.org/w/api.php", method="POST", data=rmdata
         )
@@ -1074,7 +1047,9 @@ def parsed(dpla_id, key):
     url = dpla["isShownAt"]
 
     try:
-        dates = dpla["sourceResource"]["date"]
+        dates = []
+        for displaydate in dpla["sourceResource"]["date"]:
+            dates.append(displaydate["displayDate"])
     except Exception:
         dates = ""
     try:
@@ -1089,29 +1064,32 @@ def parsed(dpla_id, key):
         subjects = []
         for subject in dpla["sourceResource"]["subject"]:
             added = False
-            # print(subject.get('name'))
             if subject.get("name") in subject_ids:
                 for subjqid in subject_ids[subject.get("name")]["id"]:
-                    # print((str(subject.get('name')), subjqid))
                     if not (any(subjqid in i for i in subjects)):
-                        # print((str(subject.get('name')), subjqid))
                         subjects.append((str(subject.get("name")), subjqid))
                         added = True
                     if not (any(subject.get("name") in i for i in subjects)):
                         subjects.append((str(subject.get("name") or ""), ""))
-                        # print((str(subject.get('name') or ''), ''))
                         added = True
             elif subject.get("exactMatch"):
                 subjqid = ""
                 naid = subject.get("exactMatch")[0].replace(
                     "https://catalog.archives.gov/id/", ""
                 )
+                reconci_query = json.dumps(
+                    {
+                        "q1": {
+                            "query": str(subject.get("name") or ""),
+                            "limit": 5,
+                            "properties": [{"pid": "P1225", "v": naid}],
+                            "type_strict": "should",
+                        }
+                    }
+                )
                 h = requests.get(
-                    "https://wikidata.reconci.link/en/api?queries=%7B%0A%20%20%22q1%22%3A%20%7B%0A%20%20%20%20%22query%22%3A%20%22"
-                    + str(subject.get("name") or "")
-                    + "%22%2C%0A%20%20%20%20%20%20%22limit%22%3A%205%2C%0A%20%20%20%20%20%20%22properties%22%3A%20%5B%0A%20%20%20%20%20%20%20%20%7B%0A%20%20%20%20%20%20%20%20%20%20%22pid%22%3A%20%22P1225%22%2C%0A%20%20%20%20%20%20%20%20%20%20%22v%22%3A%20%22"
-                    + naid
-                    + "%22%0A%20%20%20%20%20%20%20%20%7D%0A%20%20%20%20%20%20%5D%2C%0A%20%20%20%20%20%20%22type_strict%22%3A%20%22should%22%0A%20%20%20%20%7D%0A%7D"
+                    "https://wikidata.reconci.link/en/api?queries="
+                    + urllib.parse.quote(reconci_query)
                 )
                 subjectresults = json.loads(h.text)
                 if subjectresults["q1"]["result"]:
@@ -1119,9 +1097,7 @@ def parsed(dpla_id, key):
                 subjects.append((str(subject.get("name") or ""), subjqid))
                 added = True
             if added is False:
-                # print((str(subject.get('name') or ''), ''))
                 subjects.append((str(subject.get("name") or ""), ""))
-        # print(subjects)
     except Exception:
         subjects = ""
     try:
@@ -1146,21 +1122,15 @@ def parsed(dpla_id, key):
             access = codes[acccess_naid]
         except Exception:
             access = ""
-        for key in levels.keys():
-            if xml.find(key):
-                level = levels[key]
+        level = ""
+        for lvl_key in levels.keys():
+            if xml.find(lvl_key):
+                level = levels[lvl_key]
         local_ids = ""
     else:
         naids = ""
         access = ""
         level = ""
-
-    #     language
-    #     type
-    #     extent
-    #     format
-    #     contributor
-    #     publisher
 
     return (
         url,
@@ -1178,36 +1148,11 @@ def parsed(dpla_id, key):
         level,
     )
 
-    # Only make a post request if the claims array has accumulated at least one claim to add to the file. If any results set finds at least one edit to make, then 'posted' remains True, and the search will be tried again to pick up any more edits to make. If a whole results set is checked and no edits remain, we assume the edits to files with those search parameters are all complete.
-
-    # unreachable code:
-    # if len(claims["claims"]) > 0:
-    #     posted = True
-    #     try:
-    #         post = json.loads(
-    #             http.fetch(
-    #                 "https://commons.wikimedia.org/w/api.php",
-    #                 method="POST",
-    #                 data=postdata,
-    #             ).text
-    #         )
-    #         print(" --- Saved new claims!")
-    #     except:
-    #         print(" --- Error encountered. 1")
-    #         sys.exit()
-    # return count
-
-
-# Since we are posting directly to the API, we must explicitly request a login token that will be sent with the POSTs.
-
-site = pywikibot.Site()
-
 
 def login():
     tokenrequest = http.fetch(
         "https://commons.wikimedia.org/w/api.php?action=query&meta=tokens&type=csrf&format=json"
     )
-
     tokendata = json.loads(tokenrequest.text)
     token = tokendata.get("query").get("tokens").get("csrftoken")
     return token
@@ -1215,55 +1160,238 @@ def login():
 
 token = login()
 
-# We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements. If the list of claims generated is greater than zero, then we send the post using wbeditentity to the Wikimedia Commons API.
+
+def _resolve_dpla_id(title, key):
+    """Return the DPLA item ID for a Commons file title.
+
+    Tries the standard DPLA filename pattern first; falls back to a NARA
+    identifier lookup for National Archives files. Returns the title unchanged
+    if neither resolves (parsed() will record it as a missing ID).
+    """
+    dpla_id = extract_dpla_id_from_commons_title(title)
+    if dpla_id:
+        return dpla_id
+    print("Detecting NARA identifier...")
+    nara_id = re.sub(r"^.*NARA - (.*?)[\.| ].*$", r"\1", title)
+    nara_item = json.loads(
+        requests.get(
+            "https://api.dp.la/v2/items?api_key="
+            + key
+            + '&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="'
+            + nara_id
+            + '"'
+        ).text
+    )
+    if len(nara_item["docs"]) == 1:
+        return nara_item["docs"][0]["id"]
+    return title
+
+
+def process_one(mediaid, dpla_id):
+    """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
+    global claims, refclaims, token
+
+    try:
+        (
+            url,
+            descs,
+            dates,
+            titles,
+            hub,
+            local_ids,
+            institution,
+            rs,
+            creators,
+            subjects,
+            naids,
+            access,
+            level,
+        ) = parsed(dpla_id, key)
+    except TypeError:
+        with open("Missing ids.txt", "a") as missing:
+            missing.write(dpla_id + "\n")
+            print(" -- Missing ID recorded.")
+        return
+
+    claims = {"claims": []}
+    refclaims = {"claims": []}
+
+    try:
+        add_rs(mediaid, rs, dpla_id)
+    except pywikibot.exceptions.APIError:
+        print(" -- No such file on Commons.")
+        return
+    add_id(mediaid, dpla_id)
+    for title in titles:
+        add_title(mediaid, title.rstrip(), dpla_id)
+    add_collection(mediaid, hub, institution, dpla_id)
+    for creator in creators:
+        add_creator(mediaid, creator.rstrip(), dpla_id)
+    for date in dates:
+        add_date(mediaid, date.rstrip(), dpla_id)
+    for subject in subjects:
+        add_subject(mediaid, subject[0], dpla_id)
+        if subject[1]:
+            add_subject_entity(mediaid, subject[1], dpla_id)
+    for desc in descs:
+        add_desc(mediaid, desc.rstrip(), dpla_id)
+    add_contributed(mediaid, hub, institution, dpla_id)
+    add_source(mediaid, hub, url, dpla_id)
+    for local_id in local_ids:
+        if len(local_id) < 1501:
+            add_local_id(mediaid, local_id, institution, dpla_id)
+    for naid in naids:
+        add_naid(mediaid, naid, dpla_id)
+    add_access(mediaid, access, dpla_id)
+    add_level(mediaid, level, dpla_id)
+
+    if len(refclaims["claims"]) > 0:
+        postrefs = {
+            "action": "wbeditentity",
+            "format": "json",
+            "id": mediaid,
+            "data": json.dumps(refclaims),
+            "token": token,
+            "bot": True,
+            "summary": "Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:"
+            + dpla_id
+            + "|"
+            + dpla_id
+            + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+        }
+        save = http.fetch(
+            "https://commons.wikimedia.org/w/api.php",
+            method="POST",
+            data=postrefs,
+        )
+        try:
+            post = json.loads(save.text)
+            if post["success"] == 1:
+                print(" --- Saved new refs!")
+            else:
+                print(post)
+                print(" --- Error encountered on save.")
+                sys.exit()
+        except Exception:
+            try:
+                token = login()
+                postrefs["token"] = token
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postrefs,
+                )
+                post = json.loads(save.text)
+                if post["success"] == 1:
+                    print(" --- Saved new refs!")
+                else:
+                    print(post)
+                    print(" --- Error encountered on save.")
+                    sys.exit()
+            except Exception:
+                print(" --- Error encountered. 2")
+                sys.exit()
+
+    postdata = {
+        "action": "wbeditentity",
+        "format": "json",
+        "id": mediaid,
+        "data": json.dumps(claims),
+        "token": token,
+        "bot": True,
+        "summary": "Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:"
+        + dpla_id
+        + "|"
+        + dpla_id
+        + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+    }
+
+    if len(claims["claims"]) > 0:
+        try:
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postdata,
+            )
+        except (requests.exceptions.ConnectionError, ConnectionError):
+            try:
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postdata,
+                )
+            except (requests.exceptions.ConnectionError, ConnectionError):
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postdata,
+                )
+        try:
+            post = json.loads(save.text)
+            if post["success"] == 1:
+                print(" --- Saved new claims!")
+            else:
+                print(post)
+                print(" --- Error encountered on save.")
+                sys.exit()
+        except Exception:
+            try:
+                token = login()
+                postdata["token"] = token
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postdata,
+                )
+                post = json.loads(save.text)
+                if post["success"] == 1:
+                    print(" --- Saved new claims!")
+                else:
+                    print(post)
+                    print(" --- Error encountered on save.")
+                    sys.exit()
+            except Exception:
+                print(str(post) + "\n" + str(postdata))
+                print(" --- Error encountered. 3")
+                sys.exit()
+
+    dpla_claims(
+        mediaid,
+        dpla_id,
+        url,
+        descs,
+        dates,
+        titles,
+        hub,
+        local_ids,
+        institution,
+        rs,
+        creators,
+        subjects,
+        naids,
+        access,
+        level,
+    )
+
+
+# We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
 
 count = 0
 
 if method == "list":
     ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
     lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
-    percent = 100 * (len(ltotal) - len(lists)) / len(ltotal)
+    percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
     while len(lists) > 0:
-        if len(lists) > 1:
-            x = random.choice(range(0, len(lists) - 1))
-        elif len(lists) == 1:
-            x = 0
+        x = random.choice(range(0, len(lists) - 1)) if len(lists) > 1 else 0
         working_file = args.lists + "/WORKING-" + lists[x]
         print(working_file)
         os.rename(args.lists + "/" + lists[x], working_file)
 
-        files = TextIOPageGenerator(working_file)
+        files = pagegenerators.TextIOPageGenerator(working_file)
 
         for file in files:
-            print("\n" + str(file).replace('""', '"'))
-            mediaid = "M" + str(file.pageid)
-            dpla_id = re.sub(r"^.*DPLA - (.*?)[\.| ].*$", r"\1", str(file))
-            try:
-                (
-                    url,
-                    descs,
-                    dates,
-                    titles,
-                    hub,
-                    local_ids,
-                    institution,
-                    rs,
-                    creators,
-                    subjects,
-                    naids,
-                    access,
-                    level,
-                ) = parsed(dpla_id, key)
-            except TypeError:
-                with open("Missing ids.txt", "a") as missing:
-                    missing.write(dpla_id + "\n")
-                    print(" -- Missing ID recorded.")
-                continue
-
-            claims = {"claims": []}
-            refclaims = {"claims": []}
-
-            count = count + 1
+            count += 1
             print(
                 str(count)
                 + ":\n - "
@@ -1274,189 +1402,35 @@ if method == "list":
                 + str("{:.2f}".format(percent))
                 + "% done)"
             )
-            add_rs(mediaid, rs, dpla_id)
-            add_id(mediaid, dpla_id)
-            for title in titles:
-                add_title(mediaid, title.rstrip(), dpla_id)
-            add_collection(mediaid, hub, institution, dpla_id)
-            for creator in creators:
-                add_creator(mediaid, creator.rstrip(), dpla_id)
-            for subject in subjects:
-                add_subject(mediaid, subject[0], dpla_id)
-                if subject[1]:
-                    add_subject_entity(mediaid, subject[1], dpla_id)
-            for desc in descs:
-                add_desc(mediaid, desc.rstrip(), dpla_id)
-            #             for date in dates:
-            #                 add_date(mediaid, date['displayDate'], dpla_id)
-            add_contributed(mediaid, hub, institution, dpla_id)
-            add_source(mediaid, hub, url, dpla_id)
-            for local_id in local_ids:
-                add_local_id(mediaid, local_id, institution, dpla_id)
-            for naid in naids:
-                add_naid(mediaid, naid, dpla_id)
-            add_access(mediaid, access, dpla_id)
-            add_level(mediaid, level, dpla_id)
-            if len(refclaims["claims"]) > 0:
-                postrefs = {
-                    "action": "wbeditentity",
-                    "format": "json",
-                    "id": mediaid,
-                    "data": json.dumps(refclaims),
-                    "token": token,
-                    "bot": True,
-                    "summary": "Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:"
-                    + dpla_id
-                    + "|"
-                    + dpla_id
-                    + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-                }
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postrefs,
-                )
-                try:
-                    post = json.loads(save.text)
-                    if post["success"] == 1:
-                        print(" --- Saved new refs!")
-                    else:
-                        print(post)
-                        print(" --- Error encountered on save.")
-                        sys.exit()
-                except Exception:
-                    try:
-                        token = login()
-                        postrefs = {
-                            "action": "wbeditentity",
-                            "format": "json",
-                            "id": mediaid,
-                            "data": json.dumps(refclaims),
-                            "token": token,
-                            "bot": True,
-                            "summary": "Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:"
-                            + dpla_id
-                            + "|"
-                            + dpla_id
-                            + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-                        }
-                        save = http.fetch(
-                            "https://commons.wikimedia.org/w/api.php",
-                            method="POST",
-                            data=postrefs,
-                        )
-                        post = json.loads(save.text)
-                        if post["success"] == 1:
-                            print(" --- Saved new refs!")
-                        else:
-                            print(post)
-                            print(" --- Error encountered on save.")
-                            sys.exit()
-                    except Exception:
-                        print(" --- Error encountered. 2")
-                        sys.exit()
-
-            postdata = {
-                "action": "wbeditentity",
-                "format": "json",
-                "id": mediaid,
-                "data": json.dumps(claims),
-                "token": token,
-                "bot": True,
-                "summary": "Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:"
-                + dpla_id
-                + "|"
-                + dpla_id
-                + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-            }
-
-            if len(claims["claims"]) > 0:
-                try:
-                    save = http.fetch(
-                        "https://commons.wikimedia.org/w/api.php",
-                        method="POST",
-                        data=postdata,
-                    )
-                except requests.exceptions.ConnectionError:
-                    try:
-                        save = http.fetch(
-                            "https://commons.wikimedia.org/w/api.php",
-                            method="POST",
-                            data=postdata,
-                        )
-                    except requests.exceptions.ConnectionError:
-                        save = http.fetch(
-                            "https://commons.wikimedia.org/w/api.php",
-                            method="POST",
-                            data=postdata,
-                        )
-                try:
-                    post = json.loads(save.text)
-                    if post["success"] == 1:
-                        print(" --- Saved new claims!")
-                    else:
-                        print(post)
-                        print(" --- Error encountered on save.")
-                        sys.exit()
-                except Exception:
-                    try:
-                        token = login()
-                        postdata = {
-                            "action": "wbeditentity",
-                            "format": "json",
-                            "id": mediaid,
-                            "data": json.dumps(claims),
-                            "token": token,
-                            "bot": True,
-                            "summary": "Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:"
-                            + dpla_id
-                            + "|"
-                            + dpla_id
-                            + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-                        }
-                        save = http.fetch(
-                            "https://commons.wikimedia.org/w/api.php",
-                            method="POST",
-                            data=postdata,
-                        )
-                        post = json.loads(save.text)
-                        if post["success"] == 1:
-                            print(" --- Saved new claims!")
-                        else:
-                            print(post)
-                            print(" --- Error encountered on save.")
-                            sys.exit()
-                    except Exception:
-                        print(str(post) + "\n" + str(postdata))
-                        print(" --- Error encountered. 3")
-                        sys.exit()
-
-            dpla_claims(
-                mediaid,
-                dpla_id,
-                url,
-                descs,
-                dates,
-                titles,
-                hub,
-                local_ids,
-                institution,
-                rs,
-                creators,
-                subjects,
-                naids,
-                access,
-                level,
-            )
+            print("\n" + str(file).replace('""', '"'))
+            mediaid = "M" + str(file.pageid)
+            dpla_id = _resolve_dpla_id(str(file), key)
+            process_one(mediaid, dpla_id)
 
         os.rename(working_file, args.lists + "/COMPLETE-" + lists[x])
 
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
         lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
+        percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
 
-        # De-dupe missing file:
         duduped = set()
-        for line in open("Missing ids.txt", "r"):
-            duduped.add(line)
-        with open("Missing ids.txt", "w") as f:
-            f.write("".join(duduped))
+        try:
+            for line in open("Missing ids.txt", "r"):
+                duduped.add(line)
+            with open("Missing ids.txt", "w") as f:
+                f.write("".join(duduped))
+        except FileNotFoundError:
+            pass
+
+elif args.files:
+    for title in args.files:
+        print("\n" + title)
+        page = pywikibot.Page(site, title)
+        if not page.exists():
+            print(f" -- Page not found on Commons: {title}")
+            continue
+        mediaid = "M" + str(page.pageid)
+        dpla_id = _resolve_dpla_id(title, key)
+        count += 1
+        print(str(count) + ": " + mediaid)
+        process_one(mediaid, dpla_id)
