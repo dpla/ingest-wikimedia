@@ -82,15 +82,21 @@ with open(os.path.join(_REPO_ROOT, "config.toml"), "rb") as _f:
 site = pywikibot.Site()
 site.login()
 
-# Hubs and subject mappings are vendored alongside rights.json so a run is
-# fully reproducible against the checked-in metadata. To refresh, replace the
-# files from their upstream sources and commit.
-with open(os.path.join(_REPO_ROOT, "institutions_v2.json")) as f:
-    hubs = json.load(f)
+# Hubs and subject mappings are fetched live from ingestion3 on every run, by
+# design: this sync exists precisely to propagate upstream changes to that
+# data, and a vendored snapshot would defeat the point. rights.json is the
+# exception — it lives here because it's a small, slow-moving SDC-specific
+# mapping not maintained in ingestion3.
+hubs = requests.get(
+    "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json",
+    timeout=30,
+).json()
 with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
     rights = {_normalize_rights_uri(k): v for k, v in json.load(f).items()}
-with open(os.path.join(_REPO_ROOT, "subjects.json")) as f:
-    subject_ids = json.load(f)
+subject_ids = requests.get(
+    "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/src/main/resources/subjects.json",
+    timeout=30,
+).json()
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
 
