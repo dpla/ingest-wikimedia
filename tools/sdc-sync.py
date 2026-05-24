@@ -290,7 +290,7 @@ def check(mediaid, qid, prop):
                 if statement["mainsnak"]["datavalue"]["value"]["id"] == qid[
                     1
                 ] and not statement.get("qualifiers"):
-                    return add_det(statement["id"]), ref
+                    return add_det(mediaid, statement["id"]), ref
 
         elif any(
             statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
@@ -323,7 +323,7 @@ def check(mediaid, qid, prop):
                 if statement["mainsnak"]["datavalue"]["value"] == qid[
                     1
                 ] and not statement.get("qualifiers"):
-                    return add_det(statement["id"]), ref
+                    return add_det(mediaid, statement["id"]), ref
 
         elif any(
             statement["mainsnak"]["datavalue"]["value"] == qid[1]
@@ -356,7 +356,7 @@ def check(mediaid, qid, prop):
                 if statement["mainsnak"]["datavalue"]["value"]["text"] == qid[
                     1
                 ] and not statement.get("qualifiers"):
-                    return add_det(statement["id"]), ref
+                    return add_det(mediaid, statement["id"]), ref
 
         elif any(
             statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
@@ -375,11 +375,12 @@ def check(mediaid, qid, prop):
             if any(statement.get("qualifiers", {}).get(p) for statement in statements):
                 for statement in statements:
                     qualifiers = statement.get("qualifiers", {}).get(p) or []
-                    if (
-                        qualifiers
-                        and qualifiers[0]["datavalue"]["value"] == qid[1]
-                        and not statement.get("references")
-                    ):
+                    # Scan every qualifier entry, not just the first. Wikibase
+                    # qualifier props may carry multiple values.
+                    if any(
+                        q.get("datavalue", {}).get("value") == qid[1]
+                        for q in qualifiers
+                    ) and not statement.get("references"):
                         ref = statement["id"]
                 # Walk every statement looking for a qualifier match. Only
                 # return False on an actual match; otherwise fall through and
@@ -388,17 +389,15 @@ def check(mediaid, qid, prop):
                 # match and cause duplicate writes on multi-value properties
                 # (creators, dates, etc.).
                 for statement in statements:
-                    try:
-                        if (
-                            statement["qualifiers"][p][0]["datavalue"]["value"]
-                            == qid[1]
-                        ):
-                            print(
-                                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
-                            )
-                            return False, ref
-                    except (KeyError, IndexError, TypeError):
-                        continue
+                    qualifiers = statement.get("qualifiers", {}).get(p) or []
+                    if any(
+                        q.get("datavalue", {}).get("value") == qid[1]
+                        for q in qualifiers
+                    ):
+                        print(
+                            f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                        )
+                        return False, ref
                 return True, ref
             else:
                 return True, ref
@@ -411,26 +410,23 @@ def check(mediaid, qid, prop):
             ):
                 for statement in statements:
                     qualifiers = statement.get("qualifiers", {}).get("P973") or []
-                    if (
-                        qualifiers
-                        and qualifiers[0]["datavalue"]["value"] == qid[1]
-                        and not statement.get("references")
-                    ):
+                    if any(
+                        q.get("datavalue", {}).get("value") == qid[1]
+                        for q in qualifiers
+                    ) and not statement.get("references"):
                         ref = statement["id"]
                 # See the somevalue branch above: scan every statement before
                 # concluding the claim is missing.
                 for statement in statements:
-                    try:
-                        if (
-                            statement["qualifiers"]["P973"][0]["datavalue"]["value"]
-                            == qid[1]
-                        ):
-                            print(
-                                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
-                            )
-                            return False, ref
-                    except (KeyError, IndexError, TypeError):
-                        continue
+                    qualifiers = statement.get("qualifiers", {}).get("P973") or []
+                    if any(
+                        q.get("datavalue", {}).get("value") == qid[1]
+                        for q in qualifiers
+                    ):
+                        print(
+                            f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                        )
+                        return False, ref
                 return True, ref
             else:
                 return True, ref
@@ -617,8 +613,11 @@ def add_title(mediaid, title, dpla_id):
         # Normalize once: dedupe must compare what we'd actually post, not the
         # raw input. Otherwise reruns where the raw string differs from the
         # truncated/rstripped form (long titles, trailing whitespace) treat the
-        # claim as missing and post a duplicate.
+        # claim as missing and post a duplicate. Also skip whitespace-only
+        # values so we don't post empty claims.
         normalized = title[:1499].rstrip()
+        if not normalized:
+            return
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
@@ -638,6 +637,8 @@ def add_desc(mediaid, desc, dpla_id):
     if desc:
         prop = "P10358"
         normalized = desc[:1499].rstrip()
+        if not normalized:
+            return
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
@@ -657,6 +658,8 @@ def add_creator(mediaid, creator, dpla_id):
     if creator:
         prop = "P170"
         normalized = creator[:1499].rstrip()
+        if not normalized:
+            return
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(prop, "somevalue", "wikibase-entityid", dpla_id)
         claim["qualifiers"]["P2093"] = [
@@ -677,6 +680,8 @@ def add_creator(mediaid, creator, dpla_id):
 def add_date(mediaid, date, dpla_id):
     prop = "P571"
     normalized = date[:1499].rstrip()
+    if not normalized:
+        return
     summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(prop, "somevalue", "time", dpla_id)
     claim["qualifiers"]["P1932"] = [
@@ -881,7 +886,7 @@ def add_source(mediaid, hub, url, dpla_id):
         claims["claims"].append(claim)
 
 
-def add_det(claimid):
+def add_det(mediaid, claimid):
     if claimid:
         qid = "Q61848113"
         prop = "P459"
@@ -889,6 +894,11 @@ def add_det(claimid):
             {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))}
         )
         postqual(claimid, prop, value)
+        # postqual just mutated Commons state for this mediaid (added P459
+        # to an existing claim). Drop the cached snapshot so any subsequent
+        # check() call for the same mediaid in this run reads the fresh
+        # post-write state instead of repeating the qualifier write.
+        invalidate_entity(mediaid)
 
 
 def add_ref(claimid, claim):
@@ -1278,18 +1288,28 @@ def _resolve_dpla_id(title, dpla_api):
     Tries the standard DPLA filename pattern first; falls back to a NARA
     identifier lookup for National Archives files. Returns the title unchanged
     if neither resolves (parsed() will record it as a missing ID).
+
+    The NARA fallback hits the DPLA search API; any network, timeout, or
+    unexpected-payload failure here would otherwise abort the entire --cat
+    batch on a single bad file, so we catch broadly, log, and fall through
+    to the title-passthrough.
     """
     dpla_id = extract_dpla_id_from_commons_title(title)
     if dpla_id:
         return dpla_id
     print("Detecting NARA identifier...")
     nara_id = re.sub(r"^.*NARA - (.*?)[\.| ].*$", r"\1", title)
-    nara_item = requests.get(
-        f'https://api.dp.la/v2/items?api_key={dpla_api}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"',
-        timeout=15,
-    ).json()
-    if len(nara_item["docs"]) == 1:
-        return nara_item["docs"][0]["id"]
+    try:
+        nara_item = requests.get(
+            f'https://api.dp.la/v2/items?api_key={dpla_api}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"',
+            timeout=15,
+        ).json()
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        print(f" -- NARA lookup failed for {nara_id!r}: {e!r}")
+        return title
+    docs = nara_item.get("docs") if isinstance(nara_item, dict) else None
+    if isinstance(docs, list) and len(docs) == 1:
+        return docs[0].get("id") or title
     return title
 
 
@@ -1458,8 +1478,13 @@ def process_one(mediaid, dpla_id):
                     print(post)
                     print(" --- Error encountered on save.")
                     sys.exit()
-            except Exception:
-                print(post)
+            except Exception as retry_e:
+                # `post` may not be assigned yet if http.fetch / json.loads
+                # raised — referencing it directly would mask the real
+                # error with an UnboundLocalError. Log what we actually have.
+                print(f" --- Retry after token refresh failed: {retry_e!r}")
+                if "save" in locals():
+                    print(save.text)
                 print(" --- Error encountered. 3")
                 sys.exit()
 
