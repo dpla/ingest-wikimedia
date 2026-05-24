@@ -134,6 +134,10 @@ def _run_main_and_capture_full_pipeline(argv: list[str]) -> list[str]:
         try:
             wikimedia_retry.main()
         except SystemExit:
+            # main() reaches `_slack_fail` after the mocked tmux launch
+            # returns "" (no SESSION_STARTED), which calls sys.exit(1).
+            # That's expected in the mocked path — by that point we've
+            # already captured every SSM call the test cares about.
             pass
 
     return captured
@@ -171,9 +175,17 @@ def test_retry_passes_max_age_days_one_to_downloader():
         f"The retry's downloader call must pass `--max-age-days 1` so "
         f"refresh-failed files actually re-attempt; got: {pipeline_cmd!r}"
     )
-    # Defence: make sure --max-age-days 1 immediately precedes the CSV path
-    # rather than appearing somewhere else in the command line.
-    assert "downloader --max-age-days 1 " in pipeline_cmd
+    # Defence: make sure --max-age-days 1 is immediately followed by the
+    # CSV path and partner argument, not buried elsewhere in the command
+    # line. The substring match here pins the exact argument order the
+    # downloader CLI expects (`downloader [OPTIONS] IDS_FILE PARTNER`).
+    expected = (
+        "downloader --max-age-days 1 "
+        "/home/ec2-user/ingest-wikimedia/retry/smithsonian-download-retry.csv si"
+    )
+    assert expected in pipeline_cmd, (
+        f"expected substring not found; got: {pipeline_cmd!r}"
+    )
 
 
 def test_retry_clears_stale_csvs_even_when_no_partner_given():
