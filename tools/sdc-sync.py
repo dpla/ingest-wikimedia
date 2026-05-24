@@ -18,7 +18,7 @@ from pywikibot import pagegenerators
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
 
 with open("config.toml", "rb") as _f:
-    key = tomllib.load(_f)["dpla_api_key"]
+    dpla_api = tomllib.load(_f)["dpla_api_key"]
 
 site = pywikibot.Site()
 site.login()
@@ -901,7 +901,8 @@ def dpla_claims(
                                             }
                                         }
                                     )
-                                except Exception:
+                                except (KeyError, IndexError, TypeError):
+                                    # P7482 statement without a P973 qualifier — skip it
                                     pass
                             elif dtype == "wikibase-entityid":
                                 dpla_claim_list.append(
@@ -973,18 +974,18 @@ def dpla_claims(
         print(" --- Saved removals!")
 
 
-def parsed(dpla_id, key):
+def parsed(dpla_id, dpla_api):
     print(f" -- Accessing DPLA ID {dpla_id}")
     try:
         dpla = requests.get(
-            f"https://api.dp.la/v2/items/{dpla_id}?api_key={key}",
+            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
             timeout=15,
         ).json()
     except Exception:
         print(" -- Sleeping 30 seconds and retrying...")
         time.sleep(30)
         dpla = requests.get(
-            f"https://api.dp.la/v2/items/{dpla_id}?api_key={key}"
+            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}"
         ).json()
     print(f" -- Accessed DPLA ID {dpla_id}")
 
@@ -999,6 +1000,8 @@ def parsed(dpla_id, key):
         dpla["dataProvider"]["name"]
     ]["Wikidata"]
     titles = dpla["sourceResource"]["title"]
+    if isinstance(titles, str):
+        titles = [titles]
     rs = dpla["rights"]
     url = dpla["isShownAt"]
 
@@ -1007,15 +1010,19 @@ def parsed(dpla_id, key):
         for displaydate in dpla["sourceResource"]["date"]:
             dates.append(displaydate["displayDate"])
     except Exception:
-        dates = ""
+        dates = []
     try:
         local_ids = dpla["sourceResource"]["identifier"]
+        if isinstance(local_ids, str):
+            local_ids = [local_ids]
     except Exception:
-        local_ids = ""
+        local_ids = []
     try:
         descs = dpla["sourceResource"]["description"]
+        if isinstance(descs, str):
+            descs = [descs]
     except Exception:
-        descs = ""
+        descs = []
     try:
         subjects = []
         for subject in dpla["sourceResource"]["subject"]:
@@ -1055,13 +1062,17 @@ def parsed(dpla_id, key):
             if not added:
                 subjects.append((str(subject.get("name") or ""), ""))
     except Exception:
-        subjects = ""
+        subjects = []
     try:
         creators = dpla["sourceResource"]["creator"]
+        if isinstance(creators, str):
+            creators = [creators]
     except Exception:
-        creators = ""
+        creators = []
     if dpla["provider"]["name"] == "National Archives and Records Administration":
         naids = dpla["sourceResource"]["identifier"]
+        if isinstance(naids, str):
+            naids = [naids]
         codes = {
             "10031403": "Q66739888",
             "10031402": "Q24238356",
@@ -1082,9 +1093,9 @@ def parsed(dpla_id, key):
         for lvl_key in levels:
             if xml.find(lvl_key):
                 level = levels[lvl_key]
-        local_ids = ""
+        local_ids = []
     else:
-        naids = ""
+        naids = []
         access = ""
         level = ""
 
@@ -1117,7 +1128,7 @@ def login():
 token = login()
 
 
-def _resolve_dpla_id(title, key):
+def _resolve_dpla_id(title, dpla_api):
     """Return the DPLA item ID for a Commons file title.
 
     Tries the standard DPLA filename pattern first; falls back to a NARA
@@ -1130,7 +1141,7 @@ def _resolve_dpla_id(title, key):
     print("Detecting NARA identifier...")
     nara_id = re.sub(r"^.*NARA - (.*?)[\.| ].*$", r"\1", title)
     nara_item = requests.get(
-        f'https://api.dp.la/v2/items?api_key={key}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"'
+        f'https://api.dp.la/v2/items?api_key={dpla_api}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"'
     ).json()
     if len(nara_item["docs"]) == 1:
         return nara_item["docs"][0]["id"]
@@ -1156,7 +1167,7 @@ def process_one(mediaid, dpla_id):
             naids,
             access,
             level,
-        ) = parsed(dpla_id, key)
+        ) = parsed(dpla_id, dpla_api)
     except TypeError:
         with open("Missing ids.txt", "a") as missing:
             missing.write(dpla_id + "\n")
@@ -1293,7 +1304,7 @@ def process_one(mediaid, dpla_id):
                     print(" --- Error encountered on save.")
                     sys.exit()
             except Exception:
-                print(str(post) + "\n" + str(postdata))
+                print(post)
                 print(" --- Error encountered. 3")
                 sys.exit()
 
@@ -1337,7 +1348,7 @@ if method == "list":
             print(f"{count}:\n - {args.lists}/{lists[x]} ({percent:.2f}% done)")
             print("\n" + str(file).replace('""', '"'))
             mediaid = "M" + str(file.pageid)
-            dpla_id = _resolve_dpla_id(str(file), key)
+            dpla_id = _resolve_dpla_id(str(file), dpla_api)
             process_one(mediaid, dpla_id)
 
         os.rename(working_file, os.path.join(args.lists, "COMPLETE-" + lists[x]))
@@ -1354,6 +1365,7 @@ if method == "list":
             with open("Missing ids.txt", "w") as f:
                 f.write("\n".join(duduped) + "\n")
         except FileNotFoundError:
+            # No missing IDs recorded this batch; nothing to dedupe.
             pass
 
 elif args.files:
@@ -1364,7 +1376,7 @@ elif args.files:
             print(f" -- Page not found on Commons: {title}")
             continue
         mediaid = "M" + str(page.pageid)
-        dpla_id = _resolve_dpla_id(title, key)
+        dpla_id = _resolve_dpla_id(title, dpla_api)
         count += 1
         print(f"{count}: {mediaid}")
         process_one(mediaid, dpla_id)
