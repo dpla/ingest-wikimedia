@@ -56,8 +56,9 @@ parser.add_argument(
     action="store",
     default=None,
     help=(
-        "Read each DPLA item's metadata from <partner>/<dpla_id>/dpla-map.json "
-        "in S3 (staged by get-ids-es) instead of calling api.dp.la. Falls back "
+        "Read each DPLA item's metadata from the dpla-map.json staged in S3 "
+        "by get-ids-es (under the partner's sharded item prefix; resolved by "
+        "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
         "to api.dp.la when an item's dpla-map.json is missing."
     ),
 )
@@ -1132,9 +1133,11 @@ def dpla_claims(
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
     """Fetch a single DPLA item's inner doc from the public DPLA API.
 
-    Returns the inner doc (same shape as an ES `_source` and as
-    `<partner>/<dpla_id>/dpla-map.json` in S3) on success, or None on API
-    error. Retries once after a 30-second sleep on the first network failure.
+    Returns the inner doc (same shape as an ES `_source` and as the
+    dpla-map.json staged in S3 under the partner's sharded item prefix) on
+    success, or None on API error. Retries once after a 30-second sleep on
+    the first network failure; if the retry also raises, returns None so
+    parsed() can treat the item as Missing rather than aborting the batch.
     """
     try:
         response = requests.get(
@@ -1144,10 +1147,14 @@ def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
     except Exception:
         print(" -- Sleeping 30 seconds and retrying...")
         time.sleep(30)
-        response = requests.get(
-            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
-            timeout=15,
-        ).json()
+        try:
+            response = requests.get(
+                f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
+                timeout=15,
+            ).json()
+        except Exception as retry_e:
+            print(f" -- DPLA API retry failed for {dpla_id}: {retry_e!r}")
+            return None
     try:
         return response["docs"][0]
     except Exception:
@@ -1160,8 +1167,9 @@ def _fetch_dpla_doc_from_s3(s3_client, partner, dpla_id):
     """Read a single DPLA item's inner doc from S3.
 
     `get-ids-es` stages the ES `_source` for every eligible item as
-    `<partner>/<dpla_id>/dpla-map.json`. Returns the parsed doc on success,
-    None when the object is missing or unparseable. A None return lets
+    dpla-map.json under the partner's sharded item prefix (resolved by
+    S3Client.get_item_metadata). Returns the parsed doc on success, None
+    when the object is missing or unparseable. A None return lets
     `parsed()` fall back to the DPLA API path so we never silently skip an
     item just because it hasn't been staged yet.
     """
