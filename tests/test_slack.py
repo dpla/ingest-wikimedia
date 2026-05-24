@@ -8,16 +8,19 @@ log-summary logic that produces the message body.
 import os
 import tempfile
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ingest_wikimedia.slack import (
     _decode_exit_code,
     _find_latest_log,
+    _read_download_failed_count,
     _summarize_log,
     notify_pipeline_fail,
+    notify_upload_complete,
 )
+from ingest_wikimedia.tracker import Result, Tracker
 
 
 @pytest.mark.parametrize(
@@ -163,3 +166,129 @@ def test_notify_pipeline_fail_treats_any_value_other_than_1_as_not_last():
         assert "skipping to next target" in msg, (
             f"value {value!r} should be treated as not-last"
         )
+
+
+# ---------------------------------------------------------------------------
+# notify_upload_complete: combined retry summary
+# ---------------------------------------------------------------------------
+
+
+def test_read_download_failed_count_parses_counts_section(tmp_path):
+    """Reads `FAILED: N` out of a downloader log's terminal COUNTS section."""
+    log = tmp_path / "20260524-201558-si-download.log"
+    log.write_text(
+        "[INFO] 20:15:58: Starting download for si\n"
+        "[INFO] 20:46:51: \n"
+        "COUNTS:\n"
+        "DOWNLOADED: 6937\n"
+        "FAILED: 12\n"
+        "SKIPPED: 6\n"
+        "BYTES: 6785972036\n"
+        "\n"
+        "[INFO] 20:46:51: 1852.87 seconds.\n"
+    )
+    assert _read_download_failed_count(str(log)) == 12
+
+
+def test_read_download_failed_count_none_path_returns_none():
+    """Unset env var → None (no combination)."""
+    assert _read_download_failed_count(None) is None
+    assert _read_download_failed_count("") is None
+
+
+def test_read_download_failed_count_missing_file_returns_none(tmp_path):
+    """Path that doesn't exist → None, no crash."""
+    assert _read_download_failed_count(str(tmp_path / "does-not-exist.log")) is None
+
+
+def test_read_download_failed_count_no_counts_section_returns_none(tmp_path):
+    """Log file without a COUNTS section → None (downloader bombed early)."""
+    log = tmp_path / "partial.log"
+    log.write_text("[INFO] 20:15:58: Starting download for si\n")
+    assert _read_download_failed_count(str(log)) is None
+
+
+def _capture_completion_message(env: dict, tracker_counts: dict) -> dict:
+    """Run notify_upload_complete with a mocked Tracker + env, return the
+    keyword arguments passed to `_post_completion_notice` (header,
+    plain_text, stats_lines) so the test can assert on them."""
+    tracker = MagicMock(spec=Tracker)
+    tracker.count.side_effect = lambda result: tracker_counts.get(result, 0)
+    captured: dict = {}
+
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch("ingest_wikimedia.slack._post_completion_notice") as mock_post,
+    ):
+        mock_post.side_effect = lambda **kwargs: captured.update(kwargs)
+        notify_upload_complete(
+            tracker=tracker,
+            partner_label="si",
+            elapsed_seconds=16.0,
+            dry_run=False,
+        )
+    return captured
+
+
+def test_notify_upload_complete_no_retry_env_keeps_upload_only_header(tmp_path):
+    """Without WIKIMEDIA_RETRY_DOWNLOAD_LOG set, the existing
+    "Wikimedia Upload Complete" header is preserved and FAILED is the
+    uploader tracker's count alone."""
+    captured = _capture_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "si",
+        },
+        tracker_counts={Result.UPLOADED: 5, Result.SKIPPED: 10, Result.FAILED: 2},
+    )
+    assert "Wikimedia Upload Complete" in captured["header"]
+    assert "Retry Complete" not in captured["header"]
+    failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
+    assert failed_lines == ["FAILED:   2"]
+
+
+def test_notify_upload_complete_with_retry_env_combines_failed_count(tmp_path):
+    """With WIKIMEDIA_RETRY_DOWNLOAD_LOG pointing at a download log that
+    recorded 1 failure, FAILED in the Slack summary is the *sum* of the
+    upload tracker's failures and the download log's failures, and the
+    header is re-titled to "Retry Complete"."""
+    download_log = tmp_path / "20260524-220233-retry-si-download.log"
+    download_log.write_text("[INFO] foo\nCOUNTS:\nFAILED: 1\nSKIPPED: 79\n")
+    captured = _capture_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "retry-si",
+            "WIKIMEDIA_RETRY_DOWNLOAD_LOG": str(download_log),
+        },
+        # Upload tracker: 0 uploaded, 80 skipped (already on Commons), 0 failed.
+        # The retry summary must surface the download-phase FAILED=1.
+        tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
+    )
+    assert "Wikimedia Retry Complete" in captured["header"]
+    assert "Upload Complete" not in captured["header"]
+    failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
+    assert failed_lines == ["FAILED:   1"]
+    # SKIPPED and UPLOADED stay as upload-phase only — each phase's SKIPPED
+    # means a different thing (download = "already in S3"; upload = "already
+    # on Commons") and conflating them would obscure the picture.
+    skipped_lines = [s for s in captured["stats_lines"] if s.startswith("SKIPPED:")]
+    assert skipped_lines == ["SKIPPED:  80"]
+
+
+def test_notify_upload_complete_with_retry_env_but_no_log_file(tmp_path):
+    """If WIKIMEDIA_RETRY_DOWNLOAD_LOG is set but the file is unreadable
+    (e.g. the `ls -t | head -1` substitution returned empty and got
+    concatenated with $PWD/ to yield a directory path), gracefully fall
+    back to the upload-only header rather than crashing the notification."""
+    captured = _capture_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "retry-si",
+            "WIKIMEDIA_RETRY_DOWNLOAD_LOG": str(tmp_path),  # a directory, not a file
+        },
+        tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
+    )
+    # Falls back gracefully — upload-only header, FAILED unchanged.
+    assert "Wikimedia Upload Complete" in captured["header"]
+    failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
+    assert failed_lines == ["FAILED:   0"]
