@@ -65,10 +65,23 @@ class Downloader:
         destination_path: str,
         content_type: str,
         sha1: str,
+        force_overwrite: bool = False,
     ) -> bool:
         """
-        Uploads the file to S3. Returns True if the file was uploaded, False if it
-        already existed with a matching checksum and was skipped.
+        Uploads the file to S3. Returns True if the file was uploaded (or
+        touched via copy-self), False if it already existed with a matching
+        checksum and the caller did not request a forced overwrite.
+
+        `force_overwrite=True` is set by `process_media` whenever the caller
+        intends the resulting S3 object to reflect a fresh fetch — either
+        the caller passed `overwrite=True`, or the per-key age check
+        decided the existing S3 object was too old to trust. Without this
+        flag, an existing-SHA1 match silently skipped the upload, leaving
+        the S3 `LastModified` timestamp pinned to the original (long-ago)
+        write. Every subsequent refresh run then saw the same stale
+        timestamp, re-downloaded the same bytes, hit the same skip, and
+        the file's age in S3 never moved — wasting hours of network and
+        compute on every periodic refresh.
         """
         try:
             # Defence-in-depth: refuse to upload a 0-byte local file regardless
@@ -106,6 +119,35 @@ class Downloader:
                 if obj_metadata and obj_metadata.get(CHECKSUM) == sha1:
                     try:
                         if int(obj.content_length) > 0:
+                            if force_overwrite:
+                                # Refresh / overwrite path: SHA1 matches the
+                                # existing S3 object, so re-uploading the same
+                                # bytes is wasteful. Use copy-object onto the
+                                # same key to update LastModified without
+                                # re-transferring the body. MetadataDirective
+                                # "REPLACE" silently drops any metadata not
+                                # explicitly passed (per lessons.md
+                                # "AWS S3 copy_object with MetadataDirective"),
+                                # so we re-supply the full metadata dict.
+                                logging.info(
+                                    "Already at correct SHA1; touching S3 "
+                                    "LastModified via copy-object."
+                                )
+                                new_metadata = dict(obj_metadata)
+                                new_metadata[CHECKSUM] = sha1
+                                s3.meta.client.copy_object(
+                                    Bucket=S3_BUCKET,
+                                    Key=destination_path,
+                                    CopySource={
+                                        "Bucket": S3_BUCKET,
+                                        "Key": destination_path,
+                                    },
+                                    ContentType=content_type,
+                                    Metadata=new_metadata,
+                                    MetadataDirective="REPLACE",
+                                )
+                                self.tracker.increment(Result.DOWNLOADED)
+                                return True
                             logging.info("Already exists.")
                             self.tracker.increment(Result.SKIPPED)
                             return False
@@ -235,6 +277,13 @@ class Downloader:
             destination_path = self.s3_client.get_media_s3_path(
                 dpla_id, ordinal, partner
             )
+            # Track whether we're proceeding because the caller asked to
+            # overwrite or because the age check decided to refresh. Either
+            # way, upload_file_to_s3 must persist the new write even when
+            # the SHA1 matches what's already in S3 — otherwise the
+            # LastModified timestamp never advances and the file is
+            # re-attempted indefinitely on subsequent refresh runs.
+            is_refresh = False
             if not overwrite:
                 age_days = self._s3_key_age_days(destination_path)
                 if age_days is not None:
@@ -246,6 +295,7 @@ class Downloader:
                         f"Refreshing {dpla_id} {ordinal}: S3 file is "
                         f"{age_days:.0f} days old (threshold: {max_age_days})."
                     )
+                    is_refresh = True
 
             if sleep_secs != 0:
                 time.sleep(sleep_secs)
@@ -259,10 +309,15 @@ class Downloader:
 
             sha1 = self.local_fs.get_file_hash(temp_file_name)
 
+            force_overwrite = overwrite or is_refresh
             for attempt in range(1, CREDENTIAL_RETRY_MAX + 1):
                 try:
                     if self.upload_file_to_s3(
-                        temp_file_name, destination_path, content_type, sha1
+                        temp_file_name,
+                        destination_path,
+                        content_type,
+                        sha1,
+                        force_overwrite=force_overwrite,
                     ):
                         self.tracker.increment(
                             Result.BYTES, os.stat(temp_file_name).st_size

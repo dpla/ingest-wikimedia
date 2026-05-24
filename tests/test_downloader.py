@@ -83,6 +83,116 @@ def test_upload_proceeds_when_checksum_matches_but_zero_bytes(downloader):
     obj.upload_fileobj.assert_called_once()
 
 
+def test_upload_force_overwrite_touches_via_copy_when_sha1_matches(downloader):
+    """Refresh / overwrite path: when the freshly-downloaded SHA1 matches
+    the existing S3 object, we must update LastModified via copy-self
+    instead of skipping. Skipping was the bug that made `--max-age-days`
+    refreshes run forever — every periodic refresh would log "Refreshing
+    X: file is 554 days old", actually re-download the bytes, see the
+    matching SHA1, skip the upload, and leave the S3 LastModified at the
+    original write, so next run still saw the file as 554+ days old.
+    """
+    sha1 = "abc123"
+    existing_metadata = {CHECKSUM: sha1, "custom": "preserved"}
+    obj = MagicMock()
+    obj.metadata = existing_metadata
+    obj.content_length = 1024
+
+    mock_s3 = MagicMock()
+    mock_s3.Object.return_value = obj
+    downloader.s3_client.get_s3.return_value = mock_s3
+
+    with patch(
+        "builtins.open",
+        return_value=MagicMock(
+            __enter__=lambda s: BytesIO(b"data"), __exit__=MagicMock(return_value=False)
+        ),
+    ):
+        with patch("os.stat") as mock_stat:
+            mock_stat.return_value.st_size = 1024
+            result = downloader.upload_file_to_s3(
+                "/tmp/fake",
+                "dest/path",
+                "image/jpeg",
+                sha1,
+                force_overwrite=True,
+            )
+
+    assert result is True
+    # copy_object must be called to touch LastModified
+    mock_s3.meta.client.copy_object.assert_called_once()
+    kwargs = mock_s3.meta.client.copy_object.call_args.kwargs
+    assert kwargs["MetadataDirective"] == "REPLACE"
+    # MetadataDirective REPLACE drops every header not re-supplied — the full
+    # existing metadata (including CHECKSUM and any custom keys) must be
+    # passed back in. See lessons.md "AWS S3 copy_object with
+    # MetadataDirective".
+    assert kwargs["Metadata"][CHECKSUM] == sha1
+    assert kwargs["Metadata"]["custom"] == "preserved"
+    # Body re-upload must NOT happen — bytes are identical.
+    obj.upload_fileobj.assert_not_called()
+    downloader.tracker.increment.assert_called_once_with(Result.DOWNLOADED)
+
+
+def test_upload_force_overwrite_uploads_when_sha1_differs(downloader):
+    """When force_overwrite=True and the new SHA1 differs from the existing
+    S3 object's SHA1, the standard upload path runs (no SHA1-match guard
+    to begin with, so behavior here matches the default case)."""
+    obj = _make_s3_obj("old_sha", 1024)
+
+    mock_s3 = MagicMock()
+    mock_s3.Object.return_value = obj
+    downloader.s3_client.get_s3.return_value = mock_s3
+
+    fake_file = BytesIO(b"new content")
+    fake_file.name = "/tmp/fake"
+
+    with patch("builtins.open") as mock_open:
+        mock_open.return_value.__enter__ = lambda s: fake_file
+        mock_open.return_value.__exit__ = MagicMock(return_value=False)
+        with patch("os.stat") as mock_stat:
+            mock_stat.return_value.st_size = len(b"new content")
+            result = downloader.upload_file_to_s3(
+                "/tmp/fake",
+                "dest/path",
+                "image/jpeg",
+                "new_sha",
+                force_overwrite=True,
+            )
+
+    assert result is True
+    obj.upload_fileobj.assert_called_once()
+    mock_s3.meta.client.copy_object.assert_not_called()
+
+
+def test_upload_default_skips_when_sha1_matches(downloader):
+    """Existing behavior preserved: without force_overwrite, a matching
+    SHA1 short-circuits the upload (no copy-self, no upload)."""
+    sha1 = "abc123"
+    obj = _make_s3_obj(sha1, 1024)
+
+    mock_s3 = MagicMock()
+    mock_s3.Object.return_value = obj
+    downloader.s3_client.get_s3.return_value = mock_s3
+
+    with patch(
+        "builtins.open",
+        return_value=MagicMock(
+            __enter__=lambda s: BytesIO(b"data"), __exit__=MagicMock(return_value=False)
+        ),
+    ):
+        with patch("os.stat") as mock_stat:
+            mock_stat.return_value.st_size = 1024
+            result = downloader.upload_file_to_s3(
+                "/tmp/fake", "dest/path", "image/jpeg", sha1
+            )
+
+    assert result is False
+    obj.upload_fileobj.assert_not_called()
+    mock_s3.meta.client.copy_object.assert_not_called()
+    downloader.tracker.increment.assert_called_once_with(Result.SKIPPED)
+
+
 def test_upload_proceeds_when_content_length_unreadable(downloader):
     sha1 = "abc123"
     obj = _make_s3_obj(sha1, None)  # None → TypeError on int()
