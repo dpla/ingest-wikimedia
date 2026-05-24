@@ -954,8 +954,22 @@ def _post_item_orphan_check(
           - no match → log a WARNING for manual review (could be a real
             unrelated upload at that title that we shouldn't touch)
     """
-    # Build per-extension data: ext (with leading dot) → list of
-    # (sha1, kept_title) for the assets currently uploaded.
+    # Declared per-extension page count from the pre-scan.  This is what
+    # determines the legitimate (page 1)…(page N) range for the item — we
+    # MUST derive the probe start from this and not from `per_ext` below,
+    # because an ordinal whose SHA1 we can't read still occupies a real
+    # page slot.  Underestimating expected_count would make the probe
+    # overlap a legitimate page and risk tagging it as a duplicate.
+    declared_ext_counts: dict[str, int] = {}
+    for ordinal in ordinal_exts:
+        ext = ordinal_exts[ordinal]
+        if not ext:
+            continue  # stub / octet-stream ordinal — not a per-extension slot
+        declared_ext_counts[ext] = declared_ext_counts.get(ext, 0) + 1
+
+    # Build per-extension SHA1→kept_title map for the assets we can hash.
+    # Used only to decide whether a found orphan is a duplicate of a known
+    # source asset — the probe boundary is driven by declared_ext_counts.
     per_ext: dict[str, list[tuple[str, str]]] = {}
     for ordinal in sorted(ordinal_exts):
         ext = ordinal_exts[ordinal]
@@ -981,8 +995,8 @@ def _post_item_orphan_check(
         )
         per_ext.setdefault(ext, []).append((sha1, kept_title))
 
-    for ext, entries in per_ext.items():
-        expected_count = len(entries)
+    for ext, expected_count in declared_ext_counts.items():
+        entries = per_ext.get(ext, [])
         if expected_count >= 2:
             start_page = expected_count + 1
         elif expected_count == 1:

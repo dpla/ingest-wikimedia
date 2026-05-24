@@ -467,6 +467,72 @@ def test_orphan_check_flags_when_tag_save_fails():
     assert tracker.count(Result.ORPHANS_FLAGGED) == 1
 
 
+def test_orphan_check_uses_declared_count_when_sha1_metadata_missing():
+    """An in-range ordinal that's missing CHECKSUM metadata on S3 must still
+    count toward expected_count for probe-boundary purposes — otherwise the
+    probe would start inside the legitimate page range and could tag a real
+    page as a duplicate of itself.
+
+    Scenario: 3 jpgs declared in ordinal_exts; ordinal 2's S3 metadata is
+    missing the sha1 key.  Probe must still start at (page 4), not (page 3).
+    """
+
+    def _stub_s3_with_one_missing_checksum():
+        # ordinal 1 and 3 have SHA1; ordinal 2 returns metadata without 'sha1'.
+        sha1s = {1: "aaa", 3: "ccc"}
+
+        def _get_media_path(dpla_id, ordinal, partner):
+            return f"{partner}/images/x/x/x/x/{dpla_id}/{ordinal}_{dpla_id}"
+
+        def _object(_bucket, key):
+            ordinal = int(key.rsplit("/", 1)[1].split("_", 1)[0])
+            obj = MagicMock()
+            obj.metadata = {"sha1": sha1s[ordinal]} if ordinal in sha1s else {}
+            return obj
+
+        s3_client = MagicMock()
+        s3_client.get_media_s3_path.side_effect = _get_media_path
+        inner = MagicMock()
+        inner.Object.side_effect = _object
+        s3_client.get_s3.return_value = inner
+        return s3_client
+
+    tracker = Tracker()
+    s3_client = _stub_s3_with_one_missing_checksum()
+    ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    page_labels = {1: "1", 2: "2", 3: "3"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    # (page 3) is a legitimate page — its SHA1 happens to match ordinal 3's.
+    # If the probe started at (page 3), it would tag a real page as a dup.
+    # No (page 4) → nothing to tag overall.
+    existing = {f"{base} (page 3).jpg": "ccc"}
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+    tag_mock.assert_not_called()
+    # And the FilePage probe must not have hit (page 3) — it would have
+    # if we used the SHA1-filtered count of 2 instead of the declared 3.
+    probed_titles = [call.args[1] for call in fp.call_args_list]
+    assert f"{base} (page 3).jpg" not in probed_titles
+
+
 def test_orphan_check_skips_extensions_with_no_assets():
     """Empty ordinal_exts (e.g. stubs-only) → no probing, no errors."""
     tracker = Tracker()
