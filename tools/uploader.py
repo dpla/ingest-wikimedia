@@ -913,6 +913,12 @@ _REPLICATION_SETTLE_SECS = 10
 # DPLA item has more pages than this.
 _ORPHAN_PROBE_CEILING = 500
 
+# Tolerate small gaps in the probe sequence — orphans aren't always
+# contiguous.  E.g. a previous session may have moved or deleted (page N)
+# while leaving (page N+1) stranded.  Two consecutive misses is enough to
+# call the trail finished.
+_ORPHAN_GAP_TOLERANCE = 2
+
 
 def _post_item_orphan_check(
     site,
@@ -938,8 +944,10 @@ def _post_item_orphan_check(
         so any (page N) at all is an orphan — probe from page 1.
       - If count >= 2 the expected titles are (page 1)..(page N), so probe
         from page N+1.
-      - Probe upward via FilePage.exists() (page-info API, not search) until
-        the first non-existent page; that gap terminates the trail.
+      - Probe upward via FilePage.exists() (page-info API, not search),
+        tolerating up to _ORPHAN_GAP_TOLERANCE consecutive missing pages
+        — orphans aren't always contiguous (e.g. a prior session may have
+        moved or deleted (page N) while leaving (page N+1) stranded).
       - For each orphan found, compare its SHA1 to the SHA1 set of this
         item's S3 assets of the same extension:
           - match → tag as duplicate of the matching uploaded title
@@ -989,6 +997,7 @@ def _post_item_orphan_check(
         for sha1, kept_title in entries:
             sha1_to_kept.setdefault(sha1, kept_title)
 
+        consecutive_misses = 0
         for k in range(start_page, start_page + _ORPHAN_PROBE_CEILING):
             candidate_title = get_page_title(
                 item_title=item_title,
@@ -1000,7 +1009,11 @@ def _post_item_orphan_check(
             # cached result from a previous call within this session.
             candidate = pywikibot.FilePage(site, candidate_title)
             if not candidate.exists():
-                break  # gap → no more trailing orphans for this ext
+                consecutive_misses += 1
+                if consecutive_misses > _ORPHAN_GAP_TOLERANCE:
+                    break  # trail of misses long enough; stop scanning ext
+                continue
+            consecutive_misses = 0
 
             try:
                 orphan_sha1 = candidate.latest_file_info.sha1

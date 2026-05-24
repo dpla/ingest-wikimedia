@@ -338,6 +338,45 @@ def test_orphan_check_dry_run_does_not_save():
     tag_mock.assert_not_called()
 
 
+def test_orphan_check_skips_gap_and_finds_orphan_past_it():
+    """Single-asset item with no (page 1) but (page 2) stranded — gap tolerance
+    must let the probe reach it.
+
+    Real case observed: LBJ 1956 Desk Diary I (DPLA 72e2342079...) — the item
+    is now single-page (no-suffix .jpg authoritative) but (page 2).jpg lingers
+    with no (page 1).jpg adjacent to it (a previous session handled the
+    (page 1) slot via move/tag, leaving (page 2) stranded).
+    """
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa"})
+    ordinal_exts = {1: ".jpg"}
+    page_labels = {1: ""}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    # No (page 1).jpg; (page 2).jpg exists with the same SHA1 as the no-suffix asset.
+    existing = {f"{base} (page 2).jpg": "aaa"}
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 1
+    tag_mock.assert_called_once()
+    assert tag_mock.call_args.kwargs["correct_filename"] == f"{base}.jpg"
+
+
 def test_orphan_check_skips_extensions_with_no_assets():
     """Empty ordinal_exts (e.g. stubs-only) → no probing, no errors."""
     tracker = Tracker()
