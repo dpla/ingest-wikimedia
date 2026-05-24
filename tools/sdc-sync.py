@@ -985,7 +985,8 @@ def parsed(dpla_id, dpla_api):
         print(" -- Sleeping 30 seconds and retrying...")
         time.sleep(30)
         dpla = requests.get(
-            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}"
+            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
+            timeout=15,
         ).json()
     print(f" -- Accessed DPLA ID {dpla_id}")
 
@@ -1141,7 +1142,8 @@ def _resolve_dpla_id(title, dpla_api):
     print("Detecting NARA identifier...")
     nara_id = re.sub(r"^.*NARA - (.*?)[\.| ].*$", r"\1", title)
     nara_item = requests.get(
-        f'https://api.dp.la/v2/items?api_key={dpla_api}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"'
+        f'https://api.dp.la/v2/items?api_key={dpla_api}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"',
+        timeout=15,
     ).json()
     if len(nara_item["docs"]) == 1:
         return nara_item["docs"][0]["id"]
