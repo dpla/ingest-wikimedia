@@ -74,7 +74,7 @@ def test_get_phase_and_progress_grep_uses_double_dash_separator():
         # First call is the precheck (session_created + ls|grep); subsequent
         # calls only happen if a log file was returned. Return an empty
         # session_created and no log file so we exit early.
-        if not captured_commands or len(captured_commands) == 1:
+        if len(captured_commands) == 1:
             return "0\n"
         return ""
 
