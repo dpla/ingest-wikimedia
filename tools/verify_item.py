@@ -65,6 +65,10 @@ BATCH = 50
 # Fallback when a 429/503 response carries no Retry-After header. 30s is
 # Commons' usual maxlag retry window; long enough to clear most throttles.
 DEFAULT_RETRY_AFTER_SECS = 30
+# Maximum retry attempts for transient 429/503 responses from Commons.
+# Eight attempts with the typical 30-60s back-off covers ~5-10 minutes
+# of cumulative throttle without giving up on long-running batches.
+MAX_API_RETRIES = 8
 # Inter-request courtesy delay between Commons API calls. Keeps sustained
 # request rate well under the unauthenticated ceiling so we never trigger
 # the per-IP limiter on long verification runs.
@@ -99,7 +103,7 @@ def commons_api(params: dict) -> dict:
             "Content-Type": "application/x-www-form-urlencoded",
         },
     )
-    for attempt in range(8):
+    for attempt in range(MAX_API_RETRIES):
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 time.sleep(INTER_REQUEST_SLEEP_SECS)

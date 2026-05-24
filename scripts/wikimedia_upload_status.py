@@ -93,6 +93,14 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
     csv_path = shlex.quote(f"{base}/{label}.csv")
 
     sep = "__WM_SEP__"
+    # One awk pass counts all four marker lines in a single sequential read
+    # of the log; the previous code ran four separate `grep -c` invocations
+    # over the same file (plus the COUNTS: probe), which on multi-GB NARA
+    # logs translated to four full sequential reads and four SSM round-trips
+    # of pipeline setup overhead. Output is still four lines (dpla_id,
+    # uploaded, skipping, counts) in the same order as before, followed by
+    # the CSV total from `wc -l`. The `|| printf` fallback covers the
+    # missing-file case symmetrically with the old `|| true`.
     out = ssm_run(
         client,
         f"date +%s; "
@@ -100,11 +108,14 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
         f"echo {sep}; "
         f"tail -5 {log_path}; "
         f"echo {sep}; "
-        f"grep -c 'DPLA ID:' {log_path} 2>/dev/null || true; "
-        f"grep -c 'Uploaded to' {log_path} 2>/dev/null || true; "
-        f"grep -c 'Skipping.*Already exists on commons' {log_path} 2>/dev/null || true; "
-        f"wc -l < {csv_path} 2>/dev/null || echo 0; "
-        f"grep -c 'COUNTS:' {log_path} 2>/dev/null || true",
+        f"awk '"
+        f"/DPLA ID:/ {{d++}} "
+        f"/Uploaded to/ {{u++}} "
+        f"/Skipping.*Already exists on commons/ {{s++}} "
+        f"/COUNTS:/ {{c++}} "
+        f"END {{ print d+0; print u+0; print s+0; print c+0 }}"
+        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n'; "
+        f"wc -l < {csv_path} 2>/dev/null || echo 0",
     )
 
     sections = out.split(f"{sep}\n", 2)
@@ -119,11 +130,14 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
     tail = sections[1].strip() if len(sections) > 1 else ""
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
 
+    # Layout matches the awk-then-wc shell command above: the awk pass emits
+    # four counts (DPLA-ID, Uploaded, Skipping, COUNTS) and then `wc -l`
+    # emits the CSV total — five lines in total.
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
-    total = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
-    counts_marker = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
+    counts_marker = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
+    total = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
