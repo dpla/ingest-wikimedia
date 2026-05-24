@@ -260,6 +260,28 @@ def main() -> None:
         if github_sha
         else ""
     )
+    # `ssm_run` wraps every command in `sudo -u ec2-user bash -c` by
+    # default. That's correct for the actual update (we want git clone, cp,
+    # and uv sync to run as ec2-user so they never create root-owned
+    # files), but `chown -R` of root-owned files needs CAP_CHOWN, which
+    # ec2-user does not have. So the heal step uses ssm_run(..., as_root=True)
+    # to bypass the wrapper and run with the AWS-RunShellScript document's
+    # default root context.
+    #
+    # The earlier "Permission denied: ... lxml/__pycache__" failure mode
+    # came from prior root-context Python imports (back when the update
+    # itself ran as root) leaving root-owned `__pycache__/` inside an
+    # otherwise ec2-user-owned venv. The heal step cleans those up; the
+    # ec2-user-run update step prevents them from being recreated.
+    heal_cmd = (
+        "chown -R ec2-user:ec2-user /home/ec2-user/ingest-wikimedia/ && "
+        "(chown -R ec2-user:ec2-user /tmp/ingest-wikimedia-update 2>/dev/null || true)"
+    )
+    try:
+        ssm_run(ssm, heal_cmd, as_root=True)
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to heal EC2 file ownership: {e}")
+
     update_cmd = (
         "cd /tmp && rm -rf ingest-wikimedia-update && "
         "git clone --depth 1 https://github.com/dpla/ingest-wikimedia.git ingest-wikimedia-update && "
