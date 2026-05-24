@@ -268,7 +268,27 @@ def main() -> None:
         upload_csv = type_csvs.get("upload")
         steps = [f"cd {base}"]
         if download_csv:
-            steps.append(f"downloader {shlex.quote(download_csv)} {slug}")
+            # `--max-age-days 1` forces the downloader to actually re-attempt
+            # files whose S3 LastModified is older than ~now, instead of
+            # falling back to its CLI default of 365 days. The default was
+            # silently skipping any failed-refresh file that already had a
+            # stale S3 entry: the original run had set --max-age-days low
+            # (often 1) to refresh those files, the source request failed,
+            # and the S3 file stayed at its original (e.g. 58-day-old)
+            # write. The retry, defaulting to 365, would then see the same
+            # 58-day-old file as "fresh enough" and skip it — exactly the
+            # file the user was trying to retry.
+            #
+            # Passing 1 day here means: files successfully written by the
+            # prior run (S3 age ~= 0) skip correctly; files the prior run
+            # failed to refresh (S3 age >= 1 day) re-attempt; files never
+            # staged at all (no S3 entry) re-attempt unconditionally. This
+            # is independent of whatever --max-age-days the prior run used,
+            # because the retry is its own decision to re-fetch and should
+            # not need to inherit the prior threshold to be correct.
+            steps.append(
+                f"downloader --max-age-days 1 {shlex.quote(download_csv)} {slug}"
+            )
             steps.append(f"uploader {shlex.quote(download_csv)} {slug}")
         if upload_csv:
             steps.append(f"uploader {shlex.quote(upload_csv)} {slug}")
