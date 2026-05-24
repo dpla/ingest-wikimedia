@@ -102,12 +102,23 @@ def main() -> None:
 
     # Scan logs for retryable failures. Pass the EC2 directory name rather than the
     # canonical slug so get-ids-retry can find the logs dir (e.g. "smithsonian" for "si").
+    #
+    # Clear any stale `*-retry.csv` left behind by prior invocations before the
+    # scan runs. The downstream `find {RETRY_DIR} -name '*-retry.csv'` step
+    # below picks up every CSV in the directory, so leftover files from a
+    # previous run silently expand the scope of this run: a request like
+    # `/wikimedia-upload retry 30 si` would launch retry pipelines for every
+    # other hub whose CSV happened to still be sitting in the dir from days or
+    # weeks ago. Clearing here makes the pipeline strictly reflect the current
+    # scan's output. There's no useful state to preserve across runs — every
+    # retry call is self-contained (scan → process → done).
     partner_desc = f" for `{partner}`" if partner else ""
     print(
         f"Scanning logs for retryable failures in the last {days} day(s){partner_desc}..."
     )
     scan_cmd = (
         f"mkdir -p {shlex.quote(RETRY_DIR)} && "
+        f"rm -f {shlex.quote(RETRY_DIR)}/*-retry.csv && "
         "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate && "
         "cd /home/ec2-user/ingest-wikimedia && "
         f"get-ids-retry {days}"
