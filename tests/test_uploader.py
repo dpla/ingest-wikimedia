@@ -128,21 +128,35 @@ def _stub_s3_client_for_assets(assets_by_ordinal: dict[int, str]):
     return s3_client
 
 
-def _make_file_page_factory(existing: dict[str, str]):
+def _make_file_page_factory(
+    existing: dict[str, str],
+    redirects: set[str] | None = None,
+):
     """Return a stub for pywikibot.FilePage(site, title).
 
-    `existing` maps Commons title → sha1 of the orphan file at that title.
-    Titles not in the map are treated as nonexistent (exists() == False).
+    `existing` maps Commons title → sha1 of the file at that title. For
+    redirect pages, the value is the redirect *target's* sha1, mirroring
+    pywikibot's `latest_file_info.sha1` behavior of following redirects.
+
+    `redirects` is the set of titles that should be reported as redirect
+    pages (`isRedirectPage()` → True). Titles in `existing` but not in
+    `redirects` are real file pages; titles in both are redirects whose
+    `latest_file_info` would resolve through to a target.
+
+    Titles not in `existing` are nonexistent (`exists()` → False).
     """
+    redirects = redirects or set()
 
     def _factory(site, title):
         page = MagicMock()
         page.title.return_value = title
         if title in existing:
             page.exists.return_value = True
+            page.isRedirectPage.return_value = title in redirects
             page.latest_file_info.sha1 = existing[title]
         else:
             page.exists.return_value = False
+            page.isRedirectPage.return_value = False
             # Accessing latest_file_info on a nonexistent page would raise,
             # but the code-under-test breaks the loop before reading it.
         return page
@@ -551,4 +565,113 @@ def test_orphan_check_skips_extensions_with_no_assets():
         )
     fp.assert_not_called()
     assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+
+
+def test_orphan_check_skips_redirect_pages():
+    """Regression: a (page N+1) title that is already a #REDIRECT to a kept
+    asset must NOT be tagged as a duplicate.
+
+    The bug: pywikibot's `latest_file_info.sha1` on a redirect *follows*
+    the redirect and returns the target file's sha1, so the orphan check's
+    `orphan_sha1 in sha1_to_kept` lookup always matched, and the bot tagged
+    the redirect page with a `{{Duplicate}}` template — producing:
+
+        {{Duplicate|<target>|Trailing-page orphan: ...}}
+        #REDIRECT [[<target>]]
+
+    which is meaningless (the redirect already does what {{Duplicate}}
+    flags) and pollutes the page with a stray template above the redirect.
+
+    Caught from commit 1219698039 on Commons:
+    File:Drift Sight, Italian, Crocco - DPLA - 023de366f0c65bec19d5b61b7e3b42d6 (page 4).jpg
+    """
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    page_labels = {1: "1", 2: "2", 3: "3"}
+    base = "Some Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    redirect_title = f"{base} (page 4).jpg"
+    keep_title = f"{base} (page 3).jpg"
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        # (page 4) exists, is a redirect, and pywikibot's latest_file_info
+        # would (mis)report the target's sha1 ("ccc"). (page 3) exists as a
+        # real file with the same sha1.
+        fp.side_effect = _make_file_page_factory(
+            existing={redirect_title: "ccc", keep_title: "ccc"},
+            redirects={redirect_title},
+        )
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Some Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    # The redirect must NOT have been tagged.
+    tag_mock.assert_not_called()
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    # Nor was it flagged for follow-up — a redirect is already doing what
+    # we'd flag it for; no manual review needed.
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+
+
+def test_orphan_check_skips_redirect_but_continues_probing():
+    """A redirect at (page N+1) doesn't stop the probe — if (page N+2) is
+    a real orphan file, it should still get tagged."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    page_labels = {1: "1", 2: "2", 3: "3"}
+    base = "Some Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    redirect_title = f"{base} (page 4).jpg"
+    real_orphan_title = f"{base} (page 5).jpg"
+    keep_title = f"{base} (page 3).jpg"
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        # (page 4) is a redirect (will be skipped).
+        # (page 5) is a real file with the matching sha1 — should be tagged.
+        # (page 3) exists as the kept target.
+        fp.side_effect = _make_file_page_factory(
+            existing={
+                redirect_title: "ccc",
+                real_orphan_title: "ccc",
+                keep_title: "ccc",
+            },
+            redirects={redirect_title},
+        )
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Some Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    # Exactly one orphan should be tagged (the real one at page 5), and it
+    # must point at the kept title.
+    assert tag_mock.call_count == 1
+    kwargs = tag_mock.call_args.kwargs
+    assert kwargs["correct_filename"] == keep_title
+    # The first positional arg is the candidate FilePage; verify it's the
+    # real orphan, not the redirect.
+    candidate_arg = tag_mock.call_args.args[1]
+    assert candidate_arg.title() == real_orphan_title
+    assert tracker.count(Result.ORPHANS_TAGGED) == 1
     assert tracker.count(Result.ORPHANS_FLAGGED) == 0

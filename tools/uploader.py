@@ -1060,6 +1060,25 @@ def _post_item_orphan_check(
                 continue
             consecutive_misses = 0
 
+            # Redirects are not orphan files — they already point at the
+            # correct target and have no file content of their own. Tagging
+            # them as duplicates produces wikitext like
+            #   {{Duplicate|<target>|...}}
+            #   #REDIRECT [[<target>]]
+            # which is meaningless and pollutes the page with a stray
+            # template above the redirect. Worse, the SHA1 match path below
+            # silently approves the tag because pywikibot's
+            # latest_file_info follows the redirect and returns the
+            # *target's* SHA1, so a redirect to a kept asset always passes
+            # the sha1_to_kept check. Skip redirects entirely — they are
+            # already doing what {{Duplicate}} is meant to do.
+            if candidate.isRedirectPage():
+                logging.info(
+                    f"Orphan check: skipping [[File:{candidate_title}]] — "
+                    f"already a redirect to its target."
+                )
+                continue
+
             try:
                 orphan_sha1 = candidate.latest_file_info.sha1
             except Exception as e:
