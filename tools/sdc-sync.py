@@ -1133,18 +1133,26 @@ def parsed(dpla_id, dpla_api):
             "10031401": "Q66739875",
         }
         levels = {"item": "Q11723795", "itemAv": "Q11723795", "fileUnit": "Q59221146"}
-        xml = BeautifulSoup(dpla["originalRecord"]["stringValue"], "xml")
-        try:
-            acccess_naid = str(
-                xml.find("accessRestriction").find("status").find("naId").text
-            )
-            access = codes[acccess_naid]
-        except Exception:
-            access = ""
+        access = ""
         level = ""
-        for lvl_key in levels:
-            if xml.find(lvl_key):
-                level = levels[lvl_key]
+        try:
+            xml = BeautifulSoup(dpla["originalRecord"]["stringValue"], "xml")
+        except Exception as e:
+            # No XML parser available (e.g. lxml missing the xml feature) — skip
+            # NARA-specific access/level extraction rather than aborting the file.
+            print(f" -- Skipping NARA XML parse for {dpla_id}: {e}")
+            xml = None
+        if xml is not None:
+            try:
+                acccess_naid = str(
+                    xml.find("accessRestriction").find("status").find("naId").text
+                )
+                access = codes[acccess_naid]
+            except Exception:
+                access = ""
+            for lvl_key in levels:
+                if xml.find(lvl_key):
+                    level = levels[lvl_key]
         local_ids = []
     else:
         naids = []
