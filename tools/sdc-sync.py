@@ -17,12 +17,6 @@ from pywikibot.comms import http
 from pywikibot import pagegenerators
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
 
-with open("config.toml", "rb") as _f:
-    dpla_api = tomllib.load(_f)["dpla_api_key"]
-
-site = pywikibot.Site()
-site.login()
-
 # When running manually, sometimes it is helpful to specify the category to work on in the command line, using --cat "<category>".
 
 parser = argparse.ArgumentParser()
@@ -61,15 +55,39 @@ method = "livecat"
 if args.method:
     method = args.method
 
-hubs = requests.get(
-    "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json"
-).json()
+# Config + Commons login happen after argparse so that `--help` doesn't trigger
+# file I/O or network/auth on this module's import.
+with open("config.toml", "rb") as _f:
+    dpla_api = tomllib.load(_f)["dpla_api_key"]
 
-with open("rights.json") as f:
-    rights = json.load(f)
-subject_ids = requests.get(
-    "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/src/main/resources/subjects.json"
-).json()
+site = pywikibot.Site()
+site.login()
+
+
+def _normalize_rights_uri(uri):
+    """Canonicalize a DPLA rights URI for lookup against rights.json.
+
+    DPLA emits rights URIs in a few minor variants — http vs https and with or
+    without a trailing slash. Keying on a single canonical form means we don't
+    silently miss licenses just because of scheme/slash drift on either side.
+    """
+    if not uri:
+        return uri
+    canonical = uri.replace("https://", "http://").rstrip("/")
+    return canonical
+
+
+# Hubs and subject mappings are vendored alongside rights.json so a run is
+# fully reproducible against the checked-in metadata. To refresh, replace the
+# files from their upstream sources and commit.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+with open(os.path.join(_REPO_ROOT, "institutions_v2.json")) as f:
+    hubs = json.load(f)
+with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
+    rights = {_normalize_rights_uri(k): v for k, v in json.load(f).items()}
+with open(os.path.join(_REPO_ROOT, "subjects.json")) as f:
+    subject_ids = json.load(f)
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
 
@@ -335,6 +353,12 @@ def check(mediaid, qid, prop):
                         1
                     ] and not statement.get("references"):
                         ref = statement["id"]
+                # Walk every statement looking for a qualifier match. Only
+                # return False on an actual match; otherwise fall through and
+                # return True once we've exhausted all statements. Returning
+                # early on a non-match would skip later statements that DO
+                # match and cause duplicate writes on multi-value properties
+                # (creators, dates, etc.).
                 for statement in statements:
                     try:
                         if (
@@ -345,11 +369,9 @@ def check(mediaid, qid, prop):
                                 f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
                             )
                             return False, ref
-
-                        else:
-                            return True, ref
-                    except Exception:
-                        pass
+                    except (KeyError, IndexError, TypeError):
+                        continue
+                return True, ref
             else:
                 return True, ref
         except KeyError:
@@ -362,6 +384,8 @@ def check(mediaid, qid, prop):
                         1
                     ] and not statement.get("references"):
                         ref = statement["id"]
+                # See the somevalue branch above: scan every statement before
+                # concluding the claim is missing.
                 for statement in statements:
                     try:
                         if (
@@ -372,11 +396,9 @@ def check(mediaid, qid, prop):
                                 f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
                             )
                             return False, ref
-
-                        else:
-                            return True, ref
-                    except Exception:
-                        pass
+                    except (KeyError, IndexError, TypeError):
+                        continue
+                return True, ref
             else:
                 return True, ref
         except KeyError:
@@ -394,9 +416,11 @@ def check(mediaid, qid, prop):
 def add_rs(mediaid, rs, dpla_id):
     prop = None
     qid = None
-    if rights.get(rs):
-        prop = list(rights[rs])[0]
-        qid = rights[rs][prop]
+    rs_key = _normalize_rights_uri(rs)
+    rights_entry = rights.get(rs_key)
+    if rights_entry:
+        prop = list(rights_entry)[0]
+        qid = rights_entry[prop]
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
@@ -422,7 +446,7 @@ def add_rs(mediaid, rs, dpla_id):
             prop = "P6216"
             qid = "Q88088423"
 
-    if rs == "http://creativecommons.org/publicdomain/mark/1.0/":
+    if rs_key == "http://creativecommons.org/publicdomain/mark/1.0":
         prop = "P6216"
         qid = "Q19652"
 
@@ -863,9 +887,11 @@ def dpla_claims(
     rightsprop = "P6216"
     rightsvalue = ""
     statusvalue = ""
-    if rights.get(rs):
-        rightsprop = list(rights[rs])[0]
-        rightsvalue = rights[rs][rightsprop]
+    rs_key = _normalize_rights_uri(rs)
+    rights_entry = rights.get(rs_key)
+    if rights_entry:
+        rightsprop = list(rights_entry)[0]
+        rightsvalue = rights_entry[rightsprop]
 
         if rightsprop == "P275":
             statusvalue = "Q50423863"
@@ -876,7 +902,7 @@ def dpla_claims(
         if rightsvalue == "Q6938433":
             statusvalue = "Q88088423"
 
-    if rs == "http://creativecommons.org/publicdomain/mark/1.0/":
+    if rs_key == "http://creativecommons.org/publicdomain/mark/1.0":
         statusvalue = "Q19652"
 
     parsesubjects = []
