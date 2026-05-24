@@ -749,7 +749,7 @@ class Uploader:
 
             # Pre-scan via the shared helper so the verifier can reconstruct
             # the same page-label assignments without duplicating the logic.
-            _, page_labels = compute_ordinal_exts_and_page_labels(
+            ordinal_exts, page_labels = compute_ordinal_exts_and_page_labels(
                 self.s3_client, dpla_id, partner, len(files)
             )
 
@@ -777,6 +777,30 @@ class Uploader:
                 except UploadTimeoutError as ex:
                     self.handle_upload_exception(ex)
                     break
+
+            # After the per-asset loop, look for "trailing-page orphan" Commons
+            # files for this item — pages whose ordinal exceeds the current
+            # source asset count for that extension. These are invisible to
+            # process_file (it only iterates the current asset list), so the
+            # Case 2 tag-as-duplicate path never fires for them when the
+            # source truncated pages off the end of a multi-page item.
+            # Wrap separately so a check failure doesn't get charged as
+            # FAILED against the item itself — the per-asset uploads have
+            # already succeeded at this point.
+            try:
+                _post_item_orphan_check(
+                    self.site,
+                    self.s3_client,
+                    self.tracker,
+                    dpla_id,
+                    title,
+                    partner,
+                    ordinal_exts,
+                    page_labels,
+                    dry_run,
+                )
+            except Exception as ex:
+                logging.warning(f"Orphan check failed for {dpla_id}: {ex}; continuing")
 
         except Exception as ex:
             logging.warning(
@@ -883,6 +907,194 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
 # practice, so give it real headroom.  Only paid when there's something to
 # touch, which is the rare "new institution this session" case.
 _REPLICATION_SETTLE_SECS = 10
+
+# Cap the per-extension trailing-orphan probe so a runaway naming scheme
+# never produces an unbounded loop of FilePage.exists() calls.  No real
+# DPLA item has more pages than this.
+_ORPHAN_PROBE_CEILING = 500
+
+# Tolerate small gaps in the probe sequence — orphans aren't always
+# contiguous.  E.g. a previous session may have moved or deleted (page N)
+# while leaving (page N+1) stranded.  Two consecutive misses is enough to
+# call the trail finished.
+_ORPHAN_GAP_TOLERANCE = 2
+
+
+def _post_item_orphan_check(
+    site,
+    s3_client: S3Client,
+    tracker: Tracker,
+    dpla_id: str,
+    item_title: str,
+    partner: str,
+    ordinal_exts: dict[int, str],
+    page_labels: dict[int, str],
+    dry_run: bool,
+) -> None:
+    """Tag Commons files whose page-number suffix exceeds the current source
+    asset count for this item — "trailing-page orphans" left behind when the
+    source truncated one or more pages from the end of a multi-page item.
+
+    These are invisible to process_file (which only iterates current asset
+    list positions), so Case 2's tag-as-duplicate never fires for them.
+
+    For each extension used by the item:
+      - Compute the expected per-extension page count from ordinal_exts.
+      - If count == 1 the expected Commons title is the no-suffix variant,
+        so any (page N) at all is an orphan — probe from page 1.
+      - If count >= 2 the expected titles are (page 1)..(page N), so probe
+        from page N+1.
+      - Probe upward via FilePage.exists() (page-info API, not search),
+        tolerating up to _ORPHAN_GAP_TOLERANCE consecutive missing pages
+        — orphans aren't always contiguous (e.g. a prior session may have
+        moved or deleted (page N) while leaving (page N+1) stranded).
+      - For each orphan found, compare its SHA1 to the SHA1 set of this
+        item's S3 assets of the same extension:
+          - match → tag as duplicate of the matching uploaded title
+          - no match → log a WARNING for manual review (could be a real
+            unrelated upload at that title that we shouldn't touch)
+    """
+    # Declared per-extension page count from the pre-scan.  This is what
+    # determines the legitimate (page 1)…(page N) range for the item — we
+    # MUST derive the probe start from this and not from `per_ext` below,
+    # because an ordinal whose SHA1 we can't read still occupies a real
+    # page slot.  Underestimating expected_count would make the probe
+    # overlap a legitimate page and risk tagging it as a duplicate.
+    declared_ext_counts: dict[str, int] = {}
+    for ordinal in ordinal_exts:
+        ext = ordinal_exts[ordinal]
+        if not ext:
+            continue  # stub / octet-stream ordinal — not a per-extension slot
+        declared_ext_counts[ext] = declared_ext_counts.get(ext, 0) + 1
+
+    # Build per-extension SHA1→kept_title map for the assets we can hash.
+    # Used only to decide whether a found orphan is a duplicate of a known
+    # source asset — the probe boundary is driven by declared_ext_counts.
+    per_ext: dict[str, list[tuple[str, str]]] = {}
+    for ordinal in sorted(ordinal_exts):
+        ext = ordinal_exts[ordinal]
+        if not ext:
+            continue  # stub / octet-stream ordinal — no per-extension entry
+        page_label = page_labels.get(ordinal, "")
+        s3_path = s3_client.get_media_s3_path(dpla_id, ordinal, partner)
+        try:
+            s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
+            sha1 = (s3_obj.metadata or {}).get(CHECKSUM)
+        except Exception as e:
+            logging.warning(
+                f"Orphan check: could not read SHA1 for {dpla_id} ord {ordinal}: {e}"
+            )
+            continue
+        if not sha1:
+            continue
+        kept_title = get_page_title(
+            item_title=item_title,
+            dpla_identifier=dpla_id,
+            suffix=ext,
+            page=page_label,
+        )
+        per_ext.setdefault(ext, []).append((sha1, kept_title))
+
+    for ext, expected_count in declared_ext_counts.items():
+        entries = per_ext.get(ext, [])
+        if expected_count >= 2:
+            start_page = expected_count + 1
+        elif expected_count == 1:
+            start_page = 1
+        else:
+            continue
+
+        # First-seen-wins: if the same SHA1 appears at multiple kept titles
+        # (rare — happens when a source mediaMaster lists the same asset twice),
+        # any of the kept titles is a valid duplicate target.
+        sha1_to_kept: dict[str, str] = {}
+        for sha1, kept_title in entries:
+            sha1_to_kept.setdefault(sha1, kept_title)
+
+        consecutive_misses = 0
+        for k in range(start_page, start_page + _ORPHAN_PROBE_CEILING):
+            candidate_title = get_page_title(
+                item_title=item_title,
+                dpla_identifier=dpla_id,
+                suffix=ext,
+                page=str(k),
+            )
+            # Fresh FilePage each iteration so .exists() doesn't return a
+            # cached result from a previous call within this session.
+            candidate = pywikibot.FilePage(site, candidate_title)
+            if not candidate.exists():
+                consecutive_misses += 1
+                if consecutive_misses > _ORPHAN_GAP_TOLERANCE:
+                    break  # trail of misses long enough; stop scanning ext
+                continue
+            consecutive_misses = 0
+
+            try:
+                orphan_sha1 = candidate.latest_file_info.sha1
+            except Exception as e:
+                logging.warning(
+                    f"Orphan check: could not read orphan SHA1 for "
+                    f"[[File:{candidate_title}]]: {e}"
+                )
+                tracker.increment(Result.ORPHANS_FLAGGED)
+                continue
+
+            if orphan_sha1 in sha1_to_kept:
+                keep_title = sha1_to_kept[orphan_sha1]
+                # process_file may have SKIPPED the ordinal whose SHA1 we
+                # matched (bad mime, octet-stream, empty file, etc.), or the
+                # item may have aborted on UploadTimeoutError before reaching
+                # it.  In either case the kept_title we'd point at doesn't
+                # actually exist on Commons.  Confirm it does before pointing
+                # an orphan at a phantom target.
+                keep_page = pywikibot.FilePage(site, keep_title)
+                if not keep_page.exists():
+                    logging.warning(
+                        f"Orphan [[File:{candidate_title}]] (SHA1 {orphan_sha1}) "
+                        f"would point at [[File:{keep_title}]] but that title "
+                        f"does not exist on Commons (asset likely skipped or "
+                        f"upload aborted); flagging instead of tagging."
+                    )
+                    tracker.increment(Result.ORPHANS_FLAGGED)
+                    continue
+                if dry_run:
+                    logging.info(
+                        f"[DRY RUN] would tag orphan [[File:{candidate_title}]] "
+                        f"as duplicate of [[File:{keep_title}]] (DPLA ID {dpla_id})"
+                    )
+                    tracker.increment(Result.ORPHANS_TAGGED)
+                    continue
+                try:
+                    tag_as_duplicate(
+                        site,
+                        candidate,
+                        correct_filename=keep_title,
+                        reason=(
+                            "Trailing-page orphan: this title has no "
+                            "corresponding asset in the current DPLA source "
+                            "for this item; the matching asset is uploaded at "
+                            f"[[:File:{keep_title}]]."
+                        ),
+                    )
+                    logging.info(
+                        f"Tagged trailing-page orphan [[File:{candidate_title}]] "
+                        f"as duplicate of [[File:{keep_title}]] (DPLA ID {dpla_id})"
+                    )
+                    tracker.increment(Result.ORPHANS_TAGGED)
+                except Exception as e:
+                    # The orphan remains unresolved; record as FLAGGED so the
+                    # run summary accurately reflects follow-up work needed.
+                    logging.warning(
+                        f"Failed to tag orphan [[File:{candidate_title}]]: {e}"
+                    )
+                    tracker.increment(Result.ORPHANS_FLAGGED)
+            else:
+                logging.warning(
+                    f"Orphan beyond asset count: [[File:{candidate_title}]] "
+                    f"(SHA1 {orphan_sha1}) — not present in current S3 assets "
+                    f"for DPLA ID {dpla_id}; manual review needed."
+                )
+                tracker.increment(Result.ORPHANS_FLAGGED)
 
 
 def _post_upload_touch_new_institutions(

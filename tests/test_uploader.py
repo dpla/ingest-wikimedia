@@ -7,7 +7,11 @@ category.
 
 from unittest.mock import MagicMock, patch
 
-from tools.uploader import _post_upload_touch_new_institutions
+from ingest_wikimedia.tracker import Result, Tracker
+from tools.uploader import (
+    _post_item_orphan_check,
+    _post_upload_touch_new_institutions,
+)
 
 
 def _ensurer_with(newly_created: set[str]) -> MagicMock:
@@ -96,3 +100,455 @@ def test_per_qid_exception_does_not_stop_remaining_qids(caplog):
     messages = " | ".join(r.message for r in caplog.records)
     assert "Q_bad" in messages
     assert "simulated commons search failure" in messages
+
+
+# --------------------------------------------------------------------------
+# _post_item_orphan_check
+# --------------------------------------------------------------------------
+
+
+def _stub_s3_client_for_assets(assets_by_ordinal: dict[int, str]):
+    """Mock S3Client whose objects return CHECKSUM-keyed sha1 metadata."""
+
+    def _get_media_path(dpla_id, ordinal, partner):
+        return f"{partner}/images/x/x/x/x/{dpla_id}/{ordinal}_{dpla_id}"
+
+    def _object(_bucket, key):
+        ordinal = int(key.rsplit("/", 1)[1].split("_", 1)[0])
+        sha1 = assets_by_ordinal[ordinal]
+        obj = MagicMock()
+        obj.metadata = {"sha1": sha1}
+        return obj
+
+    s3_client = MagicMock()
+    s3_client.get_media_s3_path.side_effect = _get_media_path
+    inner = MagicMock()
+    inner.Object.side_effect = _object
+    s3_client.get_s3.return_value = inner
+    return s3_client
+
+
+def _make_file_page_factory(existing: dict[str, str]):
+    """Return a stub for pywikibot.FilePage(site, title).
+
+    `existing` maps Commons title → sha1 of the orphan file at that title.
+    Titles not in the map are treated as nonexistent (exists() == False).
+    """
+
+    def _factory(site, title):
+        page = MagicMock()
+        page.title.return_value = title
+        if title in existing:
+            page.exists.return_value = True
+            page.latest_file_info.sha1 = existing[title]
+        else:
+            page.exists.return_value = False
+            # Accessing latest_file_info on a nonexistent page would raise,
+            # but the code-under-test breaks the loop before reading it.
+        return page
+
+    return _factory
+
+
+def test_orphan_check_no_orphan_when_first_probe_is_missing():
+    """Item has 3 jpgs; (page 4).jpg doesn't exist → nothing to do."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    page_labels = {1: "1", 2: "2", 3: "3"}
+
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing={})
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Some Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+
+
+def test_orphan_check_tags_trailing_orphan_with_matching_sha1():
+    """Item has 3 jpgs, (page 4).jpg exists with SHA1 of (page 3) → tag it."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    page_labels = {1: "1", 2: "2", 3: "3"}
+    base = "Some Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    orphan_title = f"{base} (page 4).jpg"
+    expected_keep = f"{base} (page 3).jpg"
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        # keep_title must also exist on Commons — otherwise we'd flag, not tag.
+        fp.side_effect = _make_file_page_factory(
+            existing={orphan_title: "ccc", expected_keep: "ccc"}
+        )
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Some Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 1
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+    tag_mock.assert_called_once()
+    kwargs = tag_mock.call_args.kwargs
+    assert kwargs["correct_filename"] == expected_keep
+
+
+def test_orphan_check_flags_orphan_with_unknown_sha1():
+    """Orphan exists but SHA1 isn't one of this item's S3 assets → flag, don't tag."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    orphan_title = "T - DPLA - abcd1234abcd1234abcd1234abcd1234 (page 3).jpg"
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing={orphan_title: "zzz_unknown"})
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="T",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    tag_mock.assert_not_called()
+
+
+def test_orphan_check_handles_multiple_trailing_orphans():
+    """Item now has 2 jpgs; (page 3) and (page 4) are both orphans."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    existing = {
+        f"{base} (page 1).jpg": "aaa",  # keep target for (page 4) orphan
+        f"{base} (page 2).jpg": "bbb",  # keep target for (page 3) orphan
+        f"{base} (page 3).jpg": "bbb",  # matches kept (page 2)
+        f"{base} (page 4).jpg": "aaa",  # matches kept (page 1)
+    }
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 2
+    assert tag_mock.call_count == 2
+    keep_targets = {c.kwargs["correct_filename"] for c in tag_mock.call_args_list}
+    assert keep_targets == {f"{base} (page 1).jpg", f"{base} (page 2).jpg"}
+
+
+def test_orphan_check_single_asset_probes_from_page_1():
+    """Single-asset items use no-suffix titles, so (page 1) and up are orphans.
+
+    Common signature: item used to be multi-page and got reduced to one asset,
+    so its (page 1).jpg / (page 2).jpg / ... linger beyond the no-suffix file.
+    """
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa"})
+    ordinal_exts = {1: ".jpg"}
+    page_labels = {1: ""}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    existing = {
+        f"{base}.jpg": "aaa",  # the kept no-suffix asset must exist on Commons
+        f"{base} (page 1).jpg": "aaa",  # orphan
+    }
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 1
+    tag_mock.assert_called_once()
+    assert tag_mock.call_args.kwargs["correct_filename"] == f"{base}.jpg"
+
+
+def test_orphan_check_dry_run_does_not_save():
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    existing = {
+        f"{base} (page 2).jpg": "bbb",  # kept target must exist on Commons
+        f"{base} (page 3).jpg": "bbb",  # orphan
+    }
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=True,
+        )
+
+    # Dry-run still increments TAGGED (it counts the intent), but does not
+    # actually call tag_as_duplicate.
+    assert tracker.count(Result.ORPHANS_TAGGED) == 1
+    tag_mock.assert_not_called()
+
+
+def test_orphan_check_skips_gap_and_finds_orphan_past_it():
+    """Single-asset item with no (page 1) but (page 2) stranded — gap tolerance
+    must let the probe reach it.
+
+    Real case observed: LBJ 1956 Desk Diary I (DPLA 72e2342079...) — the item
+    is now single-page (no-suffix .jpg authoritative) but (page 2).jpg lingers
+    with no (page 1).jpg adjacent to it (a previous session handled the
+    (page 1) slot via move/tag, leaving (page 2) stranded).
+    """
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa"})
+    ordinal_exts = {1: ".jpg"}
+    page_labels = {1: ""}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    # No (page 1).jpg; (page 2).jpg exists with the same SHA1 as the no-suffix asset.
+    existing = {
+        f"{base}.jpg": "aaa",  # kept no-suffix target on Commons
+        f"{base} (page 2).jpg": "aaa",  # orphan past the gap
+    }
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 1
+    tag_mock.assert_called_once()
+    assert tag_mock.call_args.kwargs["correct_filename"] == f"{base}.jpg"
+
+
+def test_orphan_check_flags_when_keep_title_does_not_exist():
+    """If the S3 asset whose SHA1 matches the orphan was never actually
+    uploaded (e.g. process_file SKIPPED it or aborted on timeout), the
+    keep_title we'd point at doesn't exist on Commons.  Don't create a
+    duplicate tag pointing at a phantom file — flag instead.
+    """
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    # Orphan exists, but the kept target (page 2).jpg does NOT exist on Commons
+    # (e.g. process_file skipped that ordinal).
+    existing = {f"{base} (page 3).jpg": "bbb"}
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    tag_mock.assert_not_called()
+
+
+def test_orphan_check_flags_when_tag_save_fails():
+    """tag_as_duplicate raising shouldn't leave the orphan uncounted —
+    record it as FLAGGED so the run summary captures follow-up work."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    existing = {
+        f"{base} (page 2).jpg": "bbb",  # keep target exists
+        f"{base} (page 3).jpg": "bbb",  # orphan
+    }
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch(
+            "tools.uploader.tag_as_duplicate",
+            side_effect=RuntimeError("simulated save failure"),
+        ) as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tag_mock.called  # we did try
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+
+
+def test_orphan_check_uses_declared_count_when_sha1_metadata_missing():
+    """An in-range ordinal that's missing CHECKSUM metadata on S3 must still
+    count toward expected_count for probe-boundary purposes — otherwise the
+    probe would start inside the legitimate page range and could tag a real
+    page as a duplicate of itself.
+
+    Scenario: 3 jpgs declared in ordinal_exts; ordinal 2's S3 metadata is
+    missing the sha1 key.  Probe must still start at (page 4), not (page 3).
+    """
+
+    def _stub_s3_with_one_missing_checksum():
+        # ordinal 1 and 3 have SHA1; ordinal 2 returns metadata without 'sha1'.
+        sha1s = {1: "aaa", 3: "ccc"}
+
+        def _get_media_path(dpla_id, ordinal, partner):
+            return f"{partner}/images/x/x/x/x/{dpla_id}/{ordinal}_{dpla_id}"
+
+        def _object(_bucket, key):
+            ordinal = int(key.rsplit("/", 1)[1].split("_", 1)[0])
+            obj = MagicMock()
+            obj.metadata = {"sha1": sha1s[ordinal]} if ordinal in sha1s else {}
+            return obj
+
+        s3_client = MagicMock()
+        s3_client.get_media_s3_path.side_effect = _get_media_path
+        inner = MagicMock()
+        inner.Object.side_effect = _object
+        s3_client.get_s3.return_value = inner
+        return s3_client
+
+    tracker = Tracker()
+    s3_client = _stub_s3_with_one_missing_checksum()
+    ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    page_labels = {1: "1", 2: "2", 3: "3"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    # (page 3) is a legitimate page — its SHA1 happens to match ordinal 3's.
+    # If the probe started at (page 3), it would tag a real page as a dup.
+    # No (page 4) → nothing to tag overall.
+    existing = {f"{base} (page 3).jpg": "ccc"}
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+    tag_mock.assert_not_called()
+    # And the FilePage probe must not have hit (page 3) — it would have
+    # if we used the SHA1-filtered count of 2 instead of the declared 3.
+    probed_titles = [call.args[1] for call in fp.call_args_list]
+    assert f"{base} (page 3).jpg" not in probed_titles
+
+
+def test_orphan_check_skips_extensions_with_no_assets():
+    """Empty ordinal_exts (e.g. stubs-only) → no probing, no errors."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({})
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts={},
+            page_labels={},
+            dry_run=False,
+        )
+    fp.assert_not_called()
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 0

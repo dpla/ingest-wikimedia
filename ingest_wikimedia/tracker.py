@@ -12,6 +12,8 @@ class Result(Enum):
     NO_MEDIA = auto()
     BAD_IMAGE_API = auto()
     RETIRED = auto()
+    ORPHANS_TAGGED = auto()
+    ORPHANS_FLAGGED = auto()
 
 
 class Tracker:
