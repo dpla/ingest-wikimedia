@@ -180,14 +180,18 @@ def test_orphan_check_tags_trailing_orphan_with_matching_sha1():
     s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
     ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
     page_labels = {1: "1", 2: "2", 3: "3"}
-    orphan_title = "Some Item - DPLA - abcd1234abcd1234abcd1234abcd1234 (page 4).jpg"
-    expected_keep = "Some Item - DPLA - abcd1234abcd1234abcd1234abcd1234 (page 3).jpg"
+    base = "Some Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    orphan_title = f"{base} (page 4).jpg"
+    expected_keep = f"{base} (page 3).jpg"
 
     with (
         patch("tools.uploader.pywikibot.FilePage") as fp,
         patch("tools.uploader.tag_as_duplicate") as tag_mock,
     ):
-        fp.side_effect = _make_file_page_factory(existing={orphan_title: "ccc"})
+        # keep_title must also exist on Commons — otherwise we'd flag, not tag.
+        fp.side_effect = _make_file_page_factory(
+            existing={orphan_title: "ccc", expected_keep: "ccc"}
+        )
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -245,6 +249,8 @@ def test_orphan_check_handles_multiple_trailing_orphans():
     page_labels = {1: "1", 2: "2"}
     base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
     existing = {
+        f"{base} (page 1).jpg": "aaa",  # keep target for (page 4) orphan
+        f"{base} (page 2).jpg": "bbb",  # keep target for (page 3) orphan
         f"{base} (page 3).jpg": "bbb",  # matches kept (page 2)
         f"{base} (page 4).jpg": "aaa",  # matches kept (page 1)
     }
@@ -283,7 +289,10 @@ def test_orphan_check_single_asset_probes_from_page_1():
     ordinal_exts = {1: ".jpg"}
     page_labels = {1: ""}
     base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
-    existing = {f"{base} (page 1).jpg": "aaa"}
+    existing = {
+        f"{base}.jpg": "aaa",  # the kept no-suffix asset must exist on Commons
+        f"{base} (page 1).jpg": "aaa",  # orphan
+    }
 
     with (
         patch("tools.uploader.pywikibot.FilePage") as fp,
@@ -313,7 +322,10 @@ def test_orphan_check_dry_run_does_not_save():
     ordinal_exts = {1: ".jpg", 2: ".jpg"}
     page_labels = {1: "1", 2: "2"}
     base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
-    existing = {f"{base} (page 3).jpg": "bbb"}
+    existing = {
+        f"{base} (page 2).jpg": "bbb",  # kept target must exist on Commons
+        f"{base} (page 3).jpg": "bbb",  # orphan
+    }
 
     with (
         patch("tools.uploader.pywikibot.FilePage") as fp,
@@ -353,7 +365,10 @@ def test_orphan_check_skips_gap_and_finds_orphan_past_it():
     page_labels = {1: ""}
     base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
     # No (page 1).jpg; (page 2).jpg exists with the same SHA1 as the no-suffix asset.
-    existing = {f"{base} (page 2).jpg": "aaa"}
+    existing = {
+        f"{base}.jpg": "aaa",  # kept no-suffix target on Commons
+        f"{base} (page 2).jpg": "aaa",  # orphan past the gap
+    }
 
     with (
         patch("tools.uploader.pywikibot.FilePage") as fp,
@@ -375,6 +390,81 @@ def test_orphan_check_skips_gap_and_finds_orphan_past_it():
     assert tracker.count(Result.ORPHANS_TAGGED) == 1
     tag_mock.assert_called_once()
     assert tag_mock.call_args.kwargs["correct_filename"] == f"{base}.jpg"
+
+
+def test_orphan_check_flags_when_keep_title_does_not_exist():
+    """If the S3 asset whose SHA1 matches the orphan was never actually
+    uploaded (e.g. process_file SKIPPED it or aborted on timeout), the
+    keep_title we'd point at doesn't exist on Commons.  Don't create a
+    duplicate tag pointing at a phantom file — flag instead.
+    """
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    # Orphan exists, but the kept target (page 2).jpg does NOT exist on Commons
+    # (e.g. process_file skipped that ordinal).
+    existing = {f"{base} (page 3).jpg": "bbb"}
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    tag_mock.assert_not_called()
+
+
+def test_orphan_check_flags_when_tag_save_fails():
+    """tag_as_duplicate raising shouldn't leave the orphan uncounted —
+    record it as FLAGGED so the run summary captures follow-up work."""
+    tracker = Tracker()
+    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
+    ordinal_exts = {1: ".jpg", 2: ".jpg"}
+    page_labels = {1: "1", 2: "2"}
+    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
+    existing = {
+        f"{base} (page 2).jpg": "bbb",  # keep target exists
+        f"{base} (page 3).jpg": "bbb",  # orphan
+    }
+
+    with (
+        patch("tools.uploader.pywikibot.FilePage") as fp,
+        patch(
+            "tools.uploader.tag_as_duplicate",
+            side_effect=RuntimeError("simulated save failure"),
+        ) as tag_mock,
+    ):
+        fp.side_effect = _make_file_page_factory(existing=existing)
+        _post_item_orphan_check(
+            site=MagicMock(),
+            s3_client=s3_client,
+            tracker=tracker,
+            dpla_id="abcd1234abcd1234abcd1234abcd1234",
+            item_title="Item",
+            partner="nara",
+            ordinal_exts=ordinal_exts,
+            page_labels=page_labels,
+            dry_run=False,
+        )
+
+    assert tag_mock.called  # we did try
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
 
 
 def test_orphan_check_skips_extensions_with_no_assets():

@@ -1027,6 +1027,22 @@ def _post_item_orphan_check(
 
             if orphan_sha1 in sha1_to_kept:
                 keep_title = sha1_to_kept[orphan_sha1]
+                # process_file may have SKIPPED the ordinal whose SHA1 we
+                # matched (bad mime, octet-stream, empty file, etc.), or the
+                # item may have aborted on UploadTimeoutError before reaching
+                # it.  In either case the kept_title we'd point at doesn't
+                # actually exist on Commons.  Confirm it does before pointing
+                # an orphan at a phantom target.
+                keep_page = pywikibot.FilePage(site, keep_title)
+                if not keep_page.exists():
+                    logging.warning(
+                        f"Orphan [[File:{candidate_title}]] (SHA1 {orphan_sha1}) "
+                        f"would point at [[File:{keep_title}]] but that title "
+                        f"does not exist on Commons (asset likely skipped or "
+                        f"upload aborted); flagging instead of tagging."
+                    )
+                    tracker.increment(Result.ORPHANS_FLAGGED)
+                    continue
                 if dry_run:
                     logging.info(
                         f"[DRY RUN] would tag orphan [[File:{candidate_title}]] "
@@ -1052,9 +1068,12 @@ def _post_item_orphan_check(
                     )
                     tracker.increment(Result.ORPHANS_TAGGED)
                 except Exception as e:
+                    # The orphan remains unresolved; record as FLAGGED so the
+                    # run summary accurately reflects follow-up work needed.
                     logging.warning(
                         f"Failed to tag orphan [[File:{candidate_title}]]: {e}"
                     )
+                    tracker.increment(Result.ORPHANS_FLAGGED)
             else:
                 logging.warning(
                     f"Orphan beyond asset count: [[File:{candidate_title}]] "
