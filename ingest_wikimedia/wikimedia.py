@@ -1,3 +1,4 @@
+import logging
 import mimetypes
 import re
 import typing
@@ -13,7 +14,7 @@ from pywikibot.site import APISite, BaseSite
 from pywikibot.tools.chars import replace_invisible
 
 
-from .common import get_list, get_str, get_dict
+from .common import CHECKSUM, get_list, get_str, get_dict
 from .s3 import S3_BUCKET, S3Client
 from .dpla import (
     WIKIDATA_FIELD_NAME,
@@ -251,6 +252,48 @@ def compute_ordinal_exts_and_page_labels(
             page_labels[ordinal] = ""
 
     return ordinal_exts, page_labels
+
+
+def collect_duplicate_source_sha1s(
+    s3_client: S3Client,
+    dpla_id: str,
+    partner: str,
+    num_files: int,
+) -> set[str]:
+    """Return SHA1s that appear at TWO OR MORE positions in this item's S3
+    asset list.
+
+    A SHA1 in this set means the source data has the same file content
+    listed at multiple ordinals — both/all positions are legitimate per
+    the source and should land at their own Commons titles.  Without
+    this knowledge, _resolve_hash_drift would see SHA1 X already at
+    (page A), be asked to upload it to (page B), and conclude that
+    (page A) is drift to be moved over (page B).  That's wrong: both
+    positions should exist as separate Commons pages.
+
+    SHA1 metadata read failures (transient S3 errors, stub ordinals)
+    are tolerated — those ordinals are simply absent from the count,
+    which conservatively keeps the SHA1 out of the duplicate set.  We
+    DO log the skipped ordinal: under-counting silently would cause
+    _resolve_hash_drift to incorrectly treat a legitimate sibling as
+    drift and move/redirect it, so visibility matters for diagnosis.
+    """
+    counts: Counter[str] = Counter()
+    for i in range(1, num_files + 1):
+        s3_path = s3_client.get_media_s3_path(dpla_id, i, partner)
+        try:
+            s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
+            sha1 = (s3_obj.metadata or {}).get(CHECKSUM)
+        except Exception as ex:
+            logging.warning(
+                f"collect_duplicate_source_sha1s: skipped ordinal {i} for "
+                f"{dpla_id} (path={s3_path}): {ex}; duplicate detection may "
+                f"under-count this item"
+            )
+            continue
+        if sha1:
+            counts[sha1] += 1
+    return {sha1 for sha1, n in counts.items() if n > 1}
 
 
 def license_to_markup_code(rights_uri: str) -> str:

@@ -42,6 +42,7 @@ from ingest_wikimedia.wikimedia import (
     IGNORE_WIKIMEDIA_WARNINGS,
     MIME_UNKNOWN_EXT,
     build_title_drift_move_reason,
+    collect_duplicate_source_sha1s,
     compute_ordinal_exts_and_page_labels,
     get_page_title,
     get_wiki_text,
@@ -110,6 +111,7 @@ class Uploader:
         page_label: str,
         verbose: bool,
         dry_run: bool,
+        duplicate_source_sha1s: set[str] | None = None,
     ):
         temp_file = self.local_fs.get_temp_file()
 
@@ -230,21 +232,39 @@ class Uploader:
                 drift_action: str | None = None
                 force_ignore_warnings = False
                 if existing_file is not None:
-                    drift_action = self._resolve_hash_drift(
-                        existing_file=existing_file,
-                        page_title=page_title,
-                        dpla_id=dpla_id,
-                        ordinal=ordinal,
-                        wiki_markup=wiki_markup,
-                    )
-                    if drift_action == "moved":
-                        self.tracker.increment(Result.UPLOADED)
-                        return
-                    elif drift_action == "upload_and_tag":
-                        drift_old_filename = existing_file.title(with_ns=False)
+                    if duplicate_source_sha1s and sha1 in duplicate_source_sha1s:
+                        # The source data legitimately lists this SHA1 at
+                        # multiple positions within the item.  The existing
+                        # Commons file at another title is a valid sibling,
+                        # not drift to be migrated — both positions should
+                        # exist as separate Commons pages.  Upload to our
+                        # title and leave the other alone.
+                        logging.info(
+                            f"Source asset list contains the same SHA1 at "
+                            f"multiple positions for {dpla_id} {ordinal}; "
+                            f"existing file at "
+                            f"[[File:{existing_file.title(with_ns=False)}]] "
+                            f"is a legitimate sibling, not drift. Uploading "
+                            f"to [[File:{page_title}]] without disturbing it."
+                        )
+                        drift_action = "upload_only"
                         force_ignore_warnings = True
-                    else:  # "upload_only"
-                        force_ignore_warnings = True
+                    else:
+                        drift_action = self._resolve_hash_drift(
+                            existing_file=existing_file,
+                            page_title=page_title,
+                            dpla_id=dpla_id,
+                            ordinal=ordinal,
+                            wiki_markup=wiki_markup,
+                        )
+                        if drift_action == "moved":
+                            self.tracker.increment(Result.UPLOADED)
+                            return
+                        elif drift_action == "upload_and_tag":
+                            drift_old_filename = existing_file.title(with_ns=False)
+                            force_ignore_warnings = True
+                        else:  # "upload_only"
+                            force_ignore_warnings = True
 
                 with tqdm(
                     total=s3_object.content_length,
@@ -753,6 +773,16 @@ class Uploader:
                 self.s3_client, dpla_id, partner, len(files)
             )
 
+            # Identify SHA1s that legitimately appear at MORE THAN ONE
+            # position in the source asset list.  process_file uses this to
+            # short-circuit drift correction when its SHA1 is in the set —
+            # the existing Commons file at another title is a valid sibling,
+            # not a drift artefact, and both positions should remain as
+            # separate Commons pages.
+            duplicate_source_sha1s = collect_duplicate_source_sha1s(
+                self.s3_client, dpla_id, partner, len(files)
+            )
+
             for ordinal, _ in enumerate(
                 tqdm(
                     files, desc="Uploading Files", leave=False, unit="File", ncols=100
@@ -773,6 +803,7 @@ class Uploader:
                         page_label,
                         verbose,
                         dry_run,
+                        duplicate_source_sha1s=duplicate_source_sha1s,
                     )
                 except UploadTimeoutError as ex:
                     self.handle_upload_exception(ex)
