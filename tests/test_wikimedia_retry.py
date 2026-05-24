@@ -86,6 +86,96 @@ def test_retry_clears_stale_csvs_before_scan():
     )
 
 
+def _run_main_and_capture_full_pipeline(argv: list[str]) -> list[str]:
+    """Like `_run_main_and_capture_ssm_commands` but lets main() proceed
+    past the scan step so the final tmux pipeline launch command is
+    captured. Returns the full list of SSM command strings issued in order.
+
+    Mock plan, in the order main() issues calls:
+      1. update_cmd                      → return "UPDATE_DONE"
+      2. scan_cmd (get-ids-retry)        → return a "found 1 failure" line
+      3. find + memory check             → return a CSV path + ample memory
+      4. tmux ls (conflict detection)    → return empty (no conflicts)
+      5. tmux new-session …              → captured for assertion
+    Any subsequent calls (Slack notification, etc.) return "" — they don't
+    matter for the assertions in this file.
+    """
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if "UPDATE_DONE" in command:
+            return "UPDATE_DONE"
+        if "get-ids-retry" in command:
+            # Pretend the scan found one failure so main keeps going.
+            return (
+                "Partner       Type    IDs  File\n"
+                "----------------------------------\n"
+                "smithsonian   download   1  /home/ec2-user/ingest-wikimedia/retry/smithsonian-download-retry.csv\n"
+            )
+        if "__MEM_CHECK__" in command:
+            return (
+                "/home/ec2-user/ingest-wikimedia/retry/smithsonian-download-retry.csv\n"
+                "__MEM_CHECK__\n"
+                "8000 5000"
+            )
+        # tmux ls and any later calls
+        return ""
+
+    with (
+        patch("scripts.wikimedia_retry.ssm_run", side_effect=fake_ssm_run),
+        patch("scripts.wikimedia_retry.boto3.client", return_value=MagicMock()),
+        patch("scripts.wikimedia_retry.post_message"),  # no real Slack
+        patch("sys.argv", argv),
+        patch.dict("os.environ", {}, clear=False),
+    ):
+        from scripts import wikimedia_retry
+
+        try:
+            wikimedia_retry.main()
+        except SystemExit:
+            pass
+
+    return captured
+
+
+def test_retry_passes_max_age_days_one_to_downloader():
+    """Regression: the retry-driven downloader call must pass
+    `--max-age-days 1` instead of falling back to the CLI default of 365.
+
+    Without this flag, a refresh-failure retry would re-attempt the failed
+    file, see its S3 LastModified is N < 365 days old, log
+    "Key already in S3", and silently SKIP — exactly the file the user
+    was trying to retry. With --max-age-days 1, successful refreshes
+    (S3 age ~0 days) still skip correctly while refresh-failed files
+    (S3 age >= 1 day) actually re-attempt.
+
+    Scenario the bug bites:
+      * /wikimedia-upload refresh si 1 — file 4 of item X is 58 days
+        old in S3; refresh decides to refresh; source request fails
+        transiently; file 4's S3 LastModified stays at 58 days old.
+      * /wikimedia-upload retry 30 si — retry CSV includes item X;
+        downloader runs over item X's files; file 4's age (58) < default
+        365 → "Key already in S3" → SKIP. The retry user expected the
+        failed file to be re-attempted, but it was silently dropped.
+    """
+    commands = _run_main_and_capture_full_pipeline(
+        ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
+    )
+
+    pipeline_cmds = [c for c in commands if "tmux new-session" in c]
+    assert pipeline_cmds, f"No tmux new-session command was issued; saw: {commands!r}"
+    pipeline_cmd = pipeline_cmds[0]
+
+    assert "downloader --max-age-days 1" in pipeline_cmd, (
+        f"The retry's downloader call must pass `--max-age-days 1` so "
+        f"refresh-failed files actually re-attempt; got: {pipeline_cmd!r}"
+    )
+    # Defence: make sure --max-age-days 1 immediately precedes the CSV path
+    # rather than appearing somewhere else in the command line.
+    assert "downloader --max-age-days 1 " in pipeline_cmd
+
+
 def test_retry_clears_stale_csvs_even_when_no_partner_given():
     """When the user runs `/wikimedia-upload retry 30` (no partner), the
     scan still needs to clear stale CSVs so that hubs which legitimately
