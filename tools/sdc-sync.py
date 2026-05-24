@@ -42,28 +42,25 @@ method = "livecat"
 if args.method:
     method = args.method
 
-hubs = json.loads(
-    requests.get(
-        "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json"
-    ).text
-)
+hubs = requests.get(
+    "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json"
+).json()
 
-rights = json.load(open("rights.json"))
-subject_ids = json.loads(
-    requests.get(
-        "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/src/main/resources/subjects.json"
-    ).text
-)
+with open("rights.json") as f:
+    rights = json.load(f)
+subject_ids = requests.get(
+    "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/src/main/resources/subjects.json"
+).json()
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
 
 
-def formattedclaim(prop, value, type, dpla_id):
+def formattedclaim(prop, value, value_type, dpla_id):
     claim = {
         "mainsnak": {
             "snaktype": "value",
             "property": prop,
-            "datavalue": {"value": value, "type": type},
+            "datavalue": {"value": value, "type": value_type},
         },
         "type": "statement",
         "rank": "normal",
@@ -88,7 +85,7 @@ def formattedclaim(prop, value, type, dpla_id):
                             "snaktype": "value",
                             "property": "P854",
                             "datavalue": {
-                                "value": "https://dp.la/item/" + dpla_id,
+                                "value": f"https://dp.la/item/{dpla_id}",
                                 "type": "string",
                             },
                         }
@@ -141,7 +138,7 @@ def formattedclaim(prop, value, type, dpla_id):
 
 
 def postqual(claimid, prop, value):
-    summary = "Adding [[:d:Property:" + prop + "]] to " + claimid + "."
+    summary = f"Adding [[:d:Property:{prop}]] to {claimid}."
 
     postdata = {
         "action": "wbsetqualifier",
@@ -179,9 +176,8 @@ def check(mediaid, qid, prop):
     ref = ""
     raw = request.submit()
 
-    if raw.get("entities").get(mediaid).get("pageid"):
-        existing_data = raw.get("entities").get(mediaid)
-    else:
+    existing_data = raw.get("entities", {}).get(mediaid, {})
+    if not existing_data.get("pageid"):
         return True, ""
     try:
         if existing_data.get("statements").get(prop):
@@ -219,13 +215,7 @@ def check(mediaid, qid, prop):
             for statement in statements
         ):
             print(
-                " -- There already exists a statement with a "
-                + prop
-                + " > "
-                + qid[1]
-                + " claim for "
-                + mediaid
-                + "."
+                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
             )
             return False, ref
 
@@ -258,13 +248,7 @@ def check(mediaid, qid, prop):
             for statement in statements
         ):
             print(
-                " -- There already exists a statement with a "
-                + prop
-                + " > "
-                + qid[1]
-                + " claim for "
-                + mediaid
-                + "."
+                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
             )
             return False, ref
 
@@ -297,13 +281,7 @@ def check(mediaid, qid, prop):
             for statement in statements
         ):
             print(
-                " -- There already exists a statement with a "
-                + prop
-                + " > "
-                + qid[1]
-                + " claim for "
-                + mediaid
-                + "."
+                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
             )
             return False, ref
 
@@ -325,13 +303,7 @@ def check(mediaid, qid, prop):
                             == qid[1]
                         ):
                             print(
-                                " -- There already exists a statement with a "
-                                + prop
-                                + " > "
-                                + qid[1]
-                                + " claim for "
-                                + mediaid
-                                + "."
+                                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
                             )
                             return False, ref
 
@@ -358,13 +330,7 @@ def check(mediaid, qid, prop):
                             == qid[1]
                         ):
                             print(
-                                " -- There already exists a statement with a "
-                                + prop
-                                + " > "
-                                + qid[1]
-                                + " claim for "
-                                + mediaid
-                                + "."
+                                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
                             )
                             return False, ref
 
@@ -390,9 +356,9 @@ def add_rs(mediaid, rs, dpla_id):
     prop = None
     qid = None
     if rights.get(rs):
-        prop = list(rights[rs].keys())[0]
+        prop = list(rights[rs])[0]
         qid = rights[rs][prop]
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -405,7 +371,7 @@ def add_rs(mediaid, rs, dpla_id):
         if checkclaim[0] is True:
             pywikibot.output(summary)
             claims["claims"].append(claim)
-        if prop == "P275" and not qid == "Q6938433":
+        if prop == "P275" and qid != "Q6938433":
             prop = "P6216"
             qid = "Q50423863"
 
@@ -421,8 +387,8 @@ def add_rs(mediaid, rs, dpla_id):
         prop = "P6216"
         qid = "Q19652"
 
-    if rs and prop is not None:
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    if prop is not None:
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -443,7 +409,7 @@ def add_collection(mediaid, hub, institution, dpla_id):
     if institution:
         qid = institution
         prop = "P195"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -462,7 +428,7 @@ def add_access(mediaid, access, dpla_id):
     if access:
         qid = access
         prop = "P7228"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -481,7 +447,7 @@ def add_level(mediaid, level, dpla_id):
     if level:
         qid = level
         prop = "P6224"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -498,7 +464,7 @@ def add_level(mediaid, level, dpla_id):
 
 def add_id(mediaid, id):
     prop = "P760"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(prop, id, "string", id)
     checkclaim = check(mediaid, ("string", id), prop)
     if checkclaim[1]:
@@ -510,7 +476,7 @@ def add_id(mediaid, id):
 
 def add_naid(mediaid, naid, dpla_id):
     prop = "P1225"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(prop, naid, "string", dpla_id)
     checkclaim = check(mediaid, ("string", naid), prop)
     if checkclaim[1]:
@@ -522,7 +488,7 @@ def add_naid(mediaid, naid, dpla_id):
 
 def add_subject(mediaid, subject, dpla_id):
     prop = "P4272"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(prop, subject, "string", dpla_id)
     checkclaim = check(mediaid, ("string", subject), prop)
     if checkclaim[1]:
@@ -534,7 +500,7 @@ def add_subject(mediaid, subject, dpla_id):
 
 def add_subject_entity(mediaid, qid, dpla_id):
     prop = "P921"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(
         prop,
         {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -552,7 +518,7 @@ def add_subject_entity(mediaid, qid, dpla_id):
 def add_title(mediaid, title, dpla_id):
     if title:
         prop = "P1476"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"text": title[:1499].rstrip(), "language": "en"},
@@ -570,7 +536,7 @@ def add_title(mediaid, title, dpla_id):
 def add_desc(mediaid, desc, dpla_id):
     if desc:
         prop = "P10358"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
             {"text": desc[:1499].rstrip(), "language": "en"},
@@ -588,7 +554,7 @@ def add_desc(mediaid, desc, dpla_id):
 def add_creator(mediaid, creator, dpla_id):
     if creator:
         prop = "P170"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(prop, "somevalue", "wikibase-entityid", dpla_id)
         claim["qualifiers"]["P2093"] = [
             {
@@ -607,7 +573,7 @@ def add_creator(mediaid, creator, dpla_id):
 
 def add_date(mediaid, date, dpla_id):
     prop = "P571"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(prop, "somevalue", "time", dpla_id)
     claim["qualifiers"]["P1932"] = [
         {
@@ -626,7 +592,7 @@ def add_date(mediaid, date, dpla_id):
 
 def add_contributed(mediaid, hub, institution, dpla_id):
     prop = "P9126"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     qid = "Q2944483"
     claim = formattedclaim(
         prop,
@@ -749,7 +715,7 @@ def add_contributed(mediaid, hub, institution, dpla_id):
 def add_local_id(mediaid, id, institution, dpla_id):
     if id:
         prop = "P217"
-        summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+        summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(prop, id, "string", dpla_id)
         checkclaim = check(mediaid, ("string", id), prop)
         claim["qualifiers"]["P195"] = [
@@ -775,7 +741,7 @@ def add_local_id(mediaid, id, institution, dpla_id):
 def add_source(mediaid, hub, url, dpla_id):
     qid = "Q74228490"
     prop = "P7482"
-    summary = " -- Adding [[:d:Property:" + prop + "]] to " + mediaid + "."
+    summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(
         prop,
         {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
@@ -825,7 +791,7 @@ def add_ref(claimid, claim):
     if claimid:
         claim["id"] = claimid
         refclaims["claims"].append(claim)
-        print(" -- Adding reference for " + claimid + ".")
+        print(f" -- Adding reference for {claimid}.")
 
 
 def dpla_claims(
@@ -845,23 +811,21 @@ def dpla_claims(
     access,
     level,
 ):
-    print(" -- Accessing Commons ID " + mediaid)
+    print(f" -- Accessing Commons ID {mediaid}")
     try:
-        file_claims = json.loads(
-            requests.get(
-                "https://commons.wikimedia.org/wiki/Special:EntityData/"
-                + mediaid
-                + ".json"
-            ).text
-        )
+        file_claims = requests.get(
+            f"https://commons.wikimedia.org/wiki/Special:EntityData/{mediaid}.json"
+        ).json()
     except Exception:
-        file_claims = {}
-        file_claims["entities"] = {mediaid: {"statements": {}}}
-    print(" -- Accessed Commons ID " + mediaid)
+        file_claims = {"entities": {mediaid: {"statements": {}}}}
+    print(f" -- Accessed Commons ID {mediaid}")
     dpla_claim_list = []
     removals = []
+    rightsprop = "P6216"
+    rightsvalue = ""
+    statusvalue = ""
     if rights.get(rs):
-        rightsprop = list(rights[rs].keys())[0]
+        rightsprop = list(rights[rs])[0]
         rightsvalue = rights[rs][rightsprop]
 
         if rightsprop == "P275":
@@ -913,7 +877,7 @@ def dpla_claims(
         "P7228": [access],
         "P921": parsesubjectentities,
     }
-    for prop in file_claims["entities"][mediaid]["statements"].keys():
+    for prop in file_claims["entities"][mediaid]["statements"]:
         for stmt in file_claims["entities"][mediaid]["statements"][prop]:
             if stmt.get("references"):
                 if any(pubprop["snaks"].get("P123") for pubprop in stmt["references"]):
@@ -988,12 +952,12 @@ def dpla_claims(
                             except Exception:
                                 removals.append(stmt["id"])
     for claim in dpla_claim_list:
-        for prop in claim.keys():
-            if prop not in expected.keys():
+        for prop in claim:
+            if prop not in expected:
                 removals.append(claim[prop]["id"])
             elif claim[prop]["value"] not in expected[prop]:
                 removals.append(claim[prop]["id"])
-    if len(removals) > 0:
+    if removals:
         rmdata = {
             "action": "wbremoveclaims",
             "format": "json",
@@ -1001,11 +965,7 @@ def dpla_claims(
             "claim": "|".join(removals),
             "token": token,
             "bot": True,
-            "summary": "Changing structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:"
-            + dpla_id
-            + "|"
-            + dpla_id
-            + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+            "summary": f"Changing structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
         }
         http.fetch(
             "https://commons.wikimedia.org/w/api.php", method="POST", data=rmdata
@@ -1014,23 +974,19 @@ def dpla_claims(
 
 
 def parsed(dpla_id, key):
-    print(" -- Accessing DPLA ID " + dpla_id)
+    print(f" -- Accessing DPLA ID {dpla_id}")
     try:
-        dpla = json.loads(
-            requests.get(
-                "https://api.dp.la/v2/items/" + dpla_id + "?api_key=" + key,
-                timeout=15,
-            ).text
-        )
+        dpla = requests.get(
+            f"https://api.dp.la/v2/items/{dpla_id}?api_key={key}",
+            timeout=15,
+        ).json()
     except Exception:
         print(" -- Sleeping 30 seconds and retrying...")
         time.sleep(30)
-        dpla = json.loads(
-            requests.get(
-                "https://api.dp.la/v2/items/" + dpla_id + "?api_key=" + key
-            ).text
-        )
-    print(" -- Accessed DPLA ID " + dpla_id)
+        dpla = requests.get(
+            f"https://api.dp.la/v2/items/{dpla_id}?api_key={key}"
+        ).json()
+    print(f" -- Accessed DPLA ID {dpla_id}")
 
     try:
         dpla = dpla["docs"][0]
@@ -1091,12 +1047,12 @@ def parsed(dpla_id, key):
                     "https://wikidata.reconci.link/en/api?queries="
                     + urllib.parse.quote(reconci_query)
                 )
-                subjectresults = json.loads(h.text)
+                subjectresults = h.json()
                 if subjectresults["q1"]["result"]:
                     subjqid = subjectresults["q1"]["result"][0]["id"]
                 subjects.append((str(subject.get("name") or ""), subjqid))
                 added = True
-            if added is False:
+            if not added:
                 subjects.append((str(subject.get("name") or ""), ""))
     except Exception:
         subjects = ""
@@ -1123,7 +1079,7 @@ def parsed(dpla_id, key):
         except Exception:
             access = ""
         level = ""
-        for lvl_key in levels.keys():
+        for lvl_key in levels:
             if xml.find(lvl_key):
                 level = levels[lvl_key]
         local_ids = ""
@@ -1173,15 +1129,9 @@ def _resolve_dpla_id(title, key):
         return dpla_id
     print("Detecting NARA identifier...")
     nara_id = re.sub(r"^.*NARA - (.*?)[\.| ].*$", r"\1", title)
-    nara_item = json.loads(
-        requests.get(
-            "https://api.dp.la/v2/items?api_key="
-            + key
-            + '&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="'
-            + nara_id
-            + '"'
-        ).text
-    )
+    nara_item = requests.get(
+        f'https://api.dp.la/v2/items?api_key={key}&provider.@id="http://dp.la/api/contributor/nara"&sourceResource.identifier="{nara_id}"'
+    ).json()
     if len(nara_item["docs"]) == 1:
         return nara_item["docs"][0]["id"]
     return title
@@ -1245,7 +1195,7 @@ def process_one(mediaid, dpla_id):
     add_access(mediaid, access, dpla_id)
     add_level(mediaid, level, dpla_id)
 
-    if len(refclaims["claims"]) > 0:
+    if refclaims["claims"]:
         postrefs = {
             "action": "wbeditentity",
             "format": "json",
@@ -1253,11 +1203,7 @@ def process_one(mediaid, dpla_id):
             "data": json.dumps(refclaims),
             "token": token,
             "bot": True,
-            "summary": "Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:"
-            + dpla_id
-            + "|"
-            + dpla_id
-            + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+            "summary": f"Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
         }
         save = http.fetch(
             "https://commons.wikimedia.org/w/api.php",
@@ -1299,14 +1245,10 @@ def process_one(mediaid, dpla_id):
         "data": json.dumps(claims),
         "token": token,
         "bot": True,
-        "summary": "Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:"
-        + dpla_id
-        + "|"
-        + dpla_id
-        + "]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+        "summary": f"Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
     }
 
-    if len(claims["claims"]) > 0:
+    if claims["claims"]:
         try:
             save = http.fetch(
                 "https://commons.wikimedia.org/w/api.php",
@@ -1382,32 +1324,23 @@ if method == "list":
     ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
     lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
     percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
-    while len(lists) > 0:
+    while lists:
         x = random.choice(range(0, len(lists) - 1)) if len(lists) > 1 else 0
-        working_file = args.lists + "/WORKING-" + lists[x]
+        working_file = os.path.join(args.lists, "WORKING-" + lists[x])
         print(working_file)
-        os.rename(args.lists + "/" + lists[x], working_file)
+        os.rename(os.path.join(args.lists, lists[x]), working_file)
 
         files = pagegenerators.TextIOPageGenerator(working_file)
 
         for file in files:
             count += 1
-            print(
-                str(count)
-                + ":\n - "
-                + args.lists
-                + "/"
-                + lists[x]
-                + " ("
-                + str("{:.2f}".format(percent))
-                + "% done)"
-            )
+            print(f"{count}:\n - {args.lists}/{lists[x]} ({percent:.2f}% done)")
             print("\n" + str(file).replace('""', '"'))
             mediaid = "M" + str(file.pageid)
             dpla_id = _resolve_dpla_id(str(file), key)
             process_one(mediaid, dpla_id)
 
-        os.rename(working_file, args.lists + "/COMPLETE-" + lists[x])
+        os.rename(working_file, os.path.join(args.lists, "COMPLETE-" + lists[x]))
 
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
         lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
@@ -1415,10 +1348,11 @@ if method == "list":
 
         duduped = set()
         try:
-            for line in open("Missing ids.txt", "r"):
-                duduped.add(line)
+            with open("Missing ids.txt", "r") as f:
+                for line in f:
+                    duduped.add(line.strip())
             with open("Missing ids.txt", "w") as f:
-                f.write("".join(duduped))
+                f.write("\n".join(duduped) + "\n")
         except FileNotFoundError:
             pass
 
@@ -1432,5 +1366,5 @@ elif args.files:
         mediaid = "M" + str(page.pageid)
         dpla_id = _resolve_dpla_id(title, key)
         count += 1
-        print(str(count) + ": " + mediaid)
+        print(f"{count}: {mediaid}")
         process_one(mediaid, dpla_id)
