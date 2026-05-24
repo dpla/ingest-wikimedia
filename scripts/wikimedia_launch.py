@@ -260,7 +260,19 @@ def main() -> None:
         if github_sha
         else ""
     )
-    update_cmd = (
+    # SSM commands run as root by default. If any earlier root-context run
+    # imported a package from the venv, Python would have written its
+    # `__pycache__/` as root-owned — leaving subsequent ec2-user `uv sync`
+    # invocations unable to delete or update those package directories
+    # ("Permission denied: ... lxml/__pycache__"). Two-step fix:
+    #
+    #   1. Heal any pre-existing root-owned files by chowning the repo
+    #      and the /tmp staging dir back to ec2-user (root privilege
+    #      needed, so we keep this step in the default SSM root context).
+    #   2. Wrap the entire update in `sudo -u ec2-user bash -c '...'` so
+    #      git clone / cp / uv sync all run as ec2-user, never creating
+    #      new root-owned cache files in the first place.
+    update_cmd_inner = (
         "cd /tmp && rm -rf ingest-wikimedia-update && "
         "git clone --depth 1 https://github.com/dpla/ingest-wikimedia.git ingest-wikimedia-update && "
         + pin_step
@@ -269,6 +281,11 @@ def main() -> None:
         "cp ingest-wikimedia-update/pyproject.toml /home/ec2-user/ingest-wikimedia/pyproject.toml && "
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
         "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
+    )
+    update_cmd = (
+        "chown -R ec2-user:ec2-user /home/ec2-user/ingest-wikimedia/ && "
+        "(chown -R ec2-user:ec2-user /tmp/ingest-wikimedia-update 2>/dev/null || true) && "
+        f"sudo -u ec2-user bash -c {shlex.quote(update_cmd_inner)}"
     )
     out = ""
     try:
