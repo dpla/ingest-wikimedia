@@ -9,11 +9,27 @@ SSM_POLL_INTERVAL = 5
 SSM_MAX_POLLS = 60  # 5 minutes
 
 
-def ssm_run(client, cmd: str) -> str:
+def ssm_run(client, cmd: str, *, as_root: bool = False) -> str:
+    """Run cmd on EC2 via AWS-RunShellScript SSM, default ec2-user context.
+
+    The AWS-RunShellScript document executes as root by default. Most
+    pipeline commands need to act on the ec2-user-owned working tree and
+    venv, so by default we wrap the command in `sudo -u ec2-user bash -c`.
+
+    Pass as_root=True to bypass the wrapper and run with full root
+    privilege — needed for the rare operations only root can do, such as
+    `chown` of files owned by a different user. Callers that need root
+    should be explicit about it; the default keeps file ownership
+    consistently under ec2-user.
+    """
+    if as_root:
+        wrapped = cmd
+    else:
+        wrapped = f"sudo -u ec2-user bash -c {shlex.quote(cmd)}"
     resp = client.send_command(
         InstanceIds=[INSTANCE_ID],
         DocumentName="AWS-RunShellScript",
-        Parameters={"commands": [f"sudo -u ec2-user bash -c {shlex.quote(cmd)}"]},
+        Parameters={"commands": [wrapped]},
     )
     cmd_id = resp["Command"]["CommandId"]
     for attempt in range(SSM_MAX_POLLS):

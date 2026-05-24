@@ -260,19 +260,29 @@ def main() -> None:
         if github_sha
         else ""
     )
-    # SSM commands run as root by default. If any earlier root-context run
-    # imported a package from the venv, Python would have written its
-    # `__pycache__/` as root-owned — leaving subsequent ec2-user `uv sync`
-    # invocations unable to delete or update those package directories
-    # ("Permission denied: ... lxml/__pycache__"). Two-step fix:
+    # `ssm_run` wraps every command in `sudo -u ec2-user bash -c` by
+    # default. That's correct for the actual update (we want git clone, cp,
+    # and uv sync to run as ec2-user so they never create root-owned
+    # files), but `chown -R` of root-owned files needs CAP_CHOWN, which
+    # ec2-user does not have. So the heal step uses ssm_run(..., as_root=True)
+    # to bypass the wrapper and run with the AWS-RunShellScript document's
+    # default root context.
     #
-    #   1. Heal any pre-existing root-owned files by chowning the repo
-    #      and the /tmp staging dir back to ec2-user (root privilege
-    #      needed, so we keep this step in the default SSM root context).
-    #   2. Wrap the entire update in `sudo -u ec2-user bash -c '...'` so
-    #      git clone / cp / uv sync all run as ec2-user, never creating
-    #      new root-owned cache files in the first place.
-    update_cmd_inner = (
+    # The earlier "Permission denied: ... lxml/__pycache__" failure mode
+    # came from prior root-context Python imports (back when the update
+    # itself ran as root) leaving root-owned `__pycache__/` inside an
+    # otherwise ec2-user-owned venv. The heal step cleans those up; the
+    # ec2-user-run update step prevents them from being recreated.
+    heal_cmd = (
+        "chown -R ec2-user:ec2-user /home/ec2-user/ingest-wikimedia/ && "
+        "(chown -R ec2-user:ec2-user /tmp/ingest-wikimedia-update 2>/dev/null || true)"
+    )
+    try:
+        ssm_run(ssm, heal_cmd, as_root=True)
+    except Exception as e:
+        _slack_fail(response_url, f"⚠️ Failed to heal EC2 file ownership: {e}")
+
+    update_cmd = (
         "cd /tmp && rm -rf ingest-wikimedia-update && "
         "git clone --depth 1 https://github.com/dpla/ingest-wikimedia.git ingest-wikimedia-update && "
         + pin_step
@@ -281,11 +291,6 @@ def main() -> None:
         "cp ingest-wikimedia-update/pyproject.toml /home/ec2-user/ingest-wikimedia/pyproject.toml && "
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
         "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
-    )
-    update_cmd = (
-        "chown -R ec2-user:ec2-user /home/ec2-user/ingest-wikimedia/ && "
-        "(chown -R ec2-user:ec2-user /tmp/ingest-wikimedia-update 2>/dev/null || true) && "
-        f"sudo -u ec2-user bash -c {shlex.quote(update_cmd_inner)}"
     )
     out = ""
     try:
