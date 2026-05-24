@@ -1,3 +1,4 @@
+import logging
 import mimetypes
 import re
 import typing
@@ -272,7 +273,10 @@ def collect_duplicate_source_sha1s(
 
     SHA1 metadata read failures (transient S3 errors, stub ordinals)
     are tolerated — those ordinals are simply absent from the count,
-    which conservatively keeps the SHA1 out of the duplicate set.
+    which conservatively keeps the SHA1 out of the duplicate set.  We
+    DO log the skipped ordinal: under-counting silently would cause
+    _resolve_hash_drift to incorrectly treat a legitimate sibling as
+    drift and move/redirect it, so visibility matters for diagnosis.
     """
     counts: Counter[str] = Counter()
     for i in range(1, num_files + 1):
@@ -280,7 +284,12 @@ def collect_duplicate_source_sha1s(
         try:
             s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
             sha1 = (s3_obj.metadata or {}).get(CHECKSUM)
-        except Exception:
+        except Exception as ex:
+            logging.warning(
+                f"collect_duplicate_source_sha1s: skipped ordinal {i} for "
+                f"{dpla_id} (path={s3_path}): {ex}; duplicate detection may "
+                f"under-count this item"
+            )
             continue
         if sha1:
             counts[sha1] += 1

@@ -563,6 +563,19 @@ def test_collect_duplicate_source_sha1s_handles_missing_metadata():
     assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == {"aaa"}
 
 
+def test_collect_duplicate_source_sha1s_logs_skipped_ordinals(caplog):
+    """Silent skips would hide drift miscorrection; ensure each failed read
+    produces a WARNING line so an operator can see why the count is low."""
+    import logging as _logging
+
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: None, 3: "aaa"})
+    with caplog.at_level(_logging.WARNING):
+        collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3)
+    messages = " | ".join(r.message for r in caplog.records)
+    assert "skipped ordinal 2" in messages
+    assert "under-count" in messages
+
+
 def test_collect_duplicate_source_sha1s_skips_empty_sha1():
     # Empty sha1 metadata (e.g. truncated) is not counted as duplicate-of-itself.
     s3 = _fake_s3_client_with_sha1s({1: "", 2: "", 3: "aaa"})
