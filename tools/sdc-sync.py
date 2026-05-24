@@ -55,14 +55,6 @@ method = "livecat"
 if args.method:
     method = args.method
 
-# Config + Commons login happen after argparse so that `--help` doesn't trigger
-# file I/O or network/auth on this module's import.
-with open("config.toml", "rb") as _f:
-    dpla_api = tomllib.load(_f)["dpla_api_key"]
-
-site = pywikibot.Site()
-site.login()
-
 
 def _normalize_rights_uri(uri):
     """Canonicalize a DPLA rights URI for lookup against rights.json.
@@ -77,11 +69,22 @@ def _normalize_rights_uri(uri):
     return canonical
 
 
+# Resolve every load (config + vendored JSONs) relative to the repo root so the
+# script behaves the same regardless of the caller's working directory.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+
+# Config + Commons login happen after argparse so that `--help` doesn't trigger
+# file I/O or network/auth on this module's import.
+with open(os.path.join(_REPO_ROOT, "config.toml"), "rb") as _f:
+    dpla_api = tomllib.load(_f)["dpla_api_key"]
+
+site = pywikibot.Site()
+site.login()
+
 # Hubs and subject mappings are vendored alongside rights.json so a run is
 # fully reproducible against the checked-in metadata. To refresh, replace the
 # files from their upstream sources and commit.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_HERE)
 with open(os.path.join(_REPO_ROOT, "institutions_v2.json")) as f:
     hubs = json.load(f)
 with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
@@ -175,6 +178,7 @@ def formattedclaim(prop, value, value_type, dpla_id):
 
 
 def postqual(claimid, prop, value):
+    global token
     summary = f"Adding [[:d:Property:{prop}]] to {claimid}."
 
     postdata = {
@@ -197,13 +201,26 @@ def postqual(claimid, prop, value):
         pywikibot.output(summary)
 
     except Exception as e:
-        # Don't log the CSRF token itself — refresh and continue silently
-        # past the transient failure.
+        # Refresh the global token and retry once. The previous version only
+        # refreshed pywikibot's internal cache and didn't update the module
+        # `token` (used in postdata above) nor retry the POST, so qualifiers
+        # were silently dropped on any transient CSRF failure. Mirror the
+        # token-refresh pattern used by process_one().
         print(repr(e))
-        print(" -- Refreshing CSRF token after API error...")
-        site.get_tokens(["csrf"])
-        site.tokens.load_tokens(["csrf"])
-        print(" -- CSRF token refreshed.")
+        print(" -- Refreshing CSRF token after API error and retrying...")
+        token = login()
+        postdata["token"] = token
+        try:
+            json.loads(
+                http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postdata,
+                ).text
+            )
+            pywikibot.output(summary)
+        except Exception as retry_e:
+            print(f" -- Retry after token refresh failed: {repr(retry_e)}")
 
 
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
@@ -1468,7 +1485,9 @@ if method == "list":
     lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
     percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
     while lists:
-        x = random.choice(range(0, len(lists) - 1)) if len(lists) > 1 else 0
+        # range(0, len(lists)-1) is exclusive on the upper bound, so the
+        # previous expression never selected the last index — fixed.
+        x = random.randrange(len(lists))
         working_file = os.path.join(args.lists, "WORKING-" + lists[x])
         print(working_file)
         os.rename(os.path.join(args.lists, lists[x]), working_file)
