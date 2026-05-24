@@ -26,7 +26,19 @@ site.login()
 # When running manually, sometimes it is helpful to specify the category to work on in the command line, using --cat "<category>".
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--cat", dest="cat", metavar="CAT", action="store")
+parser.add_argument(
+    "--cat",
+    dest="cat",
+    metavar="CAT",
+    action="store",
+    help="Commons category name (without 'Category:' prefix) to enumerate File: pages from",
+)
+parser.add_argument(
+    "--recurse",
+    dest="recurse",
+    action="store_true",
+    help="When using --cat, also walk subcategories",
+)
 parser.add_argument("--method", dest="method", metavar="METHOD", action="store")
 parser.add_argument("--lists", dest="lists", metavar="LISTS", action="store")
 parser.add_argument(
@@ -35,6 +47,13 @@ parser.add_argument(
     metavar="FILE",
     action="append",
     help="Commons file title to process directly (repeatable)",
+)
+parser.add_argument(
+    "--limit",
+    dest="limit",
+    type=int,
+    default=0,
+    help="When using --cat, stop after this many files (0 = no limit)",
 )
 args = parser.parse_args()
 
@@ -170,13 +189,33 @@ def postqual(claimid, prop, value):
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
 
 
-def check(mediaid, qid, prop):
+# Per-file cache for wbgetentities, populated at the start of process_one()
+# and consulted by check() for all subsequent add_* calls. Avoids ~25 redundant
+# round-trips per file. Invalidate when claims change to keep the read-after-write
+# semantics correct (process_one batches writes at the end, so a single fetch is
+# safe for the duration of one file).
+_entity_cache = {}
+
+
+def get_entity(mediaid):
+    """Return the wbgetentities response for mediaid, caching per process_one run."""
+    cached = _entity_cache.get(mediaid)
+    if cached is not None:
+        return cached
     request = site.simple_request(action="wbgetentities", ids=mediaid)
-
-    ref = ""
     raw = request.submit()
+    entity = raw.get("entities", {}).get(mediaid, {})
+    _entity_cache[mediaid] = entity
+    return entity
 
-    existing_data = raw.get("entities", {}).get(mediaid, {})
+
+def invalidate_entity(mediaid):
+    _entity_cache.pop(mediaid, None)
+
+
+def check(mediaid, qid, prop):
+    ref = ""
+    existing_data = get_entity(mediaid)
     if not existing_data.get("pageid"):
         return True, ""
     try:
@@ -1026,6 +1065,11 @@ def parsed(dpla_id, dpla_api):
         descs = []
     try:
         subjects = []
+        # First pass: build the subject list and queue up any NARA exactMatch
+        # entries for reconciliation. We reserve a slot in `subjects` for each
+        # one and fill in the resolved Wikidata ID in a single batched HTTP
+        # call below.
+        reconci_slots = []  # list of (slot_index, name, naid)
         for subject in dpla["sourceResource"]["subject"]:
             added = False
             if subject.get("name") in subject_ids:
@@ -1037,31 +1081,38 @@ def parsed(dpla_id, dpla_api):
                         subjects.append((str(subject.get("name") or ""), ""))
                         added = True
             elif subject.get("exactMatch"):
-                subjqid = ""
                 naid = subject.get("exactMatch")[0].replace(
                     "https://catalog.archives.gov/id/", ""
                 )
-                reconci_query = json.dumps(
-                    {
-                        "q1": {
-                            "query": str(subject.get("name") or ""),
-                            "limit": 5,
-                            "properties": [{"pid": "P1225", "v": naid}],
-                            "type_strict": "should",
-                        }
-                    }
-                )
-                h = requests.get(
-                    "https://wikidata.reconci.link/en/api?queries="
-                    + urllib.parse.quote(reconci_query)
-                )
-                subjectresults = h.json()
-                if subjectresults["q1"]["result"]:
-                    subjqid = subjectresults["q1"]["result"][0]["id"]
-                subjects.append((str(subject.get("name") or ""), subjqid))
+                name = str(subject.get("name") or "")
+                subjects.append([name, ""])  # mutable placeholder
+                reconci_slots.append((len(subjects) - 1, name, naid))
                 added = True
             if not added:
                 subjects.append((str(subject.get("name") or ""), ""))
+
+        if reconci_slots:
+            queries = {
+                f"q{i}": {
+                    "query": name,
+                    "limit": 5,
+                    "properties": [{"pid": "P1225", "v": naid}],
+                    "type_strict": "should",
+                }
+                for i, (_, name, naid) in enumerate(reconci_slots)
+            }
+            h = requests.get(
+                "https://wikidata.reconci.link/en/api?queries="
+                + urllib.parse.quote(json.dumps(queries)),
+                timeout=15,
+            )
+            results = h.json()
+            for i, (slot, name, _) in enumerate(reconci_slots):
+                result = results.get(f"q{i}", {}).get("result") or []
+                subjqid = result[0]["id"] if result else ""
+                subjects[slot] = (name, subjqid)
+
+        subjects = [tuple(s) for s in subjects]
     except Exception:
         subjects = []
     try:
@@ -1153,6 +1204,13 @@ def _resolve_dpla_id(title, dpla_api):
 def process_one(mediaid, dpla_id):
     """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
     global claims, refclaims, token
+
+    # Drop any stale cache from a prior file so check() always reads fresh state
+    # for this mediaid.
+    invalidate_entity(mediaid)
+    # Pre-warm the per-file entity cache so the ~25 add_*/check() calls below
+    # share a single wbgetentities round-trip.
+    get_entity(mediaid)
 
     try:
         (
@@ -1382,3 +1440,20 @@ elif args.files:
         count += 1
         print(f"{count}: {mediaid}")
         process_one(mediaid, dpla_id)
+
+elif args.cat:
+    category = pywikibot.Category(site, args.cat)
+    generator = pagegenerators.CategorizedPageGenerator(
+        category, namespaces=[6], recurse=args.recurse
+    )
+    for page in generator:
+        title = page.title()
+        print("\n" + title)
+        mediaid = "M" + str(page.pageid)
+        dpla_id = _resolve_dpla_id(title, dpla_api)
+        count += 1
+        print(f"{count}: {mediaid}")
+        process_one(mediaid, dpla_id)
+        if args.limit and count >= args.limit:
+            print(f" -- Reached --limit {args.limit}, stopping.")
+            break
