@@ -197,11 +197,13 @@ def postqual(claimid, prop, value):
         pywikibot.output(summary)
 
     except Exception as e:
+        # Don't log the CSRF token itself — refresh and continue silently
+        # past the transient failure.
         print(repr(e))
-        print(site.tokens["csrf"])
+        print(" -- Refreshing CSRF token after API error...")
         site.get_tokens(["csrf"])
         site.tokens.load_tokens(["csrf"])
-        print(site.tokens["csrf"])
+        print(" -- CSRF token refreshed.")
 
 
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
@@ -347,11 +349,14 @@ def check(mediaid, qid, prop):
     if qid[0] == "somevalue":
         p = "P1932" if prop == "P571" else "P2093"
         try:
-            if any(statement["qualifiers"].get(p) for statement in statements):
+            if any(statement.get("qualifiers", {}).get(p) for statement in statements):
                 for statement in statements:
-                    if statement["qualifiers"][p][0]["datavalue"]["value"] == qid[
-                        1
-                    ] and not statement.get("references"):
+                    qualifiers = statement.get("qualifiers", {}).get(p) or []
+                    if (
+                        qualifiers
+                        and qualifiers[0]["datavalue"]["value"] == qid[1]
+                        and not statement.get("references")
+                    ):
                         ref = statement["id"]
                 # Walk every statement looking for a qualifier match. Only
                 # return False on an actual match; otherwise fall through and
@@ -378,11 +383,16 @@ def check(mediaid, qid, prop):
             return True, ref
     if qid[0] == "source":
         try:
-            if any(statement["qualifiers"].get("P973") for statement in statements):
+            if any(
+                statement.get("qualifiers", {}).get("P973") for statement in statements
+            ):
                 for statement in statements:
-                    if statement["qualifiers"]["P973"][0]["datavalue"]["value"] == qid[
-                        1
-                    ] and not statement.get("references"):
+                    qualifiers = statement.get("qualifiers", {}).get("P973") or []
+                    if (
+                        qualifiers
+                        and qualifiers[0]["datavalue"]["value"] == qid[1]
+                        and not statement.get("references")
+                    ):
                         ref = statement["id"]
                 # See the somevalue branch above: scan every statement before
                 # concluding the claim is missing.
@@ -581,14 +591,19 @@ def add_subject_entity(mediaid, qid, dpla_id):
 def add_title(mediaid, title, dpla_id):
     if title:
         prop = "P1476"
+        # Normalize once: dedupe must compare what we'd actually post, not the
+        # raw input. Otherwise reruns where the raw string differs from the
+        # truncated/rstripped form (long titles, trailing whitespace) treat the
+        # claim as missing and post a duplicate.
+        normalized = title[:1499].rstrip()
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
-            {"text": title[:1499].rstrip(), "language": "en"},
+            {"text": normalized, "language": "en"},
             "monolingualtext",
             dpla_id,
         )
-        checkclaim = check(mediaid, ("monolingualtext", title), prop)
+        checkclaim = check(mediaid, ("monolingualtext", normalized), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
         if checkclaim[0] is True:
@@ -599,14 +614,15 @@ def add_title(mediaid, title, dpla_id):
 def add_desc(mediaid, desc, dpla_id):
     if desc:
         prop = "P10358"
+        normalized = desc[:1499].rstrip()
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(
             prop,
-            {"text": desc[:1499].rstrip(), "language": "en"},
+            {"text": normalized, "language": "en"},
             "monolingualtext",
             dpla_id,
         )
-        checkclaim = check(mediaid, ("monolingualtext", desc), prop)
+        checkclaim = check(mediaid, ("monolingualtext", normalized), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
         if checkclaim[0] is True:
@@ -617,16 +633,17 @@ def add_desc(mediaid, desc, dpla_id):
 def add_creator(mediaid, creator, dpla_id):
     if creator:
         prop = "P170"
+        normalized = creator[:1499].rstrip()
         summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
         claim = formattedclaim(prop, "somevalue", "wikibase-entityid", dpla_id)
         claim["qualifiers"]["P2093"] = [
             {
                 "snaktype": "value",
                 "property": "P2093",
-                "datavalue": {"value": creator[:1499].rstrip(), "type": "string"},
+                "datavalue": {"value": normalized, "type": "string"},
             }
         ]
-        checkclaim = check(mediaid, ("somevalue", creator), prop)
+        checkclaim = check(mediaid, ("somevalue", normalized), prop)
         if checkclaim[1]:
             add_ref(checkclaim[1], claim)
         if checkclaim[0] is True:
@@ -636,16 +653,17 @@ def add_creator(mediaid, creator, dpla_id):
 
 def add_date(mediaid, date, dpla_id):
     prop = "P571"
+    normalized = date[:1499].rstrip()
     summary = f" -- Adding [[:d:Property:{prop}]] to {mediaid}."
     claim = formattedclaim(prop, "somevalue", "time", dpla_id)
     claim["qualifiers"]["P1932"] = [
         {
             "snaktype": "value",
             "property": "P1932",
-            "datavalue": {"value": date[:1499].rstrip(), "type": "string"},
+            "datavalue": {"value": normalized, "type": "string"},
         }
     ]
-    checkclaim = check(mediaid, ("somevalue", date), prop)
+    checkclaim = check(mediaid, ("somevalue", normalized), prop)
     if checkclaim[1]:
         add_ref(checkclaim[1], claim)
     if checkclaim[0] is True:
@@ -924,9 +942,10 @@ def dpla_claims(
     creators = parsecreators
     descs = parsedescs
     subjects = parsesubjects
+    # All values are lists so the `value not in expected[prop]` reconciliation
+    # below behaves consistently (a bare string would degrade `not in` into a
+    # substring check and let real DPLA claims look "unexpected").
     expected = {
-        "P6216": statusvalue,
-        rightsprop: rightsvalue,
         "P217": local_ids,
         "P760": [dpla_id],
         "P1476": titles,
@@ -942,6 +961,20 @@ def dpla_claims(
         "P7228": [access],
         "P921": parsesubjectentities,
     }
+    # P6216 (copyright status) and the rights-property (P275/P6426) need to
+    # coexist: when rightsprop *is* P6216 (public-domain-mark path), a single
+    # P6216 entry overwrote the other and caused dpla_claims() to wrongly
+    # queue the correct status claim for removal. Build them separately.
+    p6216_values = []
+    if statusvalue:
+        p6216_values.append(statusvalue)
+    if rightsprop == "P6216":
+        if rightsvalue:
+            p6216_values.append(rightsvalue)
+    else:
+        if rightsvalue:
+            expected[rightsprop] = [rightsvalue]
+    expected["P6216"] = p6216_values
     for prop in file_claims["entities"][mediaid]["statements"]:
         for stmt in file_claims["entities"][mediaid]["statements"][prop]:
             if stmt.get("references"):
@@ -1015,7 +1048,9 @@ def dpla_claims(
                                         }
                                     }
                                 )
-                            except Exception:
+                            except (KeyError, IndexError, TypeError):
+                                # somevalue claim missing its expected
+                                # stated-as qualifier — queue for removal.
                                 removals.append(stmt["id"])
     for claim in dpla_claim_list:
         for prop in claim:
@@ -1060,7 +1095,7 @@ def parsed(dpla_id, dpla_api):
     except Exception:
         print(dpla)
         print("DPLA API returned error.")
-        return False
+        return None
     hub = hubs[dpla["provider"]["name"]]["Wikidata"]
     institution = hubs[dpla["provider"]["name"]]["institutions"][
         dpla["dataProvider"]["name"]
@@ -1246,27 +1281,30 @@ def process_one(mediaid, dpla_id):
     # share a single wbgetentities round-trip.
     get_entity(mediaid)
 
-    try:
-        (
-            url,
-            descs,
-            dates,
-            titles,
-            hub,
-            local_ids,
-            institution,
-            rs,
-            creators,
-            subjects,
-            naids,
-            access,
-            level,
-        ) = parsed(dpla_id, dpla_api)
-    except TypeError:
+    # parsed() returns None on lookup failure (was: returned False and the
+    # tuple-unpack TypeError was caught here, which also swallowed real
+    # parser bugs as "missing ID"). Check the sentinel explicitly.
+    parsed_result = parsed(dpla_id, dpla_api)
+    if not parsed_result:
         with open("Missing ids.txt", "a") as missing:
             missing.write(dpla_id + "\n")
             print(" -- Missing ID recorded.")
         return
+    (
+        url,
+        descs,
+        dates,
+        titles,
+        hub,
+        local_ids,
+        institution,
+        rs,
+        creators,
+        subjects,
+        naids,
+        access,
+        level,
+    ) = parsed_result
 
     claims = {"claims": []}
     refclaims = {"claims": []}
