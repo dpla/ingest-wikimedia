@@ -9,6 +9,7 @@ from ingest_wikimedia.wikimedia import (
     get_permissions,
     escape_wiki_strings,
     join,
+    collect_duplicate_source_sha1s,
     compute_ordinal_exts_and_page_labels,
     extract_page_ordinal_from_commons_title,
     extract_strings,
@@ -498,6 +499,74 @@ def test_page_labels_clienterror_treated_as_stub_placeholder():
     exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
     assert exts == {1: ".jpg", 2: "", 3: ".jpg"}
     assert labels == {1: "1", 2: "", 3: "2"}
+
+
+# collect_duplicate_source_sha1s — drift logic must recognize legit duplicates
+def _fake_s3_client_with_sha1s(sha1_by_ord: dict[int, str | None]):
+    """Mock S3Client whose Object().metadata['sha1'] returns the configured sha1
+    per ordinal. None means the ordinal raises (treated as missing)."""
+    s3_client = MagicMock()
+
+    def get_obj(bucket, path):
+        ord_num = int(path.rsplit("/", 1)[-1].split("_", 1)[0])
+        sha1 = sha1_by_ord.get(ord_num)
+        if sha1 is None:
+            raise RuntimeError("missing")
+        obj = MagicMock()
+        obj.metadata = {"sha1": sha1}
+        return obj
+
+    boto3_resource = MagicMock()
+    boto3_resource.Object.side_effect = get_obj
+    s3_client.get_s3.return_value = boto3_resource
+    s3_client.get_media_s3_path.side_effect = lambda d, i, p: (
+        f"{p}/images/{d[0]}/{d[1]}/{d[2]}/{d[3]}/{d}/{i}_{d}"
+    )
+    return s3_client
+
+
+def test_collect_duplicate_source_sha1s_all_unique():
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "ccc"})
+    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == set()
+
+
+def test_collect_duplicate_source_sha1s_one_pair_repeats():
+    # Sherman pattern: same content at positions 1 and 12.
+    s3 = _fake_s3_client_with_sha1s(
+        {
+            1: "aaa",
+            2: "bbb",
+            3: "ccc",
+            4: "ddd",
+            5: "eee",
+            6: "fff",
+            7: "ggg",
+            8: "hhh",
+            9: "iii",
+            10: "jjj",
+            11: "kkk",
+            12: "aaa",
+            13: "bbb",
+        }
+    )
+    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 13) == {"aaa", "bbb"}
+
+
+def test_collect_duplicate_source_sha1s_same_sha1_three_times():
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "aaa", 4: "aaa"})
+    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 4) == {"aaa"}
+
+
+def test_collect_duplicate_source_sha1s_handles_missing_metadata():
+    # Read failures are tolerated; affected ordinals are absent from the count.
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: None, 3: "aaa"})
+    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == {"aaa"}
+
+
+def test_collect_duplicate_source_sha1s_skips_empty_sha1():
+    # Empty sha1 metadata (e.g. truncated) is not counted as duplicate-of-itself.
+    s3 = _fake_s3_client_with_sha1s({1: "", 2: "", 3: "aaa"})
+    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == set()
 
 
 def test_page_labels_non_404_clienterror_propagates():
