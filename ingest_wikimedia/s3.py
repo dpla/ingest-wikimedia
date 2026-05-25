@@ -12,6 +12,7 @@ IIIF_JSON = "iiif.json"
 FILE_LIST_TXT = "file-list.txt"
 TEXT_PLAIN = "text/plain"
 DPLA_MAP_FILENAME = "dpla-map.json"
+UPLOAD_RESULT_FILENAME = "upload-result.json"
 APPLICATION_JSON = "application/json"
 S3_RETRIES = 3
 S3_BUCKET = "dpla-wikimedia"
@@ -104,6 +105,28 @@ class S3Client:
         Reads the metadata file back from s3.
         """
         return self.get_item_file(partner, dpla_id, DPLA_MAP_FILENAME)
+
+    def write_upload_result(
+        self, partner: str, dpla_id: str, upload_result: dict
+    ) -> None:
+        """
+        Stage the per-item upload result file used by the SDC sync phase to
+        decide which ordinals to attempt structured-data writes on.
+
+        Replaces any existing result file for this item; we only care about
+        the latest uploader pass's verdict.
+        """
+        self.write_item_file(
+            partner,
+            dpla_id,
+            json.dumps(upload_result),
+            UPLOAD_RESULT_FILENAME,
+            APPLICATION_JSON,
+        )
+
+    def get_upload_result(self, partner: str, dpla_id: str) -> str | None:
+        """Read the per-item upload result file written by the uploader."""
+        return self.get_item_file(partner, dpla_id, UPLOAD_RESULT_FILENAME)
 
     def write_file_list(self, partner: str, dpla_id: str, file_urls: list[str]) -> None:
         """
