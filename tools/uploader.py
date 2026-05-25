@@ -1,4 +1,5 @@
 import concurrent.futures
+import datetime
 import json
 import logging
 import mimetypes
@@ -72,6 +73,19 @@ UPLOAD_RETRY_MAX_DELAY_SECS = 60
 # This cap ensures a single hung upload never freezes the whole session.
 UPLOAD_TIMEOUT_SECS = 3600  # 1 hour
 
+# Per-ordinal status strings written to <partner>/<dpla_id>/upload-result.json
+# and consumed by the SDC sync phase (PR 4). The SDC phase only attempts
+# wbsetclaims for ordinals whose status is UPLOADED or SKIPPED — the other
+# three mean no canonical Commons file exists at the expected title for this
+# ordinal in this run, so writing structured data would be pointing at the
+# wrong page or none at all.
+ORDINAL_UPLOADED = "UPLOADED"  # file just uploaded (or drift-moved into place)
+ORDINAL_SKIPPED = "SKIPPED"  # existing Commons file matches our SHA1
+ORDINAL_NOT_PRESENT = "NOT_PRESENT"  # no S3 asset to upload (downloader gap)
+ORDINAL_INELIGIBLE = "INELIGIBLE"  # S3 asset present but uploader chose not
+# to upload (bad MIME, download-only, unguessable extension, etc.)
+ORDINAL_FAILED = "FAILED"  # upload attempted, raised, did not land
+
 
 class UploadTimeoutError(RuntimeError):
     """Raised when a single file upload exceeds UPLOAD_TIMEOUT_SECS.
@@ -112,7 +126,19 @@ class Uploader:
         verbose: bool,
         dry_run: bool,
         duplicate_source_sha1s: set[str] | None = None,
-    ):
+    ) -> dict:
+        """Process one ordinal's source asset and return a per-ordinal result dict.
+
+        Return shape (consumed by process_item to assemble upload-result.json):
+          {"status": <ORDINAL_*>, "title": str | None,
+           "pageid": int | None, "error": str | None}
+
+        The status drives the SDC sync phase (PR 4): UPLOADED and SKIPPED
+        ordinals are eligible for wbsetclaims; NOT_PRESENT, INELIGIBLE, and
+        FAILED ordinals are not. `title` and `pageid` are populated only for
+        UPLOADED and SKIPPED; everything else has no canonical Commons page
+        to attach structured data to.
+        """
         temp_file = self.local_fs.get_temp_file()
 
         try:
@@ -122,7 +148,7 @@ class Uploader:
             if not self.s3_client.s3_file_exists(s3_path):
                 logging.info(f"{dpla_id} {ordinal} not present.")
                 self.tracker.increment(Result.SKIPPED)
-                return
+                return {"status": ORDINAL_NOT_PRESENT}
 
             s3_object = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
             file_size = s3_object.content_length
@@ -130,7 +156,7 @@ class Uploader:
             if file_size == 0:
                 logging.info(f"Skipping {dpla_id} {ordinal}: File size is 0.")
                 self.tracker.increment(Result.SKIPPED)
-                return
+                return {"status": ORDINAL_NOT_PRESENT}
 
             sha1 = s3_object.metadata.get(CHECKSUM, "")
             mime = s3_object.content_type
@@ -164,19 +190,19 @@ class Uploader:
                     if not dry_run:
                         self.s3_client.get_s3().Object(S3_BUCKET, s3_path).delete()
                     self.tracker.increment(Result.SKIPPED)
-                    return
+                    return {"status": ORDINAL_INELIGIBLE}
 
             if not check_content_type(mime):
                 logging.info(f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}")
                 self.tracker.increment(Result.SKIPPED)
-                return
+                return {"status": ORDINAL_INELIGIBLE}
 
             if is_download_only(mime):
                 logging.info(
                     f"Skipping {dpla_id} {ordinal}: {mime} staged for conversion, not uploaded."
                 )
                 self.tracker.increment(Result.SKIPPED)
-                return
+                return {"status": ORDINAL_INELIGIBLE}
 
             ext = mimetypes.guess_extension(mime)
 
@@ -185,7 +211,7 @@ class Uploader:
                     f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
                 )
                 self.tracker.increment(Result.SKIPPED)
-                return
+                return {"status": ORDINAL_INELIGIBLE}
 
             page_title = get_page_title(
                 item_title=title,
@@ -219,7 +245,11 @@ class Uploader:
                         f"Skipping {dpla_id} {ordinal}: Already exists on commons."
                     )
                     self.tracker.increment(Result.SKIPPED)
-                    return
+                    return {
+                        "status": ORDINAL_SKIPPED,
+                        "title": page_title,
+                        "pageid": existing_file.pageid,
+                    }
                 logging.info(
                     f"Hash drift detected for {dpla_id} {ordinal}: "
                     f"SHA1 found at [[File:{existing_file.title(with_ns=False)}]]"
@@ -259,7 +289,14 @@ class Uploader:
                         )
                         if drift_action == "moved":
                             self.tracker.increment(Result.UPLOADED)
-                            return
+                            # After a successful move the same file page lives
+                            # at page_title; existing_file.pageid is preserved
+                            # by MediaWiki across moves so we can stamp it here.
+                            return {
+                                "status": ORDINAL_UPLOADED,
+                                "title": page_title,
+                                "pageid": existing_file.pageid,
+                            }
                         elif drift_action == "upload_and_tag":
                             drift_old_filename = existing_file.title(with_ns=False)
                             force_ignore_warnings = True
@@ -447,11 +484,21 @@ class Uploader:
                     self._tag_drift_duplicate(drift_old_filename, page_title, dpla_id)
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
+                return {
+                    "status": ORDINAL_UPLOADED,
+                    "title": page_title,
+                    "pageid": wiki_file_page.pageid,
+                }
+
+            # dry_run path falls through without uploading — flag as INELIGIBLE
+            # for SDC purposes (no real Commons file was placed in this run).
+            return {"status": ORDINAL_INELIGIBLE}
 
         except UploadTimeoutError:
             raise
         except Exception as ex:
             self.handle_upload_exception(ex)
+            return {"status": ORDINAL_FAILED, "error": str(ex)}
 
         finally:
             self.local_fs.clean_up_tmp_file(temp_file)
@@ -710,6 +757,45 @@ class Uploader:
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
 
+    def _persist_upload_result(
+        self,
+        partner: str,
+        dpla_id: str,
+        ordinal_results: dict[str, dict],
+        dry_run: bool,
+    ) -> None:
+        """Write the per-item upload-result.json sidecar to S3.
+
+        Called at every non-exception exit path through process_item so the
+        sidecar always reflects what this run decided about this item — never
+        a stale verdict from a previous run. An empty ordinal_results dict is
+        the correct signal for "uploader saw the item but produced nothing
+        the SDC phase should write structured data on" (ineligible item,
+        missing institution Wikidata, zero-file manifest, etc.).
+
+        Dry-run path is intentionally a no-op: dry runs shouldn't mutate S3
+        any more than they mutate Commons.
+
+        Best-effort on the write itself: a failure here is logged but doesn't
+        propagate, since the upload work has already succeeded for any
+        ordinals that were processed and the SDC phase can re-derive on a
+        future uploader run.
+        """
+        if dry_run:
+            return
+        upload_result = {
+            "run_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+            "ordinals": ordinal_results,
+        }
+        try:
+            self.s3_client.write_upload_result(partner, dpla_id, upload_result)
+        except Exception as ex:
+            logging.warning(
+                f"Failed to write upload-result.json for {dpla_id}: {ex}; continuing"
+            )
+
     def process_item(
         self,
         dpla_id: str,
@@ -723,7 +809,14 @@ class Uploader:
 
             item_metadata_result = self.s3_client.get_item_metadata(partner, dpla_id)
             if not item_metadata_result:
+                # Missing dpla-map.json. The item is in this run's IDs CSV but
+                # there's no metadata to work from — either get-ids-es never
+                # staged it, the object was deleted between phases, or this is
+                # a transient S3 hiccup. Persist an empty result so the SDC
+                # phase doesn't keep treating a prior run's UPLOADED ordinals
+                # as authoritative for an item we now lack metadata for.
                 self.tracker.increment(Result.ITEM_NOT_PRESENT)
+                self._persist_upload_result(partner, dpla_id, {}, dry_run)
                 return
 
             item_metadata = json.loads(item_metadata_result)
@@ -737,6 +830,10 @@ class Uploader:
             ):
                 logging.info(f"Skipping {dpla_id}: Not eligible.")
                 self.tracker.increment(Result.SKIPPED)
+                # Persist an empty result so any prior upload-result.json
+                # doesn't keep telling the SDC phase the item is still SDC-able
+                # after eligibility was revoked.
+                self._persist_upload_result(partner, dpla_id, {}, dry_run)
                 return
 
             if self.category_ensurer:
@@ -756,6 +853,7 @@ class Uploader:
                         f"hub_institution_qid={hub_institution_qid!r}"
                     )
                     self.tracker.increment(Result.SKIPPED)
+                    self._persist_upload_result(partner, dpla_id, {}, dry_run)
                     return
 
             titles = get_list(
@@ -783,6 +881,13 @@ class Uploader:
                 self.s3_client, dpla_id, partner, len(files)
             )
 
+            # Per-ordinal results collected here are written to
+            # <partner>/<dpla_id>/upload-result.json at the end of this method,
+            # and read by the SDC sync phase to decide which ordinals are
+            # eligible for wbsetclaims. Schema: {ordinal_str: {status, title?,
+            # pageid?, error?}}.
+            ordinal_results: dict[str, dict] = {}
+
             for ordinal, _ in enumerate(
                 tqdm(
                     files, desc="Uploading Files", leave=False, unit="File", ncols=100
@@ -792,7 +897,7 @@ class Uploader:
                 logging.info(f"Page {ordinal}")
                 page_label = page_labels.get(ordinal, "")
                 try:
-                    self.process_file(
+                    result = self.process_file(
                         dpla_id,
                         title,
                         item_metadata,
@@ -805,7 +910,12 @@ class Uploader:
                         dry_run,
                         duplicate_source_sha1s=duplicate_source_sha1s,
                     )
+                    ordinal_results[str(ordinal)] = result
                 except UploadTimeoutError as ex:
+                    ordinal_results[str(ordinal)] = {
+                        "status": ORDINAL_FAILED,
+                        "error": str(ex),
+                    }
                     self.handle_upload_exception(ex)
                     break
 
@@ -833,7 +943,18 @@ class Uploader:
             except Exception as ex:
                 logging.warning(f"Orphan check failed for {dpla_id}: {ex}; continuing")
 
+            # Persist the per-ordinal results so the SDC sync phase (PR 4)
+            # knows which ordinals to attempt structured-data writes on. Fires
+            # even when ordinal_results is empty (e.g. zero files in
+            # file_list.txt) so a previous run's results don't get treated as
+            # the current truth.
+            self._persist_upload_result(partner, dpla_id, ordinal_results, dry_run)
+
         except Exception as ex:
+            # Intentionally NOT writing upload-result.json on the catch-all
+            # exception path. The failure may be transient (S3 hiccup,
+            # pywikibot socket reset) and the previous result file — if any —
+            # is more likely to still be accurate than a fresh empty one.
             logging.warning(
                 f"Caught exception getting item info for {dpla_id}", exc_info=ex
             )
