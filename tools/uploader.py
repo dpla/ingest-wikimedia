@@ -1047,8 +1047,13 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
         # calls — for typical runs replication has settled long before this.
         _post_upload_touch_new_institutions(commons_site, category_ensurer, dry_run)
         notify_upload_complete(
+            # Bare partner slug, not "wikimedia-<partner>" — notify_upload_complete
+            # always prepends "wikimedia-" itself (matching the bare-label
+            # convention notify_phase_start and notify_download_complete use).
+            # Passing the pre-prefixed form yielded "wikimedia-wikimedia-<partner>"
+            # in standalone runs after PR #199 refactored these helpers.
             tracker=tracker,
-            partner_label=f"wikimedia-{partner}",
+            partner_label=partner,
             elapsed_seconds=elapsed,
             dry_run=dry_run,
         )
