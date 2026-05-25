@@ -37,7 +37,8 @@ import click
 import requests
 
 from ingest_wikimedia.banlist import Banlist
-from ingest_wikimedia.dpla import DPLA, DPLA_PARTNERS, INSTITUTIONS_URL
+from ingest_wikimedia.dpla import DPLA, INSTITUTIONS_URL
+from ingest_wikimedia.partners import PARTNER_HUBS
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
 from ingest_wikimedia.s3 import S3Client
@@ -73,7 +74,7 @@ def load_eligible_dp_names(partner: str) -> list[str]:
     Name strings are used rather than Wikidata URIs so that two provider name
     variants mapping to the same Wikidata ID can carry independent upload flags.
     """
-    hub_name = DPLA_PARTNERS[partner]
+    hub_name = PARTNER_HUBS[partner]
     resp = requests.get(INSTITUTIONS_URL, timeout=15)
     resp.raise_for_status()
     institutions = resp.json()
@@ -175,7 +176,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
         raise click.BadParameter(str(e)) from e
 
     notify_phase_start(partner, "id-generation")
-    provider_name = DPLA_PARTNERS[partner]
+    provider_name = PARTNER_HUBS[partner]
 
     eligible_dp_names = load_eligible_dp_names(partner)
     if not eligible_dp_names:
