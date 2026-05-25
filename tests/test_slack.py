@@ -320,6 +320,7 @@ def test_notify_upload_complete_with_retry_label_combines_failed_count(tmp_path)
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "retry-si",
             "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
+            "WIKIMEDIA_RETRY_HAS_DOWNLOAD": "1",
         },
         # Upload tracker: 0 uploaded, 80 skipped (already on Commons), 0 failed.
         # The retry summary must surface the download-phase FAILED=1.
@@ -346,11 +347,40 @@ def test_notify_upload_complete_with_retry_label_but_no_log_file(tmp_path):
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "retry-si",
             "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
+            "WIKIMEDIA_RETRY_HAS_DOWNLOAD": "1",
         },
         tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
     )
     # Falls back gracefully — upload-only header, FAILED unchanged.
     assert "Wikimedia Upload Complete" in captured["header"]
+    failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
+    assert failed_lines == ["FAILED:   0"]
+
+
+def test_notify_upload_complete_upload_only_retry_ignores_stale_download_log(
+    tmp_path,
+):
+    """An upload-only retry (WIKIMEDIA_RETRY_HAS_DOWNLOAD unset) must NOT
+    pick up a stale `*-retry-<slug>-download.log` from a prior retry run.
+
+    Retry session labels are reused across runs, so without the gate the
+    most-recent matching download log on disk — from a previous session
+    that already shipped its own Slack summary — would be folded in,
+    inflating FAILED and incorrectly switching to "Retry Complete"."""
+    _write_retry_download_log(
+        tmp_path, "retry-si", "[INFO] stale\nCOUNTS:\nFAILED: 999\nSKIPPED: 1\n"
+    )
+    captured = _capture_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "retry-si",
+            "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
+            # WIKIMEDIA_RETRY_HAS_DOWNLOAD intentionally unset.
+        },
+        tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
+    )
+    assert "Wikimedia Upload Complete" in captured["header"]
+    assert "Retry Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
     assert failed_lines == ["FAILED:   0"]
 
@@ -378,6 +408,7 @@ def test_notify_upload_complete_clean_retry_still_titled_retry_complete(tmp_path
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "retry-si",
             "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
+            "WIKIMEDIA_RETRY_HAS_DOWNLOAD": "1",
         },
         tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
     )

@@ -258,14 +258,28 @@ def main() -> None:
             if idx == last_idx
             else "unset WIKIMEDIA_TARGET_IS_LAST"
         )
+        download_csv = type_csvs.get("download")
+        upload_csv = type_csvs.get("upload")
+        # WIKIMEDIA_RETRY_HAS_DOWNLOAD gates the combined-summary log
+        # discovery in notify_upload_complete. Retry session labels are
+        # reused across runs, so an upload-only retry would otherwise
+        # find a stale *-retry-<slug>-download.log from a prior session
+        # and inflate FAILED with already-shipped counts. Set the flag
+        # only when this target actually runs the download phase; unset
+        # it otherwise so the env doesn't leak across targets in the
+        # same tmux session.
+        has_download_env = (
+            "export WIKIMEDIA_RETRY_HAS_DOWNLOAD=1"
+            if download_csv
+            else "unset WIKIMEDIA_RETRY_HAS_DOWNLOAD"
+        )
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
             f"export WIKIMEDIA_PARTNER_DIR={base}; "
             f"{is_last_env}; "
+            f"{has_download_env}; "
             "unset WIKIMEDIA_SINGLE_ITEM"
         )
-        download_csv = type_csvs.get("download")
-        upload_csv = type_csvs.get("upload")
         steps = [f"cd {base}"]
         if download_csv:
             # `--max-age-days 1` forces the downloader to actually re-attempt

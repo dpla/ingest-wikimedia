@@ -220,6 +220,15 @@ def test_retry_pipeline_does_not_export_download_log_via_pwd_subshell():
     # on must still be present and must precede the uploader.
     assert "export WIKIMEDIA_SESSION_LABEL=" in pipeline_cmd
     assert "export WIKIMEDIA_PARTNER_DIR=" in pipeline_cmd
+    # WIKIMEDIA_RETRY_HAS_DOWNLOAD must be set to 1 when a download CSV is
+    # present, so notify_upload_complete knows the discovered download log
+    # belongs to this run rather than a prior retry session that reused
+    # the same label.
+    assert "export WIKIMEDIA_RETRY_HAS_DOWNLOAD=1" in pipeline_cmd, (
+        "pipeline must opt into combined-summary log discovery via "
+        "WIKIMEDIA_RETRY_HAS_DOWNLOAD=1 when the target has a download "
+        f"phase; got: {pipeline_cmd!r}"
+    )
 
 
 def test_retry_clears_stale_csvs_even_when_no_partner_given():

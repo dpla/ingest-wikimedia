@@ -330,14 +330,20 @@ def _read_download_failed_count(log_path: str | None) -> int | None:
 def _find_retry_download_log() -> str | None:
     """Locate this retry session's download log, if any.
 
-    Only fires for retry sessions (label prefixed `retry-`); normal upload
-    and refresh-only runs have their own Slack messaging and must not be
-    combined. Returns None when not in a retry session or no matching log
-    exists yet.
+    Only fires for retry sessions (label prefixed `retry-`) that actually
+    ran a download phase this run (WIKIMEDIA_RETRY_HAS_DOWNLOAD=1, set by
+    the retry pipeline iff a download CSV is present for the target).
+
+    The HAS_DOWNLOAD gate is important: retry session labels are reused
+    across runs, so without it an upload-only retry would happily pick
+    up a stale `*-retry-<slug>-download.log` from a prior run and inflate
+    FAILED with counts that already shipped in an earlier message.
     """
     label = (os.environ.get("WIKIMEDIA_SESSION_LABEL") or "").strip()
     partner_dir = (os.environ.get("WIKIMEDIA_PARTNER_DIR") or "").strip()
     if not label.startswith("retry-"):
+        return None
+    if os.environ.get("WIKIMEDIA_RETRY_HAS_DOWNLOAD") != "1":
         return None
     return _find_latest_log(partner_dir, label, phase="download")
 
