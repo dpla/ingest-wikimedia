@@ -1908,6 +1908,8 @@ def _run_partner_mode(partner, ids_file):
     Items where the metadata isn't yet on S3 are skipped silently and
     will be picked up the next time the full pipeline runs.
     """
+    from botocore.exceptions import ClientError
+
     from ingest_wikimedia.s3 import S3Client
 
     s3 = S3Client()
@@ -1921,7 +1923,14 @@ def _run_partner_mode(partner, ids_file):
         local_count += 1
         print(f"\n{local_count}: {dpla_id}")
 
-        sdc_raw = s3.get_sdc_json(partner, dpla_id)
+        # S3Client.get_item_file returns None on 404/NoSuchKey but re-raises
+        # any other ClientError. Catch those per-item so one transient S3
+        # failure doesn't abort the whole partner batch.
+        try:
+            sdc_raw = s3.get_sdc_json(partner, dpla_id)
+        except ClientError as e:
+            print(f" -- S3 error reading sdc.json for {dpla_id}: {e!r}; skipping.")
+            continue
         if sdc_raw is None:
             print(" -- No sdc.json on S3; skipping.")
             continue
@@ -1931,7 +1940,13 @@ def _run_partner_mode(partner, ids_file):
             print(f" -- sdc.json failed to parse: {e}; skipping.")
             continue
 
-        upload_raw = s3.get_upload_result(partner, dpla_id)
+        try:
+            upload_raw = s3.get_upload_result(partner, dpla_id)
+        except ClientError as e:
+            print(
+                f" -- S3 error reading upload-result.json for {dpla_id}: {e!r}; skipping."
+            )
+            continue
         if upload_raw is None:
             print(" -- No upload-result.json on S3; skipping.")
             continue
