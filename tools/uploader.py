@@ -809,11 +809,14 @@ class Uploader:
 
             item_metadata_result = self.s3_client.get_item_metadata(partner, dpla_id)
             if not item_metadata_result:
-                # The item isn't in S3 at all — it shouldn't be in the IDs CSV
-                # this run. Don't touch any existing upload-result.json; that
-                # state belongs to whatever run last produced it. This is
-                # purely a "we have no idea about this item" branch.
+                # Missing dpla-map.json. The item is in this run's IDs CSV but
+                # there's no metadata to work from — either get-ids-es never
+                # staged it, the object was deleted between phases, or this is
+                # a transient S3 hiccup. Persist an empty result so the SDC
+                # phase doesn't keep treating a prior run's UPLOADED ordinals
+                # as authoritative for an item we now lack metadata for.
                 self.tracker.increment(Result.ITEM_NOT_PRESENT)
+                self._persist_upload_result(partner, dpla_id, {}, dry_run)
                 return
 
             item_metadata = json.loads(item_metadata_result)
