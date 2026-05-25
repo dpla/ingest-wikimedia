@@ -24,12 +24,23 @@ dpla-map.json so the downloader can skip redundant DPLA API calls entirely.
 CONTENTdm items have their IIIF manifest URL derived from isShownAt and patched
 into the document before it is written.
 
+After pagination completes, this tool also writes a per-item sdc.json
+containing the ready-to-POST Wikibase claim list (P760, P1476, P195, P170,
+P571, P4272, P921, P10358, P9126, P7482, P217, plus the NARA-only P1225,
+P7228, P6224). Subject reconciliation against Wikidata is batched across
+the whole hub via wikidata.reconci.link so the sync phase can be a pure
+diff+POST step against pre-computed claims.
+
 Output: one DPLA ID per line to stdout.  Redirect to produce the IDs CSV
 consumed by the downloader and uploader:
 
     get-ids-es pa > pa/pa.csv
 """
 
+import datetime
+import json
+import logging
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -41,7 +52,13 @@ from ingest_wikimedia.dpla import DPLA, INSTITUTIONS_URL
 from ingest_wikimedia.partners import PARTNER_HUBS
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
-from ingest_wikimedia.s3 import S3Client
+from ingest_wikimedia.s3 import APPLICATION_JSON, S3Client
+from ingest_wikimedia.sdc import (
+    normalize_rights_uri,
+    build_claims_for_doc,
+    collect_subject_queries,
+    reconcile_subjects,
+)
 from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
 
@@ -52,6 +69,16 @@ IIIF_MANIFEST_FIELD = "iiifManifest"
 MEDIA_MASTER_FIELD = "mediaMaster"
 IS_SHOWN_AT_FIELD = "isShownAt"
 
+# SDC pre-compute inputs. subjects.json is the DPLA-subject → Wikidata-Q-ID
+# map used to populate P921 alongside the string-form P4272. rights.json is
+# the small SDC-specific copyright mapping vendored in this repo.
+SUBJECTS_URL = (
+    "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
+    "src/main/resources/subjects.json"
+)
+SDC_FILENAME = "sdc.json"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # isShownAt URL patterns from which a IIIF manifest can be formulaically
 # derived, expressed as ES wildcard values.  Extend this list as new DAMs
 # with predictable IIIF paths are identified.
@@ -60,10 +87,38 @@ IIIF_DERIVABLE_ISSHOWNAT_PATTERNS = [
 ]
 
 
-def load_eligible_dp_names(partner: str) -> list[str]:
+def fetch_institutions_v2() -> dict:
+    """Fetch the full institutions_v2.json document used for hub/institution
+    eligibility and (in the SDC pre-compute pass) Wikidata-ID resolution."""
+    resp = requests.get(INSTITUTIONS_URL, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_subjects_json() -> dict:
+    """Fetch the DPLA-subject → Wikidata-ID map used to populate P921.
+
+    Sourced from dpla/ingestion3 alongside institutions_v2.json; fetched
+    fresh per run so upstream changes land in the next sync without a
+    redeploy.
     """
-    Fetch institutions_v2.json from GitHub and return the list of
-    dataProvider name strings that are eligible for upload for the given hub.
+    resp = requests.get(SUBJECTS_URL, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def load_rights_json() -> dict:
+    """Load rights.json from the repo root and normalize its keys for
+    scheme-and-slash-insensitive lookup."""
+    with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
+        raw = json.load(f)
+    return {normalize_rights_uri(k): v for k, v in raw.items()}
+
+
+def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
+    """
+    Return the list of dataProvider name strings eligible for upload for the
+    given hub, given an already-loaded institutions_v2.json document.
 
     An institution is eligible when:
       - the hub has a non-empty Wikidata ID (required for hub Commons category), AND
@@ -75,9 +130,6 @@ def load_eligible_dp_names(partner: str) -> list[str]:
     variants mapping to the same Wikidata ID can carry independent upload flags.
     """
     hub_name = PARTNER_HUBS[partner]
-    resp = requests.get(INSTITUTIONS_URL, timeout=15)
-    resp.raise_for_status()
-    institutions = resp.json()
 
     hub = institutions.get(hub_name)
     if not hub:
@@ -94,6 +146,20 @@ def load_eligible_dp_names(partner: str) -> list[str]:
             eligible.append(inst_name)
 
     return eligible
+
+
+def stage_sdc_to_s3(
+    s3_client: S3Client, partner: str, dpla_id: str, sdc_payload: dict
+) -> None:
+    """Write the per-item sdc.json sidecar to the partner's item prefix.
+
+    Raises on failure so the caller's ThreadPoolExecutor can observe it
+    via future.exception() in the done callback (same pattern as
+    stage_item_to_s3).
+    """
+    s3_client.write_item_file(
+        partner, dpla_id, json.dumps(sdc_payload), SDC_FILENAME, APPLICATION_JSON
+    )
 
 
 def build_query(
@@ -178,7 +244,10 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
     notify_phase_start(partner, "id-generation")
     provider_name = PARTNER_HUBS[partner]
 
-    eligible_dp_names = load_eligible_dp_names(partner)
+    # Load institutions_v2.json once and reuse it for both eligibility
+    # filtering and the SDC pre-compute pass.
+    institutions = fetch_institutions_v2()
+    eligible_dp_names = load_eligible_dp_names(institutions, partner)
     if not eligible_dp_names:
         print(
             f"No eligible institutions found for {partner} in institutions_v2.json",
@@ -195,11 +264,31 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
             sys.exit(1)
         eligible_dp_names = [institution]
 
+    # SDC pre-compute inputs.
+    rights = load_rights_json()
+    subject_ids = fetch_subjects_json()
+    retrieval_date = datetime.date.today()
+
     banlist = Banlist()
     s3_client = S3Client()
     search_after = None
 
     s3_sem, failed, _on_s3_done = make_s3_stage_context(S3_WRITE_WORKERS)
+
+    # Phase 1 — paginate ES, stage dpla-map.json, remember each item's DPLA
+    # ID for the SDC pass below, and collect NARA exactMatch subject queries
+    # for batched Wikidata reconciliation.
+    #
+    # We deliberately do NOT buffer the full ES `_source` document in memory:
+    # for a hub with 100K items that would be ~1 GB resident. Phase 3 re-reads
+    # each dpla-map.json from S3 instead — cheap and bounded by S3 throughput,
+    # not by hub size in RAM.
+    #
+    # subject_queries is a set because the reconci.link call itself dedupes
+    # internally but pre-deduping bounds phase-1 memory by unique subjects
+    # rather than total occurrences across the hub.
+    dpla_ids: list[str] = []
+    subject_queries: set[tuple[str, str]] = set()
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         while True:
@@ -242,12 +331,90 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
                 )
                 future.add_done_callback(_on_s3_done(dpla_id))
 
+                dpla_ids.append(dpla_id)
+                subject_queries.update(collect_subject_queries(source))
+
                 print(dpla_id)
 
             search_after = hits[-1]["sort"]
 
     if failed[0]:
-        print(f"Error: {failed[0]} S3 writes failed", file=sys.stderr)
+        print(f"Error: {failed[0]} dpla-map.json writes failed", file=sys.stderr)
+        raise SystemExit(1)
+
+    # Phase 2 — batched Wikidata reconciliation for NARA exactMatch subjects.
+    # Best-effort: chunks that fail are logged and skipped (their items' P921
+    # entries are simply omitted; the string-form P4272 still lands).
+    print(
+        f"Reconciling {len(subject_queries)} unique subject queries...",
+        file=sys.stderr,
+    )
+    subjects_lookup = reconcile_subjects(subject_queries)
+    print(
+        f"Resolved {len(subjects_lookup)} subjects to Wikidata IDs.",
+        file=sys.stderr,
+    )
+
+    # Phase 3 — build per-item sdc.json (ready-to-POST claim list) and stage
+    # to S3 alongside dpla-map.json. Each item's source doc is re-read from
+    # the dpla-map.json we just staged in phase 1 (rather than buffered in
+    # memory) so peak memory stays O(unique-subjects) rather than scaling
+    # with hub size. Items the SDC builder can't parse (e.g. provider /
+    # institution missing from institutions_v2.json) are skipped silently;
+    # their dpla-map.json is still in place for downloader/uploader and a
+    # future re-run will pick them up.
+    sdc_sem, sdc_failed, _on_sdc_done = make_s3_stage_context(S3_WRITE_WORKERS)
+    sdc_skipped = 0
+
+    with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
+        for dpla_id in dpla_ids:
+            raw = s3_client.get_item_metadata(partner, dpla_id)
+            if raw is None:
+                # Phase 1 already exited on any S3 write failure, so a miss
+                # here is unexpected — log and continue rather than abort.
+                logging.warning(
+                    "dpla-map.json missing for %s in phase 3; skipping sdc.json",
+                    dpla_id,
+                )
+                sdc_skipped += 1
+                continue
+            try:
+                source = json.loads(raw)
+            except json.JSONDecodeError as e:
+                logging.warning(
+                    "dpla-map.json for %s failed to parse in phase 3 (%s); "
+                    "skipping sdc.json",
+                    dpla_id,
+                    e,
+                )
+                sdc_skipped += 1
+                continue
+            sdc_payload = build_claims_for_doc(
+                source,
+                dpla_id,
+                institutions,
+                rights,
+                subject_ids,
+                subjects_lookup,
+                retrieval_date,
+            )
+            if sdc_payload is None:
+                sdc_skipped += 1
+                continue
+            sdc_sem.acquire()
+            future = executor.submit(
+                stage_sdc_to_s3, s3_client, partner, dpla_id, sdc_payload
+            )
+            future.add_done_callback(_on_sdc_done(dpla_id))
+
+    if sdc_skipped:
+        print(
+            f"Skipped sdc.json for {sdc_skipped} items "
+            "(unparseable provider/institution).",
+            file=sys.stderr,
+        )
+    if sdc_failed[0]:
+        print(f"Error: {sdc_failed[0]} sdc.json writes failed", file=sys.stderr)
         raise SystemExit(1)
 
 

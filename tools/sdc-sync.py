@@ -107,7 +107,7 @@ hubs = requests.get(
 with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
     rights = {_normalize_rights_uri(k): v for k, v in json.load(f).items()}
 subject_ids = requests.get(
-    "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/src/main/resources/subjects.json",
+    "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/subjects.json",
     timeout=30,
 ).json()
 
