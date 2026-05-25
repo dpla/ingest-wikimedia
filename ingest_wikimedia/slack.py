@@ -282,8 +282,19 @@ _COUNTS_FAILED_RE = re.compile(r"^FAILED:\s*(\d+)\s*$", re.MULTILINE)
 def _read_download_failed_count(log_path: str | None) -> int | None:
     """Read the FAILED count from a downloader log's terminal COUNTS section.
 
-    Returns the int FAILED count, or None if the path is unset, the file
-    can't be read, or the COUNTS section doesn't include a FAILED line.
+    Returns:
+      * the int FAILED count when the COUNTS section names FAILED explicitly
+      * 0 when the COUNTS section exists but omits FAILED — a clean run.
+        `Tracker.__str__` only emits counter lines whose value is > 0, so
+        zero-failure downloads legitimately have no FAILED line at all.
+        Treating that as the unambiguous 0 it is (rather than as a parse
+        failure) keeps clean retries titled "Retry Complete" instead of
+        misleadingly falling back to "Upload Complete".
+      * None when the path is unset, the file can't be read, or there is
+        no COUNTS section at all — the downloader bombed before printing
+        the terminal tracker dump, so we don't have a usable count to
+        combine.
+
     Used by `notify_upload_complete` to roll the download phase's failures
     into a single retry-session Slack summary (see the retry pipeline in
     scripts/wikimedia_retry.py).
@@ -296,13 +307,20 @@ def _read_download_failed_count(log_path: str | None) -> int | None:
     except OSError as e:
         logging.warning(f"Could not read retry download log {log_path}: {e}")
         return None
-    match = _COUNTS_FAILED_RE.search(content)
-    if not match:
+    # Anchor the FAILED lookup to the COUNTS section so we don't accidentally
+    # pick up a stray "FAILED:" earlier in the log (e.g. an [ERROR] line).
+    # rfind because the tracker dump is the last thing the downloader writes.
+    counts_idx = content.rfind("COUNTS:")
+    if counts_idx < 0:
         logging.warning(
-            f"No FAILED count found in retry download log {log_path}; "
+            f"No COUNTS section found in retry download log {log_path}; "
             f"download-phase failures will not be reflected in the Slack summary"
         )
         return None
+    counts_block = content[counts_idx:]
+    match = _COUNTS_FAILED_RE.search(counts_block)
+    if not match:
+        return 0
     return int(match.group(1))
 
 

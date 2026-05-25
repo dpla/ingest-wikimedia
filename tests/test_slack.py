@@ -202,10 +202,54 @@ def test_read_download_failed_count_missing_file_returns_none(tmp_path):
 
 
 def test_read_download_failed_count_no_counts_section_returns_none(tmp_path):
-    """Log file without a COUNTS section → None (downloader bombed early)."""
+    """Log file without a COUNTS section → None (downloader bombed early).
+
+    No usable counts to combine; the upper layer falls back to the
+    upload-only header and logs a warning so the missing data is visible.
+    """
     log = tmp_path / "partial.log"
     log.write_text("[INFO] 20:15:58: Starting download for si\n")
     assert _read_download_failed_count(str(log)) is None
+
+
+def test_read_download_failed_count_counts_without_failed_returns_zero(tmp_path):
+    """COUNTS section present but no FAILED line → returns 0 (clean run).
+
+    Tracker.__str__ only emits counter lines whose value > 0, so a clean
+    download (no failures) writes a COUNTS section with no FAILED line at
+    all. Returning 0 here (rather than None) is what keeps the retry
+    summary titled "Retry Complete" instead of falling back to
+    "Upload Complete" on a clean run.
+    """
+    log = tmp_path / "20260524-220233-retry-si-download.log"
+    log.write_text(
+        "[INFO] 22:02:33: Starting download for si\n"
+        "[INFO] 22:02:36: \n"
+        "COUNTS:\n"
+        "DOWNLOADED: 50\n"
+        "SKIPPED: 30\n"
+        "BYTES: 5000\n"
+        "\n"
+        "[INFO] 22:02:36: 3.0 seconds.\n"
+    )
+    assert _read_download_failed_count(str(log)) == 0
+
+
+def test_read_download_failed_count_ignores_failed_outside_counts_section(tmp_path):
+    """A stray "FAILED:" earlier in the log (e.g. inside an [ERROR] line)
+    must NOT be picked up as the tracker's FAILED count. The COUNTS dump
+    is the last thing the downloader writes; anchor the lookup there."""
+    log = tmp_path / "noisy.log"
+    log.write_text(
+        "[INFO] 22:02:33: Starting download for si\n"
+        "[ERROR] 22:02:34: HTTPError 500; FAILED: 999 retries exhausted\n"
+        "[INFO] 22:02:36: \n"
+        "COUNTS:\n"
+        "DOWNLOADED: 50\n"
+        "SKIPPED: 30\n"
+    )
+    # Only the COUNTS section's FAILED line counts. Absent → 0.
+    assert _read_download_failed_count(str(log)) == 0
 
 
 def _capture_completion_message(env: dict, tracker_counts: dict) -> dict:
@@ -290,5 +334,36 @@ def test_notify_upload_complete_with_retry_env_but_no_log_file(tmp_path):
     )
     # Falls back gracefully — upload-only header, FAILED unchanged.
     assert "Wikimedia Upload Complete" in captured["header"]
+    failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
+    assert failed_lines == ["FAILED:   0"]
+
+
+def test_notify_upload_complete_clean_retry_still_titled_retry_complete(tmp_path):
+    """A retry session with ZERO failures must still be titled
+    "Retry Complete" — not fall back to "Upload Complete" just because
+    the download log's COUNTS section omitted the FAILED line.
+
+    Tracker.__str__ only emits counter lines whose value > 0, so clean
+    download runs legitimately have no FAILED line in their COUNTS
+    section. `_read_download_failed_count` returns 0 (not None) in that
+    case so the retry-aware code path still fires."""
+    download_log = tmp_path / "20260524-220233-retry-si-download.log"
+    download_log.write_text(
+        "[INFO] 22:02:33: Starting download for si\n"
+        "COUNTS:\n"
+        "DOWNLOADED: 80\n"
+        "SKIPPED: 0\n"
+        "BYTES: 8000\n"
+    )
+    captured = _capture_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "retry-si",
+            "WIKIMEDIA_RETRY_DOWNLOAD_LOG": str(download_log),
+        },
+        tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
+    )
+    assert "Wikimedia Retry Complete" in captured["header"]
+    assert "Upload Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
     assert failed_lines == ["FAILED:   0"]
