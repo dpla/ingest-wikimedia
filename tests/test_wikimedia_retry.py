@@ -188,6 +188,42 @@ def test_retry_passes_max_age_days_one_to_downloader():
     )
 
 
+def test_retry_pipeline_exports_download_log_for_combined_summary():
+    """The pipeline must export `WIKIMEDIA_RETRY_DOWNLOAD_LOG` after the
+    downloader runs and before the uploader runs, so notify_upload_complete
+    can fold the download-phase FAILED count into the final Slack summary.
+
+    Without this, a retry session that produces download failures (the
+    common case for the persistent-source-error class of bug) would post
+    a "Wikimedia Upload Complete: …" message with FAILED: 0 — silently
+    hiding the failures from the user, even though the download log
+    correctly recorded them.
+    """
+    commands = _run_main_and_capture_full_pipeline(
+        ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
+    )
+    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+
+    export_idx = pipeline_cmd.find("export WIKIMEDIA_RETRY_DOWNLOAD_LOG=")
+    downloader_idx = pipeline_cmd.find("downloader --max-age-days 1")
+    uploader_idx = pipeline_cmd.find("uploader ")
+
+    assert export_idx >= 0, (
+        f"pipeline must export WIKIMEDIA_RETRY_DOWNLOAD_LOG; got: {pipeline_cmd!r}"
+    )
+    assert downloader_idx < export_idx < uploader_idx, (
+        f"export must come after the downloader and before the uploader so "
+        f"the log it references actually exists by the time the uploader "
+        f"reads it; positions were downloader={downloader_idx}, "
+        f"export={export_idx}, uploader={uploader_idx}"
+    )
+    # The captured path must include `$PWD/` so notify_upload_complete gets
+    # an absolute path regardless of any cwd change inside the uploader.
+    assert "$PWD/" in pipeline_cmd, (
+        f"WIKIMEDIA_RETRY_DOWNLOAD_LOG must be an absolute path; got: {pipeline_cmd!r}"
+    )
+
+
 def test_retry_clears_stale_csvs_even_when_no_partner_given():
     """When the user runs `/wikimedia-upload retry 30` (no partner), the
     scan still needs to clear stale CSVs so that hubs which legitimately

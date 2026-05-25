@@ -289,6 +289,22 @@ def main() -> None:
             steps.append(
                 f"downloader --max-age-days 1 {shlex.quote(download_csv)} {slug}"
             )
+            # Roll the download phase's FAILED count into the upload phase's
+            # final Slack summary. After the downloader finishes, capture the
+            # most-recent log it just wrote (matches the
+            # `{timestamp}-{session_label}-download.log` naming convention
+            # produced by ingest_wikimedia.logs.setup_logging) and pass its
+            # absolute path to the uploader via WIKIMEDIA_RETRY_DOWNLOAD_LOG.
+            # notify_upload_complete reads that env var, parses the COUNTS
+            # FAILED line, and adds it to its own tracker's FAILED so the
+            # user sees one combined Retry Complete summary instead of an
+            # Upload Complete summary that misleadingly reports 0 failures
+            # when downloads bombed.
+            steps.append(
+                "export WIKIMEDIA_RETRY_DOWNLOAD_LOG="
+                '"$PWD/$(ls -t logs/*-${WIKIMEDIA_SESSION_LABEL}-download.log '
+                '2>/dev/null | head -1)"'
+            )
             steps.append(f"uploader {shlex.quote(download_csv)} {slug}")
         if upload_csv:
             steps.append(f"uploader {shlex.quote(upload_csv)} {slug}")

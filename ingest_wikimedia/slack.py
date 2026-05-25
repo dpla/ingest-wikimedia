@@ -276,6 +276,54 @@ def notify_download_complete(
     )
 
 
+_COUNTS_FAILED_RE = re.compile(r"^FAILED:\s*(\d+)\s*$", re.MULTILINE)
+
+
+def _read_download_failed_count(log_path: str | None) -> int | None:
+    """Read the FAILED count from a downloader log's terminal COUNTS section.
+
+    Returns:
+      * the int FAILED count when the COUNTS section names FAILED explicitly
+      * 0 when the COUNTS section exists but omits FAILED — a clean run.
+        `Tracker.__str__` only emits counter lines whose value is > 0, so
+        zero-failure downloads legitimately have no FAILED line at all.
+        Treating that as the unambiguous 0 it is (rather than as a parse
+        failure) keeps clean retries titled "Retry Complete" instead of
+        misleadingly falling back to "Upload Complete".
+      * None when the path is unset, the file can't be read, or there is
+        no COUNTS section at all — the downloader bombed before printing
+        the terminal tracker dump, so we don't have a usable count to
+        combine.
+
+    Used by `notify_upload_complete` to roll the download phase's failures
+    into a single retry-session Slack summary (see the retry pipeline in
+    scripts/wikimedia_retry.py).
+    """
+    if not log_path:
+        return None
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        logging.warning(f"Could not read retry download log {log_path}: {e}")
+        return None
+    # Anchor the FAILED lookup to the COUNTS section so we don't accidentally
+    # pick up a stray "FAILED:" earlier in the log (e.g. an [ERROR] line).
+    # rfind because the tracker dump is the last thing the downloader writes.
+    counts_idx = content.rfind("COUNTS:")
+    if counts_idx < 0:
+        logging.warning(
+            f"No COUNTS section found in retry download log {log_path}; "
+            f"download-phase failures will not be reflected in the Slack summary"
+        )
+        return None
+    counts_block = content[counts_idx:]
+    match = _COUNTS_FAILED_RE.search(counts_block)
+    if not match:
+        return 0
+    return int(match.group(1))
+
+
 def notify_upload_complete(
     tracker: Tracker,
     partner_label: str,
@@ -293,14 +341,35 @@ def notify_upload_complete(
     runtime = _format_runtime(elapsed_seconds)
     dry_run_note = " _(dry run)_" if dry_run else ""
 
+    # In a retry session the user cares about whether *anything* failed in
+    # the whole download+upload round-trip — not which phase produced the
+    # failure. When the retry tmux pipeline points us at the prior phase's
+    # download log via `WIKIMEDIA_RETRY_DOWNLOAD_LOG`, fold that phase's
+    # FAILED count into this summary and re-title the message as a retry
+    # complete so the user gets a single combined notification instead of
+    # the misleading "Upload Complete: 0 failed" when downloads bombed.
+    #
+    # SKIPPED/UPLOADED/BYTES are not combined: each phase has its own
+    # semantics for "skipped" (download = "already in S3"; upload =
+    # "already on Commons") and conflating them would only obscure the
+    # picture. FAILED, by contrast, is universally a failure regardless of
+    # where it happened.
+    download_log = os.environ.get("WIKIMEDIA_RETRY_DOWNLOAD_LOG") or None
+    download_failed = _read_download_failed_count(download_log)
+    is_retry_summary = download_failed is not None
+    total_failed = tracker.count(Result.FAILED) + (download_failed or 0)
+
+    header_phrase = "Retry Complete" if is_retry_summary else "Upload Complete"
+    plain_phrase = "retry complete" if is_retry_summary else "upload complete"
+
     _post_completion_notice(
         token=token,
-        header=f"*Wikimedia Upload Complete: {effective_label}*{dry_run_note}",
-        plain_text=f"Wikimedia upload complete: {effective_label}",
+        header=f"*Wikimedia {header_phrase}: {effective_label}*{dry_run_note}",
+        plain_text=f"Wikimedia {plain_phrase}: {effective_label}",
         stats_lines=[
             f"UPLOADED: {tracker.count(Result.UPLOADED):,}",
             f"SKIPPED:  {tracker.count(Result.SKIPPED):,}",
-            f"FAILED:   {tracker.count(Result.FAILED):,}",
+            f"FAILED:   {total_failed:,}",
             f"BYTES:    {_format_bytes(tracker.count(Result.BYTES))}",
             f"Runtime:  {runtime}",
         ],
