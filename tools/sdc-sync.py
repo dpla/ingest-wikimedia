@@ -1,5 +1,6 @@
 # TODO caption, date, page, iiif manifest, url
 
+import copy
 import pywikibot
 import requests
 import re
@@ -1838,7 +1839,13 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
 
     sdc_claims = sdc_payload.get("claims", [])
     first_check = True
-    for claim in sdc_claims:
+    for source_claim in sdc_claims:
+        # Deepcopy before any mutation — `add_ref` stamps `claim["id"]` on
+        # the object it's given, and we also append it to `claims["claims"]`
+        # for the wbeditentity POST. The same `sdc_payload` is reused across
+        # every ordinal of a multi-page item, so without this copy ordinal N
+        # would inherit ordinal N-1's per-mediaid claim IDs and references.
+        claim = copy.deepcopy(source_claim)
         prop = claim["mainsnak"]["property"]
         kind = _check_kind_for_claim(claim)
         comparable = _extract_comparable_value(claim)
