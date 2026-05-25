@@ -258,14 +258,28 @@ def main() -> None:
             if idx == last_idx
             else "unset WIKIMEDIA_TARGET_IS_LAST"
         )
+        download_csv = type_csvs.get("download")
+        upload_csv = type_csvs.get("upload")
+        # WIKIMEDIA_RETRY_HAS_DOWNLOAD gates the combined-summary log
+        # discovery in notify_upload_complete. Retry session labels are
+        # reused across runs, so an upload-only retry would otherwise
+        # find a stale *-retry-<slug>-download.log from a prior session
+        # and inflate FAILED with already-shipped counts. Set the flag
+        # only when this target actually runs the download phase; unset
+        # it otherwise so the env doesn't leak across targets in the
+        # same tmux session.
+        has_download_env = (
+            "export WIKIMEDIA_RETRY_HAS_DOWNLOAD=1"
+            if download_csv
+            else "unset WIKIMEDIA_RETRY_HAS_DOWNLOAD"
+        )
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
             f"export WIKIMEDIA_PARTNER_DIR={base}; "
             f"{is_last_env}; "
+            f"{has_download_env}; "
             "unset WIKIMEDIA_SINGLE_ITEM"
         )
-        download_csv = type_csvs.get("download")
-        upload_csv = type_csvs.get("upload")
         steps = [f"cd {base}"]
         if download_csv:
             # `--max-age-days 1` forces the downloader to actually re-attempt
@@ -289,22 +303,12 @@ def main() -> None:
             steps.append(
                 f"downloader --max-age-days 1 {shlex.quote(download_csv)} {slug}"
             )
-            # Roll the download phase's FAILED count into the upload phase's
-            # final Slack summary. After the downloader finishes, capture the
-            # most-recent log it just wrote (matches the
-            # `{timestamp}-{session_label}-download.log` naming convention
-            # produced by ingest_wikimedia.logs.setup_logging) and pass its
-            # absolute path to the uploader via WIKIMEDIA_RETRY_DOWNLOAD_LOG.
-            # notify_upload_complete reads that env var, parses the COUNTS
-            # FAILED line, and adds it to its own tracker's FAILED so the
-            # user sees one combined Retry Complete summary instead of an
-            # Upload Complete summary that misleadingly reports 0 failures
-            # when downloads bombed.
-            steps.append(
-                "export WIKIMEDIA_RETRY_DOWNLOAD_LOG="
-                '"$PWD/$(ls -t logs/*-${WIKIMEDIA_SESSION_LABEL}-download.log '
-                '2>/dev/null | head -1)"'
-            )
+            # The uploader's notify_upload_complete folds the download
+            # phase's FAILED count into the final Slack summary by
+            # discovering this session's download log itself, via
+            # WIKIMEDIA_SESSION_LABEL + WIKIMEDIA_PARTNER_DIR (both
+            # exported with literal values by label_export above). See
+            # slack._find_retry_download_log.
             steps.append(f"uploader {shlex.quote(download_csv)} {slug}")
         if upload_csv:
             steps.append(f"uploader {shlex.quote(upload_csv)} {slug}")

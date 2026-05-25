@@ -62,16 +62,19 @@ def _decode_exit_code(rc_str: str | None) -> str:
     return f" (exit {rc}" + (f" — {hint})" if hint else ")")
 
 
-def _find_latest_log(partner_dir: str, label: str) -> str | None:
+def _find_latest_log(partner_dir: str, label: str, phase: str = "*") -> str | None:
     """Return the most recently modified log file matching this label, or None.
 
     Logs are named `{timestamp}-{label}-{phase}.log` under `<partner_dir>/logs/`.
+    Pass `phase` (e.g. "download", "upload") to restrict the match to a single
+    phase; the default matches any phase.
+
     Tolerates the rare race where a candidate disappears between glob and stat —
     raising OSError here would suppress the Slack failure notification entirely.
     """
     if not partner_dir or not os.path.isdir(partner_dir):
         return None
-    pattern = os.path.join(partner_dir, "logs", f"*-{label}-*.log")
+    pattern = os.path.join(partner_dir, "logs", f"*-{label}-{phase}.log")
     newest: tuple[float, str] | None = None
     for path in glob.glob(pattern):
         try:
@@ -324,6 +327,27 @@ def _read_download_failed_count(log_path: str | None) -> int | None:
     return int(match.group(1))
 
 
+def _find_retry_download_log() -> str | None:
+    """Locate this retry session's download log, if any.
+
+    Only fires for retry sessions (label prefixed `retry-`) that actually
+    ran a download phase this run (WIKIMEDIA_RETRY_HAS_DOWNLOAD=1, set by
+    the retry pipeline iff a download CSV is present for the target).
+
+    The HAS_DOWNLOAD gate is important: retry session labels are reused
+    across runs, so without it an upload-only retry would happily pick
+    up a stale `*-retry-<slug>-download.log` from a prior run and inflate
+    FAILED with counts that already shipped in an earlier message.
+    """
+    label = (os.environ.get("WIKIMEDIA_SESSION_LABEL") or "").strip()
+    partner_dir = (os.environ.get("WIKIMEDIA_PARTNER_DIR") or "").strip()
+    if not label.startswith("retry-"):
+        return None
+    if os.environ.get("WIKIMEDIA_RETRY_HAS_DOWNLOAD") != "1":
+        return None
+    return _find_latest_log(partner_dir, label, phase="download")
+
+
 def notify_upload_complete(
     tracker: Tracker,
     partner_label: str,
@@ -343,18 +367,15 @@ def notify_upload_complete(
 
     # In a retry session the user cares about whether *anything* failed in
     # the whole download+upload round-trip — not which phase produced the
-    # failure. When the retry tmux pipeline points us at the prior phase's
-    # download log via `WIKIMEDIA_RETRY_DOWNLOAD_LOG`, fold that phase's
-    # FAILED count into this summary and re-title the message as a retry
-    # complete so the user gets a single combined notification instead of
-    # the misleading "Upload Complete: 0 failed" when downloads bombed.
+    # failure. Fold the download phase's FAILED count into this summary so
+    # the user sees one combined notification instead of the misleading
+    # "Upload Complete: 0 failed" when downloads bombed.
     #
-    # SKIPPED/UPLOADED/BYTES are not combined: each phase has its own
-    # semantics for "skipped" (download = "already in S3"; upload =
-    # "already on Commons") and conflating them would only obscure the
-    # picture. FAILED, by contrast, is universally a failure regardless of
-    # where it happened.
-    download_log = os.environ.get("WIKIMEDIA_RETRY_DOWNLOAD_LOG") or None
+    # SKIPPED/UPLOADED/BYTES are not combined: each phase's "skipped" means
+    # a different thing (download = "already in S3"; upload = "already on
+    # Commons") and conflating them would obscure the picture. FAILED, by
+    # contrast, is universally a failure regardless of where it happened.
+    download_log = _find_retry_download_log()
     download_failed = _read_download_failed_count(download_log)
     is_retry_summary = download_failed is not None
     total_failed = tracker.count(Result.FAILED) + (download_failed or 0)
