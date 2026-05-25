@@ -276,9 +276,11 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
     # Phase 1 — paginate ES, stage dpla-map.json, buffer items for the SDC
     # pass below, and collect NARA exactMatch subject queries for batched
-    # Wikidata reconciliation.
+    # Wikidata reconciliation. The reconci call itself de-duplicates, but
+    # collecting into a set keeps phase-1 memory bounded by unique subjects
+    # rather than total subject occurrences across the hub.
     items_buffer: list[tuple[str, dict]] = []
-    subject_queries: list[tuple[str, str]] = []
+    subject_queries: set[tuple[str, str]] = set()
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         while True:
@@ -322,7 +324,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
                 future.add_done_callback(_on_s3_done(dpla_id))
 
                 items_buffer.append((dpla_id, source))
-                subject_queries.extend(collect_subject_queries(source))
+                subject_queries.update(collect_subject_queries(source))
 
                 print(dpla_id)
 
@@ -336,8 +338,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
     # Best-effort: chunks that fail are logged and skipped (their items' P921
     # entries are simply omitted; the string-form P4272 still lands).
     print(
-        f"Reconciling {len(subject_queries)} subject queries "
-        f"(deduplicated internally)...",
+        f"Reconciling {len(subject_queries)} unique subject queries...",
         file=sys.stderr,
     )
     subjects_lookup = reconcile_subjects(subject_queries)

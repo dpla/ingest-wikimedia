@@ -350,8 +350,11 @@ def _resolve_subjects(
                 if not any(name in pair for pair in subjects):
                     subjects.append((str(name or ""), ""))
                     added = True
-            continue
-        if subject.get("exactMatch"):
+            # Fall through to the `if not added` fallback below so a
+            # subject_ids entry with an empty "id" list still yields a
+            # string-form P4272 statement — matches sdc-sync's existing
+            # behavior before this code moved into a shared module.
+        elif subject.get("exactMatch"):
             exact_match = subject["exactMatch"]
             first = exact_match[0] if isinstance(exact_match, list) else exact_match
             naid = ""
@@ -563,12 +566,19 @@ def _build_contributed_claims(
         claim["qualifiers"]["P3831"] = [_qualifier_item_snak("P3831", role_qid)]
         return claim
 
+    # The role qualifiers below intentionally MATCH what sdc-sync.add_contributed
+    # has been writing to Commons. Smithsonian's path distinguishes
+    # aggregator/contributing-institution; the non-Smithsonian path uses
+    # publisher/aggregator for hub/institution respectively. Changing these
+    # values without a coordinated Commons-side rewrite would make every
+    # existing P9126 statement look "unexpected" to dpla_claims() and trigger
+    # a remove+re-add on every re-sync.
     out.append(_with_role(Q_DPLA, Q_PUBLISHER))
     if hub == Q_SMITHSONIAN:
         out.append(_with_role(Q_SMITHSONIAN, Q_AGGREGATOR))
         out.append(_with_role(institution, Q_CONTRIBUTING_INSTITUTION))
     else:
-        out.append(_with_role(hub, Q_AGGREGATOR))
+        out.append(_with_role(hub, Q_PUBLISHER))
         out.append(_with_role(institution, Q_AGGREGATOR))
     return out
 
