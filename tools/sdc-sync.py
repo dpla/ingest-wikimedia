@@ -1071,9 +1071,23 @@ def _post_new_refs(mediaid, dpla_id):
         "bot": True,
         "summary": f"Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
     }
-    save = http.fetch(
-        "https://commons.wikimedia.org/w/api.php", method="POST", data=postrefs
-    )
+    try:
+        save = http.fetch(
+            "https://commons.wikimedia.org/w/api.php", method="POST", data=postrefs
+        )
+    except (requests.exceptions.ConnectionError, ConnectionError):
+        try:
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postrefs,
+            )
+        except (requests.exceptions.ConnectionError, ConnectionError):
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postrefs,
+            )
     try:
         post = json.loads(save.text)
         if post["success"] == 1:
