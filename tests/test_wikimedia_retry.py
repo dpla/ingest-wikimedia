@@ -188,40 +188,38 @@ def test_retry_passes_max_age_days_one_to_downloader():
     )
 
 
-def test_retry_pipeline_exports_download_log_for_combined_summary():
-    """The pipeline must export `WIKIMEDIA_RETRY_DOWNLOAD_LOG` after the
-    downloader runs and before the uploader runs, so notify_upload_complete
-    can fold the download-phase FAILED count into the final Slack summary.
+def test_retry_pipeline_does_not_export_download_log_via_pwd_subshell():
+    """Regression guard: the pipeline must NOT try to capture the download
+    log via `export WIKIMEDIA_RETRY_DOWNLOAD_LOG="$PWD/$(ls -t ...)"`.
 
-    Without this, a retry session that produces download failures (the
-    common case for the persistent-source-error class of bug) would post
-    a "Wikimedia Upload Complete: …" message with FAILED: 0 — silently
-    hiding the failures from the user, even though the download log
-    correctly recorded them.
+    That form was the original implementation of the combined-summary
+    feature and it looked correct — but the outer bash that constructs
+    the tmux session argument eagerly expanded `$PWD` (the SSM agent's
+    cwd, typically `/usr/bin/`) before the inner shell ever ran
+    `cd {partner_dir}`. The exported value was `/usr/bin/` on every
+    real run, and notify_upload_complete dutifully tried to read it as a
+    log file, failed, and silently degraded to upload-only "0 failed"
+    summaries even when downloads had bombed.
+
+    The replacement design: notify_upload_complete discovers its own
+    download log from WIKIMEDIA_SESSION_LABEL + WIKIMEDIA_PARTNER_DIR
+    (both exported as literal shlex.quote-d values that survive the
+    outer-bash parse intact). See slack._find_retry_download_log.
     """
     commands = _run_main_and_capture_full_pipeline(
         ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
     )
     pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
 
-    export_idx = pipeline_cmd.find("export WIKIMEDIA_RETRY_DOWNLOAD_LOG=")
-    downloader_idx = pipeline_cmd.find("downloader --max-age-days 1")
-    uploader_idx = pipeline_cmd.find("uploader ")
-
-    assert export_idx >= 0, (
-        f"pipeline must export WIKIMEDIA_RETRY_DOWNLOAD_LOG; got: {pipeline_cmd!r}"
+    assert "WIKIMEDIA_RETRY_DOWNLOAD_LOG" not in pipeline_cmd, (
+        "pipeline must not export WIKIMEDIA_RETRY_DOWNLOAD_LOG — the "
+        "$PWD-based form is a known footgun (outer-bash expansion timing). "
+        f"got: {pipeline_cmd!r}"
     )
-    assert downloader_idx < export_idx < uploader_idx, (
-        f"export must come after the downloader and before the uploader so "
-        f"the log it references actually exists by the time the uploader "
-        f"reads it; positions were downloader={downloader_idx}, "
-        f"export={export_idx}, uploader={uploader_idx}"
-    )
-    # The captured path must include `$PWD/` so notify_upload_complete gets
-    # an absolute path regardless of any cwd change inside the uploader.
-    assert "$PWD/" in pipeline_cmd, (
-        f"WIKIMEDIA_RETRY_DOWNLOAD_LOG must be an absolute path; got: {pipeline_cmd!r}"
-    )
+    # The label + partner-dir exports that the new discovery flow depends
+    # on must still be present and must precede the uploader.
+    assert "export WIKIMEDIA_SESSION_LABEL=" in pipeline_cmd
+    assert "export WIKIMEDIA_PARTNER_DIR=" in pipeline_cmd
 
 
 def test_retry_clears_stale_csvs_even_when_no_partner_given():

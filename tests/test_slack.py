@@ -274,14 +274,29 @@ def _capture_completion_message(env: dict, tracker_counts: dict) -> dict:
     return captured
 
 
-def test_notify_upload_complete_no_retry_env_keeps_upload_only_header(tmp_path):
-    """Without WIKIMEDIA_RETRY_DOWNLOAD_LOG set, the existing
-    "Wikimedia Upload Complete" header is preserved and FAILED is the
-    uploader tracker's count alone."""
+def _write_retry_download_log(partner_dir, label: str, body: str):
+    """Write a download log into `{partner_dir}/logs/` with the filename
+    pattern produced by ingest_wikimedia.logs.setup_logging — that's what
+    `_find_retry_download_log` globs for."""
+    logs_dir = partner_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log = logs_dir / f"20260524-220233-{label}-download.log"
+    log.write_text(body)
+    return log
+
+
+def test_notify_upload_complete_non_retry_label_keeps_upload_only_header(tmp_path):
+    """A non-retry session label (no `retry-` prefix) keeps the existing
+    "Wikimedia Upload Complete" header and FAILED is the uploader
+    tracker's count alone, even if a download log happens to be present
+    in the partner dir — non-retry runs have their own download Slack
+    message and must not be combined."""
+    _write_retry_download_log(tmp_path, "si", "[INFO] foo\nCOUNTS:\nFAILED: 999\n")
     captured = _capture_completion_message(
         env={
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "si",
+            "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
         },
         tracker_counts={Result.UPLOADED: 5, Result.SKIPPED: 10, Result.FAILED: 2},
     )
@@ -291,18 +306,20 @@ def test_notify_upload_complete_no_retry_env_keeps_upload_only_header(tmp_path):
     assert failed_lines == ["FAILED:   2"]
 
 
-def test_notify_upload_complete_with_retry_env_combines_failed_count(tmp_path):
-    """With WIKIMEDIA_RETRY_DOWNLOAD_LOG pointing at a download log that
-    recorded 1 failure, FAILED in the Slack summary is the *sum* of the
-    upload tracker's failures and the download log's failures, and the
-    header is re-titled to "Retry Complete"."""
-    download_log = tmp_path / "20260524-220233-retry-si-download.log"
-    download_log.write_text("[INFO] foo\nCOUNTS:\nFAILED: 1\nSKIPPED: 79\n")
+def test_notify_upload_complete_with_retry_label_combines_failed_count(tmp_path):
+    """With WIKIMEDIA_SESSION_LABEL=retry-* and a matching download log
+    in WIKIMEDIA_PARTNER_DIR/logs/ that recorded 1 failure, FAILED in
+    the Slack summary is the *sum* of the upload tracker's failures and
+    the download log's failures, and the header is re-titled to
+    "Retry Complete"."""
+    _write_retry_download_log(
+        tmp_path, "retry-si", "[INFO] foo\nCOUNTS:\nFAILED: 1\nSKIPPED: 79\n"
+    )
     captured = _capture_completion_message(
         env={
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "retry-si",
-            "WIKIMEDIA_RETRY_DOWNLOAD_LOG": str(download_log),
+            "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
         },
         # Upload tracker: 0 uploaded, 80 skipped (already on Commons), 0 failed.
         # The retry summary must surface the download-phase FAILED=1.
@@ -319,16 +336,16 @@ def test_notify_upload_complete_with_retry_env_combines_failed_count(tmp_path):
     assert skipped_lines == ["SKIPPED:  80"]
 
 
-def test_notify_upload_complete_with_retry_env_but_no_log_file(tmp_path):
-    """If WIKIMEDIA_RETRY_DOWNLOAD_LOG is set but the file is unreadable
-    (e.g. the `ls -t | head -1` substitution returned empty and got
-    concatenated with $PWD/ to yield a directory path), gracefully fall
-    back to the upload-only header rather than crashing the notification."""
+def test_notify_upload_complete_with_retry_label_but_no_log_file(tmp_path):
+    """If the retry label is set but no matching download log exists in
+    the partner dir's logs/, gracefully fall back to the upload-only
+    header rather than crashing the notification."""
+    (tmp_path / "logs").mkdir()  # empty logs dir, no matching file
     captured = _capture_completion_message(
         env={
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "retry-si",
-            "WIKIMEDIA_RETRY_DOWNLOAD_LOG": str(tmp_path),  # a directory, not a file
+            "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
         },
         tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
     )
@@ -347,19 +364,20 @@ def test_notify_upload_complete_clean_retry_still_titled_retry_complete(tmp_path
     download runs legitimately have no FAILED line in their COUNTS
     section. `_read_download_failed_count` returns 0 (not None) in that
     case so the retry-aware code path still fires."""
-    download_log = tmp_path / "20260524-220233-retry-si-download.log"
-    download_log.write_text(
+    _write_retry_download_log(
+        tmp_path,
+        "retry-si",
         "[INFO] 22:02:33: Starting download for si\n"
         "COUNTS:\n"
         "DOWNLOADED: 80\n"
         "SKIPPED: 0\n"
-        "BYTES: 8000\n"
+        "BYTES: 8000\n",
     )
     captured = _capture_completion_message(
         env={
             "DPLA_SLACK_BOT_TOKEN": "x",
             "WIKIMEDIA_SESSION_LABEL": "retry-si",
-            "WIKIMEDIA_RETRY_DOWNLOAD_LOG": str(download_log),
+            "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
         },
         tracker_counts={Result.UPLOADED: 0, Result.SKIPPED: 80, Result.FAILED: 0},
     )
