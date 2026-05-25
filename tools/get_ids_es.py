@@ -39,6 +39,7 @@ consumed by the downloader and uploader:
 
 import datetime
 import json
+import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -274,12 +275,19 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
     s3_sem, failed, _on_s3_done = make_s3_stage_context(S3_WRITE_WORKERS)
 
-    # Phase 1 — paginate ES, stage dpla-map.json, buffer items for the SDC
-    # pass below, and collect NARA exactMatch subject queries for batched
-    # Wikidata reconciliation. The reconci call itself de-duplicates, but
-    # collecting into a set keeps phase-1 memory bounded by unique subjects
-    # rather than total subject occurrences across the hub.
-    items_buffer: list[tuple[str, dict]] = []
+    # Phase 1 — paginate ES, stage dpla-map.json, remember each item's DPLA
+    # ID for the SDC pass below, and collect NARA exactMatch subject queries
+    # for batched Wikidata reconciliation.
+    #
+    # We deliberately do NOT buffer the full ES `_source` document in memory:
+    # for a hub with 100K items that would be ~1 GB resident. Phase 3 re-reads
+    # each dpla-map.json from S3 instead — cheap and bounded by S3 throughput,
+    # not by hub size in RAM.
+    #
+    # subject_queries is a set because the reconci.link call itself dedupes
+    # internally but pre-deduping bounds phase-1 memory by unique subjects
+    # rather than total occurrences across the hub.
+    dpla_ids: list[str] = []
     subject_queries: set[tuple[str, str]] = set()
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
@@ -323,7 +331,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
                 )
                 future.add_done_callback(_on_s3_done(dpla_id))
 
-                items_buffer.append((dpla_id, source))
+                dpla_ids.append(dpla_id)
                 subject_queries.update(collect_subject_queries(source))
 
                 print(dpla_id)
@@ -348,15 +356,39 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
     )
 
     # Phase 3 — build per-item sdc.json (ready-to-POST claim list) and stage
-    # to S3 alongside dpla-map.json. Items the SDC builder can't parse (e.g.
-    # provider/institution missing from institutions_v2.json) are skipped
-    # silently; their dpla-map.json is still in place for downloader/uploader
-    # and a future re-run will pick them up.
+    # to S3 alongside dpla-map.json. Each item's source doc is re-read from
+    # the dpla-map.json we just staged in phase 1 (rather than buffered in
+    # memory) so peak memory stays O(unique-subjects) rather than scaling
+    # with hub size. Items the SDC builder can't parse (e.g. provider /
+    # institution missing from institutions_v2.json) are skipped silently;
+    # their dpla-map.json is still in place for downloader/uploader and a
+    # future re-run will pick them up.
     sdc_sem, sdc_failed, _on_sdc_done = make_s3_stage_context(S3_WRITE_WORKERS)
     sdc_skipped = 0
 
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
-        for dpla_id, source in items_buffer:
+        for dpla_id in dpla_ids:
+            raw = s3_client.get_item_metadata(partner, dpla_id)
+            if raw is None:
+                # Phase 1 already exited on any S3 write failure, so a miss
+                # here is unexpected — log and continue rather than abort.
+                logging.warning(
+                    "dpla-map.json missing for %s in phase 3; skipping sdc.json",
+                    dpla_id,
+                )
+                sdc_skipped += 1
+                continue
+            try:
+                source = json.loads(raw)
+            except json.JSONDecodeError as e:
+                logging.warning(
+                    "dpla-map.json for %s failed to parse in phase 3 (%s); "
+                    "skipping sdc.json",
+                    dpla_id,
+                    e,
+                )
+                sdc_skipped += 1
+                continue
             sdc_payload = build_claims_for_doc(
                 source,
                 dpla_id,

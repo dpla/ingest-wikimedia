@@ -91,6 +91,10 @@ PD_MARK_URI_CANONICAL = "http://creativecommons.org/publicdomain/mark/1.0"
 RECONCI_ENDPOINT = "https://wikidata.reconci.link/en/api"
 RECONCI_BATCH_SIZE = 10
 TEXT_VALUE_LIMIT = 1499  # matches sdc-sync's longstanding truncation cap
+# Maximum length for a raw P217 (inventory number) value before we skip it
+# entirely. sdc-sync's original guard was `len(local_id) >= 1501`, so anything
+# strictly longer than 1500 is dropped.
+LOCAL_ID_MAX_LENGTH = 1500
 
 logger = logging.getLogger(__name__)
 
@@ -772,7 +776,7 @@ def build_claims_for_doc(
 
     # P217 — local identifier (non-NARA; per-value, with P195 qualifier).
     for local_id in local_ids:
-        if not local_id or len(local_id) >= 1501:
+        if not local_id or len(local_id) > LOCAL_ID_MAX_LENGTH:
             continue
         claims.append(
             _build_local_id_claim(local_id, institution, dpla_id, retrieval_date)
