@@ -8,6 +8,7 @@ from requests import Session
 from .banlist import Banlist
 from .common import null_safe, get_str, get_list, get_dict
 from .iiif import IIIF
+from .partners import PARTNER_HUBS, is_upload_eligible
 from .s3 import S3Client
 from .tracker import Tracker, Result
 
@@ -34,11 +35,22 @@ class DPLA:
 
     @staticmethod
     def check_partner(partner: str) -> None:
+        """Raise ValueError if `partner` is not an upload-eligible DPLA hub.
+
+        Eligibility is driven entirely by institutions_v2.json — the file
+        DPLA maintainers edit to opt hubs and institutions in or out. Any
+        hub slug recognised in PARTNER_HUBS whose entry in
+        institutions_v2.json marks it (or any of its institutions) as
+        `upload: True` is accepted here. No code change is required to
+        add a new partner.
         """
-        Blows up if we're working on a partner we shouldn't.
-        """
-        if partner not in DPLA_PARTNERS.keys():
+        if partner not in PARTNER_HUBS:
             raise ValueError(f"Unrecognized partner: {partner}")
+        if not is_upload_eligible(partner):
+            raise ValueError(
+                f"Hub {partner!r} has no upload-eligible institutions in "
+                f"institutions_v2.json — edit that file to opt in"
+            )
 
     def get_nara_ids(self):
         def build_collections_params(http_session: Session, api_key: str) -> list[str]:
@@ -152,7 +164,7 @@ class DPLA:
                     ) from e
 
     def get_ids(self, partner: str, add_query: str | None, no_shard: bool):
-        partner_full = DPLA_PARTNERS[partner]
+        partner_full = PARTNER_HUBS[partner]
         partner_string = partner_full.replace(" ", "+")
 
         api_query_base = (
@@ -200,7 +212,7 @@ class DPLA:
 
     @staticmethod
     def check_record_partner(partner: str, item_metadata: dict) -> bool:
-        partner_long_name = DPLA_PARTNERS.get(partner, "")
+        partner_long_name = PARTNER_HUBS.get(partner, "")
         record_partner_long_name = get_str(
             get_dict(item_metadata, PROVIDER_FIELD_NAME), EDM_AGENT_NAME
         )
@@ -385,20 +397,3 @@ DC_TITLE_FIELD_NAME = "title"
 DC_IDENTIFIER_FIELD_NAME = "identifier"
 WIKIDATA_FIELD_NAME = "Wikidata"
 AUTHORIZATION_HEADER = "Authorization"
-
-DPLA_PARTNERS = {
-    "bpl": "Digital Commonwealth",
-    "georgia": "Digital Library of Georgia",
-    # hold off on illinois "il": "Illinois Digital Heritage Hub",
-    "indiana": "Indiana Memory",
-    "nara": "National Archives and Records Administration",
-    "northwest-heritage": "Northwest Digital Heritage",
-    "ohio": "Ohio Digital Network",
-    "p2p": "Plains to Peaks Collective",
-    "pa": "PA Digital",
-    "si": "Smithsonian Institution",
-    "texas": "The Portal to Texas History",
-    "minnesota": "Minnesota Digital Library",
-    "mwdl": "Mountain West Digital Library",
-    "heartland": "Heartland Hub",
-}

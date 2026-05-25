@@ -64,12 +64,29 @@ def good_dpla_id():
     return "12345"
 
 
-def test_check_partner(dpla: DPLA):
-    with pytest.raises(Exception, match="Unrecognized partner."):
+def test_check_partner_rejects_unknown_slug(dpla: DPLA):
+    """A slug not in PARTNER_HUBS is rejected before any network call."""
+    with pytest.raises(ValueError, match="Unrecognized partner"):
         dpla.check_partner("invalid_partner")
 
-    # Assuming "bpl" is a valid partner
-    dpla.check_partner("bpl")
+
+def test_check_partner_accepts_upload_eligible_hub(dpla: DPLA):
+    """A recognised hub that's marked upload-eligible in institutions_v2.json
+    passes the check. Mocked to avoid hitting GitHub from the test suite."""
+    with patch("ingest_wikimedia.dpla.is_upload_eligible", return_value=True):
+        dpla.check_partner("bpl")
+
+
+def test_check_partner_rejects_hub_with_no_upload_eligible_institutions(
+    dpla: DPLA,
+):
+    """A recognised hub slug whose institutions_v2.json entry has nothing
+    upload-eligible is rejected with an actionable message pointing at the
+    JSON file — making it obvious that the fix is a data edit, not a code
+    change."""
+    with patch("ingest_wikimedia.dpla.is_upload_eligible", return_value=False):
+        with pytest.raises(ValueError, match="institutions_v2.json"):
+            dpla.check_partner("bpl")
 
 
 def test_check_record_partner_valid(dpla: DPLA):
