@@ -52,7 +52,7 @@ from ingest_wikimedia.dpla import DPLA, INSTITUTIONS_URL
 from ingest_wikimedia.partners import PARTNER_HUBS
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
-from ingest_wikimedia.s3 import APPLICATION_JSON, S3Client
+from ingest_wikimedia.s3 import APPLICATION_JSON, SDC_FILENAME, S3Client
 from ingest_wikimedia.sdc import (
     normalize_rights_uri,
     build_claims_for_doc,
@@ -76,7 +76,6 @@ SUBJECTS_URL = (
     "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
     "src/main/resources/subjects.json"
 )
-SDC_FILENAME = "sdc.json"
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # isShownAt URL patterns from which a IIIF manifest can be formulaically

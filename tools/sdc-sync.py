@@ -1318,7 +1318,8 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
     print(f" -- Accessing Commons ID {mediaid}")
     try:
         file_claims = requests.get(
-            f"https://commons.wikimedia.org/wiki/Special:EntityData/{mediaid}.json"
+            f"https://commons.wikimedia.org/wiki/Special:EntityData/{mediaid}.json",
+            timeout=30,
         ).json()
     except Exception:
         file_claims = {"entities": {mediaid: {"statements": {}}}}
