@@ -126,6 +126,7 @@ class Uploader:
         verbose: bool,
         dry_run: bool,
         duplicate_source_sha1s: set[str] | None = None,
+        expected_item_titles: set[str] | None = None,
     ) -> dict:
         """Process one ordinal's source asset and return a per-ordinal result dict.
 
@@ -286,6 +287,7 @@ class Uploader:
                             dpla_id=dpla_id,
                             ordinal=ordinal,
                             wiki_markup=wiki_markup,
+                            expected_item_titles=expected_item_titles,
                         )
                         if drift_action == "moved":
                             self.tracker.increment(Result.UPLOADED)
@@ -643,6 +645,7 @@ class Uploader:
         dpla_id: str,
         ordinal: int,
         wiki_markup: str | None = None,
+        expected_item_titles: set[str] | None = None,
     ) -> str:
         """
         Determine and where possible resolve the case where our file's SHA1
@@ -724,10 +727,33 @@ class Uploader:
             )
             return "upload_only"
 
-        # Case 2: intended title has real content with a different hash, and the
-        # file found at the wrong title belongs to a different item (or has no
-        # recognisable DPLA ID). Upload the correct hash and tag the orphaned
-        # old title as a duplicate so it can be cleaned up.
+        # Case 2: intended title has real content with a different hash, and
+        # the file found at the wrong title belongs to a different item (or
+        # has no recognisable DPLA ID). Normally we upload the correct hash
+        # to the intended title AND tag the orphaned old title as a duplicate
+        # so it can be cleaned up.
+        #
+        # BUT: if the "old title" is itself an expected title for one of THIS
+        # item's other current asset positions, it is not an orphan — it's a
+        # legitimate ordinal that will be (or has been) processed by its own
+        # iteration of process_file in this same run, and will get its own
+        # correct content written there.  Tagging it as a duplicate at the
+        # current instant produces a tag pointing at a page whose content is
+        # about to change, which makes the tag wrong (and triggers admin
+        # deletion of a still-valid Commons file).  Skip the tag in that case
+        # and just upload our content to the intended title.
+        if expected_item_titles and actual_filename in expected_item_titles:
+            logging.info(
+                f"Title drift (Case 2 → upload_only): "
+                f"[[File:{intended_page.title(with_ns=False)}]] has a different "
+                f"hash and our SHA1 currently lives at "
+                f"[[File:{actual_filename}]], but that title is one of this "
+                f"item's current asset positions — it will be overwritten by "
+                f"its own ordinal's iteration. Uploading to "
+                f"[[File:{page_title}]] without tagging."
+            )
+            return "upload_only"
+
         logging.info(
             f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
             f"has a different hash; will upload correct hash and tag "
@@ -881,6 +907,26 @@ class Uploader:
                 self.s3_client, dpla_id, partner, len(files)
             )
 
+            # Build the set of Commons titles this item's current asset list
+            # will produce.  _resolve_hash_drift uses this to recognise when
+            # an "old title" found via SHA1 lookup is actually one of THIS
+            # run's other ordinals (a soon-to-be-overwritten sibling, not a
+            # trailing orphan) and skip the duplicate-tagging in that case.
+            # Without this, Case 2 produces a cascade of wrong tags whenever
+            # source content has shifted within a multi-page item.
+            expected_item_titles: set[str] = set()
+            for ord_n, ext in ordinal_exts.items():
+                if not ext:
+                    continue
+                expected_item_titles.add(
+                    get_page_title(
+                        item_title=title,
+                        dpla_identifier=dpla_id,
+                        suffix=ext,
+                        page=page_labels.get(ord_n, ""),
+                    )
+                )
+
             # Per-ordinal results collected here are written to
             # <partner>/<dpla_id>/upload-result.json at the end of this method,
             # and read by the SDC sync phase to decide which ordinals are
@@ -909,6 +955,7 @@ class Uploader:
                         verbose,
                         dry_run,
                         duplicate_source_sha1s=duplicate_source_sha1s,
+                        expected_item_titles=expected_item_titles,
                     )
                     ordinal_results[str(ordinal)] = result
                 except UploadTimeoutError as ex:

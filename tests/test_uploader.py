@@ -675,3 +675,110 @@ def test_orphan_check_skips_redirect_but_continues_probing():
     assert candidate_arg.title() == real_orphan_title
     assert tracker.count(Result.ORPHANS_TAGGED) == 1
     assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+
+
+# --------------------------------------------------------------------------
+# Uploader._resolve_hash_drift — Case 2 skips tag when title is in asset list
+# --------------------------------------------------------------------------
+
+
+def _build_uploader_with_dpla(other_item_exists: bool = True) -> "object":
+    from tools.uploader import Uploader
+
+    dpla = MagicMock()
+    dpla.get_item_metadata.return_value = (
+        {"sourceResource": {}} if other_item_exists else None
+    )
+    return Uploader(
+        tracker=Tracker(),
+        local_fs=MagicMock(),
+        s3_client=MagicMock(),
+        dpla=dpla,
+        site=MagicMock(),
+        category_ensurer=None,
+    )
+
+
+def _drift_existing_file(title: str) -> MagicMock:
+    f = MagicMock()
+    f.title.return_value = title
+    return f
+
+
+def test_resolve_hash_drift_case2_skips_tag_when_existing_in_expected_titles():
+    """The bug fix: when existing file's title is one of THIS item's other
+    current asset positions, it's a sibling, not an orphan. The duplicate tag
+    would be wasted (the sibling's content will be overwritten by its own
+    ordinal in this same run), so route to upload_only."""
+    uploader = _build_uploader_with_dpla()
+    # Existing file: page N+1 of the SAME item, will be processed soon.
+    existing_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 5).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 4).jpg"
+    expected_titles = {
+        f"Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page {n}).jpg"
+        for n in range(1, 10)
+    }
+    # intended_page: exists with different content (Case 2 territory).
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with patch("tools.uploader.get_page", return_value=intended_page):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=4,
+            wiki_markup="",
+            expected_item_titles=expected_titles,
+        )
+    assert action == "upload_only"
+
+
+def test_resolve_hash_drift_case2_still_tags_when_existing_is_true_orphan():
+    """When the existing file's title is NOT in the current asset list (i.e.
+    it's a trailing orphan beyond what the source authorizes), the tag is
+    still correct and Case 2 should fire as before."""
+    uploader = _build_uploader_with_dpla()
+    # Existing file at (page 99) — way beyond our asset list of pages 1..9.
+    existing_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 99).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 4).jpg"
+    expected_titles = {
+        f"Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page {n}).jpg"
+        for n in range(1, 10)
+    }
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with patch("tools.uploader.get_page", return_value=intended_page):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=4,
+            wiki_markup="",
+            expected_item_titles=expected_titles,
+        )
+    assert action == "upload_and_tag"
+
+
+def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
+    """Backward-compat: callers that don't pass expected_item_titles see
+    Case 2 firing as before (no behavior change in that path)."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 5).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 4).jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with patch("tools.uploader.get_page", return_value=intended_page):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=4,
+            wiki_markup="",
+        )
+    assert action == "upload_and_tag"
