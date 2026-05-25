@@ -49,6 +49,19 @@ parser.add_argument(
     default=0,
     help="When using --cat, stop after this many files (0 = no limit)",
 )
+parser.add_argument(
+    "--from-s3",
+    dest="from_s3",
+    metavar="PARTNER",
+    action="store",
+    default=None,
+    help=(
+        "Read each DPLA item's metadata from the dpla-map.json staged in S3 "
+        "by get-ids-es (under the partner's sharded item prefix; resolved by "
+        "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
+        "to api.dp.la when an item's dpla-map.json is missing."
+    ),
+)
 args = parser.parse_args()
 
 method = "livecat"
@@ -97,6 +110,16 @@ subject_ids = requests.get(
     "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/src/main/resources/subjects.json",
     timeout=30,
 ).json()
+
+# When --from-s3 <partner> is set, parsed() reads each item's dpla-map.json
+# from S3 instead of calling api.dp.la. Imported lazily so that --help doesn't
+# pay the boto3 import cost.
+_s3_partner = args.from_s3
+_s3_client = None
+if _s3_partner is not None:
+    from ingest_wikimedia.s3 import S3Client
+
+    _s3_client = S3Client()
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
 
@@ -1107,28 +1130,114 @@ def dpla_claims(
         print(" --- Saved removals!")
 
 
-def parsed(dpla_id, dpla_api):
-    print(f" -- Accessing DPLA ID {dpla_id}")
+def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
+    """Fetch a single DPLA item's inner doc from the public DPLA API.
+
+    Returns the inner doc (same shape as an ES `_source` and as the
+    dpla-map.json staged in S3 under the partner's sharded item prefix) on
+    success, or None on API error. Retries once after a 30-second sleep on
+    the first network failure; if the retry also raises, returns None so
+    parsed() can treat the item as Missing rather than aborting the batch.
+    """
     try:
-        dpla = requests.get(
+        response = requests.get(
             f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
             timeout=15,
         ).json()
     except Exception:
         print(" -- Sleeping 30 seconds and retrying...")
         time.sleep(30)
-        dpla = requests.get(
-            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
-            timeout=15,
-        ).json()
-    print(f" -- Accessed DPLA ID {dpla_id}")
-
+        try:
+            response = requests.get(
+                f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
+                timeout=15,
+            ).json()
+        except Exception as retry_e:
+            print(f" -- DPLA API retry failed for {dpla_id}: {retry_e!r}")
+            return None
     try:
-        dpla = dpla["docs"][0]
+        return response["docs"][0]
     except Exception:
-        print(dpla)
+        print(response)
         print("DPLA API returned error.")
         return None
+
+
+def _fetch_dpla_doc_from_s3(s3_client, partner, dpla_id):
+    """Read a single DPLA item's inner doc from S3.
+
+    `get-ids-es` stages the ES `_source` for every eligible item as
+    dpla-map.json under the partner's sharded item prefix (resolved by
+    S3Client.get_item_metadata). Returns the parsed doc on success, None
+    when the object is missing, unparseable, or temporarily unreachable.
+    A None return lets `parsed()` fall back to the DPLA API path so we
+    never silently skip an item just because it hasn't been staged yet
+    or S3 had a hiccup.
+
+    `get_item_file` (the backing helper) returns None cleanly only for
+    404/NoSuchKey — any other ClientError (5xx, throttling, permissions)
+    re-raises. Wrap so transient infrastructure errors trigger the API
+    fallback instead of aborting the whole batch.
+    """
+    # Lazy import keeps the --help path from pulling in botocore. Only
+    # reached when --from-s3 was set, by which point boto3 is already
+    # loaded via S3Client; this import is a cached no-op then.
+    from botocore.exceptions import ClientError
+
+    try:
+        raw = s3_client.get_item_metadata(partner, dpla_id)
+    except ClientError as e:
+        print(
+            f" -- S3 fetch failed for {partner}/{dpla_id} ({e!r}); "
+            "falling back to api.dp.la."
+        )
+        return None
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print(f" -- S3 dpla-map.json for {dpla_id} failed to parse: {e}")
+        return None
+
+
+def parsed(dpla_id, dpla_api):
+    """Resolve a DPLA item to the 13-tuple consumed by process_one().
+
+    Source-of-truth selection:
+      * When --from-s3 <partner> is configured, try S3 first. On miss
+        (object not present, parse error), fall back to api.dp.la so a
+        not-yet-staged item still syncs.
+      * Otherwise hit api.dp.la directly.
+
+    Returns None when neither source has a usable doc — process_one()
+    treats that as a Missing ID.
+    """
+    print(f" -- Accessing DPLA ID {dpla_id}")
+
+    dpla = None
+    if _s3_partner is not None:
+        dpla = _fetch_dpla_doc_from_s3(_s3_client, _s3_partner, dpla_id)
+        if dpla is not None:
+            print(f" -- Loaded {dpla_id} from S3 ({_s3_partner})")
+    if dpla is None:
+        dpla = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+
+    print(f" -- Accessed DPLA ID {dpla_id}")
+
+    if dpla is None:
+        return None
+    return _parse_dpla_doc(dpla, dpla_id)
+
+
+def _parse_dpla_doc(dpla, dpla_id):
+    """Parse a DPLA item's inner doc into the 13-tuple consumed by
+    process_one().
+
+    Pure transformation over the doc, except for the optional batched
+    Wikidata reconciliation call for NARA `exactMatch` subjects (which has
+    no cheaper place to live until PR 2 moves it into get-ids-es).
+    """
     hub = hubs[dpla["provider"]["name"]]["Wikidata"]
     institution = hubs[dpla["provider"]["name"]]["institutions"][
         dpla["dataProvider"]["name"]
