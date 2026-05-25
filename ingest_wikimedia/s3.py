@@ -12,6 +12,7 @@ IIIF_JSON = "iiif.json"
 FILE_LIST_TXT = "file-list.txt"
 TEXT_PLAIN = "text/plain"
 DPLA_MAP_FILENAME = "dpla-map.json"
+SDC_FILENAME = "sdc.json"
 UPLOAD_RESULT_FILENAME = "upload-result.json"
 APPLICATION_JSON = "application/json"
 S3_RETRIES = 3
@@ -127,6 +128,16 @@ class S3Client:
     def get_upload_result(self, partner: str, dpla_id: str) -> str | None:
         """Read the per-item upload result file written by the uploader."""
         return self.get_item_file(partner, dpla_id, UPLOAD_RESULT_FILENAME)
+
+    def get_sdc_json(self, partner: str, dpla_id: str) -> str | None:
+        """Read the per-item sdc.json staged by get-ids-es.
+
+        Returns the ready-to-POST Wikibase claim list as a JSON string, or
+        None when the sidecar isn't present (item wasn't processed by
+        get-ids-es, or its provider/institution wasn't resolvable into the
+        institutions_v2.json mapping).
+        """
+        return self.get_item_file(partner, dpla_id, SDC_FILENAME)
 
     def write_file_list(self, partner: str, dpla_id: str, file_urls: list[str]) -> None:
         """
