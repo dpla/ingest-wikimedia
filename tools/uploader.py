@@ -757,6 +757,45 @@ class Uploader:
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
 
+    def _persist_upload_result(
+        self,
+        partner: str,
+        dpla_id: str,
+        ordinal_results: dict[str, dict],
+        dry_run: bool,
+    ) -> None:
+        """Write the per-item upload-result.json sidecar to S3.
+
+        Called at every non-exception exit path through process_item so the
+        sidecar always reflects what this run decided about this item — never
+        a stale verdict from a previous run. An empty ordinal_results dict is
+        the correct signal for "uploader saw the item but produced nothing
+        the SDC phase should write structured data on" (ineligible item,
+        missing institution Wikidata, zero-file manifest, etc.).
+
+        Dry-run path is intentionally a no-op: dry runs shouldn't mutate S3
+        any more than they mutate Commons.
+
+        Best-effort on the write itself: a failure here is logged but doesn't
+        propagate, since the upload work has already succeeded for any
+        ordinals that were processed and the SDC phase can re-derive on a
+        future uploader run.
+        """
+        if dry_run:
+            return
+        upload_result = {
+            "run_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+            "ordinals": ordinal_results,
+        }
+        try:
+            self.s3_client.write_upload_result(partner, dpla_id, upload_result)
+        except Exception as ex:
+            logging.warning(
+                f"Failed to write upload-result.json for {dpla_id}: {ex}; continuing"
+            )
+
     def process_item(
         self,
         dpla_id: str,
@@ -770,6 +809,10 @@ class Uploader:
 
             item_metadata_result = self.s3_client.get_item_metadata(partner, dpla_id)
             if not item_metadata_result:
+                # The item isn't in S3 at all — it shouldn't be in the IDs CSV
+                # this run. Don't touch any existing upload-result.json; that
+                # state belongs to whatever run last produced it. This is
+                # purely a "we have no idea about this item" branch.
                 self.tracker.increment(Result.ITEM_NOT_PRESENT)
                 return
 
@@ -784,6 +827,10 @@ class Uploader:
             ):
                 logging.info(f"Skipping {dpla_id}: Not eligible.")
                 self.tracker.increment(Result.SKIPPED)
+                # Persist an empty result so any prior upload-result.json
+                # doesn't keep telling the SDC phase the item is still SDC-able
+                # after eligibility was revoked.
+                self._persist_upload_result(partner, dpla_id, {}, dry_run)
                 return
 
             if self.category_ensurer:
@@ -803,6 +850,7 @@ class Uploader:
                         f"hub_institution_qid={hub_institution_qid!r}"
                     )
                     self.tracker.increment(Result.SKIPPED)
+                    self._persist_upload_result(partner, dpla_id, {}, dry_run)
                     return
 
             titles = get_list(
@@ -893,26 +941,17 @@ class Uploader:
                 logging.warning(f"Orphan check failed for {dpla_id}: {ex}; continuing")
 
             # Persist the per-ordinal results so the SDC sync phase (PR 4)
-            # knows which ordinals to attempt structured-data writes on.
-            # Best-effort: a write failure here is logged but doesn't fail the
-            # upload — the file was already on Commons successfully; SDC will
-            # just skip this item until the next uploader run.
-            if not dry_run and ordinal_results:
-                upload_result = {
-                    "run_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
-                        timespec="seconds"
-                    ),
-                    "ordinals": ordinal_results,
-                }
-                try:
-                    self.s3_client.write_upload_result(partner, dpla_id, upload_result)
-                except Exception as ex:
-                    logging.warning(
-                        f"Failed to write upload-result.json for {dpla_id}: {ex}; "
-                        "continuing"
-                    )
+            # knows which ordinals to attempt structured-data writes on. Fires
+            # even when ordinal_results is empty (e.g. zero files in
+            # file_list.txt) so a previous run's results don't get treated as
+            # the current truth.
+            self._persist_upload_result(partner, dpla_id, ordinal_results, dry_run)
 
         except Exception as ex:
+            # Intentionally NOT writing upload-result.json on the catch-all
+            # exception path. The failure may be transient (S3 hiccup,
+            # pywikibot socket reset) and the previous result file — if any —
+            # is more likely to still be accurate than a fresh empty one.
             logging.warning(
                 f"Caught exception getting item info for {dpla_id}", exc_info=ex
             )
