@@ -347,7 +347,10 @@ def _resolve_subjects(
         name = subject.get("name")
         added = False
         if name in subject_ids:
-            for subjqid in subject_ids[name]["id"]:
+            # Use .get("id", []) so a subjects.json entry missing the
+            # expected "id" array doesn't crash the whole sync — degrades
+            # to "no P921 entry for this subject", same as no Q-ID match.
+            for subjqid in subject_ids[name].get("id", []):
                 if not any(subjqid in pair for pair in subjects):
                     subjects.append((str(name), subjqid))
                     added = True
@@ -409,37 +412,49 @@ def parse_dpla_doc(
     rs = doc["rights"]
     url = doc["isShownAt"]
 
+    # The shape-tolerant blocks below treat missing or mis-typed fields as
+    # "absent" — same contract as the original sdc-sync. Narrowed from a bare
+    # except to (KeyError, IndexError, TypeError) so a real bug (e.g.
+    # AttributeError introduced by an upstream refactor) propagates instead
+    # of being silently swallowed. Each fallback is logged so silent fallback
+    # is still observable in the worker logs.
+
     try:
         dates = [
             displaydate["displayDate"] for displaydate in doc["sourceResource"]["date"]
         ]
-    except Exception:
+    except (KeyError, IndexError, TypeError) as e:
+        logger.debug("No usable dates for %s: %s", dpla_id, e)
         dates = []
 
     try:
         local_ids = doc["sourceResource"]["identifier"]
         if isinstance(local_ids, str):
             local_ids = [local_ids]
-    except Exception:
+    except (KeyError, TypeError) as e:
+        logger.debug("No usable identifiers for %s: %s", dpla_id, e)
         local_ids = []
 
     try:
         descs = doc["sourceResource"]["description"]
         if isinstance(descs, str):
             descs = [descs]
-    except Exception:
+    except (KeyError, TypeError) as e:
+        logger.debug("No usable description for %s: %s", dpla_id, e)
         descs = []
 
     try:
         subjects = _resolve_subjects(doc, subject_ids, subjects_lookup)
-    except Exception:
+    except (KeyError, IndexError, TypeError) as e:
+        logger.debug("Subject resolution failed for %s: %s", dpla_id, e)
         subjects = []
 
     try:
         creators = doc["sourceResource"]["creator"]
         if isinstance(creators, str):
             creators = [creators]
-    except Exception:
+    except (KeyError, TypeError) as e:
+        logger.debug("No usable creators for %s: %s", dpla_id, e)
         creators = []
 
     if doc["provider"]["name"] == NARA_PROVIDER_NAME:
@@ -459,7 +474,10 @@ def parse_dpla_doc(
                     xml.find("accessRestriction").find("status").find("naId").text
                 )
                 access = NARA_ACCESS_CODES.get(access_naid, "")
-            except Exception:
+            except (AttributeError, TypeError) as e:
+                # Any .find() returning None breaks the chain — log so a
+                # silently-missing access restriction is observable.
+                logger.debug("NARA access restriction missing for %s: %s", dpla_id, e)
                 access = ""
             for lvl_key in NARA_LEVELS:
                 if xml.find(lvl_key):
