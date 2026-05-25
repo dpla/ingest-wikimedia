@@ -73,7 +73,7 @@ IS_SHOWN_AT_FIELD = "isShownAt"
 # map used to populate P921 alongside the string-form P4272. rights.json is
 # the small SDC-specific copyright mapping vendored in this repo.
 SUBJECTS_URL = (
-    "https://raw.githubusercontent.com/DominicBM/ingestion3/develop/"
+    "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
     "src/main/resources/subjects.json"
 )
 SDC_FILENAME = "sdc.json"
@@ -98,9 +98,9 @@ def fetch_institutions_v2() -> dict:
 def fetch_subjects_json() -> dict:
     """Fetch the DPLA-subject → Wikidata-ID map used to populate P921.
 
-    Lives on the DominicBM/ingestion3 fork; fetched fresh per run for the
-    same reason institutions_v2.json is — upstream changes should land in
-    the next sync without a redeploy.
+    Sourced from dpla/ingestion3 alongside institutions_v2.json; fetched
+    fresh per run so upstream changes land in the next sync without a
+    redeploy.
     """
     resp = requests.get(SUBJECTS_URL, timeout=30)
     resp.raise_for_status()
