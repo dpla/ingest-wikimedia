@@ -1169,11 +1169,29 @@ def _fetch_dpla_doc_from_s3(s3_client, partner, dpla_id):
     `get-ids-es` stages the ES `_source` for every eligible item as
     dpla-map.json under the partner's sharded item prefix (resolved by
     S3Client.get_item_metadata). Returns the parsed doc on success, None
-    when the object is missing or unparseable. A None return lets
-    `parsed()` fall back to the DPLA API path so we never silently skip an
-    item just because it hasn't been staged yet.
+    when the object is missing, unparseable, or temporarily unreachable.
+    A None return lets `parsed()` fall back to the DPLA API path so we
+    never silently skip an item just because it hasn't been staged yet
+    or S3 had a hiccup.
+
+    `get_item_file` (the backing helper) returns None cleanly only for
+    404/NoSuchKey — any other ClientError (5xx, throttling, permissions)
+    re-raises. Wrap so transient infrastructure errors trigger the API
+    fallback instead of aborting the whole batch.
     """
-    raw = s3_client.get_item_metadata(partner, dpla_id)
+    # Lazy import keeps the --help path from pulling in botocore. Only
+    # reached when --from-s3 was set, by which point boto3 is already
+    # loaded via S3Client; this import is a cached no-op then.
+    from botocore.exceptions import ClientError
+
+    try:
+        raw = s3_client.get_item_metadata(partner, dpla_id)
+    except ClientError as e:
+        print(
+            f" -- S3 fetch failed for {partner}/{dpla_id} ({e!r}); "
+            "falling back to api.dp.la."
+        )
+        return None
     if raw is None:
         return None
     try:
