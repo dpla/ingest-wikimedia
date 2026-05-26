@@ -8,9 +8,12 @@ category.
 from unittest.mock import MagicMock, patch
 
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.wikimedia import WMC_UPLOAD_CHUNK_SIZE
 from tools.uploader import (
+    LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     _post_item_orphan_check,
     _post_upload_touch_new_institutions,
+    select_upload_chunk_size,
 )
 
 
@@ -782,3 +785,75 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
             wiki_markup="",
         )
     assert action == "upload_and_tag"
+
+
+# --------------------------------------------------------------------------
+# select_upload_chunk_size — pin the OOM-prevention contract: files above
+# LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES MUST force chunked upload even when
+# caller flags prefer direct, because direct can't physically succeed past
+# Wikimedia's gateway limit (the 211 MB NARA incident at 6.7 GB RSS).
+# --------------------------------------------------------------------------
+
+
+def test_chunk_size_neither_pref_returns_chunked():
+    """Default path (neither file_exists nor force_ignore_warnings): chunked."""
+    assert select_upload_chunk_size(
+        file_exists=False,
+        force_ignore_warnings=False,
+        file_size_bytes=10 * 1024 * 1024,
+    ) == (WMC_UPLOAD_CHUNK_SIZE, False)
+
+
+def test_chunk_size_file_exists_small_returns_direct():
+    """Overwrite of an existing small page → direct upload to bypass warnings."""
+    assert select_upload_chunk_size(
+        file_exists=True,
+        force_ignore_warnings=False,
+        file_size_bytes=10 * 1024 * 1024,
+    ) == (0, True)
+
+
+def test_chunk_size_force_ignore_warnings_small_returns_direct():
+    """Hash-drift upload_only on a small file → direct upload (warning bypass)."""
+    assert select_upload_chunk_size(
+        file_exists=False,
+        force_ignore_warnings=True,
+        file_size_bytes=10 * 1024 * 1024,
+    ) == (0, True)
+
+
+def test_chunk_size_large_file_exists_forces_chunked():
+    """Overwrite of a large file: direct can't succeed at this size, so chunked
+    even though the warning-bypass benefit is lost. Bounded FAILED > OOM."""
+    one_byte_over = LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES + 1
+    assert select_upload_chunk_size(
+        file_exists=True,
+        force_ignore_warnings=False,
+        file_size_bytes=one_byte_over,
+    ) == (WMC_UPLOAD_CHUNK_SIZE, True)
+
+
+def test_chunk_size_large_force_ignore_warnings_forces_chunked():
+    """Hash-drift upload_only on a 211 MB file (the NARA incident): chunked,
+    and prefers_direct still True so the caller logs the size override."""
+    nara_incident_size = 221_583_206  # exact bytes of 2_7d3114...
+    assert select_upload_chunk_size(
+        file_exists=False,
+        force_ignore_warnings=True,
+        file_size_bytes=nara_incident_size,
+    ) == (WMC_UPLOAD_CHUNK_SIZE, True)
+
+
+def test_chunk_size_exactly_at_threshold_stays_direct():
+    """At-threshold is fine for direct upload; only strictly above forces chunked."""
+    assert select_upload_chunk_size(
+        file_exists=True,
+        force_ignore_warnings=False,
+        file_size_bytes=LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
+    ) == (0, True)
+
+
+def test_chunk_size_threshold_under_wikimedia_gateway_limit():
+    """The threshold itself must stay safely under Wikimedia's ~100 MB
+    practical direct-upload limit — otherwise we re-introduce the OOM."""
+    assert LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES < 100 * 1024 * 1024
