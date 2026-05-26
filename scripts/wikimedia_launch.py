@@ -58,6 +58,18 @@ def _slugify(name: str) -> str:
     return _SLUG_RE.sub("", name.lower().replace(" ", "-"))
 
 
+def _parse_bool(value: str) -> bool:
+    """Parse a GitHub Actions boolean-string input into a real bool.
+
+    GH Actions passes ``workflow_dispatch`` boolean inputs as the literal
+    strings ``"true"`` / ``"false"`` (case-insensitive). Anything else
+    (including empty, ``"yes"``, ``"1"``) is treated as falsy. Used for
+    ``--force``, ``--refresh-only``, and ``--sdc-only`` so the polarity
+    stays consistent across all three flags.
+    """
+    return value.lower() == "true"
+
+
 def _slack_fail(response_url: str, msg: str) -> NoReturn:
     """Print msg to stderr, post ephemeral reply to response_url if set, then exit 1."""
     print(msg, file=sys.stderr)
@@ -84,10 +96,9 @@ def main() -> None:
     parser.add_argument("--sdc-only", default="false")
     args = parser.parse_args()
 
-    force = args.force.lower() == "true"
-    # GitHub Actions passes boolean inputs as the strings "true"/"false" — same as --force.
-    refresh_only = args.refresh_only.lower() == "true"
-    sdc_only = args.sdc_only.lower() == "true"
+    force = _parse_bool(args.force)
+    refresh_only = _parse_bool(args.refresh_only)
+    sdc_only = _parse_bool(args.sdc_only)
 
     # Normalize the response_url first so the mutual-exclusion check below
     # can use the validated value rather than re-implementing the same

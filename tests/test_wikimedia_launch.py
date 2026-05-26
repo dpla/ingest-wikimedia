@@ -74,22 +74,26 @@ def test_sdc_only_alone_is_accepted_at_parse_time(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "sdc_only_value,expected",
+    "value,expected",
     [
         ("true", True),
         ("True", True),
         ("TRUE", True),
         ("false", False),
         ("", False),
-        # Anything that isn't a lowercase-"true" match falls through to False.
-        # This matches the existing `--force` / `--refresh-only` handling.
+        # Anything that isn't a case-insensitive "true" match falls
+        # through to False. Same convention for --force, --refresh-only,
+        # and --sdc-only.
         ("yes", False),
         ("1", False),
     ],
 )
-def test_sdc_only_boolean_parsing(sdc_only_value, expected):
-    """The `args.sdc_only.lower() == "true"` test treats GH Actions'
-    "true"/"false" string inputs case-insensitively; everything else is
-    falsy. Lock this in so a future stringly-typed input change can't
-    quietly flip the polarity."""
-    assert (sdc_only_value.lower() == "true") is expected
+def test_parse_bool(value, expected):
+    """Exercise the launcher's actual boolean-string parser (the same
+    helper that converts `args.sdc_only`, `args.refresh_only`, and
+    `args.force` into bools). This locks in the case-insensitive "true"
+    contract so a refactor of the parsing code can't silently flip the
+    polarity."""
+    from scripts.wikimedia_launch import _parse_bool
+
+    assert _parse_bool(value) is expected

@@ -58,7 +58,7 @@ Results (success or failure) post to **#tech-alerts** via the `DPLA_SLACK_BOT_TO
 
 ### `/wikimedia-upload <target> [<target> ...]`
 
-Launches the full upload pipeline (ID generation → download → upload → SDC sync) for one or more targets. All targets run sequentially in a single tmux session. If any step fails, the chain stops.
+Launches the full upload pipeline (ID generation → download → upload → SDC sync) for one or more targets. Targets run sequentially in a single tmux session. If a step fails for a given target, that target's pipeline stops and a Slack failure notification posts — the launcher then continues with the next target in the batch.
 
 ```text
 /wikimedia-upload bpl
