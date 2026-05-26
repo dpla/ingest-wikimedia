@@ -26,7 +26,6 @@ Environment variables:
 import argparse
 import logging
 import os
-import re
 import shlex
 import sys
 from typing import NoReturn
@@ -42,6 +41,7 @@ from ingest_wikimedia.partners import (
     parse_session_labels,
     resolve_slug,
     resolve_wikidata_id,
+    slugify_session_label_component,
 )
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run
@@ -49,13 +49,13 @@ from ingest_wikimedia.ssm import REGION, ssm_run
 # Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
 MEMORY_HEADROOM_PCT = 30
 
-# Pre-compiled pattern for normalizing display names to tmux-safe label slugs.
-_SLUG_RE = re.compile(r"[^a-z0-9-]")
-
-
-def _slugify(name: str) -> str:
-    """Normalize a display name to a tmux-safe slug (lowercase alphanumeric + hyphens)."""
-    return _SLUG_RE.sub("", name.lower().replace(" ", "-"))
+# Tmux-safe session-label slugifier (lowercase alphanumeric + hyphens) lives in
+# ingest_wikimedia.partners as slugify_session_label_component so that
+# wikimedia_kill.py uses the IDENTICAL function — otherwise institutions whose
+# names contain stripped characters (e.g. ``AT&T``) would launch under one
+# slug and never match on kill.  Keep a short local alias for readability of
+# the call sites below.
+_slugify = slugify_session_label_component
 
 
 def _slack_fail(response_url: str, msg: str) -> NoReturn:
