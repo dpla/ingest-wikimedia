@@ -1,5 +1,6 @@
 from unittest.mock import patch, MagicMock
 from ingest_wikimedia.wikimedia import (
+    COMMONSDELINKER_PAGE,
     MAX_COMMENT_BYTES,
     build_title_drift_move_reason,
     get_site,
@@ -16,6 +17,8 @@ from ingest_wikimedia.wikimedia import (
     extract_strings_dict,
     is_same_item_redirect_relic,
     merge_preserved_wikitext,
+    post_commonsdelinker_request,
+    tag_as_duplicate,
     wiki_file_exists,
     check_content_type,
 )
@@ -712,3 +715,108 @@ def test_move_reason_extreme_filenames_falls_back_to_minimum():
     new = "y" * 240
     reason = build_title_drift_move_reason(old, new, _DPLA_ID, _USERNAME)
     assert reason == "Title drift correction"
+
+
+# ---------------------------------------------------------------------------
+# post_commonsdelinker_request / tag_as_duplicate — atomic-append behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_post_commonsdelinker_request_uses_appendtext_not_read_modify_write():
+    """post_commonsdelinker_request must call site.editpage(...) with the
+    `appendtext` kwarg, not the read-modify-write `page.text = page.text +
+    template; page.save()` form.
+
+    The naive form pulls the entire (~230 KB and growing) filemovers page
+    into the process on every call AND races itself when our bot is the
+    only editor: pywikibot's GET is load-balanced across MediaWiki replica
+    databases that may lag the primary, so the basetimestamp pywikibot
+    sends with the POST is older than the revision OUR previous successful
+    edit just produced. The primary rejects with EditConflictError — a
+    self-inflicted conflict from the perspective of the only editor.
+
+    `appendtext` is server-side atomic: no read, no basetimestamp, no
+    race. This test pins both halves of that contract.
+    """
+    site = MagicMock()
+    # If anything tries to read page.text the test fails loudly: that
+    # would mean we slipped back into the naive form.
+    page_text_accessed = MagicMock(
+        side_effect=AssertionError("page.text must not be accessed — use appendtext")
+    )
+    with (
+        patch("ingest_wikimedia.wikimedia.pywikibot.Page") as PageCtor,
+    ):
+        page = PageCtor.return_value
+        type(page).text = property(page_text_accessed)
+        post_commonsdelinker_request(
+            site, old_filename="Old.jpg", new_filename="New.jpg"
+        )
+
+    # Page constructed for the right target.
+    PageCtor.assert_called_once_with(site, COMMONSDELINKER_PAGE)
+    # editpage called on the *site* (the API surface that accepts appendtext),
+    # not via page.save (which would re-introduce the read).
+    assert site.editpage.call_count == 1, (
+        f"expected exactly one site.editpage() call, got {site.editpage.call_count}"
+    )
+    _, kwargs = site.editpage.call_args
+    assert "appendtext" in kwargs, (
+        f"editpage call must use appendtext; got kwargs={kwargs!r}"
+    )
+    # The leading newline matters: it guarantees the new request lands on
+    # its own line regardless of whether the existing page ends with one.
+    assert kwargs["appendtext"].startswith("\n"), (
+        "appendtext must begin with a newline so the new request is "
+        f"line-separated from the existing content; got {kwargs['appendtext']!r}"
+    )
+    # The request template carries the universal-replace shape.
+    assert "{{universal replace" in kwargs["appendtext"]
+    assert "|Old.jpg" in kwargs["appendtext"]
+    assert "|New.jpg" in kwargs["appendtext"]
+    # page.save must not be called — that path re-introduces the read.
+    page.save.assert_not_called()
+
+
+def test_tag_as_duplicate_uses_prependtext_not_read_modify_write():
+    """tag_as_duplicate must use site.editpage(prependtext=...) rather
+    than `file_page.text = tag + file_page.text; file_page.save()`.
+
+    Unlike post_commonsdelinker_request this isn't a self-conflict
+    hotspot (each call edits a different file page), but the same
+    arguments apply: skip the unnecessary GET of the existing page text,
+    let MediaWiki concatenate atomically on the primary, and keep the
+    pattern consistent with the other shared-page edits.
+    """
+    site = MagicMock()
+    file_page = MagicMock()
+    text_accessed = MagicMock(
+        side_effect=AssertionError(
+            "file_page.text must not be accessed — use prependtext"
+        )
+    )
+    type(file_page).text = property(text_accessed)
+
+    tag_as_duplicate(
+        site,
+        file_page,
+        correct_filename="Correct.jpg",
+        reason="Other file has the correct title.",
+    )
+
+    assert site.editpage.call_count == 1
+    _, kwargs = site.editpage.call_args
+    assert "prependtext" in kwargs, (
+        f"editpage call must use prependtext; got kwargs={kwargs!r}"
+    )
+    # Tag goes first, followed by a newline so the existing page wikitext
+    # starts on its own line.
+    assert kwargs["prependtext"].startswith("{{Duplicate|Correct.jpg|"), (
+        f"prependtext must begin with the Duplicate template; got "
+        f"{kwargs['prependtext']!r}"
+    )
+    assert kwargs["prependtext"].endswith("\n"), (
+        "prependtext must end with a newline so the original wikitext is "
+        f"line-separated; got {kwargs['prependtext']!r}"
+    )
+    file_page.save.assert_not_called()
