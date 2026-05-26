@@ -2118,6 +2118,7 @@ def _run_partner_mode(partner, ids_file):
                 if writes_after > writes_before and title and title != "?":
                     try:
                         pywikibot.FilePage(site, title).touch()
+                        logging.info(f" -- Touched '{title}' (category refresh).")
                     except Exception as e:
                         logging.warning(
                             f" -- Failed to touch '{title}' for category refresh: {e!r}"
