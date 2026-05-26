@@ -1991,6 +1991,11 @@ def _run_partner_mode(partner, ids_file):
     setup_logging(partner, "sdc", logging.INFO)
     start_time = time.time()
 
+    # Reset the module-level tracker so per-partner counts don't carry
+    # over across invocations of `_run_partner_mode` within a single
+    # process (e.g. tests, future multi-partner runs).
+    tracker.reset()
+
     s3 = S3Client()
 
     with open(ids_file) as f:
