@@ -686,7 +686,10 @@ def main() -> None:
             if refresh_only:
                 msg = f"✅ {', '.join(item_descs)} — eligible, download refresh starting{refresh_suffix}."
             else:
-                msg = f"✅ {', '.join(item_descs)} — eligible, download + upload starting."
+                msg = (
+                    f"✅ {', '.join(item_descs)} — eligible,"
+                    " download + upload + SDC starting."
+                )
         elif batch_targets and not single_item_targets:
             # All batch targets (hub, institution, or collection).
             batch_labels = [_target_label(c, i, col) for c, i, _, col in batch_targets]
@@ -695,7 +698,7 @@ def main() -> None:
             else:
                 msg = (
                     f"▶ Launching `{session_name}` pipeline: {', '.join(batch_labels)}"
-                    " (ID generation → download → upload)."
+                    " (ID generation → download → upload → SDC)."
                 )
         else:
             # Mixed: list all targets with a note distinguishing items from batches.
@@ -708,7 +711,10 @@ def main() -> None:
             if refresh_only:
                 msg = f"▶ Launching `{session_name}` refresh: {', '.join(all_descs)}{refresh_suffix}."
             else:
-                msg = f"▶ Launching `{session_name}` pipeline: {', '.join(all_descs)}."
+                msg = (
+                    f"▶ Launching `{session_name}` pipeline: {', '.join(all_descs)}"
+                    " (ID generation → download → upload → SDC)."
+                )
         try:
             post_message(slack_token, msg)
         except Exception as e:

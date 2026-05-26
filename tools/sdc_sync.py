@@ -1493,11 +1493,26 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
             "bot": True,
             "summary": f"Changing structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
         }
-        http.fetch(
+        # Only count removals once we've seen `success: 1` on the
+        # wbremoveclaims response, matching what `_post_new_refs` and
+        # `_post_new_claims` do for their respective POSTs. Without this
+        # check, a rejected removal batch (bad token, replication lag,
+        # claim already gone, etc.) would silently inflate the counter.
+        rm_resp = http.fetch(
             "https://commons.wikimedia.org/w/api.php", method="POST", data=rmdata
         )
-        print(" --- Saved removals!")
-        tracker.increment(Result.SDC_REMOVALS, len(removals))
+        try:
+            rm_post = json.loads(rm_resp.text)
+        except (ValueError, AttributeError):
+            print(" --- Could not parse removals response.")
+            sys.exit()
+        if rm_post.get("success") == 1:
+            print(" --- Saved removals!")
+            tracker.increment(Result.SDC_REMOVALS, len(removals))
+        else:
+            print(rm_post)
+            print(" --- Error encountered on removals save.")
+            sys.exit()
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
@@ -2043,7 +2058,19 @@ def _run_partner_mode(partner, ids_file):
                 continue
 
             synced_this_item = False
-            for ord_str, data in sorted(eligible.items(), key=lambda kv: int(kv[0])):
+            # int(ord_str) on a malformed ordinal key (e.g. "abc" instead
+            # of "3") would otherwise raise out of the whole loop and
+            # abort the partner batch. Skip the item, log, and account
+            # for it as a mapping skip — same handling as malformed JSON.
+            try:
+                ordinal_items = sorted(eligible.items(), key=lambda kv: int(kv[0]))
+            except (TypeError, ValueError):
+                logging.warning(
+                    f" -- upload-result ordinals malformed for {dpla_id}; skipping."
+                )
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+                continue
+            for ord_str, data in ordinal_items:
                 pageid = data.get("pageid")
                 if pageid is None:
                     logging.warning(f" -- Ordinal {ord_str}: no pageid; skipping.")
