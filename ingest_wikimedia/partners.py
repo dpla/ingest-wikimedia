@@ -23,6 +23,11 @@ _QID_RE = re.compile(r"^Q\d+$")
 # IDs pasted in uppercase or mixed-case are recognised correctly.
 _DPLA_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
+# Pattern that strips any character not allowed in a tmux-safe session-label
+# slug.  Anything outside [a-z0-9-] is removed; whitespace is converted to
+# hyphens first.  See slugify_session_label_component().
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9-]")
+
 # All DPLA partner hubs: canonical slug → hub display name (as used in institutions_v2.json)
 PARTNER_HUBS: dict[str, str] = {
     "artstor": "Artstor",
@@ -174,6 +179,21 @@ def is_item_upload_eligible(
     if not inst_data.get("Wikidata", ""):
         return False
     return hub.get("upload", False) or inst_data.get("upload", False)
+
+
+def slugify_session_label_component(name: str) -> str:
+    """Normalize a display name to the tmux-safe slug used in session labels.
+
+    Session-label components are lowercase alphanumeric + hyphens.  Whitespace
+    becomes hyphens; everything else (apostrophes, ampersands, commas, slashes,
+    accents, etc.) is stripped.
+
+    Both wikimedia_launch (which produces session names) and wikimedia_kill
+    (which matches them) MUST use this same function — otherwise an institution
+    name like ``AT&T Archives`` would launch as ``att-archives`` but never
+    match when ``kill`` derives its target slug from a different rule.
+    """
+    return _SLUG_STRIP_RE.sub("", name.lower().replace(" ", "-"))
 
 
 def is_wikidata_id(s: str) -> bool:
