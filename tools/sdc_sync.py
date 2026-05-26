@@ -2088,10 +2088,41 @@ def _run_partner_mode(partner, ids_file):
                     logging.warning(f" -- Ordinal {ord_str}: no pageid; skipping.")
                     continue
                 mediaid = f"M{pageid}"
-                logging.info(
-                    f" -- Ordinal {ord_str}: {mediaid} ({data.get('title', '?')})"
+                title = data.get("title", "?")
+                logging.info(f" -- Ordinal {ord_str}: {mediaid} ({title})")
+
+                # Snapshot write counters so we can detect whether this
+                # ordinal's sync actually changed anything on Commons.
+                writes_before = (
+                    tracker.count(Result.SDC_CLAIMS_ADDED)
+                    + tracker.count(Result.SDC_REFS_ADDED)
+                    + tracker.count(Result.SDC_REMOVALS)
                 )
                 process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                writes_after = (
+                    tracker.count(Result.SDC_CLAIMS_ADDED)
+                    + tracker.count(Result.SDC_REFS_ADDED)
+                    + tracker.count(Result.SDC_REMOVALS)
+                )
+
+                # If SDC actually changed for this ordinal, force a
+                # category re-render on the file page via a null edit.
+                # MediaWiki caches categories at render time; SDC writes
+                # don't propagate to the page's category list until the
+                # wikitext is re-evaluated. Without this the maintenance
+                # categories like "Digital Public Library of America
+                # files missing required SDC statements" cling on long
+                # after the SDC was added. Mirrors the touch pattern in
+                # ingest_wikimedia/categories.py's
+                # touch_files_for_institution().
+                if writes_after > writes_before and title and title != "?":
+                    try:
+                        pywikibot.FilePage(site, title).touch()
+                        logging.info(f" -- Touched '{title}' (category refresh).")
+                    except Exception as e:
+                        logging.warning(
+                            f" -- Failed to touch '{title}' for category refresh: {e!r}"
+                        )
                 synced_this_item = True
             # Only count an item as synced if at least one ordinal actually
             # made it past the pageid guard. An item whose every eligible
