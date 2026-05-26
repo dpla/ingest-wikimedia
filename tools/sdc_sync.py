@@ -1997,6 +1997,7 @@ def _run_partner_mode(partner, ids_file):
         dpla_ids = [line.strip() for line in f if line.strip()]
 
     logging.info(f"Partner mode: {partner} — {len(dpla_ids)} items from {ids_file}")
+    completed = False
     try:
         for local_count, dpla_id in enumerate(dpla_ids, start=1):
             # Item-start marker — `wikimedia_upload_status._sdc_progress`
@@ -2047,10 +2048,21 @@ def _run_partner_mode(partner, ids_file):
                 continue
 
             ordinals = upload_result.get("ordinals", {})
+            # Guard the type of `ordinals` before iteration — if the JSON
+            # sidecar is corrupt or its schema drifts (null, list, scalar),
+            # `ordinals.items()` would raise out of the whole loop and abort
+            # the partner batch. Same handling as any other mapping error.
+            if not isinstance(ordinals, dict):
+                logging.warning(
+                    f" -- upload-result.json has non-mapping `ordinals` for {dpla_id}; skipping."
+                )
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+                continue
             eligible = {
                 ord_str: data
                 for ord_str, data in ordinals.items()
-                if data.get("status") in ("UPLOADED", "SKIPPED")
+                if isinstance(data, dict)
+                and data.get("status") in ("UPLOADED", "SKIPPED")
             }
             if not eligible:
                 logging.info(" -- No SDC-eligible ordinals; skipping.")
@@ -2089,17 +2101,29 @@ def _run_partner_mode(partner, ids_file):
                 tracker.increment(Result.SDC_ITEMS_SYNCED)
             else:
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+        completed = True
     finally:
         elapsed = time.time() - start_time
-        # Terminal "COUNTS:" marker — the status script keys on it to detect
-        # SDC completion, mirroring downloader/uploader.
-        logging.info("\n" + str(tracker))
-        logging.info(f"{elapsed} seconds.")
-        notify_sdc_complete(
-            tracker=tracker,
-            partner_label=partner,
-            elapsed_seconds=elapsed,
-        )
+        # Emit the terminal "COUNTS:" marker and Slack completion message
+        # only on a successful loop completion. The shell-level failure
+        # handler (`notify_pipeline_fail`) will surface aborted runs via a
+        # separate `❌ pipeline step failed` message, so on the failure
+        # path we'd otherwise double-signal — and worse, the status script
+        # would treat the SDC phase as done based on the spurious COUNTS:
+        # line.
+        if completed:
+            logging.info("\n" + str(tracker))
+            logging.info(f"{elapsed} seconds.")
+            notify_sdc_complete(
+                tracker=tracker,
+                partner_label=partner,
+                elapsed_seconds=elapsed,
+            )
+        else:
+            logging.warning(
+                "SDC sync aborted before completion; suppressing terminal "
+                "COUNTS dump and notify_sdc_complete call."
+            )
 
 
 # We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
