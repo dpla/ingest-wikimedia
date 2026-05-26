@@ -440,6 +440,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
             Result.SDC_REMOVALS: 4,
             Result.SDC_ITEMS_SKIPPED_NO_SIDECAR: 2,
             Result.SDC_ITEMS_SKIPPED_MAPPING: 1,
+            Result.SDC_ORDINALS_SKIPPED_ERROR: 7,
         },
     )
     stats = captured["stats_lines"]
@@ -449,6 +450,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
     assert any(s.startswith("REMOVALS:") and "4" in s for s in stats)
     assert any("SKIPPED (no sidecar)" in s and "2" in s for s in stats)
     assert any("SKIPPED (mapping)" in s and "1" in s for s in stats)
+    assert any("ORDINAL ERRORS:" in s and "7" in s for s in stats)
     assert any("Runtime:" in s and "42s" in s for s in stats)
 
 

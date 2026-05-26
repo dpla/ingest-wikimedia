@@ -22,6 +22,12 @@ class Result(Enum):
     SDC_REMOVALS = auto()
     SDC_ITEMS_SKIPPED_NO_SIDECAR = auto()
     SDC_ITEMS_SKIPPED_MAPPING = auto()
+    # Ordinals whose SDC sync raised an unexpected exception
+    # (pywikibot APIError, network timeout, deep KeyError, etc.).
+    # Per-ordinal granularity so transient failures don't abort the
+    # whole partner batch — the matching try/except is in
+    # tools/sdc_sync.py::_run_partner_mode.
+    SDC_ORDINALS_SKIPPED_ERROR = auto()
 
 
 class Tracker:

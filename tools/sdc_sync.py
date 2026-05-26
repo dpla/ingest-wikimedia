@@ -2103,7 +2103,28 @@ def _run_partner_mode(partner, ids_file):
                     + tracker.count(Result.SDC_REFS_ADDED)
                     + tracker.count(Result.SDC_REMOVALS)
                 )
-                process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                # Per-ordinal exception boundary. Without this, any
+                # transient pywikibot APIError (rate limit, maxlag,
+                # transient 503), network timeout, or surprise
+                # KeyError/AssertionError deep in the property-builder
+                # propagates up through both nested loops and aborts
+                # the entire partner batch — losing thousands of items'
+                # worth of work because of one bad page. Other failure
+                # modes in this function (S3 ClientError, JSON parse,
+                # malformed ordinals) already skip-and-continue; this
+                # makes the actual SDC write follow the same pattern.
+                # `logging.exception` writes the full traceback into
+                # the SDC log file so notify_pipeline_fail's
+                # `_summarize_log` can surface it in Slack.
+                try:
+                    process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                except Exception:
+                    logging.exception(
+                        f" -- Ordinal {ord_str} ({mediaid}) for {dpla_id}:"
+                        " SDC sync failed; skipping ordinal."
+                    )
+                    tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+                    continue
                 writes_after = (
                     tracker.count(Result.SDC_CLAIMS_ADDED)
                     + tracker.count(Result.SDC_REFS_ADDED)
@@ -2138,6 +2159,17 @@ def _run_partner_mode(partner, ids_file):
             else:
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
         completed = True
+    except Exception:
+        # The per-ordinal try/except above already swallows every routine
+        # SDC-write failure. Reaching this outer handler means something
+        # truly outside-the-loop went wrong (sidecar enumeration, S3 auth,
+        # logger state, etc.). Log the traceback into the SDC log file so
+        # notify_pipeline_fail's `_summarize_log` can include it in the
+        # Slack failure message — otherwise the traceback only hits stderr
+        # (the file handler doesn't capture it) and the operator sees an
+        # abort warning with no diagnostic.
+        logging.exception("SDC sync aborted with unhandled exception")
+        raise
     finally:
         elapsed = time.time() - start_time
         # Emit the terminal "COUNTS:" marker and Slack completion message
