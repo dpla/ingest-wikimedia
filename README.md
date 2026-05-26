@@ -17,10 +17,10 @@ Pre-commit hooks use [ruff](https://docs.astral.sh/ruff/) for linting and format
 
 ## Running the pipeline
 
-The pipeline has three sequential phases, each invoked as a CLI command:
+The pipeline has four sequential phases, each invoked as a CLI command:
 
 ```bash
-# 1. Generate IDs and stage metadata (writes <partner>.csv)
+# 1. Generate IDs and stage metadata (writes <partner>.csv + per-item sdc.json sidecars)
 get-ids-es <partner>
 get-ids-es <partner> --institution "Institution Name"   # institution-level run
 
@@ -29,9 +29,12 @@ downloader <partner>.csv <partner>
 
 # 3. Upload from S3 to Wikimedia Commons
 uploader <partner>.csv <partner>
+
+# 4. Reconcile SDC (MediaInfo statements) on Commons against the staged sdc.json
+sdc-sync --partner <partner> --ids-file <partner>.csv
 ```
 
-All three must run from the partner's working directory on EC2 (e.g. `/home/ec2-user/ingest-wikimedia/bpl/`), where `config.toml` is resolved from CWD.
+All four must run from the partner's working directory on EC2 (e.g. `/home/ec2-user/ingest-wikimedia/bpl/`), where `config.toml` is resolved from CWD.
 
 **In practice, pipelines are launched via Slack or GitHub Actions** — see [docs/operations.md](docs/operations.md) for the full operations guide.
 
@@ -51,6 +54,7 @@ All three must run from the partner's working directory on EC2 (e.g. `/home/ec2-
 get-ids-es <partner> [--institution NAME] [--dry-run]
 downloader <partner>.csv <partner> [--dry-run] [--verbose]
 uploader   <partner>.csv <partner> [--dry-run] [--verbose]
+sdc-sync   --partner <partner> [--ids-file PATH]
 ```
 
 Pass `--help` to any command for full option details.
