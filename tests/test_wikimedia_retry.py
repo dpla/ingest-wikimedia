@@ -231,6 +231,42 @@ def test_retry_pipeline_does_not_export_download_log_via_pwd_subshell():
     )
 
 
+def test_retry_pipeline_escapes_dollar_in_notify_fail_cmd():
+    r"""Regression guard: the failure handler must use `\$?` and `\$rc`, not
+    `$?` and `$rc`, when capturing the failing step's exit code.
+
+    The whole pipeline_cmd is sent to tmux as a `"{pipeline_cmd}"`
+    double-quoted argument. Inside double quotes the outer bash on EC2
+    expands `$?` and `$rc` *before* tmux ever sees the command — using
+    its own (unrelated) last-command status and undefined `$rc`. Without
+    the backslashes the inner shell ends up with literal
+    `rc=0; WIKIMEDIA_LAST_EXIT= python3 -c '...'`, so every Slack failure
+    notification silently loses the exit-code suffix that decodes signals
+    like 137 (SIGKILL / probable OOM).
+    """
+    commands = _run_main_and_capture_full_pipeline(
+        ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
+    )
+    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+
+    assert r"rc=\$?" in pipeline_cmd, (
+        "notify_fail_cmd must use `rc=\\$?` (backslash-escaped) so the outer "
+        "bash leaves the `$` literal and the inner shell evaluates `$?` "
+        f"against the failing step; got: {pipeline_cmd!r}"
+    )
+    assert r"WIKIMEDIA_LAST_EXIT=\$rc" in pipeline_cmd, (
+        "notify_fail_cmd must use `WIKIMEDIA_LAST_EXIT=\\$rc` (backslash-"
+        "escaped) so $rc is read by the inner shell, not the outer one; "
+        f"got: {pipeline_cmd!r}"
+    )
+    # Defence: make sure the UNESCAPED form isn't hiding somewhere else in
+    # the command. If it ever reappears the silent-loss bug returns.
+    assert "rc=$?" not in pipeline_cmd, (
+        "found unescaped `rc=$?` in pipeline_cmd; outer bash will expand "
+        f"$? prematurely. Use `rc=\\$?`. Got: {pipeline_cmd!r}"
+    )
+
+
 def test_retry_clears_stale_csvs_even_when_no_partner_given():
     """When the user runs `/wikimedia-upload retry 30` (no partner), the
     scan still needs to clear stale CSVs so that hubs which legitimately

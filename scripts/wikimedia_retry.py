@@ -225,8 +225,18 @@ def main() -> None:
 
     # `rc=$?` captures the failing step's exit code so the Slack message can
     # decode signals like 137 (SIGKILL / probable OOM) and 143 (SIGTERM).
+    #
+    # The `$?` and `$rc` references MUST be backslash-escaped. notify_fail_cmd
+    # is embedded inside a `"{pipeline_cmd}"` double-quoted argument when the
+    # tmux command is built (see the launch path below), and the outer bash on
+    # EC2 expands unescaped `$` references inside double quotes before tmux
+    # sees the command. Without the escapes the inner shell ends up with
+    # `rc=0; WIKIMEDIA_LAST_EXIT= python3 -c '...'` and Slack failure
+    # notifications silently lose their exit-code suffix. With `\$?` and
+    # `\$rc` the outer bash leaves the `$` literal and the inner shell
+    # evaluates the references against the actual failing step's status.
     notify_fail_cmd = (
-        "rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c "
+        r"rc=\$?; WIKIMEDIA_LAST_EXIT=\$rc python3 -c "
         "'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'"
     )
     setup = " && ".join(
