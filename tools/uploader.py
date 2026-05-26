@@ -1,8 +1,10 @@
 import concurrent.futures
 import datetime
+import gc
 import json
 import logging
 import mimetypes
+import os
 import random
 import time
 
@@ -72,6 +74,51 @@ UPLOAD_RETRY_MAX_DELAY_SECS = 60
 # pywikibot's async upload polls Commons indefinitely when the job queue is stuck.
 # This cap ensures a single hung upload never freezes the whole session.
 UPLOAD_TIMEOUT_SECS = 3600  # 1 hour
+
+# Wikimedia's MediaWiki API rejects single-request upload bodies above roughly
+# 100 MB (the exact threshold varies with infrastructure; the practical hard
+# limit observed in NARA runs is between 100–200 MB before the gateway closes
+# the connection mid-stream).  Pywikibot's chunk_size=0 path puts the entire
+# file in one HTTP body, and its internal request-retry loop keeps that body
+# alive via exception tracebacks across retries — a single 211 MB upload was
+# observed to grow the process to 6.7 GB resident before OOM.  Above this
+# size we force chunked upload regardless of any other flag: stash chunks are
+# bounded at WMC_UPLOAD_CHUNK_SIZE (20 MB), so peak memory stays well under
+# control even on the same internal retry pattern.
+LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES = 95 * 1024 * 1024  # 95 MB
+
+
+def select_upload_chunk_size(
+    *,
+    file_exists: bool,
+    force_ignore_warnings: bool,
+    file_size_bytes: int,
+) -> tuple[int, bool]:
+    """Pick the pywikibot ``chunk_size`` for an upload attempt.
+
+    Returns ``(chunk_size, prefers_direct)``.  ``chunk_size`` is ``0`` for
+    a direct whole-body POST or :data:`WMC_UPLOAD_CHUNK_SIZE` for the
+    chunked stash-commit path.  ``prefers_direct`` reflects whether the
+    caller's flags would have chosen direct — useful to pick the matching
+    ``ignore_warnings`` value and to log a size-override decision.
+
+    Either ``file_exists`` (target Commons page already has content we
+    want to overwrite) or ``force_ignore_warnings`` (hash-drift path has
+    accepted a duplicate SHA1) makes direct preferred, because direct
+    suppresses MediaWiki warnings the stash-commit path can't.
+
+    Above :data:`LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES` the override fires:
+    Wikimedia's API gateway rejects single-body uploads at that size, so
+    the warning-bypass benefit is moot and we must chunk regardless.  A
+    bounded failure (e.g. fileexists-shared-forbidden at commit) is
+    strictly better than OOM-killing the whole run.
+    """
+    prefers_direct = file_exists or force_ignore_warnings
+    must_chunk_for_size = file_size_bytes > LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES
+    if prefers_direct and not must_chunk_for_size:
+        return 0, prefers_direct
+    return WMC_UPLOAD_CHUNK_SIZE, prefers_direct
+
 
 # Per-ordinal status strings written to <partner>/<dpla_id>/upload-result.json
 # and consumed by the SDC sync phase (PR 4). The SDC phase only attempts
@@ -399,26 +446,29 @@ class Uploader:
                         # valid sibling (same-item relic) or a foreign file
                         # (cross-item) and must not be tagged as a duplicate.
 
-                # Use direct upload (chunk_size=0) + ignore_warnings=True when the
-                # file page already exists, or when the hash already lives elsewhere
-                # on Commons (drift case). The stash-commit path raises
-                # fileexists-shared-forbidden even on valid overwrites; the direct
-                # path with ignorewarnings=1 bypasses it. True (vs IGNORE_WIKIMEDIA_WARNINGS)
-                # is intentional — for an overwrite we want to suppress all warnings,
-                # including 'exists' variants that would fire on the direct path.
+                # Direct vs. chunked upload decision — see
+                # select_upload_chunk_size for the contract. The on-disk
+                # temp-file size is authoritative (S3 content_length may have
+                # been a stale stub before the re-download path fired).
                 file_exists = (
                     wiki_file_page.exists() and not wiki_file_page.isRedirectPage()
                 )
-                chunk_size = (
-                    0
-                    if (file_exists or force_ignore_warnings)
-                    else WMC_UPLOAD_CHUNK_SIZE
+                temp_file_size = os.path.getsize(temp_file.name)
+                chunk_size, prefers_direct = select_upload_chunk_size(
+                    file_exists=file_exists,
+                    force_ignore_warnings=force_ignore_warnings,
+                    file_size_bytes=temp_file_size,
                 )
-                upload_warnings = (
-                    True
-                    if (file_exists or force_ignore_warnings)
-                    else IGNORE_WIKIMEDIA_WARNINGS
-                )
+                if prefers_direct and chunk_size != 0:
+                    logging.info(
+                        f"Forcing chunked upload for {dpla_id} {ordinal}: "
+                        f"file size {temp_file_size:,} B exceeds direct-upload "
+                        f"limit {LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES:,} B "
+                        f"(would have used chunk_size=0 for "
+                        f"file_exists={file_exists}, "
+                        f"force_ignore_warnings={force_ignore_warnings})."
+                    )
+                upload_warnings = True if prefers_direct else IGNORE_WIKIMEDIA_WARNINGS
 
                 result = None
                 # Avoid the `with executor:` context manager — its __exit__ calls
@@ -428,6 +478,7 @@ class Uploader:
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
                     for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                        future = None
                         try:
                             future = executor.submit(
                                 self.site.upload,
@@ -465,6 +516,15 @@ class Uploader:
                                     f"{MAX_UPLOAD_RETRIES}, retrying in "
                                     f"{delay:.1f}s: {ex}"
                                 )
+                                # Release the failed Future before sleeping —
+                                # its retained traceback frame holds pywikibot's
+                                # request body buffer (the entire file for
+                                # chunk_size=0). Without this, body buffers from
+                                # each failed attempt pile up across the retry
+                                # loop's sleep, plus pywikibot's inner retry
+                                # loop's own accumulated allocations.
+                                del future
+                                gc.collect()
                                 time.sleep(delay)
                             else:
                                 if is_backend_fail:
@@ -472,6 +532,10 @@ class Uploader:
                                 raise
                 finally:
                     executor.shutdown(wait=False)
+                    # Final sweep — clears the last attempt's Future and any
+                    # cycle-trapped pywikibot request/response objects so the
+                    # next process_file iteration doesn't inherit them.
+                    gc.collect()
 
                 if not result:
                     # upload() returned None — file exists under a different page
