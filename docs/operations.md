@@ -264,6 +264,8 @@ The `wikimedia-launch.yml` workflow accepts two boolean inputs that swap the def
 
 - **`refresh_only=true`** — runs `get-ids-es → downloader` only (no uploader, no SDC). For re-downloading aged media files in S3 without re-uploading. The downloader is invoked with `--notify-complete` so its own Slack summary fires at the end. `max_age_days=N` controls the re-download threshold (default: > 365 days).
 - **`sdc_only=true`** — runs `get-ids-es → sdc-sync` only (no downloader, no uploader). For backfilling or refreshing SDC on items that were uploaded in a prior session, including picking up changes to ingestion3's `institutions_v2.json` / `subjects.json` mappings. The `get-ids-es` step re-stages each item's `sdc.json` from current ingestion3 data; `sdc-sync` then reconciles Commons against that.
+  - **Targets without sdc.json re-staging**: single-item DPLA IDs (which use `resolve-dpla-ids` + `printf`) and NARA hub-level targets (which use `get-ids-nara`) do **not** re-stage `sdc.json`. For these, `sdc-sync` replays whatever sidecar the original upload run wrote. The launcher prints a stderr warning when this combination is detected. Useful for re-running fixed sdc-sync logic against a specific item; not useful for picking up upstream mapping changes.
+  - `max_age_days` is ignored in `sdc_only` mode (no download phase runs).
 
 ---
 

@@ -381,6 +381,40 @@ def main() -> None:
         detail = ("\n• " + "\n• ".join(skipped_warnings)) if skipped_warnings else ""
         _slack_fail(response_url, f"No valid targets to launch.{detail}")
 
+    # `--sdc-only` is meaningful only for targets whose ID-generation step
+    # re-stages sdc.json. Two target types use a different path:
+    #   * Single-item DPLA IDs — the launcher writes the one ID via `printf`
+    #     to skip the enumeration phase; `resolve-dpla-ids` (run at startup)
+    #     stages `dpla-map.json` but NOT `sdc.json`.
+    #   * NARA hub-level — uses `get-ids-nara` (NARA catalog enumeration,
+    #     not ingestion3 ES), which also doesn't write `sdc.json`.
+    # For these, sdc-sync will replay whatever sidecar the *original* upload
+    # run wrote. That's fine for re-running PR-#251-style code changes
+    # against a known item, but operators backfilling for upstream mapping
+    # changes need to know they won't pick up. Warn loudly rather than
+    # silently using stale data.
+    if sdc_only:
+        stale_sdc_target_labels = [
+            lbl
+            for canonical, institution, lbl, dpla_id, _ in targets
+            if dpla_id is not None or (canonical == "nara" and institution is None)
+        ]
+        if stale_sdc_target_labels:
+            print(
+                "Warning: --sdc-only with single-item DPLA IDs or NARA"
+                " hub-level targets will use the existing sdc.json sidecars"
+                " (last written by get-ids-es during the original upload"
+                " run). These targets cannot re-stage sdc.json. Affected:"
+                f" {', '.join(stale_sdc_target_labels)}.",
+                file=sys.stderr,
+            )
+        if max_age_days is not None:
+            print(
+                "Warning: --max-age-days is ignored in --sdc-only mode"
+                " (no download phase runs).",
+                file=sys.stderr,
+            )
+
     # Session name uses + as separator (unambiguous since slugs/institution names use -).
     # Institution-level targets include the hub slug as a prefix so the status script
     # can derive the EC2 directory: "indiana|Indiana State Library" → wikimedia-indiana+indiana-state-library.

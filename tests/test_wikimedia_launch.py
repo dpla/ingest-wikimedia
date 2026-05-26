@@ -52,11 +52,21 @@ def test_sdc_only_alone_is_accepted_at_parse_time(monkeypatch, capsys):
     we just confirm parse_args + the mutual-exclusion gate let it
     through to the next step.
 
-    We do this by passing an unresolvable target so the launcher errors
-    out *after* the flag-parsing step rather than at it. SystemExit from
-    `_slack_fail("No valid targets to launch...")` confirms parsing
-    succeeded.
+    Stub `ssm_run` so the SystemExit comes from a deterministic post-parse
+    point (`_slack_fail("Failed to heal EC2 file ownership: …")`), not
+    from an implicit AWS-credential failure that depends on whether the
+    test runner happens to have creds. The assertion that matters is just
+    that the exit is NOT the mutual-exclusion message — any post-parse
+    exit point satisfies it.
     """
+    monkeypatch.setattr(
+        "scripts.wikimedia_launch.boto3.client",
+        lambda *a, **kw: object(),
+    )
+    monkeypatch.setattr(
+        "scripts.wikimedia_launch.ssm_run",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("ssm stubbed")),
+    )
     exit_info = _run_main(
         [
             "--partner",
