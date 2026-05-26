@@ -395,3 +395,45 @@ def notify_upload_complete(
             f"Runtime:  {runtime}",
         ],
     )
+
+
+def notify_sdc_complete(
+    tracker: Tracker,
+    partner_label: str,
+    elapsed_seconds: float,
+    dry_run: bool = False,
+) -> None:
+    """Post the SDC phase's completion summary to #tech-alerts.
+
+    Same channel and block shape as `notify_upload_complete` — the user
+    sees one message per phase. Counter set differs because SDC writes
+    statements + references to existing MediaInfo entities rather than
+    uploading new files; "items synced" is the per-DPLA-ID count, and the
+    SKIPPED_* lines surface items the partner-mode loop bailed on because
+    their sidecars were missing or malformed.
+    """
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+
+    effective_label = (
+        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
+    )
+    runtime = _format_runtime(elapsed_seconds)
+    dry_run_note = " _(dry run)_" if dry_run else ""
+
+    _post_completion_notice(
+        token=token,
+        header=f"*Wikimedia SDC Complete: {effective_label}*{dry_run_note}",
+        plain_text=f"Wikimedia SDC complete: {effective_label}",
+        stats_lines=[
+            f"ITEMS SYNCED:         {tracker.count(Result.SDC_ITEMS_SYNCED):,}",
+            f"CLAIMS ADDED:         {tracker.count(Result.SDC_CLAIMS_ADDED):,}",
+            f"REFS ADDED:           {tracker.count(Result.SDC_REFS_ADDED):,}",
+            f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",
+            f"SKIPPED (no sidecar): {tracker.count(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR):,}",
+            f"SKIPPED (mapping):    {tracker.count(Result.SDC_ITEMS_SKIPPED_MAPPING):,}",
+            f"Runtime:              {runtime}",
+        ],
+    )

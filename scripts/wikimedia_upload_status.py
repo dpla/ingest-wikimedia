@@ -20,19 +20,20 @@ from ingest_wikimedia.ssm import REGION, ssm_run
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
+_SDC_COMPLETE_PREFIX = "SDC complete"
 
 
 def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
 
-    Log filenames follow "{YYYYMMDD}-{HHMMSS}-{label}-(download|upload).log".
+    Log filenames follow "{YYYYMMDD}-{HHMMSS}-{label}-(download|upload|sdc).log".
     The pattern must match `…-bpl+phillips-academy-download.log` and NOT
     `…-bpl+phillips-academy-andover-download.log` — otherwise sibling
     labels whose names extend this one steal the log selection and the
     status report sticks on the wrong target. See lessons.md
     "Log filename phase detection".
     """
-    return rf"-{re.escape(label)}-(download|upload)\.log$"
+    return rf"-{re.escape(label)}-(download|upload|sdc)\.log$"
 
 
 _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
@@ -180,6 +181,22 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
             return f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
         return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){stale_suffix}"
 
+    if log_file.endswith("-sdc.log"):
+        # sdc-sync's _run_partner_mode logs `DPLA ID: <id> (n/total)` per
+        # item — same `DPLA ID:` marker the awk pass already counts. Uses
+        # the COUNTS: terminal marker as the completion signal, matching
+        # the downloader/uploader convention. The reported figure is
+        # "items processed" (i.e. iterated by the loop) rather than
+        # "items synced" because some processed items may have been
+        # skipped for missing sidecars or mapping issues — the Slack
+        # summary surfaces the real synced count via the tracker's
+        # SDC_ITEMS_SYNCED line.
+        if dpla_id_count == 0:
+            return "SDC syncing (starting...)"
+        if counts_marker > 0:
+            return f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)"
+        return f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
+
     return "Unknown"
 
 
@@ -291,6 +308,8 @@ def main() -> None:
                     label = log_filename[: -len("-download.log")]
                 elif log_filename.endswith("-upload.log"):
                     label = log_filename[: -len("-upload.log")]
+                elif log_filename.endswith("-sdc.log"):
+                    label = log_filename[: -len("-sdc.log")]
                 else:
                     return session, f"Unknown (unrecognised log: {log_filename!r})"
                 raw_hub = label.removeprefix("retry-")
@@ -343,6 +362,7 @@ def main() -> None:
             if not (
                 phase.startswith(_UPLOAD_COMPLETE_PREFIX)
                 or phase.startswith(_DOWNLOAD_COMPLETE_PREFIX)
+                or phase.startswith(_SDC_COMPLETE_PREFIX)
             ):
                 # Active or stalled label — this is the one to report.
                 return session, f"[{label}] {phase}" if multi else phase
