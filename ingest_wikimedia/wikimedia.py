@@ -504,6 +504,27 @@ def post_commonsdelinker_request(
     Both filenames should be bare (without the 'File:' namespace prefix).
     Each call makes one edit, matching the one-request-per-edit convention
     used by other editors on that page.
+
+    Uses the MediaWiki `appendtext` API parameter rather than the naive
+    read-modify-write (`page.text = page.text + template; page.save()`).
+    The naive form races itself on this page in particular: a single
+    uploader run can post hundreds of requests in rapid succession, and
+    the GET that pywikibot issues to populate `page.text` is load-balanced
+    across MediaWiki replica databases that may be lagged behind the
+    primary by the time we POST. The resulting basetimestamp is older
+    than the primary's current revision (the one OUR previous successful
+    edit just produced), and the primary rejects with `editconflict` —
+    a self-inflicted conflict despite our bot being the only editor.
+
+    `appendtext` sidesteps both halves of that race:
+
+      * No GET — pywikibot skips reading `page.text`, so there is no
+        ~230 KB-and-growing payload pulled into the process on every
+        call (a major memory accumulator that contributed to a recent
+        OOM kill of the uploader).
+      * No basetimestamp — MediaWiki concatenates atomically on the
+        primary; conflicting concurrent edits can no longer cause
+        spurious rejections.
     """
     page = pywikibot.Page(site, COMMONSDELINKER_PAGE)
     template = (
@@ -513,8 +534,9 @@ def post_commonsdelinker_request(
         f"|reason={_COMMONSDELINKER_REASON}}}}}"
     )
     summary = f"universal replace: [[File:{old_filename}]] → [[File:{new_filename}]]"
-    page.text = page.text.rstrip("\n") + "\n" + template
-    page.save(summary=summary, minor=False)
+    # Leading newline so the new request lands on its own line regardless
+    # of whether the existing page ends with one.
+    site.editpage(page, summary=summary, minor=False, appendtext="\n" + template)
 
 
 def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
@@ -645,11 +667,21 @@ def tag_as_duplicate(
 
     correct_filename should be bare (no 'File:' prefix).
     reason is the free-text reason shown in the template.
+
+    Uses the MediaWiki `prependtext` API parameter so the existing page
+    text doesn't need to be fetched into the process just to be re-saved
+    unchanged. Each call writes a different file page (so self-conflicts
+    of the kind that hit `post_commonsdelinker_request` aren't possible
+    here), but the read-modify-write form still costs an extra GET per
+    call and is vulnerable to rare external edit conflicts on the same
+    page. `prependtext` skips the GET, skips the basetimestamp check,
+    and lets MediaWiki concatenate atomically on the primary.
     """
     tag = f"{{{{Duplicate|{correct_filename}|{reason}}}}}"
     summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
-    file_page.text = tag + "\n" + file_page.text
-    file_page.save(summary=summary, minor=False)
+    # Trailing newline so the tag sits on its own line above whatever
+    # wikitext currently starts the page.
+    site.editpage(file_page, summary=summary, minor=False, prependtext=tag + "\n")
 
 
 INVALID_CONTENT_TYPES = frozenset(
