@@ -308,6 +308,8 @@ def main() -> None:
                     label = log_filename[: -len("-download.log")]
                 elif log_filename.endswith("-upload.log"):
                     label = log_filename[: -len("-upload.log")]
+                elif log_filename.endswith("-sdc.log"):
+                    label = log_filename[: -len("-sdc.log")]
                 else:
                     return session, f"Unknown (unrecognised log: {log_filename!r})"
                 raw_hub = label.removeprefix("retry-")
