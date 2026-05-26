@@ -14,6 +14,14 @@ class Result(Enum):
     RETIRED = auto()
     ORPHANS_TAGGED = auto()
     ORPHANS_FLAGGED = auto()
+    # SDC phase counters. `Tracker.__str__` already prints only non-zero
+    # values, so adding these here doesn't affect downloader/uploader output.
+    SDC_ITEMS_SYNCED = auto()
+    SDC_CLAIMS_ADDED = auto()
+    SDC_REFS_ADDED = auto()
+    SDC_REMOVALS = auto()
+    SDC_ITEMS_SKIPPED_NO_SIDECAR = auto()
+    SDC_ITEMS_SKIPPED_MAPPING = auto()
 
 
 class Tracker:

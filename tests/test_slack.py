@@ -18,6 +18,7 @@ from ingest_wikimedia.slack import (
     _read_download_failed_count,
     _summarize_log,
     notify_pipeline_fail,
+    notify_sdc_complete,
     notify_upload_complete,
 )
 from ingest_wikimedia.tracker import Result, Tracker
@@ -383,6 +384,107 @@ def test_notify_upload_complete_upload_only_retry_ignores_stale_download_log(
     assert "Retry Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
     assert failed_lines == ["FAILED:   0"]
+
+
+def _capture_sdc_completion_message(env: dict, tracker_counts: dict) -> dict:
+    """Mirror of `_capture_completion_message` for `notify_sdc_complete`."""
+    tracker = MagicMock(spec=Tracker)
+    tracker.count.side_effect = lambda result: tracker_counts.get(result, 0)
+    captured: dict = {}
+
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch("ingest_wikimedia.slack._post_completion_notice") as mock_post,
+    ):
+        mock_post.side_effect = lambda **kwargs: captured.update(kwargs)
+        notify_sdc_complete(
+            tracker=tracker,
+            partner_label="minnesota",
+            elapsed_seconds=42.0,
+            dry_run=False,
+        )
+    return captured
+
+
+def test_notify_sdc_complete_header_uses_session_label():
+    """Confirms the SDC Slack summary header is "Wikimedia SDC Complete:
+    wikimedia-<session label>", matching the shape of upload-complete."""
+    captured = _capture_sdc_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "minnesota",
+        },
+        tracker_counts={
+            Result.SDC_ITEMS_SYNCED: 3,
+            Result.SDC_CLAIMS_ADDED: 7,
+            Result.SDC_REFS_ADDED: 5,
+        },
+    )
+    assert captured["header"] == "*Wikimedia SDC Complete: wikimedia-minnesota*"
+    assert captured["plain_text"] == "Wikimedia SDC complete: wikimedia-minnesota"
+
+
+def test_notify_sdc_complete_stats_reflect_tracker_counts():
+    """ITEMS SYNCED / CLAIMS ADDED / REFS ADDED / REMOVALS / SKIPPED lines
+    pull from the corresponding Result enum members, and Runtime formats
+    elapsed_seconds."""
+    captured = _capture_sdc_completion_message(
+        env={
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "minnesota",
+        },
+        tracker_counts={
+            Result.SDC_ITEMS_SYNCED: 100,
+            Result.SDC_CLAIMS_ADDED: 250,
+            Result.SDC_REFS_ADDED: 30,
+            Result.SDC_REMOVALS: 4,
+            Result.SDC_ITEMS_SKIPPED_NO_SIDECAR: 2,
+            Result.SDC_ITEMS_SKIPPED_MAPPING: 1,
+        },
+    )
+    stats = captured["stats_lines"]
+    assert any(s.startswith("ITEMS SYNCED:") and "100" in s for s in stats)
+    assert any(s.startswith("CLAIMS ADDED:") and "250" in s for s in stats)
+    assert any(s.startswith("REFS ADDED:") and "30" in s for s in stats)
+    assert any(s.startswith("REMOVALS:") and "4" in s for s in stats)
+    assert any("SKIPPED (no sidecar)" in s and "2" in s for s in stats)
+    assert any("SKIPPED (mapping)" in s and "1" in s for s in stats)
+    assert any("Runtime:" in s and "42s" in s for s in stats)
+
+
+def test_notify_sdc_complete_dry_run_adds_suffix():
+    """`dry_run=True` appends the same italicized note as upload-complete."""
+    tracker = MagicMock(spec=Tracker)
+    tracker.count.return_value = 0
+    captured: dict = {}
+    with (
+        patch.dict(
+            os.environ,
+            {"DPLA_SLACK_BOT_TOKEN": "x", "WIKIMEDIA_SESSION_LABEL": "minnesota"},
+            clear=True,
+        ),
+        patch("ingest_wikimedia.slack._post_completion_notice") as mock_post,
+    ):
+        mock_post.side_effect = lambda **kwargs: captured.update(kwargs)
+        notify_sdc_complete(
+            tracker=tracker,
+            partner_label="minnesota",
+            elapsed_seconds=1.0,
+            dry_run=True,
+        )
+    assert captured["header"].endswith("_(dry run)_")
+
+
+def test_notify_sdc_complete_skipped_without_token(monkeypatch, caplog):
+    """Without DPLA_SLACK_BOT_TOKEN we must skip silently (just warn)."""
+    monkeypatch.delenv("DPLA_SLACK_BOT_TOKEN", raising=False)
+    tracker = MagicMock(spec=Tracker)
+    tracker.count.return_value = 0
+    with patch("ingest_wikimedia.slack._post_completion_notice") as mock_post:
+        notify_sdc_complete(
+            tracker=tracker, partner_label="minnesota", elapsed_seconds=1.0
+        )
+        mock_post.assert_not_called()
 
 
 def test_notify_upload_complete_clean_retry_still_titled_retry_complete(tmp_path):

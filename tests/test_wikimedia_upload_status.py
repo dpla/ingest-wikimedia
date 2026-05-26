@@ -35,12 +35,13 @@ def test_log_filename_pattern_matches_only_exact_label():
 
 
 def test_log_filename_pattern_matches_only_phase_suffixes():
-    """Only -download.log and -upload.log are valid phase logs."""
+    """Only -download.log, -upload.log, and -sdc.log are valid phase logs."""
     from scripts.wikimedia_upload_status import log_filename_pattern_for_label
 
     pattern = re.compile(log_filename_pattern_for_label("nara"))
     assert pattern.search("20260522-100000-nara-download.log")
     assert pattern.search("20260522-100000-nara-upload.log")
+    assert pattern.search("20260522-100000-nara-sdc.log")
     # Other phases (e.g. legacy retirer logs) must NOT match
     assert not pattern.search("20251220-012010-nara-retirer.log")
     assert not pattern.search("20260522-100000-nara-fix.log")
@@ -118,3 +119,99 @@ def test_log_filename_pattern_always_starts_with_dash():
             f"Pattern for {label!r} must lead with `-` so the anchor before "
             "the label binds; callers must compensate with `grep -E --`."
         )
+
+
+def _fake_ssm_for_phase(log_filename: str, awk_counts: list[int], csv_total: int):
+    """Build a fake `ssm_run` that returns the precheck + counts payload
+    `get_phase_and_progress` expects, with the named log file and counts.
+
+    Sequence (matches the real two-call flow):
+      1. precheck — `session_created\nlog_filename`
+      2. main — `now\nmtime\nSEP\ntail\nSEP\n<5 lines of awk + wc>`
+    """
+    call_count = [0]
+    sep = "__WM_SEP__"
+
+    def fake_ssm_run(_client, _command, **_kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return f"1700000000\n{log_filename}\n"
+        # now=mtime so no staleness suffix; counts payload then csv_total
+        body = f"1700000000\n1700000000\n{sep}\nlast log line\n{sep}\n"
+        body += "\n".join(str(n) for n in awk_counts) + "\n"
+        body += f"{csv_total}\n"
+        return body
+
+    return fake_ssm_run
+
+
+def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
+    """An -sdc.log with DPLA IDs logged but no terminal COUNTS marker
+    surfaces as "SDC syncing (N / total items, ~pct%)".
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    # awk_counts layout: [dpla_id_count, uploaded, skipping, counts_marker]
+    fake = _fake_ssm_for_phase(
+        log_filename="20260525-200000-minnesota-sdc.log",
+        awk_counts=[3, 0, 0, 0],
+        csv_total=10,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase = get_phase_and_progress(
+            client=None,
+            session="wikimedia-minnesota",
+            hub="minnesota",
+            label="minnesota",
+        )
+    assert phase.startswith("SDC syncing")
+    assert "3" in phase
+    assert "10" in phase
+
+
+def test_get_phase_and_progress_reports_sdc_complete():
+    """An -sdc.log whose awk pass found a COUNTS: terminal marker surfaces
+    as "SDC complete (N items synced)" so the walker can mark it done.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260525-200000-minnesota-sdc.log",
+        awk_counts=[10, 0, 0, 1],  # 10 items, COUNTS marker present
+        csv_total=10,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase = get_phase_and_progress(
+            client=None,
+            session="wikimedia-minnesota",
+            hub="minnesota",
+            label="minnesota",
+        )
+    assert phase.startswith("SDC complete"), phase
+    assert "10" in phase
+
+
+def test_get_phase_and_progress_reports_sdc_starting_with_no_items():
+    """An -sdc.log that exists but hasn't logged any `DPLA ID:` lines yet
+    surfaces as "SDC syncing (starting...)" — no false staleness."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260525-200000-minnesota-sdc.log",
+        awk_counts=[0, 0, 0, 0],
+        csv_total=10,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase = get_phase_and_progress(
+            client=None,
+            session="wikimedia-minnesota",
+            hub="minnesota",
+            label="minnesota",
+        )
+    assert phase == "SDC syncing (starting...)"

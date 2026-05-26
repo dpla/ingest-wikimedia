@@ -645,6 +645,14 @@ def main() -> None:
         ]
         if not refresh_only:
             pipeline_steps.append(f"uploader {csv_file} {canonical}")
+            # SDC sync is the final step of every upload run: it reads the
+            # per-item sdc.json (staged by get-ids-es) and upload-result.json
+            # (written by uploader) sidecars and posts MediaInfo statements
+            # to Commons. Skipped for refresh_only because no upload phase
+            # ran — there's no upload-result.json to drive from.
+            pipeline_steps.append(
+                f"sdc-sync --partner {canonical} --ids-file {csv_file}"
+            )
         target_steps = " && ".join(pipeline_steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"

@@ -1,6 +1,7 @@
 # TODO caption, date, page, iiif manifest, url
 
 import copy
+import logging
 import pywikibot
 import requests
 import re
@@ -16,83 +17,104 @@ import urllib.parse
 from bs4 import BeautifulSoup
 from pywikibot.comms import http
 from pywikibot import pagegenerators
+from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.slack import notify_sdc_complete
+from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
 
-# When running manually, sometimes it is helpful to specify the category to work on in the command line, using --cat "<category>".
+# Module-level SDC tracker. Counters accumulate across one invocation of
+# main() — the helpers (`_post_new_refs`, `_post_new_claims`,
+# `_reconcile_existing_claims`) increment as their POSTs succeed, and
+# `_run_partner_mode` increments the per-item skip / sync counters.
+tracker = Tracker()
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--cat",
-    dest="cat",
-    metavar="CAT",
-    action="store",
-    help="Commons category name (without 'Category:' prefix) to enumerate File: pages from",
-)
-parser.add_argument(
-    "--recurse",
-    dest="recurse",
-    action="store_true",
-    help="When using --cat, also walk subcategories",
-)
-parser.add_argument("--method", dest="method", metavar="METHOD", action="store")
-parser.add_argument("--lists", dest="lists", metavar="LISTS", action="store")
-parser.add_argument(
-    "--file",
-    dest="files",
-    metavar="FILE",
-    action="append",
-    help="Commons file title to process directly (repeatable)",
-)
-parser.add_argument(
-    "--limit",
-    dest="limit",
-    type=int,
-    default=0,
-    help="When using --cat, stop after this many files (0 = no limit)",
-)
-parser.add_argument(
-    "--from-s3",
-    dest="from_s3",
-    metavar="PARTNER",
-    action="store",
-    default=None,
-    help=(
-        "Read each DPLA item's metadata from the dpla-map.json staged in S3 "
-        "by get-ids-es (under the partner's sharded item prefix; resolved by "
-        "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
-        "to api.dp.la when an item's dpla-map.json is missing."
-    ),
-)
-parser.add_argument(
-    "--partner",
-    dest="partner",
-    metavar="PARTNER",
-    action="store",
-    default=None,
-    help=(
-        "Partner-driven SDC sync from precomputed S3 sidecars. Iterates the "
-        "partner's IDs CSV (defaults to <PARTNER>/<PARTNER>.csv) and for each "
-        "DPLA ID reads sdc.json (staged by get-ids-es) and upload-result.json "
-        "(written by uploader). Posts SDC only for ordinals whose uploader "
-        "status is UPLOADED or SKIPPED. No api.dp.la calls."
-    ),
-)
-parser.add_argument(
-    "--ids-file",
-    dest="ids_file",
-    metavar="PATH",
-    action="store",
-    default=None,
-    help=(
-        "When using --partner, the IDs CSV path. Defaults to "
-        "<PARTNER>/<PARTNER>.csv (matching the uploader's input convention)."
-    ),
-)
-args = parser.parse_args()
+# Module-level handles populated by `_initialize()` inside main(). Importing
+# this module does no I/O — only running it (or calling main() from the
+# `sdc-sync` console-script entry point) triggers argparse, config reads,
+# Commons login, and the institutions_v2.json/subjects.json fetches.
+parser: argparse.ArgumentParser
+args: argparse.Namespace
+method: str = "livecat"
+dpla_api: str
+site: pywikibot.site.BaseSite
+hubs: dict
+rights: dict
+subject_ids: dict
+_s3_partner: str | None = None
+_s3_client = None
 
-method = "livecat"
-if args.method:
-    method = args.method
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argparse parser. Pure — no side effects."""
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--cat",
+        dest="cat",
+        metavar="CAT",
+        action="store",
+        help="Commons category name (without 'Category:' prefix) to enumerate File: pages from",
+    )
+    p.add_argument(
+        "--recurse",
+        dest="recurse",
+        action="store_true",
+        help="When using --cat, also walk subcategories",
+    )
+    p.add_argument("--method", dest="method", metavar="METHOD", action="store")
+    p.add_argument("--lists", dest="lists", metavar="LISTS", action="store")
+    p.add_argument(
+        "--file",
+        dest="files",
+        metavar="FILE",
+        action="append",
+        help="Commons file title to process directly (repeatable)",
+    )
+    p.add_argument(
+        "--limit",
+        dest="limit",
+        type=int,
+        default=0,
+        help="When using --cat, stop after this many files (0 = no limit)",
+    )
+    p.add_argument(
+        "--from-s3",
+        dest="from_s3",
+        metavar="PARTNER",
+        action="store",
+        default=None,
+        help=(
+            "Read each DPLA item's metadata from the dpla-map.json staged in S3 "
+            "by get-ids-es (under the partner's sharded item prefix; resolved by "
+            "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
+            "to api.dp.la when an item's dpla-map.json is missing."
+        ),
+    )
+    p.add_argument(
+        "--partner",
+        dest="partner",
+        metavar="PARTNER",
+        action="store",
+        default=None,
+        help=(
+            "Partner-driven SDC sync from precomputed S3 sidecars. Iterates the "
+            "partner's IDs CSV (defaults to <PARTNER>/<PARTNER>.csv) and for each "
+            "DPLA ID reads sdc.json (staged by get-ids-es) and upload-result.json "
+            "(written by uploader). Posts SDC only for ordinals whose uploader "
+            "status is UPLOADED or SKIPPED. No api.dp.la calls."
+        ),
+    )
+    p.add_argument(
+        "--ids-file",
+        dest="ids_file",
+        metavar="PATH",
+        action="store",
+        default=None,
+        help=(
+            "When using --partner, the IDs CSV path. Defaults to "
+            "<PARTNER>/<PARTNER>.csv (matching the uploader's input convention)."
+        ),
+    )
+    return p
 
 
 def _normalize_rights_uri(uri):
@@ -113,39 +135,54 @@ def _normalize_rights_uri(uri):
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_HERE)
 
-# Config + Commons login happen after argparse so that `--help` doesn't trigger
-# file I/O or network/auth on this module's import.
-with open(os.path.join(_REPO_ROOT, "config.toml"), "rb") as _f:
-    dpla_api = tomllib.load(_f)["dpla_api_key"]
 
-site = pywikibot.Site()
-site.login()
+def _initialize() -> None:
+    """Parse args, load config, log in to Commons, fetch live ingestion3 JSONs.
 
-# Hubs and subject mappings are fetched live from ingestion3 on every run, by
-# design: this sync exists precisely to propagate upstream changes to that
-# data, and a vendored snapshot would defeat the point. rights.json is the
-# exception — it lives here because it's a small, slow-moving SDC-specific
-# mapping not maintained in ingestion3.
-hubs = requests.get(
-    "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json",
-    timeout=30,
-).json()
-with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
-    rights = {_normalize_rights_uri(k): v for k, v in json.load(f).items()}
-subject_ids = requests.get(
-    "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/subjects.json",
-    timeout=30,
-).json()
+    Populates the module-level globals the helper functions read at call
+    time. Kept out of import-time so `import tools.sdc_sync` (e.g. by the
+    console-script entry point) does no I/O.
+    """
+    global parser, args, method, dpla_api, site, hubs, rights, subject_ids
+    global _s3_partner, _s3_client
 
-# When --from-s3 <partner> is set, parsed() reads each item's dpla-map.json
-# from S3 instead of calling api.dp.la. Imported lazily so that --help doesn't
-# pay the boto3 import cost.
-_s3_partner = args.from_s3
-_s3_client = None
-if _s3_partner is not None:
-    from ingest_wikimedia.s3 import S3Client
+    parser = _build_parser()
+    args = parser.parse_args()
+    if args.method:
+        method = args.method
 
-    _s3_client = S3Client()
+    with open(os.path.join(_REPO_ROOT, "config.toml"), "rb") as f:
+        dpla_api = tomllib.load(f)["dpla_api_key"]
+
+    site = pywikibot.Site()
+    site.login()
+
+    # Hubs and subject mappings are fetched live from ingestion3 on every run,
+    # by design: this sync exists precisely to propagate upstream changes to
+    # that data, and a vendored snapshot would defeat the point. rights.json
+    # is the exception — it lives here because it's a small, slow-moving
+    # SDC-specific mapping not maintained in ingestion3.
+    hubs = requests.get(
+        "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json",
+        timeout=30,
+    ).json()
+    with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
+        rights = {_normalize_rights_uri(k): v for k, v in json.load(f).items()}
+    subject_ids = requests.get(
+        "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/subjects.json",
+        timeout=30,
+    ).json()
+
+    # When --from-s3 <partner> is set, parsed() reads each item's dpla-map.json
+    # from S3 instead of calling api.dp.la. Imported lazily so this module
+    # doesn't pay the boto3 import cost when nothing needs S3.
+    _s3_partner = args.from_s3
+    _s3_client = None
+    if _s3_partner is not None:
+        from ingest_wikimedia.s3 import S3Client
+
+        _s3_client = S3Client()
+
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
 
@@ -1062,6 +1099,7 @@ def _post_new_refs(mediaid, dpla_id):
     global token
     if not refclaims["claims"]:
         return
+    refs_to_post = len(refclaims["claims"])
     postrefs = {
         "action": "wbeditentity",
         "format": "json",
@@ -1096,6 +1134,7 @@ def _post_new_refs(mediaid, dpla_id):
         post = json.loads(save.text)
         if post["success"] == 1:
             print(" --- Saved new refs!")
+            tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
         else:
             print(post)
             print(" --- Error encountered on save.")
@@ -1112,6 +1151,7 @@ def _post_new_refs(mediaid, dpla_id):
             post = json.loads(save.text)
             if post["success"] == 1:
                 print(" --- Saved new refs!")
+                tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
             else:
                 print(post)
                 print(" --- Error encountered on save.")
@@ -1132,6 +1172,7 @@ def _post_new_claims(mediaid, dpla_id):
     global token
     if not claims["claims"]:
         return
+    claims_to_post = len(claims["claims"])
     postdata = {
         "action": "wbeditentity",
         "format": "json",
@@ -1166,6 +1207,7 @@ def _post_new_claims(mediaid, dpla_id):
         post = json.loads(save.text)
         if post["success"] == 1:
             print(" --- Saved new claims!")
+            tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
         else:
             print(post)
             print(" --- Error encountered on save.")
@@ -1182,6 +1224,7 @@ def _post_new_claims(mediaid, dpla_id):
             post = json.loads(save.text)
             if post["success"] == 1:
                 print(" --- Saved new claims!")
+                tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
             else:
                 print(post)
                 print(" --- Error encountered on save.")
@@ -1216,6 +1259,7 @@ def dpla_claims(
 ):
     """Legacy entry point: build `expected` from the 13-tuple, then reconcile."""
     expected = _build_expected_from_parsed(
+        dpla_id,
         url,
         descs,
         dates,
@@ -1234,6 +1278,7 @@ def dpla_claims(
 
 
 def _build_expected_from_parsed(
+    dpla_id,
     url,
     descs,
     dates,
@@ -1446,6 +1491,7 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
             "https://commons.wikimedia.org/w/api.php", method="POST", data=rmdata
         )
         print(" --- Saved removals!")
+        tracker.increment(Result.SDC_REMOVALS, len(removals))
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
@@ -1915,152 +1961,199 @@ def _run_partner_mode(partner, ids_file):
 
     Items where the metadata isn't yet on S3 are skipped silently and
     will be picked up the next time the full pipeline runs.
+
+    Logs to `{partner}/logs/{timestamp}-{label}-sdc.log` (matching the
+    downloader/uploader pattern) so `wikimedia-upload-status` can detect
+    progress; final summary posted via `notify_sdc_complete`.
     """
     from botocore.exceptions import ClientError
 
     from ingest_wikimedia.s3 import S3Client
+
+    setup_logging(partner, "sdc", logging.INFO)
+    start_time = time.time()
 
     s3 = S3Client()
 
     with open(ids_file) as f:
         dpla_ids = [line.strip() for line in f if line.strip()]
 
-    print(f"Partner mode: {partner} — {len(dpla_ids)} items from {ids_file}")
-    local_count = 0
-    for dpla_id in dpla_ids:
-        local_count += 1
-        print(f"\n{local_count}: {dpla_id}")
+    logging.info(f"Partner mode: {partner} — {len(dpla_ids)} items from {ids_file}")
+    try:
+        for local_count, dpla_id in enumerate(dpla_ids, start=1):
+            # Item-start marker — `wikimedia_upload_status._sdc_progress`
+            # greps for this to surface SDC progress.
+            logging.info(f"DPLA ID: {dpla_id} ({local_count}/{len(dpla_ids)})")
 
-        # S3Client.get_item_file returns None on 404/NoSuchKey but re-raises
-        # any other ClientError. Catch those per-item so one transient S3
-        # failure doesn't abort the whole partner batch.
-        try:
-            sdc_raw = s3.get_sdc_json(partner, dpla_id)
-        except ClientError as e:
-            print(f" -- S3 error reading sdc.json for {dpla_id}: {e!r}; skipping.")
-            continue
-        if sdc_raw is None:
-            print(" -- No sdc.json on S3; skipping.")
-            continue
-        try:
-            sdc_payload = json.loads(sdc_raw)
-        except json.JSONDecodeError as e:
-            print(f" -- sdc.json failed to parse: {e}; skipping.")
-            continue
-
-        try:
-            upload_raw = s3.get_upload_result(partner, dpla_id)
-        except ClientError as e:
-            print(
-                f" -- S3 error reading upload-result.json for {dpla_id}: {e!r}; skipping."
-            )
-            continue
-        if upload_raw is None:
-            print(" -- No upload-result.json on S3; skipping.")
-            continue
-        try:
-            upload_result = json.loads(upload_raw)
-        except json.JSONDecodeError as e:
-            print(f" -- upload-result.json failed to parse: {e}; skipping.")
-            continue
-
-        ordinals = upload_result.get("ordinals", {})
-        eligible = {
-            ord_str: data
-            for ord_str, data in ordinals.items()
-            if data.get("status") in ("UPLOADED", "SKIPPED")
-        }
-        if not eligible:
-            print(" -- No SDC-eligible ordinals; skipping.")
-            continue
-
-        for ord_str, data in sorted(eligible.items(), key=lambda kv: int(kv[0])):
-            pageid = data.get("pageid")
-            if pageid is None:
-                print(f" -- Ordinal {ord_str}: no pageid; skipping.")
+            # S3Client.get_item_file returns None on 404/NoSuchKey but
+            # re-raises any other ClientError. Catch those per-item so one
+            # transient S3 failure doesn't abort the whole partner batch.
+            try:
+                sdc_raw = s3.get_sdc_json(partner, dpla_id)
+            except ClientError as e:
+                logging.warning(
+                    f" -- S3 error reading sdc.json for {dpla_id}: {e!r}; skipping."
+                )
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
                 continue
-            mediaid = f"M{pageid}"
-            print(f" -- Ordinal {ord_str}: {mediaid} ({data.get('title', '?')})")
-            process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+            if sdc_raw is None:
+                logging.info(" -- No sdc.json on S3; skipping.")
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
+                continue
+            try:
+                sdc_payload = json.loads(sdc_raw)
+            except json.JSONDecodeError as e:
+                logging.warning(f" -- sdc.json failed to parse: {e}; skipping.")
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+                continue
+
+            try:
+                upload_raw = s3.get_upload_result(partner, dpla_id)
+            except ClientError as e:
+                logging.warning(
+                    f" -- S3 error reading upload-result.json for {dpla_id}: {e!r}; skipping."
+                )
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
+                continue
+            if upload_raw is None:
+                logging.info(" -- No upload-result.json on S3; skipping.")
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
+                continue
+            try:
+                upload_result = json.loads(upload_raw)
+            except json.JSONDecodeError as e:
+                logging.warning(
+                    f" -- upload-result.json failed to parse: {e}; skipping."
+                )
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+                continue
+
+            ordinals = upload_result.get("ordinals", {})
+            eligible = {
+                ord_str: data
+                for ord_str, data in ordinals.items()
+                if data.get("status") in ("UPLOADED", "SKIPPED")
+            }
+            if not eligible:
+                logging.info(" -- No SDC-eligible ordinals; skipping.")
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+                continue
+
+            for ord_str, data in sorted(eligible.items(), key=lambda kv: int(kv[0])):
+                pageid = data.get("pageid")
+                if pageid is None:
+                    logging.warning(f" -- Ordinal {ord_str}: no pageid; skipping.")
+                    continue
+                mediaid = f"M{pageid}"
+                logging.info(
+                    f" -- Ordinal {ord_str}: {mediaid} ({data.get('title', '?')})"
+                )
+                process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+            tracker.increment(Result.SDC_ITEMS_SYNCED)
+    finally:
+        elapsed = time.time() - start_time
+        # Terminal "COUNTS:" marker — the status script keys on it to detect
+        # SDC completion, mirroring downloader/uploader.
+        logging.info("\n" + str(tracker))
+        logging.info(f"{elapsed} seconds.")
+        notify_sdc_complete(
+            tracker=tracker,
+            partner_label=partner,
+            elapsed_seconds=elapsed,
+        )
 
 
 # We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
 
-count = 0
 
-if method == "list":
-    ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
-    lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
-    percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
-    while lists:
-        # range(0, len(lists)-1) is exclusive on the upper bound, so the
-        # previous expression never selected the last index — fixed.
-        x = random.randrange(len(lists))
-        working_file = os.path.join(args.lists, "WORKING-" + lists[x])
-        print(working_file)
-        os.rename(os.path.join(args.lists, lists[x]), working_file)
+def main() -> None:
+    """Entry point for the `sdc-sync` console script.
 
-        files = pagegenerators.TextIOPageGenerator(working_file)
+    Dispatches to the legacy livecat/list/file/cat modes or the PR-4 partner
+    mode based on the parsed CLI flags. Initialization (argparse, Commons
+    login, ingestion3 JSON fetch) lives in `_initialize()`.
+    """
+    _initialize()
 
-        for file in files:
-            count += 1
-            print(f"{count}:\n - {args.lists}/{lists[x]} ({percent:.2f}% done)")
-            print("\n" + str(file).replace('""', '"'))
-            mediaid = "M" + str(file.pageid)
-            dpla_id = _resolve_dpla_id(str(file), dpla_api)
-            process_one(mediaid, dpla_id)
+    count = 0
 
-        os.rename(working_file, os.path.join(args.lists, "COMPLETE-" + lists[x]))
-
+    if method == "list":
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
         lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
         percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
+        while lists:
+            # range(0, len(lists)-1) is exclusive on the upper bound, so the
+            # previous expression never selected the last index — fixed.
+            x = random.randrange(len(lists))
+            working_file = os.path.join(args.lists, "WORKING-" + lists[x])
+            print(working_file)
+            os.rename(os.path.join(args.lists, lists[x]), working_file)
 
-        duduped = set()
-        try:
-            with open("Missing ids.txt", "r") as f:
-                for line in f:
-                    duduped.add(line.strip())
-            with open("Missing ids.txt", "w") as f:
-                f.write("\n".join(duduped) + "\n")
-        except FileNotFoundError:
-            # No missing IDs recorded this batch; nothing to dedupe.
-            pass
+            files = pagegenerators.TextIOPageGenerator(working_file)
 
-elif args.files:
-    for title in args.files:
-        print("\n" + title)
-        page = pywikibot.Page(site, title)
-        if not page.exists():
-            print(f" -- Page not found on Commons: {title}")
-            continue
-        mediaid = "M" + str(page.pageid)
-        dpla_id = _resolve_dpla_id(title, dpla_api)
-        count += 1
-        print(f"{count}: {mediaid}")
-        process_one(mediaid, dpla_id)
+            for file in files:
+                count += 1
+                print(f"{count}:\n - {args.lists}/{lists[x]} ({percent:.2f}% done)")
+                print("\n" + str(file).replace('""', '"'))
+                mediaid = "M" + str(file.pageid)
+                dpla_id = _resolve_dpla_id(str(file), dpla_api)
+                process_one(mediaid, dpla_id)
 
-elif args.cat:
-    category = pywikibot.Category(site, args.cat)
-    generator = pagegenerators.CategorizedPageGenerator(
-        category, namespaces=[6], recurse=args.recurse
-    )
-    for page in generator:
-        title = page.title()
-        print("\n" + title)
-        mediaid = "M" + str(page.pageid)
-        dpla_id = _resolve_dpla_id(title, dpla_api)
-        count += 1
-        print(f"{count}: {mediaid}")
-        process_one(mediaid, dpla_id)
-        if args.limit and count >= args.limit:
-            print(f" -- Reached --limit {args.limit}, stopping.")
-            break
+            os.rename(working_file, os.path.join(args.lists, "COMPLETE-" + lists[x]))
 
-elif args.partner:
-    # Partner-driven SDC phase (PR 4). Iterates the partner's IDs CSV and
-    # syncs each item's precomputed sdc.json against Commons. Designed to be
-    # the last step in a `get-ids-es → downloader → uploader → sdc-sync`
-    # pipeline chain.
-    _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")
-    _run_partner_mode(args.partner, _ids_file)
+            ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
+            lists = [i for i in ltotal if "COMPLETE" not in i and "WORKING" not in i]
+            percent = 100 * (len(ltotal) - len(lists)) / len(ltotal) if ltotal else 0
+
+            duduped = set()
+            try:
+                with open("Missing ids.txt", "r") as f:
+                    for line in f:
+                        duduped.add(line.strip())
+                with open("Missing ids.txt", "w") as f:
+                    f.write("\n".join(duduped) + "\n")
+            except FileNotFoundError:
+                # No missing IDs recorded this batch; nothing to dedupe.
+                pass
+
+    elif args.files:
+        for title in args.files:
+            print("\n" + title)
+            page = pywikibot.Page(site, title)
+            if not page.exists():
+                print(f" -- Page not found on Commons: {title}")
+                continue
+            mediaid = "M" + str(page.pageid)
+            dpla_id = _resolve_dpla_id(title, dpla_api)
+            count += 1
+            print(f"{count}: {mediaid}")
+            process_one(mediaid, dpla_id)
+
+    elif args.cat:
+        category = pywikibot.Category(site, args.cat)
+        generator = pagegenerators.CategorizedPageGenerator(
+            category, namespaces=[6], recurse=args.recurse
+        )
+        for page in generator:
+            title = page.title()
+            print("\n" + title)
+            mediaid = "M" + str(page.pageid)
+            dpla_id = _resolve_dpla_id(title, dpla_api)
+            count += 1
+            print(f"{count}: {mediaid}")
+            process_one(mediaid, dpla_id)
+            if args.limit and count >= args.limit:
+                print(f" -- Reached --limit {args.limit}, stopping.")
+                break
+
+    elif args.partner:
+        # Partner-driven SDC phase (PR 4). Iterates the partner's IDs CSV and
+        # syncs each item's precomputed sdc.json against Commons. Designed to
+        # be the last step in a `get-ids-es → downloader → uploader → sdc-sync`
+        # pipeline chain.
+        _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")
+        _run_partner_mode(args.partner, _ids_file)
+
+
+if __name__ == "__main__":
+    main()
