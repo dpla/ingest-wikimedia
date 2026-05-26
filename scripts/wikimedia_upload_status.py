@@ -185,11 +185,16 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
         # sdc-sync's _run_partner_mode logs `DPLA ID: <id> (n/total)` per
         # item — same `DPLA ID:` marker the awk pass already counts. Uses
         # the COUNTS: terminal marker as the completion signal, matching
-        # the downloader/uploader convention.
+        # the downloader/uploader convention. The reported figure is
+        # "items processed" (i.e. iterated by the loop) rather than
+        # "items synced" because some processed items may have been
+        # skipped for missing sidecars or mapping issues — the Slack
+        # summary surfaces the real synced count via the tracker's
+        # SDC_ITEMS_SYNCED line.
         if dpla_id_count == 0:
             return "SDC syncing (starting...)"
         if counts_marker > 0:
-            return f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items synced)"
+            return f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)"
         return f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
 
     return "Unknown"

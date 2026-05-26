@@ -40,6 +40,7 @@ site: pywikibot.site.BaseSite
 hubs: dict
 rights: dict
 subject_ids: dict
+token: str
 _s3_partner: str | None = None
 _s3_client = None
 
@@ -143,7 +144,7 @@ def _initialize() -> None:
     time. Kept out of import-time so `import tools.sdc_sync` (e.g. by the
     console-script entry point) does no I/O.
     """
-    global parser, args, method, dpla_api, site, hubs, rights, subject_ids
+    global parser, args, method, dpla_api, site, hubs, rights, subject_ids, token
     global _s3_partner, _s3_client
 
     parser = _build_parser()
@@ -156,6 +157,11 @@ def _initialize() -> None:
 
     site = pywikibot.Site()
     site.login()
+    # Fetch the wbeditentity CSRF token here so importing the module
+    # remains side-effect free — the helper post functions (_post_new_refs,
+    # _post_new_claims) read `token` at call time and refresh it
+    # themselves via `login()` on save failure.
+    token = login()
 
     # Hubs and subject mappings are fetched live from ingestion3 on every run,
     # by design: this sync exists precisely to propagate upstream changes to
@@ -1752,9 +1758,6 @@ def login():
     return token
 
 
-token = login()
-
-
 def _resolve_dpla_id(title, dpla_api):
     """Return the DPLA item ID for a Commons file title.
 
@@ -2039,6 +2042,7 @@ def _run_partner_mode(partner, ids_file):
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
                 continue
 
+            synced_this_item = False
             for ord_str, data in sorted(eligible.items(), key=lambda kv: int(kv[0])):
                 pageid = data.get("pageid")
                 if pageid is None:
@@ -2049,7 +2053,15 @@ def _run_partner_mode(partner, ids_file):
                     f" -- Ordinal {ord_str}: {mediaid} ({data.get('title', '?')})"
                 )
                 process_one_from_sdc(mediaid, dpla_id, sdc_payload)
-            tracker.increment(Result.SDC_ITEMS_SYNCED)
+                synced_this_item = True
+            # Only count an item as synced if at least one ordinal actually
+            # made it past the pageid guard. An item whose every eligible
+            # ordinal lacked a pageid would otherwise inflate the synced
+            # counter and underreport mapping skips.
+            if synced_this_item:
+                tracker.increment(Result.SDC_ITEMS_SYNCED)
+            else:
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
     finally:
         elapsed = time.time() - start_time
         # Terminal "COUNTS:" marker — the status script keys on it to detect
