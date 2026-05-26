@@ -88,19 +88,10 @@ def main() -> None:
     # GitHub Actions passes boolean inputs as the strings "true"/"false" — same as --force.
     refresh_only = args.refresh_only.lower() == "true"
     sdc_only = args.sdc_only.lower() == "true"
-    if refresh_only and sdc_only:
-        raw_url_for_err = args.response_url.strip()
-        err_url = (
-            raw_url_for_err
-            if raw_url_for_err.startswith("https://hooks.slack.com/commands/")
-            else ""
-        )
-        _slack_fail(
-            err_url,
-            "Cannot combine --refresh-only and --sdc-only — they're mutually"
-            " exclusive run modes (refresh skips upload + SDC; sdc-only skips"
-            " download + upload).",
-        )
+
+    # Normalize the response_url first so the mutual-exclusion check below
+    # can use the validated value rather than re-implementing the same
+    # `startswith("https://hooks.slack.com/commands/")` guard inline.
     raw_url = args.response_url.strip()
     # Only accept genuine Slack response_url values — reject arbitrary POST targets.
     response_url = (
@@ -108,6 +99,14 @@ def main() -> None:
     )
     if raw_url and not response_url:
         print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
+
+    if refresh_only and sdc_only:
+        _slack_fail(
+            response_url,
+            "Cannot combine --refresh-only and --sdc-only — they're mutually"
+            " exclusive run modes (refresh skips upload + SDC; sdc-only skips"
+            " download + upload).",
+        )
     max_age_days: int | None = None
     if args.max_age_days.strip():
         try:

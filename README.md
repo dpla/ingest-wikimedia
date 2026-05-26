@@ -40,7 +40,7 @@ All three must run from the partner's working directory on EC2 (e.g. `/home/ec2-
 | Path | Purpose |
 |------|---------|
 | `ingest_wikimedia/` | Shared library (partner registry, S3, Slack, SSM, Wikimedia API) |
-| `tools/` | CLI entry points (`get-ids-es`, `downloader`, `uploader`) |
+| `tools/` | CLI entry points (`get-ids-es`, `downloader`, `uploader`, `sdc-sync`) |
 | `scripts/` | GitHub Actions step scripts (`wikimedia_launch.py`, `wikimedia_kill.py`, `wikimedia_upload_status.py`) |
 | `lambda/wikimedia-slack-dispatch/` | Lambda handler for Slack slash commands |
 | `.github/workflows/` | Workflow definitions for launch, kill, and status checks |

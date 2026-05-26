@@ -41,10 +41,11 @@ GitHub Actions (wikimedia-launch.yml)
     ▼
 EC2 (i-033eff6c8c168f999) via AWS SSM
     │  tmux session: wikimedia-bpl+pa
-    │  Runs three phases per target (sequentially):
-    │    1. get-ids-es → <partner>.csv
+    │  Runs four phases per target (sequentially):
+    │    1. get-ids-es → <partner>.csv  (also stages per-item sdc.json)
     │    2. downloader <partner>.csv <partner>
-    │    3. uploader   <partner>.csv <partner>
+    │    3. uploader   <partner>.csv <partner>  (writes per-item upload-result.json)
+    │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv
     ▼
 S3 (s3://dpla-wikimedia/)     Wikimedia Commons
 ```
@@ -57,7 +58,7 @@ Results (success or failure) post to **#tech-alerts** via the `DPLA_SLACK_BOT_TO
 
 ### `/wikimedia-upload <target> [<target> ...]`
 
-Launches the full upload pipeline (ID generation → download → upload) for one or more targets. All targets run sequentially in a single tmux session. If any step fails, the chain stops.
+Launches the full upload pipeline (ID generation → download → upload → SDC sync) for one or more targets. All targets run sequentially in a single tmux session. If any step fails, the chain stops.
 
 ```text
 /wikimedia-upload bpl
@@ -220,11 +221,11 @@ Hub-level eligibility does not imply every institution within it is eligible —
 
 ## Pipeline phases
 
-Each target runs three sequential phases within the tmux session. The `&&` chain ensures a later phase only starts if the previous one succeeded.
+Each target runs four sequential phases within the tmux session. The `&&` chain ensures a later phase only starts if the previous one succeeded.
 
 ### Phase 1: ID generation (`get-ids-es`)
 
-Queries DPLA's Elasticsearch index for items belonging to the partner hub (or a specific institution). Writes a CSV of DPLA IDs and associated metadata to `<partner>.csv` in the partner's working directory.
+Queries DPLA's Elasticsearch index for items belonging to the partner hub (or a specific institution). Writes a CSV of DPLA IDs to `<partner>.csv` in the partner's working directory and stages each item's `dpla-map.json` plus a precomputed `sdc.json` claim envelope to S3 under `<partner>/images/<sharded-prefix>/<dpla-id>/`.
 
 ```bash
 get-ids-es <partner>                              # full hub
@@ -241,13 +242,28 @@ downloader <partner>.csv <partner>
 
 ### Phase 3: Upload (`uploader`)
 
-Reads `<partner>.csv`, retrieves media from S3, and uploads each file to Wikimedia Commons with structured SDC (Structured Data on Commons) metadata. Skips files already present on Commons.
+Reads `<partner>.csv`, retrieves media from S3, and uploads each file to Wikimedia Commons with structured SDC (Structured Data on Commons) metadata. Skips files already present on Commons. Writes a per-item `upload-result.json` sidecar to S3 with each ordinal's outcome (status / page title / pageid), which the SDC phase consumes.
 
 ```bash
 uploader <partner>.csv <partner>
 ```
 
-All three phases are idempotent — re-running is safe and picks up where it left off.
+### Phase 4: SDC sync (`sdc-sync`)
+
+Reads each item's precomputed `sdc.json` and `upload-result.json` from S3, and for every ordinal whose upload status is `UPLOADED` or `SKIPPED`, posts MediaInfo statements (and references) to the corresponding Commons file via the wbeditentity API. Idempotent — re-syncing a fully-synced item produces zero writes.
+
+```bash
+sdc-sync --partner <partner> --ids-file <partner>.csv
+```
+
+All phases are idempotent — re-running is safe and picks up where it left off.
+
+### Alternate run modes
+
+The `wikimedia-launch.yml` workflow accepts two boolean inputs that swap the default 4-phase chain for a shorter variant. They are mutually exclusive — pick at most one.
+
+- **`refresh_only=true`** — runs `get-ids-es → downloader` only (no uploader, no SDC). For re-downloading aged media files in S3 without re-uploading. The downloader is invoked with `--notify-complete` so its own Slack summary fires at the end. `max_age_days=N` controls the re-download threshold (default: > 365 days).
+- **`sdc_only=true`** — runs `get-ids-es → sdc-sync` only (no downloader, no uploader). For backfilling or refreshing SDC on items that were uploaded in a prior session, including picking up changes to ingestion3's `institutions_v2.json` / `subjects.json` mappings. The `get-ids-es` step re-stages each item's `sdc.json` from current ingestion3 data; `sdc-sync` then reconciles Commons against that.
 
 ---
 
@@ -287,6 +303,10 @@ Inputs:
 - `partner` (required): shlex-encoded target list, e.g. `bpl` or `bpl pa` or `bpl "indiana|Indiana State Library"` or `Q72380652`
 - `force` (boolean, default `false`): kill any conflicting sessions before launching
 - `response_url` (optional): Slack response URL for ephemeral error feedback
+- `concurrency_key` (optional): short SHA256 prefix of the partner string, used by the GitHub Actions concurrency group to keep the key under the 400-char limit; set by the Slack dispatcher
+- `max_age_days` (optional integer): for `refresh_only` runs, re-download files older than N days in S3 (default: 365)
+- `refresh_only` (boolean, default `false`): run `get-ids-es → downloader` only — skip the upload and SDC phases (see "Alternate run modes" above)
+- `sdc_only` (boolean, default `false`): run `get-ids-es → sdc-sync` only — skip the download and upload phases (see "Alternate run modes" above). Mutually exclusive with `refresh_only`.
 
 Steps:
 1. Installs `boto3` and `requests`
@@ -460,7 +480,7 @@ Common crash causes:
 
 ### Re-running after a crash
 
-All phases are idempotent — re-launching is safe. The downloader skips already-staged S3 objects; the uploader skips files already on Commons. Just trigger `/wikimedia-upload <hub>` again.
+All phases are idempotent — re-launching is safe. The downloader skips already-staged S3 objects; the uploader skips files already on Commons; sdc-sync re-syncs each item but writes nothing when the Commons-side state already matches the precomputed sdc.json. Just trigger `/wikimedia-upload <hub>` again.
 
 If the ID file (`<partner>.csv`) is partial or empty, delete it before re-running — the launch script will regenerate it from scratch.
 
