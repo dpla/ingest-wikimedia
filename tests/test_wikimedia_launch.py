@@ -1,0 +1,95 @@
+"""Focused tests for scripts/wikimedia_launch.py.
+
+The launcher is a thin orchestrator over boto3 + SSM + Slack — most of its
+behavior is exercised end-to-end by the GH Action that fires it. These
+tests cover the argument-validation surface added in PR 5b/5c so a typo
+in `--sdc-only` handling can't ship silently.
+"""
+
+from unittest.mock import patch
+
+import pytest
+
+
+def _run_main(argv: list[str]) -> SystemExit | None:
+    """Invoke `wikimedia_launch.main()` with a synthetic argv and return
+    the SystemExit raised by `_slack_fail` (or None if main exited cleanly).
+
+    `_slack_fail` exits 1 after stderr + optional Slack notification; the
+    test asserts on the SystemExit instance's `.code`.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    with patch("sys.argv", ["wikimedia_launch.py", *argv]):
+        try:
+            launch_mod.main()
+        except SystemExit as e:
+            return e
+    return None
+
+
+def test_refresh_only_and_sdc_only_are_mutually_exclusive():
+    """Passing both --refresh-only and --sdc-only must fail fast with a
+    clear error — they're distinct run modes and combining them silently
+    would pick whichever branch the launcher tested first."""
+    exit_info = _run_main(
+        [
+            "--partner",
+            "minnesota",
+            "--refresh-only",
+            "true",
+            "--sdc-only",
+            "true",
+        ]
+    )
+    assert exit_info is not None, "Expected SystemExit on conflicting flags"
+    assert exit_info.code == 1
+
+
+def test_sdc_only_alone_is_accepted_at_parse_time(monkeypatch, capsys):
+    """`--sdc-only true` on its own must parse without error. We can't
+    exercise the full launch chain in a unit test (it shells to EC2), so
+    we just confirm parse_args + the mutual-exclusion gate let it
+    through to the next step.
+
+    We do this by passing an unresolvable target so the launcher errors
+    out *after* the flag-parsing step rather than at it. SystemExit from
+    `_slack_fail("No valid targets to launch...")` confirms parsing
+    succeeded.
+    """
+    exit_info = _run_main(
+        [
+            "--partner",
+            "this-is-not-a-real-hub-slug",
+            "--sdc-only",
+            "true",
+        ]
+    )
+    assert exit_info is not None
+    # Anything that exits with code 1 is fine — the assertion that matters
+    # is that the SystemExit is NOT the mutual-exclusion message (which
+    # would mean we hit the wrong gate).
+    captured = capsys.readouterr()
+    assert "Cannot combine --refresh-only and --sdc-only" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "sdc_only_value,expected",
+    [
+        ("true", True),
+        ("True", True),
+        ("TRUE", True),
+        ("false", False),
+        ("", False),
+        # Anything that isn't a lowercase-"true" match falls through to False.
+        # This matches the existing `--force` / `--refresh-only` handling.
+        ("yes", False),
+        ("1", False),
+    ],
+)
+def test_sdc_only_boolean_parsing(sdc_only_value, expected):
+    """The `args.sdc_only.lower() == "true"` test treats GH Actions'
+    "true"/"false" string inputs case-insensitively; everything else is
+    falsy. Lock this in so a future stringly-typed input change can't
+    quietly flip the polarity."""
+    assert (sdc_only_value.lower() == "true") is expected

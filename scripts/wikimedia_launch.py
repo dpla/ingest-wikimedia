@@ -81,11 +81,26 @@ def main() -> None:
     parser.add_argument("--response-url", default="")
     parser.add_argument("--max-age-days", default="")
     parser.add_argument("--refresh-only", default="false")
+    parser.add_argument("--sdc-only", default="false")
     args = parser.parse_args()
 
     force = args.force.lower() == "true"
     # GitHub Actions passes boolean inputs as the strings "true"/"false" — same as --force.
     refresh_only = args.refresh_only.lower() == "true"
+    sdc_only = args.sdc_only.lower() == "true"
+    if refresh_only and sdc_only:
+        raw_url_for_err = args.response_url.strip()
+        err_url = (
+            raw_url_for_err
+            if raw_url_for_err.startswith("https://hooks.slack.com/commands/")
+            else ""
+        )
+        _slack_fail(
+            err_url,
+            "Cannot combine --refresh-only and --sdc-only — they're mutually"
+            " exclusive run modes (refresh skips upload + SDC; sdc-only skips"
+            " download + upload).",
+        )
     raw_url = args.response_url.strip()
     # Only accept genuine Slack response_url values — reject arbitrary POST targets.
     response_url = (
@@ -644,25 +659,38 @@ def main() -> None:
             f"{is_last_env}; "
             f"{single_item_env}"
         )
-        dl_age_opt = (
-            f"--max-age-days {max_age_days} " if max_age_days is not None else ""
-        )
-        dl_notify_opt = "--notify-complete " if refresh_only else ""
-        pipeline_steps = [
-            f"cd {base}",
-            get_ids_cmd,
-            f"downloader {dl_age_opt}{dl_notify_opt}{csv_file} {canonical}",
-        ]
-        if not refresh_only:
-            pipeline_steps.append(f"uploader {csv_file} {canonical}")
-            # SDC sync is the final step of every upload run: it reads the
-            # per-item sdc.json (staged by get-ids-es) and upload-result.json
-            # (written by uploader) sidecars and posts MediaInfo statements
-            # to Commons. Skipped for refresh_only because no upload phase
-            # ran — there's no upload-result.json to drive from.
-            pipeline_steps.append(
-                f"sdc-sync --partner {canonical} --ids-file {csv_file}"
+        if sdc_only:
+            # SDC-only backfill: re-enumerate the partner's items (which
+            # also refreshes sdc.json sidecars from the latest ingestion3
+            # data) then run sdc-sync. No downloader, no uploader — the
+            # caller is reconciling SDC for items the uploader already
+            # processed in a prior session.
+            pipeline_steps = [
+                f"cd {base}",
+                get_ids_cmd,
+                f"sdc-sync --partner {canonical} --ids-file {csv_file}",
+            ]
+        else:
+            dl_age_opt = (
+                f"--max-age-days {max_age_days} " if max_age_days is not None else ""
             )
+            dl_notify_opt = "--notify-complete " if refresh_only else ""
+            pipeline_steps = [
+                f"cd {base}",
+                get_ids_cmd,
+                f"downloader {dl_age_opt}{dl_notify_opt}{csv_file} {canonical}",
+            ]
+            if not refresh_only:
+                pipeline_steps.append(f"uploader {csv_file} {canonical}")
+                # SDC sync is the final step of every upload run: it reads
+                # the per-item sdc.json (staged by get-ids-es) and
+                # upload-result.json (written by uploader) sidecars and
+                # posts MediaInfo statements to Commons. Skipped for
+                # refresh_only because no upload phase ran — there's no
+                # upload-result.json to drive from.
+                pipeline_steps.append(
+                    f"sdc-sync --partner {canonical} --ids-file {csv_file}"
+                )
         target_steps = " && ".join(pipeline_steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"
@@ -695,6 +723,11 @@ def main() -> None:
             item_descs = [f"`{did}` ({c})" for c, _, did in single_item_targets]
             if refresh_only:
                 msg = f"✅ {', '.join(item_descs)} — eligible, download refresh starting{refresh_suffix}."
+            elif sdc_only:
+                msg = (
+                    f"✅ {', '.join(item_descs)} — eligible,"
+                    " SDC-only backfill starting."
+                )
             else:
                 msg = (
                     f"✅ {', '.join(item_descs)} — eligible,"
@@ -705,6 +738,11 @@ def main() -> None:
             batch_labels = [_target_label(c, i, col) for c, i, _, col in batch_targets]
             if refresh_only:
                 msg = f"▶ Launching `{session_name}` refresh: {', '.join(batch_labels)}{refresh_suffix}."
+            elif sdc_only:
+                msg = (
+                    f"▶ Launching `{session_name}` SDC backfill:"
+                    f" {', '.join(batch_labels)} (ID generation → SDC)."
+                )
             else:
                 msg = (
                     f"▶ Launching `{session_name}` pipeline: {', '.join(batch_labels)}"
@@ -720,6 +758,11 @@ def main() -> None:
                     all_descs.append(_target_label(c, i, col))
             if refresh_only:
                 msg = f"▶ Launching `{session_name}` refresh: {', '.join(all_descs)}{refresh_suffix}."
+            elif sdc_only:
+                msg = (
+                    f"▶ Launching `{session_name}` SDC backfill:"
+                    f" {', '.join(all_descs)} (ID generation → SDC)."
+                )
             else:
                 msg = (
                     f"▶ Launching `{session_name}` pipeline: {', '.join(all_descs)}"
