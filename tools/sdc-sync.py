@@ -1083,11 +1083,15 @@ def _post_new_refs(mediaid, dpla_id):
                 data=postrefs,
             )
         except (requests.exceptions.ConnectionError, ConnectionError):
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postrefs,
-            )
+            try:
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postrefs,
+                )
+            except (requests.exceptions.ConnectionError, ConnectionError):
+                print(" --- Network error posting new refs: all retries failed.")
+                sys.exit()
     try:
         post = json.loads(save.text)
         if post["success"] == 1:
@@ -1149,11 +1153,15 @@ def _post_new_claims(mediaid, dpla_id):
                 data=postdata,
             )
         except (requests.exceptions.ConnectionError, ConnectionError):
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postdata,
-            )
+            try:
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postdata,
+                )
+            except (requests.exceptions.ConnectionError, ConnectionError):
+                print(" --- Network error posting new claims: all retries failed.")
+                sys.exit()
     try:
         post = json.loads(save.text)
         if post["success"] == 1:
