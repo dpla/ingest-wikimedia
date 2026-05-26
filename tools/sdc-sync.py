@@ -1,5 +1,6 @@
 # TODO caption, date, page, iiif manifest, url
 
+import copy
 import pywikibot
 import requests
 import re
@@ -60,6 +61,31 @@ parser.add_argument(
         "by get-ids-es (under the partner's sharded item prefix; resolved by "
         "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
         "to api.dp.la when an item's dpla-map.json is missing."
+    ),
+)
+parser.add_argument(
+    "--partner",
+    dest="partner",
+    metavar="PARTNER",
+    action="store",
+    default=None,
+    help=(
+        "Partner-driven SDC sync from precomputed S3 sidecars. Iterates the "
+        "partner's IDs CSV (defaults to <PARTNER>/<PARTNER>.csv) and for each "
+        "DPLA ID reads sdc.json (staged by get-ids-es) and upload-result.json "
+        "(written by uploader). Posts SDC only for ordinals whose uploader "
+        "status is UPLOADED or SKIPPED. No api.dp.la calls."
+    ),
+)
+parser.add_argument(
+    "--ids-file",
+    dest="ids_file",
+    metavar="PATH",
+    action="store",
+    default=None,
+    help=(
+        "When using --partner, the IDs CSV path. Defaults to "
+        "<PARTNER>/<PARTNER>.csv (matching the uploader's input convention)."
     ),
 )
 args = parser.parse_args()
@@ -931,6 +957,246 @@ def add_ref(claimid, claim):
         print(f" -- Adding reference for {claimid}.")
 
 
+# --- helpers for the new partner-mode SDC path (PR 4) ---
+#
+# `_extract_comparable_value` and `_check_kind_for_claim` invert the same
+# shape-aware extraction the existing `dpla_claims()` reconciler performs on
+# already-on-Commons statements, so a precomputed sdc.json claim and its
+# Commons counterpart compare equal when they represent the same logical
+# fact. They drive both:
+#
+#   * the per-claim `check(mediaid, (kind, value), prop)` call in
+#     `process_one_from_sdc` (which decides whether to add the claim or
+#     just stamp a missing DPLA reference on an existing one), and
+#   * `_build_expected_from_sdc`, which produces the
+#     `{prop: [comparable_values]}` map `_reconcile_existing_claims` uses to
+#     decide which DPLA-published statements on Commons are no longer
+#     warranted and should be removed.
+
+
+def _check_kind_for_claim(claim):
+    """Return the 'kind' tag (item|string|monolingualtext|somevalue|source)
+    that `check()` uses to dispatch its per-type matcher against existing
+    Commons statements.
+    """
+    prop = claim["mainsnak"]["property"]
+    if claim["mainsnak"]["snaktype"] == "somevalue":
+        return "somevalue"
+    if prop == "P7482":
+        # P7482 (described at) carries its variable info in a P973 qualifier,
+        # not in the mainsnak (which is always Q74228490 source-catalog).
+        return "source"
+    datavalue = claim["mainsnak"]["datavalue"]
+    dtype = datavalue["type"]
+    if dtype == "wikibase-entityid":
+        return "item"
+    return dtype
+
+
+def _extract_comparable_value(claim):
+    """Pull the comparable scalar value out of a precomputed sdc.json claim.
+
+    Matches what `_reconcile_existing_claims` extracts from existing
+    Commons statements so the two sides line up. Returns:
+
+      * Q-ID string for wikibase-entityid (e.g. "Q19652")
+      * the raw string for string-typed claims (P760, P217, etc.)
+      * the text body for monolingualtext claims (P1476, P10358)
+      * the P1932/P2093 qualifier value for somevalue claims (P571, P170)
+      * the P973 qualifier value for the P7482 source-catalog claim
+      * None when the claim shape isn't one we know how to compare
+
+    A None return signals "skip this claim in expected-building"; the
+    matching `process_one_from_sdc` will still post the claim if a similar
+    one isn't already on Commons.
+    """
+    mainsnak = claim["mainsnak"]
+    prop = mainsnak["property"]
+    if mainsnak["snaktype"] == "somevalue":
+        qualifier_p = "P1932" if prop == "P571" else "P2093"
+        try:
+            return claim["qualifiers"][qualifier_p][0]["datavalue"]["value"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    if prop == "P7482":
+        try:
+            return claim["qualifiers"]["P973"][0]["datavalue"]["value"]
+        except (KeyError, IndexError, TypeError):
+            return None
+    datavalue = mainsnak["datavalue"]
+    dtype = datavalue["type"]
+    if dtype == "wikibase-entityid":
+        v = datavalue["value"]
+        return v.get("id") or f"Q{v['numeric-id']}"
+    if dtype == "string":
+        return datavalue["value"]
+    if dtype == "monolingualtext":
+        return datavalue["value"]["text"]
+    return None
+
+
+def _build_expected_from_sdc(sdc_payload):
+    """Build `{prop: [comparable_values]}` from a precomputed sdc.json payload.
+
+    Same shape as `_build_expected_from_parsed` so `_reconcile_existing_claims`
+    can consume either source. Skips any claim whose comparable value can't
+    be extracted (shape we don't know how to diff).
+    """
+    expected = {}
+    for claim in sdc_payload.get("claims", []):
+        prop = claim["mainsnak"]["property"]
+        value = _extract_comparable_value(claim)
+        if value is None:
+            continue
+        expected.setdefault(prop, []).append(value)
+    return expected
+
+
+def _post_new_refs(mediaid, dpla_id):
+    """POST the accumulated `refclaims["claims"]` to wbeditentity.
+
+    Reads the module-global `refclaims` (populated by `add_ref` during the
+    per-claim check loop). No-op when nothing to post. Refreshes the
+    module-global `token` and retries once on save error.
+    """
+    global token
+    if not refclaims["claims"]:
+        return
+    postrefs = {
+        "action": "wbeditentity",
+        "format": "json",
+        "id": mediaid,
+        "data": json.dumps(refclaims),
+        "token": token,
+        "bot": True,
+        "summary": f"Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+    }
+    try:
+        save = http.fetch(
+            "https://commons.wikimedia.org/w/api.php", method="POST", data=postrefs
+        )
+    except (requests.exceptions.ConnectionError, ConnectionError):
+        try:
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postrefs,
+            )
+        except (requests.exceptions.ConnectionError, ConnectionError):
+            try:
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postrefs,
+                )
+            except (requests.exceptions.ConnectionError, ConnectionError):
+                print(" --- Network error posting new refs: all retries failed.")
+                sys.exit()
+    try:
+        post = json.loads(save.text)
+        if post["success"] == 1:
+            print(" --- Saved new refs!")
+        else:
+            print(post)
+            print(" --- Error encountered on save.")
+            sys.exit()
+    except Exception:
+        try:
+            token = login()
+            postrefs["token"] = token
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postrefs,
+            )
+            post = json.loads(save.text)
+            if post["success"] == 1:
+                print(" --- Saved new refs!")
+            else:
+                print(post)
+                print(" --- Error encountered on save.")
+                sys.exit()
+        except Exception:
+            print(" --- Error encountered. 2")
+            sys.exit()
+
+
+def _post_new_claims(mediaid, dpla_id):
+    """POST the accumulated `claims["claims"]` to wbeditentity.
+
+    Reads the module-global `claims` (populated by add_* helpers during the
+    per-claim check loop). No-op when nothing to post. Retries the initial
+    fetch up to three times on ConnectionError; refreshes the module-global
+    `token` and retries the whole save once on parse / save error.
+    """
+    global token
+    if not claims["claims"]:
+        return
+    postdata = {
+        "action": "wbeditentity",
+        "format": "json",
+        "id": mediaid,
+        "data": json.dumps(claims),
+        "token": token,
+        "bot": True,
+        "summary": f"Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
+    }
+    try:
+        save = http.fetch(
+            "https://commons.wikimedia.org/w/api.php", method="POST", data=postdata
+        )
+    except (requests.exceptions.ConnectionError, ConnectionError):
+        try:
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postdata,
+            )
+        except (requests.exceptions.ConnectionError, ConnectionError):
+            try:
+                save = http.fetch(
+                    "https://commons.wikimedia.org/w/api.php",
+                    method="POST",
+                    data=postdata,
+                )
+            except (requests.exceptions.ConnectionError, ConnectionError):
+                print(" --- Network error posting new claims: all retries failed.")
+                sys.exit()
+    try:
+        post = json.loads(save.text)
+        if post["success"] == 1:
+            print(" --- Saved new claims!")
+        else:
+            print(post)
+            print(" --- Error encountered on save.")
+            sys.exit()
+    except Exception:
+        try:
+            token = login()
+            postdata["token"] = token
+            save = http.fetch(
+                "https://commons.wikimedia.org/w/api.php",
+                method="POST",
+                data=postdata,
+            )
+            post = json.loads(save.text)
+            if post["success"] == 1:
+                print(" --- Saved new claims!")
+            else:
+                print(post)
+                print(" --- Error encountered on save.")
+                sys.exit()
+        except Exception as retry_e:
+            # `post` may not be assigned yet if http.fetch / json.loads raised —
+            # referencing it directly would mask the real error with an
+            # UnboundLocalError. Log what we actually have.
+            print(f" --- Retry after token refresh failed: {retry_e!r}")
+            if "save" in locals():
+                print(save.text)
+            print(" --- Error encountered. 3")
+            sys.exit()
+
+
 def dpla_claims(
     mediaid,
     dpla_id,
@@ -948,16 +1214,46 @@ def dpla_claims(
     access,
     level,
 ):
-    print(f" -- Accessing Commons ID {mediaid}")
-    try:
-        file_claims = requests.get(
-            f"https://commons.wikimedia.org/wiki/Special:EntityData/{mediaid}.json"
-        ).json()
-    except Exception:
-        file_claims = {"entities": {mediaid: {"statements": {}}}}
-    print(f" -- Accessed Commons ID {mediaid}")
-    dpla_claim_list = []
-    removals = []
+    """Legacy entry point: build `expected` from the 13-tuple, then reconcile."""
+    expected = _build_expected_from_parsed(
+        url,
+        descs,
+        dates,
+        titles,
+        hub,
+        local_ids,
+        institution,
+        rs,
+        creators,
+        subjects,
+        naids,
+        access,
+        level,
+    )
+    _reconcile_existing_claims(mediaid, dpla_id, expected)
+
+
+def _build_expected_from_parsed(
+    url,
+    descs,
+    dates,
+    titles,
+    hub,
+    local_ids,
+    institution,
+    rs,
+    creators,
+    subjects,
+    naids,
+    access,
+    level,
+):
+    """Build `{prop: [comparable_values]}` from the parse_dpla_doc tuple.
+
+    The legacy partner-API path (parsed() → process_one → dpla_claims) uses
+    this. The new partner mode (PR 4) reads sdc.json from S3 and uses
+    `_build_expected_from_sdc` instead — same shape, different source.
+    """
     rightsprop = "P6216"
     rightsvalue = ""
     statusvalue = ""
@@ -1031,6 +1327,28 @@ def dpla_claims(
         if rightsvalue:
             expected[rightsprop] = [rightsvalue]
     expected["P6216"] = p6216_values
+    return expected
+
+
+def _reconcile_existing_claims(mediaid, dpla_id, expected):
+    """Walk DPLA-referenced claims on Commons, queue removals for any whose
+    comparable value isn't in `expected`. POSTs wbremoveclaims if needed.
+
+    Shared by `dpla_claims` (legacy partner-API path) and
+    `process_one_from_sdc` (PR 4 partner-mode path). Same removal logic;
+    just different sources for `expected`.
+    """
+    print(f" -- Accessing Commons ID {mediaid}")
+    try:
+        file_claims = requests.get(
+            f"https://commons.wikimedia.org/wiki/Special:EntityData/{mediaid}.json",
+            timeout=30,
+        ).json()
+    except Exception:
+        file_claims = {"entities": {mediaid: {"statements": {}}}}
+    print(f" -- Accessed Commons ID {mediaid}")
+    dpla_claim_list = []
+    removals = []
     for prop in file_claims["entities"][mediaid]["statements"]:
         for stmt in file_claims["entities"][mediaid]["statements"][prop]:
             if stmt.get("references"):
@@ -1490,112 +1808,8 @@ def process_one(mediaid, dpla_id):
     add_access(mediaid, access, dpla_id)
     add_level(mediaid, level, dpla_id)
 
-    if refclaims["claims"]:
-        postrefs = {
-            "action": "wbeditentity",
-            "format": "json",
-            "id": mediaid,
-            "data": json.dumps(refclaims),
-            "token": token,
-            "bot": True,
-            "summary": f"Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-        }
-        save = http.fetch(
-            "https://commons.wikimedia.org/w/api.php",
-            method="POST",
-            data=postrefs,
-        )
-        try:
-            post = json.loads(save.text)
-            if post["success"] == 1:
-                print(" --- Saved new refs!")
-            else:
-                print(post)
-                print(" --- Error encountered on save.")
-                sys.exit()
-        except Exception:
-            try:
-                token = login()
-                postrefs["token"] = token
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postrefs,
-                )
-                post = json.loads(save.text)
-                if post["success"] == 1:
-                    print(" --- Saved new refs!")
-                else:
-                    print(post)
-                    print(" --- Error encountered on save.")
-                    sys.exit()
-            except Exception:
-                print(" --- Error encountered. 2")
-                sys.exit()
-
-    postdata = {
-        "action": "wbeditentity",
-        "format": "json",
-        "id": mediaid,
-        "data": json.dumps(claims),
-        "token": token,
-        "bot": True,
-        "summary": f"Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-    }
-
-    if claims["claims"]:
-        try:
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postdata,
-            )
-        except (requests.exceptions.ConnectionError, ConnectionError):
-            try:
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postdata,
-                )
-            except (requests.exceptions.ConnectionError, ConnectionError):
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postdata,
-                )
-        try:
-            post = json.loads(save.text)
-            if post["success"] == 1:
-                print(" --- Saved new claims!")
-            else:
-                print(post)
-                print(" --- Error encountered on save.")
-                sys.exit()
-        except Exception:
-            try:
-                token = login()
-                postdata["token"] = token
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postdata,
-                )
-                post = json.loads(save.text)
-                if post["success"] == 1:
-                    print(" --- Saved new claims!")
-                else:
-                    print(post)
-                    print(" --- Error encountered on save.")
-                    sys.exit()
-            except Exception as retry_e:
-                # `post` may not be assigned yet if http.fetch / json.loads
-                # raised — referencing it directly would mask the real
-                # error with an UnboundLocalError. Log what we actually have.
-                print(f" --- Retry after token refresh failed: {retry_e!r}")
-                if "save" in locals():
-                    print(save.text)
-                print(" --- Error encountered. 3")
-                sys.exit()
+    _post_new_refs(mediaid, dpla_id)
+    _post_new_claims(mediaid, dpla_id)
 
     dpla_claims(
         mediaid,
@@ -1614,6 +1828,160 @@ def process_one(mediaid, dpla_id):
         access,
         level,
     )
+
+
+def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
+    """Sync SDC for a single Commons file against a precomputed claim list.
+
+    Reads the claim envelope produced by `build_claims_for_doc` and staged
+    to S3 as `<partner>/<dpla_id>/sdc.json`, diffs each claim against the
+    file's existing SDC, and POSTs adds + removals. This is the PR 4
+    cutover from runtime claim construction to pure S3-driven sync — no
+    api.dp.la call, no per-add_* dispatch, no Wikidata reconciliation
+    here (all of that happened upstream in get-ids-es).
+
+    The diff is the same the legacy `process_one` performs, just driven
+    by sdc.json's claim list instead of by an in-code property-by-property
+    walk. Reuses the existing `check()` per-property matcher, the shared
+    `_post_new_refs`/`_post_new_claims` POST helpers, and the shared
+    `_reconcile_existing_claims` removal logic.
+    """
+    global claims, refclaims
+
+    # Drop any stale cache from a prior file so check() always reads fresh
+    # state for this mediaid. The cache survives across files within one
+    # process invocation, so explicit invalidation is necessary when we
+    # move to a new file. Pre-warm so the per-claim check() calls below
+    # share one wbgetentities round-trip.
+    invalidate_entity(mediaid)
+    get_entity(mediaid)
+
+    claims = {"claims": []}
+    refclaims = {"claims": []}
+
+    sdc_claims = sdc_payload.get("claims", [])
+    first_check = True
+    for source_claim in sdc_claims:
+        # Deepcopy before any mutation — `add_ref` stamps `claim["id"]` on
+        # the object it's given, and we also append it to `claims["claims"]`
+        # for the wbeditentity POST. The same `sdc_payload` is reused across
+        # every ordinal of a multi-page item, so without this copy ordinal N
+        # would inherit ordinal N-1's per-mediaid claim IDs and references.
+        claim = copy.deepcopy(source_claim)
+        prop = claim["mainsnak"]["property"]
+        kind = _check_kind_for_claim(claim)
+        comparable = _extract_comparable_value(claim)
+        if comparable is None:
+            # Unknown claim shape — fall through and post unconditionally;
+            # `check()` can't compare it against existing state.
+            claims["claims"].append(claim)
+            continue
+        try:
+            checkclaim = check(mediaid, (kind, comparable), prop)
+        except pywikibot.exceptions.APIError:
+            # The first check() call is what tells us whether the file
+            # page even exists — subsequent calls hit the cache. If it
+            # raises, the page is gone or otherwise unreachable and we
+            # shouldn't try to write any SDC to it.
+            if first_check:
+                print(f" -- No such file on Commons: {mediaid}")
+                return
+            raise
+        first_check = False
+        if checkclaim[1]:
+            add_ref(checkclaim[1], claim)
+        if checkclaim[0] is True:
+            pywikibot.output(f" -- Adding [[:d:Property:{prop}]] to {mediaid}.")
+            claims["claims"].append(claim)
+
+    _post_new_refs(mediaid, dpla_id)
+    _post_new_claims(mediaid, dpla_id)
+
+    expected = _build_expected_from_sdc(sdc_payload)
+    _reconcile_existing_claims(mediaid, dpla_id, expected)
+
+
+def _run_partner_mode(partner, ids_file):
+    """Drive the SDC phase from precomputed S3 sidecars for a whole partner.
+
+    For each DPLA ID in `ids_file`:
+      * Read `sdc.json` (staged by get-ids-es). Skip if absent — item
+        couldn't be parsed, or get-ids-es hasn't run for this partner yet.
+      * Read `upload-result.json` (written by uploader). Skip if absent —
+        uploader hasn't processed this item, so we don't know which
+        ordinals exist on Commons.
+      * For each ordinal whose status is UPLOADED or SKIPPED, derive
+        `M<pageid>` and call `process_one_from_sdc(mediaid, dpla_id, sdc)`.
+
+    Items where the metadata isn't yet on S3 are skipped silently and
+    will be picked up the next time the full pipeline runs.
+    """
+    from botocore.exceptions import ClientError
+
+    from ingest_wikimedia.s3 import S3Client
+
+    s3 = S3Client()
+
+    with open(ids_file) as f:
+        dpla_ids = [line.strip() for line in f if line.strip()]
+
+    print(f"Partner mode: {partner} — {len(dpla_ids)} items from {ids_file}")
+    local_count = 0
+    for dpla_id in dpla_ids:
+        local_count += 1
+        print(f"\n{local_count}: {dpla_id}")
+
+        # S3Client.get_item_file returns None on 404/NoSuchKey but re-raises
+        # any other ClientError. Catch those per-item so one transient S3
+        # failure doesn't abort the whole partner batch.
+        try:
+            sdc_raw = s3.get_sdc_json(partner, dpla_id)
+        except ClientError as e:
+            print(f" -- S3 error reading sdc.json for {dpla_id}: {e!r}; skipping.")
+            continue
+        if sdc_raw is None:
+            print(" -- No sdc.json on S3; skipping.")
+            continue
+        try:
+            sdc_payload = json.loads(sdc_raw)
+        except json.JSONDecodeError as e:
+            print(f" -- sdc.json failed to parse: {e}; skipping.")
+            continue
+
+        try:
+            upload_raw = s3.get_upload_result(partner, dpla_id)
+        except ClientError as e:
+            print(
+                f" -- S3 error reading upload-result.json for {dpla_id}: {e!r}; skipping."
+            )
+            continue
+        if upload_raw is None:
+            print(" -- No upload-result.json on S3; skipping.")
+            continue
+        try:
+            upload_result = json.loads(upload_raw)
+        except json.JSONDecodeError as e:
+            print(f" -- upload-result.json failed to parse: {e}; skipping.")
+            continue
+
+        ordinals = upload_result.get("ordinals", {})
+        eligible = {
+            ord_str: data
+            for ord_str, data in ordinals.items()
+            if data.get("status") in ("UPLOADED", "SKIPPED")
+        }
+        if not eligible:
+            print(" -- No SDC-eligible ordinals; skipping.")
+            continue
+
+        for ord_str, data in sorted(eligible.items(), key=lambda kv: int(kv[0])):
+            pageid = data.get("pageid")
+            if pageid is None:
+                print(f" -- Ordinal {ord_str}: no pageid; skipping.")
+                continue
+            mediaid = f"M{pageid}"
+            print(f" -- Ordinal {ord_str}: {mediaid} ({data.get('title', '?')})")
+            process_one_from_sdc(mediaid, dpla_id, sdc_payload)
 
 
 # We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
@@ -1688,3 +2056,11 @@ elif args.cat:
         if args.limit and count >= args.limit:
             print(f" -- Reached --limit {args.limit}, stopping.")
             break
+
+elif args.partner:
+    # Partner-driven SDC phase (PR 4). Iterates the partner's IDs CSV and
+    # syncs each item's precomputed sdc.json against Commons. Designed to be
+    # the last step in a `get-ids-es → downloader → uploader → sdc-sync`
+    # pipeline chain.
+    _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")
+    _run_partner_mode(args.partner, _ids_file)
