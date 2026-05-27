@@ -2075,6 +2075,13 @@ def _run_partner_mode(partner, ids_file):
                 continue
 
             synced_this_item = False
+            # Tracks whether any ordinal hit the per-ordinal exception
+            # path (runtime failure) so an item with all-failed ordinals
+            # is classified under SDC_ITEMS_SKIPPED_ERROR rather than
+            # SDC_ITEMS_SKIPPED_MAPPING — they mean different things and
+            # operators read the Slack summary to distinguish bad data
+            # from bad network/API.
+            had_ordinal_error = False
             # int(ord_str) on a malformed ordinal key (e.g. "abc" instead
             # of "3") would otherwise raise out of the whole loop and
             # abort the partner batch. Skip the item, log, and account
@@ -2089,8 +2096,22 @@ def _run_partner_mode(partner, ids_file):
                 continue
             for ord_str, data in ordinal_items:
                 pageid = data.get("pageid")
-                if pageid is None:
-                    logging.warning(f" -- Ordinal {ord_str}: no pageid; skipping.")
+                # `if not pageid` rather than `is None` — a recorded
+                # pageid of 0 is just as malformed as a missing one
+                # (no Commons MediaInfo entity has ID `M0`) and would
+                # otherwise propagate downstream as a confusing
+                # pywikibot APIError on the bogus mediaid. The
+                # uploader has historically written `pageid: 0` for
+                # successful new uploads when pywikibot's FilePage
+                # cache wasn't invalidated post-upload; treat that
+                # sidecar shape as a mapping skip until the upstream
+                # bug is fixed and the existing sidecars are
+                # backfilled.
+                if not pageid:
+                    logging.warning(
+                        f" -- Ordinal {ord_str}: missing/zero pageid"
+                        f" ({pageid!r}); skipping."
+                    )
                     continue
                 mediaid = f"M{pageid}"
                 title = data.get("title", "?")
@@ -2103,7 +2124,29 @@ def _run_partner_mode(partner, ids_file):
                     + tracker.count(Result.SDC_REFS_ADDED)
                     + tracker.count(Result.SDC_REMOVALS)
                 )
-                process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                # Per-ordinal exception boundary. Without this, any
+                # transient pywikibot APIError (rate limit, maxlag,
+                # transient 503), network timeout, or surprise
+                # KeyError/AssertionError deep in the property-builder
+                # propagates up through both nested loops and aborts
+                # the entire partner batch — losing thousands of items'
+                # worth of work because of one bad page. Other failure
+                # modes in this function (S3 ClientError, JSON parse,
+                # malformed ordinals) already skip-and-continue; this
+                # makes the actual SDC write follow the same pattern.
+                # `logging.exception` writes the full traceback into
+                # the SDC log file so notify_pipeline_fail's
+                # `_summarize_log` can surface it in Slack.
+                try:
+                    process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                except Exception:
+                    logging.exception(
+                        f" -- Ordinal {ord_str} ({mediaid}) for {dpla_id}:"
+                        " SDC sync failed; skipping ordinal."
+                    )
+                    tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+                    had_ordinal_error = True
+                    continue
                 writes_after = (
                     tracker.count(Result.SDC_CLAIMS_ADDED)
                     + tracker.count(Result.SDC_REFS_ADDED)
@@ -2135,9 +2178,27 @@ def _run_partner_mode(partner, ids_file):
             # counter and underreport mapping skips.
             if synced_this_item:
                 tracker.increment(Result.SDC_ITEMS_SYNCED)
+            elif had_ordinal_error:
+                # Every eligible ordinal raised at runtime — classify
+                # under the error bucket, not MAPPING. (Mixed-result
+                # items where some ordinals succeed go to SYNCED; the
+                # per-ordinal failures are still visible under
+                # SDC_ORDINALS_SKIPPED_ERROR.)
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
             else:
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
         completed = True
+    except Exception:
+        # The per-ordinal try/except above already swallows every routine
+        # SDC-write failure. Reaching this outer handler means something
+        # truly outside-the-loop went wrong (sidecar enumeration, S3 auth,
+        # logger state, etc.). Log the traceback into the SDC log file so
+        # notify_pipeline_fail's `_summarize_log` can include it in the
+        # Slack failure message — otherwise the traceback only hits stderr
+        # (the file handler doesn't capture it) and the operator sees an
+        # abort warning with no diagnostic.
+        logging.exception("SDC sync aborted with unhandled exception")
+        raise
     finally:
         elapsed = time.time() - start_time
         # Emit the terminal "COUNTS:" marker and Slack completion message

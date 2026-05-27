@@ -434,6 +434,8 @@ def notify_sdc_complete(
             f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",
             f"SKIPPED (no sidecar): {tracker.count(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR):,}",
             f"SKIPPED (mapping):    {tracker.count(Result.SDC_ITEMS_SKIPPED_MAPPING):,}",
+            f"SKIPPED (error):      {tracker.count(Result.SDC_ITEMS_SKIPPED_ERROR):,}",
+            f"ORDINAL ERRORS:       {tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR):,}",
             f"Runtime:              {runtime}",
         ],
     )
