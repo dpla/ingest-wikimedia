@@ -348,6 +348,28 @@ def invalidate_entity(mediaid):
     _entity_cache.pop(mediaid, None)
 
 
+def _is_dpla_shaped(statement):
+    """Return True when `statement` carries the P459=Q61848113 marker that
+    DPLA stamps on every claim it writes (determination method = "determined
+    by GLAM institution and stated at its website").
+
+    Used by check() to decide whether an existing matching statement is one
+    we wrote (safe to amend in place via wbeditentity-with-id) or one
+    someone else wrote (must not be touched — wbeditentity-with-id replaces
+    the whole claim's qualifiers + references with what we send, so
+    capturing such a statement's id for ref-stamping would silently erase
+    qualifiers we don't know about).
+    """
+    qualifiers = statement.get("qualifiers") or {}
+    for snak in qualifiers.get("P459") or []:
+        try:
+            if snak["datavalue"]["value"]["id"] == "Q61848113":
+                return True
+        except (KeyError, TypeError):
+            continue
+    return False
+
+
 def check(mediaid, qid, prop):
     ref = ""
     existing_data = get_entity(mediaid)
@@ -361,125 +383,160 @@ def check(mediaid, qid, prop):
     except Exception:
         return True, ""
 
-    # The following code is used to check the existing statements that match the prop. If any statement matches the prop and qid but has no qualifiers, the statement id is returned. If there is a matching statement with qualifiers, return False. Otherwise (statements with matching prop have no matching qid) return True. This logic is not complete: it will return a statement id for a statement with no qualifier, even if another statement already has the desired qualifier. Also, it would return False even in cases where the qualifier value is different from the desired qualifier, in cases where there there is a matching qid and prop with qualifiers.
+    # Inspect existing statements that match `prop` and decide what to do:
+    #
+    #   * Capture `ref` from a matching statement only when amending it is
+    #     SAFE — either the statement has no qualifiers or it carries the
+    #     P459=Q61848113 marker (DPLA-shaped, written by us). Otherwise
+    #     wbeditentity-with-id would clobber qualifiers we didn't author.
+    #   * If a matching statement has no qualifiers at all, stamp our
+    #     P459=Q61848113 qualifier onto it (wbsetqualifier is non-destructive).
+    #   * If a matching statement carries qualifiers AND it's DPLA-shaped,
+    #     we've already written this claim — don't add a duplicate.
+    #   * If a matching statement carries qualifiers AND it's FOREIGN
+    #     (no P459=Q61848113), leave it alone and add the DPLA-authored
+    #     statement alongside as a separate claim. The two coexist with
+    #     different rationales.
     if qid[0] == "item":
-        if any(
-            statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
-            and not statement.get("references")
-            for statement in statements
-        ):
-            for statement in statements:
-                if statement["mainsnak"]["datavalue"]["value"]["id"] == qid[
-                    1
-                ] and not statement.get("references"):
-                    ref = statement["id"]
-        if any(
-            statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
-            and not statement.get("qualifiers")
-            for statement in statements
-        ):
-            for statement in statements:
-                if statement["mainsnak"]["datavalue"]["value"]["id"] == qid[
-                    1
-                ] and not statement.get("qualifiers"):
-                    return add_det(mediaid, statement["id"]), ref
+        for statement in statements:
+            if (
+                statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
+                and not statement.get("references")
+                and (not statement.get("qualifiers") or _is_dpla_shaped(statement))
+            ):
+                ref = statement["id"]
+                break
+        for statement in statements:
+            if statement["mainsnak"]["datavalue"]["value"]["id"] == qid[
+                1
+            ] and not statement.get("qualifiers"):
+                return add_det(mediaid, statement["id"]), ref
 
-        elif any(
+        if any(
+            statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
+            and _is_dpla_shaped(statement)
+            for statement in statements
+        ):
+            print(
+                f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+            )
+            return False, ref
+
+        if any(
             statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
             for statement in statements
         ):
             print(
-                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                f" -- A foreign {prop} > {qid[1]} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
             )
-            return False, ref
+            return True, ""
 
-        else:
-            return True, ref
+        return True, ref
     if qid[0] == "string":
-        if any(
-            statement["mainsnak"]["datavalue"]["value"] == qid[1]
-            and not statement.get("references")
-            for statement in statements
-        ):
-            for statement in statements:
-                if statement["mainsnak"]["datavalue"]["value"] == qid[
-                    1
-                ] and not statement.get("references"):
-                    ref = statement["id"]
-        if any(
-            statement["mainsnak"]["datavalue"]["value"] == qid[1]
-            and not statement.get("qualifiers")
-            for statement in statements
-        ):
-            for statement in statements:
-                if statement["mainsnak"]["datavalue"]["value"] == qid[
-                    1
-                ] and not statement.get("qualifiers"):
-                    return add_det(mediaid, statement["id"]), ref
+        for statement in statements:
+            if (
+                statement["mainsnak"]["datavalue"]["value"] == qid[1]
+                and not statement.get("references")
+                and (not statement.get("qualifiers") or _is_dpla_shaped(statement))
+            ):
+                ref = statement["id"]
+                break
+        for statement in statements:
+            if statement["mainsnak"]["datavalue"]["value"] == qid[
+                1
+            ] and not statement.get("qualifiers"):
+                return add_det(mediaid, statement["id"]), ref
 
-        elif any(
+        if any(
+            statement["mainsnak"]["datavalue"]["value"] == qid[1]
+            and _is_dpla_shaped(statement)
+            for statement in statements
+        ):
+            print(
+                f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+            )
+            return False, ref
+
+        if any(
             statement["mainsnak"]["datavalue"]["value"] == qid[1]
             for statement in statements
         ):
             print(
-                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                f" -- A foreign {prop} > {qid[1]} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
             )
-            return False, ref
+            return True, ""
 
-        else:
-            return True, ref
+        return True, ref
     if qid[0] == "monolingualtext":
-        if any(
-            statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
-            and not statement.get("references")
-            for statement in statements
-        ):
-            for statement in statements:
-                if statement["mainsnak"]["datavalue"]["value"]["text"] == qid[
-                    1
-                ] and not statement.get("references"):
-                    ref = statement["id"]
-        if any(
-            statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
-            and not statement.get("qualifiers")
-            for statement in statements
-        ):
-            for statement in statements:
-                if statement["mainsnak"]["datavalue"]["value"]["text"] == qid[
-                    1
-                ] and not statement.get("qualifiers"):
-                    return add_det(mediaid, statement["id"]), ref
+        for statement in statements:
+            if (
+                statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
+                and not statement.get("references")
+                and (not statement.get("qualifiers") or _is_dpla_shaped(statement))
+            ):
+                ref = statement["id"]
+                break
+        for statement in statements:
+            if statement["mainsnak"]["datavalue"]["value"]["text"] == qid[
+                1
+            ] and not statement.get("qualifiers"):
+                return add_det(mediaid, statement["id"]), ref
 
-        elif any(
+        if any(
+            statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
+            and _is_dpla_shaped(statement)
+            for statement in statements
+        ):
+            print(
+                f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+            )
+            return False, ref
+
+        if any(
             statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
             for statement in statements
         ):
             print(
-                f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                f" -- A foreign {prop} > {qid[1]} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
             )
-            return False, ref
+            return True, ""
 
-        else:
-            return True, ref
+        return True, ref
     if qid[0] == "somevalue":
         p = "P1932" if prop == "P571" else "P2093"
         try:
             if any(statement.get("qualifiers", {}).get(p) for statement in statements):
+                # Capture ref only from DPLA-shaped matching statements.
+                # somevalue claims always have at least the P1932/P2093
+                # qualifier we matched on, so "no qualifiers" is impossible;
+                # the DPLA-shaped check is the only safe gate.
                 for statement in statements:
                     qualifiers = statement.get("qualifiers", {}).get(p) or []
-                    # Scan every qualifier entry, not just the first. Wikibase
-                    # qualifier props may carry multiple values.
+                    if (
+                        any(
+                            q.get("datavalue", {}).get("value") == qid[1]
+                            for q in qualifiers
+                        )
+                        and _is_dpla_shaped(statement)
+                        and not statement.get("references")
+                    ):
+                        ref = statement["id"]
+                        break
+                # Already-our-write check: a DPLA-shaped statement with the
+                # matching qualifier value means we wrote this claim before.
+                # Don't add a duplicate.
+                for statement in statements:
+                    qualifiers = statement.get("qualifiers", {}).get(p) or []
                     if any(
                         q.get("datavalue", {}).get("value") == qid[1]
                         for q in qualifiers
-                    ) and not statement.get("references"):
-                        ref = statement["id"]
-                # Walk every statement looking for a qualifier match. Only
-                # return False on an actual match; otherwise fall through and
-                # return True once we've exhausted all statements. Returning
-                # early on a non-match would skip later statements that DO
-                # match and cause duplicate writes on multi-value properties
-                # (creators, dates, etc.).
+                    ) and _is_dpla_shaped(statement):
+                        print(
+                            f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+                        )
+                        return False, ref
+                # Foreign matching statement: leave alone, add ours as a
+                # separate claim.
                 for statement in statements:
                     qualifiers = statement.get("qualifiers", {}).get(p) or []
                     if any(
@@ -487,9 +544,9 @@ def check(mediaid, qid, prop):
                         for q in qualifiers
                     ):
                         print(
-                            f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                            f" -- A foreign {prop} > {qid[1]} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
                         )
-                        return False, ref
+                        return True, ""
                 return True, ref
             else:
                 return True, ref
@@ -500,15 +557,34 @@ def check(mediaid, qid, prop):
             if any(
                 statement.get("qualifiers", {}).get("P973") for statement in statements
             ):
+                # Same logic as the somevalue branch: P7482 source claims
+                # always have at least the P973 qualifier we matched on,
+                # so amend-safety hinges on whether the statement is
+                # DPLA-shaped (carries P459=Q61848113).
+                for statement in statements:
+                    qualifiers = statement.get("qualifiers", {}).get("P973") or []
+                    if (
+                        any(
+                            q.get("datavalue", {}).get("value") == qid[1]
+                            for q in qualifiers
+                        )
+                        and _is_dpla_shaped(statement)
+                        and not statement.get("references")
+                    ):
+                        ref = statement["id"]
+                        break
+                # Already-our-write check.
                 for statement in statements:
                     qualifiers = statement.get("qualifiers", {}).get("P973") or []
                     if any(
                         q.get("datavalue", {}).get("value") == qid[1]
                         for q in qualifiers
-                    ) and not statement.get("references"):
-                        ref = statement["id"]
-                # See the somevalue branch above: scan every statement before
-                # concluding the claim is missing.
+                    ) and _is_dpla_shaped(statement):
+                        print(
+                            f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+                        )
+                        return False, ref
+                # Foreign matching statement: leave alone, add ours alongside.
                 for statement in statements:
                     qualifiers = statement.get("qualifiers", {}).get("P973") or []
                     if any(
@@ -516,9 +592,9 @@ def check(mediaid, qid, prop):
                         for q in qualifiers
                     ):
                         print(
-                            f" -- There already exists a statement with a {prop} > {qid[1]} claim for {mediaid}."
+                            f" -- A foreign {prop} > {qid[1]} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
                         )
-                        return False, ref
+                        return True, ""
                 return True, ref
             else:
                 return True, ref
