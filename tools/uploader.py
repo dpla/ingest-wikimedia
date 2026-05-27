@@ -88,6 +88,36 @@ UPLOAD_TIMEOUT_SECS = 3600  # 1 hour
 LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES = 95 * 1024 * 1024  # 95 MB
 
 
+def is_dup_sha1_sibling_at_expected_title(
+    *,
+    sha1: str,
+    existing_file_title: str,
+    duplicate_source_sha1s: set[str] | None,
+    expected_item_titles: set[str] | None,
+) -> bool:
+    """Return True iff the existing Commons file is a true sibling at one of
+    this item's own expected current titles.
+
+    ``True`` means it's safe to take the upload-only branch — the per-ordinal
+    iteration is preserving that title intentionally and we can upload our
+    own ordinal alongside it.
+
+    ``False`` means the existing file is at a *different* title than any of
+    this item's current asset positions (typically a legacy upload from a
+    previous naming scheme, like a NARA-bot title from 2011).  Even when the
+    SHA1 legitimately appears at multiple source positions, leaving the
+    legacy title alone produces an orphan duplicate on Commons alongside our
+    new ``(page N).ext`` uploads.  The caller should route through normal
+    drift handling instead, which migrates the legacy title via Case 3.
+    """
+    return bool(
+        duplicate_source_sha1s
+        and sha1 in duplicate_source_sha1s
+        and expected_item_titles
+        and existing_file_title in expected_item_titles
+    )
+
+
 def select_upload_chunk_size(
     *,
     file_exists: bool,
@@ -310,18 +340,25 @@ class Uploader:
                 drift_action: str | None = None
                 force_ignore_warnings = False
                 if existing_file is not None:
-                    if duplicate_source_sha1s and sha1 in duplicate_source_sha1s:
-                        # The source data legitimately lists this SHA1 at
-                        # multiple positions within the item.  The existing
-                        # Commons file at another title is a valid sibling,
-                        # not drift to be migrated — both positions should
-                        # exist as separate Commons pages.  Upload to our
-                        # title and leave the other alone.
+                    # The duplicate-source-SHA1 short-circuit only applies
+                    # when the existing Commons file is at one of THIS item's
+                    # own expected titles — see
+                    # is_dup_sha1_sibling_at_expected_title's docstring for
+                    # why a legacy NARA-bot title with the same SHA1 must
+                    # NOT take this branch (it would leave an orphan
+                    # duplicate alongside our (page N) uploads).
+                    existing_title = existing_file.title(with_ns=False)
+                    if is_dup_sha1_sibling_at_expected_title(
+                        sha1=sha1,
+                        existing_file_title=existing_title,
+                        duplicate_source_sha1s=duplicate_source_sha1s,
+                        expected_item_titles=expected_item_titles,
+                    ):
                         logging.info(
                             f"Source asset list contains the same SHA1 at "
                             f"multiple positions for {dpla_id} {ordinal}; "
                             f"existing file at "
-                            f"[[File:{existing_file.title(with_ns=False)}]] "
+                            f"[[File:{existing_title}]] "
                             f"is a legitimate sibling, not drift. Uploading "
                             f"to [[File:{page_title}]] without disturbing it."
                         )

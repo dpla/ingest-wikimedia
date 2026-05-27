@@ -13,6 +13,7 @@ from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     _post_item_orphan_check,
     _post_upload_touch_new_institutions,
+    is_dup_sha1_sibling_at_expected_title,
     select_upload_chunk_size,
 )
 
@@ -857,3 +858,108 @@ def test_chunk_size_threshold_under_wikimedia_gateway_limit():
     """The threshold itself must stay safely under Wikimedia's ~100 MB
     practical direct-upload limit — otherwise we re-introduce the OOM."""
     assert LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES < 100 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------
+# is_dup_sha1_sibling_at_expected_title — the upload_only short-circuit gate
+#
+# Pin the contract that prevents the orphan-duplicate bug observed on item
+# fe6f59a29fddf8e3483e91ad805bf039 (Zuni in costume). NARA's mediaMaster
+# listed the same TIF URL at two positions, so duplicate_source_sha1s
+# contained that SHA1. The pre-fix code unconditionally treated any
+# existing file with a matching SHA1 as a sibling, leaving the 2011 legacy
+# NARA-bot title in place and uploading (page 1).tiff and (page 2).tiff
+# beside it — three Commons files with the same SHA1. The helper must
+# return True only when the existing title is one of THIS item's own
+# expected current titles.
+# --------------------------------------------------------------------------
+
+_SHA1 = "76f6fe0a766e4a664b7d99b9e6c0fb8594bac083"
+_DPLA_PAGE_1 = "Zuni in costume - DPLA - fe6f59a29fddf8e3483e91ad805bf039 (page 1).tiff"
+_DPLA_PAGE_2 = "Zuni in costume - DPLA - fe6f59a29fddf8e3483e91ad805bf039 (page 2).tiff"
+_LEGACY_NARA = "Zuni in costume - NARA - 523667.tif"
+
+
+def test_dup_sha1_sibling_true_when_existing_is_at_expected_title():
+    """SHA1 appears at multiple source positions AND the Commons file lives
+    at one of our (page N).ext titles → true sibling, upload-only is safe."""
+    assert (
+        is_dup_sha1_sibling_at_expected_title(
+            sha1=_SHA1,
+            existing_file_title=_DPLA_PAGE_1,
+            duplicate_source_sha1s={_SHA1},
+            expected_item_titles={_DPLA_PAGE_1, _DPLA_PAGE_2},
+        )
+        is True
+    )
+
+
+def test_dup_sha1_sibling_false_when_existing_is_legacy_title():
+    """THE BUG FIX: SHA1 is in duplicate_source_sha1s, but the existing file
+    is at a legacy title (here the 2011 NARA-bot upload). Returning True
+    would short-circuit drift handling and leave the legacy title in place
+    forever. Must return False so the caller falls through to drift
+    handling, which Case-3-moves the legacy title to (page 1).tiff."""
+    assert (
+        is_dup_sha1_sibling_at_expected_title(
+            sha1=_SHA1,
+            existing_file_title=_LEGACY_NARA,
+            duplicate_source_sha1s={_SHA1},
+            expected_item_titles={_DPLA_PAGE_1, _DPLA_PAGE_2},
+        )
+        is False
+    )
+
+
+def test_dup_sha1_sibling_false_when_sha1_not_in_dup_set():
+    """No multi-position SHA1 case at all → False even if title coincidentally
+    matches an expected title; the caller's normal drift path handles this."""
+    assert (
+        is_dup_sha1_sibling_at_expected_title(
+            sha1="ffffffffffffffffffffffffffffffffffffffff",
+            existing_file_title=_DPLA_PAGE_1,
+            duplicate_source_sha1s={_SHA1},
+            expected_item_titles={_DPLA_PAGE_1, _DPLA_PAGE_2},
+        )
+        is False
+    )
+
+
+def test_dup_sha1_sibling_false_when_duplicate_source_sha1s_is_none():
+    """Defensive: process_file's signature allows None; the gate must
+    not raise and must return False, routing through normal drift."""
+    assert (
+        is_dup_sha1_sibling_at_expected_title(
+            sha1=_SHA1,
+            existing_file_title=_DPLA_PAGE_1,
+            duplicate_source_sha1s=None,
+            expected_item_titles={_DPLA_PAGE_1},
+        )
+        is False
+    )
+
+
+def test_dup_sha1_sibling_false_when_expected_item_titles_is_none():
+    """Defensive: same as above for the other optional parameter."""
+    assert (
+        is_dup_sha1_sibling_at_expected_title(
+            sha1=_SHA1,
+            existing_file_title=_DPLA_PAGE_1,
+            duplicate_source_sha1s={_SHA1},
+            expected_item_titles=None,
+        )
+        is False
+    )
+
+
+def test_dup_sha1_sibling_false_when_duplicate_source_sha1s_is_empty_set():
+    """Empty set is falsy in the early-return; explicit test for clarity."""
+    assert (
+        is_dup_sha1_sibling_at_expected_title(
+            sha1=_SHA1,
+            existing_file_title=_DPLA_PAGE_1,
+            duplicate_source_sha1s=set(),
+            expected_item_titles={_DPLA_PAGE_1},
+        )
+        is False
+    )
