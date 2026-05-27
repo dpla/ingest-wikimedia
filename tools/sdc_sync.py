@@ -2096,8 +2096,22 @@ def _run_partner_mode(partner, ids_file):
                 continue
             for ord_str, data in ordinal_items:
                 pageid = data.get("pageid")
-                if pageid is None:
-                    logging.warning(f" -- Ordinal {ord_str}: no pageid; skipping.")
+                # `if not pageid` rather than `is None` — a recorded
+                # pageid of 0 is just as malformed as a missing one
+                # (no Commons MediaInfo entity has ID `M0`) and would
+                # otherwise propagate downstream as a confusing
+                # pywikibot APIError on the bogus mediaid. The
+                # uploader has historically written `pageid: 0` for
+                # successful new uploads when pywikibot's FilePage
+                # cache wasn't invalidated post-upload; treat that
+                # sidecar shape as a mapping skip until the upstream
+                # bug is fixed and the existing sidecars are
+                # backfilled.
+                if not pageid:
+                    logging.warning(
+                        f" -- Ordinal {ord_str}: missing/zero pageid"
+                        f" ({pageid!r}); skipping."
+                    )
                     continue
                 mediaid = f"M{pageid}"
                 title = data.get("title", "?")
