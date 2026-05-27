@@ -2075,6 +2075,13 @@ def _run_partner_mode(partner, ids_file):
                 continue
 
             synced_this_item = False
+            # Tracks whether any ordinal hit the per-ordinal exception
+            # path (runtime failure) so an item with all-failed ordinals
+            # is classified under SDC_ITEMS_SKIPPED_ERROR rather than
+            # SDC_ITEMS_SKIPPED_MAPPING — they mean different things and
+            # operators read the Slack summary to distinguish bad data
+            # from bad network/API.
+            had_ordinal_error = False
             # int(ord_str) on a malformed ordinal key (e.g. "abc" instead
             # of "3") would otherwise raise out of the whole loop and
             # abort the partner batch. Skip the item, log, and account
@@ -2124,6 +2131,7 @@ def _run_partner_mode(partner, ids_file):
                         " SDC sync failed; skipping ordinal."
                     )
                     tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+                    had_ordinal_error = True
                     continue
                 writes_after = (
                     tracker.count(Result.SDC_CLAIMS_ADDED)
@@ -2156,6 +2164,13 @@ def _run_partner_mode(partner, ids_file):
             # counter and underreport mapping skips.
             if synced_this_item:
                 tracker.increment(Result.SDC_ITEMS_SYNCED)
+            elif had_ordinal_error:
+                # Every eligible ordinal raised at runtime — classify
+                # under the error bucket, not MAPPING. (Mixed-result
+                # items where some ordinals succeed go to SYNCED; the
+                # per-ordinal failures are still visible under
+                # SDC_ORDINALS_SKIPPED_ERROR.)
+                tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
             else:
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
         completed = True
