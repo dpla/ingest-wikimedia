@@ -550,10 +550,59 @@ class Uploader:
                     self._tag_drift_duplicate(drift_old_filename, page_title, dpla_id)
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
+                # `wiki_file_page.pageid` is stale for net-new uploads:
+                # the pre-upload existence check populated the cached
+                # `_pageid = 0` (definitively, since the file did not
+                # exist), and `site.upload()` does not invalidate that
+                # cache. Reading it here records `pageid: 0` in
+                # upload-result.json even though the file is now on
+                # Commons with a real pageid — which downstream
+                # sdc-sync resolves to the bogus mediaid "M0" and
+                # raises. Construct a fresh FilePage (no cached
+                # pageid) and force a populated load via .exists() so
+                # the recorded pageid matches the API's assigned
+                # value.
+                #
+                # Fail closed on the sidecar contract: if the refresh
+                # throws or still returns a falsy pageid, record
+                # `pageid: None` rather than the malformed `0`. The
+                # upload itself genuinely succeeded — keep
+                # ORDINAL_UPLOADED so future runs see the file as
+                # already uploaded (returning ORDINAL_FAILED would
+                # trigger a retry against a file that's already on
+                # Commons, hitting the "file linked to another page"
+                # drift detection). sdc-sync's `if not pageid` guard
+                # (added in #252) cleanly skips None as a mapping
+                # malformed record without raising.
+                resolved_pageid = None
+                try:
+                    fresh_page = get_page(self.site, page_title)
+                    fresh_page.exists()
+                    resolved_pageid = fresh_page.pageid
+                except Exception as refresh_ex:
+                    logging.warning(
+                        f"Uploaded {page_title} but post-upload pageid"
+                        f" refresh raised: {refresh_ex!r}. Recording"
+                        " pageid=None; sdc-sync will skip this ordinal"
+                        " as malformed."
+                    )
+                if not resolved_pageid:
+                    if resolved_pageid is not None:
+                        # Refresh returned but produced a falsy value
+                        # (typically 0). Normalize to None so the
+                        # sidecar shape is uniformly "missing" rather
+                        # than the legacy bug shape.
+                        logging.warning(
+                            f"Uploaded {page_title} but resolved pageid"
+                            f" is {resolved_pageid!r}; recording"
+                            " pageid=None, sdc-sync will skip this"
+                            " ordinal as malformed."
+                        )
+                    resolved_pageid = None
                 return {
                     "status": ORDINAL_UPLOADED,
                     "title": page_title,
-                    "pageid": wiki_file_page.pageid,
+                    "pageid": resolved_pageid,
                 }
 
             # dry_run path falls through without uploading — flag as INELIGIBLE
