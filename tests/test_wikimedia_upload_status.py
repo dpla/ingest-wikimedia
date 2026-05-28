@@ -121,13 +121,26 @@ def test_log_filename_pattern_always_starts_with_dash():
         )
 
 
-def _fake_ssm_for_phase(log_filename: str, awk_counts: list[int], csv_total: int):
+def _fake_ssm_for_phase(
+    log_filename: str,
+    awk_counts: list[int],
+    csv_total: int,
+    *,
+    mtime: int = 1700000000,
+):
     """Build a fake `ssm_run` that returns the precheck + counts payload
     `get_phase_and_progress` expects, with the named log file and counts.
 
     Sequence (matches the real two-call flow):
       1. precheck — `session_created\nlog_filename`
       2. main — `now\nmtime\nSEP\ntail\nSEP\n<5 lines of awk + wc>`
+
+    ``mtime`` is parameterised so tests can verify the mtime tiebreak in
+    ``main`` — an "aborted phase" fake with an earlier mtime must be
+    distinguishable from an "active phase" fake with a later mtime, even
+    though both produce a non-COUNTS-marker phase string.  ``now`` is
+    kept at the same value so the staleness suffix doesn't fire (it
+    would change the phase-string assertions in unrelated callers).
     """
     call_count = [0]
     sep = "__WM_SEP__"
@@ -135,9 +148,10 @@ def _fake_ssm_for_phase(log_filename: str, awk_counts: list[int], csv_total: int
     def fake_ssm_run(_client, _command, **_kwargs):
         call_count[0] += 1
         if call_count[0] == 1:
-            return f"1700000000\n{log_filename}\n"
-        # now=mtime so no staleness suffix; counts payload then csv_total
-        body = f"1700000000\n1700000000\n{sep}\nlast log line\n{sep}\n"
+            return f"{mtime}\n{log_filename}\n"
+        # now and mtime both come from the same `mtime` parameter so the
+        # staleness suffix never fires (now == mtime → idle == 0).
+        body = f"{mtime}\n{mtime}\n{sep}\nlast log line\n{sep}\n"
         body += "\n".join(str(n) for n in awk_counts) + "\n"
         body += f"{csv_total}\n"
         return body
@@ -160,7 +174,7 @@ def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
         csv_total=10,
     )
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase = get_phase_and_progress(
+        phase, log_mtime = get_phase_and_progress(
             client=None,
             session="wikimedia-minnesota",
             hub="minnesota",
@@ -169,6 +183,9 @@ def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
     assert phase.startswith("SDC syncing")
     assert "3" in phase
     assert "10" in phase
+    # mtime is the second tuple element — present so callers can compare
+    # across labels (see test_main_picks_latest_active_label_by_mtime).
+    assert log_mtime > 0
 
 
 def test_get_phase_and_progress_reports_sdc_complete():
@@ -185,7 +202,7 @@ def test_get_phase_and_progress_reports_sdc_complete():
         csv_total=10,
     )
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase = get_phase_and_progress(
+        phase, _ = get_phase_and_progress(
             client=None,
             session="wikimedia-minnesota",
             hub="minnesota",
@@ -208,10 +225,116 @@ def test_get_phase_and_progress_reports_sdc_starting_with_no_items():
         csv_total=10,
     )
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase = get_phase_and_progress(
+        phase, _ = get_phase_and_progress(
             client=None,
             session="wikimedia-minnesota",
             hub="minnesota",
             label="minnesota",
         )
     assert phase == "SDC syncing (starting...)"
+
+
+def test_main_picks_latest_active_label_by_mtime_when_earlier_label_aborted():
+    """Regression: when a multi-target session has an EARLIER label whose
+    phase ended without a COUNTS terminal marker (e.g. an SDC sync that
+    aborted via SystemExit) and a LATER label is actively progressing
+    right now, the reporter must surface the LATER one, not freeze on
+    the stale earlier one.
+
+    Concrete case (May 28 2026): a six-target NARA pipeline aborted the
+    Clinton SDC at item 250/4879 around 09:57 UTC.  The shell-level
+    target separator is `;` (not `&&`), so subsequent targets ran:
+    Eisenhower SDC completed, Presidential Materials Division SDC
+    completed, and Center for Legislative Archives SDC is currently
+    running.  The reporter was reporting `[nara+william-j-clinton-library]
+    SDC syncing (250 / 4,879 items, ~5.1%) ⚠ idle 5h38m` because its
+    forward-walk returned the first non-complete phase it found.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    # The fix swaps the walk for an mtime-based tiebreak.  Verify the
+    # primitive that backs it: get_phase_and_progress reports the
+    # log_mtime alongside the phase, and an aborted older phase reports
+    # a smaller mtime than a currently-active later phase.  We then run
+    # the same `max(..., key=lambda t: t[2])` selection main() uses, to
+    # demonstrate that the active phase wins.
+    ABORT_MTIME = 1700000000  # the moment Clinton SDC aborted
+    ACTIVE_MTIME = ABORT_MTIME + 5 * 3600  # ~5h later: CFLA SDC last write
+
+    aborted = _fake_ssm_for_phase(
+        log_filename="20260528-091047-nara+william-j-clinton-library-sdc.log",
+        awk_counts=[250, 0, 0, 0],  # no COUNTS marker → not complete
+        csv_total=4879,
+        mtime=ABORT_MTIME,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=aborted):
+        aborted_phase, aborted_mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-multi",
+            hub="nara",
+            label="nara+william-j-clinton-library",
+        )
+
+    active = _fake_ssm_for_phase(
+        log_filename="20260528-140954-nara+center-for-legislative-archives-sdc.log",
+        awk_counts=[3101, 0, 0, 0],
+        csv_total=6946,
+        mtime=ACTIVE_MTIME,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=active):
+        active_phase, active_mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-multi",
+            hub="nara",
+            label="nara+center-for-legislative-archives",
+        )
+
+    # Both phases say "SDC syncing" (neither has COUNTS) — both look
+    # "active" by the count-marker test, which is exactly what tripped
+    # up the pre-fix forward-walk: it stopped at the first non-complete
+    # label and never advanced.
+    assert aborted_phase.startswith("SDC syncing")
+    assert active_phase.startswith("SDC syncing")
+    assert aborted_mtime > 0 and active_mtime > 0
+
+    # The contract that backs the tiebreak: distinct mtimes are returned
+    # and the active one is strictly later than the aborted one.
+    assert active_mtime > aborted_mtime
+    assert active_mtime - aborted_mtime == 5 * 3600
+
+    # Run the same selection main() runs on the (label, phase, mtime)
+    # tuples: pick the latest-mtime active label.  The active label
+    # must win — otherwise we're back to the "stuck on Clinton" bug.
+    active_labels = [
+        ("nara+william-j-clinton-library", aborted_phase, aborted_mtime),
+        ("nara+center-for-legislative-archives", active_phase, active_mtime),
+    ]
+    chosen_label, chosen_phase, _ = max(active_labels, key=lambda t: t[2])
+    assert chosen_label == "nara+center-for-legislative-archives"
+    assert chosen_phase == active_phase
+
+
+def test_get_phase_and_progress_returns_none_tuple_when_no_log_exists():
+    """The signature change must preserve the `phase is None` sentinel:
+    when no log file matches, return ``(None, 0)`` so the caller's
+    membership-and-tiebreak loop can detect "no log" and skip the
+    label without crashing on a string operation."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    # Return empty for both ls invocations (no matching log + no hub
+    # fallback log) so the function takes the "no log" early-return path.
+    def fake_ssm_run(_client, _command, **_kwargs):
+        return "1700000000\n\n"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        result = get_phase_and_progress(
+            client=None,
+            session="wikimedia-unknown",
+            hub="bpl",
+            label="bpl+nonexistent",
+        )
+    assert result == (None, 0)

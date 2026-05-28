@@ -13,15 +13,48 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ingest_wikimedia.slack import (
+    _PHASE_EMOJI,
     _decode_exit_code,
     _find_latest_log,
     _read_download_failed_count,
     _summarize_log,
+    notify_phase_start,
     notify_pipeline_fail,
     notify_sdc_complete,
     notify_upload_complete,
 )
 from ingest_wikimedia.tracker import Result, Tracker
+
+
+def test_notify_phase_start_supports_sdc_sync_phase():
+    """Regression: ``sdc-sync`` is a valid Phase value, with a distinct
+    emoji, so the SDC phase posts its own "starting" notification to
+    Slack the same way get-ids-es / downloader / uploader do.
+
+    Without this, a multi-target run reports `[label] Upload complete …`
+    and then goes silent for hours during SDC sync — the operator has
+    no Slack signal that the SDC phase actually started.
+    """
+    assert "sdc-sync" in _PHASE_EMOJI
+    assert _PHASE_EMOJI["sdc-sync"] != _PHASE_EMOJI["upload"]
+
+    posted = []
+
+    def _capture(token, text):
+        posted.append((token, text))
+
+    with (
+        patch.dict(os.environ, {"DPLA_SLACK_BOT_TOKEN": "x"}, clear=False),
+        patch("ingest_wikimedia.slack.post_message", side_effect=_capture),
+    ):
+        notify_phase_start("nara", "sdc-sync")
+
+    assert len(posted) == 1
+    _, text = posted[0]
+    # Emoji + session label + phase label, mirroring the other phases.
+    assert _PHASE_EMOJI["sdc-sync"] in text
+    assert "starting sdc-sync" in text
+    assert "wikimedia-nara" in text
 
 
 @pytest.mark.parametrize(

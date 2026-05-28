@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from pywikibot.comms import http
 from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
-from ingest_wikimedia.slack import notify_sdc_complete
+from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
 
@@ -2127,6 +2127,13 @@ def _run_partner_mode(partner, ids_file):
     from ingest_wikimedia.s3 import S3Client
 
     setup_logging(partner, "sdc", logging.INFO)
+    # Post the phase-start notification immediately after setup_logging so
+    # the operator sees that the SDC phase has actually begun — matching
+    # the get-ids-es / downloader / uploader convention. Without this,
+    # the gap between the upload-complete message and the eventual
+    # sdc-complete summary can stretch hours on a large hub with no
+    # indication that work has moved on.
+    notify_phase_start(partner, "sdc-sync")
     start_time = time.time()
 
     # Reset the module-level tracker so per-partner counts don't carry
@@ -2326,7 +2333,7 @@ def _run_partner_mode(partner, ids_file):
             else:
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
         completed = True
-    except Exception:
+    except BaseException as exc:
         # The per-ordinal try/except above already swallows every routine
         # SDC-write failure. Reaching this outer handler means something
         # truly outside-the-loop went wrong (sidecar enumeration, S3 auth,
@@ -2335,7 +2342,20 @@ def _run_partner_mode(partner, ids_file):
         # Slack failure message — otherwise the traceback only hits stderr
         # (the file handler doesn't capture it) and the operator sees an
         # abort warning with no diagnostic.
-        logging.exception("SDC sync aborted with unhandled exception")
+        #
+        # Widened to BaseException to capture SystemExit and KeyboardInterrupt
+        # too.  A cluster of 11 SDC aborts in May 2026 (two within 3 seconds
+        # of each other across two unrelated processes) all wrote the abort
+        # warning but no traceback — meaning a non-Exception class escaped
+        # this handler.  `except Exception` doesn't catch SystemExit /
+        # KeyboardInterrupt / GeneratorExit, so those bypassed the original
+        # log line entirely.  Widening to BaseException + re-raising
+        # preserves the original semantics (the shell-level pipeline still
+        # sees a non-zero exit and `notify_pipeline_fail` still fires) while
+        # making the next abort self-diagnosing.
+        logging.exception(
+            "SDC sync aborted with unhandled exception (%s)", type(exc).__name__
+        )
         raise
     finally:
         elapsed = time.time() - start_time
