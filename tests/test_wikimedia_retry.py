@@ -267,6 +267,172 @@ def test_retry_pipeline_escapes_dollar_in_notify_fail_cmd():
     )
 
 
+def _run_main_with_csvs(argv: list[str], csv_paths: list[str]) -> list[str]:
+    """Variant of _run_main_and_capture_full_pipeline that lets the test
+    parameterize which retry CSVs the mocked `find` step returns.  The
+    fixed helper above is hard-coded to a download-only smithsonian CSV;
+    these tests need to exercise the upload-only and both-CSVs paths."""
+    captured: list[str] = []
+
+    csv_block = "\n".join(csv_paths)
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if "UPDATE_DONE" in command:
+            return "UPDATE_DONE"
+        if "get-ids-retry" in command:
+            return "Partner found failures.\n"
+        if "__MEM_CHECK__" in command:
+            return f"{csv_block}\n__MEM_CHECK__\n8000 5000"
+        return ""
+
+    with (
+        patch("scripts.wikimedia_retry.ssm_run", side_effect=fake_ssm_run),
+        patch("scripts.wikimedia_retry.boto3.client", return_value=MagicMock()),
+        patch("scripts.wikimedia_retry.post_message"),
+        patch("sys.argv", argv),
+        patch.dict("os.environ", {}, clear=False),
+    ):
+        from scripts import wikimedia_retry
+
+        try:
+            wikimedia_retry.main()
+        except SystemExit:
+            # Expected: main() reaches _slack_fail after the mocked tmux launch
+            # returns "" (no SESSION_STARTED). All SSM commands the test cares
+            # about have been captured by this point — mirrors the established
+            # pattern in _run_main_and_capture_full_pipeline above.
+            pass
+
+    return captured
+
+
+def test_retry_merges_download_and_upload_csvs_into_single_uploader_call():
+    """Regression: when a hub has BOTH a download-retry and upload-retry
+    CSV, the pipeline must merge them into ONE combined CSV and run the
+    uploader exactly once.
+
+    The pre-fix code ran `uploader <download_csv>` then `uploader <upload_csv>`
+    back-to-back, so notify_phase_start("upload") and notify_upload_complete
+    both fired TWICE per retry hub. Users saw a confusing "starting upload"
+    appear right after the "Wikimedia Retry Complete" summary header.
+    """
+    commands = _run_main_with_csvs(
+        ["wikimedia_retry.py", "--days", "1", "--partner", "nara"],
+        [
+            "/home/ec2-user/ingest-wikimedia/retry/nara-download-retry.csv",
+            "/home/ec2-user/ingest-wikimedia/retry/nara-upload-retry.csv",
+        ],
+    )
+    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+
+    # The combined CSV merge step must be present and feed the (single)
+    # uploader invocation.  The `$0` in the awk program MUST be
+    # backslash-escaped — pipeline_cmd is embedded into the tmux launch
+    # as `"{pipeline_cmd}"` (double-quoted), and the outer bash on EC2
+    # would expand an unescaped `$0` before tmux ever sees the command.
+    # See the comment in scripts/wikimedia_retry.py around the awk step
+    # for the full rationale (same class of bug as PR #246).
+    expected_combined = (
+        "/home/ec2-user/ingest-wikimedia/retry/nara-retry-1d-combined.csv"
+    )
+    assert (
+        r"awk '!seen[\$0]++' "
+        "/home/ec2-user/ingest-wikimedia/retry/nara-download-retry.csv "
+        "/home/ec2-user/ingest-wikimedia/retry/nara-upload-retry.csv "
+        f"> {expected_combined}"
+    ) in pipeline_cmd, (
+        f"expected awk merge step missing or malformed; got: {pipeline_cmd!r}"
+    )
+    # Defence: the UNESCAPED form must not appear anywhere in the
+    # pipeline command.  If it ever reappears the silent-loss bug
+    # returns — awk would dedupe by the outer shell's argv[0] (typically
+    # the string "bash"), collapsing every retry CSV to a single line.
+    assert "awk '!seen[$0]++'" not in pipeline_cmd, (
+        f"found unescaped `$0` in pipeline_cmd; outer bash will expand "
+        f"$0 to its argv[0] before tmux sees the command. Use `\\$0`. "
+        f"Got: {pipeline_cmd!r}"
+    )
+
+    # Exactly ONE `uploader` invocation, pointing at the combined CSV.
+    # The downloader still runs separately on the download CSV (that's
+    # the actual re-download work), but only one upload pass.
+    uploader_calls = [
+        seg
+        for seg in pipeline_cmd.split("&&")
+        if " uploader " in f" {seg.strip()} " or seg.strip().startswith("uploader ")
+    ]
+    assert len(uploader_calls) == 1, (
+        f"expected exactly one uploader invocation in the merged pipeline; "
+        f"got {len(uploader_calls)}: {uploader_calls!r}"
+    )
+    assert expected_combined in uploader_calls[0], (
+        f"the single uploader call must target the combined CSV; "
+        f"got: {uploader_calls[0]!r}"
+    )
+
+    # Sanity: downloader still runs on the download CSV (uploader and
+    # downloader work different inputs in this design).
+    assert (
+        "downloader --max-age-days 1 "
+        "/home/ec2-user/ingest-wikimedia/retry/nara-download-retry.csv nara"
+    ) in pipeline_cmd
+
+
+def test_retry_download_only_csv_runs_uploader_once_without_merge_step():
+    """Download-only retry path: the existing single-CSV behavior must
+    still hold (uploader runs on the download CSV, no awk merge step,
+    notify_phase_start + notify_upload_complete fire exactly once)."""
+    commands = _run_main_with_csvs(
+        ["wikimedia_retry.py", "--days", "30", "--partner", "si"],
+        ["/home/ec2-user/ingest-wikimedia/retry/smithsonian-download-retry.csv"],
+    )
+    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+
+    assert "awk '!seen" not in pipeline_cmd, (
+        f"no merge step expected when only one retry CSV is present; "
+        f"got: {pipeline_cmd!r}"
+    )
+    assert "-retry-30d-combined.csv" not in pipeline_cmd
+    # Exactly one uploader invocation, on the download CSV.
+    uploader_calls = [
+        seg
+        for seg in pipeline_cmd.split("&&")
+        if " uploader " in f" {seg.strip()} " or seg.strip().startswith("uploader ")
+    ]
+    assert len(uploader_calls) == 1
+    assert (
+        "uploader "
+        "/home/ec2-user/ingest-wikimedia/retry/smithsonian-download-retry.csv si"
+    ) in uploader_calls[0]
+
+
+def test_retry_upload_only_csv_runs_uploader_once_without_merge_step():
+    """Upload-only retry path: same expectation."""
+    commands = _run_main_with_csvs(
+        ["wikimedia_retry.py", "--days", "30", "--partner", "si"],
+        ["/home/ec2-user/ingest-wikimedia/retry/smithsonian-upload-retry.csv"],
+    )
+    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+
+    assert "awk '!seen" not in pipeline_cmd
+    assert "-retry-30d-combined.csv" not in pipeline_cmd
+    # No downloader call — there's nothing to re-download for an upload-
+    # only retry; the items were already in S3 from their original run.
+    assert "downloader" not in pipeline_cmd, (
+        f"upload-only retry must not invoke downloader; got: {pipeline_cmd!r}"
+    )
+    uploader_calls = [
+        seg
+        for seg in pipeline_cmd.split("&&")
+        if " uploader " in f" {seg.strip()} " or seg.strip().startswith("uploader ")
+    ]
+    assert len(uploader_calls) == 1
+    assert (
+        "uploader /home/ec2-user/ingest-wikimedia/retry/smithsonian-upload-retry.csv si"
+    ) in uploader_calls[0]
+
+
 def test_retry_clears_stale_csvs_even_when_no_partner_given():
     """When the user runs `/wikimedia-upload retry 30` (no partner), the
     scan still needs to clear stale CSVs so that hubs which legitimately
