@@ -348,26 +348,83 @@ def invalidate_entity(mediaid):
     _entity_cache.pop(mediaid, None)
 
 
-def _is_dpla_shaped(statement):
-    """Return True when `statement` carries the P459=Q61848113 marker that
-    DPLA stamps on every claim it writes (determination method = "determined
-    by GLAM institution and stated at its website").
+# Per-statement-property registry of additional qualifier properties DPLA
+# writes via the add_* helpers below. Every formattedclaim() also stamps
+# P459=Q61848113 (the determination-method marker), so P459 is always
+# included implicitly via _allowed_qualifier_props.
+#
+# Keep this aligned with the add_* functions in this file:
+#   * add_creator (P170)        — P2093 (author name string)
+#   * add_date (P571)           — P1932 (stated as)
+#   * add_contributed (P9126)   — P3831 (object has role)
+#   * add_local_id (P217)       — P195 (collection)
+#   * add_source (P7482)        — P973 (described at URL), P137 (operator)
+_DPLA_EXTRA_QUALIFIER_PROPS = {
+    "P170": {"P2093"},
+    "P571": {"P1932"},
+    "P9126": {"P3831"},
+    "P217": {"P195"},
+    "P7482": {"P973", "P137"},
+}
 
-    Used by check() to decide whether an existing matching statement is one
-    we wrote (safe to amend in place via wbeditentity-with-id) or one
-    someone else wrote (must not be touched — wbeditentity-with-id replaces
-    the whole claim's qualifiers + references with what we send, so
-    capturing such a statement's id for ref-stamping would silently erase
-    qualifiers we don't know about).
+
+def _allowed_qualifier_props(prop):
+    """Return the set of qualifier property IDs DPLA writes for a given
+    statement property. Always includes P459 (the determination-method
+    marker stamped by formattedclaim)."""
+    return {"P459"} | _DPLA_EXTRA_QUALIFIER_PROPS.get(prop, set())
+
+
+def _is_dpla_reference(reference):
+    """Return True iff `reference` is a DPLA-authored reference, identified
+    by a `P123 = Q2944483` snak (publisher = "Digital Public Library of
+    America"). DPLA stamps that snak on every reference it writes via
+    formattedclaim, so it's a sufficient marker for "we authored this".
     """
-    qualifiers = statement.get("qualifiers") or {}
-    for snak in qualifiers.get("P459") or []:
+    snaks = (reference or {}).get("snaks") or {}
+    for snak in snaks.get("P123") or []:
         try:
-            if snak["datavalue"]["value"]["id"] == "Q61848113":
+            if snak["datavalue"]["value"]["id"] == "Q2944483":
                 return True
         except (KeyError, TypeError):
             continue
     return False
+
+
+def _is_safe_to_amend_in_place(statement, prop):
+    """Return True iff `statement` is safe to amend via
+    wbeditentity-with-id without losing user-authored data.
+
+    wbeditentity-with-id replaces a claim's qualifiers and references
+    wholesale with what we send. The round-trip is data-preserving iff
+    every existing qualifier/reference is already DPLA-authored — then
+    our outgoing claim shape is a superset of the existing one and the
+    write only adds the missing pieces.
+
+    A statement is safe to amend iff:
+      * every qualifier property is one DPLA writes for `prop`
+        (P459 universally, plus the per-property extras tracked in
+        `_DPLA_EXTRA_QUALIFIER_PROPS`), AND
+      * every reference is a DPLA reference (carries the publisher
+        marker checked by `_is_dpla_reference`).
+
+    An empty qualifier dict and an empty references list both pass
+    vacuously, so this also covers the "truly bare" case.
+
+    The previous, looser gate `_is_dpla_shaped` returned True as soon
+    as one P459 snak matched, ignoring other qualifiers on the same
+    claim. A claim like {P459=Q61848113 (DPLA), P1001=Q30 (user)}
+    was mis-classified as DPLA-shaped; amending it via
+    wbeditentity-with-id silently erased the P1001 qualifier.
+    """
+    allowed = _allowed_qualifier_props(prop)
+    for qualifier_prop in (statement.get("qualifiers") or {}).keys():
+        if qualifier_prop not in allowed:
+            return False
+    for reference in statement.get("references") or []:
+        if not _is_dpla_reference(reference):
+            return False
+    return True
 
 
 def check(mediaid, qid, prop):
@@ -383,26 +440,31 @@ def check(mediaid, qid, prop):
     except Exception:
         return True, ""
 
-    # Inspect existing statements that match `prop` and decide what to do:
+    # Inspect existing statements that match `prop` and decide what to do.
+    # The amend-in-place gate is `_is_safe_to_amend_in_place`: amend only
+    # when every existing qualifier and reference is DPLA-authored, so the
+    # wbeditentity-with-id round-trip cannot erase user-authored data.
     #
-    #   * Capture `ref` from a matching statement only when amending it is
-    #     SAFE — either the statement has no qualifiers or it carries the
-    #     P459=Q61848113 marker (DPLA-shaped, written by us). Otherwise
-    #     wbeditentity-with-id would clobber qualifiers we didn't author.
+    #   * Capture `ref` from a matching no-reference statement that is
+    #     safe to amend (truly bare, or contains only DPLA-authored
+    #     qualifiers). The caller will stamp our reference via
+    #     wbeditentity-with-id.
     #   * If a matching statement has no qualifiers at all, stamp our
-    #     P459=Q61848113 qualifier onto it (wbsetqualifier is non-destructive).
-    #   * If a matching statement carries qualifiers AND it's DPLA-shaped,
-    #     we've already written this claim — don't add a duplicate.
-    #   * If a matching statement carries qualifiers AND it's FOREIGN
-    #     (no P459=Q61848113), leave it alone and add the DPLA-authored
-    #     statement alongside as a separate claim. The two coexist with
-    #     different rationales.
+    #     P459=Q61848113 qualifier onto it via wbsetqualifier
+    #     (non-destructive — does not touch references).
+    #   * If a matching statement is safe to amend AND has qualifiers,
+    #     we already wrote this claim — don't add a duplicate; the
+    #     missing ref (if any) is stamped via the captured `ref`.
+    #   * If a matching statement contains any user-authored qualifier
+    #     or reference, leave it untouched and add the DPLA-authored
+    #     statement alongside as a separate claim, so the DPLA
+    #     reference is scoped only to the DPLA-authored qualifiers.
     if qid[0] == "item":
         for statement in statements:
             if (
                 statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
                 and not statement.get("references")
-                and (not statement.get("qualifiers") or _is_dpla_shaped(statement))
+                and _is_safe_to_amend_in_place(statement, prop)
             ):
                 ref = statement["id"]
                 break
@@ -414,7 +476,7 @@ def check(mediaid, qid, prop):
 
         if any(
             statement["mainsnak"]["datavalue"]["value"]["id"] == qid[1]
-            and _is_dpla_shaped(statement)
+            and _is_safe_to_amend_in_place(statement, prop)
             for statement in statements
         ):
             print(
@@ -437,7 +499,7 @@ def check(mediaid, qid, prop):
             if (
                 statement["mainsnak"]["datavalue"]["value"] == qid[1]
                 and not statement.get("references")
-                and (not statement.get("qualifiers") or _is_dpla_shaped(statement))
+                and _is_safe_to_amend_in_place(statement, prop)
             ):
                 ref = statement["id"]
                 break
@@ -449,7 +511,7 @@ def check(mediaid, qid, prop):
 
         if any(
             statement["mainsnak"]["datavalue"]["value"] == qid[1]
-            and _is_dpla_shaped(statement)
+            and _is_safe_to_amend_in_place(statement, prop)
             for statement in statements
         ):
             print(
@@ -472,7 +534,7 @@ def check(mediaid, qid, prop):
             if (
                 statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
                 and not statement.get("references")
-                and (not statement.get("qualifiers") or _is_dpla_shaped(statement))
+                and _is_safe_to_amend_in_place(statement, prop)
             ):
                 ref = statement["id"]
                 break
@@ -484,7 +546,7 @@ def check(mediaid, qid, prop):
 
         if any(
             statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
-            and _is_dpla_shaped(statement)
+            and _is_safe_to_amend_in_place(statement, prop)
             for statement in statements
         ):
             print(
@@ -517,7 +579,7 @@ def check(mediaid, qid, prop):
                             q.get("datavalue", {}).get("value") == qid[1]
                             for q in qualifiers
                         )
-                        and _is_dpla_shaped(statement)
+                        and _is_safe_to_amend_in_place(statement, prop)
                         and not statement.get("references")
                     ):
                         ref = statement["id"]
@@ -530,7 +592,7 @@ def check(mediaid, qid, prop):
                     if any(
                         q.get("datavalue", {}).get("value") == qid[1]
                         for q in qualifiers
-                    ) and _is_dpla_shaped(statement):
+                    ) and _is_safe_to_amend_in_place(statement, prop):
                         print(
                             f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
                         )
@@ -568,7 +630,7 @@ def check(mediaid, qid, prop):
                             q.get("datavalue", {}).get("value") == qid[1]
                             for q in qualifiers
                         )
-                        and _is_dpla_shaped(statement)
+                        and _is_safe_to_amend_in_place(statement, prop)
                         and not statement.get("references")
                     ):
                         ref = statement["id"]
@@ -579,7 +641,7 @@ def check(mediaid, qid, prop):
                     if any(
                         q.get("datavalue", {}).get("value") == qid[1]
                         for q in qualifiers
-                    ) and _is_dpla_shaped(statement):
+                    ) and _is_safe_to_amend_in_place(statement, prop):
                         print(
                             f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
                         )
