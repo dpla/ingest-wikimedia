@@ -76,93 +76,62 @@ def _break_query_string_pattern(title: str) -> str:
     return title
 
 
-# All Commons namespace canonical names + aliases as of 2026-05-23 (snapshot of
-# `action=query&meta=siteinfo&siprop=namespaces|namespacealiases`). If the
-# prefix of an item title (before the first `:`) matches one of these, the
-# API would mis-route the upload into that namespace. The list is stable in
-# practice; if Commons adds a namespace later, the worst case is the new
-# prefix is treated as title text rather than a namespace alias — same as
-# the old unconditional `:` → `-` replacement, never worse.
-_MW_NAMESPACE_PREFIXES: frozenset[str] = frozenset(
-    [
-        "campaign",
-        "campaign talk",
-        "cat",
-        "category",
-        "category talk",
-        "com",
-        "commons",
-        "commons talk",
-        "creator",
-        "creator talk",
-        "data",
-        "data talk",
-        "event",
-        "event talk",
-        "file",
-        "file talk",
-        "help",
-        "help talk",
-        "image",
-        "image talk",
-        "institution",
-        "institution talk",
-        "media",
-        "mediawiki",
-        "mediawiki talk",
-        "module",
-        "module talk",
-        "museum",
-        "museum talk",
-        "project",
-        "project talk",
-        "sequence",
-        "sequence talk",
-        "special",
-        "talk",
-        "template",
-        "template talk",
-        "timedtext",
-        "timedtext talk",
-        "topic",
-        "translations",
-        "translations talk",
-        "user",
-        "user talk",
-    ]
-)
-
-
-def _break_namespace_prefix_colon(title: str) -> str:
-    """If a title begins with `<namespace>:`, replace just that first colon
-    with `-` so the API doesn't mis-parse the upload as a `<namespace>:<rest>`
-    page in the wrong namespace. Mid-title colons (which Commons accepts
-    fine — e.g. `Boston, Mass.: City Hall`) are left intact.
-
-    DPLA records occasionally start with strings like `Image: …` or
-    `Media: …`; under the old unconditional `:` → `-` rule these were
-    correctly safe but every *other* mid-title colon got mangled too.
-    """
-    head, sep, _tail = title.partition(":")
-    if not sep:
-        return title
-    # MediaWiki treats spaces and underscores as equivalent in namespace
-    # names, and case-folds the first letter; normalise both before lookup.
-    normalised = head.strip().replace("_", " ").lower()
-    if normalised in _MW_NAMESPACE_PREFIXES:
-        return title.replace(":", "-", 1)
-    return title
-
-
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
-    """
-    Makes a proper Wikimedia page title from the DPLA identifier and
-    the title of the image.
+    """Build a Commons file title from a DPLA item title + identifier.
+
+    Applies the same character normalisations Commons enforces at upload
+    time so that the title returned here matches what Commons stores once
+    the upload completes.  Equality of constructed vs. stored title is
+    load-bearing for every downstream check — skip-if-already-there,
+    hash-drift detection, expected_item_titles sibling protection,
+    orphan probes, tag-as-duplicate targets, SDC sidecar bookkeeping —
+    so any character Commons normalises but we don't would silently
+    bypass those checks (see PR #261's audit).
     """
     escaped_title = (
-        _break_namespace_prefix_colon(_break_query_string_pattern(item_title[:181]))
+        # MediaWiki's `stripIllegalFilenameChars` strips `:` from File-
+        # namespace titles unconditionally (filesystem path-separator
+        # concern), replacing with `-`.  Apply the same rule here.  An
+        # earlier version of this code only broke a leading
+        # `<namespace>:` prefix and left mid-title colons intact on the
+        # assumption that Commons "accepts mid-title colons fine".  That
+        # was wrong: titles like `Delegation: "Wooden Lance"` are
+        # silently stored as `Delegation- "Wooden Lance"`.  The mismatch
+        # broke every downstream title-equality check for items whose
+        # source title contained `:` — 5 NARA items in May 2026 ended
+        # up as orphan duplicates because the uploader treated the
+        # colon-form title as the canonical one while Commons stored
+        # the dash form.
+        _break_query_string_pattern(item_title[:181])
+        .replace(":", "-")
+        # `/` must also be substituted.  An earlier reading of MediaWiki's
+        # rules (PR #223) removed this substitution because
+        # `action=query&titles=File:Test/Sub.jpg` returned "missing"
+        # rather than "invalid", which was taken as proof that Commons
+        # accepts `/` in file titles.  That reading conflated two
+        # different layers: `action=query` exercises the title PARSER
+        # (which accepts most characters including `/`), whereas
+        # UPLOAD/MOVE operations run `UploadBase::isValidName` →
+        # `Title::makeTitleSafe(NS_FILE, …)` which DOES reject titles
+        # whose `/` triggers subpage parsing.  4,114 NARA items in the
+        # May 2026 Nixon/LBJ upload sessions hit
+        # `imageinvalidfilename` during Case 3 drift-correction moves
+        # because the move target contained `/` from a date like
+        # `1/5/1966`.  Substituting up front matches what Commons
+        # actually stores (the older code's `1-5-1966` form, as visible
+        # in 2025-vintage Commons titles) and eliminates the cascade.
+        .replace("/", "-")
+        # MediaWiki's `stripIllegalFilenameChars` also strips `\` and
+        # any character outside Title::legalChars().  Of those, `<` and
+        # `>` are the only ones the existing replace-chain DIDN'T
+        # already cover.  Mirror the strip here so our constructed
+        # title matches what Commons stores — same class of fix as the
+        # `:` and `/` rules, audited together.
+        .replace("\\", "-")  # MediaWiki: stripped from file titles
+        .replace("<", "-")  # MediaWiki: not in Title::legalChars()
+        .replace(">", "-")  # MediaWiki: not in Title::legalChars()
         .replace("''", '"')  # titleblacklist: double-apostrophe rule → double-quote
         .replace("[", "(")  # MediaWiki: forbidden in page names
         .replace("]", ")")  # MediaWiki: forbidden in page names

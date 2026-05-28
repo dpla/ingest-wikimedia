@@ -99,53 +99,121 @@ def test_get_page_title_breaks_query_string_when_both_present():
     assert "filter-value+other-thing" in title
 
 
-def test_get_page_title_preserves_slash():
-    """Slashes are valid in Commons File: titles — no subpage handling in
-    File namespace — and must NOT be rewritten to `-`."""
+def test_get_page_title_replaces_slash_with_dash():
+    """`/` in source titles must be substituted with `-`. The earlier
+    reasoning that "slashes are valid in Commons File: titles" came from
+    `action=query` returning "missing" for a slash-containing title,
+    which only tests the title PARSER. The actual UPLOAD/MOVE path runs
+    `UploadBase::isValidName` → `Title::makeTitleSafe(NS_FILE, …)` which
+    rejects titles whose `/` triggers subpage parsing — observed as
+    `imageinvalidfilename` errors on 4,114 NARA items (Nixon + LBJ
+    libraries) in May 2026, where Case 3 drift moves tried to move
+    files from the older code's `1-5-1966` (dash) form to a constructed
+    `1/5/1966` (slash) target. Commons rejected every such move."""
     title = get_page_title("Page 1/2 of the survey", "abcd" * 8, ".jpg")
-    assert "/" in title
-    assert "Page 1/2 of the survey" in title
+    assert "/" not in title.split(" - DPLA -")[0]
+    assert title.startswith("Page 1-2 of the survey")
 
 
-def test_get_page_title_preserves_mid_title_colon():
-    """Colons mid-title are valid on Commons (e.g. `Boston, Mass.: City Hall`)
-    and must NOT be rewritten when there's no namespace prefix."""
+def test_get_page_title_lbj_diary_date_case():
+    """Regression pin for the LBJ-library item that surfaced the slash
+    side of the bug: `Lady Bird Johnson's Daily Diary Entry, 1/1/1968`.
+    The 2025-04-29 upload (with older code) stored as `1-1-1968` on
+    Commons. After PR #223 removed `/` → `-` from get_page_title, the
+    current code constructs the title with `/` again, so hash-drift
+    detection fires and tries to MOVE the existing dash-form file to
+    the slash-form target — which Commons rejects with
+    `imageinvalidfilename`. Restoring the substitution makes the
+    constructed title match the stored title, so no drift fires."""
+    title = get_page_title(
+        "Lady Bird Johnson's Daily Diary Entry, 1/1/1968",
+        "0b4d8351fe4b20831966e33905a2aa5a",
+        ".pdf",
+        page="1",
+    )
+    assert title.startswith("Lady Bird Johnson's Daily Diary Entry, 1-1-1968")
+    assert "/" not in title
+
+
+def test_get_page_title_replaces_all_colons_with_dashes():
+    """MediaWiki's stripIllegalFilenameChars strips `:` from File-namespace
+    titles unconditionally and replaces with `-` (filesystem path-separator
+    concern). Our get_page_title must apply the same rule so the title we
+    construct matches the title Commons stores on upload.
+
+    Before May 2026 this code only broke a leading namespace-prefix colon
+    and left mid-title colons intact on the false premise that Commons
+    accepts them. The mismatch produced 5 NARA orphan duplicates whose
+    legacy 2011 NARA-bot uploads (with `:`) silently coexisted with the
+    new DPLA-bot uploads (with `-` after Commons normalised) — see PR #261.
+    """
     title = get_page_title("Boston, Mass.: City Hall", "abcd" * 8, ".jpg")
-    assert ":" in title
-    assert "Boston, Mass.: City Hall" in title
+    assert ":" not in title.split(" - DPLA -")[0]
+    assert title.startswith("Boston, Mass.- City Hall")
 
 
-def test_get_page_title_breaks_namespace_prefix_colon():
-    """When a title begins with `<namespace>:`, the first colon must be
-    replaced so the API doesn't mis-route the upload into that namespace."""
-    # `Image:` is a File namespace alias on Commons — would re-route the upload.
+def test_get_page_title_namespace_prefix_collision_still_broken():
+    """The DPLA-records-starting-with-`Image:` case still works correctly:
+    the colon is replaced (same as any other colon) so the API doesn't
+    mis-route the upload into the File namespace alias. The mechanism is
+    no longer a namespace-list lookup — it's just the global `:` → `-`
+    rule that handles namespace and non-namespace cases identically."""
     title = get_page_title("Image: New England farmhouse", "abcd" * 8, ".jpg")
-    # First colon (the namespace-collision one) → `-`
     assert title.startswith("Image- New England farmhouse")
 
 
-def test_get_page_title_namespace_prefix_check_is_case_insensitive():
-    """MediaWiki case-folds the first letter of namespace names."""
-    for prefix in ("image:", "IMAGE:", "Image :", "image  :"):
-        title = get_page_title(f"{prefix} test", "abcd" * 8, ".jpg")
-        assert ":" not in title.split(" - DPLA -")[0], (
-            f"Namespace prefix {prefix!r} should have triggered colon replacement"
-        )
-
-
-def test_get_page_title_only_breaks_first_colon_when_namespace_match():
-    """Even when the prefix matches a namespace, only the FIRST colon is
-    replaced — any later colons in the title are mid-title and preserved."""
+def test_get_page_title_replaces_every_colon_not_just_the_first():
+    """Multiple colons in the source title — all of them must be replaced
+    so the constructed title matches what Commons stores. Previously only
+    the first colon (after a namespace prefix) would be touched, leaving
+    later colons to be normalised by Commons at upload time — exactly
+    the source of the May 2026 NARA orphan duplicates."""
     title = get_page_title("Image: Boston, Mass.: City Hall", "abcd" * 8, ".jpg")
-    # First `:` after `Image` is replaced, but the mid-title `:` after `Mass.` survives.
-    assert title.startswith("Image- Boston, Mass.:")
+    pre_dpla = title.split(" - DPLA -")[0]
+    assert ":" not in pre_dpla, f"every colon must be replaced; got: {pre_dpla!r}"
+    assert pre_dpla == "Image- Boston, Mass.- City Hall"
 
 
-def test_get_page_title_passes_through_non_namespace_prefix():
-    """A `:` after non-namespace text must be preserved."""
-    title = get_page_title("Notes:1865 inventory", "abcd" * 8, ".jpg")
-    # `Notes` is not a namespace; the `:` stays.
-    assert title.startswith("Notes:1865 inventory")
+def test_get_page_title_strips_backslash_lt_gt():
+    """Companion to the colon fix. MediaWiki's stripIllegalFilenameChars
+    strips `\\`, and any character not in Title::legalChars() — which
+    includes `<` and `>` — from file titles. None of these are likely
+    to appear in real DPLA item titles, but if they do, our constructed
+    title must match what Commons stores so downstream title-equality
+    checks don't silently mismatch (same class of bug as the colon case)."""
+    title = get_page_title(
+        "Edge<chars>here\\with backslash",
+        "abcd" * 8,
+        ".jpg",
+    )
+    pre_dpla = title.split(" - DPLA -")[0]
+    for ch in ("\\", "<", ">"):
+        assert ch not in pre_dpla, (
+            f"character {ch!r} must be replaced; got: {pre_dpla!r}"
+        )
+    assert pre_dpla == "Edge-chars-here-with backslash"
+
+
+def test_get_page_title_nara_native_american_delegations_case():
+    """Regression pin for the exact NARA item that surfaced the bug:
+    `Delegation: "Wooden Lance" (Kiowa)…`. Before the fix, get_page_title
+    produced `Delegation: "Wooden Lance"…` and the file was uploaded to
+    Commons under that title, which Commons then stored as
+    `Delegation- "Wooden Lance"…`. The stored-vs-constructed mismatch
+    silently disabled the duplicate_source_sha1s sibling check, producing
+    an orphan-duplicate alongside the 2011 NARA-bot upload (also stored
+    with the dash form because Commons normalised the same way). The
+    fix: construct the dash form ourselves so the comparison succeeds."""
+    title = get_page_title(
+        'Delegation: "Wooden Lance" (Kiowa), "Apache John" (Apache)',
+        "2617677db09ca8ae0dada8408e400191",
+        ".tiff",
+        page="1",
+    )
+    assert title.startswith(
+        'Delegation- "Wooden Lance" (Kiowa), "Apache John" (Apache)'
+    )
+    assert ":" not in title
 
 
 def test_license_to_markup_code():
