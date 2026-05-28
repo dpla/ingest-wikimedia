@@ -313,15 +313,47 @@ def main() -> None:
             steps.append(
                 f"downloader --max-age-days 1 {shlex.quote(download_csv)} {slug}"
             )
-            # The uploader's notify_upload_complete folds the download
-            # phase's FAILED count into the final Slack summary by
-            # discovering this session's download log itself, via
-            # WIKIMEDIA_SESSION_LABEL + WIKIMEDIA_PARTNER_DIR (both
-            # exported with literal values by label_export above). See
-            # slack._find_retry_download_log.
-            steps.append(f"uploader {shlex.quote(download_csv)} {slug}")
+        # Run the uploader at most ONCE per hub.  When both download and
+        # upload retry CSVs exist for this hub, merge them (de-duplicated,
+        # first-seen-order via awk) into a single combined CSV so the
+        # uploader's notify_phase_start + notify_upload_complete pair
+        # fires exactly once per retry hub.  Two separate uploader calls
+        # would post duplicate "starting upload" and duplicate "Wikimedia
+        # Retry Complete" messages — visible to the user as a confusing
+        # phase report after the summary header.
+        #
+        # The uploader's notify_upload_complete still folds the download
+        # phase's FAILED count via slack._find_retry_download_log when
+        # WIKIMEDIA_RETRY_HAS_DOWNLOAD is set (see has_download_env above).
+        upload_inputs = []
+        if download_csv:
+            upload_inputs.append(download_csv)
         if upload_csv:
-            steps.append(f"uploader {shlex.quote(upload_csv)} {slug}")
+            upload_inputs.append(upload_csv)
+        if len(upload_inputs) == 1:
+            steps.append(f"uploader {shlex.quote(upload_inputs[0])} {slug}")
+        elif len(upload_inputs) > 1:
+            combined_csv = f"{RETRY_DIR}/{slug}-retry-{days}d-combined.csv"
+            # `awk '!seen[$0]++'` is the standard idempotent dedup-while-
+            # preserving-order one-liner.  Each retry CSV is one DPLA ID
+            # per line, so per-line uniqueness is the right grain.
+            #
+            # The `$0` MUST be backslash-escaped.  pipeline_cmd is embedded
+            # as `"{pipeline_cmd}"` in tmux_cmd below — a double-quoted
+            # argument — and the outer bash on EC2 expands unescaped `$0`
+            # inside double quotes before tmux ever sees the command. `$0`
+            # would resolve to the outer shell's argv[0] (typically the
+            # string "bash"), so awk would dedupe by that literal string
+            # on every line — producing a single-line output and silently
+            # losing 99% of the retry IDs.  Same class of bug as PR #246's
+            # `\$?`/`\$rc` escapes in notify_fail_cmd.  With `\$0` the
+            # outer bash leaves the `$` literal and awk evaluates `$0` as
+            # the current input line.
+            cat_args = " ".join(shlex.quote(c) for c in upload_inputs)
+            steps.append(
+                rf"awk '!seen[\$0]++' {cat_args} > {shlex.quote(combined_csv)}"
+            )
+            steps.append(f"uploader {shlex.quote(combined_csv)} {slug}")
         target_steps = " && ".join(steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"
