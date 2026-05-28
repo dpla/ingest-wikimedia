@@ -406,13 +406,24 @@ class Uploader:
 
                 wiki_file_page = get_page(self.site, page_title)
 
-                # If the intended title is a redirect caused by title drift,
-                # move the file there first so the upload lands at the right name.
-                # This path is reached when the hash is new (not yet on Commons)
-                # and the intended title is a redirect from a prior drift correction.
-                # Skip when drift resolution returned "upload_only" — in that case
-                # we've decided not to touch any other file; just upload directly.
-                if wiki_file_page.isRedirectPage() and drift_action != "upload_only":
+                # If the intended title is a redirect, route through the
+                # redirect-handler regardless of what `_resolve_hash_drift`
+                # returned. Uploading directly onto a redirect page fails with
+                # `fileexists-shared-forbidden` — the API treats the upload as
+                # creating a duplicate of the redirect's target. The
+                # redirect-handler below picks the right strategy (move, or
+                # overwrite-in-place with the appropriate metadata
+                # preservation) based on the redirect target, and always sets
+                # `force_ignore_warnings=True` for the subsequent upload.
+                #
+                # Earlier this branch was gated on `drift_action != "upload_only"`,
+                # but `_resolve_hash_drift` can legitimately return "upload_only"
+                # while the intended title is still a redirect — specifically
+                # when the redirect's target is a sibling page rather than the
+                # SHA1's current location. The misleading warning at line ~880
+                # in `_resolve_hash_drift` was the symptom of that earlier
+                # gating mistake.
+                if wiki_file_page.isRedirectPage():
                     target_title = wiki_file_page.getRedirectTarget().title(
                         with_ns=False
                     )
@@ -869,11 +880,19 @@ class Uploader:
                     existing_file, intended_page, dpla_id, "Case 1", wiki_markup
                 )
                 return "moved"
-            logging.warning(
+            # Intended title is a redirect, but its target is somewhere
+            # other than where our SHA1 currently lives. We can't apply
+            # the Case 1 move; instead let the caller's redirect-handler
+            # decide (overwrite as same-item relic, overwrite as
+            # cross-item, etc). "upload_only" here just means
+            # "drift-resolution didn't move or tag anything"; the
+            # redirect-handler still runs unconditionally now.
+            logging.info(
                 f"Hash drift for {dpla_id} {ordinal}: intended title "
-                f"[[File:{intended_page.title(with_ns=False)}]] redirects to "
-                f"{redirect_target.title(with_ns=False)!r}, "
-                f"which does not share DPLA ID {dpla_id}; uploading anyway."
+                f"[[File:{intended_page.title(with_ns=False)}]] is a redirect to "
+                f"[[File:{redirect_target.title(with_ns=False)}]], which is not "
+                f"the location of our SHA1 ([[File:{actual_filename}]]); "
+                f"deferring to the redirect-handler in process_file."
             )
             return "upload_only"
 
