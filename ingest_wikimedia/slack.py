@@ -11,12 +11,18 @@ from ingest_wikimedia.tracker import Result, Tracker
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
-Phase = Literal["id-generation", "download", "upload"]
+Phase = Literal["id-generation", "download", "upload", "sdc-sync"]
 
 _PHASE_EMOJI: dict[str, str] = {
     "id-generation": "🔍",
     "download": "⬇",
     "upload": "⬆",
+    # SDC sync follows upload in the pipeline. Without a phase-start
+    # notification for it, the gap between the last "upload complete"
+    # message and the eventual "SDC complete" summary can stretch hours
+    # on a large hub with no indication that work has actually moved on
+    # to the SDC phase.
+    "sdc-sync": "🔗",
 }
 
 

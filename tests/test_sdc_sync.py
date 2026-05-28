@@ -16,7 +16,7 @@ A claim that contains any user-authored qualifier or reference is
 NOT safe — the wbeditentity round-trip would erase that data.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -407,3 +407,112 @@ def test_check_foreign_match_other_value_types(kind, value, mainsnak_value):
     with patch.object(sdc_sync, "get_entity", return_value=fake_entity):
         result = sdc_sync.check("M999", (kind, value), "P760")
     assert result == (True, "")
+
+
+# --------------------------------------------------------------------------
+# _run_partner_mode — SystemExit / KeyboardInterrupt diagnostic capture
+#
+# 11 SDC aborts were observed across 3 days in May 2026 with the warning
+# "SDC sync aborted before completion" but NO traceback or exception
+# class logged.  The old `except Exception:` only catches Exception-class
+# exceptions; SystemExit / KeyboardInterrupt / GeneratorExit (all
+# subclasses of BaseException, not Exception) bypassed it entirely.
+# Widened to `except BaseException` so the next abort logs a traceback +
+# the exception type name, making future occurrences self-diagnosing.
+# --------------------------------------------------------------------------
+
+
+def test_run_partner_mode_logs_traceback_and_type_on_systemexit(
+    tmp_path, caplog, monkeypatch
+):
+    """A SystemExit raised during partner-mode iteration must:
+      1. Be caught by the outer handler (not propagate silently)
+      2. Get logged with `logging.exception(...)` so the SDC log file
+         captures the traceback + exception class name
+      3. Be re-raised so the shell pipeline still sees a non-zero exit
+         and `notify_pipeline_fail` still fires.
+    The 11-abort cluster all WROTE the abort warning (so finally ran)
+    but produced no diagnostic, which only makes sense if the exception
+    class wasn't `Exception` — exactly what this widened catch fixes.
+    """
+    import logging as _logging
+
+    from tools import sdc_sync
+
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("abcdef01abcdef01abcdef01abcdef01\n")
+
+    fake_s3_client = MagicMock(name="S3Client_instance")
+    fake_s3_client.get_sdc_json.side_effect = SystemExit("simulated pywikibot exit")
+
+    notify_complete_calls = []
+
+    with (
+        patch.object(sdc_sync, "setup_logging"),
+        patch.object(sdc_sync, "notify_phase_start"),
+        patch.object(
+            sdc_sync,
+            "notify_sdc_complete",
+            side_effect=lambda **kw: notify_complete_calls.append(kw),
+        ),
+        # _run_partner_mode imports S3Client inside the function body
+        # (`from ingest_wikimedia.s3 import S3Client`).  Patch the
+        # constructor in the source module so the inner import picks
+        # up the mock.
+        patch("ingest_wikimedia.s3.S3Client", return_value=fake_s3_client),
+        caplog.at_level(_logging.WARNING, logger="root"),
+    ):
+        with pytest.raises(SystemExit):
+            sdc_sync._run_partner_mode("nara", str(ids_file))
+
+    # The completion notification must NOT have fired — the abort path
+    # explicitly suppresses it (otherwise the status reporter would see
+    # a `COUNTS:` marker and treat the aborted run as done).
+    assert notify_complete_calls == [], (
+        f"notify_sdc_complete must not be called on abort; got: {notify_complete_calls!r}"
+    )
+
+    # The diagnostic log must include the exception type name so future
+    # aborts are self-identifying (was it SystemExit?  KeyboardInterrupt?).
+    messages = " | ".join(r.getMessage() for r in caplog.records)
+    assert "SDC sync aborted with unhandled exception" in messages
+    assert "SystemExit" in messages, (
+        f"exception type name must be in the log message for diagnosis; "
+        f"got: {messages!r}"
+    )
+
+    # The finally-block warning must still fire (the message that the
+    # 11 May 2026 aborts were the ONLY log output for).  This is the
+    # signal `wikimedia_upload_status` reads as "not complete".
+    assert "SDC sync aborted before completion" in messages
+
+
+def test_run_partner_mode_logs_traceback_on_keyboardinterrupt(
+    tmp_path, caplog, monkeypatch
+):
+    """Same contract for KeyboardInterrupt — also a BaseException
+    subclass not caught by `except Exception`.  Default Python signal
+    handler raises KeyboardInterrupt on SIGINT, so this covers the
+    "process group received SIGINT" hypothesis."""
+    import logging as _logging
+
+    from tools import sdc_sync
+
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("abcdef01abcdef01abcdef01abcdef01\n")
+
+    fake_s3_client = MagicMock(name="S3Client_instance")
+    fake_s3_client.get_sdc_json.side_effect = KeyboardInterrupt()
+
+    with (
+        patch.object(sdc_sync, "setup_logging"),
+        patch.object(sdc_sync, "notify_phase_start"),
+        patch.object(sdc_sync, "notify_sdc_complete"),
+        patch("ingest_wikimedia.s3.S3Client", return_value=fake_s3_client),
+        caplog.at_level(_logging.WARNING, logger="root"),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            sdc_sync._run_partner_mode("nara", str(ids_file))
+
+    messages = " | ".join(r.getMessage() for r in caplog.records)
+    assert "KeyboardInterrupt" in messages

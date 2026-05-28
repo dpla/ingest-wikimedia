@@ -42,7 +42,21 @@ _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 _STALE_SECONDS = 1800  # 30 minutes
 
 
-def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | None:
+def get_phase_and_progress(
+    client, session: str, hub: str, label: str
+) -> tuple[str | None, int]:
+    """Return ``(phase_str, log_mtime)`` for this label.
+
+    ``phase_str`` is ``None`` when no log exists for this label yet (label
+    skipped or pipeline hasn't started it).  ``log_mtime`` is the unix
+    epoch seconds of the most recent write to the log file (0 when no
+    log exists).  The mtime is used by ``main`` to break ties between
+    multiple non-complete labels — a phase that aborted hours ago but
+    didn't write a ``COUNTS:`` terminal marker (so it doesn't look
+    "complete" via the count-marker test) must not eclipse a subsequent
+    label that's actively progressing now.
+    """
+
     def _safe_int(s: str) -> int:
         try:
             return int(s)
@@ -88,7 +102,7 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
         # been skipped (e.g. ineligible institution — get-ids-es exits 1 without
         # ever launching the downloader). Return None so the caller can decide
         # whether to keep looking at later labels.
-        return None
+        return None, 0
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
     csv_path = shlex.quote(f"{base}/{label}.csv")
@@ -126,7 +140,7 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
 
     # Log predates this session — no new log yet, treat same as no log.
     if session_created > 0 and log_mtime < session_created:
-        return None
+        return None, 0
 
     tail = sections[1].strip() if len(sections) > 1 else ""
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
@@ -161,25 +175,40 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
         # Use the COUNTS: terminal marker as the definitive completion signal —
         # "Downloading" may still appear in the tail even after the run finishes.
         if counts_marker > 0:
-            return f"{_DOWNLOAD_COMPLETE_PREFIX} ({dpla_id_count:,} / {total:,} items)"
+            return (
+                f"{_DOWNLOAD_COMPLETE_PREFIX} ({dpla_id_count:,} / {total:,} items)",
+                log_mtime,
+            )
         if "Downloading" in tail or "Key already in S3" in tail:
-            return f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
+            return (
+                f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}",
+                log_mtime,
+            )
         # Log exists for this session but no active download indicators and no COUNTS
         # marker — downloader likely crashed. Report item count without implying
         # get-ids-es is running (the old "Generating IDs" fallback was wrong here).
-        return f"Stalled ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
+        return (
+            f"Stalled ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}",
+            log_mtime,
+        )
 
     if log_file.endswith("-upload.log"):
         if dpla_id_count == 0:
             # dpla_id_count == 0 means no items logged yet — uploader just started.
             # Staleness here would be a false positive from the normal start-up lag.
-            return "Uploading (starting...)"
+            return "Uploading (starting...)", log_mtime
         # Use the COUNTS: terminal marker as the definitive completion signal.
         # dpla_id_count is logged at the start of each item, not after all its
         # files finish, so count arithmetic alone can fire too early.
         if counts_marker > 0:
-            return f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)"
-        return f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){stale_suffix}"
+            return (
+                f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)",
+                log_mtime,
+            )
+        return (
+            f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){stale_suffix}",
+            log_mtime,
+        )
 
     if log_file.endswith("-sdc.log"):
         # sdc-sync's _run_partner_mode logs `DPLA ID: <id> (n/total)` per
@@ -192,12 +221,18 @@ def get_phase_and_progress(client, session: str, hub: str, label: str) -> str | 
         # summary surfaces the real synced count via the tracker's
         # SDC_ITEMS_SYNCED line.
         if dpla_id_count == 0:
-            return "SDC syncing (starting...)"
+            return "SDC syncing (starting...)", log_mtime
         if counts_marker > 0:
-            return f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)"
-        return f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}"
+            return (
+                f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)",
+                log_mtime,
+            )
+        return (
+            f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}",
+            log_mtime,
+        )
 
-    return "Unknown"
+    return "Unknown", log_mtime
 
 
 def post_to_slack(token: str, rows: list[tuple[str, str]]) -> None:
@@ -316,7 +351,7 @@ def main() -> None:
                 hub = resolve_slug(raw_hub) or raw_hub
 
             try:
-                phase = get_phase_and_progress(ssm, session, hub, label)
+                phase, _ = get_phase_and_progress(ssm, session, hub, label)
             except Exception:
                 logging.exception(
                     "Failed to get retry status for %s (%s)", session, label
@@ -332,58 +367,66 @@ def main() -> None:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
 
-        # Walk labels in pipeline order. Skip past labels with no log file — they
-        # may have been skipped (e.g. ineligible institution errored during ID
-        # generation). Track the first no-log label after the last completed one
-        # as a fallback in case all remaining labels lack logs (meaning the session
-        # genuinely hasn't started the next phase yet).
-        first_pending: str | None = None
-        last_complete_label: str | None = None
-        last_complete_phase: str = ""
-
+        # Walk every label in the pipeline and collect each one's phase
+        # string and log mtime. We need ALL labels (not a forward-walk that
+        # short-circuits at the first non-complete one) because a label
+        # earlier in the pipeline can be "non-complete" — e.g. its SDC
+        # phase aborted without writing the COUNTS: terminal marker — yet
+        # a later label is actively progressing right now. Reporting the
+        # first non-complete label in that case freezes the Slack notice
+        # on the aborted phase forever.  Pick the label with the LATEST
+        # log mtime among those still in-flight; an active label always
+        # wins over an aborted earlier one because its log was just
+        # written, while the abort's last log write is hours stale.
+        per_label: list[tuple[str, str | None, int]] = []
         for label in labels:
             hub = label.split("+")[0]
             try:
-                phase = get_phase_and_progress(ssm, session, hub, label)
+                phase, log_mtime = get_phase_and_progress(ssm, session, hub, label)
             except Exception:
                 logging.exception("Failed to get status for %s (%s)", session, label)
-                phase = "Unknown (error)"
+                phase, log_mtime = "Unknown (error)", 0
+            per_label.append((label, phase, log_mtime))
 
-            if phase is None:
-                # No log: either skipped or not yet started. Keep looking at
-                # later labels — if any of them have a log, this one was skipped.
-                if first_pending is None:
-                    first_pending = label
-                continue
-
-            # This label has a log. Any earlier no-log labels were skipped.
-            first_pending = None
-
-            if not (
+        def _is_complete(phase: str | None) -> bool:
+            return phase is not None and (
                 phase.startswith(_UPLOAD_COMPLETE_PREFIX)
                 or phase.startswith(_DOWNLOAD_COMPLETE_PREFIX)
                 or phase.startswith(_SDC_COMPLETE_PREFIX)
-            ):
-                # Active or stalled label — this is the one to report.
-                return session, f"[{label}] {phase}" if multi else phase
+            )
 
-            last_complete_label = label
-            last_complete_phase = phase
+        # Labels with a log AND not in a "complete" terminal state.
+        active = [
+            (lbl, phase, mtime)
+            for lbl, phase, mtime in per_label
+            if phase is not None and not _is_complete(phase)
+        ]
+        if active:
+            # Latest write wins — see comment above for the rationale.
+            lbl, phase, _ = max(active, key=lambda t: t[2])
+            return session, f"[{lbl}] {phase}" if multi else phase
 
-        # Loop exhausted. Either the pipeline is waiting to start the next phase
-        # (first_pending), or everything finished (last_complete_label).
+        # No active labels.  Either everything completed, or the
+        # pipeline is between phases (no log yet for the next label).
+        # Prefer the LAST completed label in pipeline order when present;
+        # otherwise fall back to the first no-log label as "Generating IDs"
+        # (the pipeline's resting state before any phase writes a log).
+        completed = [(lbl, phase) for lbl, phase, _ in per_label if _is_complete(phase)]
+        if completed:
+            lbl, phase = completed[-1]
+            return session, f"[{lbl}] {phase}" if multi else phase
+
+        first_pending = next(
+            (lbl for lbl, phase, _ in per_label if phase is None), None
+        )
         if first_pending is not None:
             return (
                 session,
                 f"[{first_pending}] Generating IDs" if multi else "Generating IDs",
             )
-        if last_complete_label is not None:
-            return (
-                session,
-                f"[{last_complete_label}] {last_complete_phase}"
-                if multi
-                else last_complete_phase,
-            )
+        # `per_label` is built directly from `labels`, which we already
+        # checked is non-empty, so every reachable path above returned.
+        # This is a defensive fallback that should never fire.
         return session, "Generating IDs"
 
     with ThreadPoolExecutor(max_workers=min(len(sessions), 8)) as executor:
