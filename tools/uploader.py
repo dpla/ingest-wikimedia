@@ -759,11 +759,21 @@ class Uploader:
         dpla_id: str,
         case_label: str,
         wiki_markup: str | None = None,
+        post_commonsdelinker: bool = True,
     ) -> None:
         """Move existing_file to intended_page and post a CommonsDelinker request.
 
         If wiki_markup is provided, the moved page's description is updated to
         reflect current DPLA metadata after the move.
+
+        post_commonsdelinker controls whether we ask CommonsDelinker to
+        rewrite external references to actual_filename. Default True (the
+        usual title-drift case where actual_filename's redirect will outlive
+        this session). Callers pass False when they know actual_filename is
+        a sibling slot that another ordinal in this same session will
+        overwrite with different content — making the
+        rewrite-to-intended_filename request invalid the moment the
+        redirect is replaced.
         """
         actual_filename = existing_file.title(with_ns=False)
         intended_filename = intended_page.title(with_ns=False)
@@ -780,7 +790,16 @@ class Uploader:
             movetalk=False,
             noredirect=False,
         )
-        post_commonsdelinker_request(self.site, actual_filename, intended_filename)
+        if post_commonsdelinker:
+            post_commonsdelinker_request(self.site, actual_filename, intended_filename)
+        else:
+            logging.info(
+                f"Suppressing CommonsDelinker request "
+                f"[[File:{actual_filename}]] → [[File:{intended_filename}]]: "
+                f"actual_filename is one of this item's current asset "
+                f"positions and will be overwritten with different content "
+                f"by a later ordinal in this session."
+            )
 
         if wiki_markup:
             moved_page = get_page(self.site, intended_page.title())
@@ -864,10 +883,31 @@ class Uploader:
 
         intended_page = get_page(self.site, page_title)
 
+        # Pre-compute the "actual_filename is a sibling slot" guard once;
+        # used by Case 1 and Case 3 below to decide whether the post-move
+        # CommonsDelinker request would survive long enough to be valid.
+        # When actual_filename is one of this item's expected titles, a
+        # later ordinal's iteration will overwrite the redirect at
+        # actual_filename with different content. CommonsDelinker would
+        # then rewrite external references away from a title that is no
+        # longer a redirect — silently showing the wrong file to readers
+        # who landed via the rewritten link. Skip the request in that
+        # case; the move itself is still useful (it places the file at
+        # its new canonical title cheaply), but external link rewrites
+        # would be incorrect.
+        sibling_slot = bool(
+            expected_item_titles and actual_filename in expected_item_titles
+        )
+
         if not intended_page.exists():
             # Case 3: nothing at the intended title — simple move.
             self._move_to_correct_title(
-                existing_file, intended_page, dpla_id, "Case 3", wiki_markup
+                existing_file,
+                intended_page,
+                dpla_id,
+                "Case 3",
+                wiki_markup,
+                post_commonsdelinker=not sibling_slot,
             )
             return "moved"
 
@@ -877,7 +917,12 @@ class Uploader:
             redirect_target = intended_page.getRedirectTarget()
             if redirect_target.title(with_ns=False) == actual_filename:
                 self._move_to_correct_title(
-                    existing_file, intended_page, dpla_id, "Case 1", wiki_markup
+                    existing_file,
+                    intended_page,
+                    dpla_id,
+                    "Case 1",
+                    wiki_markup,
+                    post_commonsdelinker=not sibling_slot,
                 )
                 return "moved"
             # Intended title is a redirect, but its target is somewhere

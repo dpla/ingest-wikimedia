@@ -963,3 +963,124 @@ def test_dup_sha1_sibling_false_when_duplicate_source_sha1s_is_empty_set():
         )
         is False
     )
+
+
+# --------------------------------------------------------------------------
+# CommonsDelinker suppression when actual_filename will be overwritten by
+# a later ordinal in the same session. See process_file's per-ordinal
+# iteration and _resolve_hash_drift's Case 1 / Case 3 paths.
+#
+# Background: when Case 3 moves existing_file → intended_title, the source
+# title becomes a redirect. If THAT title also happens to be one of this
+# item's other current asset positions (i.e. a later ordinal will write
+# different content to it), the CommonsDelinker request to rewrite
+# external references away from the source title becomes invalid the
+# moment the redirect is overwritten — external uses pointing at the new
+# content get silently rewritten to the wrong file. Suppress the
+# request in that case. The move itself is still useful (places the file
+# at its new canonical title cheaply); only the link-rewrite is wrong.
+# --------------------------------------------------------------------------
+
+
+_ITEM_PAGE_8 = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 8).jpg"
+_ITEM_PAGE_11 = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 11).jpg"
+
+
+def _make_intended_page(title, exists=False, is_redirect=False, redirect_target=None):
+    p = MagicMock()
+    p.exists.return_value = exists
+    p.isRedirectPage.return_value = is_redirect
+    p.title.return_value = title
+    if redirect_target:
+        rt = MagicMock()
+        rt.title.return_value = redirect_target
+        p.getRedirectTarget.return_value = rt
+    return p
+
+
+def test_case3_move_suppresses_commonsdelinker_when_actual_is_sibling():
+    """Reproduces the production bug: ord 11 of a multi-page item finds its
+    SHA1 at (page 11).jpg but its renumbered intended title is (page 8).jpg.
+    Case 3 fires — but (page 11).jpg is in this item's expected_item_titles
+    because a LATER ordinal will write different content to it. The
+    CommonsDelinker request must be suppressed."""
+    uploader = _build_uploader_with_dpla()
+    intended = _make_intended_page(_ITEM_PAGE_8, exists=False)
+    expected_titles = {
+        _ITEM_PAGE_8,
+        _ITEM_PAGE_11,  # ← sibling: another ordinal will overwrite this slot
+    }
+    with (
+        patch("tools.uploader.get_page", return_value=intended),
+        patch.object(uploader, "_move_to_correct_title") as mock_move,
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(_ITEM_PAGE_11),
+            page_title=_ITEM_PAGE_8,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=11,
+            wiki_markup="",
+            expected_item_titles=expected_titles,
+        )
+    assert action == "moved"
+    mock_move.assert_called_once()
+    kwargs = mock_move.call_args.kwargs
+    assert kwargs.get("post_commonsdelinker") is False, (
+        "Case 3 must suppress CommonsDelinker when actual_filename is a"
+        " sibling slot that will be overwritten by a later ordinal."
+    )
+
+
+def test_case3_move_posts_commonsdelinker_when_actual_is_not_sibling():
+    """The common case: existing file at a legacy NARA-bot title that's
+    NOT in the current asset positions. CommonsDelinker request stays."""
+    uploader = _build_uploader_with_dpla()
+    intended = _make_intended_page(_ITEM_PAGE_8, exists=False)
+    # Old NARA-bot title from an earlier scheme — not part of current asset list.
+    legacy_title = "Foo - NAID 99999.jpg"
+    expected_titles = {_ITEM_PAGE_8, _ITEM_PAGE_11}
+    with (
+        patch("tools.uploader.get_page", return_value=intended),
+        patch.object(uploader, "_move_to_correct_title") as mock_move,
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(legacy_title),
+            page_title=_ITEM_PAGE_8,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=11,
+            wiki_markup="",
+            expected_item_titles=expected_titles,
+        )
+    assert action == "moved"
+    kwargs = mock_move.call_args.kwargs
+    assert kwargs.get("post_commonsdelinker") is True, (
+        "Case 3 must post the CommonsDelinker request when actual_filename"
+        " is a legitimate orphan (not one of this item's current slots)."
+    )
+
+
+def test_case1_move_suppresses_commonsdelinker_when_actual_is_sibling():
+    """Case 1: intended title is a redirect pointing at actual_filename.
+    The Case-1 move overwrites the redirect with the file. Same
+    sibling-slot logic: if actual_filename is in expected_item_titles,
+    suppress the CommonsDelinker request."""
+    uploader = _build_uploader_with_dpla()
+    intended = _make_intended_page(
+        _ITEM_PAGE_8, exists=True, is_redirect=True, redirect_target=_ITEM_PAGE_11
+    )
+    expected_titles = {_ITEM_PAGE_8, _ITEM_PAGE_11}
+    with (
+        patch("tools.uploader.get_page", return_value=intended),
+        patch.object(uploader, "_move_to_correct_title") as mock_move,
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(_ITEM_PAGE_11),
+            page_title=_ITEM_PAGE_8,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=11,
+            wiki_markup="",
+            expected_item_titles=expected_titles,
+        )
+    assert action == "moved"
+    kwargs = mock_move.call_args.kwargs
+    assert kwargs.get("post_commonsdelinker") is False
