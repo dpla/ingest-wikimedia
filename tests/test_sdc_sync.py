@@ -516,3 +516,144 @@ def test_run_partner_mode_logs_traceback_on_keyboardinterrupt(
 
     messages = " | ".join(r.getMessage() for r in caplog.records)
     assert "KeyboardInterrupt" in messages
+
+
+# --------------------------------------------------------------------------
+# Tests for SDC POST helpers raising RuntimeError instead of sys.exit().
+#
+# Background: the original sys.exit() calls in _post_new_refs /
+# _post_new_claims / _reconcile_existing_claims aborted the entire
+# partner batch for a single failed Commons write. SystemExit is a
+# BaseException, so the per-ordinal `except Exception:` in
+# process_one_from_sdc could not catch it. Replacing with
+# `raise RuntimeError(...)`:
+#   1. Makes the failure self-documenting (mediaid + dpla_id + the
+#      response body / underlying exception type).
+#   2. Routes through the per-ordinal handler, so the partner batch
+#      logs the traceback and continues with the next ordinal instead
+#      of losing thousands of items' worth of work.
+# --------------------------------------------------------------------------
+
+
+def test_truncate_helper_returns_under_limit_unchanged_and_truncates_long():
+    """Sanity check for the _truncate helper used in the new error messages."""
+    from tools import sdc_sync
+
+    assert sdc_sync._truncate("short", limit=100) == "short"
+    truncated = sdc_sync._truncate("x" * 1000, limit=10)
+    assert truncated.startswith("x" * 10)
+    assert "truncated" in truncated
+    assert "1000" in truncated  # original length is preserved in the suffix
+    assert sdc_sync._truncate(None) == ""
+
+
+def _install_module_globals(
+    monkeypatch, sdc_sync, response, *, refclaims_payload=None, claims_payload=None
+):
+    """Inject the module-level globals the SDC POST helpers expect.
+
+    ``refclaims`` / ``claims`` / ``token`` are not initialised at import
+    time — they're declared ``global`` and populated inside ``process_one``
+    / ``process_one_from_sdc`` before each item. Tests that call the POST
+    helpers directly have to install those globals themselves;
+    ``raising=False`` lets monkeypatch set + tear down attributes that
+    didn't exist on the module yet.
+    """
+    monkeypatch.setattr(
+        sdc_sync,
+        "refclaims",
+        {"claims": refclaims_payload if refclaims_payload is not None else []},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sdc_sync,
+        "claims",
+        {"claims": claims_payload if claims_payload is not None else []},
+        raising=False,
+    )
+    monkeypatch.setattr(sdc_sync, "token", "stub-token", raising=False)
+    monkeypatch.setattr(sdc_sync.http, "fetch", lambda *a, **kw: response)
+
+
+def test_post_new_refs_raises_runtime_error_on_non_success_save(monkeypatch):
+    """A non-success wbeditentity refs response must raise RuntimeError,
+    not call sys.exit(). The error message must include the mediaid and
+    DPLA id so the failure is self-identifying in the SDC log.
+
+    The response payload must carry an explicit ``"success": 0`` so the
+    helper's initial save lands in the ``else`` branch (the path that
+    raises the structured "non-success" error). A response with no
+    ``"success"`` key at all would raise KeyError instead and divert
+    into the relogin retry — useful for the catch-by-per-ordinal test
+    below, but not what this one is checking.
+    """
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = (
+        '{"success": 0, "error": {"code": "badtoken", "info": "Invalid token"}}'
+    )
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
+
+    msg = str(excinfo.value)
+    assert "M12345" in msg
+    assert "abcdef01abcdef01abcdef01abcdef01" in msg
+    assert "non-success" in msg
+
+
+def test_post_new_claims_raises_runtime_error_on_non_success_save(monkeypatch):
+    """Same contract for the claims POST helper."""
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = '{"success": 0, "error": {"code": "ratelimited"}}'
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sdc_sync._post_new_claims("M67890", "fedcba98fedcba98fedcba98fedcba98")
+
+    msg = str(excinfo.value)
+    assert "M67890" in msg
+    assert "fedcba98fedcba98fedcba98fedcba98" in msg
+    assert "non-success" in msg
+
+
+def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
+    """The RuntimeError raised from inside _post_new_refs must be a
+    plain Exception subclass (not BaseException), so the per-ordinal
+    `except Exception:` in process_one_from_sdc catches it and the
+    partner batch can continue with the next ordinal.
+
+    This is the key behavioural difference vs the old sys.exit() — old
+    code raised SystemExit (BaseException, not caught by the per-ordinal
+    handler), so a single failed write tanked the entire partner.
+    """
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = '{"success": 0, "error": {"code": "badtoken"}}'
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
+
+    skipped = False
+    try:
+        sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
+    except Exception:
+        # This is the same `except Exception:` clause that wraps each
+        # ordinal in process_one_from_sdc — catching it here proves the
+        # per-ordinal handler will skip rather than abort the partner.
+        skipped = True
+
+    assert skipped, (
+        "RuntimeError from _post_new_refs must be an Exception subclass so the"
+        " per-ordinal handler in process_one_from_sdc catches it (was previously"
+        " SystemExit, which bypassed that handler and aborted the whole partner)"
+    )

@@ -10,7 +10,6 @@ import datetime
 import argparse
 import random
 import os
-import sys
 import time
 import tomllib
 import urllib.parse
@@ -116,6 +115,22 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     return p
+
+
+def _truncate(text: str | None, limit: int = 500) -> str:
+    """Return ``text`` shortened to ``limit`` chars with an ellipsis suffix.
+
+    Used to keep RuntimeError messages from the SDC POST helpers readable
+    when Commons returns a verbose error body — the full response still
+    ends up in the per-ordinal traceback via ``logging.exception``; the
+    truncated version is just for the one-line message.
+    """
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated, {len(text)} chars total]"
 
 
 def _normalize_rights_uri(uri):
@@ -1271,9 +1286,12 @@ def _post_new_refs(mediaid, dpla_id):
                     method="POST",
                     data=postrefs,
                 )
-            except (requests.exceptions.ConnectionError, ConnectionError):
+            except (requests.exceptions.ConnectionError, ConnectionError) as final_e:
                 print(" --- Network error posting new refs: all retries failed.")
-                sys.exit()
+                raise RuntimeError(
+                    f"Network error posting new refs for {mediaid} ({dpla_id}):"
+                    " all 3 ConnectionError retries failed"
+                ) from final_e
     try:
         post = json.loads(save.text)
         if post["success"] == 1:
@@ -1282,7 +1300,14 @@ def _post_new_refs(mediaid, dpla_id):
         else:
             print(post)
             print(" --- Error encountered on save.")
-            sys.exit()
+            raise RuntimeError(
+                f"wbeditentity refs save returned non-success for"
+                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
+            )
+    except RuntimeError:
+        # Our own structured failure — let the per-ordinal handler see it
+        # as-is rather than restarting the relogin path below.
+        raise
     except Exception:
         try:
             token = login()
@@ -1296,13 +1321,20 @@ def _post_new_refs(mediaid, dpla_id):
             if post["success"] == 1:
                 print(" --- Saved new refs!")
                 tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
-            else:
-                print(post)
-                print(" --- Error encountered on save.")
-                sys.exit()
-        except Exception:
-            print(" --- Error encountered. 2")
-            sys.exit()
+                return
+            print(post)
+            print(" --- Error encountered on save.")
+            raise RuntimeError(
+                f"wbeditentity refs save still non-success after relogin for"
+                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
+            )
+        except RuntimeError:
+            raise
+        except Exception as retry_e:
+            print(f" --- Error encountered. 2: {retry_e!r}")
+            raise RuntimeError(
+                f"Refs relogin+save failed for {mediaid} ({dpla_id})"
+            ) from retry_e
 
 
 def _post_new_claims(mediaid, dpla_id):
@@ -1344,9 +1376,12 @@ def _post_new_claims(mediaid, dpla_id):
                     method="POST",
                     data=postdata,
                 )
-            except (requests.exceptions.ConnectionError, ConnectionError):
+            except (requests.exceptions.ConnectionError, ConnectionError) as final_e:
                 print(" --- Network error posting new claims: all retries failed.")
-                sys.exit()
+                raise RuntimeError(
+                    f"Network error posting new claims for {mediaid} ({dpla_id}):"
+                    " all 3 ConnectionError retries failed"
+                ) from final_e
     try:
         post = json.loads(save.text)
         if post["success"] == 1:
@@ -1355,7 +1390,12 @@ def _post_new_claims(mediaid, dpla_id):
         else:
             print(post)
             print(" --- Error encountered on save.")
-            sys.exit()
+            raise RuntimeError(
+                f"wbeditentity claims save returned non-success for"
+                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
+            )
+    except RuntimeError:
+        raise
     except Exception:
         try:
             token = login()
@@ -1369,10 +1409,15 @@ def _post_new_claims(mediaid, dpla_id):
             if post["success"] == 1:
                 print(" --- Saved new claims!")
                 tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
-            else:
-                print(post)
-                print(" --- Error encountered on save.")
-                sys.exit()
+                return
+            print(post)
+            print(" --- Error encountered on save.")
+            raise RuntimeError(
+                f"wbeditentity claims save still non-success after relogin for"
+                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
+            )
+        except RuntimeError:
+            raise
         except Exception as retry_e:
             # `post` may not be assigned yet if http.fetch / json.loads raised —
             # referencing it directly would mask the real error with an
@@ -1381,7 +1426,9 @@ def _post_new_claims(mediaid, dpla_id):
             if "save" in locals():
                 print(save.text)
             print(" --- Error encountered. 3")
-            sys.exit()
+            raise RuntimeError(
+                f"Claims relogin+save failed for {mediaid} ({dpla_id})"
+            ) from retry_e
 
 
 def dpla_claims(
@@ -1641,16 +1688,22 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
         )
         try:
             rm_post = json.loads(rm_resp.text)
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError) as parse_e:
             print(" --- Could not parse removals response.")
-            sys.exit()
+            raise RuntimeError(
+                f"wbremoveclaims response was not parseable JSON for"
+                f" {mediaid} ({dpla_id}): {_truncate(getattr(rm_resp, 'text', ''))}"
+            ) from parse_e
         if rm_post.get("success") == 1:
             print(" --- Saved removals!")
             tracker.increment(Result.SDC_REMOVALS, len(removals))
         else:
             print(rm_post)
             print(" --- Error encountered on removals save.")
-            sys.exit()
+            raise RuntimeError(
+                f"wbremoveclaims save returned non-success for"
+                f" {mediaid} ({dpla_id}): {_truncate(rm_resp.text)}"
+            )
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
