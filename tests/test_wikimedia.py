@@ -850,20 +850,17 @@ def test_tag_as_duplicate_uses_prependtext_not_read_modify_write():
     """tag_as_duplicate must use site.editpage(prependtext=...) rather
     than `file_page.text = tag + file_page.text; file_page.save()`.
 
-    Unlike post_commonsdelinker_request this isn't a self-conflict
-    hotspot (each call edits a different file page), but the same
-    arguments apply: skip the unnecessary GET of the existing page text,
-    let MediaWiki concatenate atomically on the primary, and keep the
-    pattern consistent with the other shared-page edits.
+    The page-text read is now required for the idempotency check (see
+    test_tag_as_duplicate_is_idempotent_when_already_tagged), but the
+    write side must still go through prependtext — MediaWiki concatenates
+    atomically on the primary, no basetimestamp, no read-modify-write
+    save() that would re-introduce edit-conflict risk.
     """
     site = MagicMock()
     file_page = MagicMock()
-    text_accessed = MagicMock(
-        side_effect=AssertionError(
-            "file_page.text must not be accessed — use prependtext"
-        )
-    )
-    type(file_page).text = property(text_accessed)
+    # No prior tag — idempotency check sees empty text and proceeds to write.
+    type(file_page).text = property(lambda self: "")
+    file_page.title.return_value = "Stranded.jpg"
 
     tag_as_duplicate(
         site,
@@ -888,3 +885,66 @@ def test_tag_as_duplicate_uses_prependtext_not_read_modify_write():
         f"line-separated; got {kwargs['prependtext']!r}"
     )
     file_page.save.assert_not_called()
+
+
+def test_tag_as_duplicate_is_idempotent_when_already_tagged():
+    """Regression: a page that already carries a {{Duplicate}} template
+    must NOT receive a second one. Two uploader code paths (per-asset
+    hash-drift correction during upload + the post-item trailing-orphan
+    sweep) can both identify the same file as a duplicate of the same
+    target. Unconditionally prepending each time stacks redundant
+    `{{Duplicate|Correct.jpg|...}}` templates on the page — seen in
+    production on a NARA file that got tagged twice within three
+    seconds with the same correct title and two different reasons.
+    """
+    site = MagicMock()
+    file_page = MagicMock()
+    # Page already tagged by an earlier upstream caller in this run.
+    type(file_page).text = property(
+        lambda self: (
+            "{{Duplicate|Correct.jpg|Other file has the correct title.}}\n"
+            "{{Information|description=...}}\n"
+        )
+    )
+    file_page.title.return_value = "Stranded.jpg"
+
+    tag_as_duplicate(
+        site,
+        file_page,
+        correct_filename="Correct.jpg",
+        reason="Trailing-page orphan: this title has no corresponding asset.",
+    )
+
+    site.editpage.assert_not_called()
+    file_page.save.assert_not_called()
+
+
+def test_tag_as_duplicate_idempotency_detects_lowercase_template():
+    """The duplicate-detection regex must also catch `{{duplicate}}`
+    (lowercase variant some Commons editors use) — otherwise our bot
+    would add `{{Duplicate}}` on top of an existing `{{duplicate}}` and
+    re-introduce the double-tag we just fixed."""
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(lambda self: "{{duplicate|Correct.jpg|reason}}")
+    file_page.title.return_value = "Stranded.jpg"
+
+    tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
+    site.editpage.assert_not_called()
+
+
+def test_tag_as_duplicate_idempotency_does_not_match_unrelated_templates():
+    """The regex must NOT false-positive on unrelated templates whose
+    name happens to start with 'Duplicate' (e.g. {{DuplicateImageFinder}}).
+    A page with only such a template should still receive its first
+    `{{Duplicate}}` tag from us."""
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(
+        lambda self: "{{DuplicateImageFinder|param=value}}\n"
+    )
+    file_page.title.return_value = "Stranded.jpg"
+
+    tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
+    # First tag still applied — the unrelated template should not count.
+    assert site.editpage.call_count == 1
