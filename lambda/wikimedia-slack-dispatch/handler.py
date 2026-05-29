@@ -14,6 +14,11 @@ Handles:
                          Wikidata QID        e.g. "Q12345"
   /wikimedia-upload kill <hub> [<hub> ...]
                      — dispatches wikimedia-kill.yml to stop running sessions.
+  /wikimedia-upload sdc <target> [<target> ...]
+                     — dispatches wikimedia-launch.yml with sdc_only=true to
+                       re-enumerate IDs and run the SDC sync phase only,
+                       skipping download + upload. Used to recover from
+                       aborted SDC syncs.
 
 Validates the incoming Slack request signature before dispatching.
 
@@ -91,6 +96,56 @@ def _slack_reply(text: str, ephemeral: bool = False) -> dict:
     }
 
 
+def _is_dispatch_timeout(exc: BaseException) -> bool:
+    """True if ``exc`` indicates the dispatch may have arrived late, not failed.
+
+    ``urllib.request.urlopen()`` with a ``timeout=`` argument doesn't propagate
+    a raw ``TimeoutError`` — the underlying ``socket.timeout`` (aliased to
+    ``TimeoutError`` in Python 3.10+) is wrapped inside ``urllib.error.URLError``
+    via ``URLError.reason``. Catching only ``TimeoutError`` would therefore miss
+    the realistic slow-but-delivered case and route it to the misleading
+    "internal error" branch.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(getattr(exc, "reason", None), TimeoutError)
+    return False
+
+
+def _launch_with_targets(
+    token: str,
+    repo: str,
+    response_url: str,
+    targets: list[str],
+    extra_inputs: dict,
+    success_text_fn,
+) -> dict:
+    """Dispatch ``wikimedia-launch.yml`` for a list of validated targets.
+
+    Shared by the ``sdc`` and ``refresh`` subcommands (and any future variant
+    that just toggles a launch.yml input). ``extra_inputs`` is merged with the
+    standard partner/response_url/concurrency_key payload; ``success_text_fn``
+    receives the comma-joined ```backtick``-wrapped targets_display.
+    """
+    if not targets:
+        return _slack_reply("No valid targets provided.", ephemeral=True)
+    partner_input = shlex.join(targets)
+    targets_display = ", ".join(f"`{t}`" for t in targets)
+    # Keep the concurrency group name well under GitHub's 400-char limit by
+    # hashing the full partner string down to a 16-char hex prefix.
+    concurrency_key = hashlib.sha256(partner_input.encode()).hexdigest()[:16]
+    inputs = {
+        "partner": partner_input,
+        "response_url": response_url,
+        "concurrency_key": concurrency_key,
+        **extra_inputs,
+    }
+    return _dispatch_and_reply(
+        token, repo, "wikimedia-launch.yml", inputs, success_text_fn(targets_display)
+    )
+
+
 def _dispatch_and_reply(
     token: str,
     repo: str,
@@ -106,6 +161,26 @@ def _dispatch_and_reply(
         logging.error("GitHub API error: HTTP %s", e.code)
         return _slack_reply(
             f"Failed to trigger workflow (HTTP {e.code}).", ephemeral=ephemeral
+        )
+    except (TimeoutError, urllib.error.URLError) as e:
+        # A slow GitHub API response often still results in a successful
+        # dispatch — telling the user "internal error" in that case is
+        # misleading, because the workflow may already be queued. Use the
+        # softer message only for timeout-shaped errors; other URL errors
+        # (DNS failure, connection refused, etc.) still indicate the
+        # dispatch did not happen and should keep the hard-failure wording.
+        if _is_dispatch_timeout(e):
+            logging.warning(
+                "Timeout waiting for GitHub dispatch response (%s)", workflow
+            )
+            return _slack_reply(
+                "GitHub API was slow — workflow may have been dispatched anyway."
+                " Check #tech-alerts in ~2 minutes or the Actions tab to confirm.",
+                ephemeral=ephemeral,
+            )
+        logging.exception("URL error dispatching workflow")
+        return _slack_reply(
+            "Failed to trigger workflow due to an internal error.", ephemeral=ephemeral
         )
     except Exception:
         logging.exception("Unexpected error dispatching workflow")
@@ -266,7 +341,8 @@ def handler(event, context):
                 ' `/wikimedia-upload "indiana|Indiana State Library"`\n'
                 "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`\n"
                 "To retry transient failures: `/wikimedia-upload retry <days> [<partner>]`\n"
-                "To refresh S3 files: `/wikimedia-upload refresh <target> <days>`",
+                "To refresh S3 files: `/wikimedia-upload refresh <target> [<target> ...] <days>`\n"
+                "To re-run only the SDC sync phase: `/wikimedia-upload sdc <target> [<target> ...]`",
                 ephemeral=True,
             )
 
@@ -343,17 +419,46 @@ def handler(event, context):
                 ephemeral=True,
             )
 
+        # SDC subcommand: /wikimedia-upload sdc <target> [<target> ...]
+        # Re-enumerates IDs and runs sdc-sync; skips download + upload phases.
+        # Used to recover SDC sync runs that were aborted before completion.
+        if tokens[0] == "sdc":
+            sdc_tokens = tokens[1:]
+            if not sdc_tokens:
+                return _slack_reply(
+                    "Usage: `/wikimedia-upload sdc <target> [<target> ...]`\n"
+                    "Re-enumerates IDs and runs the SDC sync phase only"
+                    " (skips download + upload).\n"
+                    'Example: `/wikimedia-upload sdc "nara|William J. Clinton Library"`',
+                    ephemeral=True,
+                )
+            sdc_targets, err = _validate_launch_targets(sdc_tokens)
+            if err is not None:
+                return err
+            return _launch_with_targets(
+                gh_token,
+                repo,
+                response_url,
+                sdc_targets,
+                {"sdc_only": "true"},
+                lambda targets_display: (
+                    f"Launching SDC-only sync for {targets_display}"
+                    " — confirmation will post to #tech-alerts shortly."
+                ),
+            )
+
         # Refresh subcommand: /wikimedia-upload refresh <target> [<target> ...] <days>
         # Re-downloads files older than DAYS days without running the uploader.
         if tokens[0] == "refresh":
             refresh_tokens = tokens[1:]
             if len(refresh_tokens) < 2:
                 return _slack_reply(
-                    "Usage: `/wikimedia-upload refresh <target> <days>`\n"
+                    "Usage: `/wikimedia-upload refresh <target> [<target> ...] <days>`\n"
                     "Re-downloads files already in S3 that are older than DAYS days,"
                     " without re-uploading to Commons.\n"
                     "Example: `/wikimedia-upload refresh ohio 90`\n"
-                    'Example: `/wikimedia-upload refresh "indiana|Indiana State Library" 30`',
+                    'Example: `/wikimedia-upload refresh "indiana|Indiana State Library" 30`\n'
+                    "Example: `/wikimedia-upload refresh bpl pa ohio 30`",
                     ephemeral=True,
                 )
             days, err = _parse_positive_int(refresh_tokens[-1])
@@ -362,25 +467,18 @@ def handler(event, context):
             refresh_targets, err = _validate_launch_targets(refresh_tokens[:-1])
             if err is not None:
                 return err
-            if not refresh_targets:
-                return _slack_reply("No valid targets provided.", ephemeral=True)
-            partner_input = shlex.join(refresh_targets)
-            targets_display = ", ".join(f"`{t}`" for t in refresh_targets)
-            concurrency_key = hashlib.sha256(partner_input.encode()).hexdigest()[:16]
-            return _dispatch_and_reply(
+            return _launch_with_targets(
                 gh_token,
                 repo,
-                "wikimedia-launch.yml",
-                {
-                    "partner": partner_input,
-                    "response_url": response_url,
-                    "concurrency_key": concurrency_key,
-                    "max_age_days": str(days),
-                    "refresh_only": "true",
-                },
-                f"Launching download refresh for {targets_display}"
-                f" — re-downloading files older than {days} day{'s' if days != 1 else ''}"
-                ", no upload. Confirmation will post to #tech-alerts shortly.",
+                response_url,
+                refresh_targets,
+                {"max_age_days": str(days), "refresh_only": "true"},
+                lambda targets_display: (
+                    f"Launching download refresh for {targets_display}"
+                    f" — re-downloading files older than {days}"
+                    f" day{'s' if days != 1 else ''}, no upload."
+                    " Confirmation will post to #tech-alerts shortly."
+                ),
             )
 
         # Launch subcommand: /wikimedia-upload <target> [<target> ...]
@@ -412,14 +510,19 @@ def handler(event, context):
             return _slack_reply(
                 f"Failed to launch pipeline for {targets_display} (HTTP {e.code})."
             )
-        except TimeoutError:
-            logging.warning(
-                "Timeout waiting for GitHub dispatch response for targets: %s",
-                targets_display,
-            )
+        except (TimeoutError, urllib.error.URLError) as e:
+            if _is_dispatch_timeout(e):
+                logging.warning(
+                    "Timeout waiting for GitHub dispatch response for targets: %s",
+                    targets_display,
+                )
+                return _slack_reply(
+                    f"GitHub API was slow — pipeline for {targets_display} may have been dispatched anyway. "
+                    "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
+                )
+            logging.exception("URL error dispatching workflow")
             return _slack_reply(
-                f"GitHub API was slow — pipeline for {targets_display} may have been dispatched anyway. "
-                "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
+                f"Failed to launch pipeline for {targets_display} due to an internal error."
             )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
