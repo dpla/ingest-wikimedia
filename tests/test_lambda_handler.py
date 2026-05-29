@@ -145,3 +145,34 @@ def test_top_level_usage_mentions_sdc_subcommand(monkeypatch, handler_module):
     assert reply["statusCode"] == 200
     text = _decode_reply(reply)["text"]
     assert "/wikimedia-upload sdc" in text
+
+
+def test_dispatch_helper_treats_timeout_as_possibly_dispatched(
+    monkeypatch, handler_module
+):
+    """Timeouts from `_dispatch_workflow` must not surface as 'internal error'.
+
+    A slow GitHub API response often still results in a successful dispatch,
+    so the helper-routed paths (``sdc`` / ``refresh``) must mirror the
+    direct-launch path's softer message instead of reporting failure.
+    """
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "shh")
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(
+        handler_module, "_verify_slack_signature", lambda *_a, **_k: True
+    )
+
+    def slow_dispatch(*_a, **_k):
+        raise TimeoutError("simulated slow GitHub API")
+
+    monkeypatch.setattr(handler_module, "_dispatch_workflow", slow_dispatch)
+
+    reply = handler_module.handler(
+        _make_event('sdc "nara|William J. Clinton Library"'), None
+    )
+
+    assert reply["statusCode"] == 200
+    text = _decode_reply(reply)["text"]
+    assert "internal error" not in text.lower()
+    assert "may have been dispatched" in text
+    assert "#tech-alerts" in text

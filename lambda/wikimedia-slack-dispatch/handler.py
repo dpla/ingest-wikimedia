@@ -145,6 +145,17 @@ def _dispatch_and_reply(
         return _slack_reply(
             f"Failed to trigger workflow (HTTP {e.code}).", ephemeral=ephemeral
         )
+    except TimeoutError:
+        # A slow GitHub API response often still results in a successful
+        # dispatch — telling the user "internal error" here is misleading,
+        # because the workflow may already be queued. Mirror the direct-
+        # launch path's softer message so the user knows where to verify.
+        logging.warning("Timeout waiting for GitHub dispatch response (%s)", workflow)
+        return _slack_reply(
+            "GitHub API was slow — workflow may have been dispatched anyway."
+            " Check #tech-alerts in ~2 minutes or the Actions tab to confirm.",
+            ephemeral=ephemeral,
+        )
     except Exception:
         logging.exception("Unexpected error dispatching workflow")
         return _slack_reply(
@@ -304,7 +315,7 @@ def handler(event, context):
                 ' `/wikimedia-upload "indiana|Indiana State Library"`\n'
                 "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`\n"
                 "To retry transient failures: `/wikimedia-upload retry <days> [<partner>]`\n"
-                "To refresh S3 files: `/wikimedia-upload refresh <target> <days>`\n"
+                "To refresh S3 files: `/wikimedia-upload refresh <target> [<target> ...] <days>`\n"
                 "To re-run only the SDC sync phase: `/wikimedia-upload sdc <target> [<target> ...]`",
                 ephemeral=True,
             )
@@ -416,11 +427,12 @@ def handler(event, context):
             refresh_tokens = tokens[1:]
             if len(refresh_tokens) < 2:
                 return _slack_reply(
-                    "Usage: `/wikimedia-upload refresh <target> <days>`\n"
+                    "Usage: `/wikimedia-upload refresh <target> [<target> ...] <days>`\n"
                     "Re-downloads files already in S3 that are older than DAYS days,"
                     " without re-uploading to Commons.\n"
                     "Example: `/wikimedia-upload refresh ohio 90`\n"
-                    'Example: `/wikimedia-upload refresh "indiana|Indiana State Library" 30`',
+                    'Example: `/wikimedia-upload refresh "indiana|Indiana State Library" 30`\n'
+                    "Example: `/wikimedia-upload refresh bpl pa ohio 30`",
                     ephemeral=True,
                 )
             days, err = _parse_positive_int(refresh_tokens[-1])
