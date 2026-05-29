@@ -147,14 +147,14 @@ def test_top_level_usage_mentions_sdc_subcommand(monkeypatch, handler_module):
     assert "/wikimedia-upload sdc" in text
 
 
-def test_dispatch_helper_treats_timeout_as_possibly_dispatched(
+def test_dispatch_helper_treats_raw_timeout_as_possibly_dispatched(
     monkeypatch, handler_module
 ):
-    """Timeouts from `_dispatch_workflow` must not surface as 'internal error'.
+    """Bare ``TimeoutError`` must not surface as 'internal error'.
 
-    A slow GitHub API response often still results in a successful dispatch,
-    so the helper-routed paths (``sdc`` / ``refresh``) must mirror the
-    direct-launch path's softer message instead of reporting failure.
+    Kept as a backstop even though ``urllib.request.urlopen`` normally wraps
+    timeouts in ``URLError`` — defensive in case a future urllib change (or
+    a different code path) propagates the raw exception.
     """
     monkeypatch.setenv("SLACK_SIGNING_SECRET", "shh")
     monkeypatch.setenv("GH_TOKEN", "tok")
@@ -176,3 +176,70 @@ def test_dispatch_helper_treats_timeout_as_possibly_dispatched(
     assert "internal error" not in text.lower()
     assert "may have been dispatched" in text
     assert "#tech-alerts" in text
+
+
+def test_dispatch_helper_treats_urlerror_wrapping_timeout_as_possibly_dispatched(
+    monkeypatch, handler_module
+):
+    """The realistic urllib timeout shape: ``URLError`` wrapping ``TimeoutError``.
+
+    ``urllib.request.urlopen()`` does not propagate a raw ``TimeoutError`` from
+    its ``timeout=`` parameter — it wraps the underlying ``socket.timeout``
+    (aliased to ``TimeoutError`` in Python 3.10+) inside ``URLError.reason``.
+    This is the shape that actually hits the Lambda in production, so the
+    timeout branch must recognise it and route to the softer message.
+    """
+    import urllib.error
+
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "shh")
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(
+        handler_module, "_verify_slack_signature", lambda *_a, **_k: True
+    )
+
+    def wrapped_timeout_dispatch(*_a, **_k):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(handler_module, "_dispatch_workflow", wrapped_timeout_dispatch)
+
+    reply = handler_module.handler(
+        _make_event('sdc "nara|William J. Clinton Library"'), None
+    )
+
+    assert reply["statusCode"] == 200
+    text = _decode_reply(reply)["text"]
+    assert "internal error" not in text.lower()
+    assert "may have been dispatched" in text
+    assert "#tech-alerts" in text
+
+
+def test_dispatch_helper_non_timeout_urlerror_is_hard_failure(
+    monkeypatch, handler_module
+):
+    """A non-timeout URLError (DNS, connection refused) must NOT use the soft message.
+
+    Only timeout-shaped URLErrors leave the dispatch in ambiguous-status
+    territory. A connection refused or DNS failure means the request never
+    arrived, so the hard-failure wording is correct.
+    """
+    import urllib.error
+
+    monkeypatch.setenv("SLACK_SIGNING_SECRET", "shh")
+    monkeypatch.setenv("GH_TOKEN", "tok")
+    monkeypatch.setattr(
+        handler_module, "_verify_slack_signature", lambda *_a, **_k: True
+    )
+
+    def refused_dispatch(*_a, **_k):
+        raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+
+    monkeypatch.setattr(handler_module, "_dispatch_workflow", refused_dispatch)
+
+    reply = handler_module.handler(
+        _make_event('sdc "nara|William J. Clinton Library"'), None
+    )
+
+    assert reply["statusCode"] == 200
+    text = _decode_reply(reply)["text"]
+    assert "may have been dispatched" not in text
+    assert "internal error" in text.lower()

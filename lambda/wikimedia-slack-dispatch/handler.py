@@ -96,6 +96,23 @@ def _slack_reply(text: str, ephemeral: bool = False) -> dict:
     }
 
 
+def _is_dispatch_timeout(exc: BaseException) -> bool:
+    """True if ``exc`` indicates the dispatch may have arrived late, not failed.
+
+    ``urllib.request.urlopen()`` with a ``timeout=`` argument doesn't propagate
+    a raw ``TimeoutError`` — the underlying ``socket.timeout`` (aliased to
+    ``TimeoutError`` in Python 3.10+) is wrapped inside ``urllib.error.URLError``
+    via ``URLError.reason``. Catching only ``TimeoutError`` would therefore miss
+    the realistic slow-but-delivered case and route it to the misleading
+    "internal error" branch.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(getattr(exc, "reason", None), TimeoutError)
+    return False
+
+
 def _launch_with_targets(
     token: str,
     repo: str,
@@ -145,16 +162,25 @@ def _dispatch_and_reply(
         return _slack_reply(
             f"Failed to trigger workflow (HTTP {e.code}).", ephemeral=ephemeral
         )
-    except TimeoutError:
+    except (TimeoutError, urllib.error.URLError) as e:
         # A slow GitHub API response often still results in a successful
-        # dispatch — telling the user "internal error" here is misleading,
-        # because the workflow may already be queued. Mirror the direct-
-        # launch path's softer message so the user knows where to verify.
-        logging.warning("Timeout waiting for GitHub dispatch response (%s)", workflow)
+        # dispatch — telling the user "internal error" in that case is
+        # misleading, because the workflow may already be queued. Use the
+        # softer message only for timeout-shaped errors; other URL errors
+        # (DNS failure, connection refused, etc.) still indicate the
+        # dispatch did not happen and should keep the hard-failure wording.
+        if _is_dispatch_timeout(e):
+            logging.warning(
+                "Timeout waiting for GitHub dispatch response (%s)", workflow
+            )
+            return _slack_reply(
+                "GitHub API was slow — workflow may have been dispatched anyway."
+                " Check #tech-alerts in ~2 minutes or the Actions tab to confirm.",
+                ephemeral=ephemeral,
+            )
+        logging.exception("URL error dispatching workflow")
         return _slack_reply(
-            "GitHub API was slow — workflow may have been dispatched anyway."
-            " Check #tech-alerts in ~2 minutes or the Actions tab to confirm.",
-            ephemeral=ephemeral,
+            "Failed to trigger workflow due to an internal error.", ephemeral=ephemeral
         )
     except Exception:
         logging.exception("Unexpected error dispatching workflow")
@@ -484,14 +510,19 @@ def handler(event, context):
             return _slack_reply(
                 f"Failed to launch pipeline for {targets_display} (HTTP {e.code})."
             )
-        except TimeoutError:
-            logging.warning(
-                "Timeout waiting for GitHub dispatch response for targets: %s",
-                targets_display,
-            )
+        except (TimeoutError, urllib.error.URLError) as e:
+            if _is_dispatch_timeout(e):
+                logging.warning(
+                    "Timeout waiting for GitHub dispatch response for targets: %s",
+                    targets_display,
+                )
+                return _slack_reply(
+                    f"GitHub API was slow — pipeline for {targets_display} may have been dispatched anyway. "
+                    "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
+                )
+            logging.exception("URL error dispatching workflow")
             return _slack_reply(
-                f"GitHub API was slow — pipeline for {targets_display} may have been dispatched anyway. "
-                "Check #tech-alerts in ~2 minutes or the Actions tab to confirm."
+                f"Failed to launch pipeline for {targets_display} due to an internal error."
             )
         except Exception:
             logging.exception("Unexpected error dispatching workflow")
