@@ -578,11 +578,21 @@ def _install_module_globals(
 def test_post_new_refs_raises_runtime_error_on_non_success_save(monkeypatch):
     """A non-success wbeditentity refs response must raise RuntimeError,
     not call sys.exit(). The error message must include the mediaid and
-    DPLA id so the failure is self-identifying in the SDC log."""
+    DPLA id so the failure is self-identifying in the SDC log.
+
+    The response payload must carry an explicit ``"success": 0`` so the
+    helper's initial save lands in the ``else`` branch (the path that
+    raises the structured "non-success" error). A response with no
+    ``"success"`` key at all would raise KeyError instead and divert
+    into the relogin retry — useful for the catch-by-per-ordinal test
+    below, but not what this one is checking.
+    """
     from tools import sdc_sync
 
     response = MagicMock()
-    response.text = '{"error": {"code": "badtoken", "info": "Invalid token"}}'
+    response.text = (
+        '{"success": 0, "error": {"code": "badtoken", "info": "Invalid token"}}'
+    )
     _install_module_globals(
         monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
     )
@@ -601,7 +611,7 @@ def test_post_new_claims_raises_runtime_error_on_non_success_save(monkeypatch):
     from tools import sdc_sync
 
     response = MagicMock()
-    response.text = '{"error": {"code": "ratelimited"}}'
+    response.text = '{"success": 0, "error": {"code": "ratelimited"}}'
     _install_module_globals(
         monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
     )
@@ -628,7 +638,7 @@ def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
     from tools import sdc_sync
 
     response = MagicMock()
-    response.text = '{"error": {"code": "badtoken"}}'
+    response.text = '{"success": 0, "error": {"code": "badtoken"}}'
     _install_module_globals(
         monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
     )
