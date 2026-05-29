@@ -547,6 +547,34 @@ def test_truncate_helper_returns_under_limit_unchanged_and_truncates_long():
     assert sdc_sync._truncate(None) == ""
 
 
+def _install_module_globals(
+    monkeypatch, sdc_sync, response, *, refclaims_payload=None, claims_payload=None
+):
+    """Inject the module-level globals the SDC POST helpers expect.
+
+    ``refclaims`` / ``claims`` / ``token`` are not initialised at import
+    time — they're declared ``global`` and populated inside ``process_one``
+    / ``process_one_from_sdc`` before each item. Tests that call the POST
+    helpers directly have to install those globals themselves;
+    ``raising=False`` lets monkeypatch set + tear down attributes that
+    didn't exist on the module yet.
+    """
+    monkeypatch.setattr(
+        sdc_sync,
+        "refclaims",
+        {"claims": refclaims_payload if refclaims_payload is not None else []},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sdc_sync,
+        "claims",
+        {"claims": claims_payload if claims_payload is not None else []},
+        raising=False,
+    )
+    monkeypatch.setattr(sdc_sync, "token", "stub-token", raising=False)
+    monkeypatch.setattr(sdc_sync.http, "fetch", lambda *a, **kw: response)
+
+
 def test_post_new_refs_raises_runtime_error_on_non_success_save(monkeypatch):
     """A non-success wbeditentity refs response must raise RuntimeError,
     not call sys.exit(). The error message must include the mediaid and
@@ -555,11 +583,9 @@ def test_post_new_refs_raises_runtime_error_on_non_success_save(monkeypatch):
 
     response = MagicMock()
     response.text = '{"error": {"code": "badtoken", "info": "Invalid token"}}'
-
-    # Pre-populate the module-level refclaims so the helper actually posts.
-    monkeypatch.setitem(sdc_sync.refclaims, "claims", [{"some": "ref"}])
-    monkeypatch.setattr(sdc_sync, "token", "stub-token", raising=False)
-    monkeypatch.setattr(sdc_sync.http, "fetch", lambda *a, **kw: response)
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
@@ -576,10 +602,9 @@ def test_post_new_claims_raises_runtime_error_on_non_success_save(monkeypatch):
 
     response = MagicMock()
     response.text = '{"error": {"code": "ratelimited"}}'
-
-    monkeypatch.setitem(sdc_sync.claims, "claims", [{"some": "claim"}])
-    monkeypatch.setattr(sdc_sync, "token", "stub-token", raising=False)
-    monkeypatch.setattr(sdc_sync.http, "fetch", lambda *a, **kw: response)
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         sdc_sync._post_new_claims("M67890", "fedcba98fedcba98fedcba98fedcba98")
@@ -604,9 +629,9 @@ def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
 
     response = MagicMock()
     response.text = '{"error": {"code": "badtoken"}}'
-    monkeypatch.setitem(sdc_sync.refclaims, "claims", [{"some": "ref"}])
-    monkeypatch.setattr(sdc_sync, "token", "stub-token", raising=False)
-    monkeypatch.setattr(sdc_sync.http, "fetch", lambda *a, **kw: response)
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
 
     skipped = False
     try:
