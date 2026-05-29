@@ -14,6 +14,11 @@ Handles:
                          Wikidata QID        e.g. "Q12345"
   /wikimedia-upload kill <hub> [<hub> ...]
                      — dispatches wikimedia-kill.yml to stop running sessions.
+  /wikimedia-upload sdc <target> [<target> ...]
+                     — dispatches wikimedia-launch.yml with sdc_only=true to
+                       re-enumerate IDs and run the SDC sync phase only,
+                       skipping download + upload. Used to recover from
+                       aborted SDC syncs.
 
 Validates the incoming Slack request signature before dispatching.
 
@@ -89,6 +94,39 @@ def _slack_reply(text: str, ephemeral: bool = False) -> dict:
             }
         ),
     }
+
+
+def _launch_with_targets(
+    token: str,
+    repo: str,
+    response_url: str,
+    targets: list[str],
+    extra_inputs: dict,
+    success_text_fn,
+) -> dict:
+    """Dispatch ``wikimedia-launch.yml`` for a list of validated targets.
+
+    Shared by the ``sdc`` and ``refresh`` subcommands (and any future variant
+    that just toggles a launch.yml input). ``extra_inputs`` is merged with the
+    standard partner/response_url/concurrency_key payload; ``success_text_fn``
+    receives the comma-joined ```backtick``-wrapped targets_display.
+    """
+    if not targets:
+        return _slack_reply("No valid targets provided.", ephemeral=True)
+    partner_input = shlex.join(targets)
+    targets_display = ", ".join(f"`{t}`" for t in targets)
+    # Keep the concurrency group name well under GitHub's 400-char limit by
+    # hashing the full partner string down to a 16-char hex prefix.
+    concurrency_key = hashlib.sha256(partner_input.encode()).hexdigest()[:16]
+    inputs = {
+        "partner": partner_input,
+        "response_url": response_url,
+        "concurrency_key": concurrency_key,
+        **extra_inputs,
+    }
+    return _dispatch_and_reply(
+        token, repo, "wikimedia-launch.yml", inputs, success_text_fn(targets_display)
+    )
 
 
 def _dispatch_and_reply(
@@ -266,7 +304,8 @@ def handler(event, context):
                 ' `/wikimedia-upload "indiana|Indiana State Library"`\n'
                 "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`\n"
                 "To retry transient failures: `/wikimedia-upload retry <days> [<partner>]`\n"
-                "To refresh S3 files: `/wikimedia-upload refresh <target> <days>`",
+                "To refresh S3 files: `/wikimedia-upload refresh <target> <days>`\n"
+                "To re-run only the SDC sync phase: `/wikimedia-upload sdc <target> [<target> ...]`",
                 ephemeral=True,
             )
 
@@ -343,6 +382,34 @@ def handler(event, context):
                 ephemeral=True,
             )
 
+        # SDC subcommand: /wikimedia-upload sdc <target> [<target> ...]
+        # Re-enumerates IDs and runs sdc-sync; skips download + upload phases.
+        # Used to recover SDC sync runs that were aborted before completion.
+        if tokens[0] == "sdc":
+            sdc_tokens = tokens[1:]
+            if not sdc_tokens:
+                return _slack_reply(
+                    "Usage: `/wikimedia-upload sdc <target> [<target> ...]`\n"
+                    "Re-enumerates IDs and runs the SDC sync phase only"
+                    " (skips download + upload).\n"
+                    'Example: `/wikimedia-upload sdc "nara|William J. Clinton Library"`',
+                    ephemeral=True,
+                )
+            sdc_targets, err = _validate_launch_targets(sdc_tokens)
+            if err is not None:
+                return err
+            return _launch_with_targets(
+                gh_token,
+                repo,
+                response_url,
+                sdc_targets,
+                {"sdc_only": "true"},
+                lambda targets_display: (
+                    f"Launching SDC-only sync for {targets_display}"
+                    " — confirmation will post to #tech-alerts shortly."
+                ),
+            )
+
         # Refresh subcommand: /wikimedia-upload refresh <target> [<target> ...] <days>
         # Re-downloads files older than DAYS days without running the uploader.
         if tokens[0] == "refresh":
@@ -362,25 +429,18 @@ def handler(event, context):
             refresh_targets, err = _validate_launch_targets(refresh_tokens[:-1])
             if err is not None:
                 return err
-            if not refresh_targets:
-                return _slack_reply("No valid targets provided.", ephemeral=True)
-            partner_input = shlex.join(refresh_targets)
-            targets_display = ", ".join(f"`{t}`" for t in refresh_targets)
-            concurrency_key = hashlib.sha256(partner_input.encode()).hexdigest()[:16]
-            return _dispatch_and_reply(
+            return _launch_with_targets(
                 gh_token,
                 repo,
-                "wikimedia-launch.yml",
-                {
-                    "partner": partner_input,
-                    "response_url": response_url,
-                    "concurrency_key": concurrency_key,
-                    "max_age_days": str(days),
-                    "refresh_only": "true",
-                },
-                f"Launching download refresh for {targets_display}"
-                f" — re-downloading files older than {days} day{'s' if days != 1 else ''}"
-                ", no upload. Confirmation will post to #tech-alerts shortly.",
+                response_url,
+                refresh_targets,
+                {"max_age_days": str(days), "refresh_only": "true"},
+                lambda targets_display: (
+                    f"Launching download refresh for {targets_display}"
+                    f" — re-downloading files older than {days}"
+                    f" day{'s' if days != 1 else ''}, no upload."
+                    " Confirmation will post to #tech-alerts shortly."
+                ),
             )
 
         # Launch subcommand: /wikimedia-upload <target> [<target> ...]
