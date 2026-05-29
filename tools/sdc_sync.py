@@ -117,7 +117,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _truncate(text: str, limit: int = 500) -> str:
+def _truncate(text: str | None, limit: int = 500) -> str:
     """Return ``text`` shortened to ``limit`` chars with an ellipsis suffix.
 
     Used to keep RuntimeError messages from the SDC POST helpers readable
