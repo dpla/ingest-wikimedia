@@ -933,6 +933,33 @@ def test_tag_as_duplicate_idempotency_detects_lowercase_template():
     site.editpage.assert_not_called()
 
 
+def test_tag_as_duplicate_idempotency_detects_whitespace_variants():
+    """The regex must also catch the spaced/newline variants of the
+    template invocation that wikitext allows: `{{ Duplicate|...}}`,
+    `{{Duplicate |...}}`, and `{{Duplicate\\n|...}}` are all valid
+    forms Commons editors emit. Earlier the regex required `|` or `}`
+    to follow `Duplicate` with no whitespace, which would have missed
+    every one of these and re-introduced the double-tag bug whenever
+    the prior tagger used a less-compact form.
+    """
+    for prior_tag in (
+        "{{ Duplicate|Correct.jpg|reason}}",  # space after `{{`
+        "{{Duplicate |Correct.jpg|reason}}",  # space before `|`
+        "{{Duplicate\n|Correct.jpg|reason}}",  # newline before `|`
+        "{{Duplicate}}",  # no args (closes immediately)
+        "{{Duplicate }}",  # no args with trailing whitespace
+    ):
+        site = MagicMock()
+        file_page = MagicMock()
+        type(file_page).text = property(lambda self, t=prior_tag: t)
+        file_page.title.return_value = "Stranded.jpg"
+        tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
+        assert site.editpage.call_count == 0, (
+            f"prior tag {prior_tag!r} should have been detected; "
+            f"editpage was called {site.editpage.call_count} time(s)"
+        )
+
+
 def test_tag_as_duplicate_idempotency_does_not_match_unrelated_templates():
     """The regex must NOT false-positive on unrelated templates whose
     name happens to start with 'Duplicate' (e.g. {{DuplicateImageFinder}}).

@@ -626,11 +626,16 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     return "\n".join(parts) + "\n"
 
 
-# Anchored loosely on `{{` + (D|d)uplicate to catch the standard Commons
-# variants we (and other editors) emit. The follow-on `[|}]` ensures we
-# match the actual template invocation `{{Duplicate|...}}` or `{{Duplicate}}`
-# and don't false-positive on something like `{{DuplicateImageFinder}}`.
-_DUPLICATE_TAG_RE = re.compile(r"\{\{[Dd]uplicate[|}]")
+# Matches a real {{Duplicate}} template invocation. `\s*` on both sides of
+# `duplicate` accepts the whitespace/newlines wikitext allows inside the
+# braces — `{{ Duplicate|…}}`, `{{Duplicate |…}}` and `{{Duplicate\n|…}}`
+# are all valid invocations Commons editors do use. The trailing
+# `(?:\||\}\})` is what prevents `{{DuplicateImageFinder|…}}` from
+# false-matching: we only count it as a duplicate template when the next
+# non-whitespace token is the parameter pipe or the template's closing
+# braces. IGNORECASE handles both `Duplicate` and the `{{duplicate}}`
+# variant some Commons editors use.
+_DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
 
 
 def tag_as_duplicate(
