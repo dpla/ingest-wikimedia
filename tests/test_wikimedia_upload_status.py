@@ -159,6 +159,95 @@ def _fake_ssm_for_phase(
     return fake_ssm_run
 
 
+def test_get_phase_and_progress_retry_label_reads_retry_dir_csvs():
+    """Regression: for `retry-<slug>` labels the CSV "items in scope"
+    denominator must come from the retry pipeline's CSV(s) in the shared
+    /retry/ directory, NOT from `{partner_base}/retry-<slug>.csv` (which
+    never exists). Without this, every retry session's status reported
+    "N / 0 items" because the wc -l fell back to the `|| echo 0` branch.
+
+    `northwest-heritage` is a partner whose EC2 directory name matches its
+    canonical slug (so PARTNER_DIR has no override), exercising the
+    pdir=hub fall-through.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if len(captured) == 1:
+            return "1700000000\n20260601-120000-retry-northwest-heritage-download.log\n"
+        # awk pass: dpla_id=2, uploaded=0, skipping=0, counts=0;
+        # then csv total = 5 (sum of download+upload retry CSVs)
+        return (
+            "1700000000\n1700000000\n__WM_SEP__\nDownloading something\n"
+            "__WM_SEP__\n2\n0\n0\n0\n5\n"
+        )
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-retry-7d-northwest-heritage",
+            hub="northwest-heritage",
+            label="retry-northwest-heritage",
+        )
+    assert phase is not None
+    # Phase is "Downloading (2 / 5 items, ~40.0%)" — total must be 5, not 0.
+    assert "2" in phase and "5" in phase, phase
+    assert "/ 0 items" not in phase, (
+        f"Status should not show '/ 0 items' for retry sessions; got: {phase!r}"
+    )
+
+    # The main SSM call must reference the retry/-directory CSVs, not the
+    # nonexistent {base}/retry-{slug}.csv. Pin both paths so neither half
+    # of the lookup can regress.
+    main_cmd = captured[1]
+    assert "/retry/northwest-heritage-download-retry.csv" in main_cmd, main_cmd
+    assert "/retry/northwest-heritage-upload-retry.csv" in main_cmd, main_cmd
+    # The bogus path the bug was reading must NOT be in the command.
+    assert "/retry-northwest-heritage.csv" not in main_cmd, (
+        f"status must not look for `{{base}}/retry-<slug>.csv` for retry "
+        f"sessions; got: {main_cmd!r}"
+    )
+
+
+def test_get_phase_and_progress_retry_label_uses_partner_dir_name():
+    """Retry CSVs are named by partner *directory*, not canonical slug.
+    For `si` (canonical slug) the directory is `smithsonian`, so the CSV
+    is `/retry/smithsonian-download-retry.csv`, not
+    `/retry/si-download-retry.csv`. The status script must honor
+    PARTNER_DIR the same way the retry pipeline does.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if len(captured) == 1:
+            return "1700000000\n20260601-120000-retry-si-download.log\n"
+        return "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n1\n0\n0\n0\n3\n"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        get_phase_and_progress(
+            client=None,
+            session="wikimedia-retry-7d-si",
+            hub="si",
+            label="retry-si",
+        )
+    main_cmd = captured[1]
+    assert "/retry/smithsonian-download-retry.csv" in main_cmd
+    assert "/retry/smithsonian-upload-retry.csv" in main_cmd
+    assert "/retry/si-" not in main_cmd, (
+        f"must use partner dir name (smithsonian), not slug (si); got: {main_cmd!r}"
+    )
+
+
 def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
     """An -sdc.log with DPLA IDs logged but no terminal COUNTS marker
     surfaces as "SDC syncing (N / total items, ~pct%)".

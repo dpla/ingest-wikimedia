@@ -105,7 +105,30 @@ def get_phase_and_progress(
         return None, 0
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
-    csv_path = shlex.quote(f"{base}/{label}.csv")
+    # Resolve the CSV(s) backing this label so `wc -l` returns a meaningful
+    # "items in scope" denominator.
+    #
+    # Launch sessions write a single per-target CSV at `{base}/{label}.csv`
+    # (e.g. `northwest-heritage/northwest-heritage+local-history.csv`).
+    #
+    # Retry sessions are different: the retry pipeline writes its CSVs into
+    # a shared `retry/` directory using the partner *directory* name plus a
+    # phase suffix (matching wikimedia_retry.py's RETRY_DIR layout). For a
+    # retry label like `retry-northwest-heritage` the relevant CSVs are
+    # `retry/northwest-heritage-download-retry.csv` and/or
+    # `retry/northwest-heritage-upload-retry.csv`. Sum lines from whichever
+    # exist — `cat` silently skips missing files (stderr suppressed) and
+    # `wc -l` of an empty stream is 0. Without this, the status script was
+    # always reporting "/ 0 items" for retry sessions because no file at
+    # `{base}/retry-<slug>.csv` existed.
+    if label.startswith("retry-"):
+        retry_dir = "/home/ec2-user/ingest-wikimedia/retry"
+        download_csv = shlex.quote(f"{retry_dir}/{pdir}-download-retry.csv")
+        upload_csv = shlex.quote(f"{retry_dir}/{pdir}-upload-retry.csv")
+        csv_count_cmd = f"cat {download_csv} {upload_csv} 2>/dev/null | wc -l"
+    else:
+        csv_path = shlex.quote(f"{base}/{label}.csv")
+        csv_count_cmd = f"wc -l < {csv_path} 2>/dev/null || echo 0"
 
     sep = "__WM_SEP__"
     # One awk pass counts all four marker lines in a single sequential read
@@ -130,7 +153,7 @@ def get_phase_and_progress(
         f"/COUNTS:/ {{c++}} "
         f"END {{ print d+0; print u+0; print s+0; print c+0 }}"
         f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n'; "
-        f"wc -l < {csv_path} 2>/dev/null || echo 0",
+        f"{csv_count_cmd}",
     )
 
     sections = out.split(f"{sep}\n", 2)
