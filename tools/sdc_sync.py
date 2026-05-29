@@ -1702,7 +1702,7 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
             print(" --- Error encountered on removals save.")
             raise RuntimeError(
                 f"wbremoveclaims save returned non-success for"
-                f" {mediaid} ({dpla_id}): {rm_post}"
+                f" {mediaid} ({dpla_id}): {_truncate(rm_resp.text)}"
             )
 
 
