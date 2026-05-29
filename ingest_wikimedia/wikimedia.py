@@ -626,6 +626,18 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     return "\n".join(parts) + "\n"
 
 
+# Matches a real {{Duplicate}} template invocation. `\s*` on both sides of
+# `duplicate` accepts the whitespace/newlines wikitext allows inside the
+# braces — `{{ Duplicate|…}}`, `{{Duplicate |…}}` and `{{Duplicate\n|…}}`
+# are all valid invocations Commons editors do use. The trailing
+# `(?:\||\}\})` is what prevents `{{DuplicateImageFinder|…}}` from
+# false-matching: we only count it as a duplicate template when the next
+# non-whitespace token is the parameter pipe or the template's closing
+# braces. IGNORECASE handles both `Duplicate` and the `{{duplicate}}`
+# variant some Commons editors use.
+_DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
+
+
 def tag_as_duplicate(
     site: BaseSite,
     file_page: FilePage,
@@ -637,15 +649,27 @@ def tag_as_duplicate(
     correct_filename should be bare (no 'File:' prefix).
     reason is the free-text reason shown in the template.
 
+    Idempotent: if the page already carries a {{Duplicate}} (or
+    {{duplicate}}) template, this is a no-op. Two distinct uploader code
+    paths can both identify the same file as a duplicate of the same
+    target — the per-asset hash-drift correction during upload, and the
+    post-item trailing-orphan sweep that runs after the asset loop —
+    and unconditionally prepending each time produces a stack of
+    redundant tags on the page (see uploader regression where one file
+    got tagged twice within three seconds with the same correct title).
+
     Uses the MediaWiki `prependtext` API parameter so the existing page
-    text doesn't need to be fetched into the process just to be re-saved
-    unchanged. Each call writes a different file page (so self-conflicts
-    of the kind that hit `post_commonsdelinker_request` aren't possible
-    here), but the read-modify-write form still costs an extra GET per
-    call and is vulnerable to rare external edit conflicts on the same
-    page. `prependtext` skips the GET, skips the basetimestamp check,
-    and lets MediaWiki concatenate atomically on the primary.
+    text doesn't need to be fetched, modified, and re-saved. The
+    idempotency check above does cost one GET to read `file_page.text`
+    that the pure-prependtext path avoided, but skipping a redundant
+    write is worth the single read.
     """
+    if _DUPLICATE_TAG_RE.search(file_page.text or ""):
+        logging.info(
+            f"Skipping duplicate tag on [[File:{file_page.title(with_ns=False)}]] — "
+            f"already tagged as duplicate."
+        )
+        return
     tag = f"{{{{Duplicate|{correct_filename}|{reason}}}}}"
     summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
     # Trailing newline so the tag sits on its own line above whatever
