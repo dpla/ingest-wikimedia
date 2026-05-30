@@ -657,3 +657,81 @@ def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
         " per-ordinal handler in process_one_from_sdc catches it (was previously"
         " SystemExit, which bypassed that handler and aborted the whole partner)"
     )
+
+
+# --------------------------------------------------------------------------
+# Response-body inclusion in the relogin+save failure messages.
+#
+# When the per-ordinal handler in process_one_from_sdc logs an exception
+# from these helpers, the only thing we currently see is "Claims
+# relogin+save failed for <mediaid> (<dpla_id>)" plus a chained
+# KeyError from json parsing. That isn't enough to diagnose the
+# underlying problem — Commons returns errors like
+# {"error": {"code": "permissiondenied", "info": "..."}} which have
+# NO "success" key, so post["success"] raises KeyError and the actual
+# error code is lost. Baking save.text into the RuntimeError message
+# captures the Commons error code in the structured exception, where
+# logging.exception will write it to the SDC log.
+# --------------------------------------------------------------------------
+
+
+def test_post_new_claims_relogin_failure_message_includes_response_body(monkeypatch):
+    """When the relogin retry also returns a response with no ``"success"``
+    key, the chained KeyError + new RuntimeError message must include the
+    Commons response body so we can read the error code from the SDC log.
+
+    Without this, the per-ordinal traceback only tells us the helper hit
+    line 1421 — useful for locating the abort but useless for figuring
+    out *why* a specific item is being rejected by Commons.
+    """
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = (
+        '{"error": {"code": "permissiondenied", "info": "Permission denied."}}'
+    )
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
+    )
+    # Stub ``login()`` so the relogin path completes successfully (no
+    # auth-side error masking the real save failure under test).
+    monkeypatch.setattr(sdc_sync, "login", lambda: "stub-token-2", raising=False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
+
+    msg = str(excinfo.value)
+    assert "M12345" in msg
+    assert "abcdef01abcdef01abcdef01abcdef01" in msg
+    assert "relogin+save failed" in msg
+    # The Commons error code from the response body must be reachable from
+    # the message — that's the whole point of this PR.
+    assert "permissiondenied" in msg, (
+        "Commons error code must appear in the RuntimeError message so the"
+        " per-ordinal logging.exception captures it; got: " + repr(msg)
+    )
+
+
+def test_post_new_refs_relogin_failure_message_includes_response_body(monkeypatch):
+    """Same contract for the refs helper."""
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = (
+        '{"error": {"code": "abusefilter-disallowed", "info": "Rule X tripped."}}'
+    )
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
+    monkeypatch.setattr(sdc_sync, "login", lambda: "stub-token-2", raising=False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
+
+    msg = str(excinfo.value)
+    assert "M67890" in msg
+    assert "fedcba98fedcba98fedcba98fedcba98" in msg
+    assert "relogin+save failed" in msg
+    assert "abusefilter-disallowed" in msg, (
+        "Commons error code must appear in the RuntimeError message; got: " + repr(msg)
+    )

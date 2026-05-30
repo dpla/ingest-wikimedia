@@ -1331,9 +1331,17 @@ def _post_new_refs(mediaid, dpla_id):
         except RuntimeError:
             raise
         except Exception as retry_e:
+            # `save` may not be bound if http.fetch raised before the response
+            # landed — guard with ``locals()`` so we don't mask the real cause
+            # with an UnboundLocalError. When ``save`` IS bound, the response
+            # body is the diagnostic we actually want (e.g. a Commons error
+            # like ``{"error": {"code": "permissiondenied", ...}}`` will raise
+            # KeyError on ``post["success"]`` above, but the response body
+            # itself names the cause).
             print(f" --- Error encountered. 2: {retry_e!r}")
+            body_suffix = f": {_truncate(save.text)}" if "save" in locals() else ""
             raise RuntimeError(
-                f"Refs relogin+save failed for {mediaid} ({dpla_id})"
+                f"Refs relogin+save failed for {mediaid} ({dpla_id}){body_suffix}"
             ) from retry_e
 
 
@@ -1422,12 +1430,22 @@ def _post_new_claims(mediaid, dpla_id):
             # `post` may not be assigned yet if http.fetch / json.loads raised —
             # referencing it directly would mask the real error with an
             # UnboundLocalError. Log what we actually have.
+            #
+            # Bake ``save.text`` into the RuntimeError message (when bound) so
+            # the per-ordinal ``logging.exception`` captures the Commons error
+            # response body — the existing ``print(save.text)`` goes to stdout,
+            # which is block-buffered to a non-TTY and got dropped on
+            # ``sys.exit()``. The May 2026 NARA aborts ended with ``KeyError:
+            # 'success'`` propagating out of this block, which only happens
+            # when Commons returned ``{"error": {...}}`` (no ``success`` field)
+            # — the error code in that body is the missing diagnostic.
             print(f" --- Retry after token refresh failed: {retry_e!r}")
             if "save" in locals():
                 print(save.text)
             print(" --- Error encountered. 3")
+            body_suffix = f": {_truncate(save.text)}" if "save" in locals() else ""
             raise RuntimeError(
-                f"Claims relogin+save failed for {mediaid} ({dpla_id})"
+                f"Claims relogin+save failed for {mediaid} ({dpla_id}){body_suffix}"
             ) from retry_e
 
 
