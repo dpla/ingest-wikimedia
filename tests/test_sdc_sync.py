@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ingest_wikimedia.tracker import Result
+
 
 def _qual_entity(prop, qid):
     """Build a single wikibase-entityid qualifier snak under `prop`."""
@@ -847,3 +849,80 @@ def test_missing_entity_error_is_not_a_runtime_error():
 
     assert issubclass(sdc_sync._MissingEntityError, Exception)
     assert not issubclass(sdc_sync._MissingEntityError, RuntimeError)
+
+
+def test_legacy_process_one_treats_missing_entity_as_clean_skip(monkeypatch):
+    """``process_one()`` is the legacy entry point used by ``--file`` /
+    ``--cat`` / ``--list`` runs (separate from partner mode's
+    ``process_one_from_sdc``). It must apply the same
+    ``_MissingEntityError`` → skip contract — otherwise a Commons
+    ``no-such-entity`` response would abort the legacy run, exactly the
+    cascade the PR's partner-mode handler avoids.
+    """
+    from tools import sdc_sync
+
+    # parsed() returns a real DPLA-shaped tuple so process_one proceeds
+    # past the "missing id" early return.
+    monkeypatch.setattr(
+        sdc_sync,
+        "parsed",
+        lambda dpla_id, dpla_api: (
+            "http://example/url",  # url
+            ["desc"],  # descs
+            ["2020"],  # dates
+            ["title"],  # titles
+            "nara",  # hub
+            ["local-id-1"],  # local_ids
+            "National Archives",  # institution
+            "http://creativecommons.org/publicdomain/mark/1.0/",  # rs
+            ["creator"],  # creators
+            [("subject", None)],  # subjects
+            ["12345"],  # naids
+            "access",  # access
+            "level",  # level
+        ),
+    )
+    monkeypatch.setattr(sdc_sync, "dpla_api", "stub-api-key", raising=False)
+    monkeypatch.setattr(sdc_sync, "invalidate_entity", lambda *_a, **_k: None)
+    monkeypatch.setattr(sdc_sync, "get_entity", lambda *_a, **_k: {})
+    # Skip every add_* helper — they call check() which hits the real
+    # Commons API for entity reads. Replace them with no-ops.
+    for name in [
+        "add_rs",
+        "add_id",
+        "add_title",
+        "add_collection",
+        "add_creator",
+        "add_date",
+        "add_subject",
+        "add_subject_entity",
+        "add_desc",
+        "add_contributed",
+        "add_source",
+        "add_local_id",
+        "add_naid",
+        "add_access",
+        "add_level",
+    ]:
+        monkeypatch.setattr(sdc_sync, name, lambda *_a, **_k: None)
+    # `dpla_claims` calls `_reconcile_existing_claims` — stub it too.
+    monkeypatch.setattr(sdc_sync, "dpla_claims", lambda *_a, **_k: None)
+    # The actual POST helper raises the missing-entity error.
+    monkeypatch.setattr(
+        sdc_sync,
+        "_post_new_refs",
+        lambda *_a, **_k: (_ for _ in ()).throw(sdc_sync._MissingEntityError("M12345")),
+    )
+    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *_a, **_k: None)
+
+    counter_before = sdc_sync.tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+
+    # Should NOT raise — process_one must catch _MissingEntityError and
+    # return cleanly.
+    sdc_sync.process_one("M12345", "abcdef01abcdef01abcdef01abcdef01")
+
+    counter_after = sdc_sync.tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+    assert counter_after == counter_before + 1, (
+        "process_one must increment SDC_ORDINALS_SKIPPED_MISSING_ENTITY on"
+        f" the no-such-entity skip path; before={counter_before}, after={counter_after}"
+    )

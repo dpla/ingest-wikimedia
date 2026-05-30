@@ -2127,26 +2127,39 @@ def process_one(mediaid, dpla_id):
     add_access(mediaid, access, dpla_id)
     add_level(mediaid, level, dpla_id)
 
-    _post_new_refs(mediaid, dpla_id)
-    _post_new_claims(mediaid, dpla_id)
-
-    dpla_claims(
-        mediaid,
-        dpla_id,
-        url,
-        descs,
-        dates,
-        titles,
-        hub,
-        local_ids,
-        institution,
-        rs,
-        creators,
-        subjects,
-        naids,
-        access,
-        level,
-    )
+    # Mirror the partner-mode handler at `_run_partner_mode`: ``no-such-entity``
+    # is a clean skip, not an error — the MediaInfo entity doesn't exist
+    # (file deleted by a Commons curator as a duplicate, or this is a
+    # legacy --file/--cat/--list run for a file we never owned). Without
+    # this guard the same Commons response that the partner path treats
+    # as a skip would crash the legacy entry points.
+    try:
+        _post_new_refs(mediaid, dpla_id)
+        _post_new_claims(mediaid, dpla_id)
+        dpla_claims(
+            mediaid,
+            dpla_id,
+            url,
+            descs,
+            dates,
+            titles,
+            hub,
+            local_ids,
+            institution,
+            rs,
+            creators,
+            subjects,
+            naids,
+            access,
+            level,
+        )
+    except _MissingEntityError:
+        logging.info(
+            f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity does not"
+            " exist; skipping (not an error)."
+        )
+        tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+        return
 
 
 def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
