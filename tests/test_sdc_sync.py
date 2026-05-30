@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ingest_wikimedia.tracker import Result
+
 
 def _qual_entity(prop, qid):
     """Build a single wikibase-entityid qualifier snak under `prop`."""
@@ -734,4 +736,193 @@ def test_post_new_refs_relogin_failure_message_includes_response_body(monkeypatc
     assert "relogin+save failed" in msg
     assert "abusefilter-disallowed" in msg, (
         "Commons error code must appear in the RuntimeError message; got: " + repr(msg)
+    )
+
+
+# --------------------------------------------------------------------------
+# `no-such-entity` is treated as a clean skip, NOT a failure.
+#
+# When Commons returns `{"error": {"code": "no-such-entity"}}`, it means
+# the MediaInfo entity for the staged M-id doesn't exist — most commonly
+# because the file page was deleted by a Commons curator as a duplicate,
+# or because this is an SDC-only run for a file that wasn't uploaded
+# through our pipeline. Neither is the SDC phase's fault, and re-running
+# wouldn't help — the entity isn't coming back via retry. The phase
+# must:
+#   1. NOT divert into the relogin retry path (token isn't the problem)
+#   2. raise a specific `_MissingEntityError` rather than `RuntimeError`
+#   3. propagate that exception to the per-ordinal handler, which logs
+#      it at INFO (not ERROR) and increments a dedicated counter.
+# --------------------------------------------------------------------------
+
+
+def test_raise_if_missing_entity_helper():
+    """Direct unit test of the helper."""
+    from tools import sdc_sync
+
+    # no-such-entity payload → raises _MissingEntityError
+    with pytest.raises(sdc_sync._MissingEntityError):
+        sdc_sync._raise_if_missing_entity(
+            {"error": {"code": "no-such-entity"}}, "M12345"
+        )
+
+    # Other error codes do NOT raise — they fall through to the generic
+    # error path so the existing retry / RuntimeError logic still runs.
+    sdc_sync._raise_if_missing_entity({"error": {"code": "permissiondenied"}}, "M12345")
+    sdc_sync._raise_if_missing_entity({"success": 1}, "M12345")
+    sdc_sync._raise_if_missing_entity({}, "M12345")
+    # Defensive: non-dict input shouldn't blow up.
+    sdc_sync._raise_if_missing_entity(None, "M12345")  # type: ignore[arg-type]
+
+
+def test_post_new_claims_no_such_entity_raises_missing_entity_error(monkeypatch):
+    """Claims POST helper must raise `_MissingEntityError` (not RuntimeError)
+    when Commons returns ``no-such-entity``.
+
+    The relogin retry path must NOT run — `_MissingEntityError` must
+    propagate through the `except (RuntimeError, _MissingEntityError): raise`
+    guard intact, exactly like the structured `RuntimeError` does, so the
+    per-ordinal handler sees the specific exception class.
+    """
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = '{"error": {"code": "no-such-entity", "info": "⧼no-such-entity⧽"}}'
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
+    )
+    # Stub login() so a *bug* that diverted us into the retry path would
+    # still produce diagnosable output (instead of an UnboundLocalError
+    # masking the actual control-flow defect).
+    login_called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "login",
+        lambda: (login_called.append(True), "stub-token-2")[1],
+        raising=False,
+    )
+
+    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
+        sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
+
+    assert "M12345" in str(excinfo.value)
+    # CRITICAL invariant: login() must NOT have been called. The relogin
+    # path is for "maybe our token expired" — which is irrelevant here.
+    assert login_called == [], (
+        "_post_new_claims must skip the relogin retry path on no-such-entity;"
+        " login() should not have been called"
+    )
+
+
+def test_post_new_refs_no_such_entity_raises_missing_entity_error(monkeypatch):
+    """Same contract for the refs POST helper."""
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = '{"error": {"code": "no-such-entity"}}'
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
+    login_called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "login",
+        lambda: (login_called.append(True), "stub-token-2")[1],
+        raising=False,
+    )
+
+    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
+        sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
+
+    assert "M67890" in str(excinfo.value)
+    assert login_called == []
+
+
+def test_missing_entity_error_is_not_a_runtime_error():
+    """The per-ordinal handler distinguishes `_MissingEntityError` from
+    generic `RuntimeError`/`Exception`. The exception class must NOT be
+    a `RuntimeError` subclass or it would be caught by every
+    `except RuntimeError:` guard in the POST helpers, restarting the
+    relogin loop on it.
+    """
+    from tools import sdc_sync
+
+    assert issubclass(sdc_sync._MissingEntityError, Exception)
+    assert not issubclass(sdc_sync._MissingEntityError, RuntimeError)
+
+
+def test_legacy_process_one_treats_missing_entity_as_clean_skip(monkeypatch):
+    """``process_one()`` is the legacy entry point used by ``--file`` /
+    ``--cat`` / ``--list`` runs (separate from partner mode's
+    ``process_one_from_sdc``). It must apply the same
+    ``_MissingEntityError`` → skip contract — otherwise a Commons
+    ``no-such-entity`` response would abort the legacy run, exactly the
+    cascade the PR's partner-mode handler avoids.
+    """
+    from tools import sdc_sync
+
+    # parsed() returns a real DPLA-shaped tuple so process_one proceeds
+    # past the "missing id" early return.
+    monkeypatch.setattr(
+        sdc_sync,
+        "parsed",
+        lambda dpla_id, dpla_api: (
+            "http://example/url",  # url
+            ["desc"],  # descs
+            ["2020"],  # dates
+            ["title"],  # titles
+            "nara",  # hub
+            ["local-id-1"],  # local_ids
+            "National Archives",  # institution
+            "http://creativecommons.org/publicdomain/mark/1.0/",  # rs
+            ["creator"],  # creators
+            [("subject", None)],  # subjects
+            ["12345"],  # naids
+            "access",  # access
+            "level",  # level
+        ),
+    )
+    monkeypatch.setattr(sdc_sync, "dpla_api", "stub-api-key", raising=False)
+    monkeypatch.setattr(sdc_sync, "invalidate_entity", lambda *_a, **_k: None)
+    monkeypatch.setattr(sdc_sync, "get_entity", lambda *_a, **_k: {})
+    # Skip every add_* helper — they call check() which hits the real
+    # Commons API for entity reads. Replace them with no-ops.
+    for name in [
+        "add_rs",
+        "add_id",
+        "add_title",
+        "add_collection",
+        "add_creator",
+        "add_date",
+        "add_subject",
+        "add_subject_entity",
+        "add_desc",
+        "add_contributed",
+        "add_source",
+        "add_local_id",
+        "add_naid",
+        "add_access",
+        "add_level",
+    ]:
+        monkeypatch.setattr(sdc_sync, name, lambda *_a, **_k: None)
+    # `dpla_claims` calls `_reconcile_existing_claims` — stub it too.
+    monkeypatch.setattr(sdc_sync, "dpla_claims", lambda *_a, **_k: None)
+    # The actual POST helper raises the missing-entity error.
+    monkeypatch.setattr(
+        sdc_sync,
+        "_post_new_refs",
+        lambda *_a, **_k: (_ for _ in ()).throw(sdc_sync._MissingEntityError("M12345")),
+    )
+    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *_a, **_k: None)
+
+    counter_before = sdc_sync.tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+
+    # Should NOT raise — process_one must catch _MissingEntityError and
+    # return cleanly.
+    sdc_sync.process_one("M12345", "abcdef01abcdef01abcdef01abcdef01")
+
+    counter_after = sdc_sync.tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+    assert counter_after == counter_before + 1, (
+        "process_one must increment SDC_ORDINALS_SKIPPED_MISSING_ENTITY on"
+        f" the no-such-entity skip path; before={counter_before}, after={counter_after}"
     )
