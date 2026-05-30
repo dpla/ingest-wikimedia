@@ -956,3 +956,89 @@ def test_legacy_process_one_treats_missing_entity_as_clean_skip(monkeypatch):
         "process_one must increment SDC_ORDINALS_SKIPPED_MISSING_ENTITY on"
         f" the no-such-entity skip path; before={counter_before}, after={counter_after}"
     )
+
+
+# --------------------------------------------------------------------------
+# formattedclaim now produces its dict via pywikibot.Claim + Claim.toJSON().
+# The function-boundary contract is unchanged — it still returns a
+# wbeditentity wire-format dict that the add_* callers append directly
+# to claims["claims"] — but the body is now type-safe (pywikibot.Claim
+# validates value/property combinations at build time) and idiomatic
+# (uses pywikibot.WbMonolingualText, pywikibot.WbTime, pywikibot.ItemPage
+# instead of hand-built dicts).
+#
+# The order keys pywikibot's toJSON emits (qualifiers-order, snaks-order)
+# are stripped so the existing inline-qualifier mutation pattern in
+# add_date / add_subject_entity / etc. (claim["qualifiers"][prop] = ...)
+# stays correct without each callsite having to also update the order
+# list.
+# --------------------------------------------------------------------------
+
+
+def test_set_claim_target_dispatches_each_value_type(monkeypatch):
+    """Each of the 4 value_types our 17 add_* helpers use must dispatch
+    to the right ``setTarget`` argument shape.
+
+    Verifies the value-type → pywikibot type translation matches the
+    contract the previous hand-built dict expressed inline:
+
+    - ``wikibase-entityid`` → ``ItemPage(repo, "Q...")``
+    - ``string``            → raw string
+    - ``monolingualtext``   → ``WbMonolingualText(text, language)``
+    """
+    from tools import sdc_sync
+    from unittest.mock import MagicMock
+    import pywikibot
+
+    fake_claim = MagicMock()
+    fake_repo = MagicMock()
+
+    # wikibase-entityid
+    sdc_sync._set_claim_target(
+        fake_claim,
+        fake_repo,
+        {"entity-type": "item", "numeric-id": 19652},
+        "wikibase-entityid",
+    )
+    target = fake_claim.setTarget.call_args.args[0]
+    assert isinstance(target, pywikibot.ItemPage)
+    # Pywikibot stores the QID via getID(); confirm it's the right Q-id.
+    assert target.getID() == "Q19652"
+
+    fake_claim.reset_mock()
+
+    # string
+    sdc_sync._set_claim_target(fake_claim, fake_repo, "abc123", "string")
+    assert fake_claim.setTarget.call_args.args[0] == "abc123"
+
+    fake_claim.reset_mock()
+
+    # monolingualtext
+    sdc_sync._set_claim_target(
+        fake_claim,
+        fake_repo,
+        {"text": "Hello", "language": "en"},
+        "monolingualtext",
+    )
+    target = fake_claim.setTarget.call_args.args[0]
+    assert isinstance(target, pywikibot.WbMonolingualText)
+    assert target.text == "Hello"
+    assert target.language == "en"
+
+
+def test_set_claim_target_rejects_unknown_value_type():
+    """The translator helper must raise on a value_type it doesn't know,
+    so a future caller can't silently produce malformed wire data.
+    ``"time"`` is intentionally rejected here because the only time
+    callsite (``add_date``) passes ``"somevalue"``, which is handled by
+    ``formattedclaim`` before reaching this translator.
+    """
+    from tools import sdc_sync
+    from unittest.mock import MagicMock
+
+    claim = MagicMock()
+    repo = MagicMock()
+    with pytest.raises(ValueError, match="unsupported value_type"):
+        sdc_sync._set_claim_target(claim, repo, "x", "globe-coordinate")
+    with pytest.raises(ValueError, match="unsupported value_type"):
+        sdc_sync._set_claim_target(claim, repo, {}, "time")

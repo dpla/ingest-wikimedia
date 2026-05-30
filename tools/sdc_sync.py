@@ -233,83 +233,93 @@ def _initialize() -> None:
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
 
 
+def _set_claim_target(claim, repo, value, value_type):
+    """Apply ``setTarget`` to ``claim`` using the right pywikibot type
+    for ``value_type``.
+
+    Mirrors the value-type → wire-format mapping the previous
+    hand-built ``formattedclaim`` dict expressed inline. Only the four
+    types our 17 add_* helpers actually use are handled — anything else
+    raises so a new caller can't silently miss a translation.
+    """
+    if value_type == "wikibase-entityid":
+        qid = f"Q{value['numeric-id']}"
+        claim.setTarget(pywikibot.ItemPage(repo, qid))
+    elif value_type == "string":
+        claim.setTarget(value)
+    elif value_type == "monolingualtext":
+        claim.setTarget(
+            pywikibot.WbMonolingualText(text=value["text"], language=value["language"])
+        )
+    else:
+        # The only ``"time"`` callsite (``add_date``) passes ``"somevalue"``
+        # as the value, which is handled by the caller before we get here.
+        # If a future helper passes a real time value, add the case.
+        raise ValueError(f"formattedclaim: unsupported value_type {value_type!r}")
+
+
 def formattedclaim(prop, value, value_type, dpla_id):
-    claim = {
-        "mainsnak": {
-            "snaktype": "value",
-            "property": prop,
-            "datavalue": {"value": value, "type": value_type},
-        },
-        "type": "statement",
-        "rank": "normal",
-        "qualifiers": {
-            "P459": [
-                {
-                    "snaktype": "value",
-                    "property": "P459",
-                    "datavalue": {
-                        "value": {"entity-type": "item", "numeric-id": 61848113},
-                        "type": "wikibase-entityid",
-                    },
-                    "datatype": "wikibase-item",
-                }
-            ]
-        },
-        "references": [
-            {
-                "snaks": {
-                    "P854": [
-                        {
-                            "snaktype": "value",
-                            "property": "P854",
-                            "datavalue": {
-                                "value": f"https://dp.la/item/{dpla_id}",
-                                "type": "string",
-                            },
-                        }
-                    ],
-                    "P123": [
-                        {
-                            "snaktype": "value",
-                            "property": "P123",
-                            "datavalue": {
-                                "value": {
-                                    "entity-type": "item",
-                                    "numeric-id": 2944483,
-                                },
-                                "type": "wikibase-entityid",
-                            },
-                        }
-                    ],
-                    "P813": [
-                        {
-                            "snaktype": "value",
-                            "property": "P813",
-                            "datavalue": {
-                                "value": {
-                                    "time": "+"
-                                    + str(datetime.date.today())
-                                    + "T00:00:00Z",
-                                    "timezone": 0,
-                                    "before": 0,
-                                    "after": 0,
-                                    "precision": 11,
-                                    "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
-                                },
-                                "type": "time",
-                            },
-                        }
-                    ],
-                }
-            }
-        ],
-    }
+    """Build a DPLA-authored SDC statement, returned as a wbeditentity
+    wire-format dict.
+
+    Constructed via ``pywikibot.Claim`` for type safety (the right
+    pywikibot value class is matched to the property's expected data
+    type at build time, not at POST time) and then serialised via
+    ``Claim.toJSON()`` so the result still plugs straight into the bulk
+    ``claims["claims"]`` accumulator that ``_post_new_claims`` submits.
+
+    Every statement carries the standard DPLA qualifier (P459=Q61848113,
+    determination method = "inferred from heuristic") and the 3-snak
+    DPLA reference (P854 source URL, P123 publisher=DPLA, P813 retrieved
+    date). The ``"somevalue"`` special case sets the mainsnak's
+    ``snaktype`` to ``"somevalue"`` and omits the datavalue — used for
+    claims where DPLA records that a value exists but doesn't know what
+    it is (e.g. ``add_date`` with a missing date).
+    """
+    repo = site.data_repository()
+    claim = pywikibot.Claim(site, prop)
 
     if value == "somevalue":
-        claim["mainsnak"].pop("datavalue")
-        claim["mainsnak"]["snaktype"] = "somevalue"
+        claim.setSnakType("somevalue")
+    else:
+        _set_claim_target(claim, repo, value, value_type)
 
-    return claim
+    # P459 = Q61848113 (determination method = inferred from heuristic).
+    # This is DPLA's universal "we set this" marker — `check()` and
+    # `_is_safe_to_amend_in_place` both depend on it to recognise
+    # DPLA-authored claims on read-back.
+    qualifier = pywikibot.Claim(site, "P459", is_qualifier=True)
+    qualifier.setTarget(pywikibot.ItemPage(repo, "Q61848113"))
+    claim.addQualifier(qualifier)
+
+    # Standard DPLA reference: P854 source URL + P123 publisher + P813
+    # retrieved date. ``_is_dpla_reference`` keys on the P123 publisher
+    # snak to recognise this reference shape on read-back.
+    ref_url = pywikibot.Claim(site, "P854", is_reference=True)
+    ref_url.setTarget(f"https://dp.la/item/{dpla_id}")
+    ref_publisher = pywikibot.Claim(site, "P123", is_reference=True)
+    ref_publisher.setTarget(pywikibot.ItemPage(repo, "Q2944483"))
+    today = datetime.date.today()
+    ref_retrieved = pywikibot.Claim(site, "P813", is_reference=True)
+    ref_retrieved.setTarget(
+        pywikibot.WbTime(year=today.year, month=today.month, day=today.day)
+    )
+    claim.addSources([ref_url, ref_publisher, ref_retrieved])
+
+    serialized = claim.toJSON()
+    # Strip the ``qualifiers-order`` and per-reference ``snaks-order``
+    # keys ``Claim.toJSON()`` produces. Several add_* helpers append
+    # extra inline qualifiers by mutating the returned dict
+    # (``claim["qualifiers"][P1932] = [...]`` etc.), which would leave
+    # the order keys out of sync with the actual qualifier set.
+    # Wikibase accepts dicts without order keys (the previous hand-built
+    # ``formattedclaim`` never produced them) and falls back to the
+    # natural dict iteration order, so stripping them is the
+    # lowest-risk way to keep the existing mutation pattern correct.
+    serialized.pop("qualifiers-order", None)
+    for ref in serialized.get("references", []):
+        ref.pop("snaks-order", None)
+    return serialized
 
 
 # Adds a missing qualifier to an existing claim via ``wbsetqualifier``.
