@@ -998,26 +998,20 @@ def test_set_claim_target_dispatches_each_value_type(monkeypatch):
     fake_claim = MagicMock()
     fake_repo = MagicMock()
 
-    # wikibase-entityid — mock ItemPage so the real constructor doesn't
-    # try to validate the MagicMock repo.
-    item_page_stub = MagicMock(
-        side_effect=lambda repo, qid: ("stub-ItemPage", repo, qid)
-    )
-    monkeypatch.setattr(pywikibot, "ItemPage", item_page_stub)
-
-    sdc_sync._set_claim_target(
-        fake_claim,
-        fake_repo,
-        {"entity-type": "item", "numeric-id": 19652},
-        "wikibase-entityid",
-    )
-    item_page_stub.assert_called_once_with(fake_repo, "Q19652")
-    # setTarget receives the stubbed ItemPage return value verbatim.
-    assert fake_claim.setTarget.call_args.args[0] == (
-        "stub-ItemPage",
-        fake_repo,
-        "Q19652",
-    )
+    # wikibase-entityid — patch ItemPage so the real constructor doesn't
+    # try to validate the MagicMock repo. ``patch.object`` gives us a
+    # default ``MagicMock`` whose ``return_value`` we identity-check
+    # against the value ``setTarget`` receives — more conventional than
+    # a ``side_effect`` lambda returning a sentinel tuple.
+    with patch.object(pywikibot, "ItemPage") as mock_item_page:
+        sdc_sync._set_claim_target(
+            fake_claim,
+            fake_repo,
+            {"entity-type": "item", "numeric-id": 19652},
+            "wikibase-entityid",
+        )
+    mock_item_page.assert_called_once_with(fake_repo, "Q19652")
+    assert fake_claim.setTarget.call_args.args[0] is mock_item_page.return_value
 
     fake_claim.reset_mock()
 
