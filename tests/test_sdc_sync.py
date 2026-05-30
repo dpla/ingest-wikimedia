@@ -985,6 +985,11 @@ def test_set_claim_target_dispatches_each_value_type(monkeypatch):
     - ``wikibase-entityid`` → ``ItemPage(repo, "Q...")``
     - ``string``            → raw string
     - ``monolingualtext``   → ``WbMonolingualText(text, language)``
+
+    ``pywikibot.ItemPage`` validates that its ``site`` arg is a real
+    ``DataSite`` (raises ``TypeError`` on a ``MagicMock``), so it's
+    monkeypatched here to a stub that returns a labelled sentinel —
+    the assertion is on the dispatch, not on ``ItemPage`` internals.
     """
     from tools import sdc_sync
     from unittest.mock import MagicMock
@@ -993,27 +998,37 @@ def test_set_claim_target_dispatches_each_value_type(monkeypatch):
     fake_claim = MagicMock()
     fake_repo = MagicMock()
 
-    # wikibase-entityid
+    # wikibase-entityid — mock ItemPage so the real constructor doesn't
+    # try to validate the MagicMock repo.
+    item_page_stub = MagicMock(
+        side_effect=lambda repo, qid: ("stub-ItemPage", repo, qid)
+    )
+    monkeypatch.setattr(pywikibot, "ItemPage", item_page_stub)
+
     sdc_sync._set_claim_target(
         fake_claim,
         fake_repo,
         {"entity-type": "item", "numeric-id": 19652},
         "wikibase-entityid",
     )
-    target = fake_claim.setTarget.call_args.args[0]
-    assert isinstance(target, pywikibot.ItemPage)
-    # Pywikibot stores the QID via getID(); confirm it's the right Q-id.
-    assert target.getID() == "Q19652"
+    item_page_stub.assert_called_once_with(fake_repo, "Q19652")
+    # setTarget receives the stubbed ItemPage return value verbatim.
+    assert fake_claim.setTarget.call_args.args[0] == (
+        "stub-ItemPage",
+        fake_repo,
+        "Q19652",
+    )
 
     fake_claim.reset_mock()
 
-    # string
+    # string — no pywikibot wrapping; raw string passed straight through.
     sdc_sync._set_claim_target(fake_claim, fake_repo, "abc123", "string")
     assert fake_claim.setTarget.call_args.args[0] == "abc123"
 
     fake_claim.reset_mock()
 
-    # monolingualtext
+    # monolingualtext — WbMonolingualText is a plain data class with no
+    # site validation, so it doesn't need monkeypatching.
     sdc_sync._set_claim_target(
         fake_claim,
         fake_repo,
