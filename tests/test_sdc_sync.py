@@ -735,3 +735,115 @@ def test_post_new_refs_relogin_failure_message_includes_response_body(monkeypatc
     assert "abusefilter-disallowed" in msg, (
         "Commons error code must appear in the RuntimeError message; got: " + repr(msg)
     )
+
+
+# --------------------------------------------------------------------------
+# `no-such-entity` is treated as a clean skip, NOT a failure.
+#
+# When Commons returns `{"error": {"code": "no-such-entity"}}`, it means
+# the MediaInfo entity for the staged M-id doesn't exist — most commonly
+# because the file page was deleted by a Commons curator as a duplicate,
+# or because this is an SDC-only run for a file that wasn't uploaded
+# through our pipeline. Neither is the SDC phase's fault, and re-running
+# wouldn't help — the entity isn't coming back via retry. The phase
+# must:
+#   1. NOT divert into the relogin retry path (token isn't the problem)
+#   2. raise a specific `_MissingEntityError` rather than `RuntimeError`
+#   3. propagate that exception to the per-ordinal handler, which logs
+#      it at INFO (not ERROR) and increments a dedicated counter.
+# --------------------------------------------------------------------------
+
+
+def test_raise_if_missing_entity_helper():
+    """Direct unit test of the helper."""
+    from tools import sdc_sync
+
+    # no-such-entity payload → raises _MissingEntityError
+    with pytest.raises(sdc_sync._MissingEntityError):
+        sdc_sync._raise_if_missing_entity(
+            {"error": {"code": "no-such-entity"}}, "M12345"
+        )
+
+    # Other error codes do NOT raise — they fall through to the generic
+    # error path so the existing retry / RuntimeError logic still runs.
+    sdc_sync._raise_if_missing_entity({"error": {"code": "permissiondenied"}}, "M12345")
+    sdc_sync._raise_if_missing_entity({"success": 1}, "M12345")
+    sdc_sync._raise_if_missing_entity({}, "M12345")
+    # Defensive: non-dict input shouldn't blow up.
+    sdc_sync._raise_if_missing_entity(None, "M12345")  # type: ignore[arg-type]
+
+
+def test_post_new_claims_no_such_entity_raises_missing_entity_error(monkeypatch):
+    """Claims POST helper must raise `_MissingEntityError` (not RuntimeError)
+    when Commons returns ``no-such-entity``.
+
+    The relogin retry path must NOT run — `_MissingEntityError` must
+    propagate through the `except (RuntimeError, _MissingEntityError): raise`
+    guard intact, exactly like the structured `RuntimeError` does, so the
+    per-ordinal handler sees the specific exception class.
+    """
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = '{"error": {"code": "no-such-entity", "info": "⧼no-such-entity⧽"}}'
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
+    )
+    # Stub login() so a *bug* that diverted us into the retry path would
+    # still produce diagnosable output (instead of an UnboundLocalError
+    # masking the actual control-flow defect).
+    login_called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "login",
+        lambda: (login_called.append(True), "stub-token-2")[1],
+        raising=False,
+    )
+
+    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
+        sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
+
+    assert "M12345" in str(excinfo.value)
+    # CRITICAL invariant: login() must NOT have been called. The relogin
+    # path is for "maybe our token expired" — which is irrelevant here.
+    assert login_called == [], (
+        "_post_new_claims must skip the relogin retry path on no-such-entity;"
+        " login() should not have been called"
+    )
+
+
+def test_post_new_refs_no_such_entity_raises_missing_entity_error(monkeypatch):
+    """Same contract for the refs POST helper."""
+    from tools import sdc_sync
+
+    response = MagicMock()
+    response.text = '{"error": {"code": "no-such-entity"}}'
+    _install_module_globals(
+        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+    )
+    login_called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "login",
+        lambda: (login_called.append(True), "stub-token-2")[1],
+        raising=False,
+    )
+
+    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
+        sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
+
+    assert "M67890" in str(excinfo.value)
+    assert login_called == []
+
+
+def test_missing_entity_error_is_not_a_runtime_error():
+    """The per-ordinal handler distinguishes `_MissingEntityError` from
+    generic `RuntimeError`/`Exception`. The exception class must NOT be
+    a `RuntimeError` subclass or it would be caught by every
+    `except RuntimeError:` guard in the POST helpers, restarting the
+    relogin loop on it.
+    """
+    from tools import sdc_sync
+
+    assert issubclass(sdc_sync._MissingEntityError, Exception)
+    assert not issubclass(sdc_sync._MissingEntityError, RuntimeError)

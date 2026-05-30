@@ -28,6 +28,15 @@ class Result(Enum):
     # whole partner batch — the matching try/except is in
     # tools/sdc_sync.py::_run_partner_mode.
     SDC_ORDINALS_SKIPPED_ERROR = auto()
+    # Ordinals where Commons returned `no-such-entity` for the staged
+    # M-id — the file page has been deleted (often as a duplicate by a
+    # human curator) or was never uploaded in this run path. Not a
+    # failure of the SDC phase — the SDC phase only writes to existing
+    # MediaInfo entities; ensuring the entity exists is the upload
+    # phase's responsibility. Tracked separately so genuine errors
+    # (claim rejection, throttle, etc.) stay distinguishable from
+    # not-our-problem skips.
+    SDC_ORDINALS_SKIPPED_MISSING_ENTITY = auto()
     # Items where every eligible ordinal hit the per-ordinal exception
     # path — i.e., the item didn't fail due to malformed data
     # (MAPPING) or missing sidecars (NO_SIDECAR), but because all of

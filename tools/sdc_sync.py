@@ -117,6 +117,45 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+class _MissingEntityError(Exception):
+    """Commons returned ``no-such-entity`` for the staged M-id.
+
+    Raised by the wbeditentity / wbremoveclaims POST helpers when Commons
+    reports the MediaInfo entity doesn't exist. This is not a failure of
+    the SDC phase — it just means the file page is gone (most commonly
+    because a Commons curator deleted it as a duplicate, or because this
+    is an SDC-only run for an M-id whose upload was never confirmed). The
+    per-ordinal handler in ``_run_partner_mode`` catches this distinctly
+    from generic ``Exception`` so it can:
+
+    - log at INFO instead of ERROR (it isn't an error to log against),
+    - increment ``SDC_ORDINALS_SKIPPED_MISSING_ENTITY`` instead of
+      ``SDC_ORDINALS_SKIPPED_ERROR``,
+    - leave ``had_ordinal_error`` unchanged so the item's bucket
+      classification (SYNCED / SKIPPED_ERROR / SKIPPED_MAPPING) is
+      decided by the other ordinals' outcomes, not by these skips.
+
+    Re-uploading the file or re-resolving the M-id is upstream work
+    (upload phase, drift handling) — not something this phase can or
+    should try to fix.
+    """
+
+
+def _raise_if_missing_entity(post: dict, mediaid: str) -> None:
+    """Inspect a parsed wbeditentity / wbremoveclaims response and raise
+    ``_MissingEntityError`` if Commons reported ``no-such-entity``.
+
+    Must be called BEFORE accessing ``post["success"]`` — a response with
+    no ``success`` key (the shape of every Commons error response) would
+    otherwise raise ``KeyError`` and divert into the generic retry path,
+    masking the specific cause from the per-ordinal handler.
+    """
+    if isinstance(post, dict):
+        err = post.get("error") or {}
+        if err.get("code") == "no-such-entity":
+            raise _MissingEntityError(mediaid)
+
+
 def _truncate(text: str | None, limit: int = 500) -> str:
     """Return ``text`` shortened to ``limit`` chars with an ellipsis suffix.
 
@@ -1294,6 +1333,7 @@ def _post_new_refs(mediaid, dpla_id):
                 ) from final_e
     try:
         post = json.loads(save.text)
+        _raise_if_missing_entity(post, mediaid)
         if post["success"] == 1:
             print(" --- Saved new refs!")
             tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
@@ -1304,9 +1344,11 @@ def _post_new_refs(mediaid, dpla_id):
                 f"wbeditentity refs save returned non-success for"
                 f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
             )
-    except RuntimeError:
+    except (RuntimeError, _MissingEntityError):
         # Our own structured failure — let the per-ordinal handler see it
         # as-is rather than restarting the relogin path below.
+        # ``_MissingEntityError`` in particular must skip the relogin: the
+        # entity isn't coming back via a fresh token.
         raise
     except Exception:
         try:
@@ -1318,6 +1360,7 @@ def _post_new_refs(mediaid, dpla_id):
                 data=postrefs,
             )
             post = json.loads(save.text)
+            _raise_if_missing_entity(post, mediaid)
             if post["success"] == 1:
                 print(" --- Saved new refs!")
                 tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
@@ -1328,7 +1371,7 @@ def _post_new_refs(mediaid, dpla_id):
                 f"wbeditentity refs save still non-success after relogin for"
                 f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
             )
-        except RuntimeError:
+        except (RuntimeError, _MissingEntityError):
             raise
         except Exception as retry_e:
             # `save` may not be bound if http.fetch raised before the response
@@ -1392,6 +1435,7 @@ def _post_new_claims(mediaid, dpla_id):
                 ) from final_e
     try:
         post = json.loads(save.text)
+        _raise_if_missing_entity(post, mediaid)
         if post["success"] == 1:
             print(" --- Saved new claims!")
             tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
@@ -1402,7 +1446,7 @@ def _post_new_claims(mediaid, dpla_id):
                 f"wbeditentity claims save returned non-success for"
                 f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
             )
-    except RuntimeError:
+    except (RuntimeError, _MissingEntityError):
         raise
     except Exception:
         try:
@@ -1414,6 +1458,7 @@ def _post_new_claims(mediaid, dpla_id):
                 data=postdata,
             )
             post = json.loads(save.text)
+            _raise_if_missing_entity(post, mediaid)
             if post["success"] == 1:
                 print(" --- Saved new claims!")
                 tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
@@ -1424,7 +1469,7 @@ def _post_new_claims(mediaid, dpla_id):
                 f"wbeditentity claims save still non-success after relogin for"
                 f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
             )
-        except RuntimeError:
+        except (RuntimeError, _MissingEntityError):
             raise
         except Exception as retry_e:
             # `post` may not be assigned yet if http.fetch / json.loads raised —
@@ -1712,6 +1757,7 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
                 f"wbremoveclaims response was not parseable JSON for"
                 f" {mediaid} ({dpla_id}): {_truncate(getattr(rm_resp, 'text', ''))}"
             ) from parse_e
+        _raise_if_missing_entity(rm_post, mediaid)
         if rm_post.get("success") == 1:
             print(" --- Saved removals!")
             tracker.increment(Result.SDC_REMOVALS, len(removals))
@@ -2355,6 +2401,22 @@ def _run_partner_mode(partner, ids_file):
                 # `_summarize_log` can surface it in Slack.
                 try:
                     process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                except _MissingEntityError:
+                    # Commons says the MediaInfo entity at this M-id doesn't
+                    # exist. Almost always means the file page was deleted
+                    # (often by a Commons curator as a duplicate) between
+                    # upload and SDC sync, OR this is an SDC-only run for a
+                    # file that wasn't uploaded through our pipeline in this
+                    # run. Either way it's outside the SDC phase's remit —
+                    # not an error, just a clean skip. Tracked separately
+                    # from real errors so operators can tell them apart.
+                    logging.info(
+                        f" -- Ordinal {ord_str} ({mediaid}) for {dpla_id}:"
+                        " Commons MediaInfo entity does not exist; skipping"
+                        " ordinal (not an error)."
+                    )
+                    tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+                    continue
                 except Exception:
                     logging.exception(
                         f" -- Ordinal {ord_str} ({mediaid}) for {dpla_id}:"
