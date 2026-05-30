@@ -14,7 +14,6 @@ import time
 import tomllib
 import urllib.parse
 from bs4 import BeautifulSoup
-from pywikibot.comms import http
 from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
@@ -39,7 +38,6 @@ site: pywikibot.site.BaseSite
 hubs: dict
 rights: dict
 subject_ids: dict
-token: str
 _s3_partner: str | None = None
 _s3_client = None
 
@@ -120,13 +118,16 @@ def _build_parser() -> argparse.ArgumentParser:
 class _MissingEntityError(Exception):
     """Commons returned ``no-such-entity`` for the staged M-id.
 
-    Raised by the wbeditentity / wbremoveclaims POST helpers when Commons
-    reports the MediaInfo entity doesn't exist. This is not a failure of
-    the SDC phase — it just means the file page is gone (most commonly
-    because a Commons curator deleted it as a duplicate, or because this
-    is an SDC-only run for an M-id whose upload was never confirmed). The
-    per-ordinal handler in ``_run_partner_mode`` catches this distinctly
-    from generic ``Exception`` so it can:
+    Raised by the wbeditentity / wbremoveclaims POST helpers when
+    pywikibot's ``simple_request`` translates Commons'
+    ``{"error": {"code": "no-such-entity", ...}}`` response into an
+    ``APIError`` with ``code == "no-such-entity"``; the helpers
+    re-raise it as this dedicated class. This is not a failure of the
+    SDC phase — it just means the file page is gone (most commonly
+    because a Commons curator deleted it as a duplicate, or because
+    this is an SDC-only run for an M-id whose upload was never
+    confirmed). The per-ordinal handler in ``_run_partner_mode``
+    catches this distinctly from generic ``Exception`` so it can:
 
     - log at INFO instead of ERROR (it isn't an error to log against),
     - increment ``SDC_ORDINALS_SKIPPED_MISSING_ENTITY`` instead of
@@ -139,21 +140,6 @@ class _MissingEntityError(Exception):
     (upload phase, drift handling) — not something this phase can or
     should try to fix.
     """
-
-
-def _raise_if_missing_entity(post: dict, mediaid: str) -> None:
-    """Inspect a parsed wbeditentity / wbremoveclaims response and raise
-    ``_MissingEntityError`` if Commons reported ``no-such-entity``.
-
-    Must be called BEFORE accessing ``post["success"]`` — a response with
-    no ``success`` key (the shape of every Commons error response) would
-    otherwise raise ``KeyError`` and divert into the generic retry path,
-    masking the specific cause from the per-ordinal handler.
-    """
-    if isinstance(post, dict):
-        err = post.get("error") or {}
-        if err.get("code") == "no-such-entity":
-            raise _MissingEntityError(mediaid)
 
 
 def _truncate(text: str | None, limit: int = 500) -> str:
@@ -198,7 +184,7 @@ def _initialize() -> None:
     time. Kept out of import-time so `import tools.sdc_sync` (e.g. by the
     console-script entry point) does no I/O.
     """
-    global parser, args, method, dpla_api, site, hubs, rights, subject_ids, token
+    global parser, args, method, dpla_api, site, hubs, rights, subject_ids
     global _s3_partner, _s3_client
 
     parser = _build_parser()
@@ -211,11 +197,11 @@ def _initialize() -> None:
 
     site = pywikibot.Site()
     site.login()
-    # Fetch the wbeditentity CSRF token here so importing the module
-    # remains side-effect free — the helper post functions (_post_new_refs,
-    # _post_new_claims) read `token` at call time and refresh it
-    # themselves via `login()` on save failure.
-    token = login()
+    # CSRF tokens are managed by pywikibot's ``site.tokens["csrf"]`` —
+    # lazy-loaded on first read, refreshed automatically on ``badtoken``
+    # responses. No manual token fetch or relogin loops here; the
+    # ``_wbeditentity_via_pywikibot``, ``postqual``, and removals helpers
+    # all pull from the same auto-managed source at write time.
 
     # Hubs and subject mappings are fetched live from ingestion3 on every run,
     # by design: this sync exists precisely to propagate upstream changes to
@@ -326,53 +312,46 @@ def formattedclaim(prop, value, value_type, dpla_id):
     return claim
 
 
-# This is the function that will perform the POST to the Wikimedia Commons API, when passed all necessary parameters, to add a qualifier if it is missing for an existing claim. Currently, this is only used for P459. It creates a JSON object to send in the body of the request with the data to post and the login token.
+# Adds a missing qualifier to an existing claim via ``wbsetqualifier``.
+# Currently only used for P459 (determination method). The POST is
+# submitted through pywikibot's ``site.simple_request``, which manages
+# the CSRF token and retries on transient errors automatically.
 
 
 def postqual(claimid, prop, value):
-    global token
+    """Add a qualifier to an existing claim via ``wbsetqualifier``.
+
+    Routed through ``site.simple_request`` so pywikibot handles CSRF token
+    refresh, ``maxlag`` / ``Retry-After`` honoring, exponential backoff on
+    transient errors, and auto-relogin on ``badtoken`` — all automatically.
+    Replaces a hand-rolled refresh-token-and-retry-once pattern that didn't
+    cover ``maxlag`` or rate-limit signaling.
+
+    Best-effort: a final failure logs and continues; the partner is not
+    aborted for a missing qualifier amendment.
+    """
     summary = f"Adding [[:d:Property:{prop}]] to {claimid}."
-
-    postdata = {
-        "action": "wbsetqualifier",
-        "format": "json",
-        "claim": claimid,
-        "property": prop,
-        "snaktype": "value",
-        "value": value,
-        "token": token,
-        "bot": True,
-    }
-
     try:
-        json.loads(
-            http.fetch(
-                "https://commons.wikimedia.org/w/api.php", method="POST", data=postdata
-            ).text
-        )
+        site.simple_request(
+            action="wbsetqualifier",
+            claim=claimid,
+            property=prop,
+            snaktype="value",
+            value=value,
+            bot=True,
+            summary=summary,
+            token=site.tokens["csrf"],
+        ).submit()
         pywikibot.output(summary)
-
-    except Exception as e:
-        # Refresh the global token and retry once. The previous version only
-        # refreshed pywikibot's internal cache and didn't update the module
-        # `token` (used in postdata above) nor retry the POST, so qualifiers
-        # were silently dropped on any transient CSRF failure. Mirror the
-        # token-refresh pattern used by process_one().
-        print(repr(e))
-        print(" -- Refreshing CSRF token after API error and retrying...")
-        token = login()
-        postdata["token"] = token
-        try:
-            json.loads(
-                http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postdata,
-                ).text
-            )
-            pywikibot.output(summary)
-        except Exception as retry_e:
-            print(f" -- Retry after token refresh failed: {repr(retry_e)}")
+    except pywikibot.exceptions.APIError as e:
+        # Log and continue — qualifier amends are best-effort, and pywikibot
+        # has already exhausted its built-in retry policy by the time an
+        # APIError surfaces here. Surface the Commons error code so it's
+        # diagnosable from the log without needing to enable verbose tracing.
+        print(
+            f" -- Failed to amend qualifier {prop} for {claimid}:"
+            f" {e.code} — {getattr(e, 'info', '')}"
+        )
 
 
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
@@ -1287,211 +1266,98 @@ def _build_expected_from_sdc(sdc_payload):
     return expected
 
 
-def _post_new_refs(mediaid, dpla_id):
-    """POST the accumulated `refclaims["claims"]` to wbeditentity.
+def _submit_sdc_write(action, mediaid, dpla_id, **params):
+    """Submit an SDC write (wbeditentity or wbremoveclaims) through
+    pywikibot's ``simple_request``.
 
-    Reads the module-global `refclaims` (populated by `add_ref` during the
-    per-claim check loop). No-op when nothing to post. Refreshes the
-    module-global `token` and retries once on save error.
+    Shared by the three write paths (``_post_new_refs``,
+    ``_post_new_claims``, removals in ``_reconcile_existing_claims``)
+    so they all get pywikibot's built-in behaviours for free:
+
+    - automatic CSRF token management (``site.tokens["csrf"]``);
+    - ``maxlag`` honoring (sleep ``lag + 1``, retry; default
+      ``Site.maxlag`` is 5s);
+    - ``Retry-After`` header honoring on 429/503;
+    - exponential backoff on ``internal_api_error_*`` / ``srvtimeout``;
+    - auto-relogin on ``badtoken``;
+    - structured ``APIError(code=..., info=...)`` instead of JSON
+      response inspection.
+
+    Raises :class:`_MissingEntityError` when Commons returns
+    ``no-such-entity`` (the entity doesn't exist; not the SDC phase's
+    problem — see PR #267). Other ``APIError`` codes propagate as a
+    ``RuntimeError`` carrying the code + info, which the per-ordinal
+    handler catches and treats as an ``SDC_ORDINALS_SKIPPED_ERROR``.
+
+    ``params`` is the per-action payload — for wbeditentity, the
+    serialized ``data``; for wbremoveclaims, the pipe-joined ``claim``
+    string. ``bot=True``, the CSRF token, and ``id=mediaid`` are
+    injected here so call sites stay focused on the action-specific
+    differences.
     """
-    global token
+    try:
+        site.simple_request(
+            action=action,
+            id=mediaid,
+            bot=True,
+            token=site.tokens["csrf"],
+            **params,
+        ).submit()
+    except pywikibot.exceptions.APIError as e:
+        if e.code == "no-such-entity":
+            raise _MissingEntityError(mediaid) from e
+        raise RuntimeError(
+            f"{action} failed for {mediaid} ({dpla_id}):"
+            f" {e.code} — {_truncate(getattr(e, 'info', ''))}"
+        ) from e
+
+
+def _post_new_refs(mediaid, dpla_id):
+    """POST the accumulated ``refclaims["claims"]`` to ``wbeditentity``.
+
+    Reads the module-global ``refclaims`` (populated by ``add_ref`` during
+    the per-claim check loop). No-op when nothing to post.
+    """
     if not refclaims["claims"]:
         return
     refs_to_post = len(refclaims["claims"])
-    postrefs = {
-        "action": "wbeditentity",
-        "format": "json",
-        "id": mediaid,
-        "data": json.dumps(refclaims),
-        "token": token,
-        "bot": True,
-        "summary": f"Added structured data references from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-    }
-    try:
-        save = http.fetch(
-            "https://commons.wikimedia.org/w/api.php", method="POST", data=postrefs
-        )
-    except (requests.exceptions.ConnectionError, ConnectionError):
-        try:
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postrefs,
-            )
-        except (requests.exceptions.ConnectionError, ConnectionError):
-            try:
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postrefs,
-                )
-            except (requests.exceptions.ConnectionError, ConnectionError) as final_e:
-                print(" --- Network error posting new refs: all retries failed.")
-                raise RuntimeError(
-                    f"Network error posting new refs for {mediaid} ({dpla_id}):"
-                    " all 3 ConnectionError retries failed"
-                ) from final_e
-    try:
-        post = json.loads(save.text)
-        _raise_if_missing_entity(post, mediaid)
-        if post["success"] == 1:
-            print(" --- Saved new refs!")
-            tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
-        else:
-            print(post)
-            print(" --- Error encountered on save.")
-            raise RuntimeError(
-                f"wbeditentity refs save returned non-success for"
-                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
-            )
-    except (RuntimeError, _MissingEntityError):
-        # Our own structured failure — let the per-ordinal handler see it
-        # as-is rather than restarting the relogin path below.
-        # ``_MissingEntityError`` in particular must skip the relogin: the
-        # entity isn't coming back via a fresh token.
-        raise
-    except Exception:
-        try:
-            token = login()
-            postrefs["token"] = token
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postrefs,
-            )
-            post = json.loads(save.text)
-            _raise_if_missing_entity(post, mediaid)
-            if post["success"] == 1:
-                print(" --- Saved new refs!")
-                tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
-                return
-            print(post)
-            print(" --- Error encountered on save.")
-            raise RuntimeError(
-                f"wbeditentity refs save still non-success after relogin for"
-                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
-            )
-        except (RuntimeError, _MissingEntityError):
-            raise
-        except Exception as retry_e:
-            # `save` may not be bound if http.fetch raised before the response
-            # landed — guard with ``locals()`` so we don't mask the real cause
-            # with an UnboundLocalError. When ``save`` IS bound, the response
-            # body is the diagnostic we actually want (e.g. a Commons error
-            # like ``{"error": {"code": "permissiondenied", ...}}`` will raise
-            # KeyError on ``post["success"]`` above, but the response body
-            # itself names the cause).
-            print(f" --- Error encountered. 2: {retry_e!r}")
-            body_suffix = f": {_truncate(save.text)}" if "save" in locals() else ""
-            raise RuntimeError(
-                f"Refs relogin+save failed for {mediaid} ({dpla_id}){body_suffix}"
-            ) from retry_e
+    _submit_sdc_write(
+        "wbeditentity",
+        mediaid,
+        dpla_id,
+        data=json.dumps(refclaims),
+        summary=(
+            f"Added structured data references from [[COM:DPLA|DPLA]] item"
+            f" '[[dpla:{dpla_id}|{dpla_id}]]'."
+            f" [[COM:DPLA/MOD|Leave feedback]]!"
+        ),
+    )
+    print(" --- Saved new refs!")
+    tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
 
 
 def _post_new_claims(mediaid, dpla_id):
-    """POST the accumulated `claims["claims"]` to wbeditentity.
+    """POST the accumulated ``claims["claims"]`` to ``wbeditentity``.
 
-    Reads the module-global `claims` (populated by add_* helpers during the
-    per-claim check loop). No-op when nothing to post. Retries the initial
-    fetch up to three times on ConnectionError; refreshes the module-global
-    `token` and retries the whole save once on parse / save error.
+    Reads the module-global ``claims`` (populated by add_* helpers during
+    the per-claim check loop). No-op when nothing to post.
     """
-    global token
     if not claims["claims"]:
         return
     claims_to_post = len(claims["claims"])
-    postdata = {
-        "action": "wbeditentity",
-        "format": "json",
-        "id": mediaid,
-        "data": json.dumps(claims),
-        "token": token,
-        "bot": True,
-        "summary": f"Added structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-    }
-    try:
-        save = http.fetch(
-            "https://commons.wikimedia.org/w/api.php", method="POST", data=postdata
-        )
-    except (requests.exceptions.ConnectionError, ConnectionError):
-        try:
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postdata,
-            )
-        except (requests.exceptions.ConnectionError, ConnectionError):
-            try:
-                save = http.fetch(
-                    "https://commons.wikimedia.org/w/api.php",
-                    method="POST",
-                    data=postdata,
-                )
-            except (requests.exceptions.ConnectionError, ConnectionError) as final_e:
-                print(" --- Network error posting new claims: all retries failed.")
-                raise RuntimeError(
-                    f"Network error posting new claims for {mediaid} ({dpla_id}):"
-                    " all 3 ConnectionError retries failed"
-                ) from final_e
-    try:
-        post = json.loads(save.text)
-        _raise_if_missing_entity(post, mediaid)
-        if post["success"] == 1:
-            print(" --- Saved new claims!")
-            tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
-        else:
-            print(post)
-            print(" --- Error encountered on save.")
-            raise RuntimeError(
-                f"wbeditentity claims save returned non-success for"
-                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
-            )
-    except (RuntimeError, _MissingEntityError):
-        raise
-    except Exception:
-        try:
-            token = login()
-            postdata["token"] = token
-            save = http.fetch(
-                "https://commons.wikimedia.org/w/api.php",
-                method="POST",
-                data=postdata,
-            )
-            post = json.loads(save.text)
-            _raise_if_missing_entity(post, mediaid)
-            if post["success"] == 1:
-                print(" --- Saved new claims!")
-                tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
-                return
-            print(post)
-            print(" --- Error encountered on save.")
-            raise RuntimeError(
-                f"wbeditentity claims save still non-success after relogin for"
-                f" {mediaid} ({dpla_id}): {_truncate(save.text)}"
-            )
-        except (RuntimeError, _MissingEntityError):
-            raise
-        except Exception as retry_e:
-            # `post` may not be assigned yet if http.fetch / json.loads raised —
-            # referencing it directly would mask the real error with an
-            # UnboundLocalError. Log what we actually have.
-            #
-            # Bake ``save.text`` into the RuntimeError message (when bound) so
-            # the per-ordinal ``logging.exception`` captures the Commons error
-            # response body — the existing ``print(save.text)`` goes to stdout,
-            # which is block-buffered to a non-TTY and got dropped on
-            # ``sys.exit()``. The May 2026 NARA aborts ended with ``KeyError:
-            # 'success'`` propagating out of this block, which only happens
-            # when Commons returned ``{"error": {...}}`` (no ``success`` field)
-            # — the error code in that body is the missing diagnostic.
-            print(f" --- Retry after token refresh failed: {retry_e!r}")
-            if "save" in locals():
-                print(save.text)
-            print(" --- Error encountered. 3")
-            body_suffix = f": {_truncate(save.text)}" if "save" in locals() else ""
-            raise RuntimeError(
-                f"Claims relogin+save failed for {mediaid} ({dpla_id}){body_suffix}"
-            ) from retry_e
+    _submit_sdc_write(
+        "wbeditentity",
+        mediaid,
+        dpla_id,
+        data=json.dumps(claims),
+        summary=(
+            f"Added structured data claims from [[COM:DPLA|DPLA]] item"
+            f" '[[dpla:{dpla_id}|{dpla_id}]]'."
+            f" [[COM:DPLA/MOD|Leave feedback]]!"
+        ),
+    )
+    print(" --- Saved new claims!")
+    tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
 
 
 def dpla_claims(
@@ -1732,42 +1598,19 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
             elif claim[prop]["value"] not in expected[prop]:
                 removals.append(claim[prop]["id"])
     if removals:
-        rmdata = {
-            "action": "wbremoveclaims",
-            "format": "json",
-            "id": mediaid,
-            "claim": "|".join(removals),
-            "token": token,
-            "bot": True,
-            "summary": f"Changing structured data claims from [[COM:DPLA|DPLA]] item '[[dpla:{dpla_id}|{dpla_id}]]'. [[COM:DPLA/MOD|Leave feedback]]!",
-        }
-        # Only count removals once we've seen `success: 1` on the
-        # wbremoveclaims response, matching what `_post_new_refs` and
-        # `_post_new_claims` do for their respective POSTs. Without this
-        # check, a rejected removal batch (bad token, replication lag,
-        # claim already gone, etc.) would silently inflate the counter.
-        rm_resp = http.fetch(
-            "https://commons.wikimedia.org/w/api.php", method="POST", data=rmdata
+        _submit_sdc_write(
+            "wbremoveclaims",
+            mediaid,
+            dpla_id,
+            claim="|".join(removals),
+            summary=(
+                f"Changing structured data claims from [[COM:DPLA|DPLA]]"
+                f" item '[[dpla:{dpla_id}|{dpla_id}]]'."
+                f" [[COM:DPLA/MOD|Leave feedback]]!"
+            ),
         )
-        try:
-            rm_post = json.loads(rm_resp.text)
-        except (ValueError, AttributeError) as parse_e:
-            print(" --- Could not parse removals response.")
-            raise RuntimeError(
-                f"wbremoveclaims response was not parseable JSON for"
-                f" {mediaid} ({dpla_id}): {_truncate(getattr(rm_resp, 'text', ''))}"
-            ) from parse_e
-        _raise_if_missing_entity(rm_post, mediaid)
-        if rm_post.get("success") == 1:
-            print(" --- Saved removals!")
-            tracker.increment(Result.SDC_REMOVALS, len(removals))
-        else:
-            print(rm_post)
-            print(" --- Error encountered on removals save.")
-            raise RuntimeError(
-                f"wbremoveclaims save returned non-success for"
-                f" {mediaid} ({dpla_id}): {_truncate(rm_resp.text)}"
-            )
+        print(" --- Saved removals!")
+        tracker.increment(Result.SDC_REMOVALS, len(removals))
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
@@ -2019,15 +1862,6 @@ def _parse_dpla_doc(dpla, dpla_id):
     )
 
 
-def login():
-    tokenrequest = http.fetch(
-        "https://commons.wikimedia.org/w/api.php?action=query&meta=tokens&type=csrf&format=json"
-    )
-    tokendata = json.loads(tokenrequest.text)
-    token = tokendata.get("query").get("tokens").get("csrftoken")
-    return token
-
-
 def _resolve_dpla_id(title, dpla_api):
     """Return the DPLA item ID for a Commons file title.
 
@@ -2061,7 +1895,7 @@ def _resolve_dpla_id(title, dpla_api):
 
 def process_one(mediaid, dpla_id):
     """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
-    global claims, refclaims, token
+    global claims, refclaims
 
     # Drop any stale cache from a prior file so check() always reads fresh state
     # for this mediaid.

@@ -550,16 +550,29 @@ def test_truncate_helper_returns_under_limit_unchanged_and_truncates_long():
 
 
 def _install_module_globals(
-    monkeypatch, sdc_sync, response, *, refclaims_payload=None, claims_payload=None
+    monkeypatch,
+    sdc_sync,
+    *,
+    refclaims_payload=None,
+    claims_payload=None,
+    submit_side_effect=None,
+    submit_return=None,
 ):
-    """Inject the module-level globals the SDC POST helpers expect.
+    """Inject the module-level globals the SDC POST helpers expect AND
+    mock the pywikibot path the helpers now write through.
 
-    ``refclaims`` / ``claims`` / ``token`` are not initialised at import
-    time — they're declared ``global`` and populated inside ``process_one``
-    / ``process_one_from_sdc`` before each item. Tests that call the POST
-    helpers directly have to install those globals themselves;
-    ``raising=False`` lets monkeypatch set + tear down attributes that
-    didn't exist on the module yet.
+    The POST helpers no longer hit raw ``http.fetch`` — they call
+    ``site.simple_request(action=..., ...).submit()``, which is
+    pywikibot's high-level write entry point. To exercise the helpers
+    without an actual network round-trip we mock the ``site`` module
+    global so ``simple_request`` returns a request object whose
+    ``submit()`` either returns ``submit_return`` (success) or raises
+    ``submit_side_effect`` (the pywikibot ``APIError`` we're modelling).
+
+    ``refclaims`` / ``claims`` are not initialised at import time —
+    they're declared ``global`` and populated inside ``process_one`` /
+    ``process_one_from_sdc`` before each item, so tests that call the
+    POST helpers directly install them here with ``raising=False``.
     """
     monkeypatch.setattr(
         sdc_sync,
@@ -573,30 +586,48 @@ def _install_module_globals(
         {"claims": claims_payload if claims_payload is not None else []},
         raising=False,
     )
-    monkeypatch.setattr(sdc_sync, "token", "stub-token", raising=False)
-    monkeypatch.setattr(sdc_sync.http, "fetch", lambda *a, **kw: response)
+
+    request_mock = MagicMock()
+    if submit_side_effect is not None:
+        request_mock.submit.side_effect = submit_side_effect
+    else:
+        request_mock.submit.return_value = (
+            submit_return if submit_return is not None else {"success": 1}
+        )
+
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value = request_mock
+    # Pywikibot's lazy CSRF cache surfaces as ``site.tokens["csrf"]``.
+    # The migration accesses it; mock it to a deterministic value.
+    fake_site.tokens = {"csrf": "stub-csrf-token"}
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+    return fake_site
 
 
-def test_post_new_refs_raises_runtime_error_on_non_success_save(monkeypatch):
-    """A non-success wbeditentity refs response must raise RuntimeError,
-    not call sys.exit(). The error message must include the mediaid and
-    DPLA id so the failure is self-identifying in the SDC log.
+def _api_error(code, info=""):
+    """Construct a ``pywikibot.exceptions.APIError`` for tests.
 
-    The response payload must carry an explicit ``"success": 0`` so the
-    helper's initial save lands in the ``else`` branch (the path that
-    raises the structured "non-success" error). A response with no
-    ``"success"`` key at all would raise KeyError instead and divert
-    into the relogin retry — useful for the catch-by-per-ordinal test
-    below, but not what this one is checking.
+    APIError's constructor signature is ``(code, info, **kwargs)`` and
+    callers across pywikibot pass extra context (servedby, etc.) as
+    kwargs. We only need code + info for assertions.
+    """
+    import pywikibot.exceptions
+
+    return pywikibot.exceptions.APIError(code=code, info=info)
+
+
+def test_post_new_refs_raises_runtime_error_on_apierror(monkeypatch):
+    """Pywikibot's ``APIError`` for any code OTHER than ``no-such-entity``
+    must be re-raised as ``RuntimeError`` carrying mediaid + dpla_id +
+    Commons error code so the per-ordinal handler logs a useful traceback.
     """
     from tools import sdc_sync
 
-    response = MagicMock()
-    response.text = (
-        '{"success": 0, "error": {"code": "badtoken", "info": "Invalid token"}}'
-    )
     _install_module_globals(
-        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+        monkeypatch,
+        sdc_sync,
+        refclaims_payload=[{"some": "ref"}],
+        submit_side_effect=_api_error("badtoken", info="Invalid token"),
     )
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -605,17 +636,22 @@ def test_post_new_refs_raises_runtime_error_on_non_success_save(monkeypatch):
     msg = str(excinfo.value)
     assert "M12345" in msg
     assert "abcdef01abcdef01abcdef01abcdef01" in msg
-    assert "non-success" in msg
+    # The Commons error code must appear in the RuntimeError message so
+    # the per-ordinal ``logging.exception`` captures it without needing
+    # to unwrap the ``__cause__`` chain.
+    assert "badtoken" in msg, f"expected 'badtoken' in {msg!r}"
 
 
-def test_post_new_claims_raises_runtime_error_on_non_success_save(monkeypatch):
-    """Same contract for the claims POST helper."""
+def test_post_new_claims_raises_runtime_error_on_apierror(monkeypatch):
+    """Same contract for the claims POST helper — non-no-such-entity
+    APIErrors come out as RuntimeError with the code in the message."""
     from tools import sdc_sync
 
-    response = MagicMock()
-    response.text = '{"success": 0, "error": {"code": "ratelimited"}}'
     _install_module_globals(
-        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
+        monkeypatch,
+        sdc_sync,
+        claims_payload=[{"some": "claim"}],
+        submit_side_effect=_api_error("abusefilter-disallowed", info="Rule X tripped."),
     )
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -624,226 +660,220 @@ def test_post_new_claims_raises_runtime_error_on_non_success_save(monkeypatch):
     msg = str(excinfo.value)
     assert "M67890" in msg
     assert "fedcba98fedcba98fedcba98fedcba98" in msg
-    assert "non-success" in msg
+    assert "abusefilter-disallowed" in msg, f"expected error code in {msg!r}"
 
 
 def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
-    """The RuntimeError raised from inside _post_new_refs must be a
-    plain Exception subclass (not BaseException), so the per-ordinal
-    `except Exception:` in process_one_from_sdc catches it and the
-    partner batch can continue with the next ordinal.
+    """The RuntimeError raised from inside ``_post_new_refs`` must be a
+    plain ``Exception`` subclass (not ``BaseException``), so the
+    ``except Exception:`` clause in ``process_one_from_sdc`` catches it
+    and the partner batch can continue with the next ordinal.
 
-    This is the key behavioural difference vs the old sys.exit() — old
-    code raised SystemExit (BaseException, not caught by the per-ordinal
-    handler), so a single failed write tanked the entire partner.
+    Regression guard against the pre-PR-#263 ``sys.exit()`` behaviour,
+    which raised ``SystemExit`` (a ``BaseException``) and bypassed the
+    per-ordinal handler — one failed write tanked the entire partner.
     """
     from tools import sdc_sync
 
-    response = MagicMock()
-    response.text = '{"success": 0, "error": {"code": "badtoken"}}'
     _install_module_globals(
-        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
+        monkeypatch,
+        sdc_sync,
+        refclaims_payload=[{"some": "ref"}],
+        submit_side_effect=_api_error("badtoken"),
     )
 
     skipped = False
     try:
         sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
     except Exception:
-        # This is the same `except Exception:` clause that wraps each
-        # ordinal in process_one_from_sdc — catching it here proves the
+        # Same ``except Exception:`` clause that wraps each ordinal in
+        # ``process_one_from_sdc`` — catching it here proves the
         # per-ordinal handler will skip rather than abort the partner.
         skipped = True
 
     assert skipped, (
-        "RuntimeError from _post_new_refs must be an Exception subclass so the"
-        " per-ordinal handler in process_one_from_sdc catches it (was previously"
-        " SystemExit, which bypassed that handler and aborted the whole partner)"
+        "RuntimeError from _post_new_refs must be an Exception subclass so"
+        " the per-ordinal handler in process_one_from_sdc catches it"
     )
 
 
-# --------------------------------------------------------------------------
-# Response-body inclusion in the relogin+save failure messages.
-#
-# When the per-ordinal handler in process_one_from_sdc logs an exception
-# from these helpers, the only thing we currently see is "Claims
-# relogin+save failed for <mediaid> (<dpla_id>)" plus a chained
-# KeyError from json parsing. That isn't enough to diagnose the
-# underlying problem — Commons returns errors like
-# {"error": {"code": "permissiondenied", "info": "..."}} which have
-# NO "success" key, so post["success"] raises KeyError and the actual
-# error code is lost. Baking save.text into the RuntimeError message
-# captures the Commons error code in the structured exception, where
-# logging.exception will write it to the SDC log.
-# --------------------------------------------------------------------------
+def test_post_new_refs_success_path_increments_counter(monkeypatch):
+    """The happy path: ``simple_request().submit()`` returns success →
+    the SDC_REFS_ADDED counter increments by the number of refs posted."""
+    from tools import sdc_sync
+
+    _install_module_globals(
+        monkeypatch,
+        sdc_sync,
+        refclaims_payload=[{"ref": "a"}, {"ref": "b"}, {"ref": "c"}],
+        submit_return={"success": 1, "entity": {}},
+    )
+
+    before = sdc_sync.tracker.count(Result.SDC_REFS_ADDED)
+    sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
+    after = sdc_sync.tracker.count(Result.SDC_REFS_ADDED)
+    assert after == before + 3, (
+        f"SDC_REFS_ADDED should bump by 3; before={before}, after={after}"
+    )
 
 
-def test_post_new_claims_relogin_failure_message_includes_response_body(monkeypatch):
-    """When the relogin retry also returns a response with no ``"success"``
-    key, the chained KeyError + new RuntimeError message must include the
-    Commons response body so we can read the error code from the SDC log.
+def test_post_new_claims_success_path_increments_counter(monkeypatch):
+    """Same happy-path contract for claims."""
+    from tools import sdc_sync
 
-    Without this, the per-ordinal traceback only tells us the helper hit
-    line 1421 — useful for locating the abort but useless for figuring
-    out *why* a specific item is being rejected by Commons.
+    _install_module_globals(
+        monkeypatch,
+        sdc_sync,
+        claims_payload=[{"c": "a"}, {"c": "b"}],
+        submit_return={"success": 1, "entity": {}},
+    )
+
+    before = sdc_sync.tracker.count(Result.SDC_CLAIMS_ADDED)
+    sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
+    after = sdc_sync.tracker.count(Result.SDC_CLAIMS_ADDED)
+    assert after == before + 2
+
+
+def test_post_new_refs_uses_pywikibot_simple_request_with_csrf_token(monkeypatch):
+    """Verify the helper actually routes through pywikibot's
+    ``simple_request`` and passes the CSRF token from ``site.tokens``
+    (rather than a stale module-global ``token``, which the migration
+    deleted).
     """
     from tools import sdc_sync
 
-    response = MagicMock()
-    response.text = (
-        '{"error": {"code": "permissiondenied", "info": "Permission denied."}}'
-    )
-    _install_module_globals(
-        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
-    )
-    # Stub ``login()`` so the relogin path completes successfully (no
-    # auth-side error masking the real save failure under test).
-    monkeypatch.setattr(sdc_sync, "login", lambda: "stub-token-2", raising=False)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    msg = str(excinfo.value)
-    assert "M12345" in msg
-    assert "abcdef01abcdef01abcdef01abcdef01" in msg
-    assert "relogin+save failed" in msg
-    # The Commons error code from the response body must be reachable from
-    # the message — that's the whole point of this PR.
-    assert "permissiondenied" in msg, (
-        "Commons error code must appear in the RuntimeError message so the"
-        " per-ordinal logging.exception captures it; got: " + repr(msg)
+    fake_site = _install_module_globals(
+        monkeypatch,
+        sdc_sync,
+        refclaims_payload=[{"some": "ref"}],
+        submit_return={"success": 1},
     )
 
+    sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
 
-def test_post_new_refs_relogin_failure_message_includes_response_body(monkeypatch):
-    """Same contract for the refs helper."""
-    from tools import sdc_sync
-
-    response = MagicMock()
-    response.text = (
-        '{"error": {"code": "abusefilter-disallowed", "info": "Rule X tripped."}}'
-    )
-    _install_module_globals(
-        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
-    )
-    monkeypatch.setattr(sdc_sync, "login", lambda: "stub-token-2", raising=False)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
-
-    msg = str(excinfo.value)
-    assert "M67890" in msg
-    assert "fedcba98fedcba98fedcba98fedcba98" in msg
-    assert "relogin+save failed" in msg
-    assert "abusefilter-disallowed" in msg, (
-        "Commons error code must appear in the RuntimeError message; got: " + repr(msg)
-    )
+    assert fake_site.simple_request.call_count == 1
+    kwargs = fake_site.simple_request.call_args.kwargs
+    assert kwargs["action"] == "wbeditentity"
+    assert kwargs["id"] == "M12345"
+    assert kwargs["bot"] is True
+    assert kwargs["token"] == "stub-csrf-token"
+    # The encoded claims payload should be the JSON of refclaims.
+    assert "ref" in kwargs["data"]
 
 
 # --------------------------------------------------------------------------
 # `no-such-entity` is treated as a clean skip, NOT a failure.
 #
-# When Commons returns `{"error": {"code": "no-such-entity"}}`, it means
-# the MediaInfo entity for the staged M-id doesn't exist — most commonly
+# When pywikibot raises ``APIError(code="no-such-entity")``, the
+# MediaInfo entity for the staged M-id doesn't exist — most commonly
 # because the file page was deleted by a Commons curator as a duplicate,
 # or because this is an SDC-only run for a file that wasn't uploaded
 # through our pipeline. Neither is the SDC phase's fault, and re-running
 # wouldn't help — the entity isn't coming back via retry. The phase
-# must:
-#   1. NOT divert into the relogin retry path (token isn't the problem)
-#   2. raise a specific `_MissingEntityError` rather than `RuntimeError`
-#   3. propagate that exception to the per-ordinal handler, which logs
-#      it at INFO (not ERROR) and increments a dedicated counter.
+# converts this specific APIError code into ``_MissingEntityError``,
+# which the per-ordinal handler logs at INFO (not ERROR) and counts
+# under ``SDC_ORDINALS_SKIPPED_MISSING_ENTITY`` (not ``..._ERROR``).
 # --------------------------------------------------------------------------
 
 
-def test_raise_if_missing_entity_helper():
-    """Direct unit test of the helper."""
-    from tools import sdc_sync
-
-    # no-such-entity payload → raises _MissingEntityError
-    with pytest.raises(sdc_sync._MissingEntityError):
-        sdc_sync._raise_if_missing_entity(
-            {"error": {"code": "no-such-entity"}}, "M12345"
-        )
-
-    # Other error codes do NOT raise — they fall through to the generic
-    # error path so the existing retry / RuntimeError logic still runs.
-    sdc_sync._raise_if_missing_entity({"error": {"code": "permissiondenied"}}, "M12345")
-    sdc_sync._raise_if_missing_entity({"success": 1}, "M12345")
-    sdc_sync._raise_if_missing_entity({}, "M12345")
-    # Defensive: non-dict input shouldn't blow up.
-    sdc_sync._raise_if_missing_entity(None, "M12345")  # type: ignore[arg-type]
-
-
 def test_post_new_claims_no_such_entity_raises_missing_entity_error(monkeypatch):
-    """Claims POST helper must raise `_MissingEntityError` (not RuntimeError)
-    when Commons returns ``no-such-entity``.
-
-    The relogin retry path must NOT run — `_MissingEntityError` must
-    propagate through the `except (RuntimeError, _MissingEntityError): raise`
-    guard intact, exactly like the structured `RuntimeError` does, so the
-    per-ordinal handler sees the specific exception class.
-    """
+    """Claims POST helper must raise ``_MissingEntityError`` (not
+    ``RuntimeError``) when pywikibot reports ``no-such-entity``."""
     from tools import sdc_sync
 
-    response = MagicMock()
-    response.text = '{"error": {"code": "no-such-entity", "info": "⧼no-such-entity⧽"}}'
     _install_module_globals(
-        monkeypatch, sdc_sync, response, claims_payload=[{"some": "claim"}]
-    )
-    # Stub login() so a *bug* that diverted us into the retry path would
-    # still produce diagnosable output (instead of an UnboundLocalError
-    # masking the actual control-flow defect).
-    login_called = []
-    monkeypatch.setattr(
+        monkeypatch,
         sdc_sync,
-        "login",
-        lambda: (login_called.append(True), "stub-token-2")[1],
-        raising=False,
+        claims_payload=[{"some": "claim"}],
+        submit_side_effect=_api_error("no-such-entity", info="⧼no-such-entity⧽"),
     )
 
     with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
         sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
 
     assert "M12345" in str(excinfo.value)
-    # CRITICAL invariant: login() must NOT have been called. The relogin
-    # path is for "maybe our token expired" — which is irrelevant here.
-    assert login_called == [], (
-        "_post_new_claims must skip the relogin retry path on no-such-entity;"
-        " login() should not have been called"
-    )
 
 
 def test_post_new_refs_no_such_entity_raises_missing_entity_error(monkeypatch):
     """Same contract for the refs POST helper."""
     from tools import sdc_sync
 
-    response = MagicMock()
-    response.text = '{"error": {"code": "no-such-entity"}}'
     _install_module_globals(
-        monkeypatch, sdc_sync, response, refclaims_payload=[{"some": "ref"}]
-    )
-    login_called = []
-    monkeypatch.setattr(
+        monkeypatch,
         sdc_sync,
-        "login",
-        lambda: (login_called.append(True), "stub-token-2")[1],
-        raising=False,
+        refclaims_payload=[{"some": "ref"}],
+        submit_side_effect=_api_error("no-such-entity"),
     )
 
     with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
         sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
 
     assert "M67890" in str(excinfo.value)
-    assert login_called == []
+
+
+def test_submit_sdc_write_translates_no_such_entity_for_wbremoveclaims(monkeypatch):
+    """The shared write helper translates ``APIError(no-such-entity)``
+    for ANY action — proving the wbremoveclaims path
+    (``_reconcile_existing_claims`` removals block) inherits the same
+    clean-skip contract as the wbeditentity path, since they both go
+    through ``_submit_sdc_write``.
+    """
+    from tools import sdc_sync
+
+    fake_site = _install_module_globals(
+        monkeypatch,
+        sdc_sync,
+        submit_side_effect=_api_error("no-such-entity"),
+    )
+
+    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
+        sdc_sync._submit_sdc_write(
+            "wbremoveclaims",
+            "M12345",
+            "abcdef01abcdef01abcdef01abcdef01",
+            claim="M12345$id-1|M12345$id-2",
+        )
+
+    assert "M12345" in str(excinfo.value)
+    assert fake_site.simple_request.call_args.kwargs["action"] == "wbremoveclaims"
+
+
+def test_submit_sdc_write_runtime_error_message_names_the_action(monkeypatch):
+    """The RuntimeError message includes the action name so the
+    per-ordinal log distinguishes ``wbeditentity failed`` from
+    ``wbremoveclaims failed`` without needing to inspect the traceback.
+    """
+    from tools import sdc_sync
+
+    _install_module_globals(
+        monkeypatch,
+        sdc_sync,
+        submit_side_effect=_api_error("permissiondenied", info="Denied."),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        sdc_sync._submit_sdc_write(
+            "wbremoveclaims",
+            "M99999",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+            claim="M99999$x",
+        )
+
+    msg = str(excinfo.value)
+    assert "wbremoveclaims" in msg
+    assert "M99999" in msg
+    assert "permissiondenied" in msg
 
 
 def test_missing_entity_error_is_not_a_runtime_error():
-    """The per-ordinal handler distinguishes `_MissingEntityError` from
-    generic `RuntimeError`/`Exception`. The exception class must NOT be
-    a `RuntimeError` subclass or it would be caught by every
-    `except RuntimeError:` guard in the POST helpers, restarting the
-    relogin loop on it.
+    """The per-ordinal handler distinguishes ``_MissingEntityError`` from
+    generic ``RuntimeError`` / ``Exception``. Keep the class hierarchy
+    explicit: it must be an ``Exception`` (so the per-ordinal handler
+    catches it at all) but NOT a ``RuntimeError`` subclass, so the
+    per-ordinal handler's separate ``except _MissingEntityError:`` arm
+    (logged at INFO + counted under SKIPPED_MISSING_ENTITY) reliably
+    fires before the broader ``except Exception:`` arm (logged at ERROR
+    + counted under SKIPPED_ERROR).
     """
     from tools import sdc_sync
 
