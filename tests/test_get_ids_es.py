@@ -59,7 +59,14 @@ def _invoke(*args: str):
         patch.object(get_ids_es, "load_rights_json", return_value={}),
     ):
         runner = CliRunner()
-        return runner.invoke(get_ids_es.main, list(args), catch_exceptions=False)
+        # ``catch_exceptions=True`` (the default) puts unhandled
+        # exceptions into ``result.exception`` instead of re-raising —
+        # that's how ``test_multiple_institutions_pass_validation_and_combine``
+        # reads the sentinel ``RuntimeError`` from the stubbed
+        # ``fetch_subjects_json``. With ``catch_exceptions=False`` the
+        # runner re-raises into the test body, killing it before the
+        # assertion runs.
+        return runner.invoke(get_ids_es.main, list(args))
 
 
 def test_collection_requires_exactly_one_institution_zero():
