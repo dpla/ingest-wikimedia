@@ -27,12 +27,26 @@ def _invoke(*args: str):
         patch.object(
             get_ids_es,
             "fetch_institutions_v2",
+            # ``load_eligible_dp_names`` only counts an institution as
+            # eligible when BOTH the hub and the institution carry a
+            # ``Wikidata`` field — that's how the production data
+            # excludes records that haven't been fully onboarded.
+            # Stubbed values are arbitrary QIDs; they exist solely to
+            # pass the eligibility gate so the tests can exercise the
+            # CLI-validation contract we actually care about.
             return_value={
                 "Digital Commonwealth": {
+                    "Wikidata": "Q12345",
                     "institutions": {
-                        "Boston Public Library": {"upload": True},
-                        "Boston City Archives": {"upload": True},
-                    }
+                        "Boston Public Library": {
+                            "upload": True,
+                            "Wikidata": "Q1001",
+                        },
+                        "Boston City Archives": {
+                            "upload": True,
+                            "Wikidata": "Q1002",
+                        },
+                    },
                 }
             },
         ),
