@@ -44,7 +44,7 @@ from ingest_wikimedia.partners import (
     slugify_session_label_component,
 )
 from ingest_wikimedia.slack import post_message
-from ingest_wikimedia.ssm import REGION, ssm_run
+from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
 
 # Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
 MEMORY_HEADROOM_PCT = 30
@@ -629,23 +629,14 @@ def main() -> None:
     # target (|| handler + ; separator).
     # The cd is required because config.toml is read from CWD.
     #
-    # notify_fail_cmd uses single-quoted Python inside a double-quoted tmux argument.
-    # Single quotes are literal characters inside double-quoted bash strings, so the
-    # inner Python code reaches the interpreter verbatim without needing any escaping.
-    #
-    # The `$?` and `$rc` references DO need backslash-escaping. pipeline_cmd is
-    # embedded as `"{pipeline_cmd}"` in tmux_cmd below — a double-quoted argument
-    # — and the outer bash on EC2 expands unescaped `$` references inside double
-    # quotes BEFORE tmux ever sees the command string. Without the escapes the
-    # inner shell ends up with `rc=0; WIKIMEDIA_LAST_EXIT= python3 -c '...'`
-    # (outer $? = 0 from the previous tmux launch, outer $rc undefined), so
-    # WIKIMEDIA_LAST_EXIT is always empty in the Slack message — losing the
-    # exit-code suffix that decodes signals like 137 (SIGKILL / probable OOM)
-    # and 143 (SIGTERM). With `\$?` and `\$rc`, the outer bash leaves the `$`
-    # literal and the inner shell evaluates the references against the actual
-    # failing step's exit status.
+    # notify_fail_cmd captures the failing step's exit code via `rc=$?` so the
+    # Slack message can decode signals like 137 (SIGKILL / probable OOM) and
+    # 143 (SIGTERM). No backslash escaping needed on `$?` / `$rc`: pipeline_cmd
+    # is staged to a script file via stage_and_launch_tmux below and read
+    # directly by bash, so the inner shell sees raw `$?` / `$rc` and expands
+    # them at runtime against the actual failing step.
     notify_fail_cmd = (
-        r"rc=\$?; WIKIMEDIA_LAST_EXIT=\$rc python3 -c "
+        "rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c "
         "'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'"
     )
     setup = " && ".join(
@@ -818,17 +809,22 @@ def main() -> None:
             logging.warning("Slack notification failed: %s", e)
 
     print(f"Launching {session_name} pipeline...")
-    # Use double quotes around the pipeline so single-quoted institution names inside are
-    # preserved when the outer shell (bash -c) processes the tmux command. The sentinel
-    # echo runs immediately after tmux creates the detached session — before any pipeline
-    # commands execute — so it is not subject to a race with fast-completing pipelines.
-    tmux_cmd = (
-        f"tmux new-session -d -s {shlex.quote(session_name)} -c /home/ec2-user/ingest-wikimedia/"
-        f' "{pipeline_cmd}" && echo SESSION_STARTED'
-    )
+    # Stage pipeline_cmd to a script file on EC2 and launch tmux against it
+    # rather than inlining as a `"PIPELINE_CMD"` argument to tmux. The
+    # inline form ran into SSM's per-command size limit ("command too long"
+    # on a 22-target batch — single-quoted institution names plus the
+    # shlex.quote multiplier add up fast). stage_and_launch_tmux base64-
+    # encodes the script and decodes it on the instance, keeping the SSM
+    # payload compact regardless of pipeline length. See ssm.py for the
+    # full rationale.
     out = ""
     try:
-        out = ssm_run(ssm, tmux_cmd)
+        out = stage_and_launch_tmux(
+            ssm,
+            script=pipeline_cmd,
+            session_name=session_name,
+            cwd="/home/ec2-user/ingest-wikimedia/",
+        )
     except Exception as e:
         _slack_fail(
             response_url, f"⚠️ Failed to launch tmux session `{session_name}`: {e}"

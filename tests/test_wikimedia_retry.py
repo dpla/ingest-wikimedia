@@ -1,6 +1,46 @@
 """Tests for scripts/wikimedia_retry.py."""
 
+import base64
+import re
 from unittest.mock import MagicMock, patch
+
+
+def _decode_staged_script(ssm_cmd: str) -> str:
+    """Extract the base64-encoded pipeline script from an SSM staging
+    command and return its decoded text. Returns the raw ssm_cmd
+    unchanged if no `echo <b64> | base64 -d > /tmp/wm-pipeline-` step
+    is present (e.g. a non-launch command like the scan or memory
+    check).
+
+    See ingest_wikimedia.ssm.stage_and_launch_tmux for the staging
+    wire format. Tests that assert on pipeline *content* (downloader
+    args, env exports, awk dedup step) need to decode this — the
+    surrounding SSM command only contains the base64 plus the tmux
+    wrapper.
+    """
+    m = re.search(
+        r"echo ([A-Za-z0-9+/=]+) \| base64 -d > /tmp/wm-pipeline-",
+        ssm_cmd,
+    )
+    if not m:
+        return ssm_cmd
+    return base64.b64decode(m.group(1)).decode()
+
+
+def _find_pipeline_script(commands: list[str]) -> str:
+    """Locate the staged-launch SSM command in `commands` and return the
+    decoded pipeline script. Asserts the staging step is present so a
+    refactor that accidentally drops it surfaces immediately."""
+    staged = [c for c in commands if "tmux new-session" in c]
+    assert staged, (
+        f"no tmux launch command found in captured SSM commands; got: {commands!r}"
+    )
+    decoded = _decode_staged_script(staged[0])
+    assert decoded != staged[0], (
+        "expected the launch command to be base64-staged but found no "
+        f"`echo <b64> | base64 -d > /tmp/wm-pipeline-` step: {staged[0]!r}"
+    )
+    return decoded
 
 
 def _run_main_and_capture_ssm_commands(argv: list[str]) -> list[str]:
@@ -32,6 +72,11 @@ def _run_main_and_capture_ssm_commands(argv: list[str]) -> list[str]:
 
     with (
         patch("scripts.wikimedia_retry.ssm_run", side_effect=fake_ssm_run),
+        # stage_and_launch_tmux (in ingest_wikimedia.ssm) calls ssm_run via
+        # the module namespace, so the patch on scripts.wikimedia_retry's
+        # local import doesn't intercept those. Patch the module-level
+        # function too so the staged-launch SSM command lands in `captured`.
+        patch("ingest_wikimedia.ssm.ssm_run", side_effect=fake_ssm_run),
         patch("scripts.wikimedia_retry.boto3.client", return_value=MagicMock()),
         patch("sys.argv", argv),
         patch.dict("os.environ", {}, clear=False),
@@ -124,6 +169,11 @@ def _run_main_and_capture_full_pipeline(argv: list[str]) -> list[str]:
 
     with (
         patch("scripts.wikimedia_retry.ssm_run", side_effect=fake_ssm_run),
+        # stage_and_launch_tmux (in ingest_wikimedia.ssm) calls ssm_run via
+        # the module namespace, so the patch on scripts.wikimedia_retry's
+        # local import doesn't intercept those. Patch the module-level
+        # function too so the staged-launch SSM command lands in `captured`.
+        patch("ingest_wikimedia.ssm.ssm_run", side_effect=fake_ssm_run),
         patch("scripts.wikimedia_retry.boto3.client", return_value=MagicMock()),
         patch("scripts.wikimedia_retry.post_message"),  # no real Slack
         patch("sys.argv", argv),
@@ -167,9 +217,7 @@ def test_retry_passes_max_age_days_one_to_downloader():
         ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
     )
 
-    pipeline_cmds = [c for c in commands if "tmux new-session" in c]
-    assert pipeline_cmds, f"No tmux new-session command was issued; saw: {commands!r}"
-    pipeline_cmd = pipeline_cmds[0]
+    pipeline_cmd = _find_pipeline_script(commands)
 
     assert "downloader --max-age-days 1" in pipeline_cmd, (
         f"The retry's downloader call must pass `--max-age-days 1` so "
@@ -209,7 +257,7 @@ def test_retry_pipeline_does_not_export_download_log_via_pwd_subshell():
     commands = _run_main_and_capture_full_pipeline(
         ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
     )
-    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+    pipeline_cmd = _find_pipeline_script(commands)
 
     assert "WIKIMEDIA_RETRY_DOWNLOAD_LOG" not in pipeline_cmd, (
         "pipeline must not export WIKIMEDIA_RETRY_DOWNLOAD_LOG — the "
@@ -231,39 +279,37 @@ def test_retry_pipeline_does_not_export_download_log_via_pwd_subshell():
     )
 
 
-def test_retry_pipeline_escapes_dollar_in_notify_fail_cmd():
-    r"""Regression guard: the failure handler must use `\$?` and `\$rc`, not
-    `$?` and `$rc`, when capturing the failing step's exit code.
-
-    The whole pipeline_cmd is sent to tmux as a `"{pipeline_cmd}"`
-    double-quoted argument. Inside double quotes the outer bash on EC2
-    expands `$?` and `$rc` *before* tmux ever sees the command — using
-    its own (unrelated) last-command status and undefined `$rc`. Without
-    the backslashes the inner shell ends up with literal
-    `rc=0; WIKIMEDIA_LAST_EXIT= python3 -c '...'`, so every Slack failure
-    notification silently loses the exit-code suffix that decodes signals
-    like 137 (SIGKILL / probable OOM).
+def test_retry_pipeline_uses_raw_dollar_in_notify_fail_cmd():
+    r"""The failure handler in the *script* (post base64 decode) must use
+    raw `rc=$?` / `WIKIMEDIA_LAST_EXIT=$rc`. The earlier `\$?` / `\$rc`
+    form existed only to survive the double-quote layer of an inline
+    `tmux new-session "..."` argument; with stage_and_launch_tmux the
+    script is base64-decoded into a file and read directly by bash, so
+    raw `$?` and `$rc` are evaluated against the actual failing step at
+    runtime (which is what we want). A backslash-escaped `\$?` here
+    would be interpreted as a literal `$` by bash and `rc` would get the
+    string `$?` — defeating the exit-code capture entirely.
     """
     commands = _run_main_and_capture_full_pipeline(
         ["wikimedia_retry.py", "--days", "30", "--partner", "si"]
     )
-    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+    pipeline_cmd = _find_pipeline_script(commands)
 
-    assert r"rc=\$?" in pipeline_cmd, (
-        "notify_fail_cmd must use `rc=\\$?` (backslash-escaped) so the outer "
-        "bash leaves the `$` literal and the inner shell evaluates `$?` "
-        f"against the failing step; got: {pipeline_cmd!r}"
-    )
-    assert r"WIKIMEDIA_LAST_EXIT=\$rc" in pipeline_cmd, (
-        "notify_fail_cmd must use `WIKIMEDIA_LAST_EXIT=\\$rc` (backslash-"
-        "escaped) so $rc is read by the inner shell, not the outer one; "
+    assert "rc=$?" in pipeline_cmd, (
+        "notify_fail_cmd in the staged script must use raw `rc=$?`; "
         f"got: {pipeline_cmd!r}"
     )
-    # Defence: make sure the UNESCAPED form isn't hiding somewhere else in
-    # the command. If it ever reappears the silent-loss bug returns.
-    assert "rc=$?" not in pipeline_cmd, (
-        "found unescaped `rc=$?` in pipeline_cmd; outer bash will expand "
-        f"$? prematurely. Use `rc=\\$?`. Got: {pipeline_cmd!r}"
+    assert "WIKIMEDIA_LAST_EXIT=$rc" in pipeline_cmd, (
+        "notify_fail_cmd must use `WIKIMEDIA_LAST_EXIT=$rc` so the inner "
+        f"shell reads the captured exit code; got: {pipeline_cmd!r}"
+    )
+    # Defence: the backslash-escaped form would now be a bug — `\$?` in
+    # a script context reads as literal `$?` (not as the exit code), so
+    # if a future refactor brings it back the capture silently breaks.
+    assert r"\$?" not in pipeline_cmd, (
+        r"found backslash-escaped `\$?` in the staged script; in a script "
+        r"file bash reads `\$` as literal `$` so the exit-code capture "
+        f"fails. Use raw `$?`. Got: {pipeline_cmd!r}"
     )
 
 
@@ -288,6 +334,11 @@ def _run_main_with_csvs(argv: list[str], csv_paths: list[str]) -> list[str]:
 
     with (
         patch("scripts.wikimedia_retry.ssm_run", side_effect=fake_ssm_run),
+        # stage_and_launch_tmux (in ingest_wikimedia.ssm) calls ssm_run via
+        # the module namespace, so the patch on scripts.wikimedia_retry's
+        # local import doesn't intercept those. Patch the module-level
+        # function too so the staged-launch SSM command lands in `captured`.
+        patch("ingest_wikimedia.ssm.ssm_run", side_effect=fake_ssm_run),
         patch("scripts.wikimedia_retry.boto3.client", return_value=MagicMock()),
         patch("scripts.wikimedia_retry.post_message"),
         patch("sys.argv", argv),
@@ -324,34 +375,33 @@ def test_retry_merges_download_and_upload_csvs_into_single_uploader_call():
             "/home/ec2-user/ingest-wikimedia/retry/nara-upload-retry.csv",
         ],
     )
-    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+    pipeline_cmd = _find_pipeline_script(commands)
 
     # The combined CSV merge step must be present and feed the (single)
-    # uploader invocation.  The `$0` in the awk program MUST be
-    # backslash-escaped — pipeline_cmd is embedded into the tmux launch
-    # as `"{pipeline_cmd}"` (double-quoted), and the outer bash on EC2
-    # would expand an unescaped `$0` before tmux ever sees the command.
-    # See the comment in scripts/wikimedia_retry.py around the awk step
-    # for the full rationale (same class of bug as PR #246).
+    # uploader invocation. The `$0` in the awk program is now raw (not
+    # backslash-escaped): the staged script is read directly by bash from
+    # /tmp/wm-pipeline-<id>.sh, so `$0` reaches awk verbatim and awk
+    # evaluates it as the current input line. A backslash-escaped `\$0`
+    # would now be the bug — bash would interpret `\$` as literal `$`,
+    # passing `awk '!seen[$0]++'` to awk after a quoting layer that
+    # already collapsed the backslash.
     expected_combined = (
         "/home/ec2-user/ingest-wikimedia/retry/nara-retry-1d-combined.csv"
     )
     assert (
-        r"awk '!seen[\$0]++' "
+        "awk '!seen[$0]++' "
         "/home/ec2-user/ingest-wikimedia/retry/nara-download-retry.csv "
         "/home/ec2-user/ingest-wikimedia/retry/nara-upload-retry.csv "
         f"> {expected_combined}"
     ) in pipeline_cmd, (
         f"expected awk merge step missing or malformed; got: {pipeline_cmd!r}"
     )
-    # Defence: the UNESCAPED form must not appear anywhere in the
-    # pipeline command.  If it ever reappears the silent-loss bug
-    # returns — awk would dedupe by the outer shell's argv[0] (typically
-    # the string "bash"), collapsing every retry CSV to a single line.
-    assert "awk '!seen[$0]++'" not in pipeline_cmd, (
-        f"found unescaped `$0` in pipeline_cmd; outer bash will expand "
-        f"$0 to its argv[0] before tmux sees the command. Use `\\$0`. "
-        f"Got: {pipeline_cmd!r}"
+    # Defence: the backslash-escaped form must NOT appear in the staged
+    # script — it'd be interpreted as literal `$` and break the dedup.
+    assert r"awk '!seen[\$0]++'" not in pipeline_cmd, (
+        r"found backslash-escaped `\$0` in the staged script; bash will "
+        r"read `\$` as literal `$` and awk's dedup will be wrong. "
+        f"Use raw `$0`. Got: {pipeline_cmd!r}"
     )
 
     # Exactly ONE `uploader` invocation, pointing at the combined CSV.
@@ -387,7 +437,7 @@ def test_retry_download_only_csv_runs_uploader_once_without_merge_step():
         ["wikimedia_retry.py", "--days", "30", "--partner", "si"],
         ["/home/ec2-user/ingest-wikimedia/retry/smithsonian-download-retry.csv"],
     )
-    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+    pipeline_cmd = _find_pipeline_script(commands)
 
     assert "awk '!seen" not in pipeline_cmd, (
         f"no merge step expected when only one retry CSV is present; "
@@ -413,7 +463,7 @@ def test_retry_upload_only_csv_runs_uploader_once_without_merge_step():
         ["wikimedia_retry.py", "--days", "30", "--partner", "si"],
         ["/home/ec2-user/ingest-wikimedia/retry/smithsonian-upload-retry.csv"],
     )
-    pipeline_cmd = next(c for c in commands if "tmux new-session" in c)
+    pipeline_cmd = _find_pipeline_script(commands)
 
     assert "awk '!seen" not in pipeline_cmd
     assert "-retry-30d-combined.csv" not in pipeline_cmd
