@@ -146,6 +146,70 @@ def test_stage_and_launch_tmux_keeps_ssm_payload_small_for_large_scripts():
     assert decoded == big_script
 
 
+def test_stage_and_launch_tmux_handles_apostrophe_in_script_content():
+    """Regression: a minnesota launch for `College of Saint Benedict & Saint
+    John's University` failed with `bash: -c: line 1: unexpected EOF while
+    looking for matching '` under the inline-tmux form. shlex.quote of the
+    institution name produces `'College of Saint Benedict & Saint
+    John'"'"'s University'` — three single quotes and TWO literal " chars
+    used to escape the inner apostrophe — and embedding that as a
+    `"PIPELINE_CMD"` double-quoted tmux argument was broken: the inner
+    " characters terminated the outer double quote, leaving bash with
+    unbalanced quotes.
+
+    The staged form base64-encodes the script body before it hits SSM, so
+    apostrophes/quotes/braces all become base64 alphabet characters with
+    no shell-parsing significance. The decoded script is then read by bash
+    from a file, where shlex.quote's output is the standard, correct way
+    to encode the institution name.
+
+    This test exercises the full apostrophe-institution case end-to-end:
+    the staged SSM command must (a) have no literal apostrophes/quotes
+    inside its base64 payload, and (b) decode to a script that bash can
+    actually parse (verified by running bash -n on the decoded script).
+    """
+    import shlex
+    import subprocess
+
+    institution = "College of Saint Benedict & Saint John's University"
+    script = f"printf %s {shlex.quote(institution)}"
+    session = "wikimedia-minnesota+college-of-saint-benedict--saint-johns-university"
+
+    client = _make_client_returning("SESSION_STARTED")
+    stage_and_launch_tmux(client, script=script, session_name=session, cwd="/tmp")
+    sent = client.send_command.call_args.kwargs["Parameters"]["commands"][0]
+
+    # The base64 payload itself must not contain any apostrophes or quotes
+    # that could disturb the surrounding shell layer.
+    m = re.search(
+        r"echo ([A-Za-z0-9+/=]+) \| base64 -d > /tmp/wm-pipeline-",
+        sent,
+    )
+    assert m is not None, f"no stage step found in: {sent!r}"
+    payload = m.group(1)
+    assert "'" not in payload and '"' not in payload, (
+        "base64 payload must contain only [A-Za-z0-9+/=] — quotes would "
+        f"re-introduce the shell-parsing bug we're guarding against: {payload!r}"
+    )
+
+    # The decoded script must parse cleanly under bash (bash -n flags any
+    # syntax error including unmatched quotes).  Roundtrip the institution
+    # too: bash must reconstruct the original apostrophe-containing name.
+    decoded = base64.b64decode(payload).decode()
+    syntax = subprocess.run(
+        ["bash", "-n", "-c", decoded], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, (
+        f"decoded script does not parse under bash: {syntax.stderr!r}\n"
+        f"script: {decoded!r}"
+    )
+    run = subprocess.run(["bash", "-c", decoded], capture_output=True, text=True)
+    assert run.returncode == 0
+    assert run.stdout == institution, (
+        f"bash reconstruction lost the apostrophe; got {run.stdout!r}"
+    )
+
+
 def test_stage_and_launch_tmux_script_filename_is_deterministic_per_session():
     """Same session_name → same staged-script path. Different session
     names → different paths (so concurrent launches don't collide on
