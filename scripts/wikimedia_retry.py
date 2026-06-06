@@ -22,7 +22,7 @@ import requests
 
 from ingest_wikimedia.partners import PARTNER_DIR, resolve_slug
 from ingest_wikimedia.slack import post_message
-from ingest_wikimedia.ssm import REGION, ssm_run
+from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
 
 RETRY_DIR = "/home/ec2-user/ingest-wikimedia/retry"
 MEMORY_HEADROOM_PCT = 30
@@ -224,19 +224,12 @@ def main() -> None:
         session_name += f"-{partner}"
 
     # `rc=$?` captures the failing step's exit code so the Slack message can
-    # decode signals like 137 (SIGKILL / probable OOM) and 143 (SIGTERM).
-    #
-    # The `$?` and `$rc` references MUST be backslash-escaped. notify_fail_cmd
-    # is embedded inside a `"{pipeline_cmd}"` double-quoted argument when the
-    # tmux command is built (see the launch path below), and the outer bash on
-    # EC2 expands unescaped `$` references inside double quotes before tmux
-    # sees the command. Without the escapes the inner shell ends up with
-    # `rc=0; WIKIMEDIA_LAST_EXIT= python3 -c '...'` and Slack failure
-    # notifications silently lose their exit-code suffix. With `\$?` and
-    # `\$rc` the outer bash leaves the `$` literal and the inner shell
-    # evaluates the references against the actual failing step's status.
+    # decode signals like 137 (SIGKILL / probable OOM) and 143 (SIGTERM). No
+    # backslash escaping needed: pipeline_cmd is staged to a script file via
+    # stage_and_launch_tmux below and read directly by bash, so `$?` / `$rc`
+    # are expanded at runtime against the actual failing step.
     notify_fail_cmd = (
-        r"rc=\$?; WIKIMEDIA_LAST_EXIT=\$rc python3 -c "
+        "rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c "
         "'from ingest_wikimedia.slack import notify_pipeline_fail; notify_pipeline_fail()'"
     )
     setup = " && ".join(
@@ -336,23 +329,13 @@ def main() -> None:
             combined_csv = f"{RETRY_DIR}/{slug}-retry-{days}d-combined.csv"
             # `awk '!seen[$0]++'` is the standard idempotent dedup-while-
             # preserving-order one-liner.  Each retry CSV is one DPLA ID
-            # per line, so per-line uniqueness is the right grain.
-            #
-            # The `$0` MUST be backslash-escaped.  pipeline_cmd is embedded
-            # as `"{pipeline_cmd}"` in tmux_cmd below — a double-quoted
-            # argument — and the outer bash on EC2 expands unescaped `$0`
-            # inside double quotes before tmux ever sees the command. `$0`
-            # would resolve to the outer shell's argv[0] (typically the
-            # string "bash"), so awk would dedupe by that literal string
-            # on every line — producing a single-line output and silently
-            # losing 99% of the retry IDs.  Same class of bug as PR #246's
-            # `\$?`/`\$rc` escapes in notify_fail_cmd.  With `\$0` the
-            # outer bash leaves the `$` literal and awk evaluates `$0` as
-            # the current input line.
+            # per line, so per-line uniqueness is the right grain.  No
+            # backslash escaping on `$0` — pipeline_cmd is staged to a
+            # script file via stage_and_launch_tmux below and read
+            # directly by bash, so awk's `$0` reaches awk verbatim and
+            # evaluates as the current input line as intended.
             cat_args = " ".join(shlex.quote(c) for c in upload_inputs)
-            steps.append(
-                rf"awk '!seen[\$0]++' {cat_args} > {shlex.quote(combined_csv)}"
-            )
+            steps.append(f"awk '!seen[$0]++' {cat_args} > {shlex.quote(combined_csv)}")
             steps.append(f"uploader {shlex.quote(combined_csv)} {slug}")
         target_steps = " && ".join(steps)
         target_blocks.append(
@@ -374,17 +357,30 @@ def main() -> None:
         except Exception as e:
             logging.warning("Slack notification failed: %s", e)
 
-    # Kill any existing session with the same name (retries are idempotent) and launch.
+    # Kill any existing session with the same name (retries are idempotent),
+    # then stage the pipeline as a script file and launch tmux against it.
+    # See stage_and_launch_tmux for why we don't inline pipeline_cmd as a
+    # `"{pipeline_cmd}"` argument to tmux: SSM's per-command size limit was
+    # being hit on large batches once shlex.quote'ing of many institution
+    # names inflated the inline form.
     print(f"Launching {session_name}...")
-    tmux_cmd = (
-        f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null || true; "
-        f"tmux new-session -d -s {shlex.quote(session_name)}"
-        " -c /home/ec2-user/ingest-wikimedia/"
-        f' "{pipeline_cmd}" && echo SESSION_STARTED'
-    )
+    try:
+        ssm_run(
+            ssm,
+            f"tmux kill-session -t {shlex.quote(session_name)} 2>/dev/null || true",
+        )
+    except Exception as e:
+        # kill-session failing is non-fatal — the session might not exist yet,
+        # and `|| true` should swallow that. Log and proceed to the launch.
+        logging.warning("kill-session pre-launch step failed (continuing): %s", e)
     tmux_out = ""
     try:
-        tmux_out = ssm_run(ssm, tmux_cmd)
+        tmux_out = stage_and_launch_tmux(
+            ssm,
+            script=pipeline_cmd,
+            session_name=session_name,
+            cwd="/home/ec2-user/ingest-wikimedia/",
+        )
     except Exception as e:
         _slack_fail(
             response_url, f"⚠️ Failed to launch tmux session `{session_name}`: {e}"

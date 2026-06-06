@@ -1,5 +1,7 @@
 """Shared SSM helpers for Wikimedia pipeline scripts."""
 
+import base64
+import hashlib
 import shlex
 import time
 
@@ -50,3 +52,43 @@ def ssm_run(client, cmd: str, *, as_root: bool = False) -> str:
                 f"SSM command {cmd_id} ended with {status}: {stderr or 'no stderr'}"
             )
     raise TimeoutError(f"SSM command {cmd_id} did not complete within polling window")
+
+
+def stage_and_launch_tmux(client, *, script: str, session_name: str, cwd: str) -> str:
+    """Stage `script` to a file on the instance, then launch a detached
+    tmux session that runs it. Returns whatever ssm_run returns (stdout).
+
+    Use this instead of an inline ``tmux new-session ... "PIPELINE_CMD"``
+    SSM call when ``script`` may be long.  SSM's per-command size limit
+    (the agent rejects with "command too long" once exceeded — observed
+    on a 22-target batch of ~25KB) bites when long batch pipelines or
+    institution-rich target lists get serialised inline, especially
+    once shlex.quote'ing many embedded single quotes inflates them
+    further.  Base64 adds only ~33% overhead vs the 2-3x growth from
+    quote-escaping, and the base64 alphabet (``[A-Za-z0-9+/=]``) has no
+    characters that need shell escaping, so the SSM payload stays
+    compact regardless of script content.
+
+    Side benefit: the staged script runs in a fresh bash via
+    ``bash <path>``, so its variable references see raw ``$?`` / ``$rc``
+    / ``$0`` etc. without needing backslash escapes that were only
+    necessary when the pipeline was embedded as a double-quoted
+    argument to an outer bash through tmux.  Callers should pass the
+    raw, unescaped script form.
+
+    The script filename is derived from a SHA-1 of ``session_name`` so
+    two concurrent launches with different sessions don't collide on
+    ``/tmp``, but the same launch retried after a transient error
+    overwrites cleanly.
+    """
+    script_id = hashlib.sha1(session_name.encode()).hexdigest()[:12]
+    script_path = f"/tmp/wm-pipeline-{script_id}.sh"
+    script_b64 = base64.b64encode(script.encode()).decode()
+    staged_cmd = (
+        f"echo {script_b64} | base64 -d > {script_path} && "
+        f"chmod +x {script_path} && "
+        f"tmux new-session -d -s {shlex.quote(session_name)} "
+        f"-c {shlex.quote(cwd)} 'bash {script_path}' && "
+        "echo SESSION_STARTED"
+    )
+    return ssm_run(client, staged_cmd)
