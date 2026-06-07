@@ -1385,3 +1385,497 @@ def test_initialize_pins_pywikibot_retry_budget(monkeypatch, tmp_path):
     assert pywikibot.config.max_retries == sdc_sync._PYWIKIBOT_MAX_RETRIES
     assert pywikibot.config.retry_wait == sdc_sync._PYWIKIBOT_RETRY_WAIT
     assert pywikibot.config.retry_max == sdc_sync._PYWIKIBOT_RETRY_MAX
+
+
+# ---------------------------------------------------------------------------
+# Opportunistic date parsing — time-typed P571 claims and the migration
+# from old somevalue+P1932 statements. The reconciler/check side has to
+# treat the canonical (time, precision) key as DIFFERENT from any P1932
+# string so a re-sync after the parser ships removes the old somevalue
+# claim and adds the new value-typed one in a single cycle.
+# ---------------------------------------------------------------------------
+
+
+def _time_value(time_str, precision):
+    """Build a Wikibase time-datavalue ``value`` dict for tests."""
+    return {
+        "time": time_str,
+        "precision": precision,
+        "before": 0,
+        "after": 0,
+        "timezone": 0,
+        "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+    }
+
+
+def _value_typed_p571_claim(stmt_id, time_str, precision, stated_as):
+    """Construct a value-typed P571 claim (the new shape) for tests."""
+    return {
+        "id": stmt_id,
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datavalue": {"value": _time_value(time_str, precision), "type": "time"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P1932": _qual_string("P1932", stated_as),
+        },
+        "references": [_dpla_reference()],
+    }
+
+
+def _somevalue_p571_claim(stmt_id, stated_as):
+    """Construct an old-shape P571 claim (somevalue + P1932) for tests."""
+    return _stmt(
+        stmt_id=stmt_id,
+        prop="P571",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={
+            "P459": _dpla_p459(),
+            "P1932": _qual_string("P1932", stated_as),
+        },
+        references=[_dpla_reference()],
+    )
+
+
+def test_time_comparable_uses_only_time_and_precision():
+    """``timezone``, ``before``, ``after``, ``calendarmodel`` are constants
+    in DPLA's writes; including them in the comparable key would
+    silently churn statements on every re-sync if any drift crept in."""
+    from tools import sdc_sync
+
+    v = _time_value("+1945-01-01T00:00:00Z", 9)
+    assert sdc_sync._time_comparable(v) == "+1945-01-01T00:00:00Z|P9"
+
+
+def test_time_comparable_distinguishes_precision():
+    """Same time, different precision → different comparable. ``1945``
+    (year) and ``1945-01-01`` (day) must NOT collapse to the same key —
+    they're different facts about the same item."""
+    from tools import sdc_sync
+
+    year = sdc_sync._time_comparable(_time_value("+1945-01-01T00:00:00Z", 9))
+    day = sdc_sync._time_comparable(_time_value("+1945-01-01T00:00:00Z", 11))
+    assert year != day
+
+
+def test_extract_comparable_value_handles_value_typed_time():
+    """``_extract_comparable_value`` must produce the same canonical key
+    for sdc.json-side claims as the reconciler extracts from Commons
+    statements; otherwise expected/observed never line up and the
+    reconciler removes valid claims (or fails to remove stale ones)."""
+    from tools import sdc_sync
+
+    claim = _value_typed_p571_claim("Z$1", "+1945-01-01T00:00:00Z", 9, "1945")
+    assert sdc_sync._extract_comparable_value(claim) == "+1945-01-01T00:00:00Z|P9"
+
+
+def test_extract_comparable_value_still_handles_somevalue_p571():
+    """Backward-compatibility: existing somevalue+P1932 claims (still on
+    Commons until the migration completes) continue to compare by the
+    P1932 stated-as string."""
+    from tools import sdc_sync
+
+    claim = _somevalue_p571_claim("Z$2", "During the Gilded Age")
+    assert sdc_sync._extract_comparable_value(claim) == "During the Gilded Age"
+
+
+def test_reconciler_migrates_old_somevalue_to_new_value_typed(monkeypatch):
+    """End-to-end idempotency check the user called out explicitly:
+
+      * Commons currently holds the OLD somevalue+P1932="1945" claim
+        (DPLA-authored from a prior healthy run).
+      * The new sdc.json holds a value-typed P571 with the same
+        underlying date.
+      * The reconciler MUST queue the old somevalue claim for removal
+        (its comparable string "1945" is not in expected[P571], which
+        now carries the canonical time key).
+      * The matching ADD side (``_post_new_claims``) handles inserting
+        the new value-typed claim; the reconciler's job is purely to
+        clean up the stale half.
+
+    One reconcile cycle migrates the file cleanly without leaving a
+    duplicate date statement on Commons."""
+    from tools import sdc_sync
+
+    # sdc.json's expected map (built from a value-typed P571 claim).
+    new_claim = _value_typed_p571_claim(
+        "WILL_BE_FRESH$1", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    expected = sdc_sync._build_expected_from_sdc({"claims": [new_claim]})
+    assert expected == {"P571": ["+1945-01-01T00:00:00Z|P9"]}
+
+    # Commons-side state: the OLD somevalue+P1932="1945" claim.
+    stale_old = _somevalue_p571_claim("M999$OLD", "1945")
+    entity = {"pageid": 999, "statements": {"P571": [stale_old]}}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, params.get("claim")))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [("wbremoveclaims", "M999$OLD")], submit_calls
+
+
+def test_reconciler_leaves_value_typed_claim_alone_when_unchanged(monkeypatch):
+    """No-op after migration: a value-typed P571 on Commons matches the
+    same canonical key in expected, so the reconciler doesn't queue any
+    removal."""
+    from tools import sdc_sync
+
+    new_claim = _value_typed_p571_claim(
+        "WILL_BE_FRESH$1", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    expected = sdc_sync._build_expected_from_sdc({"claims": [new_claim]})
+
+    on_commons = _value_typed_p571_claim(
+        "M999$LIVE", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    entity = {"pageid": 999, "statements": {"P571": [on_commons]}}
+
+    submit_calls = []
+
+    def fake_submit(*a, **k):
+        submit_calls.append((a, k))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == []
+
+
+def test_reconciler_removes_value_typed_claim_when_dpla_dropped_the_date(monkeypatch):
+    """When DPLA drops a date (sdc.json no longer carries that P571 at
+    all), the reconciler must clean up the prior value-typed claim too
+    — same contract as for somevalue claims. Regression guard against
+    the dtype=time branch in the value-side extraction loop being
+    forgotten."""
+    from tools import sdc_sync
+
+    # New sdc.json has NO P571 claim at all.
+    expected = sdc_sync._build_expected_from_sdc({"claims": []})
+    assert expected == {}
+
+    stale_live = _value_typed_p571_claim(
+        "M999$STALE", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    entity = {"pageid": 999, "statements": {"P571": [stale_live]}}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, params.get("claim")))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [("wbremoveclaims", "M999$STALE")], submit_calls
+
+
+def test_check_time_kind_recognises_existing_value_typed_match():
+    """When the new sdc.json's value-typed P571 already exists on
+    Commons with the same canonical key AND is DPLA-authored,
+    ``check()`` returns ``(False, ref)`` — i.e. "don't re-add". The
+    no-op behavior after migration relies on this."""
+    from tools import sdc_sync
+
+    existing = _value_typed_p571_claim("M999$LIVE", "+1945-01-01T00:00:00Z", 9, "1945")
+    entity = {"pageid": 999, "statements": {"P571": [existing]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check("M999", ("time", "+1945-01-01T00:00:00Z|P9"), "P571")
+
+    assert result == (False, "")
+
+
+def test_check_time_kind_does_not_match_old_somevalue_claim():
+    """The migration relies on this: the new value-typed claim is added
+    even when an OLD somevalue+P1932 claim exists for the same date
+    (so ``_post_new_claims`` runs first to insert the new shape;
+    ``_reconcile_existing_claims`` then removes the old)."""
+    from tools import sdc_sync
+
+    old_somevalue = _somevalue_p571_claim("M999$OLD", "1945")
+    entity = {"pageid": 999, "statements": {"P571": [old_somevalue]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check("M999", ("time", "+1945-01-01T00:00:00Z|P9"), "P571")
+
+    # First element True = "go ahead and add the new claim".
+    assert result[0] is True
+
+
+def test_reconciler_queues_removal_for_malformed_commons_time_value():
+    """Defensive: a community editor (or partial import) could leave a P571
+    statement with snaktype=value, type=time, but a value dict missing
+    ``time`` or ``precision``. Without the guard, ``_time_comparable``
+    raises KeyError, the for-loop unwinds, and the WHOLE reconciler
+    crashes for this file (and — in a fresh process — silently leaves
+    the remaining files in the batch unreconciled).
+
+    With the guard, the malformed statement is queued for removal
+    (matching the somevalue-missing-qualifier branch's behavior), the
+    loop continues, and the rest of the reconciler runs."""
+    from tools import sdc_sync
+
+    expected = {"P571": ["+1945-01-01T00:00:00Z|P9"]}
+    malformed_stmt = {
+        "id": "M999$BORK",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            # datavalue type is "time" but the inner value is missing "precision"
+            "datavalue": {"value": {"time": "+1945-01-01T00:00:00Z"}, "type": "time"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference()],
+    }
+    entity = {"pageid": 999, "statements": {"P571": [malformed_stmt]}}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, params.get("claim")))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [("wbremoveclaims", "M999$BORK")], submit_calls
+
+
+def test_check_time_kind_does_not_crash_on_malformed_commons_value():
+    """A Commons statement with snaktype=value and dtype=time but a
+    malformed value dict (missing ``precision``) must not crash
+    ``check()``. The KeyError would otherwise propagate past
+    ``process_one_from_sdc``'s APIError-only handler, abort the entire
+    ordinal, and prevent ``_reconcile_existing_claims`` from cleaning up
+    the malformed statement.
+
+    Expected behavior: ``check()`` treats the malformed statement as
+    non-matching, returns True (add the new claim), and the reconciler's
+    own defensive guard later queues the malformed statement for
+    removal."""
+    from tools import sdc_sync
+
+    malformed_stmt = {
+        "id": "M999$BORK",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            # datavalue type is "time" but inner value is missing "precision"
+            "datavalue": {"value": {"time": "+1945-01-01T00:00:00Z"}, "type": "time"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference()],
+    }
+    entity = {"pageid": 999, "statements": {"P571": [malformed_stmt]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check("M999", ("time", "+1945-01-01T00:00:00Z|P9"), "P571")
+
+    assert result[0] is True
+
+
+def test_extract_comparable_value_returns_none_for_malformed_time():
+    """Parallel guard on the sdc.json side. If _wikibase_time ever
+    regresses or a hand-crafted fixture omits a field, build_expected_from_sdc
+    must skip the broken claim rather than crash the whole expected-map
+    construction."""
+    from tools import sdc_sync
+
+    broken_claim = {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datavalue": {"value": {"time": "+1945-01-01T00:00:00Z"}, "type": "time"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference()],
+    }
+    assert sdc_sync._extract_comparable_value(broken_claim) is None
+
+
+# ---------------------------------------------------------------------------
+# Circa-bit propagation in the comparable key (CodeRabbit Major finding):
+# without including P1480 presence in the comparable, a DPLA source-string
+# change "1945" ↔ "circa 1945" doesn't trigger the reconciler to add or
+# remove the P1480 qualifier on the existing Commons claim. The
+# _time_claim_comparable wrapper adds a "|circa" suffix when the claim
+# carries P1480 = Q5727902 so the two shapes have distinct identities.
+# ---------------------------------------------------------------------------
+
+
+def _value_typed_p571_with_circa(stmt_id, time_str, precision, stated_as):
+    """Build a value-typed P571 claim WITH the P1480 = Q5727902 (circa)
+    qualifier — the shape the new builder emits for approximate dates."""
+    claim = _value_typed_p571_claim(stmt_id, time_str, precision, stated_as)
+    claim["qualifiers"]["P1480"] = _qual_entity("P1480", "Q5727902")
+    return claim
+
+
+def test_circa_bit_distinguishes_otherwise_identical_claims():
+    """A circa-qualified and a definite claim with the SAME underlying
+    time + precision must produce DIFFERENT comparable keys, so the
+    reconciler can detect the migration in either direction."""
+    from tools import sdc_sync
+
+    plain = _value_typed_p571_claim("M$plain", "+1945-01-01T00:00:00Z", 9, "1945")
+    circa = _value_typed_p571_with_circa(
+        "M$circa", "+1945-01-01T00:00:00Z", 9, "circa 1945"
+    )
+
+    plain_key = sdc_sync._time_claim_comparable(plain)
+    circa_key = sdc_sync._time_claim_comparable(circa)
+
+    assert plain_key == "+1945-01-01T00:00:00Z|P9"
+    assert circa_key == "+1945-01-01T00:00:00Z|P9|circa"
+    assert plain_key != circa_key
+
+
+def test_reconciler_migrates_plain_to_circa_when_dpla_adds_decorator(monkeypatch):
+    """DPLA changes ``"1945"`` → ``"circa 1945"`` on a previously-migrated
+    item. The new sdc.json's expected key carries ``|circa``; the
+    existing Commons claim's comparable doesn't. Reconciler queues the
+    old (no-P1480) for removal so the new (with-P1480) can take its
+    place. Without the circa-bit in the comparable, both shapes
+    matched and the migration silently stalled — the bug CodeRabbit
+    flagged."""
+    from tools import sdc_sync
+
+    new_claim = _value_typed_p571_with_circa(
+        "M$NEW", "+1945-01-01T00:00:00Z", 9, "circa 1945"
+    )
+    expected = sdc_sync._build_expected_from_sdc({"claims": [new_claim]})
+    assert expected == {"P571": ["+1945-01-01T00:00:00Z|P9|circa"]}
+
+    on_commons = _value_typed_p571_claim(
+        "M999$EXACT", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    entity = {"pageid": 999, "statements": {"P571": [on_commons]}}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, params.get("claim")))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [("wbremoveclaims", "M999$EXACT")], submit_calls
+
+
+def test_check_time_kind_treats_circa_and_exact_as_distinct():
+    """``check()``'s time branch uses the circa-bit too. An exact claim
+    on Commons does NOT match a circa target — so the new circa
+    claim gets added, and the exact one gets reconciled away."""
+    from tools import sdc_sync
+
+    exact_on_commons = _value_typed_p571_claim(
+        "M999$EXACT", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    entity = {"pageid": 999, "statements": {"P571": [exact_on_commons]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check(
+            "M999", ("time", "+1945-01-01T00:00:00Z|P9|circa"), "P571"
+        )
+
+    # True = "add the new claim alongside" — the exact claim doesn't
+    # collide with the circa claim now.
+    assert result[0] is True
+
+
+# ---------------------------------------------------------------------------
+# Legacy `_build_expected_from_parsed` must protect BOTH shapes for P571
+# (CodeRabbit Major finding): otherwise a legacy --file/--cat/--list
+# rerun against a file that partner mode has migrated to value-typed
+# time would see the migrated claim's canonical comparable as
+# "unexpected" and queue it for removal.
+# ---------------------------------------------------------------------------
+
+
+def test_build_expected_from_parsed_includes_both_shapes_for_p571(monkeypatch):
+    """The legacy expected map's P571 entry must include the raw
+    display-date string (for unmigrated somevalue+P1932 claims) AND
+    the canonical time-comparable key for the parseable subset (for
+    migrated value-typed claims), so a rerun after partner-mode
+    migration doesn't strip the migrated claim."""
+    from tools import sdc_sync
+
+    # `_build_expected_from_parsed` reads the module-global ``rights``
+    # (populated by ``_initialize()`` in production). Pin it explicitly
+    # so this test is self-contained — passes when run in isolation,
+    # under reordering, or under pytest-randomly.
+    monkeypatch.setattr(sdc_sync, "rights", {}, raising=False)
+
+    expected = sdc_sync._build_expected_from_parsed(
+        dpla_id="abcdef",
+        url="http://example.com/x",
+        descs=[],
+        dates=["1945", "circa 1929-10", "During the Gilded Age"],
+        titles=[],
+        hub="Q1",
+        local_ids=[],
+        institution="Q2",
+        rs="",
+        creators=[],
+        subjects=[],
+        naids=[],
+        access="",
+        level="",
+    )
+    p571 = expected["P571"]
+    # Raw strings preserved for old-shape somevalue+P1932 protection.
+    assert "1945" in p571
+    assert "circa 1929-10" in p571
+    assert "During the Gilded Age" in p571
+    # Canonical time keys added for the parseable subset.
+    assert "+1945-01-01T00:00:00Z|P9" in p571
+    assert "+1929-10-01T00:00:00Z|P10|circa" in p571
+    # Unparseable date contributes only the raw string (no canonical key).
+    canonical_keys = [v for v in p571 if v.startswith("+")]
+    # 2 parseables → exactly 2 canonical entries.
+    assert len(canonical_keys) == 2

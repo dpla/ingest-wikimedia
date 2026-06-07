@@ -48,6 +48,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from typing import Any
@@ -69,6 +70,15 @@ Q_AGGREGATOR = "Q108296843"
 Q_CONTRIBUTING_INSTITUTION = "Q108296919"
 Q_NARA_ITEM = "Q11723795"
 Q_NARA_FILE_UNIT = "Q59221146"
+
+# https://www.wikidata.org/wiki/Q5727902 — the canonical value for the
+# ``sourcing circumstances`` (P1480) qualifier when a date is approximate
+# (circa / c. / ca. / ~ / brackets / trailing ?). Per
+# https://www.wikidata.org/wiki/Help:Dates#Inexact_dates, this is the
+# qualifier convention for inexact dates — distinct from year/decade
+# precision, which conveys "we know the year but not the day" rather
+# than "the year itself is approximate".
+Q_CIRCA = "Q5727902"
 
 # NARA-only mappings.
 NARA_ACCESS_CODES = {
@@ -681,15 +691,218 @@ def _build_creator_claim(
     return claim
 
 
+_GREGORIAN_CALENDAR = "http://www.wikidata.org/entity/Q1985727"
+
+# Wikibase time-datavalue precision codes used here:
+#   8  = decade  (e.g. "1940s"        → +1940-01-01)
+#   9  = year   (e.g. "1945"          → +1945-01-01)
+#   10 = month  (e.g. "1945-06"       → +1945-06-01)
+#   11 = day    (e.g. "1945-06-07"    → +1945-06-07)
+_PRECISION_DECADE = 8
+_PRECISION_YEAR = 9
+_PRECISION_MONTH = 10
+_PRECISION_DAY = 11
+
+# DPLA decorators stripped before pattern-matching. Repeat iteratively so
+# nested forms like "[1945?]" collapse cleanly.
+_DATE_PREFIX = re.compile(
+    r"^\s*(?:circa|c\.|ca\.|approximately|approx\.|~|\[)\s*", re.IGNORECASE
+)
+_DATE_SUFFIX = re.compile(r"\s*(?:\]|\?)\s*$")
+
+_ISO_DATE = re.compile(r"^(\d{1,4})-(\d{1,2})-(\d{1,2})$")
+_YEAR_MONTH = re.compile(r"^(\d{1,4})-(\d{1,2})$")
+_DECADE = re.compile(r"^(\d{1,4})s$")
+_YEAR_ONLY = re.compile(r"^(\d{1,4})$")
+
+
+def _wikibase_time(time_str: str, precision: int) -> dict:
+    """Construct the canonical ``value`` payload for a Wikibase time
+    datavalue. ``timezone``, ``before``, ``after``, and ``calendarmodel``
+    are pinned to constants — DPLA only emits proleptic Gregorian dates
+    with no explicit uncertainty bounds, and downstream consumers
+    (notably the reconciler's comparable key) treat any drift in those
+    fields as "different claim, rewrite it" — which would churn millions
+    of statements on every re-sync.
+    """
+    return {
+        "time": time_str,
+        "precision": precision,
+        "before": 0,
+        "after": 0,
+        "timezone": 0,
+        "calendarmodel": _GREGORIAN_CALENDAR,
+    }
+
+
+def _strip_date_decorators(s: str) -> tuple[str, bool]:
+    """Iteratively strip leading ``circa``/``c.``/``ca.``/
+    ``approximately``/``~``/``[`` and trailing ``]``/``?`` so nested
+    patterns (``[1945?]``, ``circa [1945]``) collapse cleanly.
+
+    Returns the stripped string AND a flag recording whether any
+    decorator was actually removed — the flag drives the P1480
+    qualifier the builder stamps to mark the date as approximate."""
+    prev = None
+    stripped = False
+    while prev != s:
+        prev = s
+        new = _DATE_PREFIX.sub("", s)
+        new = _DATE_SUFFIX.sub("", new)
+        if new != s:
+            stripped = True
+        s = new
+    return s.strip(), stripped
+
+
+def parse_dpla_date(date_string: str) -> dict | None:
+    """Parse a DPLA display-date string into a structured representation,
+    or ``None`` when the input is too messy to commit to a Wikibase
+    time value.
+
+    On success returns a dict::
+
+        {
+            "value": <Wikibase time-datavalue value dict>,
+            "approximate": bool,
+        }
+
+    ``approximate`` is True when the source string carried a
+    ``circa``/``c.``/``ca.``/``approximately``/``~``/``[…]``/``?``
+    decorator. The caller stamps a ``P1480 = Q5727902`` (sourcing
+    circumstances = circa) qualifier on the claim in that case, per
+    https://www.wikidata.org/wiki/Help:Dates#Inexact_dates — distinct
+    from year/decade precision (which conveys "we know the year but
+    not the day", a different shape of uncertainty than "the year
+    itself is approximate").
+
+    Recognised single-date shapes (after decorator stripping):
+
+      * ``YYYY-MM-DD``   → precision 11 (day)
+      * ``YYYY-MM``      → precision 10 (month)
+      * ``YYYYs``        → precision 8 (decade), accepted only when the
+                            year is decade-aligned (e.g. ``1940s``, not
+                            ``1945s``)
+      * ``YYYY``         → precision 9 (year)
+
+    Returns None for ranges (``1945-1950``), BC dates (``500 BC``), free
+    prose (``During the Gilded Age``), era markers (``1945 AD``),
+    parenthesised forms (``(1945)``), month names (``January 1945``),
+    "before"/"after"/"between" prefixes, or any other shape that
+    leaves unrecognised text in the residue after decorator stripping
+    — the builder falls back to ``somevalue + P1932 stated-as`` for
+    those, so the original DPLA string is preserved verbatim
+    regardless of parse outcome.
+
+    Conservative-fallback contract: every regex above is anchored
+    (``^…$``), so ANY non-date text adjacent to a recognised pattern
+    forces a fallback. Decorator-stripping only removes the specific
+    markers we know how to encode as a P1480 qualifier; anything else
+    survives and breaks the regex match. There is no path where the
+    parser silently drops meaningful text and produces a false
+    precision.
+
+    Year 0 returns None: proleptic Gregorian has no year 0, and
+    ``datetime.date(0, …)`` would crash the calendar-arithmetic
+    validation below.
+
+    The ``value`` payload must round-trip through
+    ``tools.sdc_sync._time_comparable`` to produce the canonical key the
+    reconciler matches Commons statements against. If the
+    Wikibase-time-datavalue shape changes here, mirror the change there.
+    """
+    if not date_string:
+        return None
+    s, approximate = _strip_date_decorators(date_string.strip())
+    if not s:
+        return None
+
+    def _ok(value: dict) -> dict:
+        return {"value": value, "approximate": approximate}
+
+    m = _ISO_DATE.match(s)
+    if m:
+        y, mo, d = int(m[1]), int(m[2]), int(m[3])
+        if y == 0:
+            return None
+        try:
+            datetime.date(y, mo, d)
+        except ValueError:
+            pass
+        else:
+            return _ok(
+                _wikibase_time(f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY)
+            )
+
+    m = _YEAR_MONTH.match(s)
+    if m:
+        y, mo = int(m[1]), int(m[2])
+        if y != 0 and 1 <= mo <= 12:
+            return _ok(
+                _wikibase_time(f"+{y:04d}-{mo:02d}-01T00:00:00Z", _PRECISION_MONTH)
+            )
+
+    m = _DECADE.match(s)
+    if m:
+        y = int(m[1])
+        # Accept only decade-aligned years so "1945s" (almost certainly a
+        # typo for "1945") doesn't quietly become decade-precision.
+        if y != 0 and y % 10 == 0:
+            return _ok(_wikibase_time(f"+{y:04d}-01-01T00:00:00Z", _PRECISION_DECADE))
+
+    m = _YEAR_ONLY.match(s)
+    if m:
+        y = int(m[1])
+        if y != 0:
+            return _ok(_wikibase_time(f"+{y:04d}-01-01T00:00:00Z", _PRECISION_YEAR))
+
+    return None
+
+
 def _build_date_claim(
     date: str,
     dpla_id: str,
     retrieval_date: datetime.date,
 ) -> dict | None:
+    """Build a P571 (inception) claim from a DPLA display-date string.
+
+    When the string parses to a structured time value, emit a value-typed
+    P571 with a ``time`` datavalue at appropriate precision. When it
+    doesn't, fall back to ``somevalue`` with the raw string in a P1932
+    (stated as) qualifier — preserves today's behavior for any date the
+    parser can't commit to.
+
+    The P1932 qualifier is ALWAYS stamped, even on the value-typed
+    branch, so the original DPLA-supplied display string is recoverable
+    by readers (and so the template module can keep rendering whatever
+    text DPLA chose, rather than re-formatting from the structured
+    value).
+
+    When the source carried a ``circa``/``c.``/``ca.``/brackets/``?``
+    decorator (parser ``approximate`` flag), the claim also gets a
+    ``P1480 = Q5727902`` (sourcing circumstances = circa) qualifier,
+    per https://www.wikidata.org/wiki/Help:Dates#Inexact_dates. The
+    structured year-precision time + P1480 qualifier together carry the
+    "approximate" semantic into Wikidata-shaped queries; the P1932
+    qualifier still preserves the verbatim source string for display.
+
+    Idempotency note: the reconciler treats the OLD somevalue claim and
+    the NEW value-typed claim as different (their comparable keys
+    differ — the somevalue's P1932 string vs. the value-typed time
+    canonical key), so a re-sync after this change cleanly migrates the
+    Commons statement from somevalue to value-typed in one cycle
+    (old removed, new added).
+    """
     normalized = _truncate(date)
     if not normalized:
         return None
-    claim = formattedclaim("P571", "somevalue", "time", dpla_id, retrieval_date)
+    parsed = parse_dpla_date(normalized)
+    if parsed is not None:
+        claim = formattedclaim("P571", parsed["value"], "time", dpla_id, retrieval_date)
+        if parsed["approximate"]:
+            claim["qualifiers"]["P1480"] = [_qualifier_item_snak("P1480", Q_CIRCA)]
+    else:
+        claim = formattedclaim("P571", "somevalue", "time", dpla_id, retrieval_date)
     claim["qualifiers"]["P1932"] = [_qualifier_string_snak("P1932", normalized)]
     return claim
 

@@ -17,6 +17,8 @@ from ingest_wikimedia.sdc import (
     NARA_LEVELS,
     Q_NARA_FILE_UNIT,
     Q_NARA_ITEM,
+    _build_date_claim,
+    parse_dpla_date,
     parse_nara_access_level,
 )
 
@@ -192,3 +194,261 @@ def test_all_documented_levels_round_trip():
         assert level == expected_qid, (
             f"root {lvl_key} expected {expected_qid}, got {level}"
         )
+
+
+# ---------------------------------------------------------------------------
+# parse_dpla_date — opportunistic structured time extraction from DPLA's
+# free-text displayDate strings. A None return is a feature: the claim
+# builder falls back to somevalue + P1932 stated-as, preserving the
+# original DPLA prose for the wiki template to render verbatim.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_year_only():
+    """The most common DPLA date shape — no decorators, so not approximate."""
+    parsed = parse_dpla_date("1945")
+    assert parsed["value"] == {
+        "time": "+1945-01-01T00:00:00Z",
+        "precision": 9,
+        "before": 0,
+        "after": 0,
+        "timezone": 0,
+        "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+    }
+    assert parsed["approximate"] is False
+
+
+def test_parse_year_month():
+    parsed = parse_dpla_date("1945-06")
+    assert parsed["value"]["time"] == "+1945-06-01T00:00:00Z"
+    assert parsed["value"]["precision"] == 10
+    assert parsed["approximate"] is False
+
+
+def test_parse_full_iso_date():
+    parsed = parse_dpla_date("1945-06-07")
+    assert parsed["value"]["time"] == "+1945-06-07T00:00:00Z"
+    assert parsed["value"]["precision"] == 11
+    assert parsed["approximate"] is False
+
+
+def test_parse_decade():
+    """``1940s`` → precision 8, time pinned to decade-start. Decade
+    precision is structural (it says "this happened in the 1940s"), NOT
+    "approximate" in the P1480 sense — so ``approximate`` stays False."""
+    parsed = parse_dpla_date("1940s")
+    assert parsed["value"]["time"] == "+1940-01-01T00:00:00Z"
+    assert parsed["value"]["precision"] == 8
+    assert parsed["approximate"] is False
+
+
+def test_parse_decade_rejects_non_decade_year():
+    """``1945s`` is almost certainly a typo for ``1945``. Refuse to
+    silently coerce it to decade precision."""
+    assert parse_dpla_date("1945s") is None
+
+
+def test_parse_circa_marks_approximate():
+    """``circa`` (and equivalents) carry uncertainty into the structured
+    claim via the ``approximate`` flag — the caller stamps
+    ``P1480 = Q5727902`` on the resulting claim."""
+    parsed = parse_dpla_date("circa 1945")
+    assert parsed["value"]["time"] == "+1945-01-01T00:00:00Z"
+    assert parsed["value"]["precision"] == 9
+    assert parsed["approximate"] is True
+
+
+def test_parse_strips_c_ca_approximately_tilde_marks_approximate():
+    """All circa-equivalent prefixes set the approximate flag."""
+    for src in ("c. 1945", "ca. 1945", "approximately 1945", "approx. 1945", "~1945"):
+        parsed = parse_dpla_date(src)
+        assert parsed["value"]["time"] == "+1945-01-01T00:00:00Z", src
+        assert parsed["approximate"] is True, (
+            f"{src!r} should mark the date approximate"
+        )
+
+
+def test_parse_brackets_and_question_mark_mark_approximate():
+    """Archival convention: bracketed dates (``[1945]``) and
+    trailing-question-mark dates (``1945?``) are both inexact —
+    treat them as approximate. Nested decorators collapse
+    iteratively."""
+    for src in ("[1945]", "[1945?]", "1945?"):
+        parsed = parse_dpla_date(src)
+        assert parsed["value"]["time"] == "+1945-01-01T00:00:00Z", src
+        assert parsed["approximate"] is True, src
+
+
+def test_parse_rejects_range():
+    """``1945-1950`` is a range, not a single date. Wikibase has no
+    canonical single-time representation; fall back to somevalue+P1932
+    so the original string is preserved."""
+    assert parse_dpla_date("1945-1950") is None
+
+
+def test_parse_rejects_free_prose():
+    """The single biggest motivation for the somevalue fallback — DPLA
+    carries a long tail of un-coercable date strings that must still
+    surface in the template."""
+    assert parse_dpla_date("During the Gilded Age") is None
+    assert parse_dpla_date("could not be determined") is None
+    assert parse_dpla_date("unknown") is None
+
+
+def test_parse_rejects_year_zero():
+    """Proleptic Gregorian has no year zero; defensive guard."""
+    assert parse_dpla_date("0") is None
+    assert parse_dpla_date("0000") is None
+
+
+def test_parse_rejects_bc_year():
+    """BC years are out of the year-only regex's scope — fall back so
+    the original string survives. Could be added later if a hub
+    needs it."""
+    assert parse_dpla_date("-500") is None
+    assert parse_dpla_date("500 BC") is None
+
+
+def test_parse_rejects_invalid_iso_date():
+    """``datetime.date`` validation catches Feb 30 / month > 12; the
+    less-precise regexes don't accept this shape either, so the
+    result is None — not a silent fallback to a coarser precision."""
+    assert parse_dpla_date("2024-02-30") is None
+    assert parse_dpla_date("2024-13-01") is None
+
+
+def test_parse_rejects_empty_and_whitespace():
+    assert parse_dpla_date("") is None
+    assert parse_dpla_date("   ") is None
+    assert parse_dpla_date(None) is None
+
+
+def test_parse_falls_back_when_residue_has_unrecognised_text():
+    """Conservative-fallback contract: any text the parser can't map to
+    either a recognised precision (year/month/day/decade) OR a
+    recognised qualifier (the circa-mappable decorators) MUST cause
+    the whole parse to fall back to ``None``. Otherwise we'd silently
+    strip meaningful text (era markers, month names, parens, "before",
+    free prose adjacent to a year) and emit a structured date that
+    doesn't actually represent the source.
+
+    The builder turns ``None`` into a ``somevalue + P1932`` claim with
+    the verbatim DPLA string preserved — so the template still
+    renders the original prose. Zero false-precision risk."""
+    cases = [
+        # Era markers — not stripped, not recognised in any regex.
+        "1945 AD",
+        "AD 1945",
+        "1945 BCE",
+        # Range-y / multi-date prose.
+        "1945 or 1946",
+        "1945 and 1946",
+        "before 1945",
+        "after 1945",
+        "between 1945 and 1950",
+        # Month-name prefixes / season markers — not stripped.
+        "January 1945",
+        "Jan 1945",
+        "Spring 1945",
+        "summer 1945",
+        # Parenthesised forms — parens not in the decorator list.
+        "(1945)",
+        "1945 (uncertain)",
+        "1945 (approximate)",
+        # Recognised decorator + UNRECOGNISED residue.
+        "circa unknown",
+        "ca. summer 1945",
+        "approximately 1945-1950",
+        "[1945 to 1950]",
+        # Numeric residue that ISN'T a date.
+        "1945.5",
+        "v.1945",
+        "1945abc",
+        # Decade with trailing non-decade text.
+        "1940s and 1950s",
+    ]
+    for src in cases:
+        assert parse_dpla_date(src) is None, (
+            f"{src!r} should fall back to somevalue, not produce a structured date"
+        )
+
+
+def test_build_date_claim_emits_value_typed_when_parseable():
+    """Parser succeeds, no decorators → value-typed claim, NO P1480
+    qualifier (the date is definite). P1932 always carries the
+    original DPLA string."""
+    import datetime as _dt
+
+    claim = _build_date_claim("1945", "abc123", _dt.date(2026, 6, 7))
+    assert claim["mainsnak"]["snaktype"] == "value"
+    assert claim["mainsnak"]["datavalue"]["type"] == "time"
+    assert claim["mainsnak"]["datavalue"]["value"]["precision"] == 9
+    assert claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == "1945"
+    assert "P1480" not in claim["qualifiers"]
+
+
+def test_build_date_claim_stamps_p1480_for_circa():
+    """Parser flagged the date as approximate → claim gets a P1480
+    qualifier with value Q5727902 (circa), per Wikidata Help:Dates
+    convention for inexact dates. The structured time value AND the
+    P1480 marker together represent "around 1945" in a Wikidata-shaped
+    way; P1932 still carries the verbatim source string."""
+    import datetime as _dt
+
+    claim = _build_date_claim("circa 1945", "abc123", _dt.date(2026, 6, 7))
+    assert claim["mainsnak"]["snaktype"] == "value"
+    assert claim["mainsnak"]["datavalue"]["value"]["precision"] == 9
+    # P1932 preserves the verbatim source decoration.
+    assert claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == "circa 1945"
+    # P1480 = Q5727902 (circa). _item_value uses numeric-id encoding.
+    p1480 = claim["qualifiers"]["P1480"][0]
+    assert p1480["property"] == "P1480"
+    assert p1480["datavalue"]["type"] == "wikibase-entityid"
+    assert p1480["datavalue"]["value"]["numeric-id"] == 5727902
+    assert p1480["datavalue"]["value"]["entity-type"] == "item"
+
+
+def test_build_date_claim_stamps_p1480_for_bracketed_and_question_mark():
+    """Brackets and trailing ? both indicate inexact dates → P1480."""
+    import datetime as _dt
+
+    for src in ("[1945]", "1945?", "[1945?]"):
+        claim = _build_date_claim(src, "abc123", _dt.date(2026, 6, 7))
+        assert "P1480" in claim["qualifiers"], (
+            f"{src!r} should produce a P1480 qualifier"
+        )
+        assert (
+            claim["qualifiers"]["P1480"][0]["datavalue"]["value"]["numeric-id"]
+            == 5727902
+        ), src
+
+
+def test_build_date_claim_no_p1480_for_decade():
+    """Decade precision is structural, not "approximate" in the P1480
+    sense — ``1940s`` stays without P1480."""
+    import datetime as _dt
+
+    claim = _build_date_claim("1940s", "abc123", _dt.date(2026, 6, 7))
+    assert claim["mainsnak"]["datavalue"]["value"]["precision"] == 8
+    assert "P1480" not in claim["qualifiers"]
+
+
+def test_build_date_claim_falls_back_to_somevalue_when_unparseable():
+    """somevalue + P1932 fallback preserves DPLA's exact prose."""
+    import datetime as _dt
+
+    claim = _build_date_claim("During the Gilded Age", "abc123", _dt.date(2026, 6, 7))
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    assert "datavalue" not in claim["mainsnak"]
+    assert (
+        claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == "During the Gilded Age"
+    )
+
+
+def test_build_date_claim_returns_none_for_empty_input():
+    """Matches the pre-existing contract so the caller's
+    ``if c is not None`` loop short-circuits cleanly."""
+    import datetime as _dt
+
+    assert _build_date_claim("", "abc123", _dt.date(2026, 6, 7)) is None
+    assert _build_date_claim("   ", "abc123", _dt.date(2026, 6, 7)) is None
