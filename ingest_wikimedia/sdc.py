@@ -48,11 +48,11 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup
 
 # Hardcoded Wikibase entities used across the SDC mapping. Centralized here
 # so any change has a single edit site.
@@ -85,6 +85,53 @@ NARA_LEVELS = {
 }
 NARA_PROVIDER_NAME = "National Archives and Records Administration"
 NARA_CATALOG_PREFIX = "https://catalog.archives.gov/id/"
+
+
+def parse_nara_access_level(string_value: str) -> tuple[str, str]:
+    """Extract ``(access_qid, level_qid)`` from a NARA item's
+    ``originalRecord["stringValue"]`` XML payload.
+
+    Returns ``""`` for either field when it isn't present in the
+    record — these are legitimate empty cases (the NARA item just
+    doesn't carry that specific descriptor).
+
+    Raises :class:`xml.etree.ElementTree.ParseError` on malformed
+    XML. Callers MUST let this propagate to the per-item error
+    boundary rather than catching-and-defaulting: returning empty
+    strings for a *parse* failure (vs. a missing-field) lets the
+    uploader write a sdc.json without P7228/P6224, and the next
+    sdc-sync reconciler run would then strip those claims off
+    Commons files where they were correctly written by a prior
+    healthy run.
+
+    The previous implementation used ``BeautifulSoup(..., "xml")``,
+    which silently degraded to "no access / no level" whenever
+    lxml wasn't installed on the host — exactly the silent-failure
+    pattern this signature deliberately rules out. Stdlib's
+    ElementTree is always available, removing the dependency.
+
+    Namespace-tolerant via XPath ``{*}`` wildcards: NARA's
+    ``xmlns="http://description.das.nara.gov/"`` is matched without
+    requiring a specific prefix or URI.
+    """
+    root = ET.fromstring(string_value)
+
+    access = ""
+    naid_elem = root.find(".//{*}accessRestriction/{*}status/{*}naId")
+    if naid_elem is not None and naid_elem.text:
+        access = NARA_ACCESS_CODES.get(naid_elem.text.strip(), "")
+
+    # Level comes from the root element's local name — NARA records use
+    # <item>, <itemAv>, or <fileUnit> as the root and never nest them.
+    # The prior BeautifulSoup code iterated NARA_LEVELS with "last match
+    # wins", which had a latent bug: an <item> root with a stray
+    # descendant <fileUnit> got classified as fileUnit. Pin to the
+    # root tag instead — descendant matches are not consulted.
+    root_local = root.tag.rsplit("}", 1)[-1] if "}" in root.tag else root.tag
+    level = NARA_LEVELS.get(root_local, "")
+
+    return access, level
+
 
 PD_MARK_URI_CANONICAL = "http://creativecommons.org/publicdomain/mark/1.0"
 
@@ -461,27 +508,10 @@ def parse_dpla_doc(
         naids = doc["sourceResource"]["identifier"]
         if isinstance(naids, str):
             naids = [naids]
-        access = ""
-        level = ""
-        try:
-            xml = BeautifulSoup(doc["originalRecord"]["stringValue"], "xml")
-        except Exception as e:
-            logger.warning("Skipping NARA XML parse for %s: %s", dpla_id, e)
-            xml = None
-        if xml is not None:
-            try:
-                access_naid = str(
-                    xml.find("accessRestriction").find("status").find("naId").text
-                )
-                access = NARA_ACCESS_CODES.get(access_naid, "")
-            except (AttributeError, TypeError) as e:
-                # Any .find() returning None breaks the chain — log so a
-                # silently-missing access restriction is observable.
-                logger.debug("NARA access restriction missing for %s: %s", dpla_id, e)
-                access = ""
-            for lvl_key in NARA_LEVELS:
-                if xml.find(lvl_key):
-                    level = NARA_LEVELS[lvl_key]
+        # Malformed NARA XML raises ET.ParseError here — intentionally
+        # propagated to the per-item boundary (writing a partial sdc.json
+        # lets the reconciler later strip valid P7228/P6224 claims).
+        access, level = parse_nara_access_level(doc["originalRecord"]["stringValue"])
         local_ids = []
     else:
         naids = []
