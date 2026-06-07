@@ -1053,25 +1053,12 @@ def test_set_claim_target_rejects_unknown_value_type():
         sdc_sync._set_claim_target(claim, repo, {}, "time")
 
 
-# --------------------------------------------------------------------------
-# _reconcile_existing_claims — fetches Commons MediaInfo state and queues
-# wbremoveclaims for DPLA-referenced claims whose value isn't in `expected`.
-#
-# Critical regression history: until this fix, the reconciler used a bare
-# `requests.get(Special:EntityData/{mediaid}.json).json()` which Wikimedia
-# now (per phab T400119) rejects with HTTP 403 + "Please set a user-agent"
-# for the default `python-requests/X.Y` UA. The function's broad
-# `except Exception:` swallowed the JSONDecodeError, set file_claims to
-# an empty entity, and queued zero removals across every file. Routing
-# through `get_entity` reuses pywikibot's properly-configured session
-# (correct UA, CSRF, maxlag honoring) so this can't recur.
-# --------------------------------------------------------------------------
+# Regression coverage for the Special:EntityData UA-403 silent-failure bug
+# in `_reconcile_existing_claims` (phab T400119).
 
 
 def _stmt(stmt_id, prop, snaktype, value, qualifiers=None, references=None):
-    """Build a Commons statement dict in the shape Special:EntityData returns
-    (also matches wbgetentities). Used to construct entities for reconciler
-    test scenarios."""
+    """Build a Commons statement dict in the wbgetentities shape."""
     if snaktype == "somevalue":
         mainsnak = {"snaktype": "somevalue", "property": prop}
     elif prop == "P760":
@@ -1102,17 +1089,7 @@ def _stmt(stmt_id, prop, snaktype, value, qualifiers=None, references=None):
 
 
 def test_reconciler_queues_removal_for_stale_p170_string():
-    """Production bug case (Cherokee Petition, M192627579): a DPLA-referenced
-    P170=somevalue claim's P2093 qualifier was written by an earlier
-    sdc-sync run with a different date stringification ("U.S. Senate.
-    3/4/1789") than the current sdc.json's value ("U.S. Senate.
-    (03/04/1789)"). The reconciler must recognize the existing claim's
-    qualifier value is not in `expected[P170]` and queue it for removal.
-
-    The pre-fix reconciler queued zero removals for this exact item
-    because its `requests.get(...)` was rejected with HTTP 403 by
-    Wikimedia and the resulting JSONDecodeError was silently swallowed
-    in an `except Exception:` block."""
+    """Stale DPLA-referenced P170 qualifier (value not in `expected`) is queued for wbremoveclaims."""
     from tools import sdc_sync
 
     stale_stmt = _stmt(
@@ -1153,8 +1130,7 @@ def test_reconciler_queues_removal_for_stale_p170_string():
 
 
 def test_reconciler_keeps_claim_when_value_matches_expected():
-    """A DPLA-referenced claim whose P2093 value IS in `expected` must stay.
-    The fix must not have over-corrected into removing healthy claims."""
+    """Healthy DPLA-referenced claim whose value is in `expected` is left alone."""
     from tools import sdc_sync
 
     good_stmt = _stmt(
@@ -1191,14 +1167,9 @@ def test_reconciler_keeps_claim_when_value_matches_expected():
 
 
 def test_reconciler_ignores_foreign_claim_without_dpla_reference():
-    """Claims without a DPLA-publisher reference are not DPLA-authored and
-    must be left alone, even if their value isn't in expected. This is
-    the user-authored-statement invariant (also enforced by
-    `_is_safe_to_amend_in_place` on the write side)."""
+    """Foreign (non-DPLA-referenced) claim is never queued for removal, even when its value isn't in `expected`."""
     from tools import sdc_sync
 
-    # Mainsnak matches a healthy DPLA claim's value, but no DPLA reference
-    # — a community editor's statement.
     foreign_stmt = _stmt(
         stmt_id="M999$FOREIGN",
         prop="P170",
@@ -1230,27 +1201,18 @@ def test_reconciler_ignores_foreign_claim_without_dpla_reference():
 
 
 def test_reconciler_propagates_get_entity_error():
-    """When the entity fetch raises (network failure, 403, etc.), the
-    reconciler must let the exception propagate to the per-ordinal
-    boundary in `_run_partner_mode` — NOT silently swallow it and
-    fall through with an empty entity, which would mean zero removals
-    queued for a working file."""
+    """Entity-fetch errors propagate (no silent fallback to an empty entity)."""
     from tools import sdc_sync
 
-    def fake_get_entity(mediaid):
-        raise RuntimeError("simulated wbgetentities failure")
-
     with (
-        patch.object(sdc_sync, "get_entity", side_effect=fake_get_entity),
+        patch.object(
+            sdc_sync,
+            "get_entity",
+            side_effect=RuntimeError("simulated wbgetentities failure"),
+        ),
         patch.object(sdc_sync, "invalidate_entity"),
+        pytest.raises(RuntimeError, match="simulated wbgetentities failure"),
     ):
-        try:
-            sdc_sync._reconcile_existing_claims(
-                "M999", "abc1234567890abcdef1234567890abcd", {"P170": ["x"]}
-            )
-        except RuntimeError as e:
-            assert "simulated wbgetentities failure" in str(e)
-        else:
-            raise AssertionError(
-                "reconciler must propagate get_entity errors; got silent fallback"
-            )
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", {"P170": ["x"]}
+        )

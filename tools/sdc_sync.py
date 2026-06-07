@@ -1513,33 +1513,18 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
     `process_one_from_sdc` (PR 4 partner-mode path). Same removal logic;
     just different sources for `expected`.
     """
-    # Fetch the file's current MediaInfo state via pywikibot's
-    # wbgetentities, NOT a bare `requests.get(...)` to Special:EntityData.
-    # Wikimedia now (per phab T400119) returns HTTP 403 to any
-    # `python-requests/X.Y`-style default User-Agent, with body
-    # "Please set a user-agent and respect our robot policy". `.json()`
-    # on that body raises JSONDecodeError. The previous broad
-    # `except Exception:` silently swallowed every such failure and
-    # fell back to `{"entities": {mediaid: {"statements": {}}}}`,
-    # so the reconciler saw zero DPLA-referenced claims on every file
-    # and queued ZERO removals across every partner-mode SDC run.
-    # Stale claims (e.g. an older author-name-string formatting that
-    # has since been replaced in sdc.json) accumulate forever.
-    #
-    # Routing through `get_entity` reuses pywikibot's
-    # `Site.simple_request`, which sets the correct UA, manages
-    # CSRF tokens, honors maxlag/Retry-After, etc. We invalidate
-    # the per-process entity cache first so this read sees the
-    # post-write state from `_post_new_claims` above. Errors here
-    # propagate to the per-ordinal exception boundary in
-    # `_run_partner_mode` (logged + counted as
-    # SDC_ORDINALS_SKIPPED_ERROR) instead of silently masking a
-    # broken reconciler.
+    # Use pywikibot's wbgetentities (via get_entity) rather than a direct
+    # requests.get to Special:EntityData: Wikimedia rejects the default
+    # python-requests UA with HTTP 403 (phab T400119), and pywikibot's
+    # Site.simple_request sets a compliant UA plus maxlag/CSRF handling.
+    # Invalidate the cache so this read sees post-write state from
+    # `_post_new_claims` above; let errors propagate to the per-ordinal
+    # boundary in `_run_partner_mode`.
     print(f" -- Accessing Commons ID {mediaid}")
     invalidate_entity(mediaid)
     entity = get_entity(mediaid)
     print(f" -- Accessed Commons ID {mediaid}")
-    statements = entity.get("statements", {}) or {}
+    statements = entity.get("statements") or {}
     dpla_claim_list = []
     removals = []
     for prop in statements:
