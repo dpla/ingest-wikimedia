@@ -323,6 +323,56 @@ def test_parse_rejects_empty_and_whitespace():
     assert parse_dpla_date(None) is None
 
 
+def test_parse_falls_back_when_residue_has_unrecognised_text():
+    """Conservative-fallback contract: any text the parser can't map to
+    either a recognised precision (year/month/day/decade) OR a
+    recognised qualifier (the circa-mappable decorators) MUST cause
+    the whole parse to fall back to ``None``. Otherwise we'd silently
+    strip meaningful text (era markers, month names, parens, "before",
+    free prose adjacent to a year) and emit a structured date that
+    doesn't actually represent the source.
+
+    The builder turns ``None`` into a ``somevalue + P1932`` claim with
+    the verbatim DPLA string preserved — so the template still
+    renders the original prose. Zero false-precision risk."""
+    cases = [
+        # Era markers — not stripped, not recognised in any regex.
+        "1945 AD",
+        "AD 1945",
+        "1945 BCE",
+        # Range-y / multi-date prose.
+        "1945 or 1946",
+        "1945 and 1946",
+        "before 1945",
+        "after 1945",
+        "between 1945 and 1950",
+        # Month-name prefixes / season markers — not stripped.
+        "January 1945",
+        "Jan 1945",
+        "Spring 1945",
+        "summer 1945",
+        # Parenthesised forms — parens not in the decorator list.
+        "(1945)",
+        "1945 (uncertain)",
+        "1945 (approximate)",
+        # Recognised decorator + UNRECOGNISED residue.
+        "circa unknown",
+        "ca. summer 1945",
+        "approximately 1945-1950",
+        "[1945 to 1950]",
+        # Numeric residue that ISN'T a date.
+        "1945.5",
+        "v.1945",
+        "1945abc",
+        # Decade with trailing non-decade text.
+        "1940s and 1950s",
+    ]
+    for src in cases:
+        assert parse_dpla_date(src) is None, (
+            f"{src!r} should fall back to somevalue, not produce a structured date"
+        )
+
+
 def test_build_date_claim_emits_value_typed_when_parseable():
     """Parser succeeds, no decorators → value-typed claim, NO P1480
     qualifier (the date is definite). P1932 always carries the

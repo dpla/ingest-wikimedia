@@ -786,10 +786,21 @@ def parse_dpla_date(date_string: str) -> dict | None:
       * ``YYYY``         → precision 9 (year)
 
     Returns None for ranges (``1945-1950``), BC dates (``500 BC``), free
-    prose (``During the Gilded Age``), or any other shape — the
-    builder falls back to ``somevalue + P1932 stated-as`` for those, so
-    the original DPLA string is preserved verbatim regardless of parse
-    outcome.
+    prose (``During the Gilded Age``), era markers (``1945 AD``),
+    parenthesised forms (``(1945)``), month names (``January 1945``),
+    "before"/"after"/"between" prefixes, or any other shape that
+    leaves unrecognised text in the residue after decorator stripping
+    — the builder falls back to ``somevalue + P1932 stated-as`` for
+    those, so the original DPLA string is preserved verbatim
+    regardless of parse outcome.
+
+    Conservative-fallback contract: every regex above is anchored
+    (``^…$``), so ANY non-date text adjacent to a recognised pattern
+    forces a fallback. Decorator-stripping only removes the specific
+    markers we know how to encode as a P1480 qualifier; anything else
+    survives and breaks the regex match. There is no path where the
+    parser silently drops meaningful text and produces a false
+    precision.
 
     Year 0 returns None: proleptic Gregorian has no year 0, and
     ``datetime.date(0, …)`` would crash the calendar-arithmetic
