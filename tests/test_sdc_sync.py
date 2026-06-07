@@ -1051,3 +1051,206 @@ def test_set_claim_target_rejects_unknown_value_type():
         sdc_sync._set_claim_target(claim, repo, "x", "globe-coordinate")
     with pytest.raises(ValueError, match="unsupported value_type"):
         sdc_sync._set_claim_target(claim, repo, {}, "time")
+
+
+# --------------------------------------------------------------------------
+# _reconcile_existing_claims — fetches Commons MediaInfo state and queues
+# wbremoveclaims for DPLA-referenced claims whose value isn't in `expected`.
+#
+# Critical regression history: until this fix, the reconciler used a bare
+# `requests.get(Special:EntityData/{mediaid}.json).json()` which Wikimedia
+# now (per phab T400119) rejects with HTTP 403 + "Please set a user-agent"
+# for the default `python-requests/X.Y` UA. The function's broad
+# `except Exception:` swallowed the JSONDecodeError, set file_claims to
+# an empty entity, and queued zero removals across every file. Routing
+# through `get_entity` reuses pywikibot's properly-configured session
+# (correct UA, CSRF, maxlag honoring) so this can't recur.
+# --------------------------------------------------------------------------
+
+
+def _stmt(stmt_id, prop, snaktype, value, qualifiers=None, references=None):
+    """Build a Commons statement dict in the shape Special:EntityData returns
+    (also matches wbgetentities). Used to construct entities for reconciler
+    test scenarios."""
+    if snaktype == "somevalue":
+        mainsnak = {"snaktype": "somevalue", "property": prop}
+    elif prop == "P760":
+        mainsnak = {
+            "snaktype": "value",
+            "property": prop,
+            "datavalue": {"value": value, "type": "string"},
+        }
+    else:
+        mainsnak = {
+            "snaktype": "value",
+            "property": prop,
+            "datavalue": {
+                "value": {
+                    "entity-type": "item",
+                    "numeric-id": int(value.replace("Q", "")),
+                    "id": value,
+                },
+                "type": "wikibase-entityid",
+            },
+        }
+    s = {"id": stmt_id, "mainsnak": mainsnak, "type": "statement", "rank": "normal"}
+    if qualifiers is not None:
+        s["qualifiers"] = qualifiers
+    if references is not None:
+        s["references"] = references
+    return s
+
+
+def test_reconciler_queues_removal_for_stale_p170_string():
+    """Production bug case (Cherokee Petition, M192627579): a DPLA-referenced
+    P170=somevalue claim's P2093 qualifier was written by an earlier
+    sdc-sync run with a different date stringification ("U.S. Senate.
+    3/4/1789") than the current sdc.json's value ("U.S. Senate.
+    (03/04/1789)"). The reconciler must recognize the existing claim's
+    qualifier value is not in `expected[P170]` and queue it for removal.
+
+    The pre-fix reconciler queued zero removals for this exact item
+    because its `requests.get(...)` was rejected with HTTP 403 by
+    Wikimedia and the resulting JSONDecodeError was silently swallowed
+    in an `except Exception:` block."""
+    from tools import sdc_sync
+
+    stale_stmt = _stmt(
+        stmt_id="M999$STALE",
+        prop="P170",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={
+            "P459": _dpla_p459(),
+            "P2093": _qual_string("P2093", "U.S. Senate. 3/4/1789"),
+        },
+        references=[_dpla_reference()],
+    )
+    entity = {"pageid": 999, "statements": {"P170": [stale_stmt]}}
+    expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, mediaid, params))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert len(submit_calls) == 1
+    action, mediaid, params = submit_calls[0]
+    assert action == "wbremoveclaims"
+    assert mediaid == "M999"
+    assert params["claim"] == "M999$STALE", (
+        f"reconciler should queue the stale claim for removal; got {params['claim']!r}"
+    )
+
+
+def test_reconciler_keeps_claim_when_value_matches_expected():
+    """A DPLA-referenced claim whose P2093 value IS in `expected` must stay.
+    The fix must not have over-corrected into removing healthy claims."""
+    from tools import sdc_sync
+
+    good_stmt = _stmt(
+        stmt_id="M999$KEEP",
+        prop="P170",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={
+            "P459": _dpla_p459(),
+            "P2093": _qual_string("P2093", "U.S. Senate. (03/04/1789)"),
+        },
+        references=[_dpla_reference()],
+    )
+    entity = {"pageid": 999, "statements": {"P170": [good_stmt]}}
+    expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
+
+    submit_calls = []
+
+    def fake_submit(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [], (
+        f"reconciler should not queue removal for a healthy claim; got {submit_calls!r}"
+    )
+
+
+def test_reconciler_ignores_foreign_claim_without_dpla_reference():
+    """Claims without a DPLA-publisher reference are not DPLA-authored and
+    must be left alone, even if their value isn't in expected. This is
+    the user-authored-statement invariant (also enforced by
+    `_is_safe_to_amend_in_place` on the write side)."""
+    from tools import sdc_sync
+
+    # Mainsnak matches a healthy DPLA claim's value, but no DPLA reference
+    # — a community editor's statement.
+    foreign_stmt = _stmt(
+        stmt_id="M999$FOREIGN",
+        prop="P170",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={"P2093": _qual_string("P2093", "Some User's Author Name")},
+        references=[_foreign_reference()],
+    )
+    entity = {"pageid": 999, "statements": {"P170": [foreign_stmt]}}
+    expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
+
+    submit_calls = []
+
+    def fake_submit(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [], (
+        "reconciler must not touch foreign (non-DPLA-referenced) claims"
+    )
+
+
+def test_reconciler_propagates_get_entity_error():
+    """When the entity fetch raises (network failure, 403, etc.), the
+    reconciler must let the exception propagate to the per-ordinal
+    boundary in `_run_partner_mode` — NOT silently swallow it and
+    fall through with an empty entity, which would mean zero removals
+    queued for a working file."""
+    from tools import sdc_sync
+
+    def fake_get_entity(mediaid):
+        raise RuntimeError("simulated wbgetentities failure")
+
+    with (
+        patch.object(sdc_sync, "get_entity", side_effect=fake_get_entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+    ):
+        try:
+            sdc_sync._reconcile_existing_claims(
+                "M999", "abc1234567890abcdef1234567890abcd", {"P170": ["x"]}
+            )
+        except RuntimeError as e:
+            assert "simulated wbgetentities failure" in str(e)
+        else:
+            raise AssertionError(
+                "reconciler must propagate get_entity errors; got silent fallback"
+            )
