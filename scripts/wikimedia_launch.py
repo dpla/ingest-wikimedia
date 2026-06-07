@@ -137,7 +137,11 @@ def main() -> None:
         _slack_fail(response_url, f"Could not parse --partner: {e}")
 
     # Validate each target and build
-    # (canonical, institution_or_None, label, dpla_id_or_None, collection_or_None) tuples.
+    # (canonical, institutions_tuple, label, dpla_id_or_None, collection_or_None) tuples.
+    # ``institutions_tuple`` is ``()`` for hub-level, ``(name,)`` for single-
+    # institution, or ``(n1, n2, …)`` for a combined session covering multiple
+    # institutions under one hub (used when a single Wikidata QID resolves to
+    # multiple institutions in the same hub).
     # Dedup by full target string so the same hub may appear with different institutions
     # (e.g. two QIDs that both resolve into the same hub but different institutions).
     seen_target_strs: set[str] = set()
@@ -145,7 +149,7 @@ def main() -> None:
     seen_session_labels: dict[
         str, None
     ] = {}  # insertion-ordered; drives session naming
-    targets: list[tuple[str, str | None, str, str | None, str | None]] = []
+    targets: list[tuple[str, tuple[str, ...], str, str | None, str | None]] = []
     # DPLA item ID tokens collected separately; resolved via EC2 before target building.
     dpla_id_tokens: list[str] = []
     # Per-target validation warnings; populated by _add_target and the conflict
@@ -155,21 +159,36 @@ def main() -> None:
 
     def _add_target(
         canonical: str,
-        institution: str | None,
+        institutions: tuple[str, ...] = (),
         dpla_id: str | None = None,
         collection: str | None = None,
     ) -> None:
-        if collection is not None and institution is None:
+        # ``institutions`` semantics:
+        #   ``()``         → hub-level (no institution filter at get-ids-es time)
+        #   ``(name,)``    → single institution (the historical / pipe-target case)
+        #   ``(n1, n2, …)`` → combined session covering multiple institutions
+        #                     under the same hub. Used when a single Wikidata
+        #                     QID resolves to N institutions in one hub; the
+        #                     pipeline runs ONE ``get-ids-es`` (with N
+        #                     ``--institution`` flags), one downloader, one
+        #                     uploader, one sdc-sync — so the operator sees
+        #                     one tmux session and one set of Slack
+        #                     notifications instead of N chained sessions.
+        if collection is not None and len(institutions) != 1:
             skipped_warnings.append(
-                f"Collection '{collection}' specified without an institution."
+                f"Collection '{collection}' requires exactly one institution"
+                " (collection scoping is per-institution)."
             )
             return
-        if institution is not None:
-            institution = institution.strip()
-            if not institution:
+        stripped: list[str] = []
+        for name in institutions:
+            name = name.strip()
+            if not name:
                 skipped_warnings.append(f"'{canonical}|': empty institution name.")
                 return
-        if dpla_id is None and canonical != "nara" and institution is None:
+            stripped.append(name)
+        institutions = tuple(stripped)
+        if dpla_id is None and canonical != "nara" and not institutions:
             # Hub-level target: check that any institution in the hub is eligible.
             # Skipped for DPLA item ID targets — item-level eligibility (rights
             # statement + media presence) was already verified by resolve-dpla-ids.
@@ -190,9 +209,16 @@ def main() -> None:
                 )
                 return
         if collection is not None:
-            target_str = f"{canonical}|{institution}|{collection}"
-        elif institution is not None:
-            target_str = f"{canonical}|{institution}"
+            target_str = f"{canonical}|{institutions[0]}|{collection}"
+        elif len(institutions) == 1:
+            target_str = f"{canonical}|{institutions[0]}"
+        elif institutions:
+            # Multi-institution: dedup key joins all names so two different
+            # institution sets under the same hub produce two different
+            # sessions, but the same QID resolved twice in one command
+            # produces a "duplicate target" warning rather than two
+            # near-identical sessions.
+            target_str = f"{canonical}|" + "+".join(institutions)
         elif dpla_id is not None:
             target_str = dpla_id
         else:
@@ -207,13 +233,21 @@ def main() -> None:
             # This is long enough to distinguish concurrent single-item sessions for
             # the same hub while keeping session names readable.
             inst_label: str | None = dpla_id[:8]
-        elif institution is not None:
-            inst_label = _slugify(institution)
-            if not inst_label:
+        elif institutions:
+            first_slug = _slugify(institutions[0])
+            if not first_slug:
                 skipped_warnings.append(
-                    f"'{canonical}|{institution}': institution name normalizes to an empty slug."
+                    f"'{canonical}|{institutions[0]}': institution name normalizes to an empty slug."
                 )
                 return
+            if len(institutions) == 1:
+                inst_label = first_slug
+            else:
+                # Multi-institution session label: keep it short and parseable.
+                # ``-and-N-more`` is human-readable in tmux ls output and in
+                # Slack notifications, and the leading slug pins which hub +
+                # at-least-one-institution this session is for.
+                inst_label = f"{first_slug}-and-{len(institutions) - 1}-more"
         else:
             inst_label = None
         if collection is not None:
@@ -232,7 +266,7 @@ def main() -> None:
             )
             return
         seen_session_labels[label] = None
-        targets.append((canonical, institution, label, dpla_id, collection))
+        targets.append((canonical, institutions, label, dpla_id, collection))
 
     for token in target_tokens:
         if is_wikidata_id(token):
@@ -242,8 +276,34 @@ def main() -> None:
                     f"Wikidata ID {token!r}: not found in institutions_v2.json."
                 )
                 continue
+            # Group resolved pairs by canonical hub so multiple institutions
+            # under the same hub collapse into a single combined session
+            # (one tmux session, one get-ids-es with N --institution flags,
+            # one downloader / uploader / sdc-sync run, one set of Slack
+            # notifications). Cross-hub QIDs — rare; same QID present under
+            # institutions in different hubs — still produce one session per
+            # hub, but each of those sessions is itself combined across all
+            # institutions matching the QID in that hub.
+            by_hub: dict[str, list[str | None]] = {}
             for canonical, institution in resolved:
-                _add_target(canonical, institution)
+                by_hub.setdefault(canonical, []).append(institution)
+            for canonical, inst_list in by_hub.items():
+                if None in inst_list:
+                    # The QID matched the hub itself — that's strictly broader
+                    # than any per-institution match, so the hub-level scope
+                    # wins (no --institution filter, all eligible institutions
+                    # processed).
+                    _add_target(canonical, institutions=())
+                else:
+                    # All matches are institution-level; combine them.
+                    # ``inst_list`` only contains non-None strings at this
+                    # branch, so the cast is safe.
+                    _add_target(
+                        canonical,
+                        institutions=tuple(
+                            name for name in inst_list if name is not None
+                        ),
+                    )
         elif is_dpla_id(token):
             # Collect for batch resolution via EC2 after local parsing is done.
             # Normalise to lowercase — ES and S3 paths expect the canonical form.
@@ -257,16 +317,18 @@ def main() -> None:
                 continue
             if len(token_parts) == 3:
                 _, institution, collection = token_parts
-                _add_target(canonical, institution, collection=collection)
+                _add_target(
+                    canonical, institutions=(institution,), collection=collection
+                )
             else:
                 _, institution = token_parts
-                _add_target(canonical, institution)
+                _add_target(canonical, institutions=(institution,))
         else:
             canonical = resolve_slug(token)
             if canonical is None:
                 skipped_warnings.append(f"'{token}': unknown hub slug.")
                 continue
-            _add_target(canonical, None)
+            _add_target(canonical, institutions=())
 
     slack_token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     ssm = boto3.client("ssm", region_name=REGION)
@@ -363,7 +425,15 @@ def main() -> None:
                         f"DPLA ID `{item_id}`: not eligible ({reason})."
                     )
                 elif status.startswith("HUB="):
-                    _add_target(status.removeprefix("HUB="), None, dpla_id=item_id)
+                    # DPLA-ID single-item target: no institution filter.
+                    # ``institutions=()`` is the new "hub-level / no filter"
+                    # signal — passing ``None`` would crash because the
+                    # body iterates ``institutions``.
+                    _add_target(
+                        status.removeprefix("HUB="),
+                        institutions=(),
+                        dpla_id=item_id,
+                    )
                 elif status.startswith("ERROR:"):
                     skipped_warnings.append(
                         f"DPLA ID `{item_id}`: resolve error — {status.removeprefix('ERROR:')}."
@@ -396,8 +466,8 @@ def main() -> None:
     if sdc_only:
         stale_sdc_target_labels = [
             lbl
-            for canonical, institution, lbl, dpla_id, _ in targets
-            if dpla_id is not None or (canonical == "nara" and institution is None)
+            for canonical, institutions, lbl, dpla_id, _ in targets
+            if dpla_id is not None or (canonical == "nara" and not institutions)
         ]
         if stale_sdc_target_labels:
             print(
@@ -522,8 +592,8 @@ def main() -> None:
         if not existing_name.startswith("wikimedia-"):
             continue
         existing_labels = set(parse_session_labels(existing_name[len("wikimedia-") :]))
-        for canonical, institution, label, dpla_id, collection in targets:
-            if institution is None and dpla_id is None:
+        for canonical, institutions, label, dpla_id, collection in targets:
+            if not institutions and dpla_id is None:
                 # Hub-level request conflicts with any existing session touching this hub
                 # (hub-level, institution-level, or collection-level for the same hub).
                 conflicts_this = any(
@@ -539,21 +609,25 @@ def main() -> None:
                 #   3. An existing session for the exact same collection label
                 # A collection does NOT conflict with a different collection from the
                 # same institution — those are independent, disjoint subsets.
-                inst_label = f"{canonical}+{_slugify(institution)}"
+                # ``institutions`` is exactly one element when collection is set
+                # (enforced by _add_target).
+                inst_label = f"{canonical}+{_slugify(institutions[0])}"
                 conflicts_this = (
                     canonical in existing_labels
                     or inst_label in existing_labels
                     or label in existing_labels
                 )
             elif dpla_id is None:
-                # Institution-level requests conflict with:
+                # Institution-level (or multi-institution-combined) requests
+                # conflict with:
                 #   1. An existing hub-level session for the same hub
-                #   2. An existing session for the exact same institution label
-                #   3. Any existing collection-level session for the same institution
+                #   2. An existing session for the exact same label
+                #   3. Any existing collection-level session for the same label
                 #      (the collection is a strict subset; the institution run would
                 #      duplicate work on those items, symmetric with collection→institution)
-                # Two institution-level sessions for different institutions within
-                # the same hub do NOT conflict.
+                # Two institution-level sessions for different institution sets
+                # within the same hub do NOT conflict — combined and single sets
+                # are treated symmetrically.
                 conflicts_this = (
                     canonical in existing_labels
                     or label in existing_labels
@@ -647,7 +721,7 @@ def main() -> None:
     )
     target_blocks = []
     last_idx = len(targets) - 1
-    for idx, (canonical, institution, session_label, dpla_id, collection) in enumerate(
+    for idx, (canonical, institutions, session_label, dpla_id, collection) in enumerate(
         targets
     ):
         pdir = PARTNER_DIR.get(canonical, canonical)
@@ -659,12 +733,15 @@ def main() -> None:
             # Single-item target: metadata was already staged to S3 by resolve-dpla-ids.
             # Write the one ID directly to the CSV; no ID-generation phase needed.
             get_ids_cmd = f"printf '%s\\n' {shlex.quote(dpla_id)} > {csv_file}"
-        elif canonical == "nara" and institution is None:
+        elif canonical == "nara" and not institutions:
             get_ids_cmd = f"get-ids-nara > {csv_file}"
         else:
             get_ids_cmd = f"get-ids-es {canonical}"
-            if institution is not None:
-                get_ids_cmd += f" --institution {shlex.quote(institution)}"
+            # ``--institution`` is repeated per name when the QID resolved
+            # to multiple institutions under this hub; get-ids-es ORs them
+            # in the Elasticsearch dataProvider filter.
+            for inst in institutions:
+                get_ids_cmd += f" --institution {shlex.quote(inst)}"
             if collection is not None:
                 get_ids_cmd += f" --collection {shlex.quote(collection)}"
             get_ids_cmd += f" > {csv_file}"
@@ -735,12 +812,21 @@ def main() -> None:
 
     if slack_token:
 
-        def _target_label(c: str, i: str | None, col: str | None) -> str:
-            """Format a batch target as the pipe-separated string shown in Slack."""
+        def _target_label(c: str, insts: tuple[str, ...], col: str | None) -> str:
+            """Format a batch target as the pipe-separated string shown in Slack.
+
+            For a combined-institution target (multiple institutions from a
+            single QID under one hub), shows the first institution + a
+            ``(+N more)`` hint — full list would blow up the Slack message
+            width for QIDs with many sub-institutions.
+            """
             if col:
-                return f"`{c}|{i}|{col}`"
-            if i:
-                return f"`{c}|{i}`"
+                # Collection-level is always single-institution by construction.
+                return f"`{c}|{insts[0]}|{col}`"
+            if len(insts) == 1:
+                return f"`{c}|{insts[0]}`"
+            if insts:
+                return f"`{c}|{insts[0]} (+{len(insts) - 1} more)`"
             return f"`{c}`"
 
         single_item_targets = [

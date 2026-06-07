@@ -210,28 +210,45 @@ def build_query(
 @click.argument("partner")
 @click.option(
     "--institution",
-    default=None,
-    help="Restrict to a single institution name (must be upload-eligible).",
+    "institutions",
+    multiple=True,
+    help=(
+        "Restrict to a specific institution name (must be upload-eligible)."
+        " May be passed multiple times to combine several institutions into"
+        " one ID-generation run — used by the launch script when a single"
+        " Wikidata QID resolves to multiple institutions under one hub."
+    ),
 )
 @click.option(
     "--collection",
     default=None,
-    help="Restrict to items in a specific collection title (requires --institution).",
+    help=(
+        "Restrict to items in a specific collection title. Requires exactly"
+        " one --institution (collection scoping is per-institution)."
+    ),
 )
-def main(partner: str, institution: str | None, collection: str | None) -> None:
+def main(partner: str, institutions: tuple[str, ...], collection: str | None) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
     Also stages each item's full metadata to S3 (dpla-map.json) so the
     downloader can skip DPLA API calls entirely.
+
+    Multiple ``--institution`` flags are ORed together in the
+    Elasticsearch ``dataProvider`` filter, so the output covers items
+    belonging to any of the listed institutions in one combined run.
+    No ``--institution`` flags means "all eligible institutions for
+    this hub" (the existing hub-level behaviour).
     """
     if collection is not None:
         collection = collection.strip()
         if not collection:
             print("--collection cannot be empty.", file=sys.stderr)
             sys.exit(1)
-        if institution is None:
+        if len(institutions) != 1:
             print(
-                "--collection requires --institution to be specified.", file=sys.stderr
+                "--collection requires exactly one --institution to be specified"
+                " (collection scoping is per-institution).",
+                file=sys.stderr,
             )
             sys.exit(1)
 
@@ -245,8 +262,8 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
 
     # Load institutions_v2.json once and reuse it for both eligibility
     # filtering and the SDC pre-compute pass.
-    institutions = fetch_institutions_v2()
-    eligible_dp_names = load_eligible_dp_names(institutions, partner)
+    institutions_json = fetch_institutions_v2()
+    eligible_dp_names = load_eligible_dp_names(institutions_json, partner)
     if not eligible_dp_names:
         print(
             f"No eligible institutions found for {partner} in institutions_v2.json",
@@ -254,14 +271,15 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
         )
         sys.exit(0)
 
-    if institution is not None:
-        if institution not in eligible_dp_names:
+    if institutions:
+        ineligible = [name for name in institutions if name not in eligible_dp_names]
+        if ineligible:
             print(
-                f"Institution '{institution}' is not upload-eligible for {partner}.",
+                f"Institution(s) not upload-eligible for {partner}: {ineligible}.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        eligible_dp_names = [institution]
+        eligible_dp_names = list(institutions)
 
     # SDC pre-compute inputs.
     rights = load_rights_json()
@@ -391,7 +409,7 @@ def main(partner: str, institution: str | None, collection: str | None) -> None:
             sdc_payload = build_claims_for_doc(
                 source,
                 dpla_id,
-                institutions,
+                institutions_json,
                 rights,
                 subject_ids,
                 subjects_lookup,
