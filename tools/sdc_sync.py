@@ -444,13 +444,16 @@ def invalidate_entity(mediaid):
 #
 # Keep this aligned with the add_* functions in this file:
 #   * add_creator (P170)        — P2093 (author name string)
-#   * add_date (P571)           — P1932 (stated as)
+#   * add_date (P571)           — P1932 (stated as), P1480 (circa marker
+#                                  when the source carried a
+#                                  circa/[]/?/~/c./ca./approximately
+#                                  decorator)
 #   * add_contributed (P9126)   — P3831 (object has role)
 #   * add_local_id (P217)       — P195 (collection)
 #   * add_source (P7482)        — P973 (described at URL), P137 (operator)
 _DPLA_EXTRA_QUALIFIER_PROPS = {
     "P170": {"P2093"},
-    "P571": {"P1932"},
+    "P571": {"P1932", "P1480"},
     "P9126": {"P3831"},
     "P217": {"P195"},
     "P7482": {"P973", "P137"},
