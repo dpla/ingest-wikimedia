@@ -595,9 +595,28 @@ def is_same_item_redirect_relic(
 #   parent page it was extracted from. Anchored anywhere in the text (including
 #   inside |other versions= of an {{Information}} template).
 # - Category links: [[Category:Name]] or [[Category:Name|sort key]].
+# - Assessment-class templates: status that Commons editors confer on a
+#   file outside of its bare description — Media/Picture of the day on a
+#   specific date, Featured/Quality/Valued image marks, or the bundled
+#   {{Assessments}} wrapper. These represent real curatorial work and must
+#   survive a metadata-rescue rewrite. Pattern is case-insensitive to handle
+#   the casing variants Commons editors use in practice ({{media of the day}}
+#   vs {{Media of the day}}). Optional `|params` covers the dated forms
+#   like {{Media of the day|2023|2|18}}.
 _PD_USGOV_RE = re.compile(r"\{\{PD-USGov(?:-[A-Za-z0-9_-]+)?(?:\|[^{}]*)?\}\}")
 _IMAGE_EXTRACTED_RE = re.compile(r"\{\{Image extracted\|[^{}]*\}\}", re.IGNORECASE)
 _CATEGORY_RE = re.compile(r"\[\[Category:[^\]\n]+\]\]")
+_ASSESSMENT_TEMPLATE_RE = re.compile(
+    r"\{\{\s*(?:"
+    r"Media of the day"
+    r"|Picture of the day"
+    r"|Featured picture"
+    r"|Quality image"
+    r"|Valued image"
+    r"|Assessments"
+    r")\s*(?:\|[^{}]*)?\}\}",
+    re.IGNORECASE,
+)
 
 
 def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
@@ -606,18 +625,32 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     Used when the uploader rewrites a file description after a title-drift
     move or redirect-overwrite. The new {{Artwork}} wikitext is authoritative
     for the file's description, but page-level metadata that pre-existed —
-    PD-USGov license tags, Image-extracted parent links, and category
-    membership — must survive the rewrite.
+    PD-USGov license tags, Image-extracted parent links, category
+    membership, and assessment-class templates — must survive the rewrite.
 
-    Result order:
+    Result order (matches Commons page-structure convention):
         1. new_artwork (the freshly generated {{Artwork}} block)
-        2. preserved {{PD-USGov...}} templates (license, above categories)
-        3. preserved {{Image extracted|...}} templates (above categories)
-        4. preserved [[Category:...]] links
+        2. preserved Assessment block (=={{Assessment}}== header + any
+           {{Media of the day|...}}, {{Picture of the day|...}},
+           {{Featured picture}}, {{Quality image}}, {{Valued image}},
+           or {{Assessments|...}} templates from the original)
+        3. preserved {{PD-USGov...}} templates (license, above categories)
+        4. preserved {{Image extracted|...}} templates (above categories)
+        5. preserved [[Category:...]] links
+
+    The Assessment header is emitted unconditionally when any assessment
+    template is preserved — Commons convention is that these templates
+    live under that header for proper categorisation, and an MOTD-archive
+    scraper expecting that wrapper would miss a bare template.
 
     Duplicates within each preserved group are collapsed.
     """
     parts: list[str] = [new_artwork.rstrip()]
+    assessment = list(dict.fromkeys(_ASSESSMENT_TEMPLATE_RE.findall(existing_text)))
+    if assessment:
+        parts.append("")
+        parts.append("=={{Assessment}}==")
+        parts.extend(assessment)
     for pattern in (_PD_USGOV_RE, _IMAGE_EXTRACTED_RE, _CATEGORY_RE):
         group = list(dict.fromkeys(pattern.findall(existing_text)))
         if group:
