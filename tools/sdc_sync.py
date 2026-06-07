@@ -703,6 +703,59 @@ def check(mediaid, qid, prop):
                 return True, ref
         except KeyError:
             return True, ref
+    if qid[0] == "time":
+        # Mirrors the item/string/somevalue branches above for value-typed
+        # time claims (P571 when ``parse_dpla_date`` succeeded). Compares
+        # canonical (time, precision) keys via ``_time_comparable``.
+        #
+        # A Commons statement with the OLD somevalue+P1932 shape does NOT
+        # match here, so the new value-typed claim is added; the
+        # corresponding old somevalue claim will be queued for removal by
+        # ``_reconcile_existing_claims`` (its P1932 string isn't in
+        # ``expected`` once the sdc.json carries the value-typed
+        # equivalent). One reconcile cycle migrates the file from old to
+        # new without leaving the date duplicated.
+        target = qid[1]
+
+        def _statement_value_time_matches(statement) -> bool:
+            if statement["mainsnak"].get("snaktype") != "value":
+                return False
+            dv = statement["mainsnak"].get("datavalue") or {}
+            if dv.get("type") != "time":
+                return False
+            return _time_comparable(dv["value"]) == target
+
+        for statement in statements:
+            if (
+                _statement_value_time_matches(statement)
+                and not statement.get("references")
+                and _is_safe_to_amend_in_place(statement, prop)
+            ):
+                ref = statement["id"]
+                break
+        for statement in statements:
+            if _statement_value_time_matches(statement) and not statement.get(
+                "qualifiers"
+            ):
+                return add_det(mediaid, statement["id"]), ref
+
+        if any(
+            _statement_value_time_matches(statement)
+            and _is_safe_to_amend_in_place(statement, prop)
+            for statement in statements
+        ):
+            print(
+                f" -- There already exists a DPLA-authored statement with a {prop} > {target} claim for {mediaid}."
+            )
+            return False, ref
+
+        if any(_statement_value_time_matches(statement) for statement in statements):
+            print(
+                f" -- A foreign {prop} > {target} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
+            )
+            return True, ""
+
+        return True, ref
     if qid[0] == "source":
         try:
             if any(
@@ -1245,7 +1298,7 @@ def add_ref(claimid, claim):
 
 
 def _check_kind_for_claim(claim):
-    """Return the 'kind' tag (item|string|monolingualtext|somevalue|source)
+    """Return the 'kind' tag (item|string|monolingualtext|somevalue|source|time)
     that `check()` uses to dispatch its per-type matcher against existing
     Commons statements.
     """
@@ -1263,6 +1316,26 @@ def _check_kind_for_claim(claim):
     return dtype
 
 
+def _time_comparable(value):
+    """Canonical comparable key for a Wikibase time datavalue.
+
+    Used wherever a P571 (or other time-typed) claim's value needs to
+    compare equal to another for "is this the same fact?" purposes.
+    Includes only the salient identity fields — ``time`` and
+    ``precision``. ``timezone``, ``before``, ``after``, and
+    ``calendarmodel`` are constants in DPLA's writes; any drift in
+    those would have been a user-edit, and ``_is_safe_to_amend_in_place``
+    keeps user-edited statements out of this code path anyway.
+
+    Distinct from any P1932 stated-as string a somevalue claim could
+    produce, so the migration from ``somevalue+P1932="1945"`` to a
+    value-typed ``time("+1945-01-01T00:00:00Z", precision=9)`` is
+    correctly detected as a different fact by the reconciler
+    (old removed, new added in one cycle).
+    """
+    return f"{value['time']}|P{value['precision']}"
+
+
 def _extract_comparable_value(claim):
     """Pull the comparable scalar value out of a precomputed sdc.json claim.
 
@@ -1272,6 +1345,7 @@ def _extract_comparable_value(claim):
       * Q-ID string for wikibase-entityid (e.g. "Q19652")
       * the raw string for string-typed claims (P760, P217, etc.)
       * the text body for monolingualtext claims (P1476, P10358)
+      * the canonical time key for time-typed claims (P571 when parseable)
       * the P1932/P2093 qualifier value for somevalue claims (P571, P170)
       * the P973 qualifier value for the P7482 source-catalog claim
       * None when the claim shape isn't one we know how to compare
@@ -1302,6 +1376,15 @@ def _extract_comparable_value(claim):
         return datavalue["value"]
     if dtype == "monolingualtext":
         return datavalue["value"]["text"]
+    if dtype == "time":
+        try:
+            return _time_comparable(datavalue["value"])
+        except (KeyError, TypeError):
+            # Malformed time datavalue (missing "time" or "precision" key).
+            # Skip rather than crash the whole expected-build; the
+            # corresponding Commons-side extraction has the same guard
+            # so the two sides stay symmetric.
+            return None
     return None
 
 
@@ -1632,6 +1715,36 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
                                         }
                                     }
                                 )
+                            elif dtype == "time":
+                                # Same canonical key as
+                                # `_extract_comparable_value` produces on
+                                # the sdc.json side. Without this branch,
+                                # a value-typed P571 on Commons would be
+                                # silently ignored by the reconciler
+                                # (left in dpla_claim_list as a missing
+                                # entry), and a sdc.json that no longer
+                                # includes that date would never trigger
+                                # the corresponding removal.
+                                try:
+                                    comparable = _time_comparable(
+                                        stmt["mainsnak"]["datavalue"]["value"]
+                                    )
+                                except (KeyError, TypeError):
+                                    # Malformed Commons time datavalue
+                                    # (missing "time" or "precision"); queue
+                                    # the statement for removal — mirrors
+                                    # the somevalue-missing-qualifier
+                                    # branch below.
+                                    removals.append(stmt["id"])
+                                else:
+                                    dpla_claim_list.append(
+                                        {
+                                            stmt["mainsnak"]["property"]: {
+                                                "id": stmt["id"],
+                                                "value": comparable,
+                                            }
+                                        }
+                                    )
                         if stmt["mainsnak"]["snaktype"] == "somevalue":
                             p = "P1932" if prop == "P571" else "P2093"
                             try:

@@ -48,6 +48,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from typing import Any
@@ -681,15 +682,167 @@ def _build_creator_claim(
     return claim
 
 
+_GREGORIAN_CALENDAR = "http://www.wikidata.org/entity/Q1985727"
+
+# Wikibase time-datavalue precision codes used here:
+#   8  = decade  (e.g. "1940s"        → +1940-01-01)
+#   9  = year   (e.g. "1945"          → +1945-01-01)
+#   10 = month  (e.g. "1945-06"       → +1945-06-01)
+#   11 = day    (e.g. "1945-06-07"    → +1945-06-07)
+_PRECISION_DECADE = 8
+_PRECISION_YEAR = 9
+_PRECISION_MONTH = 10
+_PRECISION_DAY = 11
+
+# DPLA decorators stripped before pattern-matching. Repeat iteratively so
+# nested forms like "[1945?]" collapse cleanly.
+_DATE_PREFIX = re.compile(
+    r"^\s*(?:circa|c\.|ca\.|approximately|approx\.|~|\[)\s*", re.IGNORECASE
+)
+_DATE_SUFFIX = re.compile(r"\s*(?:\]|\?)\s*$")
+
+_ISO_DATE = re.compile(r"^(\d{1,4})-(\d{1,2})-(\d{1,2})$")
+_YEAR_MONTH = re.compile(r"^(\d{1,4})-(\d{1,2})$")
+_DECADE = re.compile(r"^(\d{1,4})s$")
+_YEAR_ONLY = re.compile(r"^(\d{1,4})$")
+
+
+def _wikibase_time(time_str: str, precision: int) -> dict:
+    """Construct the canonical ``value`` payload for a Wikibase time
+    datavalue. ``timezone``, ``before``, ``after``, and ``calendarmodel``
+    are pinned to constants — DPLA only emits proleptic Gregorian dates
+    with no explicit uncertainty bounds, and downstream consumers
+    (notably the reconciler's comparable key) treat any drift in those
+    fields as "different claim, rewrite it" — which would churn millions
+    of statements on every re-sync.
+    """
+    return {
+        "time": time_str,
+        "precision": precision,
+        "before": 0,
+        "after": 0,
+        "timezone": 0,
+        "calendarmodel": _GREGORIAN_CALENDAR,
+    }
+
+
+def _strip_date_decorators(s: str) -> str:
+    """Iteratively strip leading 'circa'/'['/'~' and trailing ']'/'?'
+    so nested patterns ('[1945?]', 'circa [1945]') collapse cleanly."""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _DATE_PREFIX.sub("", s)
+        s = _DATE_SUFFIX.sub("", s)
+    return s.strip()
+
+
+def parse_dpla_date(date_string: str) -> dict | None:
+    """Parse a DPLA display-date string into a Wikibase time-datavalue
+    ``value`` dict, or ``None`` when the input is too messy to commit
+    to a structured time.
+
+    Recognised single-date shapes (after stripping ``circa``/``c.``/
+    ``ca.``/``approximately``/brackets/trailing ``?``):
+
+      * ``YYYY-MM-DD``   → precision 11 (day)
+      * ``YYYY-MM``      → precision 10 (month)
+      * ``YYYYs``        → precision 8 (decade), accepted only when the
+                            year is decade-aligned (e.g. ``1940s``, not
+                            ``1945s``)
+      * ``YYYY``         → precision 9 (year)
+
+    Returns None for ranges (``1945-1950``), BC dates (``500 BC``), free
+    prose (``During the Gilded Age``), or any other shape — the
+    builder falls back to ``somevalue + P1932 stated-as`` for those, so
+    the original DPLA string is preserved verbatim regardless of parse
+    outcome.
+
+    Year 0 returns None: proleptic Gregorian has no year 0, and ``datetime.date(0, …)``
+    would crash the calendar-arithmetic validation below.
+
+    The shape this returns must round-trip through
+    ``tools.sdc_sync._time_comparable`` to produce the canonical key the
+    reconciler matches Commons statements against. If the
+    Wikibase-time-datavalue shape changes here, mirror the change there.
+    """
+    if not date_string:
+        return None
+    s = _strip_date_decorators(date_string.strip())
+    if not s:
+        return None
+
+    m = _ISO_DATE.match(s)
+    if m:
+        y, mo, d = int(m[1]), int(m[2]), int(m[3])
+        if y == 0:
+            return None
+        try:
+            datetime.date(y, mo, d)
+        except ValueError:
+            pass
+        else:
+            return _wikibase_time(
+                f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
+            )
+
+    m = _YEAR_MONTH.match(s)
+    if m:
+        y, mo = int(m[1]), int(m[2])
+        if y != 0 and 1 <= mo <= 12:
+            return _wikibase_time(f"+{y:04d}-{mo:02d}-01T00:00:00Z", _PRECISION_MONTH)
+
+    m = _DECADE.match(s)
+    if m:
+        y = int(m[1])
+        # Accept only decade-aligned years so "1945s" (almost certainly a
+        # typo for "1945") doesn't quietly become decade-precision.
+        if y != 0 and y % 10 == 0:
+            return _wikibase_time(f"+{y:04d}-01-01T00:00:00Z", _PRECISION_DECADE)
+
+    m = _YEAR_ONLY.match(s)
+    if m:
+        y = int(m[1])
+        if y != 0:
+            return _wikibase_time(f"+{y:04d}-01-01T00:00:00Z", _PRECISION_YEAR)
+
+    return None
+
+
 def _build_date_claim(
     date: str,
     dpla_id: str,
     retrieval_date: datetime.date,
 ) -> dict | None:
+    """Build a P571 (inception) claim from a DPLA display-date string.
+
+    When the string parses to a structured time value, emit a value-typed
+    P571 with a ``time`` datavalue at appropriate precision. When it
+    doesn't, fall back to ``somevalue`` with the raw string in a P1932
+    (stated as) qualifier — preserves today's behavior for any date the
+    parser can't commit to.
+
+    The P1932 qualifier is ALWAYS stamped, even on the value-typed
+    branch, so the original DPLA-supplied display string is recoverable
+    by readers (and so the template module can keep rendering whatever
+    text DPLA chose, rather than re-formatting from the structured
+    value).
+
+    Idempotency note: the reconciler treats the OLD somevalue claim and
+    the NEW value-typed claim as different (their comparable keys
+    differ — the somevalue's P1932 string vs. the value-typed time
+    canonical key), so a re-sync after this change cleanly migrates the
+    Commons statement from somevalue to value-typed in one cycle
+    (old removed, new added).
+    """
     normalized = _truncate(date)
     if not normalized:
         return None
-    claim = formattedclaim("P571", "somevalue", "time", dpla_id, retrieval_date)
+    parsed = parse_dpla_date(normalized)
+    if parsed is not None:
+        claim = formattedclaim("P571", parsed, "time", dpla_id, retrieval_date)
+    else:
+        claim = formattedclaim("P571", "somevalue", "time", dpla_id, retrieval_date)
     claim["qualifiers"]["P1932"] = [_qualifier_string_snak("P1932", normalized)]
     return claim
 
