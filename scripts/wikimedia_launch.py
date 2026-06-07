@@ -70,9 +70,32 @@ def _parse_bool(value: str) -> bool:
     return value.lower() == "true"
 
 
-def _slack_fail(response_url: str, msg: str) -> NoReturn:
-    """Print msg to stderr, post ephemeral reply to response_url if set, then exit 1."""
+def _slack_fail(response_url: str, msg: str, *, operational: bool = False) -> NoReturn:
+    """Print msg to stderr, post ephemeral reply to response_url, then exit 1.
+
+    By default this is the ONLY delivery — appropriate for user-error
+    failures (typos, unparseable arguments, bad target syntax, ineligible
+    institution, mutually-exclusive flags). Those should stay private
+    between the runner and the user who issued the slash command; the
+    public `#tech-alerts` channel must not get flooded with them.
+
+    Pass ``operational=True`` for infrastructure-style failures (EC2
+    update timeout, mem/dir check failures, tmux launch failures, etc.)
+    — i.e. anything the user can't fix by re-typing the command. If the
+    response_url post fails for an operational error, fall back to
+    posting to `#tech-alerts` via ``DPLA_SLACK_BOT_TOKEN``. The fallback
+    uses ``api.slack.com/chat.postMessage`` (a different host and TLS
+    handshake than ``hooks.slack.com``), which buys some resilience to
+    correlated network failures from the GitHub runner — observed
+    behaviour: when the runner couldn't reach SSM, it also couldn't
+    reach hooks.slack.com, and the entire failure went unannounced.
+
+    The bot-token fallback is operational-only by design: user errors
+    are intentionally allowed to slip into silence rather than spam the
+    channel if the user's response_url happens to be flaky.
+    """
     print(msg, file=sys.stderr)
+    delivered = False
     if response_url:
         try:
             resp = requests.post(
@@ -81,8 +104,19 @@ def _slack_fail(response_url: str, msg: str) -> NoReturn:
                 timeout=5,
             )
             resp.raise_for_status()
+            delivered = True
         except Exception as e:
             logging.warning("Failed to post to Slack response_url: %s", e)
+    if not delivered and operational:
+        token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
+        if token:
+            try:
+                post_message(
+                    token,
+                    f"❌ Launch failure (response_url unreachable): {msg}",
+                )
+            except Exception as e:
+                logging.warning("Fallback post to #tech-alerts also failed: %s", e)
     sys.exit(1)
 
 
@@ -395,11 +429,12 @@ def main() -> None:
     try:
         out = ssm_run(ssm, update_cmd)
     except Exception as e:
-        _slack_fail(response_url, f"⚠️ Failed to update EC2 code: {e}")
+        _slack_fail(response_url, f"⚠️ Failed to update EC2 code: {e}", operational=True)
     if "UPDATE_DONE" not in out:
         _slack_fail(
             response_url,
             "⚠️ EC2 code update did not confirm completion. Check the GitHub Actions run for details.",
+            operational=True,
         )
     print("EC2 code updated.")
 
@@ -506,21 +541,34 @@ def main() -> None:
     try:
         mem_out = ssm_run(ssm, "free -m | awk 'NR==2{print $2, $7}'")
     except Exception as e:
-        _slack_fail(response_url, f"⚠️ Failed to check instance memory: {e}")
+        _slack_fail(
+            response_url,
+            f"⚠️ Failed to check instance memory: {e}",
+            operational=True,
+        )
     parts = mem_out.split()
     if len(parts) != 2:
-        _slack_fail(response_url, f"⚠️ Unexpected memory output: {mem_out!r}")
+        _slack_fail(
+            response_url,
+            f"⚠️ Unexpected memory output: {mem_out!r}",
+            operational=True,
+        )
     try:
         total_mb, available_mb = int(parts[0]), int(parts[1])
         pct_available = available_mb * 100 // total_mb
     except (ValueError, ZeroDivisionError) as e:
-        _slack_fail(response_url, f"⚠️ Could not parse memory output ({mem_out!r}): {e}")
+        _slack_fail(
+            response_url,
+            f"⚠️ Could not parse memory output ({mem_out!r}): {e}",
+            operational=True,
+        )
     print(f"Memory: {pct_available}% available ({available_mb} MB of {total_mb} MB).")
     if pct_available < MEMORY_HEADROOM_PCT:
         _slack_fail(
             response_url,
             f"⚠️ Cannot launch `{session_name}`: only {pct_available}% memory available"
             f" ({available_mb} MB of {total_mb} MB). Threshold is {MEMORY_HEADROOM_PCT}%.",
+            operational=True,
         )
 
     # Verify every requested partner has a working directory on EC2. Pywikibot
@@ -539,7 +587,11 @@ def main() -> None:
     try:
         dir_check_out = ssm_run(ssm, check_cmd)
     except Exception as e:
-        _slack_fail(response_url, f"⚠️ Failed to check partner directories: {e}")
+        _slack_fail(
+            response_url,
+            f"⚠️ Failed to check partner directories: {e}",
+            operational=True,
+        )
     missing_dirs = sorted(
         line.split(":", 1)[1]
         for line in dir_check_out.splitlines()
@@ -556,6 +608,7 @@ def main() -> None:
                 f" `bpl` is missing on EC2. The bot relies on it as the source"
                 f" of pywikibot configuration when bootstrapping new partner"
                 f" directories. Manual setup required.",
+                operational=True,
             )
         print(f"Bootstrapping missing partner directories: {missing_dirs}")
         # Single SSM round-trip: mkdir + cp -np for each missing dir. -n
@@ -576,6 +629,7 @@ def main() -> None:
                 response_url,
                 f"⚠️ Cannot launch `{session_name}`: failed to bootstrap"
                 f" partner directories {missing_dirs}: {e}",
+                operational=True,
             )
         bootstrapped_list = ", ".join(f"`{d}`" for d in missing_dirs)
         print(f"Auto-bootstrapped partner directories: {bootstrapped_list}")
@@ -597,7 +651,11 @@ def main() -> None:
     try:
         tmux_list = ssm_run(ssm, "tmux ls 2>/dev/null || true")
     except Exception as e:
-        _slack_fail(response_url, f"⚠️ Failed to list tmux sessions: {e}")
+        _slack_fail(
+            response_url,
+            f"⚠️ Failed to list tmux sessions: {e}",
+            operational=True,
+        )
     label_conflicts: dict[str, list[str]] = {}
     for line in tmux_list.splitlines():
         existing_name = line.split(":")[0].strip()
@@ -664,7 +722,9 @@ def main() -> None:
                     ssm_run(ssm, f"tmux kill-session -t {shlex.quote(existing_name)}")
                 except Exception as e:
                     _slack_fail(
-                        response_url, f"⚠️ Failed to kill session `{existing_name}`: {e}"
+                        response_url,
+                        f"⚠️ Failed to kill session `{existing_name}`: {e}",
+                        operational=True,
                     )
         else:
             for label, existing_names in label_conflicts.items():
@@ -925,13 +985,16 @@ def main() -> None:
         )
     except Exception as e:
         _slack_fail(
-            response_url, f"⚠️ Failed to launch tmux session `{session_name}`: {e}"
+            response_url,
+            f"⚠️ Failed to launch tmux session `{session_name}`: {e}",
+            operational=True,
         )
     if "SESSION_STARTED" not in out:
         _slack_fail(
             response_url,
             f"⚠️ `{session_name}` failed to start — tmux could not create session."
             " Check the GitHub Actions run for details.",
+            operational=True,
         )
     print(f"Session {session_name} confirmed running.")
 
