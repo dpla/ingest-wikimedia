@@ -364,10 +364,22 @@ def main() -> None:
         "chown -R ec2-user:ec2-user /home/ec2-user/ingest-wikimedia/ && "
         "(chown -R ec2-user:ec2-user /tmp/ingest-wikimedia-update 2>/dev/null || true)"
     )
+    # Non-fatal: the heal step is best-effort cleanup of incidental
+    # root-owned files. If it times out (SSM scheduling latency — observed
+    # ~5min queue time on a single-item launch where the chown itself ran
+    # in 0 seconds but SSM held the command pending past our polling
+    # window), or fails for any other reason, log a warning and proceed.
+    # If a previous root-owned file actually blocks the downstream update,
+    # `uv sync` will fail loudly with a specific permission error — which
+    # is more actionable than a generic "heal timed out" abort that
+    # forces the user to re-launch over an SSM-side hiccup.
     try:
         ssm_run(ssm, heal_cmd, as_root=True)
     except Exception as e:
-        _slack_fail(response_url, f"⚠️ Failed to heal EC2 file ownership: {e}")
+        logging.warning(
+            "EC2 file-ownership heal step failed or timed out (continuing): %s",
+            e,
+        )
 
     update_cmd = (
         "cd /tmp && rm -rf ingest-wikimedia-update && "
