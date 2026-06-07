@@ -723,7 +723,19 @@ def check(mediaid, qid, prop):
             dv = statement["mainsnak"].get("datavalue") or {}
             if dv.get("type") != "time":
                 return False
-            return _time_comparable(dv["value"]) == target
+            try:
+                return _time_comparable(dv.get("value") or {}) == target
+            except (KeyError, TypeError):
+                # Malformed Commons time datavalue (missing ``time`` or
+                # ``precision``). Treat as non-matching so check()
+                # returns True and the new claim is still added —
+                # ``_reconcile_existing_claims`` will queue the malformed
+                # statement for removal via its own defensive guard.
+                # Without this, the KeyError would bubble past check()'s
+                # APIError-only handler in ``process_one_from_sdc`` and
+                # abort the whole ordinal, leaving the bad statement
+                # on Commons.
+                return False
 
         for statement in statements:
             if (

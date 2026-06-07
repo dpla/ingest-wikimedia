@@ -1676,6 +1676,41 @@ def test_reconciler_queues_removal_for_malformed_commons_time_value():
     assert submit_calls == [("wbremoveclaims", "M999$BORK")], submit_calls
 
 
+def test_check_time_kind_does_not_crash_on_malformed_commons_value():
+    """A Commons statement with snaktype=value and dtype=time but a
+    malformed value dict (missing ``precision``) must not crash
+    ``check()``. The KeyError would otherwise propagate past
+    ``process_one_from_sdc``'s APIError-only handler, abort the entire
+    ordinal, and prevent ``_reconcile_existing_claims`` from cleaning up
+    the malformed statement.
+
+    Expected behavior: ``check()`` treats the malformed statement as
+    non-matching, returns True (add the new claim), and the reconciler's
+    own defensive guard later queues the malformed statement for
+    removal."""
+    from tools import sdc_sync
+
+    malformed_stmt = {
+        "id": "M999$BORK",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            # datavalue type is "time" but inner value is missing "precision"
+            "datavalue": {"value": {"time": "+1945-01-01T00:00:00Z"}, "type": "time"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference()],
+    }
+    entity = {"pageid": 999, "statements": {"P571": [malformed_stmt]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check("M999", ("time", "+1945-01-01T00:00:00Z|P9"), "P571")
+
+    assert result[0] is True
+
+
 def test_extract_comparable_value_returns_none_for_malformed_time():
     """Parallel guard on the sdc.json side. If _wikibase_time ever
     regresses or a hand-crafted fixture omits a field, build_expected_from_sdc
