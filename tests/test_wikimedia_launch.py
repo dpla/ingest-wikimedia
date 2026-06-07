@@ -233,12 +233,22 @@ def test_slack_fail_operational_skips_fallback_when_response_url_succeeds(
 def test_slack_fail_operational_silent_when_no_bot_token(monkeypatch):
     """If DPLA_SLACK_BOT_TOKEN is unset AND response_url fails, the
     operational `_slack_fail` should still exit cleanly (logging a
-    warning) rather than crash trying to call post_message with an
-    empty token."""
+    warning) — and must NOT attempt the fallback post_message call
+    with an empty token. A future refactor that lost the empty-token
+    guard would crash with a Slack `invalid_auth` error; this test
+    locks in the "silent when no token" contract by asserting
+    post_message is never invoked."""
     from scripts import wikimedia_launch
+
+    posted_to_channel: list[tuple[str, str]] = []
 
     monkeypatch.delenv("DPLA_SLACK_BOT_TOKEN", raising=False)
     monkeypatch.setattr(wikimedia_launch.requests, "post", _raise_connect_timeout)
+    monkeypatch.setattr(
+        wikimedia_launch,
+        "post_message",
+        lambda token, text: posted_to_channel.append((token, text)),
+    )
 
     with pytest.raises(SystemExit) as excinfo:
         wikimedia_launch._slack_fail(
@@ -247,3 +257,7 @@ def test_slack_fail_operational_silent_when_no_bot_token(monkeypatch):
             operational=True,
         )
     assert excinfo.value.code == 1  # still exits 1, no traceback
+    assert posted_to_channel == [], (
+        "fallback must NOT attempt post_message with an empty token; "
+        f"got: {posted_to_channel!r}"
+    )
