@@ -15,7 +15,7 @@ import tomllib
 import urllib.parse
 from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
-from ingest_wikimedia.sdc import parse_nara_access_level
+from ingest_wikimedia.sdc import parse_dpla_date, parse_nara_access_level
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
@@ -727,7 +727,7 @@ def check(mediaid, qid, prop):
             if dv.get("type") != "time":
                 return False
             try:
-                return _time_comparable(dv.get("value") or {}) == target
+                return _time_claim_comparable(statement) == target
             except (KeyError, TypeError):
                 # Malformed Commons time datavalue (missing ``time`` or
                 # ``precision``). Treat as non-matching so check()
@@ -1351,6 +1351,47 @@ def _time_comparable(value):
     return f"{value['time']}|P{value['precision']}"
 
 
+def _claim_has_circa_marker(claim):
+    """True iff the claim carries a ``P1480 = Q5727902`` (circa)
+    qualifier — the sourcing-circumstances marker the builder stamps
+    when a DPLA display-date had a ``circa``/``[…]``/``?``-style
+    decorator."""
+    for q in claim.get("qualifiers", {}).get("P1480") or []:
+        if q.get("snaktype") != "value":
+            continue
+        dv = q.get("datavalue") or {}
+        if dv.get("type") != "wikibase-entityid":
+            continue
+        v = dv.get("value") or {}
+        if not isinstance(v, dict):
+            continue
+        qid = v.get("id") or (f"Q{v['numeric-id']}" if "numeric-id" in v else None)
+        if qid == "Q5727902":
+            return True
+    return False
+
+
+def _time_claim_comparable(claim):
+    """Canonical comparable key for a *value-typed time* claim, including
+    the circa-bit derived from the P1480 qualifier.
+
+    Without including the circa-bit, a DPLA source change
+    ``"1945"`` → ``"circa 1945"`` (the time canonical key
+    ``+1945-01-01T00:00:00Z|P9`` is unchanged) would not trigger the
+    reconciler to add the new P1480 qualifier to the existing Commons
+    claim. With the circa-bit suffix, the two versions have different
+    comparables and the reconciler correctly queues old-without-P1480
+    for removal so the new-with-P1480 (or vice versa) can be written
+    in its place.
+
+    Wraps :func:`_time_comparable`; the inner call may still raise
+    ``KeyError`` / ``TypeError`` on a malformed datavalue, which
+    callers handle as before.
+    """
+    base = _time_comparable(claim["mainsnak"]["datavalue"]["value"])
+    return f"{base}|circa" if _claim_has_circa_marker(claim) else base
+
+
 def _extract_comparable_value(claim):
     """Pull the comparable scalar value out of a precomputed sdc.json claim.
 
@@ -1393,7 +1434,7 @@ def _extract_comparable_value(claim):
         return datavalue["value"]["text"]
     if dtype == "time":
         try:
-            return _time_comparable(datavalue["value"])
+            return _time_claim_comparable(claim)
         except (KeyError, TypeError):
             # Malformed time datavalue (missing "time" or "precision" key).
             # Skip rather than crash the whole expected-build; the
@@ -1571,6 +1612,15 @@ def _build_expected_from_parsed(
     The legacy partner-API path (parsed() → process_one → dpla_claims) uses
     this. The new partner mode (PR 4) reads sdc.json from S3 and uses
     `_build_expected_from_sdc` instead — same shape, different source.
+
+    P571 entries: include BOTH the raw DPLA display-date string AND
+    the canonical time-comparable key the partner-mode path produces
+    when ``parse_dpla_date`` succeeds. This way a legacy ``--file`` /
+    ``--cat`` / ``--list`` rerun against a file that partner mode has
+    already migrated from ``somevalue+P1932`` to value-typed time
+    won't see the migrated claim's comparable as ``unexpected`` and
+    queue it for removal. Both old-shape and new-shape Commons claims
+    representing the same date are protected.
     """
     rightsprop = "P6216"
     rightsvalue = ""
@@ -1615,6 +1665,20 @@ def _build_expected_from_parsed(
     # All values are lists so the `value not in expected[prop]` reconciliation
     # below behaves consistently (a bare string would degrade `not in` into a
     # substring check and let real DPLA claims look "unexpected").
+    # P571: include both the raw DPLA strings (for OLD-shape
+    # somevalue+P1932 claims) AND the canonical time-comparable keys
+    # for the parseable subset (for NEW-shape value-typed claims).
+    # See docstring above — legacy reruns must protect both shapes.
+    p571_expected = list(dates)
+    for date in dates:
+        parsed = parse_dpla_date(date)
+        if parsed is None:
+            continue
+        base = f"{parsed['value']['time']}|P{parsed['value']['precision']}"
+        if parsed["approximate"]:
+            base = f"{base}|circa"
+        p571_expected.append(base)
+
     expected = {
         "P217": local_ids,
         "P760": [dpla_id],
@@ -1624,7 +1688,7 @@ def _build_expected_from_parsed(
         "P9126": ["Q2944483", hub, institution],
         "P7482": [url],
         "P4272": subjects,
-        "P571": dates,
+        "P571": p571_expected,
         "P10358": descs,
         "P1225": naids,
         "P6224": [level],
@@ -1741,9 +1805,7 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
                                 # includes that date would never trigger
                                 # the corresponding removal.
                                 try:
-                                    comparable = _time_comparable(
-                                        stmt["mainsnak"]["datavalue"]["value"]
-                                    )
+                                    comparable = _time_claim_comparable(stmt)
                                 except (KeyError, TypeError):
                                     # Malformed Commons time datavalue
                                     # (missing "time" or "precision"); queue

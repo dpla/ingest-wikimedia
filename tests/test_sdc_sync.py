@@ -1730,3 +1730,146 @@ def test_extract_comparable_value_returns_none_for_malformed_time():
         "references": [_dpla_reference()],
     }
     assert sdc_sync._extract_comparable_value(broken_claim) is None
+
+
+# ---------------------------------------------------------------------------
+# Circa-bit propagation in the comparable key (CodeRabbit Major finding):
+# without including P1480 presence in the comparable, a DPLA source-string
+# change "1945" ↔ "circa 1945" doesn't trigger the reconciler to add or
+# remove the P1480 qualifier on the existing Commons claim. The
+# _time_claim_comparable wrapper adds a "|circa" suffix when the claim
+# carries P1480 = Q5727902 so the two shapes have distinct identities.
+# ---------------------------------------------------------------------------
+
+
+def _value_typed_p571_with_circa(stmt_id, time_str, precision, stated_as):
+    """Build a value-typed P571 claim WITH the P1480 = Q5727902 (circa)
+    qualifier — the shape the new builder emits for approximate dates."""
+    claim = _value_typed_p571_claim(stmt_id, time_str, precision, stated_as)
+    claim["qualifiers"]["P1480"] = _qual_entity("P1480", "Q5727902")
+    return claim
+
+
+def test_circa_bit_distinguishes_otherwise_identical_claims():
+    """A circa-qualified and a definite claim with the SAME underlying
+    time + precision must produce DIFFERENT comparable keys, so the
+    reconciler can detect the migration in either direction."""
+    from tools import sdc_sync
+
+    plain = _value_typed_p571_claim("M$plain", "+1945-01-01T00:00:00Z", 9, "1945")
+    circa = _value_typed_p571_with_circa(
+        "M$circa", "+1945-01-01T00:00:00Z", 9, "circa 1945"
+    )
+
+    plain_key = sdc_sync._time_claim_comparable(plain)
+    circa_key = sdc_sync._time_claim_comparable(circa)
+
+    assert plain_key == "+1945-01-01T00:00:00Z|P9"
+    assert circa_key == "+1945-01-01T00:00:00Z|P9|circa"
+    assert plain_key != circa_key
+
+
+def test_reconciler_migrates_plain_to_circa_when_dpla_adds_decorator(monkeypatch):
+    """DPLA changes ``"1945"`` → ``"circa 1945"`` on a previously-migrated
+    item. The new sdc.json's expected key carries ``|circa``; the
+    existing Commons claim's comparable doesn't. Reconciler queues the
+    old (no-P1480) for removal so the new (with-P1480) can take its
+    place. Without the circa-bit in the comparable, both shapes
+    matched and the migration silently stalled — the bug CodeRabbit
+    flagged."""
+    from tools import sdc_sync
+
+    new_claim = _value_typed_p571_with_circa(
+        "M$NEW", "+1945-01-01T00:00:00Z", 9, "circa 1945"
+    )
+    expected = sdc_sync._build_expected_from_sdc({"claims": [new_claim]})
+    assert expected == {"P571": ["+1945-01-01T00:00:00Z|P9|circa"]}
+
+    on_commons = _value_typed_p571_claim(
+        "M999$EXACT", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    entity = {"pageid": 999, "statements": {"P571": [on_commons]}}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, params.get("claim")))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [("wbremoveclaims", "M999$EXACT")], submit_calls
+
+
+def test_check_time_kind_treats_circa_and_exact_as_distinct():
+    """``check()``'s time branch uses the circa-bit too. An exact claim
+    on Commons does NOT match a circa target — so the new circa
+    claim gets added, and the exact one gets reconciled away."""
+    from tools import sdc_sync
+
+    exact_on_commons = _value_typed_p571_claim(
+        "M999$EXACT", "+1945-01-01T00:00:00Z", 9, "1945"
+    )
+    entity = {"pageid": 999, "statements": {"P571": [exact_on_commons]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check(
+            "M999", ("time", "+1945-01-01T00:00:00Z|P9|circa"), "P571"
+        )
+
+    # True = "add the new claim alongside" — the exact claim doesn't
+    # collide with the circa claim now.
+    assert result[0] is True
+
+
+# ---------------------------------------------------------------------------
+# Legacy `_build_expected_from_parsed` must protect BOTH shapes for P571
+# (CodeRabbit Major finding): otherwise a legacy --file/--cat/--list
+# rerun against a file that partner mode has migrated to value-typed
+# time would see the migrated claim's canonical comparable as
+# "unexpected" and queue it for removal.
+# ---------------------------------------------------------------------------
+
+
+def test_build_expected_from_parsed_includes_both_shapes_for_p571():
+    """The legacy expected map's P571 entry must include the raw
+    display-date string (for unmigrated somevalue+P1932 claims) AND
+    the canonical time-comparable key for the parseable subset (for
+    migrated value-typed claims), so a rerun after partner-mode
+    migration doesn't strip the migrated claim."""
+    from tools import sdc_sync
+
+    expected = sdc_sync._build_expected_from_parsed(
+        dpla_id="abcdef",
+        url="http://example.com/x",
+        descs=[],
+        dates=["1945", "circa 1929-10", "During the Gilded Age"],
+        titles=[],
+        hub="Q1",
+        local_ids=[],
+        institution="Q2",
+        rs="",
+        creators=[],
+        subjects=[],
+        naids=[],
+        access="",
+        level="",
+    )
+    p571 = expected["P571"]
+    # Raw strings preserved for old-shape somevalue+P1932 protection.
+    assert "1945" in p571
+    assert "circa 1929-10" in p571
+    assert "During the Gilded Age" in p571
+    # Canonical time keys added for the parseable subset.
+    assert "+1945-01-01T00:00:00Z|P9" in p571
+    assert "+1929-10-01T00:00:00Z|P10|circa" in p571
+    # Unparseable date contributes only the raw string (no canonical key).
+    canonical_keys = [v for v in p571 if v.startswith("+")]
+    # 2 parseables → exactly 2 canonical entries.
+    assert len(canonical_keys) == 2
