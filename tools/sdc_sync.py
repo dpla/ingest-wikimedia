@@ -195,6 +195,18 @@ def _initialize() -> None:
     with open(os.path.join(_REPO_ROOT, "config.toml"), "rb") as f:
         dpla_api = tomllib.load(f)["dpla_api_key"]
 
+    # Bound pywikibot's retry budget. Defaults let a single hung Commons
+    # endpoint stall ``simple_request().submit()`` for ~30 minutes
+    # (max_retries=15 × retry_max=120s backoff). One stuck connection
+    # then holds up the whole 50K-file partner batch behind it. The
+    # values below cap worst-case stall at ~9 min and still ride through
+    # the 1-2 retries needed for transient blips. Applies process-wide,
+    # including to ``site.login()`` immediately below and to all
+    # subsequent ``simple_request`` / ``FilePage.touch`` calls.
+    pywikibot.config.max_retries = _PYWIKIBOT_MAX_RETRIES
+    pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
+    pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
+
     site = pywikibot.Site()
     site.login()
     # CSRF tokens are managed by pywikibot's ``site.tokens["csrf"]`` —
@@ -367,6 +379,14 @@ def postqual(claimid, prop, value):
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
 
 
+# Pywikibot retry budget — applied process-wide in ``_initialize()``.
+# Worst-case single-call stall ≈ max_retries × (read_timeout + retry_max)
+# = 5 × (45s + 60s) ≈ 9 min, vs pywikibot's ~30-min default.
+_PYWIKIBOT_MAX_RETRIES = 5
+_PYWIKIBOT_RETRY_WAIT = 5
+_PYWIKIBOT_RETRY_MAX = 60
+
+
 # Per-file cache for wbgetentities, populated at the start of process_one()
 # and consulted by check() for all subsequent add_* calls. Avoids ~25 redundant
 # round-trips per file. Invalidate when claims change to keep the read-after-write
@@ -375,13 +395,39 @@ def postqual(claimid, prop, value):
 _entity_cache = {}
 
 
+def _raise_if_missing_entity(error, mediaid):
+    """Raise :class:`_MissingEntityError` for ``APIError(code='no-such-entity')``;
+    return silently otherwise.
+
+    The partner-mode boundary catches ``_MissingEntityError`` distinctly
+    so deleted-file skips can be counted as
+    ``SDC_ORDINALS_SKIPPED_MISSING_ENTITY`` instead of folded into the
+    generic error bucket. Callers MUST be inside an
+    ``except pywikibot.exceptions.APIError`` block and MUST follow the
+    silent-return path with their own ``raise`` (re-raise the original)
+    or ``raise SomeRuntimeError(...) from error`` — otherwise the
+    non-missing APIError is silently swallowed."""
+    if (
+        isinstance(error, pywikibot.exceptions.APIError)
+        and error.code == "no-such-entity"
+    ):
+        raise _MissingEntityError(mediaid) from error
+
+
 def get_entity(mediaid):
     """Return the wbgetentities response for mediaid, caching per process_one run."""
     cached = _entity_cache.get(mediaid)
     if cached is not None:
         return cached
-    request = site.simple_request(action="wbgetentities", ids=mediaid)
-    raw = request.submit()
+    try:
+        raw = site.simple_request(action="wbgetentities", ids=mediaid).submit()
+    except pywikibot.exceptions.APIError as e:
+        # A file deleted between upload and SDC sync surfaces here as
+        # ``no-such-entity``; without the translation it would bubble
+        # up as a generic Exception and be miscounted as an error in
+        # the partner-mode Slack summary.
+        _raise_if_missing_entity(e, mediaid)
+        raise
     entity = raw.get("entities", {}).get(mediaid, {})
     _entity_cache[mediaid] = entity
     return entity
@@ -1314,8 +1360,7 @@ def _submit_sdc_write(action, mediaid, dpla_id, **params):
             **params,
         ).submit()
     except pywikibot.exceptions.APIError as e:
-        if e.code == "no-such-entity":
-            raise _MissingEntityError(mediaid) from e
+        _raise_if_missing_entity(e, mediaid)
         raise RuntimeError(
             f"{action} failed for {mediaid} ({dpla_id}):"
             f" {e.code} — {_truncate(getattr(e, 'info', ''))}"
@@ -2377,6 +2422,35 @@ def _run_partner_mode(partner, ids_file):
 # We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
 
 
+def _safe_process_one(mediaid: str, dpla_id: str) -> None:
+    """Run ``process_one`` with the per-file exception boundary the
+    legacy ``--list`` / ``--files`` / ``--cat`` loops need.
+
+    Without this, a transient pywikibot APIError on any one file
+    aborts the entire loop — and on ``--list``, leaves WORKING-*.txt
+    unrenamed so the rest of the manifest is silently abandoned.
+    Mirrors ``_run_partner_mode``'s per-ordinal boundary at
+    line ~2294.
+
+    Catches ``_MissingEntityError`` separately because ``process_one``
+    pre-warms via ``get_entity`` BEFORE its own internal handler at
+    line 2015 — so a deleted file's ``_MissingEntityError`` bypasses
+    that handler and surfaces here. Categorise it as MISSING_ENTITY
+    (clean skip) instead of folding it into the generic ERROR bucket.
+    """
+    try:
+        process_one(mediaid, dpla_id)
+    except _MissingEntityError:
+        logging.info(
+            f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity"
+            " does not exist; skipping (not an error)."
+        )
+        tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+    except Exception:
+        logging.exception(f" -- {mediaid} for {dpla_id}: SDC sync failed; skipping.")
+        tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+
+
 def main() -> None:
     """Entry point for the `sdc-sync` console script.
 
@@ -2408,7 +2482,7 @@ def main() -> None:
                 print("\n" + str(file).replace('""', '"'))
                 mediaid = "M" + str(file.pageid)
                 dpla_id = _resolve_dpla_id(str(file), dpla_api)
-                process_one(mediaid, dpla_id)
+                _safe_process_one(mediaid, dpla_id)
 
             os.rename(working_file, os.path.join(args.lists, "COMPLETE-" + lists[x]))
 
@@ -2438,7 +2512,7 @@ def main() -> None:
             dpla_id = _resolve_dpla_id(title, dpla_api)
             count += 1
             print(f"{count}: {mediaid}")
-            process_one(mediaid, dpla_id)
+            _safe_process_one(mediaid, dpla_id)
 
     elif args.cat:
         category = pywikibot.Category(site, args.cat)
@@ -2452,7 +2526,7 @@ def main() -> None:
             dpla_id = _resolve_dpla_id(title, dpla_api)
             count += 1
             print(f"{count}: {mediaid}")
-            process_one(mediaid, dpla_id)
+            _safe_process_one(mediaid, dpla_id)
             if args.limit and count >= args.limit:
                 print(f" -- Reached --limit {args.limit}, stopping.")
                 break
