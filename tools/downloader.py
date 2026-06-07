@@ -256,7 +256,7 @@ class Downloader:
         overwrite: bool,
         max_age_days: int | None,
         sleep_secs: float,
-    ) -> None:
+    ) -> str:
         """
         For a given capture for a given item, downloads it if we don't have it or are
         overwriting, gets the mime and sha1, and sticks it in S3.
@@ -269,6 +269,22 @@ class Downloader:
         credentials occasionally fail to refresh from IMDS, causing a brief blip that
         resolves within seconds. Only the S3 upload is retried — the HTTP download is
         not repeated, since the file is already on disk when the upload step fails.
+
+        Returns a per-ordinal status string used by ``process_item`` to emit a
+        single-line per-item summary at the end of the ordinal loop. The
+        existing global ``self.tracker`` counters are still incremented as
+        before — the return value is purely so callers can show fine-grained
+        per-item progress without re-scanning the log:
+
+        - ``"SKIPPED"``   — S3 already had a fresh-enough key, no network work
+                            (also: SHA1-match race in ``upload_file_to_s3``)
+        - ``"FETCHED"``   — first-time fresh download to S3
+        - ``"REFRESHED"`` — S3 had a stale key (older than ``max_age_days``);
+                            re-downloaded and overwritten
+        - ``"REJECTED"``  — bytes were fetched but rejected (bad content
+                            type); no S3 write happened
+        - ``"FAILED"``    — the ordinal raised, or the 0-byte defensive
+                            refusal in ``upload_file_to_s3`` triggered
         """
         temp_file = self.local_fs.get_temp_file()
         temp_file_name = temp_file.name
@@ -290,7 +306,7 @@ class Downloader:
                     if max_age_days is None or age_days < max_age_days:
                         logging.info("Key already in S3.")
                         self.tracker.increment(Result.SKIPPED)
-                        return
+                        return "SKIPPED"
                     logging.info(
                         f"Refreshing {dpla_id} {ordinal}: S3 file is "
                         f"{age_days:.0f} days old (threshold: {max_age_days})."
@@ -299,30 +315,68 @@ class Downloader:
 
             if sleep_secs != 0:
                 time.sleep(sleep_secs)
+            # Time the fetch + S3 upload pair so the per-ordinal "Fetched"
+            # line below reports honest wall-clock cost. ``Downloading`` (the
+            # pre-check line in process_item) is emitted for every ordinal
+            # regardless of whether work happens, which makes log volume
+            # alone a poor proxy for actual network time — the "Fetched"
+            # line fires only when bytes really moved.
+            fetch_start = time.time()
             self.download_file_to_temp_path(media_url, temp_file_name)
 
             content_type = self.local_fs.get_content_type(temp_file_name)
             if not check_content_type(content_type):
                 logging.info(f"Bad content type: {content_type}")
+                # Bytes WERE fetched (download_file_to_temp_path ran), but
+                # the content type isn't an image we'll store — so no S3
+                # write. The tracker continues to bump Result.SKIPPED for
+                # COUNTS continuity (pre-existing semantics), but the
+                # per-item summary status is "REJECTED" so it does not
+                # claim "no network work" alongside the genuine fresh-S3
+                # skips earlier in this function.
                 self.tracker.increment(Result.SKIPPED)
-                return
+                return "REJECTED"
 
             sha1 = self.local_fs.get_file_hash(temp_file_name)
 
             force_overwrite = overwrite or is_refresh
             for attempt in range(1, CREDENTIAL_RETRY_MAX + 1):
                 try:
-                    if self.upload_file_to_s3(
+                    if not self.upload_file_to_s3(
                         temp_file_name,
                         destination_path,
                         content_type,
                         sha1,
                         force_overwrite=force_overwrite,
                     ):
-                        self.tracker.increment(
-                            Result.BYTES, os.stat(temp_file_name).st_size
-                        )
-                    return
+                        # upload_file_to_s3 returned False on one of two
+                        # paths that have already incremented the tracker.
+                        # Distinguish them so the per-item summary stays
+                        # consistent with the global COUNTS:
+                        #   * 0-byte defensive refusal → Result.FAILED
+                        #     (download_file_to_temp_path should have
+                        #     raised first; defence-in-depth path)
+                        #   * SHA1-match race → Result.SKIPPED
+                        #     (another writer landed the same key
+                        #     between our age check and our upload)
+                        if os.stat(temp_file_name).st_size == 0:
+                            return "FAILED"
+                        return "SKIPPED"
+                    size_bytes = os.stat(temp_file_name).st_size
+                    self.tracker.increment(Result.BYTES, size_bytes)
+                    elapsed = time.time() - fetch_start
+                    # ADDITIVE companion to the pre-check ``Downloading``
+                    # line: emitted only when a network fetch actually
+                    # happened (fresh or refresh). Grep history for the
+                    # old ``Downloading nara`` pattern is unchanged; the
+                    # new ``Fetched nara`` pattern lets you count real
+                    # network work and visually distinguish skips in the
+                    # log live.
+                    logging.info(
+                        f"Fetched {partner} {dpla_id} {ordinal}"
+                        f" ({size_bytes:,} bytes, {elapsed:.1f}s)."
+                    )
+                    return "REFRESHED" if is_refresh else "FETCHED"
                 except CredentialRetrievalError as e:
                     if attempt < CREDENTIAL_RETRY_MAX:
                         delay = CREDENTIAL_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1))
@@ -338,9 +392,16 @@ class Downloader:
         except Exception as e:
             self.tracker.increment(Result.FAILED)
             logging.warning(f"Failed: {dpla_id} {ordinal}", exc_info=e)
+            return "FAILED"
 
         finally:
             self.local_fs.clean_up_tmp_file(temp_file)
+
+        # Defensive: unreachable in normal flow because every branch above
+        # either returns explicitly or falls through to the exception
+        # handler. Returning a known status here keeps callers' per-item
+        # tallies sound if the control flow ever evolves.
+        return "FAILED"
 
     def process_item(
         self,
@@ -437,6 +498,21 @@ class Downloader:
             logging.info(f"DPLA ID: {dpla_id}")
             logging.info(f"Metadata: {item_metadata}")
 
+        # Per-item tally for the end-of-item summary line. Keeps the
+        # global ``self.tracker`` counters untouched (they continue to
+        # accumulate across the whole run); these locals exist only to
+        # produce the one ``Item {dpla_id}: ...`` summary at the end of
+        # the ordinal loop. Lets operators grep
+        # ``grep "Item .*fetched=[1-9]"`` to see which items actually
+        # had network work, vs scrolling thousands of per-ordinal lines.
+        item_counts = {
+            "SKIPPED": 0,
+            "FETCHED": 0,
+            "REFRESHED": 0,
+            "REJECTED": 0,
+            "FAILED": 0,
+        }
+
         for media_url in tqdm(
             media_urls, desc="Downloading Files", leave=False, unit="File", ncols=100
         ):
@@ -444,6 +520,7 @@ class Downloader:
             if not media_url:
                 logging.warning(f"Skipping {dpla_id} ordinal {count}: empty URL.")
                 self.tracker.increment(Result.SKIPPED)
+                item_counts["SKIPPED"] += 1
                 continue
             # NARA item URLs sporadically arrive with a malformed scheme of
             # "https/..." (missing the colon) — repair before requesting.
@@ -454,7 +531,7 @@ class Downloader:
                 media_url = media_url.replace("https/", "https:/")
             logging.info(f"Downloading {partner} {dpla_id} {count} from {media_url}")
             if not dry_run:
-                self.process_media(
+                status = self.process_media(
                     partner,
                     dpla_id,
                     count,
@@ -463,6 +540,23 @@ class Downloader:
                     max_age_days,
                     sleep_secs,
                 )
+                item_counts[status] = item_counts.get(status, 0) + 1
+
+        # Per-item summary: one concise line operators can grep to find
+        # items that actually had network work (vs scrolling thousands of
+        # per-ordinal lines). Companion to the per-ordinal ``Fetched``
+        # line emitted by ``process_media`` — together they make the log
+        # honest about how much of the work was real downloads vs how
+        # much was already-staged-skip churn.
+        if not dry_run:
+            logging.info(
+                f"Item {dpla_id}: {len(media_urls)} ordinals"
+                f" (skipped={item_counts['SKIPPED']},"
+                f" fetched={item_counts['FETCHED']},"
+                f" refreshed={item_counts['REFRESHED']},"
+                f" rejected={item_counts['REJECTED']},"
+                f" failed={item_counts['FAILED']})."
+            )
 
 
 @click.command()
