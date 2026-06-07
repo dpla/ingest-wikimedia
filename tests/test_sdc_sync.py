@@ -1051,3 +1051,168 @@ def test_set_claim_target_rejects_unknown_value_type():
         sdc_sync._set_claim_target(claim, repo, "x", "globe-coordinate")
     with pytest.raises(ValueError, match="unsupported value_type"):
         sdc_sync._set_claim_target(claim, repo, {}, "time")
+
+
+# Regression coverage for the Special:EntityData UA-403 silent-failure bug
+# in `_reconcile_existing_claims` (phab T400119).
+
+
+def _stmt(stmt_id, prop, snaktype, value, qualifiers=None, references=None):
+    """Build a Commons statement dict in the wbgetentities shape."""
+    if snaktype == "somevalue":
+        mainsnak = {"snaktype": "somevalue", "property": prop}
+    elif prop == "P760":
+        mainsnak = {
+            "snaktype": "value",
+            "property": prop,
+            "datavalue": {"value": value, "type": "string"},
+        }
+    else:
+        mainsnak = {
+            "snaktype": "value",
+            "property": prop,
+            "datavalue": {
+                "value": {
+                    "entity-type": "item",
+                    "numeric-id": int(value.replace("Q", "")),
+                    "id": value,
+                },
+                "type": "wikibase-entityid",
+            },
+        }
+    s = {"id": stmt_id, "mainsnak": mainsnak, "type": "statement", "rank": "normal"}
+    if qualifiers is not None:
+        s["qualifiers"] = qualifiers
+    if references is not None:
+        s["references"] = references
+    return s
+
+
+def test_reconciler_queues_removal_for_stale_p170_string():
+    """Stale DPLA-referenced P170 qualifier (value not in `expected`) is queued for wbremoveclaims."""
+    from tools import sdc_sync
+
+    stale_stmt = _stmt(
+        stmt_id="M999$STALE",
+        prop="P170",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={
+            "P459": _dpla_p459(),
+            "P2093": _qual_string("P2093", "U.S. Senate. 3/4/1789"),
+        },
+        references=[_dpla_reference()],
+    )
+    entity = {"pageid": 999, "statements": {"P170": [stale_stmt]}}
+    expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
+
+    submit_calls = []
+
+    def fake_submit(action, mediaid, dpla_id, **params):
+        submit_calls.append((action, mediaid, params))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert len(submit_calls) == 1
+    action, mediaid, params = submit_calls[0]
+    assert action == "wbremoveclaims"
+    assert mediaid == "M999"
+    assert params["claim"] == "M999$STALE", (
+        f"reconciler should queue the stale claim for removal; got {params['claim']!r}"
+    )
+
+
+def test_reconciler_keeps_claim_when_value_matches_expected():
+    """Healthy DPLA-referenced claim whose value is in `expected` is left alone."""
+    from tools import sdc_sync
+
+    good_stmt = _stmt(
+        stmt_id="M999$KEEP",
+        prop="P170",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={
+            "P459": _dpla_p459(),
+            "P2093": _qual_string("P2093", "U.S. Senate. (03/04/1789)"),
+        },
+        references=[_dpla_reference()],
+    )
+    entity = {"pageid": 999, "statements": {"P170": [good_stmt]}}
+    expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
+
+    submit_calls = []
+
+    def fake_submit(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [], (
+        f"reconciler should not queue removal for a healthy claim; got {submit_calls!r}"
+    )
+
+
+def test_reconciler_ignores_foreign_claim_without_dpla_reference():
+    """Foreign (non-DPLA-referenced) claim is never queued for removal, even when its value isn't in `expected`."""
+    from tools import sdc_sync
+
+    foreign_stmt = _stmt(
+        stmt_id="M999$FOREIGN",
+        prop="P170",
+        snaktype="somevalue",
+        value=None,
+        qualifiers={"P2093": _qual_string("P2093", "Some User's Author Name")},
+        references=[_foreign_reference()],
+    )
+    entity = {"pageid": 999, "statements": {"P170": [foreign_stmt]}}
+    expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
+
+    submit_calls = []
+
+    def fake_submit(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", expected
+        )
+
+    assert submit_calls == [], (
+        "reconciler must not touch foreign (non-DPLA-referenced) claims"
+    )
+
+
+def test_reconciler_propagates_get_entity_error():
+    """Entity-fetch errors propagate (no silent fallback to an empty entity)."""
+    from tools import sdc_sync
+
+    with (
+        patch.object(
+            sdc_sync,
+            "get_entity",
+            side_effect=RuntimeError("simulated wbgetentities failure"),
+        ),
+        patch.object(sdc_sync, "invalidate_entity"),
+        pytest.raises(RuntimeError, match="simulated wbgetentities failure"),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999", "abc1234567890abcdef1234567890abcd", {"P170": ["x"]}
+        )

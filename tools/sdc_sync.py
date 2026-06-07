@@ -1513,19 +1513,22 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
     `process_one_from_sdc` (PR 4 partner-mode path). Same removal logic;
     just different sources for `expected`.
     """
+    # Use pywikibot's wbgetentities (via get_entity) rather than a direct
+    # requests.get to Special:EntityData: Wikimedia rejects the default
+    # python-requests UA with HTTP 403 (phab T400119), and pywikibot's
+    # Site.simple_request sets a compliant UA plus maxlag/CSRF handling.
+    # Invalidate the cache so this read sees post-write state from
+    # `_post_new_claims` above; let errors propagate to the per-ordinal
+    # boundary in `_run_partner_mode`.
     print(f" -- Accessing Commons ID {mediaid}")
-    try:
-        file_claims = requests.get(
-            f"https://commons.wikimedia.org/wiki/Special:EntityData/{mediaid}.json",
-            timeout=30,
-        ).json()
-    except Exception:
-        file_claims = {"entities": {mediaid: {"statements": {}}}}
+    invalidate_entity(mediaid)
+    entity = get_entity(mediaid)
     print(f" -- Accessed Commons ID {mediaid}")
+    statements = entity.get("statements") or {}
     dpla_claim_list = []
     removals = []
-    for prop in file_claims["entities"][mediaid]["statements"]:
-        for stmt in file_claims["entities"][mediaid]["statements"][prop]:
+    for prop in statements:
+        for stmt in statements[prop]:
             if stmt.get("references"):
                 if any(pubprop["snaks"].get("P123") for pubprop in stmt["references"]):
                     if any(
