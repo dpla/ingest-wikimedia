@@ -633,6 +633,36 @@ def test_process_media_returns_failed_on_exception(downloader, tmp_path):
     downloader.tracker.increment.assert_any_call(Result.FAILED)
 
 
+def test_process_media_returns_failed_when_upload_signals_no_work(downloader, tmp_path):
+    """upload_file_to_s3 returns False on its 0-byte refusal path and on
+    the SHA1-match race (another writer landed the key between our age
+    check and our upload). Either way no fetch landed, so process_media
+    must NOT credit the ordinal as 'FETCHED' — the per-item summary
+    counts would lie. Verify the status is 'FAILED' instead."""
+    temp_file = MagicMock()
+    temp_file.name = str(tmp_path / "fake.jpg")
+    downloader.local_fs.get_temp_file.return_value = temp_file
+    downloader.local_fs.get_content_type.return_value = "image/jpeg"
+    downloader.local_fs.get_file_hash.return_value = "deadbeef"
+
+    with (
+        patch.object(downloader, "_s3_key_age_days", return_value=None),
+        patch.object(downloader, "download_file_to_temp_path"),
+        patch.object(downloader, "upload_file_to_s3", return_value=False),
+    ):
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=5,
+            media_url="http://example.com/w.jpg",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+
+    assert status == "FAILED"
+
+
 def test_process_item_emits_per_item_summary_line(downloader, tmp_path):
     """The ordinal loop must end with one summary line tallying skip /
     fetch / refresh / fail counts. Grep-friendly companion to the

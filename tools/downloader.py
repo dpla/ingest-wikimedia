@@ -331,27 +331,34 @@ class Downloader:
             force_overwrite = overwrite or is_refresh
             for attempt in range(1, CREDENTIAL_RETRY_MAX + 1):
                 try:
-                    if self.upload_file_to_s3(
+                    if not self.upload_file_to_s3(
                         temp_file_name,
                         destination_path,
                         content_type,
                         sha1,
                         force_overwrite=force_overwrite,
                     ):
-                        size_bytes = os.stat(temp_file_name).st_size
-                        self.tracker.increment(Result.BYTES, size_bytes)
-                        elapsed = time.time() - fetch_start
-                        # ADDITIVE companion to the pre-check ``Downloading``
-                        # line: emitted only when a network fetch actually
-                        # happened (fresh or refresh). Grep history for the
-                        # old ``Downloading nara`` pattern is unchanged; the
-                        # new ``Fetched nara`` pattern lets you count real
-                        # network work and visually distinguish skips in the
-                        # log live.
-                        logging.info(
-                            f"Fetched {partner} {dpla_id} {ordinal}"
-                            f" ({size_bytes:,} bytes, {elapsed:.1f}s)."
-                        )
+                        # upload_file_to_s3 returned False — either the
+                        # 0-byte defensive refusal (tracker already bumped
+                        # FAILED) or a SHA1-match race on a non-refresh
+                        # path (tracker already bumped SKIPPED). In both
+                        # cases no fetch landed, so the per-item summary
+                        # must NOT credit this ordinal as FETCHED.
+                        return "FAILED"
+                    size_bytes = os.stat(temp_file_name).st_size
+                    self.tracker.increment(Result.BYTES, size_bytes)
+                    elapsed = time.time() - fetch_start
+                    # ADDITIVE companion to the pre-check ``Downloading``
+                    # line: emitted only when a network fetch actually
+                    # happened (fresh or refresh). Grep history for the
+                    # old ``Downloading nara`` pattern is unchanged; the
+                    # new ``Fetched nara`` pattern lets you count real
+                    # network work and visually distinguish skips in the
+                    # log live.
+                    logging.info(
+                        f"Fetched {partner} {dpla_id} {ordinal}"
+                        f" ({size_bytes:,} bytes, {elapsed:.1f}s)."
+                    )
                     return "REFRESHED" if is_refresh else "FETCHED"
                 except CredentialRetrievalError as e:
                     if attempt < CREDENTIAL_RETRY_MAX:
