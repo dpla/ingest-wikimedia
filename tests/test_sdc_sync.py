@@ -1837,13 +1837,19 @@ def test_check_time_kind_treats_circa_and_exact_as_distinct():
 # ---------------------------------------------------------------------------
 
 
-def test_build_expected_from_parsed_includes_both_shapes_for_p571():
+def test_build_expected_from_parsed_includes_both_shapes_for_p571(monkeypatch):
     """The legacy expected map's P571 entry must include the raw
     display-date string (for unmigrated somevalue+P1932 claims) AND
     the canonical time-comparable key for the parseable subset (for
     migrated value-typed claims), so a rerun after partner-mode
     migration doesn't strip the migrated claim."""
     from tools import sdc_sync
+
+    # `_build_expected_from_parsed` reads the module-global ``rights``
+    # (populated by ``_initialize()`` in production). Pin it explicitly
+    # so this test is self-contained — passes when run in isolation,
+    # under reordering, or under pytest-randomly.
+    monkeypatch.setattr(sdc_sync, "rights", {}, raising=False)
 
     expected = sdc_sync._build_expected_from_parsed(
         dpla_id="abcdef",
