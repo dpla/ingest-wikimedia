@@ -402,6 +402,128 @@ def test_merge_preserved_wikitext_no_metadata_returns_artwork_unchanged():
     assert result == ARTWORK + "\n"
 
 
+# ---------------------------------------------------------------------------
+# Assessment-template preservation (Media of the day, etc.)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_preserved_wikitext_preserves_media_of_the_day():
+    """Regression: {{Media of the day|YEAR|MONTH|DAY}} (and the
+    `=={{Assessment}}== ` header that wraps it) must survive the metadata
+    rescue overwrite. Earlier the rescue path silently dropped the entire
+    Assessment block — observed on the May-Ling Soong Chiang address
+    file (revid 1222566342), where the file lost its MOTD designation
+    for 2023-02-18 in a title-drift rewrite.
+    """
+    existing = (
+        "== {{int:filedesc}} ==\n"
+        "{{Information |description=...|date=1943-02-18 }}\n"
+        "\n"
+        "=={{Assessment}}==\n"
+        "{{Media of the day|2023|2|18}}\n"
+        "\n"
+        "=={{int:license-header}}==\n"
+        "{{PD-USGov-Congress}}\n"
+    )
+    result = merge_preserved_wikitext(existing, ARTWORK)
+
+    # The MOTD template survives with all three date components.
+    assert "{{Media of the day|2023|2|18}}" in result
+    # The Assessment header is emitted above it (Commons convention; an
+    # MOTD-archive scraper looking for that wrapper would miss a bare
+    # template).
+    assessment_idx = result.index("=={{Assessment}}==")
+    motd_idx = result.index("{{Media of the day|2023|2|18}}")
+    assert assessment_idx < motd_idx, (
+        "Assessment header must appear above the preserved MOTD template; "
+        f"got assessment_idx={assessment_idx}, motd_idx={motd_idx}"
+    )
+    # Assessment block goes BETWEEN the artwork and the license (matches
+    # Commons page-structure convention).
+    license_idx = result.index("{{PD-USGov-Congress}}")
+    artwork_end = len(ARTWORK)
+    assert artwork_end <= assessment_idx < license_idx, (
+        "Assessment block must go after artwork and before license; "
+        f"got artwork_end={artwork_end}, assessment_idx={assessment_idx}, "
+        f"license_idx={license_idx}"
+    )
+
+
+def test_merge_preserved_wikitext_preserves_picture_of_the_day():
+    """POTD has the same shape as MOTD and must round-trip identically."""
+    existing = (
+        "== {{int:filedesc}} ==\nold description\n{{Picture of the day|2024|6|15}}\n"
+    )
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    assert "{{Picture of the day|2024|6|15}}" in result
+    assert "=={{Assessment}}==" in result
+
+
+def test_merge_preserved_wikitext_preserves_quality_image_featured_valued():
+    """Status templates other than the time-stamped MOTD/POTD pair —
+    {{Featured picture}}, {{Quality image}}, {{Valued image}} — must
+    survive too. They're conferred by Commons editorial processes and
+    losing them in a rescue rewrite quietly demotes the file."""
+    existing = "{{Featured picture}}\n{{Quality image}}\n{{Valued image}}\n"
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    assert "{{Featured picture}}" in result
+    assert "{{Quality image}}" in result
+    assert "{{Valued image}}" in result
+    # Single Assessment header for the whole block, not one per template.
+    assert result.count("=={{Assessment}}==") == 1
+
+
+def test_merge_preserved_wikitext_preserves_assessments_bundle():
+    """The {{Assessments|...}} bundle template encodes multiple statuses
+    in one call (e.g. `{{Assessments|featured=1|quality=1}}`). Must be
+    preserved with its parameters intact."""
+    existing = "{{Assessments|featured=1|quality=1|com_nom=Foo.jpg}}"
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    assert "{{Assessments|featured=1|quality=1|com_nom=Foo.jpg}}" in result
+
+
+def test_merge_preserved_wikitext_assessment_template_case_insensitive():
+    """Commons editors use both `{{Media of the day|...}}` and the
+    lowercase `{{media of the day|...}}` variant. Both must be picked
+    up by the preservation pattern."""
+    existing = "{{media of the day|2023|2|18}}"
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    assert "{{media of the day|2023|2|18}}" in result
+
+
+def test_merge_preserved_wikitext_no_assessment_header_when_no_templates():
+    """When the existing page has no assessment-class templates at all,
+    no synthetic Assessment header must be added to the rewrite.
+    Otherwise every rescue would emit a dangling header above bare
+    license templates."""
+    existing = "{{PD-USGov}}\n[[Category:Foo]]"
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    assert "=={{Assessment}}==" not in result
+
+
+def test_merge_preserved_wikitext_dedupes_assessment_templates():
+    """Repeated MOTD designations (rare but possible if a file was
+    featured twice) must collapse to a single entry — same dedup
+    treatment as the other preserved-content groups."""
+    existing = "{{Media of the day|2023|2|18}}\n{{Media of the day|2023|2|18}}\n"
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    assert result.count("{{Media of the day|2023|2|18}}") == 1
+
+
+def test_merge_preserved_wikitext_assessment_does_not_false_match_other_templates():
+    """The pattern must not pick up unrelated templates whose names
+    happen to share a prefix (e.g. `{{Picture of the day request|...}}`
+    is NOT the same as `{{Picture of the day|...}}` and shouldn't be
+    preserved as if it were)."""
+    existing = "{{Picture of the day request|reason=test}}"
+    result = merge_preserved_wikitext(existing, ARTWORK)
+    # The whole template should not be picked up — it's a request, not a
+    # designation. (If it WERE matched, the Assessment header would also
+    # appear.)
+    assert "{{Picture of the day request" not in result
+    assert "=={{Assessment}}==" not in result
+
+
 def test_extract_page_ordinal_multipage():
     title = "Plant Life - DPLA - 002b0f7ad761858506721b83e3370c5f (page 17).jpg"
     assert extract_page_ordinal_from_commons_title(title) == 17
