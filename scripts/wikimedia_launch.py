@@ -425,7 +425,15 @@ def main() -> None:
                         f"DPLA ID `{item_id}`: not eligible ({reason})."
                     )
                 elif status.startswith("HUB="):
-                    _add_target(status.removeprefix("HUB="), None, dpla_id=item_id)
+                    # DPLA-ID single-item target: no institution filter.
+                    # ``institutions=()`` is the new "hub-level / no filter"
+                    # signal — passing ``None`` would crash because the
+                    # body iterates ``institutions``.
+                    _add_target(
+                        status.removeprefix("HUB="),
+                        institutions=(),
+                        dpla_id=item_id,
+                    )
                 elif status.startswith("ERROR:"):
                     skipped_warnings.append(
                         f"DPLA ID `{item_id}`: resolve error — {status.removeprefix('ERROR:')}."
