@@ -498,3 +498,252 @@ def test_s3_key_age_days_propagates_non_404_errors(downloader):
     )
     with pytest.raises(ClientError):
         downloader._s3_key_age_days("any/path")
+
+
+# ---------------------------------------------------------------------------
+# process_media returns a per-ordinal status code so process_item can emit
+# a per-item summary line. The existing global tracker counters are still
+# incremented; the return value is purely so callers can group results.
+#
+# Status codes:
+#   "SKIPPED"   — S3 already had a fresh-enough key (no network work)
+#   "FETCHED"   — first-time fresh download to S3
+#   "REFRESHED" — S3 key was stale; re-downloaded and overwritten
+#   "FAILED"    — the ordinal raised at some point
+# ---------------------------------------------------------------------------
+
+
+def test_process_media_returns_skipped_when_s3_has_fresh_key(downloader):
+    """If the S3 key exists and is younger than max_age_days, return
+    'SKIPPED' immediately and don't touch the network."""
+    with patch.object(downloader, "_s3_key_age_days", return_value=10.0):
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=1,
+            media_url="http://example.com/x.jpg",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+    assert status == "SKIPPED"
+    downloader.tracker.increment.assert_called_with(Result.SKIPPED)
+
+
+def test_process_media_returns_fetched_on_first_time_download(downloader, tmp_path):
+    """When the S3 key doesn't exist, process_media downloads + uploads
+    and returns 'FETCHED'. The 'Fetched' log line carries bytes + seconds
+    so operators can spot real network work in the log."""
+    temp_file = MagicMock()
+    temp_file.name = str(tmp_path / "fake.jpg")
+    downloader.local_fs.get_temp_file.return_value = temp_file
+    downloader.local_fs.get_content_type.return_value = "image/jpeg"
+    downloader.local_fs.get_file_hash.return_value = "deadbeef"
+
+    with (
+        patch.object(downloader, "_s3_key_age_days", return_value=None),
+        patch.object(downloader, "download_file_to_temp_path"),
+        patch.object(downloader, "upload_file_to_s3", return_value=True),
+        patch("os.stat") as mock_stat,
+        patch("logging.info") as mock_log,
+    ):
+        mock_stat.return_value.st_size = 123456
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=2,
+            media_url="http://example.com/y.jpg",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+
+    assert status == "FETCHED"
+    # The "Fetched" line must appear with byte count + elapsed seconds —
+    # this is the additive companion to the pre-check "Downloading" line
+    # that makes the log honest about which considerations were real
+    # downloads.
+    fetched_log = next(
+        (c for c in mock_log.call_args_list if "Fetched bpl abc 2" in str(c)),
+        None,
+    )
+    assert fetched_log is not None, (
+        f"Expected a 'Fetched bpl abc 2 ...' log line; got: {mock_log.call_args_list}"
+    )
+    assert "123,456 bytes" in str(fetched_log)
+
+
+def test_process_media_returns_refreshed_when_s3_key_stale(downloader, tmp_path):
+    """When the S3 key exists but is older than max_age_days,
+    process_media re-downloads and returns 'REFRESHED' (distinct from
+    'FETCHED' so the per-item summary can break refresh out)."""
+    temp_file = MagicMock()
+    temp_file.name = str(tmp_path / "fake.jpg")
+    downloader.local_fs.get_temp_file.return_value = temp_file
+    downloader.local_fs.get_content_type.return_value = "image/jpeg"
+    downloader.local_fs.get_file_hash.return_value = "deadbeef"
+
+    with (
+        patch.object(downloader, "_s3_key_age_days", return_value=400.0),
+        patch.object(downloader, "download_file_to_temp_path"),
+        patch.object(downloader, "upload_file_to_s3", return_value=True),
+        patch("os.stat") as mock_stat,
+    ):
+        mock_stat.return_value.st_size = 42
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=3,
+            media_url="http://example.com/z.jpg",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+
+    assert status == "REFRESHED"
+
+
+def test_process_media_returns_failed_on_exception(downloader, tmp_path):
+    """When the download itself raises, the status is 'FAILED' (and the
+    global tracker is bumped). Lets process_item count failed ordinals
+    distinctly in the per-item summary."""
+    temp_file = MagicMock()
+    temp_file.name = str(tmp_path / "fake.jpg")
+    downloader.local_fs.get_temp_file.return_value = temp_file
+
+    with (
+        patch.object(downloader, "_s3_key_age_days", return_value=None),
+        patch.object(
+            downloader,
+            "download_file_to_temp_path",
+            side_effect=RuntimeError("network blew up"),
+        ),
+    ):
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=4,
+            media_url="http://example.com/x.jpg",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+
+    assert status == "FAILED"
+    downloader.tracker.increment.assert_any_call(Result.FAILED)
+
+
+def test_process_item_emits_per_item_summary_line(downloader, tmp_path):
+    """The ordinal loop must end with one summary line tallying skip /
+    fetch / refresh / fail counts. Grep-friendly companion to the
+    per-ordinal 'Fetched' line — operators can grep
+    ``"Item .*fetched=[1-9]"`` to find items that actually had work."""
+    from ingest_wikimedia.dpla import MEDIA_MASTER_FIELD_NAME
+
+    downloader.s3_client.get_item_metadata.return_value = json.dumps(
+        {
+            "_staged_by_get_ids_es": True,
+            MEDIA_MASTER_FIELD_NAME: [
+                "http://example.com/page1.jpg",
+                "http://example.com/page2.jpg",
+                "http://example.com/page3.jpg",
+            ],
+        }
+    )
+
+    # Make all three ordinals resolve to SKIPPED so the loop completes
+    # quickly without needing a full download mock chain.
+    with (
+        patch.object(downloader, "process_media", return_value="SKIPPED"),
+        patch("logging.info") as mock_log,
+    ):
+        downloader.process_item(
+            overwrite=False,
+            dry_run=False,
+            verbose=False,
+            partner="bpl",
+            dpla_id="item-xyz",
+            sleep_secs=0,
+        )
+
+    summary_log = next(
+        (c for c in mock_log.call_args_list if "Item item-xyz: 3 ordinals" in str(c)),
+        None,
+    )
+    assert summary_log is not None, (
+        f"Expected an 'Item item-xyz: 3 ordinals ...' summary log line; "
+        f"got: {[str(c) for c in mock_log.call_args_list]}"
+    )
+    assert "skipped=3" in str(summary_log)
+    assert "fetched=0" in str(summary_log)
+    assert "refreshed=0" in str(summary_log)
+    assert "failed=0" in str(summary_log)
+
+
+def test_process_item_summary_groups_mixed_statuses(downloader, tmp_path):
+    """A mix of SKIPPED / FETCHED / REFRESHED / FAILED outcomes across
+    the ordinals of one item must be tallied correctly in the summary."""
+    from ingest_wikimedia.dpla import MEDIA_MASTER_FIELD_NAME
+
+    downloader.s3_client.get_item_metadata.return_value = json.dumps(
+        {
+            "_staged_by_get_ids_es": True,
+            MEDIA_MASTER_FIELD_NAME: ["url" + str(i) for i in range(6)],
+        }
+    )
+
+    # Per-ordinal status cycle: 3 skipped, 2 fetched, 1 refreshed
+    statuses = ["SKIPPED", "SKIPPED", "SKIPPED", "FETCHED", "FETCHED", "REFRESHED"]
+    with (
+        patch.object(downloader, "process_media", side_effect=statuses),
+        patch("logging.info") as mock_log,
+    ):
+        downloader.process_item(
+            overwrite=False,
+            dry_run=False,
+            verbose=False,
+            partner="bpl",
+            dpla_id="item-mixed",
+            sleep_secs=0,
+        )
+
+    summary_log = next(
+        (c for c in mock_log.call_args_list if "Item item-mixed" in str(c)),
+        None,
+    )
+    assert summary_log is not None
+    text = str(summary_log)
+    assert "6 ordinals" in text
+    assert "skipped=3" in text
+    assert "fetched=2" in text
+    assert "refreshed=1" in text
+    assert "failed=0" in text
+
+
+def test_process_item_does_not_emit_summary_in_dry_run(downloader, tmp_path):
+    """The per-item summary is meaningless during a dry run (no
+    process_media calls happen, so all counts would be zero). Suppress
+    it so dry-run logs aren't padded with empty summary lines."""
+    from ingest_wikimedia.dpla import MEDIA_MASTER_FIELD_NAME
+
+    downloader.s3_client.get_item_metadata.return_value = json.dumps(
+        {
+            "_staged_by_get_ids_es": True,
+            MEDIA_MASTER_FIELD_NAME: ["url1", "url2"],
+        }
+    )
+
+    with patch("logging.info") as mock_log:
+        downloader.process_item(
+            overwrite=False,
+            dry_run=True,
+            verbose=False,
+            partner="bpl",
+            dpla_id="item-dry",
+            sleep_secs=0,
+        )
+
+    summary_logs = [c for c in mock_log.call_args_list if "Item item-dry" in str(c)]
+    assert not summary_logs, (
+        f"Per-item summary should be suppressed in dry-run mode; got: {summary_logs}"
+    )
