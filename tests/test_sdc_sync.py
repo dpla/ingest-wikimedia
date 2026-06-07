@@ -1216,3 +1216,172 @@ def test_reconciler_propagates_get_entity_error():
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", {"P170": ["x"]}
         )
+
+
+# ---------------------------------------------------------------------------
+# _raise_if_missing_entity / get_entity
+#
+# Reads are now expected to translate ``no-such-entity`` to
+# ``_MissingEntityError`` so the partner-mode boundary categorises deleted
+# files as MISSING_ENTITY rather than generic ERROR.
+# ---------------------------------------------------------------------------
+
+
+def test_raise_if_missing_entity_translates_no_such_entity():
+    """APIError(code='no-such-entity') becomes _MissingEntityError."""
+    from tools import sdc_sync
+
+    err = _api_error("no-such-entity", info="No entity")
+    with pytest.raises(sdc_sync._MissingEntityError):
+        sdc_sync._raise_if_missing_entity(err, "M999")
+
+
+def test_raise_if_missing_entity_silent_on_other_apierror():
+    """Other APIError codes pass through so the caller can wrap/re-raise."""
+    from tools import sdc_sync
+
+    # No raise → returns None implicitly.
+    assert sdc_sync._raise_if_missing_entity(_api_error("maxlag"), "M999") is None
+
+
+def test_get_entity_translates_no_such_entity(monkeypatch):
+    """When wbgetentities returns no-such-entity for a deleted Commons file,
+    get_entity must raise _MissingEntityError so the partner-mode boundary
+    increments SDC_ORDINALS_SKIPPED_MISSING_ENTITY (not _ERROR)."""
+    from tools import sdc_sync
+
+    fake_request = MagicMock()
+    fake_request.submit.side_effect = _api_error("no-such-entity")
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value = fake_request
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+    monkeypatch.setattr(sdc_sync, "_entity_cache", {}, raising=False)
+
+    with pytest.raises(sdc_sync._MissingEntityError):
+        sdc_sync.get_entity("M999")
+
+
+def test_get_entity_propagates_other_apierrors(monkeypatch):
+    """Non-missing APIErrors (maxlag, badtoken, etc.) propagate so the
+    per-ordinal boundary catches them as generic errors."""
+    import pywikibot.exceptions
+
+    from tools import sdc_sync
+
+    fake_request = MagicMock()
+    fake_request.submit.side_effect = _api_error("maxlag", info="DB lag")
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value = fake_request
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+    monkeypatch.setattr(sdc_sync, "_entity_cache", {}, raising=False)
+
+    with pytest.raises(pywikibot.exceptions.APIError, match="maxlag"):
+        sdc_sync.get_entity("M999")
+
+
+# ---------------------------------------------------------------------------
+# _safe_process_one — per-file exception boundary for the legacy
+# --list / --files / --cat loops, mirroring _run_partner_mode's
+# per-ordinal boundary. Unit-tested directly here; integration with main()
+# is exercised by hand against the three call sites.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_process_one_passes_through_on_success(monkeypatch):
+    """No exception → no tracker increment."""
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+    monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
+
+    sdc_sync._safe_process_one("M1", "dpla-1")
+
+    fake_tracker.increment.assert_not_called()
+
+
+def test_safe_process_one_categorises_missing_entity(monkeypatch):
+    """_MissingEntityError → SDC_ORDINALS_SKIPPED_MISSING_ENTITY, not the
+    generic ERROR bucket. Without this branch, the new get_entity
+    translation (which can raise _MissingEntityError from process_one's
+    pre-warm at line 1950, OUTSIDE its own try/except at line 2015)
+    would be miscounted as a generic error."""
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+
+    def raise_missing(*a):
+        raise sdc_sync._MissingEntityError("M1")
+
+    monkeypatch.setattr(sdc_sync, "process_one", raise_missing)
+
+    sdc_sync._safe_process_one("M1", "dpla-1")
+
+    fake_tracker.increment.assert_called_once_with(
+        Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY
+    )
+
+
+def test_safe_process_one_categorises_generic_error(monkeypatch):
+    """Any other Exception → SDC_ORDINALS_SKIPPED_ERROR + traceback logged
+    (so the loop continues to the next file)."""
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+
+    def raise_other(*a):
+        raise RuntimeError("simulated APIError")
+
+    monkeypatch.setattr(sdc_sync, "process_one", raise_other)
+
+    # Should NOT propagate; loops upstream rely on this swallowing-and-continuing.
+    sdc_sync._safe_process_one("M1", "dpla-1")
+
+    fake_tracker.increment.assert_called_once_with(Result.SDC_ORDINALS_SKIPPED_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# pywikibot retry budget — bounded by _initialize()
+# ---------------------------------------------------------------------------
+
+
+def test_initialize_pins_pywikibot_retry_budget(monkeypatch, tmp_path):
+    """A hung Commons endpoint must not stall a single API call for the
+    ~30-minute pywikibot default. _initialize() pins max_retries +
+    retry_wait + retry_max to the module's _PYWIKIBOT_* constants so
+    the worst-case stall is bounded (~9 min)."""
+    import pywikibot
+
+    from tools import sdc_sync
+
+    # monkeypatch.setattr registers teardown BEFORE the mutation, so a
+    # mid-test failure can't leak polluted config to other tests.
+    monkeypatch.setattr(pywikibot.config, "max_retries", 15)
+    monkeypatch.setattr(pywikibot.config, "retry_wait", 5)
+    monkeypatch.setattr(pywikibot.config, "retry_max", 120)
+
+    # _initialize() reads config.toml + rights.json from _REPO_ROOT; stub both.
+    (tmp_path / "config.toml").write_text('dpla_api_key = "stub"\n')
+    (tmp_path / "rights.json").write_text("{}")
+    monkeypatch.setattr(sdc_sync, "_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        sdc_sync,
+        "_build_parser",
+        lambda: MagicMock(
+            parse_args=lambda: MagicMock(method=None, from_s3=None),
+        ),
+    )
+    monkeypatch.setattr(pywikibot, "Site", MagicMock)
+    monkeypatch.setattr(
+        sdc_sync.requests, "get", lambda *a, **k: MagicMock(json=lambda: {})
+    )
+
+    sdc_sync._initialize()
+
+    # Pin equality, not <=, so any future loosening of the constants is
+    # a deliberate edit reviewers see — not an invisible drift.
+    assert pywikibot.config.max_retries == sdc_sync._PYWIKIBOT_MAX_RETRIES
+    assert pywikibot.config.retry_wait == sdc_sync._PYWIKIBOT_RETRY_WAIT
+    assert pywikibot.config.retry_max == sdc_sync._PYWIKIBOT_RETRY_MAX
