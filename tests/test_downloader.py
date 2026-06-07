@@ -633,12 +633,13 @@ def test_process_media_returns_failed_on_exception(downloader, tmp_path):
     downloader.tracker.increment.assert_any_call(Result.FAILED)
 
 
-def test_process_media_returns_failed_when_upload_signals_no_work(downloader, tmp_path):
-    """upload_file_to_s3 returns False on its 0-byte refusal path and on
-    the SHA1-match race (another writer landed the key between our age
-    check and our upload). Either way no fetch landed, so process_media
-    must NOT credit the ordinal as 'FETCHED' — the per-item summary
-    counts would lie. Verify the status is 'FAILED' instead."""
+def test_process_media_returns_failed_when_upload_refuses_zero_byte(
+    downloader, tmp_path
+):
+    """When upload_file_to_s3 returns False because the temp file is
+    0 bytes (defence-in-depth past download_file_to_temp_path's primary
+    raise), it has already bumped Result.FAILED. process_media must
+    return 'FAILED' so the per-item summary matches the global tracker."""
     temp_file = MagicMock()
     temp_file.name = str(tmp_path / "fake.jpg")
     downloader.local_fs.get_temp_file.return_value = temp_file
@@ -649,7 +650,9 @@ def test_process_media_returns_failed_when_upload_signals_no_work(downloader, tm
         patch.object(downloader, "_s3_key_age_days", return_value=None),
         patch.object(downloader, "download_file_to_temp_path"),
         patch.object(downloader, "upload_file_to_s3", return_value=False),
+        patch("os.stat") as mock_stat,
     ):
+        mock_stat.return_value.st_size = 0
         status = downloader.process_media(
             partner="bpl",
             dpla_id="abc",
@@ -661,6 +664,69 @@ def test_process_media_returns_failed_when_upload_signals_no_work(downloader, tm
         )
 
     assert status == "FAILED"
+
+
+def test_process_media_returns_skipped_on_sha1_match_race(downloader, tmp_path):
+    """SHA1-match race: between the age check returning None (no key)
+    and upload_file_to_s3's metadata read, another writer landed the
+    same key with a matching SHA1. upload_file_to_s3 returns False
+    after bumping Result.SKIPPED. process_media must mirror that with
+    'SKIPPED' so the per-item summary doesn't disagree with the tracker."""
+    temp_file = MagicMock()
+    temp_file.name = str(tmp_path / "fake.jpg")
+    downloader.local_fs.get_temp_file.return_value = temp_file
+    downloader.local_fs.get_content_type.return_value = "image/jpeg"
+    downloader.local_fs.get_file_hash.return_value = "deadbeef"
+
+    with (
+        patch.object(downloader, "_s3_key_age_days", return_value=None),
+        patch.object(downloader, "download_file_to_temp_path"),
+        patch.object(downloader, "upload_file_to_s3", return_value=False),
+        patch("os.stat") as mock_stat,
+    ):
+        # Non-zero size distinguishes this from the 0-byte refusal path.
+        mock_stat.return_value.st_size = 4096
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=6,
+            media_url="http://example.com/v.jpg",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+
+    assert status == "SKIPPED"
+
+
+def test_process_media_returns_rejected_on_bad_content_type(downloader, tmp_path):
+    """Bad-content-type rejection: the HTTP fetch happened
+    (download_file_to_temp_path ran) but the response wasn't an image
+    we'll store. Distinct from 'SKIPPED' (which means no network
+    work) so the per-item summary stays honest about what consumed
+    bandwidth."""
+    temp_file = MagicMock()
+    temp_file.name = str(tmp_path / "fake.html")
+    downloader.local_fs.get_temp_file.return_value = temp_file
+    downloader.local_fs.get_content_type.return_value = "text/html"
+
+    with (
+        patch.object(downloader, "_s3_key_age_days", return_value=None),
+        patch.object(downloader, "download_file_to_temp_path"),
+    ):
+        status = downloader.process_media(
+            partner="bpl",
+            dpla_id="abc",
+            ordinal=7,
+            media_url="http://example.com/q.html",
+            overwrite=False,
+            max_age_days=30,
+            sleep_secs=0,
+        )
+
+    assert status == "REJECTED"
+    # Pre-existing tracker semantic preserved (COUNTS continuity).
+    downloader.tracker.increment.assert_any_call(Result.SKIPPED)
 
 
 def test_process_item_emits_per_item_summary_line(downloader, tmp_path):
@@ -707,23 +773,33 @@ def test_process_item_emits_per_item_summary_line(downloader, tmp_path):
     assert "skipped=3" in str(summary_log)
     assert "fetched=0" in str(summary_log)
     assert "refreshed=0" in str(summary_log)
+    assert "rejected=0" in str(summary_log)
     assert "failed=0" in str(summary_log)
 
 
 def test_process_item_summary_groups_mixed_statuses(downloader, tmp_path):
-    """A mix of SKIPPED / FETCHED / REFRESHED / FAILED outcomes across
-    the ordinals of one item must be tallied correctly in the summary."""
+    """A mix of SKIPPED / FETCHED / REFRESHED / REJECTED / FAILED outcomes
+    across the ordinals of one item must be tallied correctly in the
+    summary."""
     from ingest_wikimedia.dpla import MEDIA_MASTER_FIELD_NAME
 
     downloader.s3_client.get_item_metadata.return_value = json.dumps(
         {
             "_staged_by_get_ids_es": True,
-            MEDIA_MASTER_FIELD_NAME: ["url" + str(i) for i in range(6)],
+            MEDIA_MASTER_FIELD_NAME: ["url" + str(i) for i in range(7)],
         }
     )
 
-    # Per-ordinal status cycle: 3 skipped, 2 fetched, 1 refreshed
-    statuses = ["SKIPPED", "SKIPPED", "SKIPPED", "FETCHED", "FETCHED", "REFRESHED"]
+    # Per-ordinal status cycle: 3 skipped, 2 fetched, 1 refreshed, 1 rejected
+    statuses = [
+        "SKIPPED",
+        "SKIPPED",
+        "SKIPPED",
+        "FETCHED",
+        "FETCHED",
+        "REFRESHED",
+        "REJECTED",
+    ]
     with (
         patch.object(downloader, "process_media", side_effect=statuses),
         patch("logging.info") as mock_log,
@@ -743,10 +819,11 @@ def test_process_item_summary_groups_mixed_statuses(downloader, tmp_path):
     )
     assert summary_log is not None
     text = str(summary_log)
-    assert "6 ordinals" in text
+    assert "7 ordinals" in text
     assert "skipped=3" in text
     assert "fetched=2" in text
     assert "refreshed=1" in text
+    assert "rejected=1" in text
     assert "failed=0" in text
 
 

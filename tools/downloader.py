@@ -277,10 +277,14 @@ class Downloader:
         per-item progress without re-scanning the log:
 
         - ``"SKIPPED"``   — S3 already had a fresh-enough key, no network work
+                            (also: SHA1-match race in ``upload_file_to_s3``)
         - ``"FETCHED"``   — first-time fresh download to S3
         - ``"REFRESHED"`` — S3 had a stale key (older than ``max_age_days``);
                             re-downloaded and overwritten
-        - ``"FAILED"``    — the ordinal raised at some point
+        - ``"REJECTED"``  — bytes were fetched but rejected (bad content
+                            type); no S3 write happened
+        - ``"FAILED"``    — the ordinal raised, or the 0-byte defensive
+                            refusal in ``upload_file_to_s3`` triggered
         """
         temp_file = self.local_fs.get_temp_file()
         temp_file_name = temp_file.name
@@ -323,8 +327,15 @@ class Downloader:
             content_type = self.local_fs.get_content_type(temp_file_name)
             if not check_content_type(content_type):
                 logging.info(f"Bad content type: {content_type}")
+                # Bytes WERE fetched (download_file_to_temp_path ran), but
+                # the content type isn't an image we'll store — so no S3
+                # write. The tracker continues to bump Result.SKIPPED for
+                # COUNTS continuity (pre-existing semantics), but the
+                # per-item summary status is "REJECTED" so it does not
+                # claim "no network work" alongside the genuine fresh-S3
+                # skips earlier in this function.
                 self.tracker.increment(Result.SKIPPED)
-                return "SKIPPED"
+                return "REJECTED"
 
             sha1 = self.local_fs.get_file_hash(temp_file_name)
 
@@ -338,13 +349,19 @@ class Downloader:
                         sha1,
                         force_overwrite=force_overwrite,
                     ):
-                        # upload_file_to_s3 returned False — either the
-                        # 0-byte defensive refusal (tracker already bumped
-                        # FAILED) or a SHA1-match race on a non-refresh
-                        # path (tracker already bumped SKIPPED). In both
-                        # cases no fetch landed, so the per-item summary
-                        # must NOT credit this ordinal as FETCHED.
-                        return "FAILED"
+                        # upload_file_to_s3 returned False on one of two
+                        # paths that have already incremented the tracker.
+                        # Distinguish them so the per-item summary stays
+                        # consistent with the global COUNTS:
+                        #   * 0-byte defensive refusal → Result.FAILED
+                        #     (download_file_to_temp_path should have
+                        #     raised first; defence-in-depth path)
+                        #   * SHA1-match race → Result.SKIPPED
+                        #     (another writer landed the same key
+                        #     between our age check and our upload)
+                        if os.stat(temp_file_name).st_size == 0:
+                            return "FAILED"
+                        return "SKIPPED"
                     size_bytes = os.stat(temp_file_name).st_size
                     self.tracker.increment(Result.BYTES, size_bytes)
                     elapsed = time.time() - fetch_start
@@ -488,7 +505,13 @@ class Downloader:
         # the ordinal loop. Lets operators grep
         # ``grep "Item .*fetched=[1-9]"`` to see which items actually
         # had network work, vs scrolling thousands of per-ordinal lines.
-        item_counts = {"SKIPPED": 0, "FETCHED": 0, "REFRESHED": 0, "FAILED": 0}
+        item_counts = {
+            "SKIPPED": 0,
+            "FETCHED": 0,
+            "REFRESHED": 0,
+            "REJECTED": 0,
+            "FAILED": 0,
+        }
 
         for media_url in tqdm(
             media_urls, desc="Downloading Files", leave=False, unit="File", ncols=100
@@ -531,6 +554,7 @@ class Downloader:
                 f" (skipped={item_counts['SKIPPED']},"
                 f" fetched={item_counts['FETCHED']},"
                 f" refreshed={item_counts['REFRESHED']},"
+                f" rejected={item_counts['REJECTED']},"
                 f" failed={item_counts['FAILED']})."
             )
 
