@@ -13,9 +13,9 @@ import os
 import time
 import tomllib
 import urllib.parse
-from bs4 import BeautifulSoup
 from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.sdc import parse_nara_access_level
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
@@ -1869,34 +1869,11 @@ def _parse_dpla_doc(dpla, dpla_id):
         naids = dpla["sourceResource"]["identifier"]
         if isinstance(naids, str):
             naids = [naids]
-        codes = {
-            "10031403": "Q66739888",
-            "10031402": "Q24238356",
-            "10031399": "Q66739729",
-            "10031400": "Q66739849",
-            "10031401": "Q66739875",
-        }
-        levels = {"item": "Q11723795", "itemAv": "Q11723795", "fileUnit": "Q59221146"}
-        access = ""
-        level = ""
-        try:
-            xml = BeautifulSoup(dpla["originalRecord"]["stringValue"], "xml")
-        except Exception as e:
-            # No XML parser available (e.g. lxml missing the xml feature) — skip
-            # NARA-specific access/level extraction rather than aborting the file.
-            print(f" -- Skipping NARA XML parse for {dpla_id}: {e}")
-            xml = None
-        if xml is not None:
-            try:
-                acccess_naid = str(
-                    xml.find("accessRestriction").find("status").find("naId").text
-                )
-                access = codes[acccess_naid]
-            except Exception:
-                access = ""
-            for lvl_key in levels:
-                if xml.find(lvl_key):
-                    level = levels[lvl_key]
+        # Malformed NARA XML raises ET.ParseError — intentionally propagated
+        # to the per-file boundary so a parse failure does NOT write a
+        # partial sdc.json that the reconciler would then mis-treat as
+        # "P7228/P6224 should not exist" and strip from Commons.
+        access, level = parse_nara_access_level(dpla["originalRecord"]["stringValue"])
         local_ids = []
     else:
         naids = []

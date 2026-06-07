@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import sys
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import click
@@ -406,15 +407,29 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
                 )
                 sdc_skipped += 1
                 continue
-            sdc_payload = build_claims_for_doc(
-                source,
-                dpla_id,
-                institutions_json,
-                rights,
-                subject_ids,
-                subjects_lookup,
-                retrieval_date,
-            )
+            try:
+                sdc_payload = build_claims_for_doc(
+                    source,
+                    dpla_id,
+                    institutions_json,
+                    rights,
+                    subject_ids,
+                    subjects_lookup,
+                    retrieval_date,
+                )
+            except ET.ParseError as e:
+                # parse_nara_access_level surfaces malformed NARA
+                # originalRecord XML here instead of silently writing a
+                # partial sdc.json missing P7228/P6224. One bad item
+                # must not abort staging for the whole NARA hub.
+                logging.warning(
+                    "build_claims_for_doc for %s raised ET.ParseError (%s); "
+                    "skipping sdc.json for this item",
+                    dpla_id,
+                    e,
+                )
+                sdc_skipped += 1
+                continue
             if sdc_payload is None:
                 sdc_skipped += 1
                 continue
