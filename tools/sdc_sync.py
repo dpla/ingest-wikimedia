@@ -1568,12 +1568,24 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     Matching is by mainsnak value (the DPLA ID itself). One P760 per
     MediaInfo entity carries that DPLA ID, so the match is unambiguous.
 
-    A no-op when ``page_number`` is ``None`` (the ordinal isn't part of a
-    multi-file extension group), when no DPLA-authored P760 exists yet,
-    or when P304 already matches the expected value.
+    A no-op when no DPLA-authored P760 exists yet or when the existing
+    P304 already matches the expected value. When ``page_number`` is
+    ``None`` (the ordinal is no longer part of a multi-file extension
+    group), still walks the existing P304 qualifiers and removes any
+    stale entries — the reconciler doesn't diff P304, so without this
+    cleanup pass a file would keep incorrect page metadata after its
+    sibling ordinals were deleted.
     """
-    if page_number is None:
-        return
+    # ``page_number=None`` means "no P304 is expected for this file" —
+    # typically a file that was once part of a multi-file extension
+    # group (with a P304 stamped) but is now a singleton in its group
+    # (e.g. siblings were deleted by a Commons curator). We must still
+    # walk the existing qualifiers and remove any stale P304; otherwise
+    # the file keeps incorrect page metadata indefinitely. Early-
+    # returning here would mean the reconciler never catches it
+    # (the statement-level reconciler diffs P760 by mainsnak value
+    # only, never by qualifier set).
+    expected_value = None if page_number is None else str(page_number)
 
     # No leading invalidate_entity: ``_amend_p7482_url_qualifiers`` runs
     # immediately before this helper in process_one_from_sdc and either
@@ -1597,16 +1609,15 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     if target_stmt is None:
         return
 
-    expected_value = str(page_number)
-    # Walk existing P304 qualifiers and bucket them: present-with-expected-
-    # value (idempotent — nothing to do) vs. present-with-different-value
-    # (stale, must be removed before adding the new one). Without removing
-    # stale values, a renumber between syncs — e.g. a sibling ordinal was
-    # deleted by a Commons curator, shifting this file from page 3 to
-    # page 2 — would leave the prior P304="3" alongside the new P304="2"
-    # indefinitely; the statement-level reconciler can't clean it up
-    # because it matches P760 statements only by mainsnak value, not by
-    # their qualifier set.
+    # Walk existing P304 qualifiers and bucket them: matches-expected
+    # (idempotent — nothing to do) vs. stale (must be removed). Three
+    # scenarios reach here:
+    #   * expected_value is None: any existing P304 is stale (file is
+    #     no longer in a multi-file extension group).
+    #   * expected_value matches one existing value: any OTHER existing
+    #     P304 is stale (renumber between syncs left a duplicate).
+    #   * expected_value doesn't match any existing value: every existing
+    #     P304 is stale, and the new value still needs to be added.
     # TODO: ``_amend_p7482_url_qualifiers`` has the same latent issue
     # for P2699 and P6108. Trigger is rarer there (partner catalog URLs
     # almost never change for already-uploaded files), but the cleanup
@@ -1620,13 +1631,14 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
         dv = q.get("datavalue")
         if not (isinstance(dv, dict) and "value" in dv):
             continue
-        if dv["value"] == expected_value:
+        if expected_value is not None and dv["value"] == expected_value:
             expected_already_present = True
         elif q.get("hash"):
             stale_snak_hashes.append(q["hash"])
 
-    if expected_already_present and not stale_snak_hashes:
-        # Idempotent — exact match, no writes. Matches the conditional-
+    if not stale_snak_hashes and (expected_value is None or expected_already_present):
+        # No work: either nothing exists and nothing's expected, or the
+        # exact match is already there. Matches the conditional-
         # invalidate pattern in ``_amend_p7482_url_qualifiers``.
         return
 
@@ -1638,13 +1650,13 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
             claim=target_stmt["id"],
             qualifiers="|".join(stale_snak_hashes),
             summary=(
-                f"Removing stale P304 page-number qualifier(s) before"
-                f" applying recomputed value for [[dpla:{dpla_id}|{dpla_id}]]."
+                f"Removing stale P304 page-number qualifier(s) for"
+                f" [[dpla:{dpla_id}|{dpla_id}]]."
                 f" [[COM:DPLA/MOD|Leave feedback]]!"
             ),
         )
 
-    if not expected_already_present:
+    if expected_value is not None and not expected_already_present:
         postqual(target_stmt["id"], "P304", json.dumps(expected_value))
 
     invalidate_entity(mediaid)
@@ -1953,7 +1965,15 @@ def dpla_claims(
         access,
         level,
     )
-    _reconcile_existing_claims(mediaid, dpla_id, expected)
+    # Protect chunkable properties from the legacy reconciler: their
+    # expected values may exist on Commons as a multi-claim chunked
+    # series (P1545="A1", "A2", ...) that the legacy expected-builder
+    # doesn't model. Without this, a `--file`/`--cat`/`--list` rerun
+    # against a partner-mode-migrated file would queue every chunked
+    # statement for removal. See _reconcile_existing_claims docstring.
+    _reconcile_existing_claims(
+        mediaid, dpla_id, expected, protected_props=CHUNKABLE_PROPS
+    )
 
 
 def _build_expected_from_parsed(
@@ -2044,26 +2064,28 @@ def _build_expected_from_parsed(
             base = f"{base}|circa"
         p571_expected.append(base)
 
-    # Chunkable-prop values are keyed as (value, p1545) tuples in
-    # _reconcile_existing_claims (it extracts the same tuple shape from
-    # Commons-side statements). The legacy partner-API path never
-    # produces chunked claims — it predates chunking and runs on the
-    # parsed-doc tuple, not sdc.json — so p1545 is always None here.
-    # Without these tuples, the reconciler's `value not in expected[prop]`
-    # would see Commons-side ("text", None) versus expected ["text"] and
-    # queue every DPLA-authored string/monolingualtext claim for removal.
+    # Chunkable-prop values (P760, P217, P1476, P4272, P10358, P1225)
+    # are intentionally still plain strings here even though
+    # _reconcile_existing_claims extracts them from Commons as
+    # (value, p1545) tuples — the legacy path passes
+    # ``protected_props=CHUNKABLE_PROPS`` to skip reconciliation for
+    # these properties entirely. The legacy expected-builder doesn't
+    # know about chunk shape and partial-matching (value, None) versus
+    # (chunk_text, "A1") would still wrongly queue partner-mode chunked
+    # statements for removal. Skipping reconciliation is safer than
+    # half-matching; full parity is a follow-up to this PR.
     expected = {
-        "P217": [(v, None) for v in local_ids],
-        "P760": [(dpla_id, None)],
-        "P1476": [(v, None) for v in titles],
+        "P217": local_ids,
+        "P760": [dpla_id],
+        "P1476": titles,
         "P195": ["Q518155" if hub == "Q518155" else institution],
         "P170": creators,
         "P9126": ["Q2944483", hub, institution],
         "P7482": [url],
-        "P4272": [(v, None) for v in subjects],
+        "P4272": subjects,
         "P571": p571_expected,
-        "P10358": [(v, None) for v in descs],
-        "P1225": [(v, None) for v in naids],
+        "P10358": descs,
+        "P1225": naids,
         "P6224": [level],
         "P7228": [access],
         "P921": parsesubjectentities,
@@ -2085,13 +2107,31 @@ def _build_expected_from_parsed(
     return expected
 
 
-def _reconcile_existing_claims(mediaid, dpla_id, expected):
+def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=frozenset()):
     """Walk DPLA-referenced claims on Commons, queue removals for any whose
     comparable value isn't in `expected`. POSTs wbremoveclaims if needed.
 
     Shared by `dpla_claims` (legacy partner-API path) and
     `process_one_from_sdc` (PR 4 partner-mode path). Same removal logic;
     just different sources for `expected`.
+
+    ``protected_props`` is a set of property IDs whose existing
+    DPLA-authored claims are NOT subject to reconciliation — they're
+    left in place regardless of whether they appear in ``expected``.
+    The legacy partner-API path uses this for ``CHUNKABLE_PROPS``
+    (string/monolingualtext properties whose values may have been
+    chunked into multi-statement series with P1545 ordinals by
+    partner mode). Without protection, a legacy ``--file``/``--cat``/
+    ``--list`` rerun would treat partner-mode chunked claims as
+    unexpected — the legacy ``expected`` is keyed on un-chunked
+    ``(value, None)`` tuples while Commons-side chunked statements
+    extract as ``(chunk_text, "A1")``, ``(chunk_text, "A2")``... — and
+    queue them all for removal. For long P217 values, ``process_one``
+    additionally skips re-adding them, so the identifier would
+    disappear entirely. Protecting the chunkable-prop set in legacy
+    reconciliation keeps maintenance-mode reruns safe until full
+    chunking parity is added to the legacy builders (out of scope
+    here).
     """
     # Use pywikibot's wbgetentities (via get_entity) rather than a direct
     # requests.get to Special:EntityData: Wikimedia rejects the default
@@ -2225,6 +2265,12 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
                                 removals.append(stmt["id"])
     for claim in dpla_claim_list:
         for prop in claim:
+            if prop in protected_props:
+                # Caller has declared this property off-limits for
+                # removal — typically chunkable properties on the
+                # legacy path where the legacy expected-builder
+                # doesn't know about chunk shape. Skip the diff.
+                continue
             if prop not in expected:
                 removals.append(claim[prop]["id"])
             elif claim[prop]["value"] not in expected[prop]:

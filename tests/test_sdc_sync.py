@@ -1882,50 +1882,97 @@ def test_build_expected_from_parsed_includes_both_shapes_for_p571(monkeypatch):
     assert len(canonical_keys) == 2
 
 
-def test_build_expected_from_parsed_emits_tuple_keys_for_chunkable_props(monkeypatch):
-    """Regression guard against CodeRabbit's PR #282 finding: the legacy
-    ``dpla_claims()`` path's expected map MUST key chunkable-property
-    values as ``(value, p1545)`` tuples so the reconciler's tuple-keyed
-    Commons-side extraction sees a match. Without this, a legacy
-    ``--file`` / ``--cat`` / ``--list`` rerun would treat every
-    DPLA-authored P760/P217/P4272/P1225/P1476/P10358 statement as
-    unexpected and queue it for removal."""
-    from ingest_wikimedia.sdc import CHUNKABLE_PROPS
+def test_reconciler_protected_props_skips_removal_for_chunkable_claims():
+    """The legacy ``dpla_claims()`` path passes
+    ``protected_props=CHUNKABLE_PROPS`` to ``_reconcile_existing_claims``
+    so partner-mode-written chunked claims (P1545="A1", "A2", ...) on
+    a Commons file aren't queued for removal during a legacy
+    ``--file`` / ``--cat`` / ``--list`` rerun. The legacy expected-
+    builder doesn't model chunk shape; without protection the
+    reconciler would see chunked Commons claims as unexpected and
+    delete them.
+    """
     from tools import sdc_sync
 
-    monkeypatch.setattr(sdc_sync, "rights", {}, raising=False)
+    # A chunked P10358 statement on Commons — DPLA-authored, P1545="A1".
+    chunked_a1 = {
+        "id": "M999$chunkA1",
+        "mainsnak": {
+            "property": "P10358",
+            "snaktype": "value",
+            "datavalue": {
+                "type": "monolingualtext",
+                "value": {"text": "chunk one text", "language": "en"},
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459(), "P1545": _qual_string("P1545", "A1")},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P10358": [chunked_a1]}}
 
-    expected = sdc_sync._build_expected_from_parsed(
-        dpla_id="abcdef",
-        url="http://example.com/x",
-        descs=["a description"],
-        dates=[],
-        titles=["A title"],
-        hub="Q1",
-        local_ids=["local-1", "local-2"],
-        institution="Q2",
-        rs="",
-        creators=[],
-        subjects=[("subj-1", ""), ("subj-2", "Q5")],
-        naids=["naid-1"],
-        access="",
-        level="",
-    )
-    # Each chunkable-prop entry is a list of (value, None) tuples — the
-    # legacy path never produces chunked claims (it predates chunking),
-    # so p1545 is always None on this side.
-    assert expected["P760"] == [("abcdef", None)]
-    assert expected["P217"] == [("local-1", None), ("local-2", None)]
-    assert expected["P1476"] == [("A title", None)]
-    assert expected["P10358"] == [("a description", None)]
-    assert expected["P4272"] == [("subj-1", None), ("subj-2", None)]
-    assert expected["P1225"] == [("naid-1", None)]
-    # Sanity: every CHUNKABLE_PROPS entry is the tuple shape.
-    for prop in CHUNKABLE_PROPS:
-        for v in expected.get(prop, []):
-            assert isinstance(v, tuple) and len(v) == 2, (
-                f"{prop} entry {v!r} must be a (value, p1545) tuple"
-            )
+    # Legacy expected models the unchunked full text — won't match the
+    # ("chunk one text", "A1") tuple the reconciler extracts.
+    expected = {"P10358": ["the full unchunked description text"]}
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
+        ),
+    ):
+        sdc_sync._reconcile_existing_claims(
+            "M999",
+            "abcdef",
+            expected,
+            protected_props=frozenset({"P10358"}),
+        )
+
+    # Nothing got queued for removal because P10358 is protected.
+    assert submit_calls == []
+
+
+def test_reconciler_without_protection_would_remove_unrecognized_chunked_claim():
+    """Sanity check that the previous test would fail without
+    protection — the protection mechanism is doing real work, not just
+    a no-op covering for some other guard."""
+    from tools import sdc_sync
+
+    chunked_a1 = {
+        "id": "M999$chunkA1",
+        "mainsnak": {
+            "property": "P10358",
+            "snaktype": "value",
+            "datavalue": {
+                "type": "monolingualtext",
+                "value": {"text": "chunk one text", "language": "en"},
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459(), "P1545": _qual_string("P1545", "A1")},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P10358": [chunked_a1]}}
+    expected = {"P10358": ["the full unchunked description text"]}
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
+        ),
+    ):
+        # No protected_props — the chunked statement gets queued for removal
+        # because ("chunk one text", "A1") isn't in expected["P10358"].
+        sdc_sync._reconcile_existing_claims("M999", "abcdef", expected)
+
+    assert len(submit_calls) == 1
+    assert submit_calls[0][0] == "wbremoveclaims"
 
 
 # ---------------------------------------------------------------------------
@@ -2231,15 +2278,40 @@ def test_compute_page_numbers_mixed_singletons_returns_empty():
     assert sdc_sync._compute_page_numbers(ordinals) == {}
 
 
-def test_amend_p760_page_qualifier_noop_when_page_number_is_none():
-    """``page_number=None`` (single-file extension group) means no P304;
-    helper must not POST anything."""
+def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing_p304():
+    """``page_number=None`` (singleton in extension group) + no
+    existing P304 → no writes. Note the helper STILL reads the entity
+    to confirm there's no stale P304 to clean up; this is intentional
+    (the cleanup pass is the whole reason None doesn't early-return)."""
     from tools import sdc_sync
 
+    no_p304_stmt = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [no_p304_stmt]}}
+
     postqual_calls = []
+    submit_calls = []
+    invalidate_calls = []
     with (
-        patch.object(sdc_sync, "get_entity") as mock_get,
-        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(
+            sdc_sync,
+            "invalidate_entity",
+            side_effect=lambda *a: invalidate_calls.append(a),
+        ),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
+        ),
         patch.object(
             sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
         ),
@@ -2247,7 +2319,66 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none():
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=None
         )
-        mock_get.assert_not_called()
+    assert postqual_calls == []
+    assert submit_calls == []
+    # No writes happened → no terminal invalidate.
+    assert invalidate_calls == []
+
+
+def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none():
+    """Critical CodeRabbit-flagged case: file that USED to be in a
+    multi-file extension group (had P304="2") is now a singleton
+    (e.g. siblings were deleted). page_number is None in the new
+    computation, but the existing P304 must be removed — otherwise
+    the file keeps incorrect page metadata indefinitely, since the
+    reconciler doesn't diff P304."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P304": [
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "2"},
+                    "hash": "obsolete-hash",
+                }
+            ],
+        },
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    submit_calls = []
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
+        ),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=None
+        )
+
+    # wbremovequalifiers fired for the stale snak; no postqual.
+    assert len(submit_calls) == 1
+    action, _args, kw = submit_calls[0]
+    assert action == "wbremovequalifiers"
+    assert kw["qualifiers"] == "obsolete-hash"
     assert postqual_calls == []
 
 
