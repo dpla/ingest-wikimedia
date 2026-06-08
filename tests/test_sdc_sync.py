@@ -16,6 +16,7 @@ A claim that contains any user-authored qualifier or reference is
 NOT safe — the wbeditentity round-trip would erase that data.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1879,3 +1880,232 @@ def test_build_expected_from_parsed_includes_both_shapes_for_p571(monkeypatch):
     canonical_keys = [v for v in p571 if v.startswith("+")]
     # 2 parseables → exactly 2 canonical entries.
     assert len(canonical_keys) == 2
+
+
+# ---------------------------------------------------------------------------
+# P2699 / P6108 qualifiers on P7482 (PR description in
+# tools/sdc_sync.py::_amend_p7482_url_qualifiers).
+#
+# Test surface:
+#   * per-ordinal P2699 injection in process_one_from_sdc
+#   * idempotent amend of existing DPLA-authored P7482 statements
+#     (missing → POST wbsetqualifier; already present → no-op)
+#   * eligibility gate: don't amend foreign-shaped P7482 statements
+#   * reconciler treats P2699/P6108 as DPLA-owned (doesn't queue removal)
+# ---------------------------------------------------------------------------
+
+
+def _p7482_stmt(stmt_id, p973_value, extra_qualifiers=None):
+    """A DPLA-authored P7482 statement with the standard P973/P137/P459
+    qualifier set. ``extra_qualifiers`` is a dict merged in on top
+    (used by tests that need to set P2699 / P6108 to pre-existing
+    values)."""
+    qualifiers = {
+        "P459": _dpla_p459(),
+        "P973": _qual_string("P973", p973_value),
+        "P137": _qual_entity("P137", "Q12345"),
+    }
+    if extra_qualifiers:
+        qualifiers.update(extra_qualifiers)
+    return {
+        "id": stmt_id,
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P7482",
+            "datavalue": {
+                "value": {
+                    "entity-type": "item",
+                    "numeric-id": 74228490,
+                    "id": "Q74228490",
+                },
+                "type": "wikibase-entityid",
+            },
+        },
+        "qualifiers": qualifiers,
+        "references": [_dpla_reference()],
+    }
+
+
+def _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=None):
+    """Build a sdc.json shape with a single P7482 claim — what
+    ``_amend_p7482_url_qualifiers`` reads to learn what should be there."""
+    p7482 = {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P7482",
+            "datavalue": {
+                "value": {"entity-type": "item", "numeric-id": 74228490},
+                "type": "wikibase-entityid",
+            },
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P973": _qual_string("P973", catalog_url),
+            "P137": _qual_entity("P137", "Q12345"),
+        },
+        "references": [_dpla_reference()],
+    }
+    if iiif_manifest_url is not None:
+        p7482["qualifiers"]["P6108"] = _qual_string("P6108", iiif_manifest_url)
+    return {"claims": [p7482]}
+
+
+def test_amend_p7482_adds_missing_p2699_and_p6108(monkeypatch):
+    """Existing DPLA-authored P7482 with only P973/P137/P459 — the
+    common case for every file uploaded before this PR. Sdc-sync should
+    POST wbsetqualifier for each missing qualifier and stop."""
+    from tools import sdc_sync
+
+    catalog_url = "https://example.org/item/abc"
+    download_url = "https://example.org/files/abc-page1.jpg"
+    iiif_url = "https://example.org/iiif/abc/manifest.json"
+
+    legacy_stmt = _p7482_stmt("M999$P7482", catalog_url)
+    entity = {"pageid": 999, "statements": {"P7482": [legacy_stmt]}}
+    payload = _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=iiif_url)
+
+    postqual_calls = []
+
+    def fake_postqual(claimid, prop, value):
+        postqual_calls.append((claimid, prop, value))
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(sdc_sync, "postqual", side_effect=fake_postqual),
+    ):
+        sdc_sync._amend_p7482_url_qualifiers(
+            "M999", "abcdef", payload, download_url=download_url
+        )
+
+    # Both qualifiers were posted; both targeted the same existing claim.
+    by_prop = {c[1]: c for c in postqual_calls}
+    assert "P2699" in by_prop, postqual_calls
+    assert "P6108" in by_prop, postqual_calls
+    assert by_prop["P2699"][0] == "M999$P7482"
+    assert by_prop["P6108"][0] == "M999$P7482"
+    # Values are JSON-encoded strings (matches add_det's wbsetqualifier value).
+    assert json.loads(by_prop["P2699"][2]) == download_url
+    assert json.loads(by_prop["P6108"][2]) == iiif_url
+
+
+def test_amend_p7482_noop_when_qualifiers_already_match(monkeypatch):
+    """Already-present qualifiers with the matching values → zero
+    wbsetqualifier calls. Re-running the same partner against an
+    already-migrated file is silent."""
+    from tools import sdc_sync
+
+    catalog_url = "https://example.org/item/abc"
+    download_url = "https://example.org/files/abc-page1.jpg"
+    iiif_url = "https://example.org/iiif/abc/manifest.json"
+
+    already_migrated = _p7482_stmt(
+        "M999$P7482",
+        catalog_url,
+        extra_qualifiers={
+            "P2699": _qual_string("P2699", download_url),
+            "P6108": _qual_string("P6108", iiif_url),
+        },
+    )
+    entity = {"pageid": 999, "statements": {"P7482": [already_migrated]}}
+    payload = _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=iiif_url)
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p7482_url_qualifiers(
+            "M999", "abcdef", payload, download_url=download_url
+        )
+
+    assert postqual_calls == []
+
+
+def test_amend_p7482_skips_when_no_existing_statement(monkeypatch):
+    """When Commons has no P7482 yet (newly uploaded file), the standard
+    ``_post_new_claims`` path is responsible for adding it with all the
+    qualifiers already in place. ``_amend_p7482_url_qualifiers`` should
+    not POST anything — no claim id to target."""
+    from tools import sdc_sync
+
+    entity = {"pageid": 999, "statements": {}}  # no P7482
+    payload = _sdc_payload_with_p7482("https://example.org/item/abc")
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p7482_url_qualifiers(
+            "M999",
+            "abcdef",
+            payload,
+            download_url="https://example.org/files/abc.jpg",
+        )
+
+    assert postqual_calls == []
+
+
+def test_amend_p7482_does_not_touch_foreign_statements(monkeypatch):
+    """A P7482 statement carrying user-added qualifiers (or a non-DPLA
+    publisher reference) must be left alone — the
+    ``_is_safe_to_amend_in_place`` gate keeps community-edited statements
+    out of the amend path. Re-running shouldn't drag in our P2699/P6108
+    next to someone else's data."""
+    from tools import sdc_sync
+
+    catalog_url = "https://example.org/item/abc"
+    foreign_stmt = _p7482_stmt(
+        "M999$FOREIGN",
+        catalog_url,
+        extra_qualifiers={
+            # P1001 isn't in _DPLA_EXTRA_QUALIFIER_PROPS for P7482 →
+            # _is_safe_to_amend_in_place returns False.
+            "P1001": _qual_entity("P1001", "Q30"),
+        },
+    )
+    entity = {"pageid": 999, "statements": {"P7482": [foreign_stmt]}}
+    payload = _sdc_payload_with_p7482(catalog_url)
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p7482_url_qualifiers(
+            "M999", "abcdef", payload, download_url="https://example.org/files/abc.jpg"
+        )
+
+    assert postqual_calls == []
+
+
+def test_dpla_extra_qualifier_props_p7482_includes_new_url_quals():
+    """``_DPLA_EXTRA_QUALIFIER_PROPS["P7482"]`` must include both P2699
+    and P6108 so the reconciler's amend-safety check counts them as
+    DPLA-owned. Without this, a P7482 statement carrying our own
+    P2699/P6108 would look 'foreign' to ``_is_safe_to_amend_in_place``
+    and the reconciler would refuse to clean it up if DPLA's catalog
+    URL ever changed."""
+    from tools import sdc_sync
+
+    allowed = sdc_sync._DPLA_EXTRA_QUALIFIER_PROPS["P7482"]
+    assert "P2699" in allowed
+    assert "P6108" in allowed
+    # Keep the existing qualifiers in the set too — regression guard
+    # against an accidental overwrite.
+    assert "P973" in allowed
+    assert "P137" in allowed

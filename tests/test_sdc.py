@@ -18,6 +18,7 @@ from ingest_wikimedia.sdc import (
     Q_NARA_FILE_UNIT,
     Q_NARA_ITEM,
     _build_date_claim,
+    _build_source_claim,
     parse_dpla_date,
     parse_nara_access_level,
 )
@@ -452,3 +453,122 @@ def test_build_date_claim_returns_none_for_empty_input():
 
     assert _build_date_claim("", "abc123", _dt.date(2026, 6, 7)) is None
     assert _build_date_claim("   ", "abc123", _dt.date(2026, 6, 7)) is None
+
+
+# ---------------------------------------------------------------------------
+# _build_source_claim — P7482 (described at) with its qualifier bundle.
+# P6108 (IIIF manifest URL) is the new per-item qualifier in this PR;
+# P2699 is per-ordinal and gets materialized in sdc-sync, NOT here.
+# ---------------------------------------------------------------------------
+
+
+def test_build_source_claim_omits_p6108_when_no_iiif_manifest():
+    """Items without iiifManifest in the source doc → no P6108 qualifier.
+    Default behavior — preserves the pre-PR shape for the long tail of
+    non-IIIF partners."""
+    import datetime as _dt
+
+    claim = _build_source_claim(
+        "Q12345", "https://example.org/item/1", "abc", _dt.date(2026, 6, 7)
+    )
+    quals = claim["qualifiers"]
+    assert "P973" in quals  # described-at URL still there
+    assert "P137" in quals  # operator still there
+    assert "P6108" not in quals
+
+
+def test_build_source_claim_stamps_p6108_when_iiif_manifest_provided():
+    """When the source carries a IIIF manifest URL, build it into the
+    P7482 statement as a P6108 qualifier (per-item). sdc.json now carries
+    the value; sdc-sync handles backfill of existing P7482 statements
+    via ``_amend_p7482_url_qualifiers``."""
+    import datetime as _dt
+
+    manifest_url = "https://example.org/iiif/abc/manifest.json"
+    claim = _build_source_claim(
+        "Q12345",
+        "https://example.org/item/1",
+        "abc",
+        _dt.date(2026, 6, 7),
+        iiif_manifest_url=manifest_url,
+    )
+    p6108 = claim["qualifiers"]["P6108"][0]
+    assert p6108["property"] == "P6108"
+    assert p6108["datavalue"]["value"] == manifest_url
+    assert p6108["datavalue"]["type"] == "string"
+    assert p6108["datatype"] == "url"
+
+
+def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
+    """``doc["iiifManifest"]`` arrives from upstream DPLA records that
+    occasionally carry junk — literal string "null", whitespace, schemes
+    we don't recognise. Stamping any of those as P6108 on Commons would
+    require manual cleanup. Pin the defense: only stamp when the value
+    is a real http(s) URL after stripping."""
+    from ingest_wikimedia.sdc import build_claims_for_doc
+
+    def _doc(iiif_value):
+        return {
+            "id": "abc1234567890",
+            "provider": {"name": "Digital Commonwealth"},
+            "dataProvider": {"name": "Boston Public Library"},
+            "sourceResource": {
+                "title": ["A title"],
+                "date": [{"displayDate": "1945"}],
+            },
+            "isShownAt": "https://example.org/item/abc",
+            "rights": "http://rightsstatements.org/vocab/InC/1.0/",
+            "iiifManifest": iiif_value,
+        }
+
+    hubs = {
+        "Digital Commonwealth": {
+            "Wikidata": "Q1",
+            "institutions": {"Boston Public Library": {"Wikidata": "Q2"}},
+        }
+    }
+    import datetime as _dt
+
+    for junk in (None, "", "   ", "null", "ftp://example.org/x", "not a url"):
+        out = build_claims_for_doc(
+            _doc(junk), "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 7)
+        )
+        p7482 = next(c for c in out["claims"] if c["mainsnak"]["property"] == "P7482")
+        assert "P6108" not in p7482["qualifiers"], (
+            f"{junk!r} should not produce a P6108 qualifier"
+        )
+
+    # Valid http/https URLs DO get stamped, with surrounding whitespace
+    # tolerated.
+    for valid in (
+        "https://example.org/iiif/manifest.json",
+        "  https://example.org/iiif/manifest.json  ",
+        "http://example.org/iiif/manifest.json",
+    ):
+        out = build_claims_for_doc(
+            _doc(valid), "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 7)
+        )
+        p7482 = next(c for c in out["claims"] if c["mainsnak"]["property"] == "P7482")
+        assert "P6108" in p7482["qualifiers"], (
+            f"{valid!r} should produce a P6108 qualifier"
+        )
+        # Stamped value is the stripped form.
+        assert p7482["qualifiers"]["P6108"][0]["datavalue"]["value"] == valid.strip()
+
+
+def test_build_source_claim_never_stamps_p2699():
+    """``P2699`` is per-ordinal — different ordinals of the same DPLA
+    item have different download URLs, so the qualifier can't be baked
+    into sdc.json. It gets injected by ``process_one_from_sdc`` at sync
+    time. Pin the contract that ``_build_source_claim`` does NOT emit
+    it, even speculatively."""
+    import datetime as _dt
+
+    claim = _build_source_claim(
+        "Q12345",
+        "https://example.org/item/1",
+        "abc",
+        _dt.date(2026, 6, 7),
+        iiif_manifest_url="https://example.org/iiif/abc/manifest.json",
+    )
+    assert "P2699" not in claim["qualifiers"]
