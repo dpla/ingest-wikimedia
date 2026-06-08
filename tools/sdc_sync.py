@@ -412,19 +412,42 @@ _entity_cache = {}
 # process_one* entry point. Cleared at the top of each process_one* call.
 claims = {"claims": []}
 refclaims = {"claims": []}
-qualifier_amends = []
-removals = []
+qualifier_amends = []  # list of (claimid, prop, snak_to_add)
+qualifier_removals = []  # list of (claimid, snak_hash_to_remove)
+removals = []  # list of statement IDs to remove from Commons
 
 
 def _reset_per_file_accumulators():
     """Drop every per-file accumulator at the start of a new file's
     processing. Used by both ``process_one`` and ``process_one_from_sdc``
     so the dispatcher only ever sees the current file's fragments."""
-    global claims, refclaims, qualifier_amends, removals
+    global claims, refclaims, qualifier_amends, qualifier_removals, removals
     claims = {"claims": []}
     refclaims = {"claims": []}
     qualifier_amends = []
+    qualifier_removals = []
     removals = []
+
+
+def _url_snak(prop, url):
+    """Build a Wikibase URL-typed qualifier snak (used for P2699 / P6108
+    qualifier additions on P7482 via the per-file dispatcher)."""
+    return {
+        "snaktype": "value",
+        "property": prop,
+        "datavalue": {"value": url, "type": "string"},
+        "datatype": "url",
+    }
+
+
+def _string_snak(prop, value):
+    """Build a Wikibase string-typed qualifier snak (used for P304 page-
+    number qualifier additions on P760 via the per-file dispatcher)."""
+    return {
+        "snaktype": "value",
+        "property": prop,
+        "datavalue": {"value": value, "type": "string"},
+    }
 
 
 def _merge_qualifier_snaks(existing_qualifiers, additions):
@@ -1555,17 +1578,13 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
     expected_p973 = _first_qualifier_value(sdc_p7482, "P973")
     expected_p6108 = _first_qualifier_value(sdc_p7482, "P6108")
 
-    # _post_new_refs / _post_new_claims (called just before this helper)
-    # don't invalidate the entity cache after writing — same shape as
-    # the pre-existing invalidate-before-reconcile pattern elsewhere
-    # in this file. Drop the cached snapshot so we read the
-    # post-write state and don't see a phantom-absent P7482 when one
-    # was just created.
-    invalidate_entity(mediaid)
+    # Read once from the cached entity. The dispatcher does no writes
+    # between this helper and the entity snapshot in cache, so no
+    # invalidate-before-read needed.
     entity = get_entity(mediaid)
     existing_p7482 = (entity.get("statements") or {}).get("P7482") or []
 
-    # Find the DPLA-authored statement whose P973 matches our expectation.
+    # Find the DPLA-authored statement whose P973 qualifier matches.
     target_stmt = None
     for stmt in existing_p7482:
         if not _is_safe_to_amend_in_place(stmt, "P7482"):
@@ -1574,29 +1593,19 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
             target_stmt = stmt
             break
     if target_stmt is None:
-        # No existing match — either no P7482 yet (``_post_new_claims``
-        # already handled it), or only foreign / unsafe-to-amend
-        # statements exist. Either way, nothing to backfill.
+        # No existing match — either no P7482 yet (a fresh claim will be
+        # added through the normal ``_post_new_claims`` accumulator), or
+        # only foreign / unsafe-to-amend statements exist.
         return
 
     claimid = target_stmt["id"]
     existing_p2699_values = _qualifier_values(target_stmt, "P2699")
     existing_p6108_values = _qualifier_values(target_stmt, "P6108")
 
-    amended = False
     if download_url and download_url not in existing_p2699_values:
-        postqual(claimid, "P2699", json.dumps(download_url))
-        amended = True
+        qualifier_amends.append((claimid, "P2699", _url_snak("P2699", download_url)))
     if expected_p6108 and expected_p6108 not in existing_p6108_values:
-        postqual(claimid, "P6108", json.dumps(expected_p6108))
-        amended = True
-
-    if amended:
-        # Drop the cached snapshot so any subsequent code in this
-        # process_one_from_sdc cycle (notably ``_reconcile_existing_claims``
-        # immediately below the caller) reads the freshly-amended state
-        # — same invariant ``add_det`` maintains for P459.
-        invalidate_entity(mediaid)
+        qualifier_amends.append((claimid, "P6108", _url_snak("P6108", expected_p6108)))
 
 
 def _file_extension(title):
@@ -1678,18 +1687,10 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     # typically a file that was once part of a multi-file extension
     # group (with a P304 stamped) but is now a singleton in its group
     # (e.g. siblings were deleted by a Commons curator). We must still
-    # walk the existing qualifiers and remove any stale P304; otherwise
-    # the file keeps incorrect page metadata indefinitely. Early-
-    # returning here would mean the reconciler never catches it
-    # (the statement-level reconciler diffs P760 by mainsnak value
-    # only, never by qualifier set).
+    # walk the existing qualifiers and queue any stale P304 removal;
+    # otherwise the file keeps incorrect page metadata indefinitely.
     expected_value = None if page_number is None else str(page_number)
 
-    # No leading invalidate_entity: ``_amend_p7482_url_qualifiers`` runs
-    # immediately before this helper in process_one_from_sdc and either
-    # left the cache valid (it didn't write) or invalidated it (it did),
-    # so get_entity here returns fresh state in both cases. Saves a
-    # wbgetentities round-trip per ordinal at scale.
     entity = get_entity(mediaid)
     existing_p760 = (entity.get("statements") or {}).get("P760") or []
 
@@ -1707,22 +1708,11 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     if target_stmt is None:
         return
 
-    # Walk existing P304 qualifiers and bucket them: matches-expected
-    # (idempotent — nothing to do) vs. stale (must be removed). Three
-    # scenarios reach here:
-    #   * expected_value is None: any existing P304 is stale (file is
-    #     no longer in a multi-file extension group).
-    #   * expected_value matches one existing value: any OTHER existing
-    #     P304 is stale (renumber between syncs left a duplicate).
-    #   * expected_value doesn't match any existing value: every existing
-    #     P304 is stale, and the new value still needs to be added.
-    # TODO: ``_amend_p7482_url_qualifiers`` has the same latent issue
-    # for P2699 and P6108. Trigger is rarer there (partner catalog URLs
-    # almost never change for already-uploaded files), but the cleanup
-    # should be unified — likely as a shared ``_replace_dpla_qualifier``
-    # helper once we have a second use case (this one).
+    # Bucket existing P304 snaks: matches-expected (skip) vs stale (queue
+    # for removal). The dispatcher will assemble the wholesale-replace
+    # qualifier set from the combined adds and removes across all
+    # accumulators when it builds the final wbeditentity payload.
     expected_already_present = False
-    stale_snak_hashes = []
     for q in target_stmt.get("qualifiers", {}).get("P304", []) or []:
         if q.get("snaktype") != "value":
             continue
@@ -1732,32 +1722,12 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
         if expected_value is not None and dv["value"] == expected_value:
             expected_already_present = True
         elif q.get("hash"):
-            stale_snak_hashes.append(q["hash"])
-
-    if not stale_snak_hashes and (expected_value is None or expected_already_present):
-        # No work: either nothing exists and nothing's expected, or the
-        # exact match is already there. Matches the conditional-
-        # invalidate pattern in ``_amend_p7482_url_qualifiers``.
-        return
-
-    if stale_snak_hashes:
-        _submit_sdc_write(
-            "wbremovequalifiers",
-            mediaid,
-            dpla_id,
-            claim=target_stmt["id"],
-            qualifiers="|".join(stale_snak_hashes),
-            summary=(
-                f"Removing stale P304 page-number qualifier(s) for"
-                f" [[dpla:{dpla_id}|{dpla_id}]]."
-                f" [[COM:DPLA/MOD|Leave feedback]]!"
-            ),
-        )
+            qualifier_removals.append((target_stmt["id"], q["hash"]))
 
     if expected_value is not None and not expected_already_present:
-        postqual(target_stmt["id"], "P304", json.dumps(expected_value))
-
-    invalidate_entity(mediaid)
+        qualifier_amends.append(
+            (target_stmt["id"], "P304", _string_snak("P304", expected_value))
+        )
 
 
 def add_ref(claimid, claim):

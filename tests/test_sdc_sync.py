@@ -16,7 +16,6 @@ A claim that contains any user-authored qualifier or reference is
 NOT safe — the wbeditentity round-trip would erase that data.
 """
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2049,8 +2048,10 @@ def _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=None):
 
 def test_amend_p7482_adds_missing_p2699_and_p6108(monkeypatch):
     """Existing DPLA-authored P7482 with only P973/P137/P459 — the
-    common case for every file uploaded before this PR. Sdc-sync should
-    POST wbsetqualifier for each missing qualifier and stop."""
+    common case for every file uploaded before this code shipped. The
+    builder pushes a (claimid, prop, snak) tuple onto the module-level
+    ``qualifier_amends`` accumulator for each missing qualifier; the
+    per-file dispatcher flushes them in the combined wbeditentity."""
     from tools import sdc_sync
 
     catalog_url = "https://example.org/item/abc"
@@ -2061,29 +2062,20 @@ def test_amend_p7482_adds_missing_p2699_and_p6108(monkeypatch):
     entity = {"pageid": 999, "statements": {"P7482": [legacy_stmt]}}
     payload = _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=iiif_url)
 
-    postqual_calls = []
-
-    def fake_postqual(claimid, prop, value):
-        postqual_calls.append((claimid, prop, value))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "postqual", side_effect=fake_postqual),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p7482_url_qualifiers(
             "M999", "abcdef", payload, download_url=download_url
         )
 
-    # Both qualifiers were posted; both targeted the same existing claim.
-    by_prop = {c[1]: c for c in postqual_calls}
-    assert "P2699" in by_prop, postqual_calls
-    assert "P6108" in by_prop, postqual_calls
+    by_prop = {prop: (cid, snak) for (cid, prop, snak) in sdc_sync.qualifier_amends}
+    assert "P2699" in by_prop, sdc_sync.qualifier_amends
+    assert "P6108" in by_prop, sdc_sync.qualifier_amends
     assert by_prop["P2699"][0] == "M999$P7482"
     assert by_prop["P6108"][0] == "M999$P7482"
-    # Values are JSON-encoded strings (matches add_det's wbsetqualifier value).
-    assert json.loads(by_prop["P2699"][2]) == download_url
-    assert json.loads(by_prop["P6108"][2]) == iiif_url
+    assert by_prop["P2699"][1]["datavalue"]["value"] == download_url
+    assert by_prop["P6108"][1]["datavalue"]["value"] == iiif_url
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_amend_p7482_noop_when_qualifiers_already_match(monkeypatch):
@@ -2326,12 +2318,13 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing
 
 
 def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none():
-    """Critical CodeRabbit-flagged case: file that USED to be in a
-    multi-file extension group (had P304="2") is now a singleton
-    (e.g. siblings were deleted). page_number is None in the new
-    computation, but the existing P304 must be removed — otherwise
-    the file keeps incorrect page metadata indefinitely, since the
-    reconciler doesn't diff P304."""
+    """File that USED to be in a multi-file extension group (had
+    P304="2") is now a singleton — ``page_number=None``. The builder
+    must push the stale snak hash onto ``qualifier_removals``; the
+    per-file dispatcher will exclude it from the wholesale-replace
+    qualifier set in the combined wbeditentity. Otherwise the file
+    keeps incorrect page metadata indefinitely since the reconciler
+    doesn't diff P304."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2356,35 +2349,21 @@ def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none()
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    submit_calls = []
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=None
         )
 
-    # wbremovequalifiers fired for the stale snak; no postqual.
-    assert len(submit_calls) == 1
-    action, _args, kw = submit_calls[0]
-    assert action == "wbremovequalifiers"
-    assert kw["qualifiers"] == "obsolete-hash"
-    assert postqual_calls == []
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "obsolete-hash")]
+    assert sdc_sync.qualifier_amends == []
+    sdc_sync._reset_per_file_accumulators()
 
 
-def test_amend_p760_page_qualifier_stamps_missing_p304_via_postqual():
-    """Existing DPLA-authored P760 with no P304 → postqual gets called
-    with the page-number value."""
+def test_amend_p760_page_qualifier_stamps_missing_p304_via_accumulator():
+    """Existing DPLA-authored P760 with no P304 → the builder pushes a
+    new-P304 snak onto ``qualifier_amends`` for the dispatcher to flush
+    in the combined wbeditentity."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2399,23 +2378,19 @@ def test_amend_p760_page_qualifier_stamps_missing_p304_via_postqual():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    assert len(postqual_calls) == 1
-    claimid, prop, value_json = postqual_calls[0]
+    assert len(sdc_sync.qualifier_amends) == 1
+    claimid, prop, snak = sdc_sync.qualifier_amends[0]
     assert claimid == "M999$p760id"
     assert prop == "P304"
-    assert json.loads(value_json) == "2"
+    assert snak["datavalue"]["value"] == "2"
+    assert sdc_sync.qualifier_removals == []
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_amend_p760_page_qualifier_idempotent_when_p304_already_matches():
@@ -2489,10 +2464,10 @@ def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
     """Renumber scenario: existing DPLA-authored P760 has P304="3"
     (from a prior sync), but the recomputed page_number is now 2 (a
     sibling ordinal got deleted, shifting this file's position). The
-    helper must remove the stale "3" qualifier via wbremovequalifiers
-    BEFORE adding the new "2"; otherwise the statement accumulates
-    conflicting page numbers indefinitely since the reconciler matches
-    P760 only by mainsnak value."""
+    builder must push both the stale snak-hash removal AND the new
+    snak addition onto the accumulators; the dispatcher folds them
+    together into a single wholesale-replace qualifier set on the
+    combined wbeditentity."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2517,43 +2492,26 @@ def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    submit_calls = []
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    # wbremovequalifiers was called for the stale snak hash.
-    assert len(submit_calls) == 1
-    action, _args, kw = submit_calls[0]
-    assert action == "wbremovequalifiers"
-    assert kw["claim"] == "M999$p760id"
-    assert kw["qualifiers"] == "stale-snak-hash-3"
-
-    # postqual added the new value.
-    assert len(postqual_calls) == 1
-    claimid, prop, value_json = postqual_calls[0]
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "stale-snak-hash-3")]
+    assert len(sdc_sync.qualifier_amends) == 1
+    claimid, prop, snak = sdc_sync.qualifier_amends[0]
     assert claimid == "M999$p760id"
     assert prop == "P304"
-    assert json.loads(value_json) == "2"
+    assert snak["datavalue"]["value"] == "2"
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
     """Mixed case: existing P304 has both the expected value AND a stale
-    one (e.g. a prior renumber wasn't cleaned up). Helper must remove
-    only the stale snak and NOT re-add the expected value."""
+    one (e.g. a prior renumber wasn't cleaned up). Builder must push
+    only the stale snak-hash removal onto ``qualifier_removals`` and
+    NOT add the expected value (it's already present)."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2584,29 +2542,17 @@ def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    submit_calls = []
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    # Only the stale snak got removed; the expected value was already
-    # present, so no postqual.
-    assert len(submit_calls) == 1
-    assert submit_calls[0][2]["qualifiers"] == "stale-hash-3"
-    assert postqual_calls == []
+    # Only the stale snak got queued for removal; the expected value
+    # was already present, so no addition pushed.
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "stale-hash-3")]
+    assert sdc_sync.qualifier_amends == []
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_dpla_extra_qualifier_props_p760_includes_p304_and_p1545():
