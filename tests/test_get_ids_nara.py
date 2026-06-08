@@ -8,10 +8,19 @@ timestamp on S3 against the get-ids-nara run time" — this test pins the
 in-process call graph so a future refactor that drops Phase 3 surfaces
 as a test failure rather than a Slack-message-shaped surprise on the
 next operator run.
+
+Uses ``contextlib.ExitStack`` rather than the parenthesized ``with (A,
+B, C):`` form — CodeQL's ``py/unused-import`` query has a known false-
+positive class with the parenthesized form
+(https://github.com/github/codeql/issues/9657) and flags ``patch``,
+``CliRunner``, and the iteration source as "unused" even though
+ruff's F401/F841 confirm they are. The ExitStack pattern keeps every
+reference at top-level statement scope where the analyzer can trace it.
 """
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -45,41 +54,63 @@ def test_main_runs_sdc_phase_after_enumeration():
             }
         },
     ]
+    paginate_iter = iter(fake_hits)
 
-    with (
+    with contextlib.ExitStack() as stack:
         # No remote ES calls during the build_*_queries phases.
-        patch.object(get_ids_nara, "build_format_queries", return_value=[]),
-        patch.object(get_ids_nara, "build_language_queries", return_value=[]),
-        patch.object(get_ids_nara, "notify_phase_start"),
+        stack.enter_context(
+            patch.object(get_ids_nara, "build_format_queries", return_value=[])
+        )
+        stack.enter_context(
+            patch.object(get_ids_nara, "build_language_queries", return_value=[])
+        )
+        stack.enter_context(patch.object(get_ids_nara, "notify_phase_start"))
         # Phase 1: yield the two fake hits across whatever filter is passed.
-        patch.object(get_ids_nara, "_paginate", return_value=iter(fake_hits)),
+        stack.enter_context(
+            patch.object(get_ids_nara, "_paginate", return_value=paginate_iter)
+        )
         # Phase 1 staging: don't actually write to S3.
-        patch.object(get_ids_nara, "stage_item_to_s3") as stage_item_mock,
+        stage_item_mock = stack.enter_context(
+            patch.object(get_ids_nara, "stage_item_to_s3")
+        )
         # SDC-input loaders: cheap stubs.
-        patch.object(
-            get_ids_nara,
-            "fetch_institutions_v2",
-            return_value={
-                "National Archives and Records Administration": {
-                    "Wikidata": "Q518155",
-                    "institutions": {},
-                }
-            },
-        ),
-        patch.object(get_ids_nara, "load_rights_json", return_value={}),
-        patch.object(get_ids_nara, "fetch_subjects_json", return_value={}),
-        patch.object(get_ids_nara, "reconcile_subjects", return_value={}),
-        # S3Client used to read dpla-map.json back in Phase 3. Return the
-        # source doc verbatim — build_claims_for_doc handles it from there.
-        patch.object(get_ids_nara, "S3Client") as s3_class_mock,
+        stack.enter_context(
+            patch.object(
+                get_ids_nara,
+                "fetch_institutions_v2",
+                return_value={
+                    "National Archives and Records Administration": {
+                        "Wikidata": "Q518155",
+                        "institutions": {},
+                    }
+                },
+            )
+        )
+        stack.enter_context(
+            patch.object(get_ids_nara, "load_rights_json", return_value={})
+        )
+        stack.enter_context(
+            patch.object(get_ids_nara, "fetch_subjects_json", return_value={})
+        )
+        stack.enter_context(
+            patch.object(get_ids_nara, "reconcile_subjects", return_value={})
+        )
+        # S3Client used to read dpla-map.json back in Phase 3.
+        s3_class_mock = stack.enter_context(patch.object(get_ids_nara, "S3Client"))
         # build_claims_for_doc: stub return so Phase 3 actually calls stage_sdc_to_s3.
-        patch.object(
-            get_ids_nara, "build_claims_for_doc", return_value={"claims": []}
-        ) as build_mock,
+        build_mock = stack.enter_context(
+            patch.object(
+                get_ids_nara, "build_claims_for_doc", return_value={"claims": []}
+            )
+        )
         # Phase 3 staging: capture the calls.
-        patch.object(get_ids_nara, "stage_sdc_to_s3") as stage_sdc_mock,
-        patch.object(get_ids_nara.Banlist, "is_banned", return_value=False),
-    ):
+        stage_sdc_mock = stack.enter_context(
+            patch.object(get_ids_nara, "stage_sdc_to_s3")
+        )
+        stack.enter_context(
+            patch.object(get_ids_nara.Banlist, "is_banned", return_value=False)
+        )
+
         # Wire S3Client().get_item_metadata to return each fake hit's source
         # doc as JSON so Phase 3's re-read succeeds.
         s3_instance = s3_class_mock.return_value
@@ -94,7 +125,6 @@ def test_main_runs_sdc_phase_after_enumeration():
             '"sourceResource":{"title":["y"]},"mediaMaster":["http://example.org/y.jpg"]}',
         ]
 
-        # Run main() and wait for the ThreadPoolExecutors to finish.
         runner = CliRunner()
         # Click's main() exits via SystemExit; standalone_mode=False
         # surfaces any non-zero exit code through the result.
