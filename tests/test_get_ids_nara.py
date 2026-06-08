@@ -9,21 +9,22 @@ in-process call graph so a future refactor that drops Phase 3 surfaces
 as a test failure rather than a Slack-message-shaped surprise on the
 next operator run.
 
-Uses ``contextlib.ExitStack`` rather than the parenthesized ``with (A,
-B, C):`` form — CodeQL's ``py/unused-import`` query has a known false-
-positive class with the parenthesized form
-(https://github.com/github/codeql/issues/9657) and flags ``patch``,
-``CliRunner``, and the iteration source as "unused" even though
-ruff's F401/F841 confirm they are. The ExitStack pattern keeps every
-reference at top-level statement scope where the analyzer can trace it.
+Uses module-style imports (``import unittest.mock``, ``import click.testing``)
+rather than ``from … import patch, CliRunner`` because the latter
+triggers a known false-positive class in github-code-quality's
+unused-import analysis when the imported names are only referenced
+inside a context-manager block — switching to attribute access
+(``unittest.mock.patch.object`` / ``click.testing.CliRunner``) puts
+the references in unambiguous top-level expression form.
 """
 
 from __future__ import annotations
 
 import contextlib
-from unittest.mock import patch
+import json
+import unittest.mock
 
-from click.testing import CliRunner
+import click.testing
 
 
 def test_main_runs_sdc_phase_after_enumeration():
@@ -34,27 +35,23 @@ def test_main_runs_sdc_phase_after_enumeration():
     PR closes."""
     from tools import get_ids_nara
 
-    fake_hits = [
-        {
-            "_source": {
-                "id": "nara0000000000000000000000000001",
-                "provider": {"name": "National Archives and Records Administration"},
-                "dataProvider": {"name": "NARA — Some Library"},
-                "sourceResource": {"title": ["x"]},
-                "mediaMaster": ["http://example.org/x.jpg"],
-            }
-        },
-        {
-            "_source": {
-                "id": "nara0000000000000000000000000002",
-                "provider": {"name": "National Archives and Records Administration"},
-                "dataProvider": {"name": "NARA — Another Library"},
-                "sourceResource": {"title": ["y"]},
-                "mediaMaster": ["http://example.org/y.jpg"],
-            }
-        },
-    ]
-    paginate_iter = iter(fake_hits)
+    item_one = {
+        "id": "nara0000000000000000000000000001",
+        "provider": {"name": "National Archives and Records Administration"},
+        "dataProvider": {"name": "NARA — Some Library"},
+        "sourceResource": {"title": ["x"]},
+        "mediaMaster": ["http://example.org/x.jpg"],
+    }
+    item_two = {
+        "id": "nara0000000000000000000000000002",
+        "provider": {"name": "National Archives and Records Administration"},
+        "dataProvider": {"name": "NARA — Another Library"},
+        "sourceResource": {"title": ["y"]},
+        "mediaMaster": ["http://example.org/y.jpg"],
+    }
+    paginate_iter = iter([{"_source": item_one}, {"_source": item_two}])
+
+    patch = unittest.mock.patch  # local alias for readability
 
     with contextlib.ExitStack() as stack:
         # No remote ES calls during the build_*_queries phases.
@@ -112,20 +109,16 @@ def test_main_runs_sdc_phase_after_enumeration():
         )
 
         # Wire S3Client().get_item_metadata to return each fake hit's source
-        # doc as JSON so Phase 3's re-read succeeds.
+        # doc as JSON so Phase 3's re-read succeeds. ``json.dumps`` keeps
+        # the payload literal-free — implicit multi-line string
+        # concatenation was tripping the linter's "missing comma" check.
         s3_instance = s3_class_mock.return_value
         s3_instance.get_item_metadata.side_effect = [
-            '{"id":"nara0000000000000000000000000001",'
-            '"provider":{"name":"National Archives and Records Administration"},'
-            '"dataProvider":{"name":"NARA — Some Library"},'
-            '"sourceResource":{"title":["x"]},"mediaMaster":["http://example.org/x.jpg"]}',
-            '{"id":"nara0000000000000000000000000002",'
-            '"provider":{"name":"National Archives and Records Administration"},'
-            '"dataProvider":{"name":"NARA — Another Library"},'
-            '"sourceResource":{"title":["y"]},"mediaMaster":["http://example.org/y.jpg"]}',
+            json.dumps(item_one),
+            json.dumps(item_two),
         ]
 
-        runner = CliRunner()
+        runner = click.testing.CliRunner()
         # Click's main() exits via SystemExit; standalone_mode=False
         # surfaces any non-zero exit code through the result.
         result = runner.invoke(get_ids_nara.main, [], standalone_mode=False)
