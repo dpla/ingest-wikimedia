@@ -391,11 +391,15 @@ _PYWIKIBOT_RETRY_WAIT = 5
 _PYWIKIBOT_RETRY_MAX = 60
 
 
-# Per-file cache for wbgetentities, populated at the start of process_one()
-# and consulted by check() for all subsequent add_* calls. Avoids ~25 redundant
-# round-trips per file. Invalidate when claims change to keep the read-after-write
-# semantics correct (process_one batches writes at the end, so a single fetch is
-# safe for the duration of one file).
+# Per-file cache for wbgetentities. Populated at the start of process_one()
+# / process_one_from_sdc() and consulted by check() and the various amend_*
+# helpers for all subsequent reads of the same mediaid. Avoids ~25 redundant
+# round-trips per file. ``invalidate_entity(mediaid)`` is called after writes
+# to the same file so the next read sees post-write state. The cache is
+# cleared in full at every file-boundary entry point (``_entity_cache.clear()``
+# at the top of process_one / process_one_from_sdc) so a long-running session
+# doesn't accumulate one entity per file processed indefinitely — that
+# unbounded growth caused multi-GB RSS on long NARA runs.
 _entity_cache = {}
 
 
@@ -2552,11 +2556,15 @@ def process_one(mediaid, dpla_id):
     """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
     global claims, refclaims
 
-    # Drop any stale cache from a prior file so check() always reads fresh state
-    # for this mediaid.
-    invalidate_entity(mediaid)
-    # Pre-warm the per-file entity cache so the ~25 add_*/check() calls below
-    # share a single wbgetentities round-trip.
+    # Drop every prior file's cached entity at the file boundary. The cache
+    # locality the per-file check() / reconciler / amend_* calls rely on is
+    # scoped to ONE file's processing; without this clear, the module-level
+    # ``_entity_cache`` accumulates an entity per file processed and leaks
+    # memory monotonically across a long-running session (a 25-hour NARA
+    # run reached ~2.6 GB RSS before this clear was added). Pre-warm the
+    # cache so the ~25 add_* / check() calls below share one wbgetentities
+    # round-trip.
+    _entity_cache.clear()
     get_entity(mediaid)
 
     # parsed() returns None on lookup failure (was: returned False and the
@@ -2689,12 +2697,15 @@ def process_one_from_sdc(
     """
     global claims, refclaims
 
-    # Drop any stale cache from a prior file so check() always reads fresh
-    # state for this mediaid. The cache survives across files within one
-    # process invocation, so explicit invalidation is necessary when we
-    # move to a new file. Pre-warm so the per-claim check() calls below
-    # share one wbgetentities round-trip.
-    invalidate_entity(mediaid)
+    # Drop every prior file's cached entity at the file boundary. The cache
+    # locality the per-claim check() / reconciler / amend_* calls below
+    # rely on is scoped to ONE file's processing; without this clear, the
+    # module-level ``_entity_cache`` accumulates an entity per file
+    # processed and leaks memory monotonically across a long-running
+    # session (a 25-hour NARA run reached ~2.6 GB RSS before this clear
+    # was added). Pre-warm so the per-claim calls share one
+    # wbgetentities round-trip.
+    _entity_cache.clear()
     get_entity(mediaid)
 
     claims = {"claims": []}
