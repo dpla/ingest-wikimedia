@@ -2762,8 +2762,6 @@ def test_process_one_cache_does_not_grow_across_many_files(monkeypatch, tmp_path
 def test_submit_per_item_edit_no_op_when_all_fragment_lists_empty():
     """Empty accumulators → no POST. Files with nothing to change don't
     generate spurious revisions."""
-    import json
-
     from tools import sdc_sync
 
     submit_calls = []
@@ -2774,7 +2772,6 @@ def test_submit_per_item_edit_no_op_when_all_fragment_lists_empty():
     ):
         sdc_sync._submit_per_item_edit("M999", "abcdef", summary="summary")
     assert submit_calls == []
-    del json  # silence unused-import linting
 
 
 def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
