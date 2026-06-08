@@ -1598,13 +1598,55 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
         return
 
     expected_value = str(page_number)
-    if expected_value in _qualifier_values(target_stmt, "P304"):
-        # Already matches; skip the postqual and the cache invalidation.
-        # Matches the conditional-invalidate pattern in
-        # ``_amend_p7482_url_qualifiers``.
+    # Walk existing P304 qualifiers and bucket them: present-with-expected-
+    # value (idempotent — nothing to do) vs. present-with-different-value
+    # (stale, must be removed before adding the new one). Without removing
+    # stale values, a renumber between syncs — e.g. a sibling ordinal was
+    # deleted by a Commons curator, shifting this file from page 3 to
+    # page 2 — would leave the prior P304="3" alongside the new P304="2"
+    # indefinitely; the statement-level reconciler can't clean it up
+    # because it matches P760 statements only by mainsnak value, not by
+    # their qualifier set.
+    # TODO: ``_amend_p7482_url_qualifiers`` has the same latent issue
+    # for P2699 and P6108. Trigger is rarer there (partner catalog URLs
+    # almost never change for already-uploaded files), but the cleanup
+    # should be unified — likely as a shared ``_replace_dpla_qualifier``
+    # helper once we have a second use case (this one).
+    expected_already_present = False
+    stale_snak_hashes = []
+    for q in target_stmt.get("qualifiers", {}).get("P304", []) or []:
+        if q.get("snaktype") != "value":
+            continue
+        dv = q.get("datavalue")
+        if not (isinstance(dv, dict) and "value" in dv):
+            continue
+        if dv["value"] == expected_value:
+            expected_already_present = True
+        elif q.get("hash"):
+            stale_snak_hashes.append(q["hash"])
+
+    if expected_already_present and not stale_snak_hashes:
+        # Idempotent — exact match, no writes. Matches the conditional-
+        # invalidate pattern in ``_amend_p7482_url_qualifiers``.
         return
 
-    postqual(target_stmt["id"], "P304", json.dumps(expected_value))
+    if stale_snak_hashes:
+        _submit_sdc_write(
+            "wbremovequalifiers",
+            mediaid,
+            dpla_id,
+            claim=target_stmt["id"],
+            qualifiers="|".join(stale_snak_hashes),
+            summary=(
+                f"Removing stale P304 page-number qualifier(s) before"
+                f" applying recomputed value for [[dpla:{dpla_id}|{dpla_id}]]."
+                f" [[COM:DPLA/MOD|Leave feedback]]!"
+            ),
+        )
+
+    if not expected_already_present:
+        postqual(target_stmt["id"], "P304", json.dumps(expected_value))
+
     invalidate_entity(mediaid)
 
 
@@ -2002,18 +2044,26 @@ def _build_expected_from_parsed(
             base = f"{base}|circa"
         p571_expected.append(base)
 
+    # Chunkable-prop values are keyed as (value, p1545) tuples in
+    # _reconcile_existing_claims (it extracts the same tuple shape from
+    # Commons-side statements). The legacy partner-API path never
+    # produces chunked claims — it predates chunking and runs on the
+    # parsed-doc tuple, not sdc.json — so p1545 is always None here.
+    # Without these tuples, the reconciler's `value not in expected[prop]`
+    # would see Commons-side ("text", None) versus expected ["text"] and
+    # queue every DPLA-authored string/monolingualtext claim for removal.
     expected = {
-        "P217": local_ids,
-        "P760": [dpla_id],
-        "P1476": titles,
+        "P217": [(v, None) for v in local_ids],
+        "P760": [(dpla_id, None)],
+        "P1476": [(v, None) for v in titles],
         "P195": ["Q518155" if hub == "Q518155" else institution],
         "P170": creators,
         "P9126": ["Q2944483", hub, institution],
         "P7482": [url],
-        "P4272": subjects,
+        "P4272": [(v, None) for v in subjects],
         "P571": p571_expected,
-        "P10358": descs,
-        "P1225": naids,
+        "P10358": [(v, None) for v in descs],
+        "P1225": [(v, None) for v in naids],
         "P6224": [level],
         "P7228": [access],
         "P921": parsesubjectentities,

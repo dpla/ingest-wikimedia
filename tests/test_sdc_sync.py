@@ -1882,6 +1882,52 @@ def test_build_expected_from_parsed_includes_both_shapes_for_p571(monkeypatch):
     assert len(canonical_keys) == 2
 
 
+def test_build_expected_from_parsed_emits_tuple_keys_for_chunkable_props(monkeypatch):
+    """Regression guard against CodeRabbit's PR #282 finding: the legacy
+    ``dpla_claims()`` path's expected map MUST key chunkable-property
+    values as ``(value, p1545)`` tuples so the reconciler's tuple-keyed
+    Commons-side extraction sees a match. Without this, a legacy
+    ``--file`` / ``--cat`` / ``--list`` rerun would treat every
+    DPLA-authored P760/P217/P4272/P1225/P1476/P10358 statement as
+    unexpected and queue it for removal."""
+    from ingest_wikimedia.sdc import CHUNKABLE_PROPS
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "rights", {}, raising=False)
+
+    expected = sdc_sync._build_expected_from_parsed(
+        dpla_id="abcdef",
+        url="http://example.com/x",
+        descs=["a description"],
+        dates=[],
+        titles=["A title"],
+        hub="Q1",
+        local_ids=["local-1", "local-2"],
+        institution="Q2",
+        rs="",
+        creators=[],
+        subjects=[("subj-1", ""), ("subj-2", "Q5")],
+        naids=["naid-1"],
+        access="",
+        level="",
+    )
+    # Each chunkable-prop entry is a list of (value, None) tuples — the
+    # legacy path never produces chunked claims (it predates chunking),
+    # so p1545 is always None on this side.
+    assert expected["P760"] == [("abcdef", None)]
+    assert expected["P217"] == [("local-1", None), ("local-2", None)]
+    assert expected["P1476"] == [("A title", None)]
+    assert expected["P10358"] == [("a description", None)]
+    assert expected["P4272"] == [("subj-1", None), ("subj-2", None)]
+    assert expected["P1225"] == [("naid-1", None)]
+    # Sanity: every CHUNKABLE_PROPS entry is the tuple shape.
+    for prop in CHUNKABLE_PROPS:
+        for v in expected.get(prop, []):
+            assert isinstance(v, tuple) and len(v) == 2, (
+                f"{prop} entry {v!r} must be a (value, p1545) tuple"
+            )
+
+
 # ---------------------------------------------------------------------------
 # P2699 / P6108 qualifiers on P7482 (PR description in
 # tools/sdc_sync.py::_amend_p7482_url_qualifiers).
@@ -2305,6 +2351,130 @@ def test_amend_p760_page_qualifier_skips_when_no_dpla_authored_p760():
             "M999", "abcdef", {"claims": []}, page_number=1
         )
 
+    assert postqual_calls == []
+
+
+def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
+    """Renumber scenario: existing DPLA-authored P760 has P304="3"
+    (from a prior sync), but the recomputed page_number is now 2 (a
+    sibling ordinal got deleted, shifting this file's position). The
+    helper must remove the stale "3" qualifier via wbremovequalifiers
+    BEFORE adding the new "2"; otherwise the statement accumulates
+    conflicting page numbers indefinitely since the reconciler matches
+    P760 only by mainsnak value."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P304": [
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "3"},
+                    "hash": "stale-snak-hash-3",
+                }
+            ],
+        },
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    submit_calls = []
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
+        ),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=2
+        )
+
+    # wbremovequalifiers was called for the stale snak hash.
+    assert len(submit_calls) == 1
+    action, _args, kw = submit_calls[0]
+    assert action == "wbremovequalifiers"
+    assert kw["claim"] == "M999$p760id"
+    assert kw["qualifiers"] == "stale-snak-hash-3"
+
+    # postqual added the new value.
+    assert len(postqual_calls) == 1
+    claimid, prop, value_json = postqual_calls[0]
+    assert claimid == "M999$p760id"
+    assert prop == "P304"
+    assert json.loads(value_json) == "2"
+
+
+def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
+    """Mixed case: existing P304 has both the expected value AND a stale
+    one (e.g. a prior renumber wasn't cleaned up). Helper must remove
+    only the stale snak and NOT re-add the expected value."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P304": [
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "2"},
+                    "hash": "hash-2",
+                },
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "3"},
+                    "hash": "stale-hash-3",
+                },
+            ],
+        },
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    submit_calls = []
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
+        ),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=2
+        )
+
+    # Only the stale snak got removed; the expected value was already
+    # present, so no postqual.
+    assert len(submit_calls) == 1
+    assert submit_calls[0][2]["qualifiers"] == "stale-hash-3"
     assert postqual_calls == []
 
 
