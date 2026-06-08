@@ -2923,3 +2923,94 @@ def test_qualifier_values_returns_empty_when_no_qualifiers():
     assert sdc_sync._qualifier_values(stmt, "P304") == ["2"]
     assert sdc_sync._first_qualifier_value(stmt, "P304") == "2"
     assert sdc_sync._first_qualifier_value(stmt, "P999") is None
+
+
+
+# ---------------------------------------------------------------------------
+# Entity-cache leak fix.
+#
+# Pre-fix, ``_entity_cache`` accumulated one cached MediaInfo entity per file
+# processed across a session's lifetime — only ``invalidate_entity(mediaid)``
+# (per-write, single-key pop) ever evicted entries. A 25-hour NARA run
+# reached ~2.6 GB RSS as the cache grew to ~200k entities. Both
+# ``process_one`` and ``process_one_from_sdc`` now ``_entity_cache.clear()``
+# at the file-boundary entry so cache locality stays per-file but doesn't
+# leak across files.
+# ---------------------------------------------------------------------------
+
+
+def _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, current_mediaid):
+    """Stub every network/IO surface ``process_one_from_sdc`` touches so the
+    test can drive it without contacting Commons."""
+    fake_request = MagicMock()
+    fake_request.submit.return_value = {
+        "entities": {
+            current_mediaid: {
+                "pageid": int(current_mediaid.lstrip("M")),
+                "statements": {},
+            }
+        }
+    }
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value = fake_request
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+    monkeypatch.setattr(sdc_sync, "_post_new_refs", lambda *a, **kw: None)
+    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *a, **kw: None)
+    monkeypatch.setattr(sdc_sync, "_amend_p7482_url_qualifiers", lambda *a, **kw: None)
+    monkeypatch.setattr(sdc_sync, "_amend_p760_page_qualifier", lambda *a, **kw: None)
+    monkeypatch.setattr(sdc_sync, "_reconcile_existing_claims", lambda *a, **kw: None)
+
+
+def test_process_one_from_sdc_clears_entity_cache_at_file_boundary(monkeypatch):
+    """Regression guard for the cache-leak fix. The module-level
+    ``_entity_cache`` must be flushed at every file-boundary entry so a
+    long-running session's RSS stays flat regardless of file count."""
+    from tools import sdc_sync
+
+    sdc_sync._entity_cache.update(
+        {
+            "M111": {"pageid": 111, "statements": {}},
+            "M222": {"pageid": 222, "statements": {}},
+            "M333": {"pageid": 333, "statements": {}},
+            "M444": {"pageid": 444, "statements": {}},
+            "M555": {"pageid": 555, "statements": {}},
+        }
+    )
+    assert len(sdc_sync._entity_cache) == 5
+
+    _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, "M999")
+
+    sdc_sync.process_one_from_sdc("M999", "abcdef", {"claims": []})
+
+    # Prior files' entities are gone. The current mediaid may or may not
+    # be in the cache afterward (post-write cleanup invalidates it), but
+    # in no case do prior files persist.
+    for prior in ("M111", "M222", "M333", "M444", "M555"):
+        assert prior not in sdc_sync._entity_cache, (
+            f"prior file {prior} leaked across the file boundary"
+        )
+    # Defensive cleanup so this test doesn't leak state into the next.
+    sdc_sync._entity_cache.clear()
+
+
+def test_entity_cache_does_not_grow_across_many_files(monkeypatch):
+    """Direct memory-leak regression. Run the file-boundary entry point
+    against many synthetic files in sequence; cache size must stay
+    bounded (≤ 1 entry per call), never accumulating."""
+    from tools import sdc_sync
+
+    sdc_sync._entity_cache.clear()
+    sizes = []
+    for i in range(100):
+        mediaid = f"M{1000 + i}"
+        _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, mediaid)
+        sdc_sync.process_one_from_sdc(mediaid, f"dpla{i:06d}", {"claims": []})
+        sizes.append(len(sdc_sync._entity_cache))
+
+    # Pre-fix, sizes would be [1, 2, 3, ..., 100] (linear growth).
+    # Post-fix, every entry must be ≤ 1.
+    assert max(sizes) <= 1, (
+        f"_entity_cache grew across files (max size {max(sizes)}); "
+        f"cache locality must be per-file"
+    )
+    sdc_sync._entity_cache.clear()
