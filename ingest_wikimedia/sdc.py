@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from typing import Any
@@ -150,11 +151,41 @@ PD_MARK_URI_CANONICAL = "http://creativecommons.org/publicdomain/mark/1.0"
 
 RECONCI_ENDPOINT = "https://wikidata.reconci.link/en/api"
 RECONCI_BATCH_SIZE = 10
-TEXT_VALUE_LIMIT = 1499  # matches sdc-sync's longstanding truncation cap
-# Maximum length for a raw P217 (inventory number) value before we skip it
-# entirely. sdc-sync's original guard was `len(local_id) >= 1501`, so anything
-# strictly longer than 1500 is dropped.
-LOCAL_ID_MAX_LENGTH = 1500
+TEXT_VALUE_LIMIT = 1499  # matches sdc-sync's longstanding truncation cap;
+# retained for snak values inside qualifiers (P2093 in P170, P1932 in P571),
+# which can't be chunked at the qualifier level. Mainsnak values are chunked
+# instead via _chunk_value below.
+
+# Wikibase's hard cap for `string` and `monolingualtext` mainsnak values on
+# Wikidata-class wikis (Commons inherits via the MediaInfo extension).
+# Reference: https://www.wikidata.org/wiki/Help:Data_type — both datatypes
+# listed at 1500. Mainsnak values exceeding this get split into multiple
+# claims, each carrying a P1545 (series ordinal) qualifier so the Lua
+# template on Commons can reassemble them on read.
+WIKIBASE_STRING_LIMIT = 1500
+
+# P1545 (series ordinal) is added by _chunk_and_emit_claims as a qualifier
+# on every chunked-claim and is therefore a DPLA-authored qualifier wherever
+# chunking is enabled. tools/sdc_sync.py's _DPLA_EXTRA_QUALIFIER_PROPS must
+# include P1545 under each chunked property so _is_safe_to_amend_in_place
+# treats it as part of the DPLA-owned envelope.
+CHUNKABLE_PROPS = frozenset(
+    {
+        "P760",  # DPLA ID (typically short, normalized but rarely chunks)
+        "P217",  # local identifier
+        "P4272",  # subject string
+        "P1225",  # NARA NAID
+        "P1476",  # title (monolingualtext)
+        "P10358",  # description (monolingualtext)
+    }
+)
+
+# Character class for ASCII / Latin-1 control characters. Mirrors Wikibase's
+# server-side `preg_replace('/\\p{Cc}+/u', ' ', $value)` normalization for
+# string and monolingualtext datatypes (lib/includes/StringNormalizer.php).
+# We apply the same transform locally so chunk boundary char counts match
+# what Wikibase will actually store after the wbeditentity round-trip.
+_CONTROL_CHAR_RUN = re.compile(r"[\x00-\x1F\x7F-\x9F]+")
 
 # DPLA subject → Wikidata Q-ID lookup table; sourced from dpla/ingestion3
 # alongside institutions_v2.json. Fetched fresh per run so upstream changes
@@ -590,8 +621,216 @@ def parse_dpla_doc(
 
 
 def _truncate(value: str) -> str:
-    """Match sdc-sync's longstanding `[:1499].rstrip()` normalization."""
+    """Match sdc-sync's longstanding `[:1499].rstrip()` normalization.
+
+    Used only for snak values inside qualifiers (e.g. P2093 in a P170
+    creator statement). Mainsnak string/monolingualtext values go through
+    :func:`_normalize_string_value` + :func:`_chunk_value` instead so long
+    values are preserved across multiple claims rather than truncated.
+    """
     return value[:TEXT_VALUE_LIMIT].rstrip() if value else ""
+
+
+def _normalize_string_value(text: str, *, is_monolingualtext: bool = False) -> str:
+    """Apply Wikibase's server-side string normalization locally.
+
+    Mirrors `lib/includes/StringNormalizer.php` (Wikibase) so our in-memory
+    value matches the bytes Wikibase will store after wbeditentity. Without
+    this, the next sync would see drift on values containing newlines,
+    leading/trailing whitespace, or invisible format characters (BOM,
+    bidi marks) and trigger spurious re-writes; for chunked values, the
+    drift compounds across every chunk.
+
+    The transforms, applied in the order Wikibase applies them:
+
+      1. ``trimBadChars`` — strip a fixed set of invisible/non-character
+         codepoints that Wikibase rejects: BOM (``U+FEFF``), bidi marks
+         (``U+200E``/``U+200F``), and non-characters (``U+FFFE``/
+         ``U+FFFF``). Source CSV/JSON occasionally carries these when
+         partner metadata is round-tripped through pasted-text fields.
+      2. Collapse every run of ASCII / Latin-1 control characters
+         (``\\x00`` – ``\\x1F``, ``\\x7F`` – ``\\x9F`` — includes ``\\n``,
+         ``\\r``, ``\\t``) to a single ASCII space.
+      3. Strip leading and trailing whitespace. Python's ``str.strip()``
+         covers chars where ``isspace()`` is true, which matches
+         Wikibase's ``\\p{Z}`` strip closely enough for DPLA's
+         source-metadata corpus.
+      4. For monolingualtext datatypes only: NFC-normalize via
+         :func:`unicodedata.normalize`. Wikibase wires `cleanupToNFC` for
+         the monolingualtext parser path.
+
+    Wikibase does NOT collapse internal regular spaces; neither does this
+    helper. ``<``, ``>``, ``&`` are stored verbatim — no HTML escaping at
+    the snak layer.
+    """
+    if not text:
+        return ""
+    text = text.translate(_BAD_CHARS_TABLE)
+    text = _CONTROL_CHAR_RUN.sub(" ", text)
+    text = text.strip()
+    if is_monolingualtext:
+        text = unicodedata.normalize("NFC", text)
+    return text
+
+
+# Codepoints Wikibase rejects via its trimBadChars equivalent. BOM (U+FEFF)
+# and bidi marks (U+200E/U+200F) appear mid-string when partner metadata
+# comes through pasted-text fields; non-characters (U+FFFE/U+FFFF) are
+# always invalid Unicode regardless. Without stripping these locally, a
+# value with an embedded BOM would round-trip through Wikibase shorter
+# than what we emit, and the next sync would see a mismatch and re-write.
+_BAD_CHARS_TABLE = dict.fromkeys((0xFEFF, 0x200E, 0x200F, 0xFFFE, 0xFFFF))
+
+
+def _chunk_value(text: str, limit: int = WIKIBASE_STRING_LIMIT) -> list[str]:
+    """Split ``text`` into chunks no longer than ``limit`` characters each.
+
+    Boundary search picks a position N (1 ≤ N ≤ ``limit``) where both
+    ``text[N-1]`` and ``text[N]`` are non-whitespace. This guarantees neither
+    side of the split has leading or trailing whitespace that Wikibase
+    would strip on save, so concat-after-store reassembles bit-for-bit
+    identical to the original.
+
+    Pathological case: a whitespace run longer than ``limit`` characters
+    that straddles the chunk window leaves no valid non-whitespace boundary
+    within reach. We fall back to splitting at exactly ``limit`` and emit a
+    warning — interior whitespace at that boundary will collapse on
+    round-trip, but content outside the whitespace run survives intact.
+    DPLA source metadata never contains runs this long in practice.
+
+    Callers must apply :func:`_normalize_string_value` before chunking so
+    input matches Wikibase's stored form.
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        boundary = limit
+        while boundary > 0 and (
+            remaining[boundary - 1].isspace() or remaining[boundary].isspace()
+        ):
+            boundary -= 1
+        if boundary == 0:
+            logger.warning(
+                "Chunk boundary fell inside a whitespace run longer than %d "
+                "characters; interior whitespace at this boundary will "
+                "collapse on Wikibase round-trip",
+                limit,
+            )
+            boundary = limit
+        chunks.append(remaining[:boundary])
+        remaining = remaining[boundary:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _next_series_letter(
+    letters: dict[tuple[str, str], str], prop: str, language: str
+) -> str:
+    """Return the next series letter for a chunked value on (prop, language).
+
+    First long value seen for a (prop, lang) gets ``"A"``; second ``"B"``;
+    twenty-seventh ``"AA"``; then ``"AB"``, ``"AC"``... — Excel-style
+    column-letter sequence so the series never silently advances past
+    ``"Z"`` into non-alpha codepoints (``chr(ord('Z') + 1) == '['``,
+    which Commons-side reassembly would mis-group). 26+ long values on
+    one (prop, lang) is unlikely in practice, but the failure mode is
+    silent data corruption — well worth the eight extra lines to make
+    it impossible.
+
+    The letter is paired with the chunk ordinal to form the P1545
+    qualifier value (e.g. ``"A1"``, ``"A2"``, ``"AA1"``). The Lua
+    template on Commons groups chunks by series letter and sorts by
+    ordinal to reassemble each long value independently.
+
+    Mutates ``letters`` in place — callers thread the same dict through
+    one ``build_claims_for_doc`` invocation to maintain per-doc state.
+    """
+    current = letters.get((prop, language))
+    new_letter = "A" if current is None else _advance_series_letter(current)
+    letters[(prop, language)] = new_letter
+    return new_letter
+
+
+def _advance_series_letter(letter: str) -> str:
+    """Advance an Excel-style column-letter sequence by one: ``A → B``,
+    ``Z → AA``, ``AZ → BA``, ``ZZ → AAA``.
+
+    Pure function. Used only by :func:`_next_series_letter` to safely
+    increment past ``Z`` rather than falling off the end of the ASCII
+    uppercase range.
+    """
+    chars = list(letter)
+    i = len(chars) - 1
+    while i >= 0:
+        if chars[i] == "Z":
+            chars[i] = "A"
+            i -= 1
+        else:
+            chars[i] = chr(ord(chars[i]) + 1)
+            return "".join(chars)
+    # All Z's — extend the sequence by one position ("ZZ" → "AAA").
+    return "A" + "".join(chars)
+
+
+def _chunk_and_emit_claims(
+    prop: str,
+    text: str,
+    value_type: str,
+    dpla_id: str,
+    retrieval_date: datetime.date,
+    chunk_series_letters: dict[tuple[str, str], str],
+    *,
+    language: str = "",
+) -> list[dict]:
+    """Normalize ``text``, chunk if it exceeds ``WIKIBASE_STRING_LIMIT``,
+    and return one claim per chunk.
+
+    Single-chunk values (≤ limit after normalization) emit one claim with
+    no P1545 qualifier — bytewise identical to the pre-chunking output
+    apart from the normalization pass.
+
+    Multi-chunk values emit one claim per chunk, each carrying a P1545
+    qualifier with value ``f"{letter}{ordinal}"`` (e.g. ``"A1"``, ``"A2"``).
+    The series letter advances per (prop, language) so a second long
+    value on the same property + language gets the next letter, keeping
+    the chunk groups separable for reassembly.
+
+    ``value_type`` is ``"string"`` or ``"monolingualtext"``. For
+    monolingualtext, ``language`` is required and is also used as part of
+    the series-letter key so two long English titles get A/B series
+    while a long French title gets its own A series.
+
+    Mutates ``chunk_series_letters`` in place when a long value consumes
+    a fresh series letter — callers thread the same dict through one
+    ``build_claims_for_doc`` invocation.
+    """
+    is_monolingualtext = value_type == "monolingualtext"
+    normalized = _normalize_string_value(text, is_monolingualtext=is_monolingualtext)
+    if not normalized:
+        return []
+    chunks = _chunk_value(normalized)
+    if len(chunks) == 1:
+        value: Any = (
+            {"text": normalized, "language": language}
+            if is_monolingualtext
+            else normalized
+        )
+        return [formattedclaim(prop, value, value_type, dpla_id, retrieval_date)]
+    letter = _next_series_letter(chunk_series_letters, prop, language)
+    out: list[dict] = []
+    for ordinal, chunk in enumerate(chunks, start=1):
+        chunk_value: Any = (
+            {"text": chunk, "language": language} if is_monolingualtext else chunk
+        )
+        claim = formattedclaim(prop, chunk_value, value_type, dpla_id, retrieval_date)
+        claim["qualifiers"]["P1545"] = [
+            _qualifier_string_snak("P1545", f"{letter}{ordinal}")
+        ]
+        out.append(claim)
+    return out
 
 
 def _build_rights_claims(
@@ -735,11 +974,25 @@ def _build_local_id_claim(
     institution: str,
     dpla_id: str,
     retrieval_date: datetime.date,
-) -> dict:
-    """Build a P217 (inventory number) claim with P195 (collection) qualifier."""
-    claim = formattedclaim("P217", local_id, "string", dpla_id, retrieval_date)
-    claim["qualifiers"]["P195"] = [_qualifier_item_snak("P195", institution)]
-    return claim
+    chunk_series_letters: dict[tuple[str, str], str],
+) -> list[dict]:
+    """Build a P217 (inventory number) claim with P195 (collection) qualifier.
+
+    Returns one claim per chunk when ``local_id`` exceeds the Wikibase
+    string limit; the P195 collection qualifier is replicated on every
+    chunk claim since each chunk is its own statement.
+    """
+    claims = _chunk_and_emit_claims(
+        "P217",
+        local_id,
+        "string",
+        dpla_id,
+        retrieval_date,
+        chunk_series_letters,
+    )
+    for claim in claims:
+        claim["qualifiers"]["P195"] = [_qualifier_item_snak("P195", institution)]
+    return claims
 
 
 def _build_creator_claim(
@@ -978,16 +1231,22 @@ def _build_monolingual_claim(
     text: str,
     dpla_id: str,
     retrieval_date: datetime.date,
-) -> dict | None:
-    normalized = _truncate(text)
-    if not normalized:
-        return None
-    return formattedclaim(
+    chunk_series_letters: dict[tuple[str, str], str],
+) -> list[dict]:
+    """Build the monolingualtext claim(s) for a long-form text field.
+
+    Returns multiple claims with P1545 series-ordinal qualifiers when the
+    text exceeds the Wikibase string limit; the Lua template on Commons
+    reassembles by series + ordinal.
+    """
+    return _chunk_and_emit_claims(
         prop,
-        {"text": normalized, "language": "en"},
+        text,
         "monolingualtext",
         dpla_id,
         retrieval_date,
+        chunk_series_letters,
+        language="en",
     )
 
 
@@ -1035,17 +1294,29 @@ def build_claims_for_doc(
 
     claims: list[dict] = []
 
+    # Track series-letter assignments for long-value chunking. Keyed by
+    # (prop, language); first long value seen for a key gets letter "A",
+    # second "B", and so on. The chunk emitters mutate this dict as they
+    # consume letters.
+    chunk_series_letters: dict[tuple[str, str], str] = {}
+
     # Rights cluster (P275/P6426/P6216).
     claims.extend(_build_rights_claims(rs, rights, dpla_id, retrieval_date))
 
     # P760 — DPLA ID.
-    claims.append(formattedclaim("P760", dpla_id, "string", dpla_id, retrieval_date))
+    claims.extend(
+        _chunk_and_emit_claims(
+            "P760", dpla_id, "string", dpla_id, retrieval_date, chunk_series_letters
+        )
+    )
 
-    # P1476 — title (one statement per title).
+    # P1476 — title (one statement per title; chunked if needed).
     for title in titles:
-        c = _build_monolingual_claim("P1476", title, dpla_id, retrieval_date)
-        if c is not None:
-            claims.append(c)
+        claims.extend(
+            _build_monolingual_claim(
+                "P1476", title, dpla_id, retrieval_date, chunk_series_letters
+            )
+        )
 
     # P195 — collection (one statement; Smithsonian uses hub-as-institution).
     if institution:
@@ -1075,8 +1346,15 @@ def build_claims_for_doc(
     # P4272 (subject string) and P921 (subject entity).
     for name, subjqid in subjects:
         if name:
-            claims.append(
-                formattedclaim("P4272", name, "string", dpla_id, retrieval_date)
+            claims.extend(
+                _chunk_and_emit_claims(
+                    "P4272",
+                    name,
+                    "string",
+                    dpla_id,
+                    retrieval_date,
+                    chunk_series_letters,
+                )
             )
         if subjqid:
             claims.append(
@@ -1089,11 +1367,13 @@ def build_claims_for_doc(
                 )
             )
 
-    # P10358 — description.
+    # P10358 — description (chunked if needed).
     for desc in descs:
-        c = _build_monolingual_claim("P10358", desc, dpla_id, retrieval_date)
-        if c is not None:
-            claims.append(c)
+        claims.extend(
+            _build_monolingual_claim(
+                "P10358", desc, dpla_id, retrieval_date, chunk_series_letters
+            )
+        )
 
     # P9126 — maintained by chain.
     claims.extend(_build_contributed_claims(hub, institution, dpla_id, retrieval_date))
@@ -1121,18 +1401,30 @@ def build_claims_for_doc(
     )
 
     # P217 — local identifier (non-NARA; per-value, with P195 qualifier).
+    # Values exceeding the Wikibase string limit are chunked rather than
+    # dropped, preserving the source identifier across multiple P217
+    # statements (each carrying P195 + a P1545 series-ordinal qualifier).
     for local_id in local_ids:
-        if not local_id or len(local_id) > LOCAL_ID_MAX_LENGTH:
+        if not local_id:
             continue
-        claims.append(
-            _build_local_id_claim(local_id, institution, dpla_id, retrieval_date)
+        claims.extend(
+            _build_local_id_claim(
+                local_id, institution, dpla_id, retrieval_date, chunk_series_letters
+            )
         )
 
     # NARA-only fields.
     for naid in naids:
         if naid:
-            claims.append(
-                formattedclaim("P1225", naid, "string", dpla_id, retrieval_date)
+            claims.extend(
+                _chunk_and_emit_claims(
+                    "P1225",
+                    naid,
+                    "string",
+                    dpla_id,
+                    retrieval_date,
+                    chunk_series_letters,
+                )
             )
     if access:
         claims.append(

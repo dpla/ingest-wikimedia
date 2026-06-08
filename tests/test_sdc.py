@@ -572,3 +572,324 @@ def test_build_source_claim_never_stamps_p2699():
         iiif_manifest_url="https://example.org/iiif/abc/manifest.json",
     )
     assert "P2699" not in claim["qualifiers"]
+
+
+# --------------------------------------------------------------------------
+# Long-value chunking — _normalize_string_value, _chunk_value,
+# _next_series_letter, _chunk_and_emit_claims.
+#
+# Wikibase normalizes string and monolingualtext values on save
+# (lib/includes/StringNormalizer.php): control char runs become a single
+# space, leading/trailing Unicode whitespace is stripped, monolingualtext
+# is NFC-normalized. We pre-apply the same transforms locally so chunk
+# boundary char counts match what Wikibase will store and chunk-by-chunk
+# matching stays stable across syncs.
+# --------------------------------------------------------------------------
+
+
+def test_normalize_string_value_strips_leading_trailing_whitespace():
+    from ingest_wikimedia.sdc import _normalize_string_value
+
+    assert _normalize_string_value("  hello  ") == "hello"
+    assert _normalize_string_value("\thello\t") == "hello"
+    assert _normalize_string_value(" hello ") == "hello"
+
+
+def test_normalize_string_value_collapses_control_char_runs_to_single_space():
+    """Wikibase's preg_replace('/\\p{Cc}+/u', ' ', ...) — any run of
+    control chars becomes a single ASCII space. Internal regular
+    spaces are NOT collapsed."""
+    from ingest_wikimedia.sdc import _normalize_string_value
+
+    assert _normalize_string_value("Line one.\nLine two.") == "Line one. Line two."
+    assert _normalize_string_value("a\n\n\nb") == "a b"
+    assert _normalize_string_value("a\t\r\n\tb") == "a b"
+    assert _normalize_string_value("a    b") == "a    b"
+
+
+def test_normalize_string_value_empty_input():
+    from ingest_wikimedia.sdc import _normalize_string_value
+
+    assert _normalize_string_value("") == ""
+    assert _normalize_string_value("   ") == ""
+    assert _normalize_string_value("\n\t\r") == ""
+
+
+def test_normalize_string_value_idempotent():
+    """Applying normalization twice yields the same result as once."""
+    from ingest_wikimedia.sdc import _normalize_string_value
+
+    samples = ["  hello  ", "a\nb", "café", "Line\n\nbreak", "\thello\t"]
+    for s in samples:
+        once = _normalize_string_value(s)
+        twice = _normalize_string_value(once)
+        assert once == twice, f"non-idempotent on {s!r}: {once!r} → {twice!r}"
+
+
+def test_normalize_string_value_nfc_for_monolingualtext():
+    """cleanupToNFC is wired only for monolingualtext on Wikibase."""
+    from ingest_wikimedia.sdc import _normalize_string_value
+
+    decomposed = "é"  # e + COMBINING ACUTE ACCENT (NFD)
+    precomposed = "é"  # NFC
+    assert _normalize_string_value(decomposed, is_monolingualtext=True) == precomposed
+    assert _normalize_string_value(decomposed, is_monolingualtext=False) == decomposed
+
+
+def test_chunk_value_under_limit_returns_single_chunk():
+    from ingest_wikimedia.sdc import _chunk_value
+
+    assert _chunk_value("short") == ["short"]
+    text = "x" * 1500
+    assert _chunk_value(text) == [text]
+
+
+def test_chunk_value_over_limit_splits_at_non_whitespace_boundary():
+    """Boundary search walks backward to find a position where both
+    adjacent characters are non-whitespace, so Wikibase's
+    leading/trailing-whitespace strip can't eat bytes at the boundary."""
+    from ingest_wikimedia.sdc import _chunk_value
+
+    text = "abcdefghij klmnopqrst"
+    chunks = _chunk_value(text, limit=12)
+    assert len(chunks) == 2
+    assert not chunks[0].endswith(" ")
+    assert not chunks[1].startswith(" ")
+    assert "".join(chunks) == text
+
+
+def test_chunk_value_pathological_whitespace_run_falls_back_to_exact_limit(caplog):
+    """A whitespace run longer than the chunk window leaves no valid
+    non-whitespace boundary in reach. Chunk at exactly limit + warn."""
+    import logging
+
+    from ingest_wikimedia.sdc import _chunk_value
+
+    text = "a" + (" " * 20) + "b"
+    with caplog.at_level(logging.WARNING, logger="ingest_wikimedia.sdc"):
+        chunks = _chunk_value(text, limit=10)
+    assert len(chunks) >= 2
+    assert any("whitespace run" in rec.message for rec in caplog.records)
+    assert "".join(chunks) == text
+
+
+def test_chunk_value_multiple_chunks():
+    from ingest_wikimedia.sdc import _chunk_value
+
+    text = "x" * 3500
+    chunks = _chunk_value(text, limit=1000)
+    assert len(chunks) == 4
+    assert sum(len(c) for c in chunks) == 3500
+    for chunk in chunks:
+        assert len(chunk) <= 1000
+
+
+def test_next_series_letter_advances_per_key():
+    from ingest_wikimedia.sdc import _next_series_letter
+
+    letters = {}
+    assert _next_series_letter(letters, "P1476", "en") == "A"
+    assert _next_series_letter(letters, "P1476", "en") == "B"
+    assert _next_series_letter(letters, "P10358", "en") == "A"
+    assert _next_series_letter(letters, "P1476", "en") == "C"
+    assert _next_series_letter(letters, "P1476", "fr") == "A"
+
+
+def test_chunk_and_emit_claims_short_value_emits_one_claim_no_p1545():
+    """Single-chunk values keep the pre-chunking shape — no P1545."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import _chunk_and_emit_claims
+
+    letters = {}
+    claims = _chunk_and_emit_claims(
+        "P1476",
+        "Short title",
+        "monolingualtext",
+        "abc",
+        _dt.date(2026, 1, 1),
+        letters,
+        language="en",
+    )
+    assert len(claims) == 1
+    assert "P1545" not in claims[0]["qualifiers"]
+    assert letters == {}
+
+
+def test_chunk_and_emit_claims_long_value_emits_multiple_with_p1545():
+    """Long values split into multiple claims, each with P1545="A1",
+    "A2", etc. Series letter advances for the next long value on the
+    same (prop, language)."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import _chunk_and_emit_claims
+
+    letters = {}
+    long_text = "x" * 1500 + " " + "y" * 800
+    claims = _chunk_and_emit_claims(
+        "P10358",
+        long_text,
+        "monolingualtext",
+        "abc",
+        _dt.date(2026, 1, 1),
+        letters,
+        language="en",
+    )
+    assert len(claims) == 2
+    assert claims[0]["qualifiers"]["P1545"][0]["datavalue"]["value"] == "A1"
+    assert claims[1]["qualifiers"]["P1545"][0]["datavalue"]["value"] == "A2"
+    assert letters == {("P10358", "en"): "A"}
+
+    second_long = "z" * 1500 + " " + "w" * 800
+    more = _chunk_and_emit_claims(
+        "P10358",
+        second_long,
+        "monolingualtext",
+        "abc",
+        _dt.date(2026, 1, 1),
+        letters,
+        language="en",
+    )
+    assert [c["qualifiers"]["P1545"][0]["datavalue"]["value"] for c in more] == [
+        "B1",
+        "B2",
+    ]
+
+
+def test_chunk_and_emit_claims_empty_after_normalization_emits_nothing():
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import _chunk_and_emit_claims
+
+    assert (
+        _chunk_and_emit_claims(
+            "P1476",
+            "   ",
+            "monolingualtext",
+            "abc",
+            _dt.date(2026, 1, 1),
+            {},
+            language="en",
+        )
+        == []
+    )
+    assert (
+        _chunk_and_emit_claims("P217", "", "string", "abc", _dt.date(2026, 1, 1), {})
+        == []
+    )
+
+
+def test_chunk_and_emit_claims_per_language_series_independent():
+    """A long English description and a long French description on the
+    same property each start a fresh A series — series-letter key is
+    (prop, language)."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import _chunk_and_emit_claims
+
+    letters = {}
+    en = _chunk_and_emit_claims(
+        "P10358",
+        "x" * 2500,
+        "monolingualtext",
+        "abc",
+        _dt.date(2026, 1, 1),
+        letters,
+        language="en",
+    )
+    fr = _chunk_and_emit_claims(
+        "P10358",
+        "y" * 2500,
+        "monolingualtext",
+        "abc",
+        _dt.date(2026, 1, 1),
+        letters,
+        language="fr",
+    )
+    assert en[0]["qualifiers"]["P1545"][0]["datavalue"]["value"].startswith("A")
+    assert fr[0]["qualifiers"]["P1545"][0]["datavalue"]["value"].startswith("A")
+
+
+def test_chunk_and_emit_claims_normalizes_before_chunking():
+    """Embedded newlines collapse to single spaces (per Wikibase's
+    server-side normalization) BEFORE the chunk boundary search runs.
+    Without this, our chunk char counts would diverge from Wikibase's
+    stored byte length and matching would drift on every sync."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import _chunk_and_emit_claims
+
+    # 1500 'x' + newline + 1500 'y' → after normalization it's
+    # 1500 'x' + single space + 1500 'y' = 3001 chars, chunked.
+    text = "x" * 1500 + "\n" + "y" * 1500
+    claims = _chunk_and_emit_claims(
+        "P10358",
+        text,
+        "monolingualtext",
+        "abc",
+        _dt.date(2026, 1, 1),
+        {},
+        language="en",
+    )
+    # Concatenated values reassemble to the normalized form, not the raw.
+    rebuilt = "".join(c["mainsnak"]["datavalue"]["value"]["text"] for c in claims)
+    assert rebuilt == "x" * 1500 + " " + "y" * 1500
+
+
+def test_normalize_string_value_strips_bom_and_bidi_marks():
+    """Wikibase's trimBadChars equivalent strips BOM (U+FEFF), bidi marks
+    (U+200E/U+200F), and non-characters (U+FFFE/U+FFFF) — invisible
+    codepoints that DPLA source CSV/JSON occasionally carries from
+    pasted-text round-trips. Without local stripping, the next sync
+    would see drift on every such value (Wikibase stores N-1 bytes,
+    we emit N) and re-write every chunk indefinitely."""
+    from ingest_wikimedia.sdc import _normalize_string_value
+
+    # BOM at start, mid, and end — all stripped.
+    assert _normalize_string_value("﻿Hello") == "Hello"
+    assert _normalize_string_value("Hello﻿") == "Hello"
+    assert _normalize_string_value("He﻿llo") == "Hello"
+    # LRM (U+200E) and RLM (U+200F) — both stripped.
+    assert _normalize_string_value("Hello‎") == "Hello"
+    assert _normalize_string_value("a‏b") == "ab"
+    # Non-characters U+FFFE / U+FFFF — both stripped.
+    assert _normalize_string_value("Hello￾") == "Hello"
+    assert _normalize_string_value("a￿b") == "ab"
+
+
+def test_advance_series_letter_basic_increment():
+    from ingest_wikimedia.sdc import _advance_series_letter
+
+    assert _advance_series_letter("A") == "B"
+    assert _advance_series_letter("B") == "C"
+    assert _advance_series_letter("Y") == "Z"
+
+
+def test_advance_series_letter_carry_past_z():
+    """The bug this guards against: ``chr(ord('Z') + 1) == '['`` —
+    silently advancing into non-alpha codepoints would corrupt Lua-side
+    reassembly. Excel-style carry to AA is the documented behavior."""
+    from ingest_wikimedia.sdc import _advance_series_letter
+
+    assert _advance_series_letter("Z") == "AA"
+    assert _advance_series_letter("AA") == "AB"
+    assert _advance_series_letter("AZ") == "BA"
+    assert _advance_series_letter("BZ") == "CA"
+    assert _advance_series_letter("ZZ") == "AAA"
+    assert _advance_series_letter("AAZ") == "ABA"
+
+
+def test_next_series_letter_advances_past_z_without_corruption():
+    """A doc with 27+ long values on one (prop, lang) advances past Z
+    safely. Verify the first 28 letters in sequence."""
+    from ingest_wikimedia.sdc import _next_series_letter
+
+    letters = {}
+    seen = [_next_series_letter(letters, "P10358", "en") for _ in range(28)]
+    # First 26 letters A through Z.
+    assert seen[:26] == [chr(ord("A") + i) for i in range(26)]
+    # 27th is AA (not "[").
+    assert seen[26] == "AA"
+    assert seen[27] == "AB"
+    # The persisted state matches the last value returned.
+    assert letters[("P10358", "en")] == "AB"
