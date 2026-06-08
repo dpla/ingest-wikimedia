@@ -322,7 +322,11 @@ def main(
                 # before the tmux session is even launched), so applying the
                 # rightsCategory / institution-upload-flag gates here would
                 # only cause confusing failures when those gates drift.
-                query = {"query": {"term": {"id": single_id}}, "size": 1}
+                # ``size: 2`` (not 1) so the defensive ``len(hits) != 1``
+                # check below is actually REACHABLE. With size=1 ES caps
+                # the response and the >1 defense never fires, which
+                # defeats its purpose against stale-replica duplicates.
+                query = {"query": {"term": {"id": single_id}}, "size": 2}
             else:
                 query = build_query(
                     provider_name, eligible_dp_names, collection, search_after
@@ -338,9 +342,10 @@ def main(
 
             if single_id is not None:
                 # Defense-in-depth against ES returning more than one hit
-                # (shouldn't with ``size: 1`` but stale-replica or
-                # reindex-cutover scenarios have surfaced duplicates in the
-                # past) and against ID normalization on the ES side (e.g. if
+                # (shouldn't with a properly unique ``id`` field but stale-
+                # replica or reindex-cutover scenarios have surfaced
+                # duplicates in the past — see the ``size: 2`` request
+                # above) and against ID normalization on the ES side (e.g. if
                 # the field analyser ever changed). Bail loudly rather than
                 # silently staging the wrong document — single-id mode skips
                 # the hub-eligibility filter, so we have no other guardrail.

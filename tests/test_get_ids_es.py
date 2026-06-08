@@ -200,6 +200,12 @@ def _invoke_single_id(single_id, hits):
         patch.object(get_ids_es, "post_es", return_value=fake_response) as post_es_mock,
         patch.object(get_ids_es, "check_es_response"),
         patch.object(get_ids_es, "stage_item_to_s3"),
+        # Phase 3 stages sdc.json via this helper — mock it explicitly,
+        # otherwise the real S3Client tries an actual write and the CI
+        # job exits 1 with "1 sdc.json writes failed" before any
+        # assertion runs (the failure mode CodeRabbit caught on the
+        # earlier push of this PR).
+        patch.object(get_ids_es, "stage_sdc_to_s3"),
         patch.object(get_ids_es.Banlist, "is_banned", return_value=False),
         patch.object(get_ids_es, "reconcile_subjects", return_value={}),
         patch.object(get_ids_es, "build_claims_for_doc", return_value={"claims": []}),
@@ -234,7 +240,10 @@ def test_single_id_builds_term_query_not_paginated_filter():
     # built by build_query (which would include rightsCategory /
     # eligible-dp-names filters that single-id is meant to bypass).
     sent_query = post_es_mock.call_args[0][0]
-    assert sent_query == {"query": {"term": {"id": fake_id}}, "size": 1}
+    # ``size: 2`` (not 1) so the in-process ``len(hits) != 1`` defense
+    # is actually reachable — see the matching comment in get_ids_es.py
+    # where the query is built.
+    assert sent_query == {"query": {"term": {"id": fake_id}}, "size": 2}
 
 
 def test_single_id_exits_nonzero_when_es_has_no_match():
