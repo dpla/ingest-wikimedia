@@ -1887,6 +1887,84 @@ def _submit_sdc_write(action, mediaid, dpla_id, **params):
         ) from e
 
 
+def _submit_per_item_edit(
+    mediaid,
+    dpla_id,
+    summary,
+    *,
+    new_claims=(),
+    reference_updates=(),
+    qualifier_updates=(),
+    removals=(),
+):
+    """Submit one ``wbeditentity`` per file with all per-file edits bundled.
+
+    The consolidated dispatcher behind the partner-mode and legacy file-
+    processing paths. Replaces the previous pattern of issuing several
+    separate API calls per file (separate ``wbeditentity`` for new
+    claims, ``wbeditentity`` for reference updates, ``wbsetqualifier``
+    per qualifier amend, ``wbremovequalifiers`` for stale-qualifier
+    cleanup, ``wbremoveclaims`` for reconciler removals) with one
+    atomic ``wbeditentity`` carrying every change.
+
+    Each fragment is a Wikibase claim-data dict; the kind is inferred
+    from its shape per ``data.claims[]`` semantics on `wbeditentity`:
+
+    * ``new_claims`` — full claim dicts with no ``id`` field. Wikibase
+      creates a fresh statement for each, assigning a new statement ID.
+    * ``reference_updates`` — claim dicts with ``id`` + ``references``.
+      Wikibase updates only the references of the named statement; the
+      mainsnak and qualifiers are left intact.
+    * ``qualifier_updates`` — claim dicts with ``id`` + ``qualifiers``.
+      Wikibase updates only the qualifiers of the named statement; the
+      mainsnak and references are left intact. Qualifier values are
+      provided as a wholesale set, so callers must merge new qualifier
+      snaks with the existing qualifier set (preserving snak hashes)
+      before passing them in — otherwise the existing qualifiers would
+      be erased.
+    * ``removals`` — claim dicts shaped ``{"id": ..., "remove": ""}``.
+      Wikibase deletes the named statement.
+
+    Atomicity: the entire bundle lands as a single revision on the
+    file's MediaInfo entity, or none of it does. There is no partial-
+    update window where new claims have been written but removals
+    haven't — the previous multi-POST pattern allowed exactly that
+    failure mode and could leak orphaned stale statements when an
+    intermediate POST failed.
+
+    The dispatcher tracker-counts ``new_claims`` under
+    ``SDC_CLAIMS_ADDED``, ``reference_updates`` under
+    ``SDC_REFS_ADDED``, and ``removals`` under ``SDC_REMOVALS``.
+    Qualifier-only amends are not separately counted (they ride along
+    on a claim that's already accounted for or on a legacy backfill).
+
+    No-op when every fragment list is empty.
+    """
+    all_fragments = (
+        list(new_claims)
+        + list(reference_updates)
+        + list(qualifier_updates)
+        + list(removals)
+    )
+    if not all_fragments:
+        return
+
+    _submit_sdc_write(
+        "wbeditentity",
+        mediaid,
+        dpla_id,
+        data=json.dumps({"claims": all_fragments}),
+        summary=summary,
+    )
+
+    if new_claims:
+        tracker.increment(Result.SDC_CLAIMS_ADDED, len(new_claims))
+    if reference_updates:
+        tracker.increment(Result.SDC_REFS_ADDED, len(reference_updates))
+    if removals:
+        tracker.increment(Result.SDC_REMOVALS, len(removals))
+
+
 def _post_new_refs(mediaid, dpla_id):
     """POST the accumulated ``refclaims["claims"]`` to ``wbeditentity``.
 
