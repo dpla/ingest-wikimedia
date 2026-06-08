@@ -40,28 +40,32 @@ consumed by the downloader and uploader:
 import datetime
 import json
 import logging
-import os
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import click
-import requests
 
 from ingest_wikimedia.banlist import Banlist
-from ingest_wikimedia.dpla import DPLA, INSTITUTIONS_URL
+from ingest_wikimedia.dpla import DPLA
 from ingest_wikimedia.partners import PARTNER_HUBS
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
-from ingest_wikimedia.s3 import APPLICATION_JSON, SDC_FILENAME, S3Client
+from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.sdc import (
-    normalize_rights_uri,
     build_claims_for_doc,
     collect_subject_queries,
+    fetch_institutions_v2,
+    fetch_subjects_json,
+    load_rights_json,
     reconcile_subjects,
 )
 from ingest_wikimedia.slack import notify_phase_start
-from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
+from ingest_wikimedia.staging import (
+    make_s3_stage_context,
+    stage_item_to_s3,
+    stage_sdc_to_s3,
+)
 
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
@@ -70,49 +74,12 @@ IIIF_MANIFEST_FIELD = "iiifManifest"
 MEDIA_MASTER_FIELD = "mediaMaster"
 IS_SHOWN_AT_FIELD = "isShownAt"
 
-# SDC pre-compute inputs. subjects.json is the DPLA-subject → Wikidata-Q-ID
-# map used to populate P921 alongside the string-form P4272. rights.json is
-# the small SDC-specific copyright mapping vendored in this repo.
-SUBJECTS_URL = (
-    "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
-    "src/main/resources/subjects.json"
-)
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 # isShownAt URL patterns from which a IIIF manifest can be formulaically
 # derived, expressed as ES wildcard values.  Extend this list as new DAMs
 # with predictable IIIF paths are identified.
 IIIF_DERIVABLE_ISSHOWNAT_PATTERNS = [
     "*/cdm/ref/collection/*/id/*",  # CONTENTdm
 ]
-
-
-def fetch_institutions_v2() -> dict:
-    """Fetch the full institutions_v2.json document used for hub/institution
-    eligibility and (in the SDC pre-compute pass) Wikidata-ID resolution."""
-    resp = requests.get(INSTITUTIONS_URL, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_subjects_json() -> dict:
-    """Fetch the DPLA-subject → Wikidata-ID map used to populate P921.
-
-    Sourced from dpla/ingestion3 alongside institutions_v2.json; fetched
-    fresh per run so upstream changes land in the next sync without a
-    redeploy.
-    """
-    resp = requests.get(SUBJECTS_URL, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def load_rights_json() -> dict:
-    """Load rights.json from the repo root and normalize its keys for
-    scheme-and-slash-insensitive lookup."""
-    with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
-        raw = json.load(f)
-    return {normalize_rights_uri(k): v for k, v in raw.items()}
 
 
 def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
@@ -146,20 +113,6 @@ def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
             eligible.append(inst_name)
 
     return eligible
-
-
-def stage_sdc_to_s3(
-    s3_client: S3Client, partner: str, dpla_id: str, sdc_payload: dict
-) -> None:
-    """Write the per-item sdc.json sidecar to the partner's item prefix.
-
-    Raises on failure so the caller's ThreadPoolExecutor can observe it
-    via future.exception() in the done callback (same pattern as
-    stage_item_to_s3).
-    """
-    s3_client.write_item_file(
-        partner, dpla_id, json.dumps(sdc_payload), SDC_FILENAME, APPLICATION_JSON
-    )
 
 
 def build_query(
