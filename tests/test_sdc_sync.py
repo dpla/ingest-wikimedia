@@ -2109,3 +2109,516 @@ def test_dpla_extra_qualifier_props_p7482_includes_new_url_quals():
     # against an accidental overwrite.
     assert "P973" in allowed
     assert "P137" in allowed
+
+
+# --------------------------------------------------------------------------
+# #40 — P304 (page-number) per-ordinal qualifier on P760 (DPLA ID).
+#
+# Multipage items have multiple Commons files. Files of the same extension
+# get numbered within their format series (3 JPGs → 1/2/3, 2 PDFs → 1/2).
+# A file that's the only one of its extension on the item gets no P304.
+# --------------------------------------------------------------------------
+
+
+def test_file_extension_lowercases_and_handles_dotless_titles():
+    from tools import sdc_sync
+
+    assert sdc_sync._file_extension("File:Foo - 1.jpg") == "jpg"
+    assert sdc_sync._file_extension("File:Foo.PDF") == "pdf"
+    assert sdc_sync._file_extension("File:Foo - 1 - bar.JPG") == "jpg"
+    assert sdc_sync._file_extension("noext") == ""
+    assert sdc_sync._file_extension("") == ""
+    assert sdc_sync._file_extension(None) == ""
+
+
+def test_compute_page_numbers_single_ordinal_returns_empty():
+    """One file → no P304 (not multipage)."""
+    from tools import sdc_sync
+
+    ordinals = [("1", {"title": "File:Solo.jpg"})]
+    assert sdc_sync._compute_page_numbers(ordinals) == {}
+
+
+def test_compute_page_numbers_multiple_jpgs_single_pdf_numbers_only_jpgs():
+    """3 JPGs + 1 PDF: only the JPGs get P304 (the PDF is alone in its
+    extension series). User-confirmed: 'we are only numbering within
+    each ordinal series — JPGs and PDFs are numbered separately'."""
+    from tools import sdc_sync
+
+    ordinals = [
+        ("1", {"title": "File:A.jpg"}),
+        ("2", {"title": "File:B.pdf"}),
+        ("3", {"title": "File:C.jpg"}),
+        ("4", {"title": "File:D.jpg"}),
+    ]
+    result = sdc_sync._compute_page_numbers(ordinals)
+    # JPGs (ordinals 1, 3, 4) get 1, 2, 3 in the order encountered.
+    assert result == {"1": 1, "3": 2, "4": 3}
+    # The single PDF gets no entry.
+    assert "2" not in result
+
+
+def test_compute_page_numbers_multiple_extensions_each_numbered_separately():
+    """3 JPGs + 2 PDFs: JPGs get 1/2/3, PDFs get 1/2."""
+    from tools import sdc_sync
+
+    ordinals = [
+        ("1", {"title": "File:A.jpg"}),
+        ("2", {"title": "File:B.pdf"}),
+        ("3", {"title": "File:C.jpg"}),
+        ("4", {"title": "File:D.pdf"}),
+        ("5", {"title": "File:E.jpg"}),
+    ]
+    result = sdc_sync._compute_page_numbers(ordinals)
+    assert result == {"1": 1, "3": 2, "5": 3, "2": 1, "4": 2}
+
+
+def test_compute_page_numbers_mixed_singletons_returns_empty():
+    """1 JPG + 1 PDF: neither file is part of a multipage series within
+    its own format. No P304 anywhere."""
+    from tools import sdc_sync
+
+    ordinals = [
+        ("1", {"title": "File:A.jpg"}),
+        ("2", {"title": "File:B.pdf"}),
+    ]
+    assert sdc_sync._compute_page_numbers(ordinals) == {}
+
+
+def test_amend_p760_page_qualifier_noop_when_page_number_is_none():
+    """``page_number=None`` (single-file extension group) means no P304;
+    helper must not POST anything."""
+    from tools import sdc_sync
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity") as mock_get,
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=None
+        )
+        mock_get.assert_not_called()
+    assert postqual_calls == []
+
+
+def test_amend_p760_page_qualifier_stamps_missing_p304_via_postqual():
+    """Existing DPLA-authored P760 with no P304 → postqual gets called
+    with the page-number value."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=2
+        )
+
+    assert len(postqual_calls) == 1
+    claimid, prop, value_json = postqual_calls[0]
+    assert claimid == "M999$p760id"
+    assert prop == "P304"
+    assert json.loads(value_json) == "2"
+
+
+def test_amend_p760_page_qualifier_idempotent_when_p304_already_matches():
+    """Existing DPLA-authored P760 already has the correct P304 value →
+    no POST. Re-running the same sync must be a no-op."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P304": _qual_string("P304", "2"),
+        },
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=2
+        )
+
+    assert postqual_calls == []
+
+
+def test_amend_p760_page_qualifier_skips_when_no_dpla_authored_p760():
+    """Only foreign / unsafe P760 statements on Commons → nothing to
+    amend; helper exits quietly."""
+    from tools import sdc_sync
+
+    foreign_p760 = {
+        "id": "M999$foreign",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {"P1001": _qual_string("P1001", "user-added")},
+        "references": [_foreign_reference()],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [foreign_p760]}}
+
+    postqual_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
+        ),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=1
+        )
+
+    assert postqual_calls == []
+
+
+def test_dpla_extra_qualifier_props_p760_includes_p304_and_p1545():
+    """``_DPLA_EXTRA_QUALIFIER_PROPS["P760"]`` must include P304 (per-
+    ordinal page number) and P1545 (chunk series ordinal) so
+    ``_is_safe_to_amend_in_place`` counts them as DPLA-owned."""
+    from tools import sdc_sync
+
+    allowed = sdc_sync._DPLA_EXTRA_QUALIFIER_PROPS["P760"]
+    assert "P304" in allowed
+    assert "P1545" in allowed
+
+
+# --------------------------------------------------------------------------
+# #39 — chunked-claim idempotency: _extract_p1545_value, check(),
+# _extract_comparable_value tuple shape.
+# --------------------------------------------------------------------------
+
+
+def test_extract_p1545_value_returns_none_when_absent():
+    from tools import sdc_sync
+
+    stmt = {"qualifiers": {"P459": _dpla_p459()}}
+    assert sdc_sync._extract_p1545_value(stmt) is None
+    # Also handles missing qualifiers key.
+    assert sdc_sync._extract_p1545_value({}) is None
+
+
+def test_extract_p1545_value_returns_string_when_present():
+    from tools import sdc_sync
+
+    stmt = {"qualifiers": {"P1545": _qual_string("P1545", "A2")}}
+    assert sdc_sync._extract_p1545_value(stmt) == "A2"
+
+
+def test_extract_p1545_value_skips_malformed_snaks():
+    """A P1545 qualifier missing 'datavalue' or whose snaktype isn't
+    'value' shouldn't crash — return None and move on."""
+    from tools import sdc_sync
+
+    stmt = {
+        "qualifiers": {
+            "P1545": [
+                {"snaktype": "novalue", "property": "P1545"},
+                # Then a well-formed one — still returns the well-formed value.
+                {
+                    "snaktype": "value",
+                    "property": "P1545",
+                    "datavalue": {"type": "string", "value": "B1"},
+                },
+            ]
+        }
+    }
+    assert sdc_sync._extract_p1545_value(stmt) == "B1"
+
+
+def test_extract_comparable_value_returns_tuple_for_string():
+    """String/monolingualtext comparable values are (value, p1545)
+    tuples so chunk-by-chunk matching can distinguish chunks of the
+    same logical value."""
+    from tools import sdc_sync
+
+    unchunked = {
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        }
+    }
+    assert sdc_sync._extract_comparable_value(unchunked) == ("abcdef", None)
+
+    chunked = {
+        "mainsnak": {
+            "property": "P217",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "chunk-1-text"},
+        },
+        "qualifiers": {"P1545": _qual_string("P1545", "A1")},
+    }
+    assert sdc_sync._extract_comparable_value(chunked) == ("chunk-1-text", "A1")
+
+
+def test_extract_comparable_value_returns_tuple_for_monolingualtext():
+    from tools import sdc_sync
+
+    claim = {
+        "mainsnak": {
+            "property": "P1476",
+            "snaktype": "value",
+            "datavalue": {
+                "type": "monolingualtext",
+                "value": {"text": "Hello", "language": "en"},
+            },
+        },
+        "qualifiers": {"P1545": _qual_string("P1545", "A2")},
+    }
+    assert sdc_sync._extract_comparable_value(claim) == ("Hello", "A2")
+
+
+def test_check_chunked_claim_matches_only_same_p1545():
+    """sdc.json claim with P1545="A1" must NOT match an existing Commons
+    statement with P1545="A2" — different chunks of the same logical
+    value are independent."""
+    from tools import sdc_sync
+
+    chunked_a1 = {
+        "id": "M999$chunkA1",
+        "mainsnak": {
+            "property": "P1476",
+            "snaktype": "value",
+            "datavalue": {
+                "type": "monolingualtext",
+                "value": {"text": "shared chunk text", "language": "en"},
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459(), "P1545": _qual_string("P1545", "A1")},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P1476": [chunked_a1]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        # Looking for A1 — should find the existing A1 (no add).
+        result_a1 = sdc_sync.check(
+            "M999", ("monolingualtext", ("shared chunk text", "A1")), "P1476"
+        )
+        # Looking for A2 — same text but different chunk; should add new.
+        result_a2 = sdc_sync.check(
+            "M999", ("monolingualtext", ("shared chunk text", "A2")), "P1476"
+        )
+
+    assert result_a1[0] is False  # don't duplicate the matching A1
+    assert result_a2[0] is True  # A2 is a distinct chunk — add it
+
+
+def test_check_chunked_claim_does_not_match_unchunked_legacy_statement():
+    """A pre-chunking Commons statement (no P1545) is NOT the same logical
+    claim as a new chunked statement, even with matching text. The
+    reconciler will remove the legacy one; check() must let the new one
+    through."""
+    from tools import sdc_sync
+
+    legacy_stmt = {
+        "id": "M999$legacy",
+        "mainsnak": {
+            "property": "P1476",
+            "snaktype": "value",
+            "datavalue": {
+                "type": "monolingualtext",
+                "value": {"text": "value", "language": "en"},
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P1476": [legacy_stmt]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        result = sdc_sync.check("M999", ("monolingualtext", ("value", "A1")), "P1476")
+
+    # The chunked sdc.json claim must be added — it's not equivalent to
+    # the pre-chunking statement.
+    assert result[0] is True
+
+
+def test_check_legacy_string_qid_still_accepted():
+    """Backwards compat: legacy callers (dpla_claims path) still pass
+    plain-string qids without P1545. check() must accept that shape
+    and treat it as p1545=None."""
+    from tools import sdc_sync
+
+    legacy_stmt = {
+        "id": "M999$legacy",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abc"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [legacy_stmt]}}
+
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        # qid[1] is a raw string (not tuple) — legacy shape.
+        result = sdc_sync.check("M999", ("string", "abc"), "P760")
+
+    # Existing matches with no P1545, qid implicitly p1545=None → no
+    # duplicate add.
+    assert result[0] is False
+
+
+def test_dpla_extra_qualifier_props_chunkable_have_p1545():
+    """Every chunkable property must include P1545 in its allowed
+    qualifier set; otherwise ``_is_safe_to_amend_in_place`` would treat
+    DPLA's own chunked claims as foreign. The dict is populated from
+    ``CHUNKABLE_PROPS`` so adding a new chunkable property in sdc.py
+    automatically widens this allowed-qualifier set."""
+    from ingest_wikimedia.sdc import CHUNKABLE_PROPS
+    from tools import sdc_sync
+
+    for prop in CHUNKABLE_PROPS:
+        allowed = sdc_sync._DPLA_EXTRA_QUALIFIER_PROPS[prop]
+        assert "P1545" in allowed, f"{prop} allowed set missing P1545: {allowed}"
+
+
+def test_chunked_claim_roundtrip_extract_comparable_value_preserves_chunk_identity():
+    """End-to-end: build a long monolingualtext value via
+    ``build_claims_for_doc``, then extract comparable tuples for each
+    resulting chunk claim via ``_extract_comparable_value``. The
+    tuples must be distinct per chunk (text or P1545 differs), and
+    the P1545 series ordinal must follow A1/A2/A3 in order. Without
+    this end-to-end coverage, the sdc.py and sdc_sync.py halves could
+    drift on the chunk-key contract."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import build_claims_for_doc
+    from tools import sdc_sync
+
+    long_desc = "a" * 1500 + " " + "b" * 1500 + " " + "c" * 800
+    doc = {
+        "id": "abc1234567890",
+        "provider": {"name": "Digital Commonwealth"},
+        "dataProvider": {"name": "Boston Public Library"},
+        "sourceResource": {
+            "title": ["A title"],
+            "description": [long_desc],
+        },
+        "isShownAt": "https://example.org/item/abc",
+        "rights": "http://rightsstatements.org/vocab/InC/1.0/",
+    }
+    hubs = {
+        "Digital Commonwealth": {
+            "Wikidata": "Q1",
+            "institutions": {"Boston Public Library": {"Wikidata": "Q2"}},
+        }
+    }
+    out = build_claims_for_doc(
+        doc, "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 1)
+    )
+    assert out is not None, "doc should be parseable; check fixture shape"
+    desc_claims = [c for c in out["claims"] if c["mainsnak"]["property"] == "P10358"]
+    assert len(desc_claims) == 3, (
+        f"expected 3 chunks for {len(long_desc)}-char description, "
+        f"got {len(desc_claims)}"
+    )
+    comparable_tuples = [sdc_sync._extract_comparable_value(c) for c in desc_claims]
+    # All distinct.
+    assert len(set(comparable_tuples)) == 3
+    # P1545 ordinals follow A1/A2/A3.
+    assert [t[1] for t in comparable_tuples] == ["A1", "A2", "A3"]
+
+
+def test_amend_p760_page_qualifier_does_not_re_invalidate_when_p304_matches():
+    """When the existing P760 already has the expected P304, the helper
+    must skip both postqual AND the terminal invalidate_entity — at
+    millions of items, the spared cache drop is real. Mirrors the
+    conditional-invalidate pattern in ``_amend_p7482_url_qualifiers``."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P304": _qual_string("P304", "2"),
+        },
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    invalidate_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(
+            sdc_sync,
+            "invalidate_entity",
+            side_effect=lambda *a: invalidate_calls.append(a),
+        ),
+        patch.object(sdc_sync, "postqual"),
+    ):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999", "abcdef", {"claims": []}, page_number=2
+        )
+
+    # Idempotent path: no invalidate, no postqual. (The pre-PR version
+    # always invalidated at the end; the cleanup keeps it conditional.)
+    assert invalidate_calls == []
+
+
+def test_qualifier_values_returns_empty_when_no_qualifiers():
+    """Module-level helper safety — passes the smoke-test cases that
+    callers used to inline in each amend helper."""
+    from tools import sdc_sync
+
+    assert sdc_sync._qualifier_values({}, "P304") == []
+    assert sdc_sync._qualifier_values({"qualifiers": {}}, "P304") == []
+    # Skip malformed snaks rather than crash.
+    stmt = {
+        "qualifiers": {
+            "P304": [
+                {"snaktype": "novalue", "property": "P304"},
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "2"},
+                },
+            ]
+        }
+    }
+    assert sdc_sync._qualifier_values(stmt, "P304") == ["2"]
+    assert sdc_sync._first_qualifier_value(stmt, "P304") == "2"
+    assert sdc_sync._first_qualifier_value(stmt, "P999") is None

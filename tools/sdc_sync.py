@@ -15,7 +15,11 @@ import tomllib
 import urllib.parse
 from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
-from ingest_wikimedia.sdc import parse_dpla_date, parse_nara_access_level
+from ingest_wikimedia.sdc import (
+    CHUNKABLE_PROPS,
+    parse_dpla_date,
+    parse_nara_access_level,
+)
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
@@ -457,13 +461,27 @@ def invalidate_entity(mediaid):
 #                                  P6108 (IIIF manifest URL — per-item;
 #                                  emitted by build_claims_for_doc when
 #                                  the source carries iiifManifest)
+# Every chunked claim (one whose mainsnak value was split across multiple
+# statements by sdc.py) carries a P1545 (series ordinal) qualifier so the
+# Lua template on Commons can reassemble the chunks. P1545 is therefore a
+# DPLA-authored qualifier on every chunkable property and must be in the
+# safe-to-amend allowed set. ``CHUNKABLE_PROPS`` is the single source of
+# truth (imported from ingest_wikimedia.sdc); the dict below is built from
+# it so adding a new chunkable property in sdc.py automatically widens the
+# allowed-qualifier set here.
 _DPLA_EXTRA_QUALIFIER_PROPS = {
     "P170": {"P2093"},
     "P571": {"P1932", "P1480"},
     "P9126": {"P3831"},
     "P217": {"P195"},
     "P7482": {"P973", "P137", "P2699", "P6108"},
+    # P304 is the per-ordinal page-number qualifier on P760, materialized at
+    # write time from upload-result.json by sdc-sync (multipage items only,
+    # grouped per file extension).
+    "P760": {"P304"},
 }
+for _chunkable_prop in CHUNKABLE_PROPS:
+    _DPLA_EXTRA_QUALIFIER_PROPS.setdefault(_chunkable_prop, set()).add("P1545")
 
 
 def _allowed_qualifier_props(prop):
@@ -523,6 +541,51 @@ def _is_safe_to_amend_in_place(statement, prop):
         if not _is_dpla_reference(reference):
             return False
     return True
+
+
+def _qualifier_values(statement, prop):
+    """Return the list of value-typed qualifier values for ``prop`` on
+    ``statement``, skipping any snak that isn't well-formed (snaktype
+    other than ``"value"``, missing or non-dict ``datavalue``, missing
+    ``"value"`` key).
+
+    Module-level helper so check(), _amend_p7482_url_qualifiers,
+    _amend_p760_page_qualifier, and _extract_p1545_value all read
+    qualifiers through one safe extraction path. Returning a list keeps
+    callers flexible: ``[0]`` for first-match, ``in expected`` for
+    presence, ``== [target]`` for exact-match.
+    """
+    out = []
+    for q in (statement.get("qualifiers") or {}).get(prop, []) or []:
+        if q.get("snaktype") != "value":
+            continue
+        dv = q.get("datavalue")
+        if isinstance(dv, dict) and "value" in dv:
+            out.append(dv["value"])
+    return out
+
+
+def _first_qualifier_value(statement, prop):
+    """Return the first well-formed value-typed qualifier value for
+    ``prop`` on ``statement``, or ``None`` when no such qualifier
+    exists."""
+    values = _qualifier_values(statement, prop)
+    return values[0] if values else None
+
+
+def _extract_p1545_value(statement):
+    """Return the first P1545 (series ordinal) qualifier value on
+    ``statement``, or ``None`` when no P1545 qualifier is present.
+
+    P1545 marks chunked claims emitted by
+    :func:`ingest_wikimedia.sdc._chunk_and_emit_claims`. Chunked-claim
+    matching is chunk-by-chunk: a sdc.json claim with P1545="A1" only
+    matches an existing Commons claim with the same mainsnak value AND
+    the same P1545="A1" — distinct chunks (A1 vs A2) and chunked-vs-
+    unchunked variants of the same text are kept separate so the Lua
+    template can reassemble each series independently.
+    """
+    return _first_qualifier_value(statement, "P1545")
 
 
 def check(mediaid, qid, prop):
@@ -593,67 +656,93 @@ def check(mediaid, qid, prop):
 
         return True, ref
     if qid[0] == "string":
+        # qid[1] is (value, p1545) from _extract_comparable_value on the new
+        # sdc.json path. Legacy callers (dpla_claims) still pass the raw
+        # string — accept that shape too by wrapping to the tuple form with
+        # p1545=None, which correctly preserves their pre-chunking behavior
+        # (those code paths never produce chunked claims).
+        target_value, target_p1545 = (
+            qid[1] if isinstance(qid[1], tuple) else (qid[1], None)
+        )
         for statement in statements:
             if (
-                statement["mainsnak"]["datavalue"]["value"] == qid[1]
+                statement["mainsnak"]["datavalue"]["value"] == target_value
+                and _extract_p1545_value(statement) == target_p1545
                 and not statement.get("references")
                 and _is_safe_to_amend_in_place(statement, prop)
             ):
                 ref = statement["id"]
                 break
-        for statement in statements:
-            if statement["mainsnak"]["datavalue"]["value"] == qid[
-                1
-            ] and not statement.get("qualifiers"):
-                return add_det(mediaid, statement["id"]), ref
+        # The bare-add-det branch (stamp P459 onto an existing qualifier-less
+        # statement) is meaningful only for unchunked values — a chunked
+        # sdc.json claim shouldn't graft itself onto a pre-existing bare
+        # statement, since they represent different chunks of different
+        # series. Restrict the branch to target_p1545 is None.
+        if target_p1545 is None:
+            for statement in statements:
+                if statement["mainsnak"]["datavalue"][
+                    "value"
+                ] == target_value and not statement.get("qualifiers"):
+                    return add_det(mediaid, statement["id"]), ref
 
         if any(
-            statement["mainsnak"]["datavalue"]["value"] == qid[1]
+            statement["mainsnak"]["datavalue"]["value"] == target_value
+            and _extract_p1545_value(statement) == target_p1545
             and _is_safe_to_amend_in_place(statement, prop)
             for statement in statements
         ):
             print(
-                f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+                f" -- There already exists a DPLA-authored statement with a {prop} > {target_value} claim for {mediaid}."
             )
             return False, ref
 
         if any(
-            statement["mainsnak"]["datavalue"]["value"] == qid[1]
+            statement["mainsnak"]["datavalue"]["value"] == target_value
+            and _extract_p1545_value(statement) == target_p1545
             for statement in statements
         ):
             print(
-                f" -- A foreign {prop} > {qid[1]} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
+                f" -- A foreign {prop} > {target_value} statement exists for {mediaid}; adding the DPLA-authored statement alongside."
             )
             return True, ""
 
         return True, ref
     if qid[0] == "monolingualtext":
+        # qid[1] is (text, p1545); legacy callers still pass raw text — same
+        # backwards-compat shim as the string branch above.
+        target_value, target_p1545 = (
+            qid[1] if isinstance(qid[1], tuple) else (qid[1], None)
+        )
         for statement in statements:
             if (
-                statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
+                statement["mainsnak"]["datavalue"]["value"]["text"] == target_value
+                and _extract_p1545_value(statement) == target_p1545
                 and not statement.get("references")
                 and _is_safe_to_amend_in_place(statement, prop)
             ):
                 ref = statement["id"]
                 break
-        for statement in statements:
-            if statement["mainsnak"]["datavalue"]["value"]["text"] == qid[
-                1
-            ] and not statement.get("qualifiers"):
-                return add_det(mediaid, statement["id"]), ref
+        if target_p1545 is None:
+            for statement in statements:
+                if statement["mainsnak"]["datavalue"]["value"][
+                    "text"
+                ] == target_value and not statement.get("qualifiers"):
+                    return add_det(mediaid, statement["id"]), ref
 
         if any(
-            statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
+            statement["mainsnak"]["datavalue"]["value"]["text"] == target_value
+            and _extract_p1545_value(statement) == target_p1545
             and _is_safe_to_amend_in_place(statement, prop)
             for statement in statements
         ):
             print(
-                f" -- There already exists a DPLA-authored statement with a {prop} > {qid[1]} claim for {mediaid}."
+                f" -- There already exists a DPLA-authored statement with a {prop} > {target_value} claim for {mediaid}."
             )
             return False, ref
 
         if any(
-            statement["mainsnak"]["datavalue"]["value"]["text"] == qid[1]
+            statement["mainsnak"]["datavalue"]["value"]["text"] == target_value
+            and _extract_p1545_value(statement) == target_p1545
             for statement in statements
         ):
             print(
@@ -1365,16 +1454,8 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
     if sdc_p7482 is None:
         return
 
-    def _first_qual_value(claim, prop):
-        for q in claim.get("qualifiers", {}).get(prop, []) or []:
-            if q.get("snaktype") == "value":
-                dv = q.get("datavalue") or {}
-                if "value" in dv:
-                    return dv["value"]
-        return None
-
-    expected_p973 = _first_qual_value(sdc_p7482, "P973")
-    expected_p6108 = _first_qual_value(sdc_p7482, "P6108")
+    expected_p973 = _first_qualifier_value(sdc_p7482, "P973")
+    expected_p6108 = _first_qualifier_value(sdc_p7482, "P6108")
 
     # _post_new_refs / _post_new_claims (called just before this helper)
     # don't invalidate the entity cache after writing — same shape as
@@ -1391,7 +1472,7 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
     for stmt in existing_p7482:
         if not _is_safe_to_amend_in_place(stmt, "P7482"):
             continue
-        if _first_qual_value(stmt, "P973") == expected_p973:
+        if _first_qualifier_value(stmt, "P973") == expected_p973:
             target_stmt = stmt
             break
     if target_stmt is None:
@@ -1401,19 +1482,8 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
         return
 
     claimid = target_stmt["id"]
-
-    def _qual_values(stmt, prop):
-        out = []
-        for q in stmt.get("qualifiers", {}).get(prop, []) or []:
-            if q.get("snaktype") != "value":
-                continue
-            dv = q.get("datavalue")
-            if isinstance(dv, dict) and "value" in dv:
-                out.append(dv["value"])
-        return out
-
-    existing_p2699_values = _qual_values(target_stmt, "P2699")
-    existing_p6108_values = _qual_values(target_stmt, "P6108")
+    existing_p2699_values = _qualifier_values(target_stmt, "P2699")
+    existing_p6108_values = _qualifier_values(target_stmt, "P6108")
 
     amended = False
     if download_url and download_url not in existing_p2699_values:
@@ -1429,6 +1499,113 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
         # immediately below the caller) reads the freshly-amended state
         # — same invariant ``add_det`` maintains for P459.
         invalidate_entity(mediaid)
+
+
+def _file_extension(title):
+    """Return the lowercased extension of a Commons file title, or ``""``
+    when no extension is present.
+
+    Uploader-produced titles look like ``File:Some Image - 1.jpg``; we want
+    ``"jpg"`` so ordinals can be grouped per-format for P304 numbering.
+    """
+    # Check the separator (not the third element): rpartition returns the
+    # entire string as the third element when "." is absent, which would
+    # otherwise misclassify a dotless title as having an extension equal
+    # to the title itself.
+    _, sep, ext = (title or "").rpartition(".")
+    return ext.lower() if sep else ""
+
+
+def _compute_page_numbers(ordinal_items):
+    """Compute per-ordinal P304 (page-number) values for a multipage item,
+    grouped per file extension.
+
+    ``ordinal_items`` is the ``[(ord_str, data), ...]`` list of eligible
+    ordinals for the item, sorted by ordinal. Returns a mapping
+    ``ord_str → page_number`` populated only for ordinals belonging to a
+    multi-file extension group. Ordinals in single-file groups are
+    omitted — that file isn't part of a multipage series within its own
+    format.
+
+    Example: an item with 3 JPGs and 2 PDFs returns
+    ``{jpg_ord_1: 1, jpg_ord_2: 2, jpg_ord_3: 3, pdf_ord_1: 1, pdf_ord_2: 2}``.
+    An item with one JPG and one PDF returns ``{}`` — neither file is part
+    of a multipage series within its own format.
+
+    Page numbers reset per extension group so an item's JPGs are numbered
+    1, 2, 3 independently of its PDFs (per the user-confirmed rule:
+    "we are only numbering within each ordinal series — JPGs and PDFs are
+    numbered separately").
+
+    Assumes ``ordinal_items`` is already sorted by integer ordinal — the
+    caller in ``_run_partner_mode`` sorts before calling — so iteration
+    order produces the expected per-extension sequence (the first JPG by
+    ordinal gets P304=1, the second gets P304=2, etc.).
+    """
+    ext_groups = {}
+    for ord_str, data in ordinal_items:
+        ext = _file_extension(data.get("title") or "")
+        ext_groups.setdefault(ext, []).append(ord_str)
+    page_numbers = {}
+    for ord_strs in ext_groups.values():
+        if len(ord_strs) <= 1:
+            continue
+        for idx, ord_str in enumerate(ord_strs, start=1):
+            page_numbers[ord_str] = idx
+    return page_numbers
+
+
+def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
+    """Stamp a missing ``P304`` (page-number) qualifier onto an existing
+    DPLA-authored ``P760`` (DPLA ID) statement on Commons.
+
+    Mirror of :func:`_amend_p7482_url_qualifiers` for P304. Every file
+    uploaded before this code shipped has a P760 with only its DPLA
+    publisher reference and P459 qualifier; without this pass, the
+    normal ``check()`` path finds the existing P760, returns False
+    ("don't add a duplicate"), and P304 never lands.
+
+    Matching is by mainsnak value (the DPLA ID itself). One P760 per
+    MediaInfo entity carries that DPLA ID, so the match is unambiguous.
+
+    A no-op when ``page_number`` is ``None`` (the ordinal isn't part of a
+    multi-file extension group), when no DPLA-authored P760 exists yet,
+    or when P304 already matches the expected value.
+    """
+    if page_number is None:
+        return
+
+    # No leading invalidate_entity: ``_amend_p7482_url_qualifiers`` runs
+    # immediately before this helper in process_one_from_sdc and either
+    # left the cache valid (it didn't write) or invalidated it (it did),
+    # so get_entity here returns fresh state in both cases. Saves a
+    # wbgetentities round-trip per ordinal at scale.
+    entity = get_entity(mediaid)
+    existing_p760 = (entity.get("statements") or {}).get("P760") or []
+
+    target_stmt = None
+    for stmt in existing_p760:
+        if not _is_safe_to_amend_in_place(stmt, "P760"):
+            continue
+        try:
+            mainsnak_value = stmt["mainsnak"]["datavalue"]["value"]
+        except (KeyError, TypeError):
+            continue
+        if mainsnak_value == dpla_id:
+            target_stmt = stmt
+            break
+    if target_stmt is None:
+        return
+
+    expected_value = str(page_number)
+    if expected_value in _qualifier_values(target_stmt, "P304"):
+        # Already matches; skip the postqual and the cache invalidation.
+        # Matches the conditional-invalidate pattern in
+        # ``_amend_p7482_url_qualifiers``.
+        return
+
+    postqual(target_stmt["id"], "P304", json.dumps(expected_value))
+    invalidate_entity(mediaid)
 
 
 def add_ref(claimid, claim):
@@ -1572,9 +1749,12 @@ def _extract_comparable_value(claim):
         v = datavalue["value"]
         return v.get("id") or f"Q{v['numeric-id']}"
     if dtype == "string":
-        return datavalue["value"]
+        # Tuple shape so chunk-by-chunk matching can distinguish chunks of
+        # the same logical value (A1 vs A2) and chunked-vs-unchunked
+        # variants of the same text. ``p1545`` is None for unchunked claims.
+        return (datavalue["value"], _extract_p1545_value(claim))
     if dtype == "monolingualtext":
-        return datavalue["value"]["text"]
+        return (datavalue["value"]["text"], _extract_p1545_value(claim))
     if dtype == "time":
         try:
             return _time_claim_comparable(claim)
@@ -1916,13 +2096,21 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
                                     }
                                 )
                             elif dtype == "string":
+                                # Tuple key — mirrors _extract_comparable_value
+                                # so the reconciler diffs the chunk identity
+                                # (text + P1545) rather than just the text.
+                                # Without this, a chunked statement on Commons
+                                # whose chunk text appears in expected[prop]
+                                # but at a different P1545 ordinal would
+                                # incorrectly survive reconciliation.
                                 dpla_claim_list.append(
                                     {
                                         stmt["mainsnak"]["property"]: {
                                             "id": stmt["id"],
-                                            "value": stmt["mainsnak"]["datavalue"][
-                                                "value"
-                                            ],
+                                            "value": (
+                                                stmt["mainsnak"]["datavalue"]["value"],
+                                                _extract_p1545_value(stmt),
+                                            ),
                                         }
                                     }
                                 )
@@ -1931,9 +2119,12 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected):
                                     {
                                         stmt["mainsnak"]["property"]: {
                                             "id": stmt["id"],
-                                            "value": stmt["mainsnak"]["datavalue"][
-                                                "value"
-                                            ]["text"],
+                                            "value": (
+                                                stmt["mainsnak"]["datavalue"]["value"][
+                                                    "text"
+                                                ],
+                                                _extract_p1545_value(stmt),
+                                            ),
                                         }
                                     }
                                 )
@@ -2364,7 +2555,9 @@ def process_one(mediaid, dpla_id):
         return
 
 
-def process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url=None):
+def process_one_from_sdc(
+    mediaid, dpla_id, sdc_payload, download_url=None, page_number=None
+):
     """Sync SDC for a single Commons file against a precomputed claim list.
 
     Reads the claim envelope produced by `build_claims_for_doc` and staged
@@ -2388,6 +2581,15 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url=None):
     than baked into the per-item sdc.json. For existing P7482
     statements on Commons that lack P2699, ``_amend_p7482_url_qualifiers``
     POSTs the missing qualifier via wbsetqualifier (idempotent).
+
+    ``page_number`` is the per-ordinal P304 (page-number) value computed
+    by :func:`_compute_page_numbers` from upload-result.json's per-file
+    extension grouping. Supplied only for files that are part of a
+    multi-file extension group on a multipage item; ``None`` for
+    single-file ordinals. When supplied, the P760 (DPLA ID) claim
+    receives a P304 qualifier with the page number; the legacy-state
+    backfill ``_amend_p760_page_qualifier`` handles existing P760
+    statements that lack it.
     """
     global claims, refclaims
 
@@ -2423,6 +2625,19 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url=None):
                     "property": "P2699",
                     "datavalue": {"value": download_url, "type": "string"},
                     "datatype": "url",
+                }
+            ]
+
+        # Per-ordinal P304 (page-number) qualifier on the P760 (DPLA ID)
+        # claim — same per-ordinal rationale as P2699 above. Only stamped
+        # for files that are part of a multi-file extension group on a
+        # multipage item; ``page_number`` is ``None`` otherwise.
+        if prop == "P760" and page_number is not None:
+            claim.setdefault("qualifiers", {})["P304"] = [
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"value": str(page_number), "type": "string"},
                 }
             ]
 
@@ -2462,6 +2677,11 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url=None):
     # by design: a qualifier whose value already matches what sdc.json (+
     # per-ordinal download_url) says is silently skipped.
     _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url)
+
+    # Backfill the per-ordinal P304 (page-number) qualifier onto any
+    # pre-existing DPLA-authored P760 statement that lacks it. Same
+    # legacy-state rationale as ``_amend_p7482_url_qualifiers`` above.
+    _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number)
 
     expected = _build_expected_from_sdc(sdc_payload)
     _reconcile_existing_claims(mediaid, dpla_id, expected)
@@ -2619,6 +2839,15 @@ def _run_partner_mode(partner, ids_file):
                 )
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
                 continue
+
+            # Compute per-ordinal P304 (page-number) values for any
+            # multi-file extension group. Single-file groups (one JPG,
+            # one PDF, etc.) are absent from the map — `page_numbers.get(
+            # ord_str)` returns None for them and process_one_from_sdc
+            # skips the qualifier. JPGs and PDFs are numbered as
+            # independent series per the user-confirmed rule.
+            page_numbers = _compute_page_numbers(ordinal_items)
+
             for ord_str, data in ordinal_items:
                 pageid = data.get("pageid")
                 # `if not pageid` rather than `is None` — a recorded
@@ -2679,7 +2908,11 @@ def _run_partner_mode(partner, ids_file):
                         download_url = None
                 try:
                     process_one_from_sdc(
-                        mediaid, dpla_id, sdc_payload, download_url=download_url
+                        mediaid,
+                        dpla_id,
+                        sdc_payload,
+                        download_url=download_url,
+                        page_number=page_numbers.get(ord_str),
                     )
                 except _MissingEntityError:
                     # Commons says the MediaInfo entity at this M-id doesn't
