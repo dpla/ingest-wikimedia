@@ -450,13 +450,19 @@ def invalidate_entity(mediaid):
 #                                  decorator)
 #   * add_contributed (P9126)   — P3831 (object has role)
 #   * add_local_id (P217)       — P195 (collection)
-#   * add_source (P7482)        — P973 (described at URL), P137 (operator)
+#   * add_source (P7482)        — P973 (described at URL), P137 (operator),
+#                                  P2699 (direct file download URL — per-
+#                                  ordinal; materialized by sdc-sync from
+#                                  file-list.txt at write time),
+#                                  P6108 (IIIF manifest URL — per-item;
+#                                  emitted by build_claims_for_doc when
+#                                  the source carries iiifManifest)
 _DPLA_EXTRA_QUALIFIER_PROPS = {
     "P170": {"P2093"},
     "P571": {"P1932", "P1480"},
     "P9126": {"P3831"},
     "P217": {"P195"},
-    "P7482": {"P973", "P137"},
+    "P7482": {"P973", "P137", "P2699", "P6108"},
 }
 
 
@@ -1285,6 +1291,130 @@ def add_det(mediaid, claimid):
         # to an existing claim). Drop the cached snapshot so any subsequent
         # check() call for the same mediaid in this run reads the fresh
         # post-write state instead of repeating the qualifier write.
+        invalidate_entity(mediaid)
+
+
+def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
+    """For an EXISTING DPLA-authored P7482 statement on Commons, stamp
+    any missing ``P2699`` (download URL) or ``P6108`` (IIIF manifest URL)
+    qualifier via wbsetqualifier.
+
+    Why this exists: every file uploaded before this code shipped has a
+    P7482 with only P973 / P137 / P459 qualifiers. The normal ``check()``
+    path for source claims finds the existing statement, returns False
+    ("don't add a duplicate"), and never gets a chance to add the new
+    qualifiers. This function fills that gap — it's the same shape as
+    :func:`add_det` (which stamps P459 onto bare claims), generalized to
+    two new qualifier properties.
+
+    Match-and-amend logic, in order:
+
+      1. Look for a P7482 statement on Commons whose P973 qualifier
+         matches the sdc.json's P973 (the partner catalog URL — uniquely
+         identifies "our" P7482 vs. a community editor's).
+      2. Confirm it's safe to amend in place (``_is_safe_to_amend_in_place``
+         — every qualifier on the statement is one DPLA writes, every
+         reference carries the DPLA publisher marker).
+      3. For each of P2699 (when ``download_url`` is supplied) and
+         P6108 (when the sdc.json carries one), check if a qualifier
+         with the matching value is already present. Skip if yes; POST
+         wbsetqualifier if not.
+
+    Idempotent: re-running the same call against the same Commons state
+    sends zero requests once both qualifiers are present.
+
+    Best-effort: a postqual that fails just logs (postqual's own error
+    handler) and continues — the reconciler doesn't depend on this pass
+    succeeding, and the next sync attempt will retry the missing
+    qualifier.
+
+    Limitations:
+      * P973 match is exact-string. Real-world catalog URLs drift
+        (http → https, trailing slash, percent-encoding). If a legacy
+        Commons P7482's P973 doesn't byte-match the new sdc.json's
+        P973, ``check()`` will also miss (same exact-match comparison)
+        and add a SECOND P7482 alongside the legacy one. Worth a
+        normalization helper here and in ``check()`` someday;
+        consciously out of scope for this PR.
+      * The in-memory P2699 augmentation in ``process_one_from_sdc``
+        only takes effect when ``check()`` decides to ADD a new
+        P7482 statement (the new-upload path). For the much more
+        common existing-statement case, this helper is the path
+        that lands P2699/P6108 onto Commons.
+    """
+    # Find sdc.json's P7482 claim to learn the expected catalog URL +
+    # IIIF manifest URL (if any). sdc.json has at most one P7482 entry.
+    sdc_p7482 = next(
+        (
+            c
+            for c in sdc_payload.get("claims", [])
+            if c["mainsnak"]["property"] == "P7482"
+        ),
+        None,
+    )
+    if sdc_p7482 is None:
+        return
+
+    def _first_qual_value(claim, prop):
+        for q in claim.get("qualifiers", {}).get(prop, []) or []:
+            if q.get("snaktype") == "value":
+                dv = q.get("datavalue") or {}
+                if "value" in dv:
+                    return dv["value"]
+        return None
+
+    expected_p973 = _first_qual_value(sdc_p7482, "P973")
+    expected_p6108 = _first_qual_value(sdc_p7482, "P6108")
+
+    # _post_new_refs / _post_new_claims (called just before this helper)
+    # don't invalidate the entity cache after writing — same shape as
+    # the pre-existing invalidate-before-reconcile pattern elsewhere
+    # in this file. Drop the cached snapshot so we read the
+    # post-write state and don't see a phantom-absent P7482 when one
+    # was just created.
+    invalidate_entity(mediaid)
+    entity = get_entity(mediaid)
+    existing_p7482 = (entity.get("statements") or {}).get("P7482") or []
+
+    # Find the DPLA-authored statement whose P973 matches our expectation.
+    target_stmt = None
+    for stmt in existing_p7482:
+        if not _is_safe_to_amend_in_place(stmt, "P7482"):
+            continue
+        if _first_qual_value(stmt, "P973") == expected_p973:
+            target_stmt = stmt
+            break
+    if target_stmt is None:
+        # No existing match — either no P7482 yet (``_post_new_claims``
+        # already handled it), or only foreign / unsafe-to-amend
+        # statements exist. Either way, nothing to backfill.
+        return
+
+    claimid = target_stmt["id"]
+    existing_p2699_values = [
+        q["datavalue"]["value"]
+        for q in (target_stmt.get("qualifiers", {}).get("P2699") or [])
+        if q.get("snaktype") == "value" and q.get("datavalue")
+    ]
+    existing_p6108_values = [
+        q["datavalue"]["value"]
+        for q in (target_stmt.get("qualifiers", {}).get("P6108") or [])
+        if q.get("snaktype") == "value" and q.get("datavalue")
+    ]
+
+    amended = False
+    if download_url and download_url not in existing_p2699_values:
+        postqual(claimid, "P2699", json.dumps(download_url))
+        amended = True
+    if expected_p6108 and expected_p6108 not in existing_p6108_values:
+        postqual(claimid, "P6108", json.dumps(expected_p6108))
+        amended = True
+
+    if amended:
+        # Drop the cached snapshot so any subsequent code in this
+        # process_one_from_sdc cycle (notably ``_reconcile_existing_claims``
+        # immediately below the caller) reads the freshly-amended state
+        # — same invariant ``add_det`` maintains for P459.
         invalidate_entity(mediaid)
 
 
@@ -2221,7 +2351,7 @@ def process_one(mediaid, dpla_id):
         return
 
 
-def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
+def process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url=None):
     """Sync SDC for a single Commons file against a precomputed claim list.
 
     Reads the claim envelope produced by `build_claims_for_doc` and staged
@@ -2236,6 +2366,15 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
     walk. Reuses the existing `check()` per-property matcher, the shared
     `_post_new_refs`/`_post_new_claims` POST helpers, and the shared
     `_reconcile_existing_claims` removal logic.
+
+    ``download_url`` is the per-ordinal direct file URL (from
+    file-list.txt). When supplied, the P7482 (described at) claim gets
+    a P2699 (URL) qualifier with that value before being posted —
+    different ordinals of the same DPLA item have different download
+    URLs, so the qualifier must be materialized per-call here rather
+    than baked into the per-item sdc.json. For existing P7482
+    statements on Commons that lack P2699, ``_amend_p7482_url_qualifiers``
+    POSTs the missing qualifier via wbsetqualifier (idempotent).
     """
     global claims, refclaims
 
@@ -2260,6 +2399,20 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
         # would inherit ordinal N-1's per-mediaid claim IDs and references.
         claim = copy.deepcopy(source_claim)
         prop = claim["mainsnak"]["property"]
+
+        # Materialize the per-ordinal P2699 qualifier on the P7482 claim.
+        # build_claims_for_doc can't do this — sdc.json is per-DPLA-item
+        # and a multi-page item's ordinals have different download URLs.
+        if prop == "P7482" and download_url:
+            claim.setdefault("qualifiers", {})["P2699"] = [
+                {
+                    "snaktype": "value",
+                    "property": "P2699",
+                    "datavalue": {"value": download_url, "type": "string"},
+                    "datatype": "url",
+                }
+            ]
+
         kind = _check_kind_for_claim(claim)
         comparable = _extract_comparable_value(claim)
         if comparable is None:
@@ -2287,6 +2440,15 @@ def process_one_from_sdc(mediaid, dpla_id, sdc_payload):
 
     _post_new_refs(mediaid, dpla_id)
     _post_new_claims(mediaid, dpla_id)
+
+    # Backfill P2699/P6108 qualifiers onto any pre-existing DPLA-authored
+    # P7482 statement that lacks them. Every file uploaded BEFORE this PR
+    # shipped has a P7482 with only P973/P137/P459 — without this pass,
+    # ``check()`` finds the existing statement, returns False (no
+    # duplicate), and the new qualifiers never land on Commons. Idempotent
+    # by design: a qualifier whose value already matches what sdc.json (+
+    # per-ordinal download_url) says is silently skipped.
+    _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url)
 
     expected = _build_expected_from_sdc(sdc_payload)
     _reconcile_existing_claims(mediaid, dpla_id, expected)
@@ -2386,6 +2548,22 @@ def _run_partner_mode(partner, ids_file):
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
                 continue
 
+            # file-list.txt maps ordinal-1 (zero-indexed) → download URL.
+            # Used to populate the per-ordinal P2699 qualifier on the
+            # P7482 (described at) claim — every file gets one, but the
+            # URL differs per ordinal so it can't live in the per-item
+            # sdc.json. A missing or empty file-list.txt is non-fatal:
+            # P2699 simply isn't materialized for those ordinals (the
+            # rest of the SDC pass still runs).
+            try:
+                file_list = s3.get_file_list(partner, dpla_id)
+            except ClientError as e:
+                logging.warning(
+                    f" -- S3 error reading file-list.txt for {dpla_id}: {e!r};"
+                    " continuing without P2699 qualifiers."
+                )
+                file_list = []
+
             ordinals = upload_result.get("ordinals", {})
             # Guard the type of `ordinals` before iteration — if the JSON
             # sidecar is corrupt or its schema drifts (null, list, scalar),
@@ -2471,8 +2649,25 @@ def _run_partner_mode(partner, ids_file):
                 # `logging.exception` writes the full traceback into
                 # the SDC log file so notify_pipeline_fail's
                 # `_summarize_log` can surface it in Slack.
+                # Look up this ordinal's download URL from file-list.txt
+                # (zero-indexed; ord_str is "1"-indexed). Used to stamp the
+                # per-ordinal P2699 qualifier on the P7482 statement.
+                # Explicit range guard — Python's negative indexing would
+                # silently grab the LAST entry for ord_str == "0", planting
+                # the wrong URL on a real Commons claim via wbsetqualifier.
                 try:
-                    process_one_from_sdc(mediaid, dpla_id, sdc_payload)
+                    ord_num = int(ord_str)
+                except ValueError:
+                    download_url = None
+                else:
+                    if 1 <= ord_num <= len(file_list):
+                        download_url = file_list[ord_num - 1] or None
+                    else:
+                        download_url = None
+                try:
+                    process_one_from_sdc(
+                        mediaid, dpla_id, sdc_payload, download_url=download_url
+                    )
                 except _MissingEntityError:
                     # Commons says the MediaInfo entity at this M-id doesn't
                     # exist. Almost always means the file page was deleted

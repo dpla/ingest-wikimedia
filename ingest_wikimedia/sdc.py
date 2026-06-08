@@ -694,8 +694,26 @@ def _build_source_claim(
     url: str,
     dpla_id: str,
     retrieval_date: datetime.date,
+    iiif_manifest_url: str | None = None,
 ) -> dict:
-    """Build the P7482 (described at) claim with P973 + P137 qualifiers."""
+    """Build the P7482 (described at) claim with its qualifier bundle.
+
+    Qualifiers, all DPLA-authored (the ``_is_safe_to_amend_in_place`` gate
+    considers a P7482 statement still "ours" only when every qualifier is
+    in this list; see ``_DPLA_EXTRA_QUALIFIER_PROPS`` in tools/sdc_sync.py):
+
+      * ``P973``  — described-at URL (the partner catalog page for this
+                    DPLA item, ``edm:isShownAt``)
+      * ``P137``  — operator (the hub's Wikidata QID)
+      * ``P6108`` — IIIF manifest URL (only when the source DPLA record
+                    has ``iiifManifest``; per-DPLA-item, identical across
+                    every ordinal)
+
+    The per-ordinal ``P2699`` qualifier (direct file download URL) is NOT
+    stamped here — it differs per Commons file and is materialized at
+    sdc-sync write time from ``file-list.txt``. See
+    ``process_one_from_sdc`` in tools/sdc_sync.py.
+    """
     claim = formattedclaim(
         "P7482",
         _item_value(Q_SOURCE_CATALOG),
@@ -705,6 +723,10 @@ def _build_source_claim(
     )
     claim["qualifiers"]["P973"] = [_qualifier_string_snak("P973", url, datatype="url")]
     claim["qualifiers"]["P137"] = [_qualifier_item_snak("P137", hub)]
+    if iiif_manifest_url:
+        claim["qualifiers"]["P6108"] = [
+            _qualifier_string_snak("P6108", iiif_manifest_url, datatype="url")
+        ]
     return claim
 
 
@@ -1076,8 +1098,27 @@ def build_claims_for_doc(
     # P9126 — maintained by chain.
     claims.extend(_build_contributed_claims(hub, institution, dpla_id, retrieval_date))
 
-    # P7482 — described at source catalog.
-    claims.append(_build_source_claim(hub, url, dpla_id, retrieval_date))
+    # P7482 — described at source catalog. P6108 (IIIF manifest URL) is
+    # added as a qualifier here when the source carries a usable
+    # iiifManifest; P2699 (per-ordinal download URL) is added downstream
+    # by sdc-sync. Defensive URL validation: some hubs ship the literal
+    # string "null", whitespace, or malformed fragments in iiifManifest;
+    # stamping that as P6108 would require manual Commons cleanup later.
+    iiif_manifest_raw = doc.get("iiifManifest") or ""
+    iiif_manifest_url = (
+        iiif_manifest_raw.strip() if isinstance(iiif_manifest_raw, str) else ""
+    )
+    if not iiif_manifest_url.startswith(("http://", "https://")):
+        iiif_manifest_url = None
+    claims.append(
+        _build_source_claim(
+            hub,
+            url,
+            dpla_id,
+            retrieval_date,
+            iiif_manifest_url=iiif_manifest_url,
+        )
+    )
 
     # P217 — local identifier (non-NARA; per-value, with P195 qualifier).
     for local_id in local_ids:
