@@ -403,6 +403,82 @@ _PYWIKIBOT_RETRY_MAX = 60
 _entity_cache = {}
 
 
+# Per-file accumulators populated by the builders during the per-claim walk
+# and drained by ``_submit_per_item_edit`` at the end of each
+# ``process_one`` / ``process_one_from_sdc`` call so the whole file's edits
+# land as a single wbeditentity revision. Initialized at module level so
+# helpers that read these globals (e.g. add_ref, add_det, the amend
+# helpers) don't NameError when called from tests that don't first run a
+# process_one* entry point. Cleared at the top of each process_one* call.
+claims = {"claims": []}
+refclaims = {"claims": []}
+qualifier_amends = []
+removals = []
+
+
+def _reset_per_file_accumulators():
+    """Drop every per-file accumulator at the start of a new file's
+    processing. Used by both ``process_one`` and ``process_one_from_sdc``
+    so the dispatcher only ever sees the current file's fragments."""
+    global claims, refclaims, qualifier_amends, removals
+    claims = {"claims": []}
+    refclaims = {"claims": []}
+    qualifier_amends = []
+    removals = []
+
+
+def _merge_qualifier_snaks(existing_qualifiers, additions):
+    """Build a Wikibase ``qualifiers`` dict that combines ``additions`` on
+    top of ``existing_qualifiers``, preserving the existing snaks'
+    ``hash`` fields so Wikibase recognises them as unchanged on
+    ``wbeditentity``.
+
+    ``existing_qualifiers`` is the claim's current ``qualifiers`` dict
+    (property → list of snak dicts, as returned by ``wbgetentities``).
+    ``additions`` is a list of ``(property, snak_dict)`` tuples to ADD;
+    the new snaks are appended after any existing snaks for the same
+    property.
+
+    Wikibase's ``wbeditentity`` replaces the qualifier set wholesale, so
+    callers must include every snak they want to keep. Including the
+    existing snaks with their original hashes is what keeps the diff
+    tight: Wikibase recognises unchanged snaks by hash and only shows
+    the new ones in the per-file edit diff.
+    """
+    import copy as _copy
+
+    merged = {
+        prop: [_copy.deepcopy(snak) for snak in snaks]
+        for prop, snaks in (existing_qualifiers or {}).items()
+    }
+    for prop, new_snak in additions:
+        merged.setdefault(prop, []).append(_copy.deepcopy(new_snak))
+    return merged
+
+
+def _exclude_qualifier_snaks(existing_qualifiers, excluded_snak_hashes):
+    """Build a Wikibase ``qualifiers`` dict that drops the snaks whose
+    ``hash`` is in ``excluded_snak_hashes``, preserving everything else
+    with its original hash.
+
+    Wholesale-replace semantics on ``wbeditentity``: we send only the
+    snaks we want to keep. Properties that end up with an empty snak
+    list are dropped entirely (Wikibase rejects empty qualifier-property
+    arrays as invalid).
+    """
+    import copy as _copy
+
+    out = {}
+    excluded = set(excluded_snak_hashes or ())
+    for prop, snaks in (existing_qualifiers or {}).items():
+        kept = [
+            _copy.deepcopy(snak) for snak in snaks if snak.get("hash") not in excluded
+        ]
+        if kept:
+            out[prop] = kept
+    return out
+
+
 def _raise_if_missing_entity(error, mediaid):
     """Raise :class:`_MissingEntityError` for ``APIError(code='no-such-entity')``;
     return silently otherwise.
@@ -1373,18 +1449,36 @@ def add_source(mediaid, hub, url, dpla_id):
 
 
 def add_det(mediaid, claimid):
-    if claimid:
-        qid = "Q61848113"
-        prop = "P459"
-        value = json.dumps(
-            {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))}
-        )
-        postqual(claimid, prop, value)
-        # postqual just mutated Commons state for this mediaid (added P459
-        # to an existing claim). Drop the cached snapshot so any subsequent
-        # check() call for the same mediaid in this run reads the fresh
-        # post-write state instead of repeating the qualifier write.
-        invalidate_entity(mediaid)
+    """Queue a ``P459 = Q61848113`` (determination method = heuristic)
+    qualifier addition onto an existing claim, to be flushed by the per-
+    file dispatcher (``_submit_per_item_edit``) in the combined
+    ``wbeditentity``.
+
+    Pushes a single-snak ``(P459, snak)`` entry onto the module-level
+    ``qualifier_amends`` accumulator under ``claimid``. The dispatcher
+    later reads the existing claim's qualifier set from the cached
+    entity, merges the new P459 snak in (preserving the existing snaks'
+    hashes via :func:`_merge_qualifier_snaks`), and includes the
+    resulting full qualifier set in the combined edit's payload.
+
+    No POST happens here — the cache stays valid because no remote
+    state has been mutated. Idempotent at the accumulator level: if
+    multiple claims happen to target the same ``claimid``, the
+    dispatcher de-duplicates by id before building the fragment.
+    """
+    if not claimid:
+        return
+    qid = "Q61848113"
+    snak = {
+        "snaktype": "value",
+        "property": "P459",
+        "datavalue": {
+            "value": {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
+            "type": "wikibase-entityid",
+        },
+        "datatype": "wikibase-item",
+    }
+    qualifier_amends.append((claimid, "P459", snak))
 
 
 def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
