@@ -2925,7 +2925,6 @@ def test_qualifier_values_returns_empty_when_no_qualifiers():
     assert sdc_sync._first_qualifier_value(stmt, "P999") is None
 
 
-
 # ---------------------------------------------------------------------------
 # Entity-cache leak fix.
 #
@@ -3012,5 +3011,76 @@ def test_entity_cache_does_not_grow_across_many_files(monkeypatch):
     assert max(sizes) <= 1, (
         f"_entity_cache grew across files (max size {max(sizes)}); "
         f"cache locality must be per-file"
+    )
+    sdc_sync._entity_cache.clear()
+
+
+def _patch_process_one_dependencies(monkeypatch, sdc_sync, current_mediaid, tmp_path):
+    """Stub the legacy ``process_one`` entry point's network/IO so its
+    file-boundary clear can be tested in isolation. ``parsed`` returning
+    a falsy value causes the function to return after writing
+    ``Missing ids.txt`` — chdir into ``tmp_path`` so that write happens
+    in a throwaway directory rather than polluting the working tree."""
+    fake_request = MagicMock()
+    fake_request.submit.return_value = {
+        "entities": {
+            current_mediaid: {
+                "pageid": int(current_mediaid.lstrip("M")),
+                "statements": {},
+            }
+        }
+    }
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value = fake_request
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+    monkeypatch.setattr(sdc_sync, "parsed", lambda *a, **kw: None)
+    monkeypatch.chdir(tmp_path)
+
+
+def test_process_one_clears_entity_cache_at_file_boundary(monkeypatch, tmp_path):
+    """Symmetric regression guard for the legacy ``process_one`` entry
+    point. Both file-boundary entry points (``process_one`` and
+    ``process_one_from_sdc``) must flush the module-level cache; locking
+    down only the partner-mode entry would silently leave the legacy
+    path leaking on ``--file`` / ``--cat`` / ``--list`` reruns."""
+    from tools import sdc_sync
+
+    sdc_sync._entity_cache.update(
+        {
+            "M111": {"pageid": 111, "statements": {}},
+            "M222": {"pageid": 222, "statements": {}},
+            "M333": {"pageid": 333, "statements": {}},
+        }
+    )
+    assert len(sdc_sync._entity_cache) == 3
+
+    _patch_process_one_dependencies(monkeypatch, sdc_sync, "M999", tmp_path)
+
+    sdc_sync.process_one("M999", "abcdef")
+
+    for prior in ("M111", "M222", "M333"):
+        assert prior not in sdc_sync._entity_cache, (
+            f"prior file {prior} leaked across the legacy-path file boundary"
+        )
+    sdc_sync._entity_cache.clear()
+
+
+def test_process_one_cache_does_not_grow_across_many_files(monkeypatch, tmp_path):
+    """Direct memory-leak regression for the legacy path. Parallel to
+    ``test_entity_cache_does_not_grow_across_many_files`` but exercising
+    ``process_one`` rather than ``process_one_from_sdc``."""
+    from tools import sdc_sync
+
+    sdc_sync._entity_cache.clear()
+    sizes = []
+    for i in range(100):
+        mediaid = f"M{1000 + i}"
+        _patch_process_one_dependencies(monkeypatch, sdc_sync, mediaid, tmp_path)
+        sdc_sync.process_one(mediaid, f"dpla{i:06d}")
+        sizes.append(len(sdc_sync._entity_cache))
+
+    assert max(sizes) <= 1, (
+        f"_entity_cache grew across files via legacy path (max size "
+        f"{max(sizes)}); cache locality must be per-file"
     )
     sdc_sync._entity_cache.clear()
