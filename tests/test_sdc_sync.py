@@ -1089,7 +1089,10 @@ def _stmt(stmt_id, prop, snaktype, value, qualifiers=None, references=None):
 
 
 def test_reconciler_queues_removal_for_stale_p170_string():
-    """Stale DPLA-referenced P170 qualifier (value not in `expected`) is queued for wbremoveclaims."""
+    """Stale DPLA-referenced P170 qualifier (value not in ``expected``)
+    is pushed onto the module-level ``removals`` accumulator. The
+    dispatcher flushes it via the combined wbeditentity payload's
+    ``{"id": ..., "remove": ""}`` claim entries."""
     from tools import sdc_sync
 
     stale_stmt = _stmt(
@@ -1106,27 +1109,14 @@ def test_reconciler_queues_removal_for_stale_p170_string():
     entity = {"pageid": 999, "statements": {"P170": [stale_stmt]}}
     expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, mediaid, params))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert len(submit_calls) == 1
-    action, mediaid, params = submit_calls[0]
-    assert action == "wbremoveclaims"
-    assert mediaid == "M999"
-    assert params["claim"] == "M999$STALE", (
-        f"reconciler should queue the stale claim for removal; got {params['claim']!r}"
-    )
+    assert sdc_sync.removals == ["M999$STALE"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_reconciler_keeps_claim_when_value_matches_expected():
@@ -1513,21 +1503,14 @@ def test_reconciler_migrates_old_somevalue_to_new_value_typed(monkeypatch):
     stale_old = _somevalue_p571_claim("M999$OLD", "1945")
     entity = {"pageid": 999, "statements": {"P571": [stale_old]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$OLD")], submit_calls
+    assert sdc_sync.removals == ["M999$OLD"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_reconciler_leaves_value_typed_claim_alone_when_unchanged(monkeypatch):
@@ -1580,21 +1563,14 @@ def test_reconciler_removes_value_typed_claim_when_dpla_dropped_the_date(monkeyp
     )
     entity = {"pageid": 999, "statements": {"P571": [stale_live]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$STALE")], submit_calls
+    assert sdc_sync.removals == ["M999$STALE"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_check_time_kind_recognises_existing_value_typed_match():
@@ -1659,21 +1635,14 @@ def test_reconciler_queues_removal_for_malformed_commons_time_value():
     }
     entity = {"pageid": 999, "statements": {"P571": [malformed_stmt]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$BORK")], submit_calls
+    assert sdc_sync.removals == ["M999$BORK"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_check_time_kind_does_not_crash_on_malformed_commons_value():
@@ -1790,21 +1759,14 @@ def test_reconciler_migrates_plain_to_circa_when_dpla_adds_decorator(monkeypatch
     )
     entity = {"pageid": 999, "statements": {"P571": [on_commons]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$EXACT")], submit_calls
+    assert sdc_sync.removals == ["M999$EXACT"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_check_time_kind_treats_circa_and_exact_as_distinct():
@@ -1956,22 +1918,14 @@ def test_reconciler_without_protection_would_remove_unrecognized_chunked_claim()
     entity = {"pageid": 999, "statements": {"P10358": [chunked_a1]}}
     expected = {"P10358": ["the full unchunked description text"]}
 
-    submit_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         # No protected_props — the chunked statement gets queued for removal
         # because ("chunk one text", "A1") isn't in expected["P10358"].
         sdc_sync._reconcile_existing_claims("M999", "abcdef", expected)
 
-    assert len(submit_calls) == 1
-    assert submit_calls[0][0] == "wbremoveclaims"
+    assert sdc_sync.removals == ["M999$chunkA1"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 # ---------------------------------------------------------------------------

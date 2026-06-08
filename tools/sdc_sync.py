@@ -2254,12 +2254,14 @@ def _build_expected_from_parsed(
 
 
 def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=frozenset()):
-    """Walk DPLA-referenced claims on Commons, queue removals for any whose
-    comparable value isn't in `expected`. POSTs wbremoveclaims if needed.
+    """Walk DPLA-referenced claims on Commons; push the IDs of any
+    claims that should be removed (DPLA-authored but no longer
+    expected) onto the module-level ``removals`` accumulator. The
+    per-file dispatcher flushes them in the combined wbeditentity.
 
-    Shared by `dpla_claims` (legacy partner-API path) and
-    `process_one_from_sdc` (PR 4 partner-mode path). Same removal logic;
-    just different sources for `expected`.
+    Shared by ``dpla_claims`` (legacy partner-API path) and
+    ``process_one_from_sdc`` (partner-mode path). Same removal logic;
+    just different sources for ``expected``.
 
     ``protected_props`` is a set of property IDs whose existing
     DPLA-authored claims are NOT subject to reconciliation — they're
@@ -2278,21 +2280,23 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=froze
     reconciliation keeps maintenance-mode reruns safe until full
     chunking parity is added to the legacy builders (out of scope
     here).
+
+    No POST happens here — pushes onto the ``removals`` accumulator
+    instead. The dispatcher flushes them via the combined
+    ``wbeditentity`` payload using ``{"id": ..., "remove": ""}`` claim
+    entries.
     """
     # Use pywikibot's wbgetentities (via get_entity) rather than a direct
     # requests.get to Special:EntityData: Wikimedia rejects the default
     # python-requests UA with HTTP 403 (phab T400119), and pywikibot's
     # Site.simple_request sets a compliant UA plus maxlag/CSRF handling.
-    # Invalidate the cache so this read sees post-write state from
-    # `_post_new_claims` above; let errors propagate to the per-ordinal
-    # boundary in `_run_partner_mode`.
+    # Read from the cache populated at the file-boundary entry; no
+    # mid-flow writes have happened in the consolidated dispatcher.
     print(f" -- Accessing Commons ID {mediaid}")
-    invalidate_entity(mediaid)
     entity = get_entity(mediaid)
     print(f" -- Accessed Commons ID {mediaid}")
     statements = entity.get("statements") or {}
     dpla_claim_list = []
-    removals = []
     for prop in statements:
         for stmt in statements[prop]:
             if stmt.get("references"):
@@ -2421,20 +2425,6 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=froze
                 removals.append(claim[prop]["id"])
             elif claim[prop]["value"] not in expected[prop]:
                 removals.append(claim[prop]["id"])
-    if removals:
-        _submit_sdc_write(
-            "wbremoveclaims",
-            mediaid,
-            dpla_id,
-            claim="|".join(removals),
-            summary=(
-                f"Changing structured data claims from [[COM:DPLA|DPLA]]"
-                f" item '[[dpla:{dpla_id}|{dpla_id}]]'."
-                f" [[COM:DPLA/MOD|Leave feedback]]!"
-            ),
-        )
-        print(" --- Saved removals!")
-        tracker.increment(Result.SDC_REMOVALS, len(removals))
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
