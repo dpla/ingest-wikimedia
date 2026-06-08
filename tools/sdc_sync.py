@@ -2029,52 +2029,85 @@ def _submit_per_item_edit(
         tracker.increment(Result.SDC_REMOVALS, len(removals))
 
 
-def _post_new_refs(mediaid, dpla_id):
-    """POST the accumulated ``refclaims["claims"]`` to ``wbeditentity``.
+def _build_qualifier_update_fragments(mediaid):
+    """Fold the per-file ``qualifier_amends`` and ``qualifier_removals``
+    accumulators into a list of wbeditentity claim fragments — one per
+    target statement ID — each carrying the wholesale-replace qualifier
+    set computed from the cached entity's existing qualifiers plus the
+    queued adds, minus the queued removals.
 
-    Reads the module-global ``refclaims`` (populated by ``add_ref`` during
-    the per-claim check loop). No-op when nothing to post.
+    The dispatcher's qualifier-update kind expects ``{id, qualifiers}``
+    where the qualifier set is sent in full (it replaces the existing
+    set wholesale on save). Existing snak ``hash`` values are preserved
+    so Wikibase recognises unchanged snaks and surfaces only the new
+    ones in the per-file edit diff.
+
+    Returns the empty list when neither accumulator has entries.
     """
-    if not refclaims["claims"]:
-        return
-    refs_to_post = len(refclaims["claims"])
-    _submit_sdc_write(
-        "wbeditentity",
+    if not qualifier_amends and not qualifier_removals:
+        return []
+    adds_by_id = {}
+    for claimid, prop, snak in qualifier_amends:
+        adds_by_id.setdefault(claimid, []).append((prop, snak))
+    removes_by_id = {}
+    for claimid, snak_hash in qualifier_removals:
+        removes_by_id.setdefault(claimid, set()).add(snak_hash)
+    target_ids = set(adds_by_id) | set(removes_by_id)
+
+    entity = get_entity(mediaid)
+    statements_by_id = {}
+    for prop_stmts in (entity.get("statements") or {}).values():
+        for stmt in prop_stmts:
+            stmt_id = stmt.get("id")
+            if stmt_id:
+                statements_by_id[stmt_id] = stmt
+
+    fragments = []
+    for claimid in target_ids:
+        stmt = statements_by_id.get(claimid)
+        if stmt is None:
+            # Statement vanished between the cached read and now —
+            # rare; nothing safe to do, skip rather than crash.
+            continue
+        existing_qualifiers = stmt.get("qualifiers") or {}
+        # Drop stale snaks first; merge new ones afterward.
+        kept = _exclude_qualifier_snaks(
+            existing_qualifiers, removes_by_id.get(claimid, set())
+        )
+        merged = _merge_qualifier_snaks(kept, adds_by_id.get(claimid, []))
+        fragments.append({"id": claimid, "qualifiers": merged})
+    return fragments
+
+
+def _flush_per_file_edits(mediaid, dpla_id):
+    """Drain every per-file accumulator into a single ``wbeditentity``
+    POST via :func:`_submit_per_item_edit`. Called at the end of each
+    ``process_one_from_sdc`` and ``process_one`` invocation; this is
+    the one POST per file that replaces the previous five-to-seven
+    separate API calls.
+
+    After a successful write, invalidate the cached entity once so any
+    follow-up code reading from cache picks up the new revision.
+    """
+    qualifier_fragments = _build_qualifier_update_fragments(mediaid)
+    removal_fragments = [{"id": cid, "remove": ""} for cid in removals]
+
+    _submit_per_item_edit(
         mediaid,
         dpla_id,
-        data=json.dumps(refclaims),
         summary=(
-            f"Added structured data references from [[COM:DPLA|DPLA]] item"
+            f"Updating structured data claims from [[COM:DPLA|DPLA]] item"
             f" '[[dpla:{dpla_id}|{dpla_id}]]'."
             f" [[COM:DPLA/MOD|Leave feedback]]!"
         ),
+        new_claims=claims["claims"],
+        reference_updates=refclaims["claims"],
+        qualifier_updates=qualifier_fragments,
+        removals=removal_fragments,
     )
-    print(" --- Saved new refs!")
-    tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
-
-
-def _post_new_claims(mediaid, dpla_id):
-    """POST the accumulated ``claims["claims"]`` to ``wbeditentity``.
-
-    Reads the module-global ``claims`` (populated by add_* helpers during
-    the per-claim check loop). No-op when nothing to post.
-    """
-    if not claims["claims"]:
-        return
-    claims_to_post = len(claims["claims"])
-    _submit_sdc_write(
-        "wbeditentity",
-        mediaid,
-        dpla_id,
-        data=json.dumps(claims),
-        summary=(
-            f"Added structured data claims from [[COM:DPLA|DPLA]] item"
-            f" '[[dpla:{dpla_id}|{dpla_id}]]'."
-            f" [[COM:DPLA/MOD|Leave feedback]]!"
-        ),
-    )
-    print(" --- Saved new claims!")
-    tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
+    # One terminal invalidation regardless of how many fragments landed
+    # — the file's MediaInfo revision now reflects the combined edit.
+    invalidate_entity(mediaid)
 
 
 def dpla_claims(
@@ -2686,17 +2719,13 @@ def _resolve_dpla_id(title, dpla_api):
 
 def process_one(mediaid, dpla_id):
     """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
-    global claims, refclaims
-
-    # Drop every prior file's cached entity at the file boundary. The cache
-    # locality the per-file check() / reconciler / amend_* calls rely on is
-    # scoped to ONE file's processing; without this clear, the module-level
-    # ``_entity_cache`` accumulates an entity per file processed and leaks
-    # memory monotonically across a long-running session (a 25-hour NARA
-    # run reached ~2.6 GB RSS before this clear was added). Pre-warm the
-    # cache so the ~25 add_* / check() calls below share one wbgetentities
-    # round-trip.
+    # Drop every prior file's cached entity at the file boundary so the
+    # cache doesn't leak entities across files (see _entity_cache
+    # docstring), and drain the per-file accumulators so the dispatcher
+    # only sees this file's fragments. Pre-warm the cache so the ~25
+    # add_* / check() calls below share one wbgetentities round-trip.
     _entity_cache.clear()
+    _reset_per_file_accumulators()
     get_entity(mediaid)
 
     # parsed() returns None on lookup failure (was: returned False and the
@@ -2723,9 +2752,6 @@ def process_one(mediaid, dpla_id):
         access,
         level,
     ) = parsed_result
-
-    claims = {"claims": []}
-    refclaims = {"claims": []}
 
     try:
         add_rs(mediaid, rs, dpla_id)
@@ -2763,8 +2789,10 @@ def process_one(mediaid, dpla_id):
     # this guard the same Commons response that the partner path treats
     # as a skip would crash the legacy entry points.
     try:
-        _post_new_refs(mediaid, dpla_id)
-        _post_new_claims(mediaid, dpla_id)
+        # Run the reconciler builder so it populates the ``removals``
+        # accumulator alongside the new-claim and new-ref accumulators
+        # built by the check() walk above. Then flush everything in
+        # one atomic wbeditentity per file.
         dpla_claims(
             mediaid,
             dpla_id,
@@ -2782,6 +2810,7 @@ def process_one(mediaid, dpla_id):
             access,
             level,
         )
+        _flush_per_file_edits(mediaid, dpla_id)
     except _MissingEntityError:
         logging.info(
             f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity does not"
@@ -2827,21 +2856,15 @@ def process_one_from_sdc(
     backfill ``_amend_p760_page_qualifier`` handles existing P760
     statements that lack it.
     """
-    global claims, refclaims
-
-    # Drop every prior file's cached entity at the file boundary. The cache
-    # locality the per-claim check() / reconciler / amend_* calls below
-    # rely on is scoped to ONE file's processing; without this clear, the
-    # module-level ``_entity_cache`` accumulates an entity per file
-    # processed and leaks memory monotonically across a long-running
-    # session (a 25-hour NARA run reached ~2.6 GB RSS before this clear
-    # was added). Pre-warm so the per-claim calls share one
+    # Drop every prior file's cached entity at the file boundary so the
+    # cache doesn't leak entities across files (see _entity_cache
+    # docstring), and drain the per-file accumulators so the dispatcher
+    # only sees this file's fragments. Pre-warm the cache so the
+    # per-claim check() / amend_* / reconciler calls below share one
     # wbgetentities round-trip.
     _entity_cache.clear()
+    _reset_per_file_accumulators()
     get_entity(mediaid)
-
-    claims = {"claims": []}
-    refclaims = {"claims": []}
 
     sdc_claims = sdc_payload.get("claims", [])
     first_check = True
@@ -2905,25 +2928,16 @@ def process_one_from_sdc(
             pywikibot.output(f" -- Adding [[:d:Property:{prop}]] to {mediaid}.")
             claims["claims"].append(claim)
 
-    _post_new_refs(mediaid, dpla_id)
-    _post_new_claims(mediaid, dpla_id)
-
-    # Backfill P2699/P6108 qualifiers onto any pre-existing DPLA-authored
-    # P7482 statement that lacks them. Every file uploaded BEFORE this PR
-    # shipped has a P7482 with only P973/P137/P459 — without this pass,
-    # ``check()`` finds the existing statement, returns False (no
-    # duplicate), and the new qualifiers never land on Commons. Idempotent
-    # by design: a qualifier whose value already matches what sdc.json (+
-    # per-ordinal download_url) says is silently skipped.
+    # Run the legacy-backfill amend builders and the reconciler so they
+    # populate the per-file accumulators (qualifier_amends,
+    # qualifier_removals, removals). All four accumulators (those plus
+    # the new-claims / new-refs lists populated by the check() walk
+    # above) are then flushed in one atomic wbeditentity per file.
     _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url)
-
-    # Backfill the per-ordinal P304 (page-number) qualifier onto any
-    # pre-existing DPLA-authored P760 statement that lacks it. Same
-    # legacy-state rationale as ``_amend_p7482_url_qualifiers`` above.
     _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number)
-
     expected = _build_expected_from_sdc(sdc_payload)
     _reconcile_existing_claims(mediaid, dpla_id, expected)
+    _flush_per_file_edits(mediaid, dpla_id)
 
 
 def _run_partner_mode(partner, ids_file):

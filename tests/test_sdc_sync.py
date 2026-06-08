@@ -616,201 +616,6 @@ def _api_error(code, info=""):
     return pywikibot.exceptions.APIError(code=code, info=info)
 
 
-def test_post_new_refs_raises_runtime_error_on_apierror(monkeypatch):
-    """Pywikibot's ``APIError`` for any code OTHER than ``no-such-entity``
-    must be re-raised as ``RuntimeError`` carrying mediaid + dpla_id +
-    Commons error code so the per-ordinal handler logs a useful traceback.
-    """
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_side_effect=_api_error("badtoken", info="Invalid token"),
-    )
-
-    with pytest.raises(RuntimeError) as excinfo:
-        sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    msg = str(excinfo.value)
-    assert "M12345" in msg
-    assert "abcdef01abcdef01abcdef01abcdef01" in msg
-    # The Commons error code must appear in the RuntimeError message so
-    # the per-ordinal ``logging.exception`` captures it without needing
-    # to unwrap the ``__cause__`` chain.
-    assert "badtoken" in msg, f"expected 'badtoken' in {msg!r}"
-
-
-def test_post_new_claims_raises_runtime_error_on_apierror(monkeypatch):
-    """Same contract for the claims POST helper — non-no-such-entity
-    APIErrors come out as RuntimeError with the code in the message."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        claims_payload=[{"some": "claim"}],
-        submit_side_effect=_api_error("abusefilter-disallowed", info="Rule X tripped."),
-    )
-
-    with pytest.raises(RuntimeError) as excinfo:
-        sdc_sync._post_new_claims("M67890", "fedcba98fedcba98fedcba98fedcba98")
-
-    msg = str(excinfo.value)
-    assert "M67890" in msg
-    assert "fedcba98fedcba98fedcba98fedcba98" in msg
-    assert "abusefilter-disallowed" in msg, f"expected error code in {msg!r}"
-
-
-def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
-    """The RuntimeError raised from inside ``_post_new_refs`` must be a
-    plain ``Exception`` subclass (not ``BaseException``), so the
-    ``except Exception:`` clause in ``process_one_from_sdc`` catches it
-    and the partner batch can continue with the next ordinal.
-
-    Regression guard against the pre-PR-#263 ``sys.exit()`` behaviour,
-    which raised ``SystemExit`` (a ``BaseException``) and bypassed the
-    per-ordinal handler — one failed write tanked the entire partner.
-    """
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_side_effect=_api_error("badtoken"),
-    )
-
-    skipped = False
-    try:
-        sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-    except Exception:
-        # Same ``except Exception:`` clause that wraps each ordinal in
-        # ``process_one_from_sdc`` — catching it here proves the
-        # per-ordinal handler will skip rather than abort the partner.
-        skipped = True
-
-    assert skipped, (
-        "RuntimeError from _post_new_refs must be an Exception subclass so"
-        " the per-ordinal handler in process_one_from_sdc catches it"
-    )
-
-
-def test_post_new_refs_success_path_increments_counter(monkeypatch):
-    """The happy path: ``simple_request().submit()`` returns success →
-    the SDC_REFS_ADDED counter increments by the number of refs posted."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"ref": "a"}, {"ref": "b"}, {"ref": "c"}],
-        submit_return={"success": 1, "entity": {}},
-    )
-
-    before = sdc_sync.tracker.count(Result.SDC_REFS_ADDED)
-    sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-    after = sdc_sync.tracker.count(Result.SDC_REFS_ADDED)
-    assert after == before + 3, (
-        f"SDC_REFS_ADDED should bump by 3; before={before}, after={after}"
-    )
-
-
-def test_post_new_claims_success_path_increments_counter(monkeypatch):
-    """Same happy-path contract for claims."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        claims_payload=[{"c": "a"}, {"c": "b"}],
-        submit_return={"success": 1, "entity": {}},
-    )
-
-    before = sdc_sync.tracker.count(Result.SDC_CLAIMS_ADDED)
-    sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
-    after = sdc_sync.tracker.count(Result.SDC_CLAIMS_ADDED)
-    assert after == before + 2
-
-
-def test_post_new_refs_uses_pywikibot_simple_request_with_csrf_token(monkeypatch):
-    """Verify the helper actually routes through pywikibot's
-    ``simple_request`` and passes the CSRF token from ``site.tokens``
-    (rather than a stale module-global ``token``, which the migration
-    deleted).
-    """
-    from tools import sdc_sync
-
-    fake_site = _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_return={"success": 1},
-    )
-
-    sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    assert fake_site.simple_request.call_count == 1
-    kwargs = fake_site.simple_request.call_args.kwargs
-    assert kwargs["action"] == "wbeditentity"
-    assert kwargs["id"] == "M12345"
-    assert kwargs["bot"] is True
-    assert kwargs["token"] == "stub-csrf-token"
-    # The encoded claims payload should be the JSON of refclaims.
-    assert "ref" in kwargs["data"]
-
-
-# --------------------------------------------------------------------------
-# `no-such-entity` is treated as a clean skip, NOT a failure.
-#
-# When pywikibot raises ``APIError(code="no-such-entity")``, the
-# MediaInfo entity for the staged M-id doesn't exist — most commonly
-# because the file page was deleted by a Commons curator as a duplicate,
-# or because this is an SDC-only run for a file that wasn't uploaded
-# through our pipeline. Neither is the SDC phase's fault, and re-running
-# wouldn't help — the entity isn't coming back via retry. The phase
-# converts this specific APIError code into ``_MissingEntityError``,
-# which the per-ordinal handler logs at INFO (not ERROR) and counts
-# under ``SDC_ORDINALS_SKIPPED_MISSING_ENTITY`` (not ``..._ERROR``).
-# --------------------------------------------------------------------------
-
-
-def test_post_new_claims_no_such_entity_raises_missing_entity_error(monkeypatch):
-    """Claims POST helper must raise ``_MissingEntityError`` (not
-    ``RuntimeError``) when pywikibot reports ``no-such-entity``."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        claims_payload=[{"some": "claim"}],
-        submit_side_effect=_api_error("no-such-entity", info="⧼no-such-entity⧽"),
-    )
-
-    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
-        sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    assert "M12345" in str(excinfo.value)
-
-
-def test_post_new_refs_no_such_entity_raises_missing_entity_error(monkeypatch):
-    """Same contract for the refs POST helper."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_side_effect=_api_error("no-such-entity"),
-    )
-
-    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
-        sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
-
-    assert "M67890" in str(excinfo.value)
-
-
 def test_submit_sdc_write_translates_no_such_entity_for_wbremoveclaims(monkeypatch):
     """The shared write helper translates ``APIError(no-such-entity)``
     for ANY action — proving the wbremoveclaims path
@@ -937,13 +742,14 @@ def test_legacy_process_one_treats_missing_entity_as_clean_skip(monkeypatch):
         monkeypatch.setattr(sdc_sync, name, lambda *_a, **_k: None)
     # `dpla_claims` calls `_reconcile_existing_claims` — stub it too.
     monkeypatch.setattr(sdc_sync, "dpla_claims", lambda *_a, **_k: None)
-    # The actual POST helper raises the missing-entity error.
+    # The combined per-file dispatcher raises the missing-entity error
+    # (the equivalent of the old _post_new_* POST helpers' failure
+    # surface, now consolidated into a single wbeditentity per file).
     monkeypatch.setattr(
         sdc_sync,
-        "_post_new_refs",
+        "_flush_per_file_edits",
         lambda *_a, **_k: (_ for _ in ()).throw(sdc_sync._MissingEntityError("M12345")),
     )
-    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *_a, **_k: None)
 
     counter_before = sdc_sync.tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
 
@@ -2853,11 +2659,10 @@ def _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, current_medi
     fake_site = MagicMock()
     fake_site.simple_request.return_value = fake_request
     monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
-    monkeypatch.setattr(sdc_sync, "_post_new_refs", lambda *a, **kw: None)
-    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *a, **kw: None)
     monkeypatch.setattr(sdc_sync, "_amend_p7482_url_qualifiers", lambda *a, **kw: None)
     monkeypatch.setattr(sdc_sync, "_amend_p760_page_qualifier", lambda *a, **kw: None)
     monkeypatch.setattr(sdc_sync, "_reconcile_existing_claims", lambda *a, **kw: None)
+    monkeypatch.setattr(sdc_sync, "_flush_per_file_edits", lambda *a, **kw: None)
 
 
 def test_process_one_from_sdc_clears_entity_cache_at_file_boundary(monkeypatch):
