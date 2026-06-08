@@ -1328,19 +1328,29 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
     succeeding, and the next sync attempt will retry the missing
     qualifier.
 
-    Limitations:
-      * P973 match is exact-string. Real-world catalog URLs drift
-        (http → https, trailing slash, percent-encoding). If a legacy
-        Commons P7482's P973 doesn't byte-match the new sdc.json's
-        P973, ``check()`` will also miss (same exact-match comparison)
-        and add a SECOND P7482 alongside the legacy one. Worth a
-        normalization helper here and in ``check()`` someday;
-        consciously out of scope for this PR.
+    Design notes:
+      * DPLA-authored P7482 statements reference the partner's source
+        metadata; they semantically belong to that reference. Any
+        community-added qualifiers on those specific statements are
+        out of band — a community contributor wanting to assert a
+        fact about the file should add their own statement with their
+        own reference, not graft onto DPLA's. So when URL drift
+        triggers a remove-and-re-add cycle (via the reconciler's
+        normal "P973 mismatch → not our statement → add a new one"
+        path), discarding any stray user additions on the old
+        DPLA-referenced statement is correct, not lossy.
+      * That said, P973 matching is exact-string today. Real-world
+        catalog URLs drift over time (http → https, trailing slash,
+        percent-encoding) and each drift causes an unnecessary
+        remove+re-add churn even though both URLs point to the same
+        resource. A normalization helper here and in ``check()``
+        would be a pure efficiency win; consciously out of scope
+        for this PR.
       * The in-memory P2699 augmentation in ``process_one_from_sdc``
-        only takes effect when ``check()`` decides to ADD a new
-        P7482 statement (the new-upload path). For the much more
-        common existing-statement case, this helper is the path
-        that lands P2699/P6108 onto Commons.
+        only fires on the new-upload path (when ``check()`` decides
+        to ADD a P7482). For the far more common existing-statement
+        case, this helper is the path that lands P2699/P6108 onto
+        Commons.
     """
     # Find sdc.json's P7482 claim to learn the expected catalog URL +
     # IIIF manifest URL (if any). sdc.json has at most one P7482 entry.
