@@ -12,7 +12,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import Future
 
-from .s3 import S3Client
+from .s3 import APPLICATION_JSON, SDC_FILENAME, S3Client
 
 _QUEUE_DEPTH_MULTIPLIER = 4
 
@@ -26,6 +26,20 @@ def stage_item_to_s3(
     future.exception() in the done callback.
     """
     s3_client.write_item_metadata(partner, dpla_id, json.dumps(source))
+
+
+def stage_sdc_to_s3(
+    s3_client: S3Client, partner: str, dpla_id: str, sdc_payload: dict
+) -> None:
+    """Write the per-item sdc.json sidecar to the partner's item prefix.
+
+    Shared by get-ids-es and get-ids-nara (and any future tool that
+    pre-computes SDC claims). Raises on failure so the caller's
+    ThreadPoolExecutor can observe it via future.exception().
+    """
+    s3_client.write_item_file(
+        partner, dpla_id, json.dumps(sdc_payload), SDC_FILENAME, APPLICATION_JSON
+    )
 
 
 def make_s3_stage_context(

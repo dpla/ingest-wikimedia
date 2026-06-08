@@ -48,12 +48,15 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from typing import Any
 
 import requests
+
+from ingest_wikimedia.dpla import INSTITUTIONS_URL
 
 # Hardcoded Wikibase entities used across the SDC mapping. Centralized here
 # so any change has a single edit site.
@@ -153,7 +156,48 @@ TEXT_VALUE_LIMIT = 1499  # matches sdc-sync's longstanding truncation cap
 # strictly longer than 1500 is dropped.
 LOCAL_ID_MAX_LENGTH = 1500
 
+# DPLA subject → Wikidata Q-ID lookup table; sourced from dpla/ingestion3
+# alongside institutions_v2.json. Fetched fresh per run so upstream changes
+# land in the next sync without a redeploy.
+SUBJECTS_URL = (
+    "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
+    "src/main/resources/subjects.json"
+)
+
+# Locate rights.json by walking up from this module's directory. sdc.py
+# lives at <repo>/ingest_wikimedia/sdc.py, so two dirname's above gives the
+# repo root.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 logger = logging.getLogger(__name__)
+
+
+def fetch_institutions_v2() -> dict:
+    """Fetch the full institutions_v2.json document used for hub/institution
+    eligibility and (in the SDC pre-compute pass) Wikidata-ID resolution."""
+    resp = requests.get(INSTITUTIONS_URL, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_subjects_json() -> dict:
+    """Fetch the DPLA-subject → Wikidata-ID map used to populate P921.
+
+    Sourced from dpla/ingestion3 alongside institutions_v2.json; fetched
+    fresh per run so upstream changes land in the next sync without a
+    redeploy.
+    """
+    resp = requests.get(SUBJECTS_URL, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def load_rights_json() -> dict:
+    """Load rights.json from the repo root and normalize its keys for
+    scheme-and-slash-insensitive lookup."""
+    with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
+        raw = json.load(f)
+    return {normalize_rights_uri(k): v for k, v in raw.items()}
 
 
 def normalize_rights_uri(uri: str) -> str:

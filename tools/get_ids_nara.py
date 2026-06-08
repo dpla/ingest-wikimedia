@@ -17,12 +17,21 @@ can be updated as priorities change.
 For each eligible item, the full ES source document is written to S3 as dpla-map.json
 so the downloader can skip DPLA API calls entirely.
 
+After enumeration completes, this tool also writes a per-item sdc.json sidecar
+containing the ready-to-POST Wikibase claim list — same shape and code path as
+get-ids-es. Without this, NARA hub-level runs would leave sdc.json stale (last
+written by the *previous* upload run) and sdc-sync would silently miss any
+ingest_wikimedia.sdc mapping changes shipped in the interim.
+
 Output: one DPLA ID per line to stdout. Redirect to produce the IDs CSV:
     get-ids-nara > nara/nara.csv
 """
 
+import datetime
+import json
 import logging
 import sys
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import click
@@ -30,8 +39,20 @@ import click
 from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.es import ES_HARD_TIMEOUT, check_es_response, post_es
 from ingest_wikimedia.s3 import S3Client
+from ingest_wikimedia.sdc import (
+    build_claims_for_doc,
+    collect_subject_queries,
+    fetch_institutions_v2,
+    fetch_subjects_json,
+    load_rights_json,
+    reconcile_subjects,
+)
 from ingest_wikimedia.slack import notify_phase_start
-from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
+from ingest_wikimedia.staging import (
+    make_s3_stage_context,
+    stage_item_to_s3,
+    stage_sdc_to_s3,
+)
 
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 4
@@ -301,6 +322,17 @@ def main() -> None:
 
     s3_sem, failed, _on_s3_done = make_s3_stage_context(S3_WRITE_WORKERS)
 
+    # SDC pre-compute inputs. Loaded once and reused for the Phase 3 pass.
+    # Fetched fresh so an upstream institutions_v2 / subjects.json change
+    # is reflected in the next NARA run without a redeploy.
+    institutions_json = fetch_institutions_v2()
+    rights = load_rights_json()
+    subject_ids = fetch_subjects_json()
+    retrieval_date = datetime.date.today()
+
+    dpla_ids: list[str] = []
+    subject_queries: set[tuple[str, str]] = set()
+
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         for label, extra_filter in queries:
             print(f"Querying {label}", file=sys.stderr)
@@ -320,10 +352,101 @@ def main() -> None:
                 )
                 future.add_done_callback(_on_s3_done(dpla_id))
 
+                dpla_ids.append(dpla_id)
+                subject_queries.update(collect_subject_queries(source))
+
                 print(dpla_id)
 
     if failed[0]:
         print(f"Error: {failed[0]} S3 writes failed", file=sys.stderr)
+        raise SystemExit(1)
+
+    # Phase 2 — batched Wikidata reconciliation for NARA exactMatch subjects.
+    # Mirrors get-ids-es Phase 2. Best-effort: chunks that fail are logged
+    # and skipped (their items' P921 entries simply omitted; P4272 still
+    # lands).
+    print(
+        f"Reconciling {len(subject_queries)} unique subject queries...",
+        file=sys.stderr,
+    )
+    subjects_lookup = reconcile_subjects(subject_queries)
+    print(
+        f"Resolved {len(subjects_lookup)} subjects to Wikidata IDs.",
+        file=sys.stderr,
+    )
+
+    # Phase 3 — build per-item sdc.json (ready-to-POST claim list) and stage
+    # to S3 alongside dpla-map.json. Re-reads each item's source doc from
+    # the dpla-map.json staged in Phase 1 (rather than buffering in memory)
+    # so peak memory stays O(unique-subjects) rather than scaling with the
+    # NARA hit set. Items the SDC builder can't parse (e.g. provider /
+    # institution missing from institutions_v2.json, malformed NARA XML)
+    # are skipped — their dpla-map.json is still in place for downloader/
+    # uploader and a future re-run will pick them up.
+    sdc_sem, sdc_failed, _on_sdc_done = make_s3_stage_context(S3_WRITE_WORKERS)
+    sdc_skipped = 0
+
+    with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
+        for dpla_id in dpla_ids:
+            raw = s3_client.get_item_metadata(PARTNER, dpla_id)
+            if raw is None:
+                logging.warning(
+                    "dpla-map.json missing for %s in phase 3; skipping sdc.json",
+                    dpla_id,
+                )
+                sdc_skipped += 1
+                continue
+            try:
+                source = json.loads(raw)
+            except json.JSONDecodeError as e:
+                logging.warning(
+                    "dpla-map.json for %s failed to parse in phase 3 (%s);"
+                    " skipping sdc.json",
+                    dpla_id,
+                    e,
+                )
+                sdc_skipped += 1
+                continue
+            try:
+                sdc_payload = build_claims_for_doc(
+                    source,
+                    dpla_id,
+                    institutions_json,
+                    rights,
+                    subject_ids,
+                    subjects_lookup,
+                    retrieval_date,
+                )
+            except ET.ParseError as e:
+                # Malformed NARA originalRecord XML (parse_nara_access_level
+                # surfaces this). Skip the sdc.json for this item rather than
+                # abort the whole run — same boundary get-ids-es uses.
+                logging.warning(
+                    "build_claims_for_doc for %s raised ET.ParseError (%s);"
+                    " skipping sdc.json for this item",
+                    dpla_id,
+                    e,
+                )
+                sdc_skipped += 1
+                continue
+            if sdc_payload is None:
+                sdc_skipped += 1
+                continue
+            sdc_sem.acquire()
+            future = executor.submit(
+                stage_sdc_to_s3, s3_client, PARTNER, dpla_id, sdc_payload
+            )
+            future.add_done_callback(_on_sdc_done(dpla_id))
+
+    if sdc_skipped:
+        print(
+            f"Skipped sdc.json for {sdc_skipped} items"
+            " (missing/malformed dpla-map.json or unmappable source).",
+            file=sys.stderr,
+        )
+
+    if sdc_failed[0]:
+        print(f"Error: {sdc_failed[0]} sdc.json writes failed", file=sys.stderr)
         raise SystemExit(1)
 
 

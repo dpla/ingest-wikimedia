@@ -498,39 +498,20 @@ def main() -> None:
         detail = ("\n• " + "\n• ".join(skipped_warnings)) if skipped_warnings else ""
         _slack_fail(response_url, f"No valid targets to launch.{detail}")
 
-    # `--sdc-only` is meaningful only for targets whose ID-generation step
-    # re-stages sdc.json. Two target types use a different path:
-    #   * Single-item DPLA IDs — the launcher writes the one ID via `printf`
-    #     to skip the enumeration phase; `resolve-dpla-ids` (run at startup)
-    #     stages `dpla-map.json` but NOT `sdc.json`.
-    #   * NARA hub-level — uses `get-ids-nara` (NARA catalog enumeration,
-    #     not ingestion3 ES), which also doesn't write `sdc.json`.
-    # For these, sdc-sync will replay whatever sidecar the *original* upload
-    # run wrote. That's fine for re-running PR-#251-style code changes
-    # against a known item, but operators backfilling for upstream mapping
-    # changes need to know they won't pick up. Warn loudly rather than
-    # silently using stale data.
-    if sdc_only:
-        stale_sdc_target_labels = [
-            lbl
-            for canonical, institutions, lbl, dpla_id, _ in targets
-            if dpla_id is not None or (canonical == "nara" and not institutions)
-        ]
-        if stale_sdc_target_labels:
-            print(
-                "Warning: --sdc-only with single-item DPLA IDs or NARA"
-                " hub-level targets will use the existing sdc.json sidecars"
-                " (last written by get-ids-es during the original upload"
-                " run). These targets cannot re-stage sdc.json. Affected:"
-                f" {', '.join(stale_sdc_target_labels)}.",
-                file=sys.stderr,
-            )
-        if max_age_days is not None:
-            print(
-                "Warning: --max-age-days is ignored in --sdc-only mode"
-                " (no download phase runs).",
-                file=sys.stderr,
-            )
+    # `--sdc-only` re-runs the ID-generation step (which now re-stages
+    # sdc.json for every target type — get-ids-es for hub/institution and
+    # single-item, get-ids-nara for NARA hub-level) so operators
+    # backfilling for upstream mapping changes pick up the latest claims.
+    # Previously NARA hub-level and single-item DPLA-ID targets
+    # short-circuited their respective Phase 3 (sdc.json staging) — that
+    # gap was closed in this PR, so no "stale sdc.json" warning is needed
+    # anymore.
+    if sdc_only and max_age_days is not None:
+        print(
+            "Warning: --max-age-days is ignored in --sdc-only mode"
+            " (no download phase runs).",
+            file=sys.stderr,
+        )
 
     # Session name uses + as separator (unambiguous since slugs/institution names use -).
     # Institution-level targets include the hub slug as a prefix so the status script
@@ -802,9 +783,21 @@ def main() -> None:
         # collection-level sessions don't clobber each other's ID lists.
         csv_file = f"{session_label}.csv"
         if dpla_id is not None:
-            # Single-item target: metadata was already staged to S3 by resolve-dpla-ids.
-            # Write the one ID directly to the CSV; no ID-generation phase needed.
-            get_ids_cmd = f"printf '%s\\n' {shlex.quote(dpla_id)} > {csv_file}"
+            # Single-item target: re-run get-ids-es in ``--single-id`` mode so
+            # dpla-map.json AND sdc.json are staged with the latest mapping
+            # code before the downloader/uploader/sdc-sync chain reads them.
+            # Without this re-staging, sdc-sync would diff against whatever
+            # sdc.json the partner's last full run produced — silently missing
+            # any subsequent ingest_wikimedia.sdc changes (e.g. PR #279's
+            # opportunistic date parsing, PR #278's NARA stdlib XML).
+            # ``resolve-dpla-ids`` (the pre-launch eligibility check) is
+            # still useful because it short-circuits ineligible IDs with a
+            # clean Slack message before the tmux session is even launched,
+            # but the per-item S3 staging it does is superseded here.
+            get_ids_cmd = (
+                f"get-ids-es {canonical}"
+                f" --single-id {shlex.quote(dpla_id)} > {csv_file}"
+            )
         elif canonical == "nara" and not institutions:
             get_ids_cmd = f"get-ids-nara > {csv_file}"
         else:

@@ -40,28 +40,32 @@ consumed by the downloader and uploader:
 import datetime
 import json
 import logging
-import os
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import click
-import requests
 
 from ingest_wikimedia.banlist import Banlist
-from ingest_wikimedia.dpla import DPLA, INSTITUTIONS_URL
+from ingest_wikimedia.dpla import DPLA
 from ingest_wikimedia.partners import PARTNER_HUBS
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
-from ingest_wikimedia.s3 import APPLICATION_JSON, SDC_FILENAME, S3Client
+from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.sdc import (
-    normalize_rights_uri,
     build_claims_for_doc,
     collect_subject_queries,
+    fetch_institutions_v2,
+    fetch_subjects_json,
+    load_rights_json,
     reconcile_subjects,
 )
 from ingest_wikimedia.slack import notify_phase_start
-from ingest_wikimedia.staging import make_s3_stage_context, stage_item_to_s3
+from ingest_wikimedia.staging import (
+    make_s3_stage_context,
+    stage_item_to_s3,
+    stage_sdc_to_s3,
+)
 
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
@@ -70,49 +74,12 @@ IIIF_MANIFEST_FIELD = "iiifManifest"
 MEDIA_MASTER_FIELD = "mediaMaster"
 IS_SHOWN_AT_FIELD = "isShownAt"
 
-# SDC pre-compute inputs. subjects.json is the DPLA-subject → Wikidata-Q-ID
-# map used to populate P921 alongside the string-form P4272. rights.json is
-# the small SDC-specific copyright mapping vendored in this repo.
-SUBJECTS_URL = (
-    "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
-    "src/main/resources/subjects.json"
-)
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 # isShownAt URL patterns from which a IIIF manifest can be formulaically
 # derived, expressed as ES wildcard values.  Extend this list as new DAMs
 # with predictable IIIF paths are identified.
 IIIF_DERIVABLE_ISSHOWNAT_PATTERNS = [
     "*/cdm/ref/collection/*/id/*",  # CONTENTdm
 ]
-
-
-def fetch_institutions_v2() -> dict:
-    """Fetch the full institutions_v2.json document used for hub/institution
-    eligibility and (in the SDC pre-compute pass) Wikidata-ID resolution."""
-    resp = requests.get(INSTITUTIONS_URL, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_subjects_json() -> dict:
-    """Fetch the DPLA-subject → Wikidata-ID map used to populate P921.
-
-    Sourced from dpla/ingestion3 alongside institutions_v2.json; fetched
-    fresh per run so upstream changes land in the next sync without a
-    redeploy.
-    """
-    resp = requests.get(SUBJECTS_URL, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def load_rights_json() -> dict:
-    """Load rights.json from the repo root and normalize its keys for
-    scheme-and-slash-insensitive lookup."""
-    with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
-        raw = json.load(f)
-    return {normalize_rights_uri(k): v for k, v in raw.items()}
 
 
 def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
@@ -146,20 +113,6 @@ def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
             eligible.append(inst_name)
 
     return eligible
-
-
-def stage_sdc_to_s3(
-    s3_client: S3Client, partner: str, dpla_id: str, sdc_payload: dict
-) -> None:
-    """Write the per-item sdc.json sidecar to the partner's item prefix.
-
-    Raises on failure so the caller's ThreadPoolExecutor can observe it
-    via future.exception() in the done callback (same pattern as
-    stage_item_to_s3).
-    """
-    s3_client.write_item_file(
-        partner, dpla_id, json.dumps(sdc_payload), SDC_FILENAME, APPLICATION_JSON
-    )
 
 
 def build_query(
@@ -228,7 +181,33 @@ def build_query(
         " one --institution (collection scoping is per-institution)."
     ),
 )
-def main(partner: str, institutions: tuple[str, ...], collection: str | None) -> None:
+@click.option(
+    "--single-id",
+    "single_id",
+    default=None,
+    help=(
+        "Re-stage dpla-map.json + sdc.json for exactly ONE DPLA ID, then"
+        " print that ID to stdout. Skips the hub-level eligibility scan;"
+        " the operator is presumed to have already verified eligibility"
+        " (e.g. via the launch script's ``resolve-dpla-ids`` pre-check)."
+        " Mutually exclusive with ``--institution`` and ``--collection``."
+        " Used by the launch script's single-item path so a"
+        " ``/wikimedia-upload <dpla-id>`` run picks up the latest mapping"
+        " code in ``build_claims_for_doc`` — without this, the sdc-sync"
+        " step diffs against whatever sdc.json the partner's last full"
+        " run produced, silently missing any subsequent mapping changes."
+        " Eligibility is a SNAPSHOT taken at ``resolve-dpla-ids`` time;"
+        " if institutions_v2.json drifts (e.g. ``upload`` flag flipped"
+        " off) between submit and Phase 3, ``--single-id`` does NOT"
+        " re-check — the operator's submission is treated as authoritative."
+    ),
+)
+def main(
+    partner: str,
+    institutions: tuple[str, ...],
+    collection: str | None,
+    single_id: str | None,
+) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
     Also stages each item's full metadata to S3 (dpla-map.json) so the
@@ -239,7 +218,21 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
     belonging to any of the listed institutions in one combined run.
     No ``--institution`` flags means "all eligible institutions for
     this hub" (the existing hub-level behaviour).
+
+    ``--single-id`` switches to a per-ID branch: skip the hub-wide ES
+    scan, fetch the one document by ID, run the same Phase 1 → 2 → 3
+    pipeline on a list of one, and emit the single ID. Used by the
+    launch script's ``/wikimedia-upload <dpla-id>`` path so single-item
+    runs pick up the latest mapping code.
     """
+    if single_id is not None and (institutions or collection):
+        print(
+            "--single-id cannot be combined with --institution or --collection"
+            " (single-id mode targets exactly one document by ID).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if collection is not None:
         collection = collection.strip()
         if not collection:
@@ -308,11 +301,36 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
     dpla_ids: list[str] = []
     subject_queries: set[tuple[str, str]] = set()
 
+    # Single-ID mode: pre-check the banlist BEFORE the ES round-trip so the
+    # operator gets a distinct ``banlisted`` error rather than the generic
+    # ``no document from ES`` message — the two failures need different
+    # remediation (banlist edit vs. ES indexing investigation).
+    if single_id is not None and banlist.is_banned(single_id):
+        print(
+            f"Error: --single-id {single_id} is on the banlist; remove it"
+            " from dpla-id-banlist.txt to proceed.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         while True:
-            query = build_query(
-                provider_name, eligible_dp_names, collection, search_after
-            )
+            if single_id is not None:
+                # Single-ID branch: bypass the hub-eligibility filter entirely
+                # and look the document up by its DPLA ID. The operator already
+                # vouched for eligibility upstream (resolve-dpla-ids runs
+                # before the tmux session is even launched), so applying the
+                # rightsCategory / institution-upload-flag gates here would
+                # only cause confusing failures when those gates drift.
+                # ``size: 2`` (not 1) so the defensive ``len(hits) != 1``
+                # check below is actually REACHABLE. With size=1 ES caps
+                # the response and the >1 defense never fires, which
+                # defeats its purpose against stale-replica duplicates.
+                query = {"query": {"term": {"id": single_id}}, "size": 2}
+            else:
+                query = build_query(
+                    provider_name, eligible_dp_names, collection, search_after
+                )
             response = post_es(query)
             response.raise_for_status()
             page = response.json()
@@ -321,6 +339,32 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
 
             if not hits:
                 break
+
+            if single_id is not None:
+                # Defense-in-depth against ES returning more than one hit
+                # (shouldn't with a properly unique ``id`` field but stale-
+                # replica or reindex-cutover scenarios have surfaced
+                # duplicates in the past — see the ``size: 2`` request
+                # above) and against ID normalization on the ES side (e.g. if
+                # the field analyser ever changed). Bail loudly rather than
+                # silently staging the wrong document — single-id mode skips
+                # the hub-eligibility filter, so we have no other guardrail.
+                if len(hits) != 1:
+                    print(
+                        f"Error: --single-id {single_id} returned"
+                        f" {len(hits)} hits from ES; expected exactly 1.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
+                returned_id = hits[0]["_source"].get("id")
+                if returned_id != single_id:
+                    print(
+                        f"Error: --single-id {single_id} returned a document"
+                        f" with id={returned_id!r}; refusing to stage under a"
+                        " mismatched key.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
 
             for hit in hits:
                 source = hit["_source"]
@@ -354,7 +398,24 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
 
                 print(dpla_id)
 
+            if single_id is not None:
+                # No pagination — single-id mode is a one-shot lookup.
+                break
             search_after = hits[-1]["sort"]
+
+    if single_id is not None and not dpla_ids:
+        # ES had no document for this ID. (The banlist case is short-
+        # circuited above with its own distinct error, and the per-hit
+        # ID-mismatch / >1-hit cases also raise with their own messages,
+        # so reaching this branch means ES genuinely returned an empty
+        # hits array.) Non-zero exit so the launch script's tmux chain
+        # short-circuits before downloader/uploader/sdc-sync run against
+        # an empty CSV.
+        print(
+            f"Error: --single-id {single_id} returned no document from ES.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     if failed[0]:
         print(f"Error: {failed[0]} dpla-map.json writes failed", file=sys.stderr)
