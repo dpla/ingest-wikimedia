@@ -1401,16 +1401,19 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
         return
 
     claimid = target_stmt["id"]
-    existing_p2699_values = [
-        q["datavalue"]["value"]
-        for q in (target_stmt.get("qualifiers", {}).get("P2699") or [])
-        if q.get("snaktype") == "value" and q.get("datavalue")
-    ]
-    existing_p6108_values = [
-        q["datavalue"]["value"]
-        for q in (target_stmt.get("qualifiers", {}).get("P6108") or [])
-        if q.get("snaktype") == "value" and q.get("datavalue")
-    ]
+
+    def _qual_values(stmt, prop):
+        out = []
+        for q in stmt.get("qualifiers", {}).get(prop, []) or []:
+            if q.get("snaktype") != "value":
+                continue
+            dv = q.get("datavalue")
+            if isinstance(dv, dict) and "value" in dv:
+                out.append(dv["value"])
+        return out
+
+    existing_p2699_values = _qual_values(target_stmt, "P2699")
+    existing_p6108_values = _qual_values(target_stmt, "P6108")
 
     amended = False
     if download_url and download_url not in existing_p2699_values:
