@@ -228,7 +228,33 @@ def build_query(
         " one --institution (collection scoping is per-institution)."
     ),
 )
-def main(partner: str, institutions: tuple[str, ...], collection: str | None) -> None:
+@click.option(
+    "--single-id",
+    "single_id",
+    default=None,
+    help=(
+        "Re-stage dpla-map.json + sdc.json for exactly ONE DPLA ID, then"
+        " print that ID to stdout. Skips the hub-level eligibility scan;"
+        " the operator is presumed to have already verified eligibility"
+        " (e.g. via the launch script's ``resolve-dpla-ids`` pre-check)."
+        " Mutually exclusive with ``--institution`` and ``--collection``."
+        " Used by the launch script's single-item path so a"
+        " ``/wikimedia-upload <dpla-id>`` run picks up the latest mapping"
+        " code in ``build_claims_for_doc`` — without this, the sdc-sync"
+        " step diffs against whatever sdc.json the partner's last full"
+        " run produced, silently missing any subsequent mapping changes."
+        " Eligibility is a SNAPSHOT taken at ``resolve-dpla-ids`` time;"
+        " if institutions_v2.json drifts (e.g. ``upload`` flag flipped"
+        " off) between submit and Phase 3, ``--single-id`` does NOT"
+        " re-check — the operator's submission is treated as authoritative."
+    ),
+)
+def main(
+    partner: str,
+    institutions: tuple[str, ...],
+    collection: str | None,
+    single_id: str | None,
+) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
     Also stages each item's full metadata to S3 (dpla-map.json) so the
@@ -239,7 +265,21 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
     belonging to any of the listed institutions in one combined run.
     No ``--institution`` flags means "all eligible institutions for
     this hub" (the existing hub-level behaviour).
+
+    ``--single-id`` switches to a per-ID branch: skip the hub-wide ES
+    scan, fetch the one document by ID, run the same Phase 1 → 2 → 3
+    pipeline on a list of one, and emit the single ID. Used by the
+    launch script's ``/wikimedia-upload <dpla-id>`` path so single-item
+    runs pick up the latest mapping code.
     """
+    if single_id is not None and (institutions or collection):
+        print(
+            "--single-id cannot be combined with --institution or --collection"
+            " (single-id mode targets exactly one document by ID).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if collection is not None:
         collection = collection.strip()
         if not collection:
@@ -308,11 +348,32 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
     dpla_ids: list[str] = []
     subject_queries: set[tuple[str, str]] = set()
 
+    # Single-ID mode: pre-check the banlist BEFORE the ES round-trip so the
+    # operator gets a distinct ``banlisted`` error rather than the generic
+    # ``no document from ES`` message — the two failures need different
+    # remediation (banlist edit vs. ES indexing investigation).
+    if single_id is not None and banlist.is_banned(single_id):
+        print(
+            f"Error: --single-id {single_id} is on the banlist; remove it"
+            " from dpla-id-banlist.txt to proceed.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     with ThreadPoolExecutor(max_workers=S3_WRITE_WORKERS) as executor:
         while True:
-            query = build_query(
-                provider_name, eligible_dp_names, collection, search_after
-            )
+            if single_id is not None:
+                # Single-ID branch: bypass the hub-eligibility filter entirely
+                # and look the document up by its DPLA ID. The operator already
+                # vouched for eligibility upstream (resolve-dpla-ids runs
+                # before the tmux session is even launched), so applying the
+                # rightsCategory / institution-upload-flag gates here would
+                # only cause confusing failures when those gates drift.
+                query = {"query": {"term": {"id": single_id}}, "size": 1}
+            else:
+                query = build_query(
+                    provider_name, eligible_dp_names, collection, search_after
+                )
             response = post_es(query)
             response.raise_for_status()
             page = response.json()
@@ -321,6 +382,31 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
 
             if not hits:
                 break
+
+            if single_id is not None:
+                # Defense-in-depth against ES returning more than one hit
+                # (shouldn't with ``size: 1`` but stale-replica or
+                # reindex-cutover scenarios have surfaced duplicates in the
+                # past) and against ID normalization on the ES side (e.g. if
+                # the field analyser ever changed). Bail loudly rather than
+                # silently staging the wrong document — single-id mode skips
+                # the hub-eligibility filter, so we have no other guardrail.
+                if len(hits) != 1:
+                    print(
+                        f"Error: --single-id {single_id} returned"
+                        f" {len(hits)} hits from ES; expected exactly 1.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
+                returned_id = hits[0]["_source"].get("id")
+                if returned_id != single_id:
+                    print(
+                        f"Error: --single-id {single_id} returned a document"
+                        f" with id={returned_id!r}; refusing to stage under a"
+                        " mismatched key.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(1)
 
             for hit in hits:
                 source = hit["_source"]
@@ -354,7 +440,24 @@ def main(partner: str, institutions: tuple[str, ...], collection: str | None) ->
 
                 print(dpla_id)
 
+            if single_id is not None:
+                # No pagination — single-id mode is a one-shot lookup.
+                break
             search_after = hits[-1]["sort"]
+
+    if single_id is not None and not dpla_ids:
+        # ES had no document for this ID. (The banlist case is short-
+        # circuited above with its own distinct error, and the per-hit
+        # ID-mismatch / >1-hit cases also raise with their own messages,
+        # so reaching this branch means ES genuinely returned an empty
+        # hits array.) Non-zero exit so the launch script's tmux chain
+        # short-circuits before downloader/uploader/sdc-sync run against
+        # an empty CSV.
+        print(
+            f"Error: --single-id {single_id} returned no document from ES.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     if failed[0]:
         print(f"Error: {failed[0]} dpla-map.json writes failed", file=sys.stderr)

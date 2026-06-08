@@ -129,3 +129,188 @@ def test_unknown_institution_rejected_with_clear_message():
     assert result.exit_code == 1, result.output
     assert "not upload-eligible" in result.output
     assert "Nonexistent Institution" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --single-id mode — re-stage one DPLA item's sidecars so the per-item
+# launch path (``/wikimedia-upload <dpla-id>``) actually exercises the
+# latest mapping code, instead of diffing sdc-sync against whatever
+# sdc.json the partner's last full run produced.
+# ---------------------------------------------------------------------------
+
+
+def test_single_id_rejects_combined_with_institution():
+    """--single-id targets exactly one doc by ID; combining it with
+    --institution makes no sense (the institution filter would be
+    ignored or would unexpectedly hide the requested ID)."""
+    result = _invoke(
+        "bpl",
+        "--single-id",
+        "deadbeefcafe00000000000000000000",
+        "--institution",
+        "Boston Public Library",
+    )
+    assert result.exit_code == 1, result.output
+    assert "cannot be combined with --institution" in result.output
+
+
+def test_single_id_rejects_combined_with_collection():
+    """Same defense for --collection."""
+    result = _invoke(
+        "bpl",
+        "--single-id",
+        "deadbeefcafe00000000000000000000",
+        "--collection",
+        "Some Collection",
+    )
+    assert result.exit_code == 1, result.output
+    assert "cannot be combined with --institution or --collection" in result.output
+
+
+def _invoke_single_id(single_id, hits):
+    """Invoke get-ids-es with --single-id, mocking out ES + S3 + reconci.link
+    so the test exercises validation, query construction, and the
+    not-found vs found code paths without external calls."""
+    from unittest.mock import MagicMock
+
+    from tools import get_ids_es
+
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"hits": {"hits": hits}}
+    fake_response.raise_for_status.return_value = None
+
+    with (
+        patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        patch.object(get_ids_es, "notify_phase_start"),
+        patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
+        patch.object(
+            get_ids_es,
+            "fetch_institutions_v2",
+            return_value={
+                "Digital Commonwealth": {
+                    "Wikidata": "Q12345",
+                    "institutions": {
+                        "Boston Public Library": {"upload": True, "Wikidata": "Q1001"},
+                    },
+                }
+            },
+        ),
+        patch.object(get_ids_es, "load_rights_json", return_value={}),
+        patch.object(get_ids_es, "fetch_subjects_json", return_value={}),
+        patch.object(get_ids_es, "post_es", return_value=fake_response) as post_es_mock,
+        patch.object(get_ids_es, "check_es_response"),
+        patch.object(get_ids_es, "stage_item_to_s3"),
+        patch.object(get_ids_es.Banlist, "is_banned", return_value=False),
+        patch.object(get_ids_es, "reconcile_subjects", return_value={}),
+        patch.object(get_ids_es, "build_claims_for_doc", return_value={"claims": []}),
+        patch("ingest_wikimedia.s3.S3Client.get_item_metadata", return_value="{}"),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(get_ids_es.main, ["bpl", "--single-id", single_id])
+        return result, post_es_mock
+
+
+def test_single_id_builds_term_query_not_paginated_filter():
+    """--single-id must query ES by exact DPLA-ID term, NOT via
+    ``build_query``'s hub-wide filter. Otherwise the rightsCategory /
+    institution-upload-flag gates could silently hide the requested ID,
+    defeating the operator's explicit single-item invocation."""
+    fake_id = "deadbeefcafe00000000000000000000"
+    fake_hit = {
+        "_source": {
+            "id": fake_id,
+            "provider": {"name": "Digital Commonwealth"},
+            "dataProvider": {"name": "Boston Public Library"},
+            "mediaMaster": ["http://example.org/img.jpg"],
+            "sourceResource": {"title": ["x"]},
+        }
+    }
+    result, post_es_mock = _invoke_single_id(fake_id, [fake_hit])
+
+    assert result.exit_code == 0, result.output
+    # The single document was printed.
+    assert fake_id in result.output
+    # The ES query was a one-shot term lookup, not a paginated filter
+    # built by build_query (which would include rightsCategory /
+    # eligible-dp-names filters that single-id is meant to bypass).
+    sent_query = post_es_mock.call_args[0][0]
+    assert sent_query == {"query": {"term": {"id": fake_id}}, "size": 1}
+
+
+def test_single_id_exits_nonzero_when_es_has_no_match():
+    """ID not in ES → exit code 1 with a clear error message. The launch
+    script's tmux chain relies on the non-zero exit to short-circuit
+    the downstream downloader/uploader/sdc-sync (which would otherwise
+    run against an empty CSV and produce confusing 0-item summaries)."""
+    fake_id = "deadbeefcafe00000000000000000000"
+    result, _ = _invoke_single_id(fake_id, [])
+    assert result.exit_code == 1, result.output
+    assert fake_id in result.output
+    assert "no document" in result.output
+
+
+def test_single_id_banlist_hit_gets_distinct_error():
+    """A banlisted ID must produce a ``banlist``-specific error message,
+    not the generic ``no document from ES`` one. Operationally distinct:
+    fixing a banlist hit is a one-line edit to dpla-id-banlist.txt,
+    whereas a missing-from-ES hit needs an indexing investigation. The
+    Slack failure handler surfaces this message verbatim, so the wording
+    has to point on-call at the right remediation."""
+    from unittest.mock import MagicMock
+
+    from tools import get_ids_es
+
+    fake_id = "deadbeefcafe00000000000000000000"
+    # post_es should NEVER be called when the banlist check short-circuits.
+    post_es_mock = MagicMock(
+        side_effect=AssertionError("ES round-trip skipped on banlist hit")
+    )
+    with (
+        patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        patch.object(get_ids_es, "notify_phase_start"),
+        patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
+        patch.object(
+            get_ids_es,
+            "fetch_institutions_v2",
+            return_value={
+                "Digital Commonwealth": {
+                    "Wikidata": "Q12345",
+                    "institutions": {
+                        "Boston Public Library": {"upload": True, "Wikidata": "Q1001"},
+                    },
+                }
+            },
+        ),
+        patch.object(get_ids_es, "load_rights_json", return_value={}),
+        patch.object(get_ids_es, "fetch_subjects_json", return_value={}),
+        patch.object(get_ids_es.Banlist, "is_banned", return_value=True),
+        patch.object(get_ids_es, "post_es", post_es_mock),
+    ):
+        runner = CliRunner()
+        result = runner.invoke(get_ids_es.main, ["bpl", "--single-id", fake_id])
+
+    assert result.exit_code == 1, result.output
+    assert "banlist" in result.output
+    assert fake_id in result.output
+
+
+def test_single_id_rejects_mismatched_id_from_es():
+    """Defense-in-depth: if ES returns a document whose ``_source.id``
+    differs from the queried ID (would indicate either an index
+    normalization regression or stale-replica weirdness), refuse to
+    stage under the wrong key. The dpla-map.json S3 path is keyed by
+    the source ID; staging under a mismatched key would orphan the
+    object from the downstream downloader/uploader."""
+    queried = "deadbeefcafe00000000000000000000"
+    returned_id = "aaaabbbbccccddddeeeeffff00000000"
+    hit = {
+        "_source": {
+            "id": returned_id,
+            "provider": {"name": "Digital Commonwealth"},
+            "dataProvider": {"name": "Boston Public Library"},
+        }
+    }
+    result, _ = _invoke_single_id(queried, [hit])
+    assert result.exit_code == 1, result.output
+    assert "mismatched" in result.output
+    assert returned_id in result.output
