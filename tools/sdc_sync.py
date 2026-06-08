@@ -338,46 +338,12 @@ def formattedclaim(prop, value, value_type, dpla_id):
     return serialized
 
 
-# Adds a missing qualifier to an existing claim via ``wbsetqualifier``.
-# Currently only used for P459 (determination method). The POST is
-# submitted through pywikibot's ``site.simple_request``, which manages
-# the CSRF token and retries on transient errors automatically.
-
-
-def postqual(claimid, prop, value):
-    """Add a qualifier to an existing claim via ``wbsetqualifier``.
-
-    Routed through ``site.simple_request`` so pywikibot handles CSRF token
-    refresh, ``maxlag`` / ``Retry-After`` honoring, exponential backoff on
-    transient errors, and auto-relogin on ``badtoken`` — all automatically.
-    Replaces a hand-rolled refresh-token-and-retry-once pattern that didn't
-    cover ``maxlag`` or rate-limit signaling.
-
-    Best-effort: a final failure logs and continues; the partner is not
-    aborted for a missing qualifier amendment.
-    """
-    summary = f"Adding [[:d:Property:{prop}]] to {claimid}."
-    try:
-        site.simple_request(
-            action="wbsetqualifier",
-            claim=claimid,
-            property=prop,
-            snaktype="value",
-            value=value,
-            bot=True,
-            summary=summary,
-            token=site.tokens["csrf"],
-        ).submit()
-        pywikibot.output(summary)
-    except pywikibot.exceptions.APIError as e:
-        # Log and continue — qualifier amends are best-effort, and pywikibot
-        # has already exhausted its built-in retry policy by the time an
-        # APIError surfaces here. Surface the Commons error code so it's
-        # diagnosable from the log without needing to enable verbose tracing.
-        print(
-            f" -- Failed to amend qualifier {prop} for {claimid}:"
-            f" {e.code} — {getattr(e, 'info', '')}"
-        )
+# NOTE: ``postqual`` (wbsetqualifier POST) and ``wbremovequalifiers``
+# direct POSTs have been removed. The qualifier add and remove
+# operations route through the per-file dispatcher
+# (``_submit_per_item_edit``), which folds them into a single
+# wbeditentity per file. See ``_build_qualifier_update_fragments`` and
+# ``_flush_per_file_edits``.
 
 
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
@@ -2079,6 +2045,103 @@ def _build_qualifier_update_fragments(mediaid):
     return fragments
 
 
+def _build_p813_refresh_fragments(mediaid, dpla_id, already_touched_ids):
+    """Build reference-update fragments that refresh the ``P813``
+    (retrieved on) date in each DPLA-authored claim's reference to
+    today's date.
+
+    Only fires for claims NOT already covered by another fragment in
+    this file's edit (``already_touched_ids``). For each remaining
+    DPLA-authored claim on the file, we replace just the DPLA reference
+    in the claim's references list, leaving any user-added references
+    untouched. Claims whose DPLA reference's P813 is already today's
+    date are skipped — no spurious edit on already-fresh references.
+
+    Conditional on the dispatcher already deciding to make some other
+    edit on this file (the call site only constructs these fragments
+    when ``combined_claims`` is otherwise non-empty). The point is to
+    refresh "as-of" dates across every DPLA assertion on a file we're
+    touching anyway, signalling to downstream consumers that the
+    metadata was re-verified against DPLA on that date — without
+    introducing a wave of edits on files where nothing else changed.
+    """
+    import copy as _copy
+
+    today_p813_snak = _build_p813_snak(datetime.date.today())
+    entity = get_entity(mediaid)
+    fragments = []
+    for prop_stmts in (entity.get("statements") or {}).values():
+        for stmt in prop_stmts:
+            stmt_id = stmt.get("id")
+            if not stmt_id or stmt_id in already_touched_ids:
+                continue
+            existing_refs = stmt.get("references") or []
+            if not existing_refs:
+                continue
+            # Locate the DPLA reference; preserve every user-added
+            # reference unchanged. If multiple references match (rare;
+            # legacy duplicates) refresh all of them.
+            new_refs = []
+            changed = False
+            for ref in existing_refs:
+                if not _is_dpla_reference(ref):
+                    new_refs.append(ref)
+                    continue
+                if _p813_already_today(ref):
+                    new_refs.append(ref)
+                    continue
+                refreshed = _copy.deepcopy(ref)
+                refreshed.setdefault("snaks", {})["P813"] = [today_p813_snak]
+                # Drop the snaks-hashes for the refreshed P813 so
+                # Wikibase recomputes it on save (the snak content
+                # changed); leave the other snaks alone.
+                snaks_order = refreshed.get("snaks-order") or []
+                if "P813" not in snaks_order:
+                    snaks_order = list(snaks_order) + ["P813"]
+                    refreshed["snaks-order"] = snaks_order
+                new_refs.append(refreshed)
+                changed = True
+            if changed:
+                fragments.append({"id": stmt_id, "references": new_refs})
+    return fragments
+
+
+def _build_p813_snak(retrieval_date):
+    """Build the P813 (retrieved on) snak for the standard DPLA
+    reference shape — calendarmodel Gregorian, precision day."""
+    return {
+        "snaktype": "value",
+        "property": "P813",
+        "datavalue": {
+            "value": {
+                "time": "+" + retrieval_date.isoformat() + "T00:00:00Z",
+                "timezone": 0,
+                "before": 0,
+                "after": 0,
+                "precision": 11,
+                "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+            },
+            "type": "time",
+        },
+    }
+
+
+def _p813_already_today(reference):
+    """Return True iff the reference's P813 (retrieved on) snak already
+    carries today's date in its time value. Avoids emitting spurious
+    edits on references that were already refreshed today (e.g. an
+    item processed twice in the same UTC day).
+    """
+    today_iso = "+" + datetime.date.today().isoformat() + "T00:00:00Z"
+    for snak in (reference.get("snaks") or {}).get("P813") or []:
+        try:
+            if snak["datavalue"]["value"]["time"] == today_iso:
+                return True
+        except (KeyError, TypeError):
+            continue
+    return False
+
+
 def _flush_per_file_edits(mediaid, dpla_id):
     """Drain every per-file accumulator into a single ``wbeditentity``
     POST via :func:`_submit_per_item_edit`. Called at the end of each
@@ -2086,11 +2149,37 @@ def _flush_per_file_edits(mediaid, dpla_id):
     the one POST per file that replaces the previous five-to-seven
     separate API calls.
 
+    When any other edit fragments are present, opportunistically refresh
+    the ``P813`` (retrieved on) date on every other DPLA-authored claim
+    on the file to today. The premise: the bot has just re-verified the
+    file's structured data against DPLA's current source metadata, so
+    every DPLA assertion on the file is effectively "as-of today" — that
+    information is useful to downstream consumers and free to write
+    inside an edit we're making anyway. No spurious edits when the file
+    has nothing else to change.
+
     After a successful write, invalidate the cached entity once so any
     follow-up code reading from cache picks up the new revision.
     """
     qualifier_fragments = _build_qualifier_update_fragments(mediaid)
     removal_fragments = [{"id": cid, "remove": ""} for cid in removals]
+    reference_updates = list(refclaims["claims"])
+
+    has_any_other_edit = bool(
+        claims["claims"]
+        or reference_updates
+        or qualifier_fragments
+        or removal_fragments
+    )
+    if has_any_other_edit:
+        touched_ids = set()
+        for frag in qualifier_fragments + removal_fragments + reference_updates:
+            fid = frag.get("id")
+            if fid:
+                touched_ids.add(fid)
+        reference_updates.extend(
+            _build_p813_refresh_fragments(mediaid, dpla_id, touched_ids)
+        )
 
     _submit_per_item_edit(
         mediaid,
@@ -2101,7 +2190,7 @@ def _flush_per_file_edits(mediaid, dpla_id):
             f" [[COM:DPLA/MOD|Leave feedback]]!"
         ),
         new_claims=claims["claims"],
-        reference_updates=refclaims["claims"],
+        reference_updates=reference_updates,
         qualifier_updates=qualifier_fragments,
         removals=removal_fragments,
     )
