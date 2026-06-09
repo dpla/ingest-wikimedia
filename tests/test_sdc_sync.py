@@ -3129,6 +3129,7 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
     }
     amend_target = {
         "id": "M999$amend",
+        "rank": "preferred",
         "mainsnak": {
             "property": "P7482",
             "snaktype": "value",
@@ -3138,6 +3139,7 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
             },
         },
         "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abcdef")],
     }
     entity = {
         "pageid": 999,
@@ -3191,4 +3193,19 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
             f"non-removal fragment missing mainsnak — wbeditentity "
             f"would reject the bundle: {claim!r}"
         )
+    # Sibling-field preservation: wbeditentity wholesale-replaces every
+    # field provided, so a fragment that drops the sibling field (e.g.
+    # qualifier-update without ``references``) would silently erase
+    # those references on the live statement. Catch both the rejection
+    # path AND the silent-data-loss side by asserting each fragment
+    # kind preserves the fields it isn't supposed to modify.
+    assert by_id["M999$amend"]["references"] == amend_target["references"], (
+        "qualifier-update fragment must preserve existing references"
+    )
+    assert by_id["M999$amend"]["rank"] == "preferred", (
+        "qualifier-update fragment must preserve existing rank"
+    )
+    assert by_id["M999$stale"]["qualifiers"] == stale_claim["qualifiers"], (
+        "P813 refresh fragment must preserve existing qualifiers"
+    )
     sdc_sync._reset_per_file_accumulators()
