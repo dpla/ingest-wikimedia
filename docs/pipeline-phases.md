@@ -2,7 +2,7 @@
 
 Four sequential phases per target. All four are idempotent — re-running picks up where it left off. All four operate per-partner, reading and writing under `s3://dpla-wikimedia/<partner>/images/<sharded-prefix>/<dpla-id>/` (see [sidecars.md](sidecars.md) for the path layout and file inventory).
 
-```
+```text
 get-ids-es  →  downloader  →  uploader  →  sdc-sync
    ▼              ▼            ▼              ▼
 dpla-map.json   media bytes   Commons         MediaInfo

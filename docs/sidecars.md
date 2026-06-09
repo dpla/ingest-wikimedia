@@ -2,7 +2,7 @@
 
 The four pipeline phases communicate via JSON / text sidecar files in S3, plus the media bytes themselves. Every sidecar for a DPLA item lives under one prefix:
 
-```
+```text
 s3://dpla-wikimedia/<partner>/images/<a>/<b>/<c>/<d>/<dpla-id>/
 ```
 

@@ -108,9 +108,9 @@ No code changes have landed for this transition yet; no TODO/FIXME comments in `
 
 A summary diagram:
 
-```
+```text
             ┌──────────────────────────────────────────────┐
-            │  S3 sidecars (from get-ids-es Phase 3)       │
+            │  S3 sidecars (from get-ids-es, Phase 1)      │
             │    dpla-map.json      ──┐                    │
             │    sdc.json           ──┘                    │
             └────────┬─────────────────────────────────────┘

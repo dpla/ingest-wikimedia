@@ -91,7 +91,7 @@ This is the bulk of the dispatch logic. In order, it:
 2. **Resolves targets.** QIDs are looked up against `institutions_v2.json` (live-fetched from `github.com/dpla/ingestion3/.../wiki/institutions_v2.json`, module-cached so warm Lambda calls don't refetch). DPLA IDs are batched into one SSM call to `resolve-dpla-ids` on EC2, which does an ES `terms` query and applies the full eligibility filter.
 3. **Checks EC2 memory.** Aborts when available RAM is below 30 %. Each session uses ~300–500 MB on a 7.6 GB instance, so 30 % free leaves room for 4–5 concurrent sessions.
 4. **Detects session conflicts.** Hub-level, institution-level, and collection-level targets define conflict rules so that, e.g., a hub run blocks any institution-level run inside that hub. `force=true` (GH-Actions-manual-only — the Lambda never sets it) kills offending sessions instead of aborting.
-5. **Updates EC2 source code.** Clones `dpla/ingest-wikimedia` at `GITHUB_SHA` into `/tmp` and `cp -r`s `ingest_wikimedia/`, `tools/`, `pyproject.toml`, `uv.lock` onto the EC2 install, then runs `uv sync`. The EC2 install is an editable install, so updated source files take effect immediately.
+5. **Updates EC2 source code.** Clones `dpla/ingest-wikimedia` at `GITHUB_SHA` into `/tmp` and runs `cp -r` over `ingest_wikimedia/`, `tools/`, `pyproject.toml`, `uv.lock` onto the EC2 install, then runs `uv sync`. The EC2 install is an editable install, so updated source files take effect immediately.
 6. **Builds the pipeline shell script.** Each target becomes a `cd <base> && get-ids-es ... && downloader ... && uploader ... && sdc-sync ... || { notify_pipeline_fail; }` block; the blocks are joined with `; ` so one target's failure doesn't abort the batch (only the `&&` chain inside one target).
 7. **Launches the tmux session via SSM.** The script is base64-encoded, written to `/tmp/wm-pipeline-<sha1>.sh` on EC2, then started under `tmux new-session -d -s <session_name> -c <cwd> 'bash <script>'`. Base64 avoids SSM's command-length cap (~25 KB) and shell-metacharacter escaping issues — large batches of 20+ targets hit the cap before this change.
 8. **Posts a launch confirmation** to #tech-alerts.
@@ -100,7 +100,7 @@ This is the bulk of the dispatch logic. In order, it:
 
 The tmux session runs detached. For each target block, `bash` exports `WIKIMEDIA_SESSION_LABEL`, `WIKIMEDIA_PARTNER_DIR`, `WIKIMEDIA_TARGET_IS_LAST`, and (for single-item targets) `WIKIMEDIA_SINGLE_ITEM`. These env vars are read by the Slack-notification helpers inside the Python phase tools so completion / failure messages identify the right target.
 
-Phase output is logged to `<partner_dir>/logs/<timestamp>-<label>-<phase>.log` (download / upload / sdc). The status workflow's progress derivation tails these logs.
+Phase output is logged to `<partner_dir>/logs/<timestamp>-<label>-<phase>.log` (download / upload / sdc). The status workflow tails these logs to derive progress.
 
 ## Target resolution
 

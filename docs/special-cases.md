@@ -14,7 +14,7 @@ The uploader carries the bulk of the pipeline's "what if Commons-side state does
 
 `get_page_title()` in `ingest_wikimedia/wikimedia.py` is the single source of truth for Commons file titles. The final form is:
 
-```
+```text
 <sanitized-source-title> - DPLA - <dpla-id>[ (page N)]<extension>
 ```
 
@@ -35,7 +35,7 @@ Applied in order to the first 181 chars of the source title:
 | `� → '` | Unicode replacement char → right single quote |
 | `replace_invisible()` | Strip zero-width / bidi characters that Commons rejects |
 
-There is no separate "title blacklist" file the uploader reads; the rules are encoded as the substitution table above. Each was added in response to a specific incident; the lesson at `~/.claude/lessons.md` under "Title-blacklist character substitutions: guard on the actual rule, not on any single character" captures the most-recent revision (the `&...=` together-only rule replacing an unconditional always-replace-`&` from an earlier version).
+There is no separate "title blacklist" file the uploader reads; the rules are encoded as the substitution table above. Each was added in response to a specific incident: the colon and slash substitutions trace back to NARA imports in May 2026 where the prior code silently orphaned items whose source titles contained mid-title `:` or `/`; the `&...=` together-only rule replaced an earlier unconditional `&`-replacer that was too aggressive (Commons' actual blacklist only matches when both characters appear together, typical of unencoded query-string titles). The pattern in all cases: match the *actual* MediaWiki rejection rule (which usually involves multiple characters together), not any single character in isolation, so the substitution doesn't damage benign titles.
 
 ## Duplicate-detection decision tree
 

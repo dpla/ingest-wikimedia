@@ -186,6 +186,6 @@ The two fragment builders (`_build_qualifier_update_fragments`, `_build_p813_ref
 
 The hash-preserving merge is what keeps a P2699 backfill from re-stamping every existing P973/P137/P459 qualifier as "changed" — the existing snaks come back with their pre-existing hashes, Wikibase recognises them, and the diff shows only the new P2699 snak.
 
-### Lessons file
+### Regression test
 
-The lesson stored at `~/.claude/lessons.md` under "wbeditentity claim entries must carry `type: "statement"`" captures the broader pattern: any hand-built dict appended to `wbeditentity`'s `data.claims` list that isn't a removal must carry `type: "statement"` AND `mainsnak`. Tests that mock `_submit_sdc_write` don't catch this — the fragment shape must be asserted directly against the payload. The regression test `test_flush_emits_type_statement_on_every_non_removal_fragment` does exactly that for every fragment kind.
+The shape contract — every hand-built dict in `wbeditentity`'s `data.claims` list that isn't a removal must carry `type: "statement"` AND `mainsnak` — is asserted by the regression test `test_flush_emits_type_statement_on_every_non_removal_fragment`. Tests that mock `_submit_sdc_write` don't catch this class of bug because they never inspect the actual payload shape; the regression test exercises a realistic mix of fragment kinds (new claim, qualifier amend, P813 refresh, removal) and asserts both fields are present on every non-removal entry of the bundle. New fragment builders should be added to the same scenario so the contract stays enforced.

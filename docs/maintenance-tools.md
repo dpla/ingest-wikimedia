@@ -68,7 +68,7 @@ For eligible items: stages the ES document to S3 as `dpla-map.json` with `_stage
 
 Output (one line per ID, parsed by `wikimedia_launch.py`):
 
-```
+```text
 <id> HUB=<slug>            # eligible
 <id> NOT_FOUND
 <id> INELIGIBLE:<reason>
@@ -107,7 +107,7 @@ Walks `s3://dpla-wikimedia/<partner>/images/` looking for objects whose stored c
 
 Used when the original downloader couldn't determine MIME (typically because the source server returned `application/octet-stream`). Once libmagic identifies the actual type, the uploader can pick a sensible file extension.
 
-The companion `MetadataDirective="REPLACE"` rule applies — `Metadata=dict(s3_object.metadata)` is explicitly passed to preserve the `CHECKSUM` field across the copy. See the lesson at `~/.claude/lessons.md` under "AWS S3 `copy_object` with `MetadataDirective="REPLACE"`".
+The companion `MetadataDirective="REPLACE"` rule applies — `Metadata=dict(s3_object.metadata)` is explicitly passed to preserve the `CHECKSUM` field across the copy. `MetadataDirective="REPLACE"` silently drops every metadata field not provided in the request, so any time you re-stamp an S3 object's content-type (or any other system metadata), you have to pass the existing user metadata back through explicitly or you'll lose the SHA1 and break duplicate detection.
 
 ---
 

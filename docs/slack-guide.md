@@ -16,7 +16,7 @@ Non-technical reference for triggering Wikimedia upload runs from Slack. Every c
 | Stop a running upload | `/wikimedia-upload kill <label>` |
 | See what's running | `/wikimedia-status` |
 
-All commands respond in #tech-alerts (and an immediate ephemeral ack to you).
+Slack-side outcomes (unknown hub, invalid syntax, ineligible institution) come back as ephemeral replies visible only to you. Once the workflow has accepted the command, ongoing progress and completion messages post to #tech-alerts — see [What posts to #tech-alerts](#what-posts-to-tech-alerts-and-what-you-see-ephemerally) at the bottom of this guide for the full split.
 
 ---
 

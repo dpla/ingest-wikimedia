@@ -41,7 +41,7 @@ Pre-commit hooks use [ruff](https://docs.astral.sh/ruff/) for linting and format
 |------|---------|
 | `ingest_wikimedia/` | Shared library: partner registry, ES client, S3, Slack, SSM, Wikimedia API, SDC builders |
 | `tools/` | CLI entry points (`get-ids-es`, `downloader`, `uploader`, `sdc-sync`, plus maintenance utilities) |
-| `scripts/` | GitHub-Actions step scripts (`wikimedia_launch.py`, `wikimedia_kill.py`, `wikimedia_retry.py`, `wikimedia_upload_status.py`) |
+| `scripts/` | GitHub Actions step scripts (`wikimedia_launch.py`, `wikimedia_kill.py`, `wikimedia_retry.py`, `wikimedia_upload_status.py`) |
 | `lambda/wikimedia-slack-dispatch/` | AWS Lambda handler for `/wikimedia-*` Slack slash commands |
 | `.github/workflows/` | Workflow definitions for launch, kill, retry, status, CIM pageviews, plus CI (pytest, ruff, codeql) |
 | `metrics/` | Source for the GitHub-Pages site plus the scheduled `CIMviews.py` bot |

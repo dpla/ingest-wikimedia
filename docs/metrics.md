@@ -40,7 +40,8 @@ For every Commons category that transcludes `{{views from category}}`:
 
 1. Walks `Category:Category with page views table` to enumerate target categories (removing the maintenance subcategory `Category:Category page views need to be updated`).
 2. Calls the Wikimedia Commons-Impact-Metrics REST endpoint:
-   ```
+
+   ```text
    https://wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/<category>/deep/all-wikis/00000101/99991231
    ```
    This returns monthly pageview counts for every wiki that ever displayed a file in the category.
@@ -51,7 +52,7 @@ For every Commons category that transcludes `{{views from category}}`:
 
 ### `--mode categories`
 
-Walks `Category:Category requested for Commons Impact Metrics`. For categories now in the Wikimedia "category allow list" (fetched live from the Airflow DAGs repo at `gitlab.wikimedia.org`), removes the request as fulfilled. For categories not yet in the allow list, adds the request via the standard `{{Commons Impact Metrics request}}` template — unless a request is already pending.
+For categories tracked by `{{views from category}}` but NOT yet in the Wikimedia "category allow list" (fetched live from the Airflow DAGs repo at `gitlab.wikimedia.org`), the bot appends `[[Category:Category requested for Commons Impact Metrics]]` directly to the category page's wikitext via `category.save(...)`. Categories that ARE on the allow list get the same tracking category *removed* via `category.change_category(cimcat, None, ...)` — so `Category:Category requested for Commons Impact Metrics` becomes a self-cleaning queue of pending requests. The bot skips a category whose wikitext already carries the request tag, so re-runs don't duplicate.
 
 In effect: `data` mode publishes the numbers; `categories` mode manages the queue of categories that *should* have numbers published.
 
@@ -77,10 +78,10 @@ Two jobs (`categories`, `data`), each gated by the matching trigger:
 Both jobs do the same setup:
 
 1. Checkout the repo.
-2. Install Python via `actions/setup-python`.
-3. Install `uv`; run `uv sync --no-dev`.
+2. Install `uv` via `astral-sh/setup-uv`.
+3. Run `uv python install` to provision the Python interpreter `uv` will use, then `uv sync --no-dev` to install dependencies.
 4. Build `metrics/cim-pageviews/user-password.py` at runtime via a HEREDOC, embedding `BotPassword('PARTNER_UPLOADS', '<secret>')` where `<secret>` is `secrets.PYWIKIBOT_PASSWORD`. (The committed `user-config.py` references this file but doesn't contain the secret.)
-5. Run `python metrics/cim-pageviews/CIMviews.py --mode <mode>` with `PYWIKIBOT_DIR=metrics/cim-pageviews`.
+5. Run the bot under `uv run`: `uv run python metrics/cim-pageviews/CIMviews.py` (data job, default mode) or `uv run python metrics/cim-pageviews/CIMviews.py --mode categories` (categories job), with `PYWIKIBOT_DIR=metrics/cim-pageviews` exported.
 
 Permissions: `contents: read`. The bot's edits to Commons happen via pywikibot's own auth flow, not GitHub's permissions.
 
@@ -98,11 +99,11 @@ The page does no server-side work; everything is client-side JS in `metrics/metr
    - `?show=dpla` — only categories under the DPLA umbrella (walks Commons' category hierarchy from `Category:Media contributed by the Digital Public Library of America` → hubs → contributing institutions).
    - `?show=<category>` — a single named category.
    - `?hub=<name>` — every contributing institution within one DPLA hub.
-5. For each rendered category, fetches the `Data:Views/<category>.tab` JSON page from Commons via the standard MediaWiki API and renders a Google Chart from the monthly series.
+5. For each rendered category, calls the same Wikimedia Commons-Impact-Metrics REST endpoint the bot writes from (`wikimedia.org/api/rest_v1/metrics/commons-analytics/pageviews-per-category-monthly/<category>/deep/all-wikis/00000101/99991231`) and renders a Google Chart from the monthly series in the response.
 
 A pre-paint inline script (`metrics/index.html` line 11) sets a `.filter-view` class on `<html>` when the URL has a `show` or `hub` parameter — this lets CSS hide the input form without a flash-of-unstyled-content.
 
-There is no server-side state. The bot publishes `Data:` pages on Commons; the GitHub Pages site fetches them client-side. The two systems are decoupled — a change to either doesn't break the other as long as the `Data:Views/<category>.tab` JSON schema stays stable.
+The frontend and the bot read the same REST API, but they're decoupled: the bot writes Commons `Data:Views/<category>.tab` / `.chart` pages so other on-wiki templates and tools can consume the monthly series without hitting the REST endpoint themselves, while this site goes direct to the REST endpoint for freshness. A change to either side doesn't break the other as long as the REST response schema is stable.
 
 ## Why this is separate from the ingest pipeline
 
