@@ -149,7 +149,7 @@ Distinct from `retirer`: nuke hard-deletes everything (sidecars, media, metadata
 
 Source: `tools/get_ids_retry.py`. Invoked by `scripts/wikimedia_retry.py` (which is triggered by `/wikimedia-upload retry`).
 
-Parses recent upload + download logs and classifies failures into two retry types:
+Parses recent upload + download + SDC logs and classifies failures into three retry types:
 
 ### `upload-retry`
 
@@ -171,11 +171,26 @@ Matches `Failed downloading <url>` patterns, excluding the empty-URL IIIF-parser
 
 For these, the S3 bytes are absent — re-run the downloader with `--max-age-days 1` to force a re-fetch of any partial / stale state.
 
+### `sdc-retry`
+
+Matches `-- Ordinal N (Mxxx) for <DPLA-ID>: SDC sync failed; skipping ordinal.` markers in `*-sdc.log`, then classifies the trailing traceback against `SDC_TRANSIENT_ERRORS`:
+
+- `MaxlagTimeoutError`, `maxlag`, `readonly`, `ratelimited` — Wikibase replica lag, read-only mode, rate limiting
+- `ServerError` — HTTP 5xx from MediaWiki / Wikibase
+- `ReadTimeoutError`, `ReadTimeout`, `ConnectTimeoutError`, `EndpointConnectionError`, `ChunkedEncodingError`, `ProtocolError`, `ConnectionError` — botocore / requests / urllib3 transients
+- `internal_api_error_DBQueryError`, `internal_api_error_DBConnectionError` — MediaWiki API DB blips
+- `editconflict`, `failed-save` — race / save retry storm
+- `SlowDown`, `RequestTimeout`, `ServiceUnavailable`, `InternalError` — S3 transients during sidecar reads
+
+Structural failures (`invalid-claim`, `permissiondenied`, `no-such-entity`, code bugs like `KeyError` / `AttributeError`) are deliberately excluded — re-running won't help, so they're left to surface in the next regular sync where an operator will catch them and fix the underlying issue.
+
+For SDC retries, just re-run `sdc-sync --partner <slug> --ids-file <csv>`. The SDC sync is idempotent so the IDs that were already done re-run as no-ops; only the ones that hit transient failures actually write.
+
 ### Output
 
 One CSV per partner per type to `--output-dir` (default `<INGEST_WIKIMEDIA_DIR>/retry/`). Logs are processed oldest-first per partner so a later clean run can supersede an earlier failure for the same item.
 
-The retry script merges upload-retry + download-retry CSVs per hub into one combined `<slug>-retry-<days>d-combined.csv` and runs the uploader once on the combined list, so an operator sees one "Retry Complete" summary per hub instead of one-per-type.
+The retry script merges upload-retry + download-retry CSVs per hub into one combined `<slug>-retry-<days>d-combined.csv` and runs the uploader once on the combined list, so an operator sees one "Retry Complete" summary per hub instead of one-per-type. If an SDC-retry CSV also exists for the same hub, `sdc-sync` runs as a final step after the uploader so it sees the freshly-refreshed `upload-result.json` sidecars. An SDC-only retry (no upload / download failures) skips the uploader and downloader entirely.
 
 ---
 

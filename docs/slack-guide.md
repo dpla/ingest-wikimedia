@@ -150,7 +150,7 @@ The downloader is invoked with `--notify-complete` so a #tech-alerts summary fir
 
 ## 8. Retry recent failures
 
-`/wikimedia-upload retry <days> [<hub>]` scans the last N days of upload + download logs across all partners (or one, if specified), classifies retryable failures, and launches new uploader / downloader runs to clean them up.
+`/wikimedia-upload retry <days> [<hub>]` scans the last N days of upload + download + SDC logs across all partners (or one, if specified), classifies retryable failures, and launches new uploader / downloader / sdc-sync runs to clean them up.
 
 ```text
 /wikimedia-upload retry 7              # all partners, last 7 days
@@ -159,8 +159,11 @@ The downloader is invoked with `--notify-complete` so a #tech-alerts summary fir
 
 Retryable failure types (see [maintenance-tools.md](maintenance-tools.md#get-ids-retry) for the full list):
 
-- Upload-side: `lockmanager-fail-conflict`, `stashfailed: Could not acquire lock`, `backend-fail-internal`, hash drift, redirect collisions.
-- Download-side: `Failed downloading <url>` (excluding the empty-URL IIIF bug pattern).
+- **Upload-side:** `lockmanager-fail-conflict`, `stashfailed: Could not acquire lock`, `backend-fail-internal`, hash drift, redirect collisions.
+- **Download-side:** `Failed downloading <url>` (excluding the empty-URL IIIF bug pattern).
+- **SDC-side:** Wikibase API transients (`MaxlagTimeoutError`, replica lag, rate limiting, 5xx, network blips, `editconflict`, `readonly`). Structural failures (`invalid-claim`, `permissiondenied`, `no-such-entity`, code bugs) are deliberately excluded — re-running wouldn't help.
+
+When a hub has both upload and SDC failures, the retry pipeline runs upload first, then SDC — so `sdc-sync` sees the freshly-refreshed `upload-result.json` from the upload step. SDC-only retries (e.g. a one-off maxlag spike during an otherwise clean SDC pass) skip the uploader and downloader entirely.
 
 The retry response is ephemeral (only you see the immediate Slack reply); the actual retry session posts to #tech-alerts normally once it starts.
 

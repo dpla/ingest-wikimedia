@@ -498,3 +498,49 @@ def test_retry_clears_stale_csvs_even_when_no_partner_given():
     assert "rm -f" in scan_cmd
     assert "*-retry.csv" in scan_cmd
     assert scan_cmd.find("rm -f") < scan_cmd.find("get-ids-retry")
+
+
+def test_retry_sdc_only_csv_runs_sdc_sync_step():
+    """When only an sdc-retry CSV exists for a hub, the pipeline runs
+    sdc-sync (partner mode against that CSV) and does NOT invoke the
+    downloader or uploader — S3 assets and Commons pages are already
+    correct; only SDC needs to be re-attempted."""
+    commands = _run_main_with_csvs(
+        ["wikimedia_retry.py", "--days", "7", "--partner", "nara"],
+        ["/home/ec2-user/ingest-wikimedia/retry/nara-sdc-retry.csv"],
+    )
+    pipeline_cmd = _find_pipeline_script(commands)
+
+    assert "downloader" not in pipeline_cmd, (
+        f"sdc-only retry must not invoke downloader; got: {pipeline_cmd!r}"
+    )
+    assert "uploader" not in pipeline_cmd, (
+        f"sdc-only retry must not invoke uploader; got: {pipeline_cmd!r}"
+    )
+    assert (
+        "sdc-sync --partner nara --ids-file /home/ec2-user/ingest-wikimedia/retry/nara-sdc-retry.csv"
+        in pipeline_cmd
+    )
+
+
+def test_retry_sdc_runs_after_upload_when_both_csvs_present():
+    """Upload + SDC retries on the same hub: the sdc-sync step runs
+    AFTER the uploader because the uploader refreshes upload-result.json
+    on S3, which sdc-sync reads to find SDC-eligible ordinals."""
+    commands = _run_main_with_csvs(
+        ["wikimedia_retry.py", "--days", "7", "--partner", "nara"],
+        [
+            "/home/ec2-user/ingest-wikimedia/retry/nara-upload-retry.csv",
+            "/home/ec2-user/ingest-wikimedia/retry/nara-sdc-retry.csv",
+        ],
+    )
+    pipeline_cmd = _find_pipeline_script(commands)
+
+    upload_pos = pipeline_cmd.find("uploader ")
+    sdc_pos = pipeline_cmd.find("sdc-sync ")
+    assert upload_pos != -1, f"uploader step missing: {pipeline_cmd!r}"
+    assert sdc_pos != -1, f"sdc-sync step missing: {pipeline_cmd!r}"
+    assert upload_pos < sdc_pos, (
+        f"sdc-sync must follow uploader (uploader writes upload-result.json "
+        f"that sdc-sync reads); got positions upload={upload_pos} sdc={sdc_pos}"
+    )
