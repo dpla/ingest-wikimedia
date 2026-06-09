@@ -2065,12 +2065,24 @@ def _build_qualifier_update_fragments(mediaid):
             existing_qualifiers, removes_by_id.get(claimid, set())
         )
         merged = _merge_qualifier_snaks(kept, adds_by_id.get(claimid, []))
-        # ``type: "statement"`` is required by wbeditentity on every
-        # non-removal claim entry — omitting it makes Wikibase reject
-        # the whole bundle with ``invalid-claim: Type is missing``,
-        # which (because the dispatcher is atomic) drops every other
-        # edit in the file's per-file batch too.
-        fragments.append({"id": claimid, "type": "statement", "qualifiers": merged})
+        # wbeditentity treats every non-removal claim entry as a
+        # wholesale-replace operation, so the fragment must carry the
+        # entire statement — ``mainsnak``, ``rank``, existing
+        # ``references`` — not just the field being amended. Omitting
+        # ``mainsnak`` fails the bundle with ``invalid-claim:
+        # Attribute "mainsnak" is missing``; omitting ``references``
+        # would silently erase them. Copy from the cached statement
+        # and overlay the new qualifier set; ``type`` is stamped by
+        # the dispatcher as a defense-in-depth.
+        fragment = {
+            "id": claimid,
+            "type": "statement",
+            "mainsnak": copy.deepcopy(stmt["mainsnak"]),
+            "rank": stmt.get("rank", "normal"),
+            "qualifiers": merged,
+            "references": copy.deepcopy(stmt.get("references") or []),
+        }
+        fragments.append(fragment)
     return fragments
 
 
@@ -2131,8 +2143,20 @@ def _build_p813_refresh_fragments(mediaid, dpla_id, already_touched_ids):
                 new_refs.append(refreshed)
                 changed = True
             if changed:
+                # Same wholesale-replace contract as
+                # _build_qualifier_update_fragments: include the
+                # statement's existing mainsnak / qualifiers / rank so
+                # wbeditentity preserves them and only diffs the
+                # references field.
                 fragments.append(
-                    {"id": stmt_id, "type": "statement", "references": new_refs}
+                    {
+                        "id": stmt_id,
+                        "type": "statement",
+                        "mainsnak": _copy.deepcopy(stmt["mainsnak"]),
+                        "rank": stmt.get("rank", "normal"),
+                        "qualifiers": _copy.deepcopy(stmt.get("qualifiers") or {}),
+                        "references": new_refs,
+                    }
                 )
     return fragments
 
