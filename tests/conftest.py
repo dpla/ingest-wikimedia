@@ -87,4 +87,7 @@ def _no_slack_in_tests(monkeypatch: pytest.MonkeyPatch):
         try:
             p.stop()
         except Exception:
+            # Best-effort: the patch may have already been stopped (e.g.
+            # by a test that manually managed its lifetime).  Swallow so
+            # subsequent ``p.stop()`` calls in this loop still run.
             pass
