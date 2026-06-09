@@ -806,7 +806,7 @@ class Uploader:
             if moved_page.exists() and not moved_page.isRedirectPage():
                 # After the move, moved_page carries the original page's
                 # wikitext. Preserve license, Image-extracted, and category
-                # metadata from it before replacing with the DPLA Artwork block.
+                # metadata from it before replacing with the {{DPLA metadata}} block.
                 moved_page.text = merge_preserved_wikitext(
                     moved_page.text or "", wiki_markup
                 )

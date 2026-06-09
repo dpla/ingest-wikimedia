@@ -5,6 +5,7 @@ from ingest_wikimedia.wikimedia import (
     build_title_drift_move_reason,
     get_site,
     get_page_title,
+    get_wiki_text,
     license_to_markup_code,
     get_permissions_template,
     get_permissions,
@@ -1097,3 +1098,80 @@ def test_tag_as_duplicate_idempotency_does_not_match_unrelated_templates():
     tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
     # First tag still applied — the unrelated template should not count.
     assert site.editpage.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# get_wiki_text: the wikitext the uploader writes for new files and for the
+# title-drift metadata-rescue overwrite path.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_item_metadata():
+    """Just-enough DPLA-item metadata to drive get_wiki_text without
+    blowing up. Exercises the typical-record path (creator + title +
+    description + date + permission + source) so the emitted template
+    has every parameter we care about."""
+    return {
+        "rights": "http://creativecommons.org/publicdomain/zero/1.0/",
+        "isShownAt": "https://example.org/item/123",
+        "sourceResource": {
+            "creator": ["A Creator"],
+            "title": ["A Title"],
+            "description": ["A description"],
+            "date": [{"displayDate": "1900"}],
+            "identifier": ["local-123"],
+        },
+    }
+
+
+def test_get_wiki_text_emits_dpla_metadata_template():
+    """The uploader writes a {{DPLA metadata}} block (not {{Artwork}}).
+
+    DPLA's Commons template was designed to fully replicate the
+    {{Artwork}} parameter set the uploader had been emitting, so the
+    transition is a one-line template-name swap with no parameter
+    changes. This test pins the name so a future refactor or revert
+    can't quietly flip back to {{Artwork}}.
+    """
+    result = get_wiki_text(
+        dpla_id="abc123",
+        item_metadata=_minimal_item_metadata(),
+        provider={"Wikidata": "Q1"},
+        data_provider={"Wikidata": "Q2"},
+    )
+    # The whole-template name appears with leading whitespace from the
+    # template_string formatting; assert on the unambiguous fragment.
+    assert "{{ DPLA metadata" in result, (
+        f"get_wiki_text must emit {{{{DPLA metadata}}}}; got:\n{result}"
+    )
+    assert "{{ Artwork" not in result, (
+        "get_wiki_text must NOT emit {{Artwork}} (replaced by "
+        f"{{{{DPLA metadata}}}}); got:\n{result}"
+    )
+
+
+def test_get_wiki_text_preserves_artwork_parameters_under_new_template():
+    """Locking-in regression: the parameter set the upload-time
+    wikitext writes is unchanged from the prior {{Artwork}}-based form
+    — title, description, date, permission, source (with the DPLA
+    sub-template), Institution. Pin each so a structural refactor of
+    `get_wiki_text` can't silently drop a field."""
+    result = get_wiki_text(
+        dpla_id="abc123",
+        item_metadata=_minimal_item_metadata(),
+        provider={"Wikidata": "Q1"},
+        data_provider={"Wikidata": "Q2"},
+    )
+    for fragment in (
+        "| title = A Title",
+        "| description = A description",
+        "| date = 1900",
+        "| permission =",
+        "| source = {{ DPLA",
+        "| Institution = {{ Institution | wikidata = Q2 }}",
+        "| dpla_id = abc123",
+        "| hub = Q1",
+    ):
+        assert fragment in result, (
+            f"missing expected fragment {fragment!r} in:\n{result}"
+        )

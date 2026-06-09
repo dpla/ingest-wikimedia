@@ -343,7 +343,7 @@ def get_wiki_text(
 
     template_string = (
         """== {{int:filedesc}} ==
-     {{ Artwork"""
+     {{ DPLA metadata"""
         + creator_template
         + """
         | title = $title
@@ -623,13 +623,16 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     """Append preserved metadata from existing_text to new_artwork.
 
     Used when the uploader rewrites a file description after a title-drift
-    move or redirect-overwrite. The new {{Artwork}} wikitext is authoritative
-    for the file's description, but page-level metadata that pre-existed —
-    PD-USGov license tags, Image-extracted parent links, category
-    membership, and assessment-class templates — must survive the rewrite.
+    move or redirect-overwrite. The new {{DPLA metadata}} wikitext is
+    authoritative for the file's description, but page-level metadata that
+    pre-existed — PD-USGov license tags, Image-extracted parent links,
+    category membership, and assessment-class templates — must survive the
+    rewrite.
 
     Result order (matches Commons page-structure convention):
-        1. new_artwork (the freshly generated {{Artwork}} block)
+        1. new_artwork (the freshly generated {{DPLA metadata}} block; the
+           parameter name `new_artwork` is historical from the prior
+           {{Artwork}}-emitting code path)
         2. preserved Assessment block (=={{Assessment}}== header + any
            {{Media of the day|...}}, {{Picture of the day|...}},
            {{Featured picture}}, {{Quality image}}, {{Valued image}},
