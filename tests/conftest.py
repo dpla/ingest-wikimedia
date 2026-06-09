@@ -78,5 +78,13 @@ def _no_slack_in_tests(monkeypatch: pytest.MonkeyPatch):
 
     yield
 
+    # Best-effort cleanup: if one patch's stop() raises (rare but possible
+    # when a test has already manually stopped it), keep going so the
+    # remaining patches still get torn down.  A stranded patch would leak
+    # into subsequent tests and surface as confusing test-order
+    # dependencies.
     for p in patches:
-        p.stop()
+        try:
+            p.stop()
+        except Exception:
+            pass
