@@ -96,7 +96,7 @@ The migration step is not yet implemented; today's duplicate-detection flow hand
 {{DPLA metadata
  |title       = ...
  |description = ...
- |author      = ...
+ |creator     = ...
  |date        = ...
  |institution = ...
  |subject     = ...
@@ -106,6 +106,8 @@ The migration step is not yet implemented; today's duplicate-detection flow hand
 {{<permissions-template>}}
 ```
 
+The template also accepts `author` and `artist` as aliases for `creator` (for editor familiarity with `{{Information}}` and `{{Artwork}}` conventions); `creator` is preferred because of the [archival-records sense the SAA assigns to it](https://dictionary.archivists.org/entry/creator.html), which matches DPLA's source collections better than "Author."
+
 The licensing line stays separate because Commons' file-curation conventions require the license template to be visible in the wikitext (not just SDC) for human review.
 
 The cleanup edit (step 3 of the lifecycle) would be a new piece of code — likely a separate maintenance pass that runs at some interval after SDC sync, scans for files where SDC and wikitext params agree, and strips the params.
@@ -114,7 +116,7 @@ The cleanup edit (step 3 of the lifecycle) would be a new piece of code — like
 
 - `ingest_wikimedia/wikimedia.py::get_wiki_text` — new template body with explicit params.
 - A new maintenance pass (e.g. `tools/strip_redundant_params.py`) for step 3.
-- The adoption-migration path in `tools/uploader.py::_resolve_hash_drift` — extend the rename branches to salvage the original editor's wikitext into yellow-box params.
+- The adoption-migration path in `tools/uploader.py::Uploader._resolve_hash_drift` — extend the rename branches to salvage the original editor's wikitext into yellow-box params.
 - Commons-side [`Template:DPLA metadata/doc`](https://commons.wikimedia.org/wiki/Template:DPLA_metadata/doc) — already documents the planned lifecycle.
 - `Commons:Digital Public Library of America/Modeling` — already updated to describe the SDC properties the module reads.
 - Operator runbook in [operations.md](operations.md) — note the change in the "what's on a fresh upload" wording.
