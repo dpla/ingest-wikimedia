@@ -1955,6 +1955,13 @@ def _submit_per_item_edit(
     * ``removals`` — claim dicts shaped ``{"id": ..., "remove": ""}``.
       Wikibase deletes the named statement.
 
+    Wikibase requires ``"type": "statement"`` on every non-removal claim
+    entry; the dispatcher stamps it on any fragment that's missing it
+    before POSTing, so callers may omit the field. (The two in-tree
+    builders set it explicitly for local readability, but the guard
+    here protects future builders and ad-hoc callers from re-introducing
+    the bundle-wide ``invalid-claim: Type is missing`` rejection.)
+
     Atomicity: the entire bundle lands as a single revision on the
     file's MediaInfo entity, or none of it does. There is no partial-
     update window where new claims have been written but removals
@@ -1978,6 +1985,23 @@ def _submit_per_item_edit(
     )
     if not all_fragments:
         return
+
+    # Defense-in-depth: stamp ``type: "statement"`` on every non-removal
+    # fragment that's missing it. Wikibase rejects the entire bundle
+    # with ``invalid-claim: Type is missing`` if any non-removal entry
+    # lacks this field, and atomicity means one malformed fragment
+    # silently drops every other edit on the file. The two known
+    # builders (``_build_qualifier_update_fragments`` /
+    # ``_build_p813_refresh_fragments``) set it themselves, but adding
+    # the guard here makes any future builder that forgets — or any
+    # external caller passing hand-built fragments — fail closed
+    # instead of nuking the whole edit. Removals (``{"id": ...,
+    # "remove": ""}``) are exempt: Wikibase accepts them without
+    # ``type``, and adding it has no effect.
+    for fragment in all_fragments:
+        if fragment.get("remove") == "":
+            continue
+        fragment.setdefault("type", "statement")
 
     _submit_sdc_write(
         "wbeditentity",
@@ -2041,7 +2065,12 @@ def _build_qualifier_update_fragments(mediaid):
             existing_qualifiers, removes_by_id.get(claimid, set())
         )
         merged = _merge_qualifier_snaks(kept, adds_by_id.get(claimid, []))
-        fragments.append({"id": claimid, "qualifiers": merged})
+        # ``type: "statement"`` is required by wbeditentity on every
+        # non-removal claim entry — omitting it makes Wikibase reject
+        # the whole bundle with ``invalid-claim: Type is missing``,
+        # which (because the dispatcher is atomic) drops every other
+        # edit in the file's per-file batch too.
+        fragments.append({"id": claimid, "type": "statement", "qualifiers": merged})
     return fragments
 
 
@@ -2102,7 +2131,9 @@ def _build_p813_refresh_fragments(mediaid, dpla_id, already_touched_ids):
                 new_refs.append(refreshed)
                 changed = True
             if changed:
-                fragments.append({"id": stmt_id, "references": new_refs})
+                fragments.append(
+                    {"id": stmt_id, "type": "statement", "references": new_refs}
+                )
     return fragments
 
 
