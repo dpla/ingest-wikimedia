@@ -1,8 +1,8 @@
 """
-Extract DPLA IDs from recent upload/download logs for items that failed due to
-transient or now-resolvable issues and should be retried.
+Extract DPLA IDs from recent upload/download/sdc logs for items that failed due
+to transient or now-resolvable issues and should be retried.
 
-Two failure types are identified:
+Three failure types are identified:
 
   upload   — Wikimedia-side transient errors (lock contention, backend storage
               failures) and title/hash-drift errors that the uploader can now
@@ -11,6 +11,12 @@ Two failure types are identified:
 
   download — Media-server HTTP failures after all retries are exhausted.  Both
               the downloader and uploader need to run.
+
+  sdc      — Wikibase API transient failures during SDC sync (maxlag, replica
+              lag, rate limiting, 5xx, network blips).  Filtered to exceptions
+              a bare retry is likely to succeed against — structural errors
+              (invalid-claim, no-such-entity, permission denied) are NOT
+              classified as retryable because re-running won't help.
 
 Output: one CSV per partner per failure type, written to --output-dir.
 A summary table is printed to stdout.
@@ -60,6 +66,64 @@ DOWNLOAD_FAILED_RE = re.compile(r"Failed: ([0-9a-f]{32})")
 # The double space indicates an empty URL — produced by the IIIF parsing bug fixed in PR #180.
 EMPTY_URL_FAILURE = "Failed downloading  to"
 
+# The per-ordinal failure marker logged from sdc_sync._run_partner_mode's
+# exception boundary.  The traceback follows on subsequent lines until the
+# next [INFO] / [ERROR] marker.
+SDC_ORDINAL_ERROR_RE = re.compile(
+    r"-- Ordinal \d+ \(M\d+\) for ([0-9a-f]{32}): SDC sync failed; skipping ordinal\."
+)
+
+# Substring patterns that indicate the failure is transient and a bare retry
+# (re-running sdc-sync against the same staged sdc.json) is likely to succeed.
+# Anything not matching one of these patterns is treated as STRUCTURAL —
+# either a code bug, malformed SDC fragment, or Commons-side permanent state
+# (deleted entity, permission denial) — and excluded from the retry CSV
+# because re-running would just reproduce the same failure.
+#
+# Match strings are taken verbatim from observed traceback / API-error text:
+#
+#   * MaxlagTimeoutError                 — replica lag exhausted pywikibot retry budget
+#   * ServerError                        — HTTP 5xx from MediaWiki / Wikibase
+#   * ReadTimeoutError / ReadTimeout     — botocore / requests
+#   * ConnectTimeoutError                — botocore
+#   * EndpointConnectionError            — botocore
+#   * ChunkedEncodingError               — requests partial-response
+#   * ProtocolError                      — urllib3 connection drops
+#   * ConnectionError                    — requests / urllib3
+#   * internal_api_error_DBQueryError    — MediaWiki API replica/DB blip
+#   * internal_api_error_DBConnectionError
+#   * editconflict                       — concurrent writer race on the entity
+#   * failed-save                        — Wikibase save retry storm
+#   * readonly                           — MediaWiki database in read-only mode
+#   * ratelimited                        — API rate limit reached
+#   * maxlag                             — explicit maxlag rejection (lowercase form)
+#   * SlowDown / RequestTimeout /        — S3 transient sidecar reads
+#     ServiceUnavailable / InternalError
+SDC_TRANSIENT_ERRORS = (
+    "MaxlagTimeoutError",
+    "ServerError",
+    "ReadTimeoutError",
+    "ReadTimeout",
+    "ConnectTimeoutError",
+    "EndpointConnectionError",
+    "ChunkedEncodingError",
+    "ProtocolError",
+    "ConnectionError",
+    "internal_api_error_DBQueryError",
+    "internal_api_error_DBConnectionError",
+    "editconflict",
+    "failed-save",
+    "readonly",
+    "ratelimited",
+    "maxlag",
+    "SlowDown",
+    "RequestTimeout",
+    "ServiceUnavailable",
+    "InternalError",
+)
+
+SDC_TRANSIENT_RE = re.compile("|".join(re.escape(e) for e in SDC_TRANSIENT_ERRORS))
+
 
 def parse_upload_log(path: Path) -> tuple[set[str], set[str]]:
     """Return (transient_failure_ids, successfully_uploaded_ids) from an upload log.
@@ -102,8 +166,71 @@ def parse_download_log(path: Path) -> set[str]:
     return failed
 
 
-def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[str]]:
-    """Scan logs for *partner* and return (upload_failures, download_failures).
+def parse_sdc_log(path: Path) -> set[str]:
+    """Return DPLA IDs whose per-ordinal SDC sync failed with a transient error.
+
+    The per-ordinal exception boundary in ``sdc_sync._run_partner_mode`` logs
+    a single marker line followed by a Python traceback.  We collect the
+    traceback text up to the next ``[INFO]`` / ``[ERROR]`` line and classify:
+
+      retryable  — traceback matches ``SDC_TRANSIENT_RE``.  The DPLA ID is
+                   added to the result set.
+      structural — anything else.  Either a code bug, malformed SDC, or
+                   permanent Commons-side state (deleted entity, permission
+                   denial).  Re-running won't help; excluded from the CSV.
+
+    A single DPLA item can have many ordinals; if ANY ordinal hit a
+    retryable error, the whole item ID is included (sdc-sync's partner
+    mode reads each item's sidecars and only writes diffs against
+    Commons-side state, so re-syncing the whole item is safe and cheap —
+    the already-clean ordinals produce zero writes).
+    """
+    retryable: set[str] = set()
+    current_id: str | None = None
+    current_traceback: list[str] = []
+
+    def _flush() -> None:
+        # Close the current traceback block: if it matched a transient
+        # pattern, register the ID for retry.  Reset state regardless.
+        nonlocal current_id, current_traceback
+        if current_id and current_traceback:
+            blob = "".join(current_traceback)
+            if SDC_TRANSIENT_RE.search(blob):
+                retryable.add(current_id)
+        current_id = None
+        current_traceback = []
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = SDC_ORDINAL_ERROR_RE.search(line)
+            if m:
+                # New error block: flush any prior, start fresh.
+                _flush()
+                current_id = m.group(1)
+                continue
+            if current_id is None:
+                continue
+            # Inside an error block: collect traceback lines until the
+            # next [INFO] / [ERROR] marker.  Anything starting with
+            # "[INFO] " or "[ERROR] " ends the block.
+            if line.startswith("[INFO] ") or line.startswith("[ERROR] "):
+                _flush()
+                # If this terminating line is itself a new ordinal error,
+                # re-classify it as the start of the next block.
+                m2 = SDC_ORDINAL_ERROR_RE.search(line)
+                if m2:
+                    current_id = m2.group(1)
+                continue
+            current_traceback.append(line)
+        # End-of-file: flush whatever is pending.
+        _flush()
+    return retryable
+
+
+def collect_partner_ids(
+    partner: str, cutoff: datetime
+) -> tuple[set[str], set[str], set[str]]:
+    """Scan logs for *partner* and return ``(upload, download, sdc)`` retry sets.
 
     Upload logs are processed oldest-first so each run's outcome can supersede
     the previous one.  For each run an ID is classified as:
@@ -116,11 +243,19 @@ def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[s
     An ID that fails in an early run but uploads cleanly in a later run ends up
     as "done" and is excluded.  An ID with partial success in a single run
     (some files fail, some succeed) stays "retry".
+
+    SDC logs are processed similarly: each per-ordinal error is classified as
+    transient (matches ``SDC_TRANSIENT_RE``) or structural.  Only transient
+    failures land in the retry set.  Items that succeed in a later run aren't
+    excluded — the per-item SDC sync is idempotent, so re-running them is a
+    no-op that produces zero writes; the simpler "any transient error in the
+    window" rule is cheaper than tracking per-run outcomes.
     """
     log_dir = BASE_DIR / partner / "logs"
     # id → "retry" | "done"; later log files (by mtime) overwrite earlier ones.
     outcomes: dict[str, str] = {}
     download_failures: set[str] = set()
+    sdc_failures: set[str] = set()
 
     for log_file in sorted(
         log_dir.glob("*-upload.log"), key=lambda f: f.stat().st_mtime
@@ -138,12 +273,24 @@ def collect_partner_ids(partner: str, cutoff: datetime) -> tuple[set[str], set[s
             continue
         download_failures.update(parse_download_log(log_file))
 
+    for log_file in sorted(log_dir.glob("*-sdc.log")):
+        if datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc) < cutoff:
+            continue
+        sdc_failures.update(parse_sdc_log(log_file))
+
     upload_failures = {dpla_id for dpla_id, o in outcomes.items() if o == "retry"}
     fully_uploaded = {dpla_id for dpla_id, o in outcomes.items() if o == "done"}
     download_failures -= fully_uploaded
-    # Avoid scheduling the same ID for both retry types.
+    # Avoid scheduling the same ID for both upload-side retry types.  An ID
+    # that needs an upload retry will also re-run sdc-sync downstream when the
+    # uploader catches up, so don't double-list it in the sdc-retry CSV
+    # either — that would force the sdc-sync step to run twice on the same
+    # ID.  Same rule for download: the combined retry pipeline already
+    # chains uploader after downloader and sdc-sync after uploader.
     upload_failures -= download_failures
-    return upload_failures, download_failures
+    sdc_failures -= upload_failures
+    sdc_failures -= download_failures
+    return upload_failures, download_failures, sdc_failures
 
 
 def write_ids(path: Path, ids: set[str]) -> None:
@@ -181,6 +328,7 @@ def main(days: int, partner: str | None, output_dir: str) -> None:
     Writes one CSV per partner per failure type to OUTPUT_DIR:
       <partner>-upload-retry.csv   — run uploader only
       <partner>-download-retry.csv — run downloader then uploader
+      <partner>-sdc-retry.csv      — run sdc-sync only (transient SDC failures)
     """
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     out = Path(output_dir)
@@ -196,8 +344,12 @@ def main(days: int, partner: str | None, output_dir: str) -> None:
             logging.warning("No logs directory for partner '%s', skipping.", p)
             continue
 
-        upload_ids, download_ids = collect_partner_ids(p, cutoff)
-        for suffix, ids in (("upload", upload_ids), ("download", download_ids)):
+        upload_ids, download_ids, sdc_ids = collect_partner_ids(p, cutoff)
+        for suffix, ids in (
+            ("upload", upload_ids),
+            ("download", download_ids),
+            ("sdc", sdc_ids),
+        ):
             if ids:
                 csv_path = out / f"{p}-{suffix}-retry.csv"
                 write_ids(csv_path, ids)

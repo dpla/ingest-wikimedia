@@ -182,6 +182,9 @@ def main() -> None:
         elif filename.endswith("-upload-retry.csv"):
             csv_partner_dir = filename[: -len("-upload-retry.csv")]
             retry_type = "upload"
+        elif filename.endswith("-sdc-retry.csv"):
+            csv_partner_dir = filename[: -len("-sdc-retry.csv")]
+            retry_type = "sdc"
         else:
             logging.warning("Unexpected CSV filename: %s", filename)
             continue
@@ -337,6 +340,16 @@ def main() -> None:
             cat_args = " ".join(shlex.quote(c) for c in upload_inputs)
             steps.append(f"awk '!seen[$0]++' {cat_args} > {shlex.quote(combined_csv)}")
             steps.append(f"uploader {shlex.quote(combined_csv)} {slug}")
+        # SDC retries: a separate phase that follows download+upload because
+        # sdc-sync's partner mode reads per-item upload-result.json from S3
+        # to find which ordinals exist on Commons. Re-running download or
+        # upload (above) refreshes that sidecar, so the sdc-sync step sees
+        # current state. When only an sdc-retry CSV exists for the hub
+        # (typical case: transient maxlag during the original sync), this
+        # is the only step in the block.
+        sdc_csv = type_csvs.get("sdc")
+        if sdc_csv:
+            steps.append(f"sdc-sync --partner {slug} --ids-file {shlex.quote(sdc_csv)}")
         target_steps = " && ".join(steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"
