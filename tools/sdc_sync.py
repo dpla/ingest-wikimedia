@@ -338,46 +338,12 @@ def formattedclaim(prop, value, value_type, dpla_id):
     return serialized
 
 
-# Adds a missing qualifier to an existing claim via ``wbsetqualifier``.
-# Currently only used for P459 (determination method). The POST is
-# submitted through pywikibot's ``site.simple_request``, which manages
-# the CSRF token and retries on transient errors automatically.
-
-
-def postqual(claimid, prop, value):
-    """Add a qualifier to an existing claim via ``wbsetqualifier``.
-
-    Routed through ``site.simple_request`` so pywikibot handles CSRF token
-    refresh, ``maxlag`` / ``Retry-After`` honoring, exponential backoff on
-    transient errors, and auto-relogin on ``badtoken`` — all automatically.
-    Replaces a hand-rolled refresh-token-and-retry-once pattern that didn't
-    cover ``maxlag`` or rate-limit signaling.
-
-    Best-effort: a final failure logs and continues; the partner is not
-    aborted for a missing qualifier amendment.
-    """
-    summary = f"Adding [[:d:Property:{prop}]] to {claimid}."
-    try:
-        site.simple_request(
-            action="wbsetqualifier",
-            claim=claimid,
-            property=prop,
-            snaktype="value",
-            value=value,
-            bot=True,
-            summary=summary,
-            token=site.tokens["csrf"],
-        ).submit()
-        pywikibot.output(summary)
-    except pywikibot.exceptions.APIError as e:
-        # Log and continue — qualifier amends are best-effort, and pywikibot
-        # has already exhausted its built-in retry policy by the time an
-        # APIError surfaces here. Surface the Commons error code so it's
-        # diagnosable from the log without needing to enable verbose tracing.
-        print(
-            f" -- Failed to amend qualifier {prop} for {claimid}:"
-            f" {e.code} — {getattr(e, 'info', '')}"
-        )
+# NOTE: ``postqual`` (wbsetqualifier POST) and ``wbremovequalifiers``
+# direct POSTs have been removed. The qualifier add and remove
+# operations route through the per-file dispatcher
+# (``_submit_per_item_edit``), which folds them into a single
+# wbeditentity per file. See ``_build_qualifier_update_fragments`` and
+# ``_flush_per_file_edits``.
 
 
 # This function performs an initial GET request on the given Wikimedia file to check if the statement we will be adding is already in the page. It returns a boolean, with True if the statement is not found and can be added. "qid" is passed as a tuple with both the value and the data type, so this check can handle the formatting for different data types. If statements are found in the entity with the prop and value, but no qualifiers, we return the statement id instead, so that the qualifier can be added to that statement instead of creating a new one using postqual().
@@ -401,6 +367,105 @@ _PYWIKIBOT_RETRY_MAX = 60
 # doesn't accumulate one entity per file processed indefinitely — that
 # unbounded growth caused multi-GB RSS on long NARA runs.
 _entity_cache = {}
+
+
+# Per-file accumulators populated by the builders during the per-claim walk
+# and drained by ``_submit_per_item_edit`` at the end of each
+# ``process_one`` / ``process_one_from_sdc`` call so the whole file's edits
+# land as a single wbeditentity revision. Initialized at module level so
+# helpers that read these globals (e.g. add_ref, add_det, the amend
+# helpers) don't NameError when called from tests that don't first run a
+# process_one* entry point. Cleared at the top of each process_one* call.
+claims = {"claims": []}
+refclaims = {"claims": []}
+qualifier_amends = []  # list of (claimid, prop, snak_to_add)
+qualifier_removals = []  # list of (claimid, snak_hash_to_remove)
+removals = []  # list of statement IDs to remove from Commons
+
+
+def _reset_per_file_accumulators():
+    """Drop every per-file accumulator at the start of a new file's
+    processing. Used by both ``process_one`` and ``process_one_from_sdc``
+    so the dispatcher only ever sees the current file's fragments."""
+    global claims, refclaims, qualifier_amends, qualifier_removals, removals
+    claims = {"claims": []}
+    refclaims = {"claims": []}
+    qualifier_amends = []
+    qualifier_removals = []
+    removals = []
+
+
+def _url_snak(prop, url):
+    """Build a Wikibase URL-typed qualifier snak (used for P2699 / P6108
+    qualifier additions on P7482 via the per-file dispatcher)."""
+    return {
+        "snaktype": "value",
+        "property": prop,
+        "datavalue": {"value": url, "type": "string"},
+        "datatype": "url",
+    }
+
+
+def _string_snak(prop, value):
+    """Build a Wikibase string-typed qualifier snak (used for P304 page-
+    number qualifier additions on P760 via the per-file dispatcher)."""
+    return {
+        "snaktype": "value",
+        "property": prop,
+        "datavalue": {"value": value, "type": "string"},
+    }
+
+
+def _merge_qualifier_snaks(existing_qualifiers, additions):
+    """Build a Wikibase ``qualifiers`` dict that combines ``additions`` on
+    top of ``existing_qualifiers``, preserving the existing snaks'
+    ``hash`` fields so Wikibase recognises them as unchanged on
+    ``wbeditentity``.
+
+    ``existing_qualifiers`` is the claim's current ``qualifiers`` dict
+    (property → list of snak dicts, as returned by ``wbgetentities``).
+    ``additions`` is a list of ``(property, snak_dict)`` tuples to ADD;
+    the new snaks are appended after any existing snaks for the same
+    property.
+
+    Wikibase's ``wbeditentity`` replaces the qualifier set wholesale, so
+    callers must include every snak they want to keep. Including the
+    existing snaks with their original hashes is what keeps the diff
+    tight: Wikibase recognises unchanged snaks by hash and only shows
+    the new ones in the per-file edit diff.
+    """
+    import copy as _copy
+
+    merged = {
+        prop: [_copy.deepcopy(snak) for snak in snaks]
+        for prop, snaks in (existing_qualifiers or {}).items()
+    }
+    for prop, new_snak in additions:
+        merged.setdefault(prop, []).append(_copy.deepcopy(new_snak))
+    return merged
+
+
+def _exclude_qualifier_snaks(existing_qualifiers, excluded_snak_hashes):
+    """Build a Wikibase ``qualifiers`` dict that drops the snaks whose
+    ``hash`` is in ``excluded_snak_hashes``, preserving everything else
+    with its original hash.
+
+    Wholesale-replace semantics on ``wbeditentity``: we send only the
+    snaks we want to keep. Properties that end up with an empty snak
+    list are dropped entirely (Wikibase rejects empty qualifier-property
+    arrays as invalid).
+    """
+    import copy as _copy
+
+    out = {}
+    excluded = set(excluded_snak_hashes or ())
+    for prop, snaks in (existing_qualifiers or {}).items():
+        kept = [
+            _copy.deepcopy(snak) for snak in snaks if snak.get("hash") not in excluded
+        ]
+        if kept:
+            out[prop] = kept
+    return out
 
 
 def _raise_if_missing_entity(error, mediaid):
@@ -1373,18 +1438,36 @@ def add_source(mediaid, hub, url, dpla_id):
 
 
 def add_det(mediaid, claimid):
-    if claimid:
-        qid = "Q61848113"
-        prop = "P459"
-        value = json.dumps(
-            {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))}
-        )
-        postqual(claimid, prop, value)
-        # postqual just mutated Commons state for this mediaid (added P459
-        # to an existing claim). Drop the cached snapshot so any subsequent
-        # check() call for the same mediaid in this run reads the fresh
-        # post-write state instead of repeating the qualifier write.
-        invalidate_entity(mediaid)
+    """Queue a ``P459 = Q61848113`` (determination method = heuristic)
+    qualifier addition onto an existing claim, to be flushed by the per-
+    file dispatcher (``_submit_per_item_edit``) in the combined
+    ``wbeditentity``.
+
+    Pushes a single-snak ``(P459, snak)`` entry onto the module-level
+    ``qualifier_amends`` accumulator under ``claimid``. The dispatcher
+    later reads the existing claim's qualifier set from the cached
+    entity, merges the new P459 snak in (preserving the existing snaks'
+    hashes via :func:`_merge_qualifier_snaks`), and includes the
+    resulting full qualifier set in the combined edit's payload.
+
+    No POST happens here — the cache stays valid because no remote
+    state has been mutated. Idempotent at the accumulator level: if
+    multiple claims happen to target the same ``claimid``, the
+    dispatcher de-duplicates by id before building the fragment.
+    """
+    if not claimid:
+        return
+    qid = "Q61848113"
+    snak = {
+        "snaktype": "value",
+        "property": "P459",
+        "datavalue": {
+            "value": {"entity-type": "item", "numeric-id": int(qid.replace("Q", ""))},
+            "type": "wikibase-entityid",
+        },
+        "datatype": "wikibase-item",
+    }
+    qualifier_amends.append((claimid, "P459", snak))
 
 
 def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
@@ -1461,17 +1544,13 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
     expected_p973 = _first_qualifier_value(sdc_p7482, "P973")
     expected_p6108 = _first_qualifier_value(sdc_p7482, "P6108")
 
-    # _post_new_refs / _post_new_claims (called just before this helper)
-    # don't invalidate the entity cache after writing — same shape as
-    # the pre-existing invalidate-before-reconcile pattern elsewhere
-    # in this file. Drop the cached snapshot so we read the
-    # post-write state and don't see a phantom-absent P7482 when one
-    # was just created.
-    invalidate_entity(mediaid)
+    # Read once from the cached entity. The dispatcher does no writes
+    # between this helper and the entity snapshot in cache, so no
+    # invalidate-before-read needed.
     entity = get_entity(mediaid)
     existing_p7482 = (entity.get("statements") or {}).get("P7482") or []
 
-    # Find the DPLA-authored statement whose P973 matches our expectation.
+    # Find the DPLA-authored statement whose P973 qualifier matches.
     target_stmt = None
     for stmt in existing_p7482:
         if not _is_safe_to_amend_in_place(stmt, "P7482"):
@@ -1480,29 +1559,19 @@ def _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url):
             target_stmt = stmt
             break
     if target_stmt is None:
-        # No existing match — either no P7482 yet (``_post_new_claims``
-        # already handled it), or only foreign / unsafe-to-amend
-        # statements exist. Either way, nothing to backfill.
+        # No existing match — either no P7482 yet (a fresh claim will be
+        # added through the normal ``_post_new_claims`` accumulator), or
+        # only foreign / unsafe-to-amend statements exist.
         return
 
     claimid = target_stmt["id"]
     existing_p2699_values = _qualifier_values(target_stmt, "P2699")
     existing_p6108_values = _qualifier_values(target_stmt, "P6108")
 
-    amended = False
     if download_url and download_url not in existing_p2699_values:
-        postqual(claimid, "P2699", json.dumps(download_url))
-        amended = True
+        qualifier_amends.append((claimid, "P2699", _url_snak("P2699", download_url)))
     if expected_p6108 and expected_p6108 not in existing_p6108_values:
-        postqual(claimid, "P6108", json.dumps(expected_p6108))
-        amended = True
-
-    if amended:
-        # Drop the cached snapshot so any subsequent code in this
-        # process_one_from_sdc cycle (notably ``_reconcile_existing_claims``
-        # immediately below the caller) reads the freshly-amended state
-        # — same invariant ``add_det`` maintains for P459.
-        invalidate_entity(mediaid)
+        qualifier_amends.append((claimid, "P6108", _url_snak("P6108", expected_p6108)))
 
 
 def _file_extension(title):
@@ -1584,18 +1653,10 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     # typically a file that was once part of a multi-file extension
     # group (with a P304 stamped) but is now a singleton in its group
     # (e.g. siblings were deleted by a Commons curator). We must still
-    # walk the existing qualifiers and remove any stale P304; otherwise
-    # the file keeps incorrect page metadata indefinitely. Early-
-    # returning here would mean the reconciler never catches it
-    # (the statement-level reconciler diffs P760 by mainsnak value
-    # only, never by qualifier set).
+    # walk the existing qualifiers and queue any stale P304 removal;
+    # otherwise the file keeps incorrect page metadata indefinitely.
     expected_value = None if page_number is None else str(page_number)
 
-    # No leading invalidate_entity: ``_amend_p7482_url_qualifiers`` runs
-    # immediately before this helper in process_one_from_sdc and either
-    # left the cache valid (it didn't write) or invalidated it (it did),
-    # so get_entity here returns fresh state in both cases. Saves a
-    # wbgetentities round-trip per ordinal at scale.
     entity = get_entity(mediaid)
     existing_p760 = (entity.get("statements") or {}).get("P760") or []
 
@@ -1613,22 +1674,11 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     if target_stmt is None:
         return
 
-    # Walk existing P304 qualifiers and bucket them: matches-expected
-    # (idempotent — nothing to do) vs. stale (must be removed). Three
-    # scenarios reach here:
-    #   * expected_value is None: any existing P304 is stale (file is
-    #     no longer in a multi-file extension group).
-    #   * expected_value matches one existing value: any OTHER existing
-    #     P304 is stale (renumber between syncs left a duplicate).
-    #   * expected_value doesn't match any existing value: every existing
-    #     P304 is stale, and the new value still needs to be added.
-    # TODO: ``_amend_p7482_url_qualifiers`` has the same latent issue
-    # for P2699 and P6108. Trigger is rarer there (partner catalog URLs
-    # almost never change for already-uploaded files), but the cleanup
-    # should be unified — likely as a shared ``_replace_dpla_qualifier``
-    # helper once we have a second use case (this one).
+    # Bucket existing P304 snaks: matches-expected (skip) vs stale (queue
+    # for removal). The dispatcher will assemble the wholesale-replace
+    # qualifier set from the combined adds and removes across all
+    # accumulators when it builds the final wbeditentity payload.
     expected_already_present = False
-    stale_snak_hashes = []
     for q in target_stmt.get("qualifiers", {}).get("P304", []) or []:
         if q.get("snaktype") != "value":
             continue
@@ -1638,32 +1688,12 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
         if expected_value is not None and dv["value"] == expected_value:
             expected_already_present = True
         elif q.get("hash"):
-            stale_snak_hashes.append(q["hash"])
-
-    if not stale_snak_hashes and (expected_value is None or expected_already_present):
-        # No work: either nothing exists and nothing's expected, or the
-        # exact match is already there. Matches the conditional-
-        # invalidate pattern in ``_amend_p7482_url_qualifiers``.
-        return
-
-    if stale_snak_hashes:
-        _submit_sdc_write(
-            "wbremovequalifiers",
-            mediaid,
-            dpla_id,
-            claim=target_stmt["id"],
-            qualifiers="|".join(stale_snak_hashes),
-            summary=(
-                f"Removing stale P304 page-number qualifier(s) for"
-                f" [[dpla:{dpla_id}|{dpla_id}]]."
-                f" [[COM:DPLA/MOD|Leave feedback]]!"
-            ),
-        )
+            qualifier_removals.append((target_stmt["id"], q["hash"]))
 
     if expected_value is not None and not expected_already_present:
-        postqual(target_stmt["id"], "P304", json.dumps(expected_value))
-
-    invalidate_entity(mediaid)
+        qualifier_amends.append(
+            (target_stmt["id"], "P304", _string_snak("P304", expected_value))
+        )
 
 
 def add_ref(claimid, claim):
@@ -1887,52 +1917,286 @@ def _submit_sdc_write(action, mediaid, dpla_id, **params):
         ) from e
 
 
-def _post_new_refs(mediaid, dpla_id):
-    """POST the accumulated ``refclaims["claims"]`` to ``wbeditentity``.
+def _submit_per_item_edit(
+    mediaid,
+    dpla_id,
+    summary,
+    *,
+    new_claims=(),
+    reference_updates=(),
+    qualifier_updates=(),
+    removals=(),
+):
+    """Submit one ``wbeditentity`` per file with all per-file edits bundled.
 
-    Reads the module-global ``refclaims`` (populated by ``add_ref`` during
-    the per-claim check loop). No-op when nothing to post.
+    The consolidated dispatcher behind the partner-mode and legacy file-
+    processing paths. Replaces the previous pattern of issuing several
+    separate API calls per file (separate ``wbeditentity`` for new
+    claims, ``wbeditentity`` for reference updates, ``wbsetqualifier``
+    per qualifier amend, ``wbremovequalifiers`` for stale-qualifier
+    cleanup, ``wbremoveclaims`` for reconciler removals) with one
+    atomic ``wbeditentity`` carrying every change.
+
+    Each fragment is a Wikibase claim-data dict; the kind is inferred
+    from its shape per ``data.claims[]`` semantics on `wbeditentity`:
+
+    * ``new_claims`` — full claim dicts with no ``id`` field. Wikibase
+      creates a fresh statement for each, assigning a new statement ID.
+    * ``reference_updates`` — claim dicts with ``id`` + ``references``.
+      Wikibase updates only the references of the named statement; the
+      mainsnak and qualifiers are left intact.
+    * ``qualifier_updates`` — claim dicts with ``id`` + ``qualifiers``.
+      Wikibase updates only the qualifiers of the named statement; the
+      mainsnak and references are left intact. Qualifier values are
+      provided as a wholesale set, so callers must merge new qualifier
+      snaks with the existing qualifier set (preserving snak hashes)
+      before passing them in — otherwise the existing qualifiers would
+      be erased.
+    * ``removals`` — claim dicts shaped ``{"id": ..., "remove": ""}``.
+      Wikibase deletes the named statement.
+
+    Atomicity: the entire bundle lands as a single revision on the
+    file's MediaInfo entity, or none of it does. There is no partial-
+    update window where new claims have been written but removals
+    haven't — the previous multi-POST pattern allowed exactly that
+    failure mode and could leak orphaned stale statements when an
+    intermediate POST failed.
+
+    The dispatcher tracker-counts ``new_claims`` under
+    ``SDC_CLAIMS_ADDED``, ``reference_updates`` under
+    ``SDC_REFS_ADDED``, and ``removals`` under ``SDC_REMOVALS``.
+    Qualifier-only amends are not separately counted (they ride along
+    on a claim that's already accounted for or on a legacy backfill).
+
+    No-op when every fragment list is empty.
     """
-    if not refclaims["claims"]:
+    all_fragments = (
+        list(new_claims)
+        + list(reference_updates)
+        + list(qualifier_updates)
+        + list(removals)
+    )
+    if not all_fragments:
         return
-    refs_to_post = len(refclaims["claims"])
+
     _submit_sdc_write(
         "wbeditentity",
         mediaid,
         dpla_id,
-        data=json.dumps(refclaims),
-        summary=(
-            f"Added structured data references from [[COM:DPLA|DPLA]] item"
-            f" '[[dpla:{dpla_id}|{dpla_id}]]'."
-            f" [[COM:DPLA/MOD|Leave feedback]]!"
-        ),
+        data=json.dumps({"claims": all_fragments}),
+        summary=summary,
     )
-    print(" --- Saved new refs!")
-    tracker.increment(Result.SDC_REFS_ADDED, refs_to_post)
+
+    if new_claims:
+        tracker.increment(Result.SDC_CLAIMS_ADDED, len(new_claims))
+    if reference_updates:
+        tracker.increment(Result.SDC_REFS_ADDED, len(reference_updates))
+    if removals:
+        tracker.increment(Result.SDC_REMOVALS, len(removals))
 
 
-def _post_new_claims(mediaid, dpla_id):
-    """POST the accumulated ``claims["claims"]`` to ``wbeditentity``.
+def _build_qualifier_update_fragments(mediaid):
+    """Fold the per-file ``qualifier_amends`` and ``qualifier_removals``
+    accumulators into a list of wbeditentity claim fragments — one per
+    target statement ID — each carrying the wholesale-replace qualifier
+    set computed from the cached entity's existing qualifiers plus the
+    queued adds, minus the queued removals.
 
-    Reads the module-global ``claims`` (populated by add_* helpers during
-    the per-claim check loop). No-op when nothing to post.
+    The dispatcher's qualifier-update kind expects ``{id, qualifiers}``
+    where the qualifier set is sent in full (it replaces the existing
+    set wholesale on save). Existing snak ``hash`` values are preserved
+    so Wikibase recognises unchanged snaks and surfaces only the new
+    ones in the per-file edit diff.
+
+    Returns the empty list when neither accumulator has entries.
     """
-    if not claims["claims"]:
-        return
-    claims_to_post = len(claims["claims"])
-    _submit_sdc_write(
-        "wbeditentity",
+    if not qualifier_amends and not qualifier_removals:
+        return []
+    adds_by_id = {}
+    for claimid, prop, snak in qualifier_amends:
+        adds_by_id.setdefault(claimid, []).append((prop, snak))
+    removes_by_id = {}
+    for claimid, snak_hash in qualifier_removals:
+        removes_by_id.setdefault(claimid, set()).add(snak_hash)
+    target_ids = set(adds_by_id) | set(removes_by_id)
+
+    entity = get_entity(mediaid)
+    statements_by_id = {}
+    for prop_stmts in (entity.get("statements") or {}).values():
+        for stmt in prop_stmts:
+            stmt_id = stmt.get("id")
+            if stmt_id:
+                statements_by_id[stmt_id] = stmt
+
+    fragments = []
+    for claimid in target_ids:
+        stmt = statements_by_id.get(claimid)
+        if stmt is None:
+            # Statement vanished between the cached read and now —
+            # rare; nothing safe to do, skip rather than crash.
+            continue
+        existing_qualifiers = stmt.get("qualifiers") or {}
+        # Drop stale snaks first; merge new ones afterward.
+        kept = _exclude_qualifier_snaks(
+            existing_qualifiers, removes_by_id.get(claimid, set())
+        )
+        merged = _merge_qualifier_snaks(kept, adds_by_id.get(claimid, []))
+        fragments.append({"id": claimid, "qualifiers": merged})
+    return fragments
+
+
+def _build_p813_refresh_fragments(mediaid, dpla_id, already_touched_ids):
+    """Build reference-update fragments that refresh the ``P813``
+    (retrieved on) date in each DPLA-authored claim's reference to
+    today's date.
+
+    Only fires for claims NOT already covered by another fragment in
+    this file's edit (``already_touched_ids``). For each remaining
+    DPLA-authored claim on the file, we replace just the DPLA reference
+    in the claim's references list, leaving any user-added references
+    untouched. Claims whose DPLA reference's P813 is already today's
+    date are skipped — no spurious edit on already-fresh references.
+
+    Conditional on the dispatcher already deciding to make some other
+    edit on this file (the call site only constructs these fragments
+    when ``combined_claims`` is otherwise non-empty). The point is to
+    refresh "as-of" dates across every DPLA assertion on a file we're
+    touching anyway, signalling to downstream consumers that the
+    metadata was re-verified against DPLA on that date — without
+    introducing a wave of edits on files where nothing else changed.
+    """
+    import copy as _copy
+
+    today_p813_snak = _build_p813_snak(datetime.date.today())
+    entity = get_entity(mediaid)
+    fragments = []
+    for prop_stmts in (entity.get("statements") or {}).values():
+        for stmt in prop_stmts:
+            stmt_id = stmt.get("id")
+            if not stmt_id or stmt_id in already_touched_ids:
+                continue
+            existing_refs = stmt.get("references") or []
+            if not existing_refs:
+                continue
+            # Locate the DPLA reference; preserve every user-added
+            # reference unchanged. If multiple references match (rare;
+            # legacy duplicates) refresh all of them.
+            new_refs = []
+            changed = False
+            for ref in existing_refs:
+                if not _is_dpla_reference(ref):
+                    new_refs.append(ref)
+                    continue
+                if _p813_already_today(ref):
+                    new_refs.append(ref)
+                    continue
+                refreshed = _copy.deepcopy(ref)
+                refreshed.setdefault("snaks", {})["P813"] = [today_p813_snak]
+                # Drop the snaks-hashes for the refreshed P813 so
+                # Wikibase recomputes it on save (the snak content
+                # changed); leave the other snaks alone.
+                snaks_order = refreshed.get("snaks-order") or []
+                if "P813" not in snaks_order:
+                    snaks_order = list(snaks_order) + ["P813"]
+                    refreshed["snaks-order"] = snaks_order
+                new_refs.append(refreshed)
+                changed = True
+            if changed:
+                fragments.append({"id": stmt_id, "references": new_refs})
+    return fragments
+
+
+def _build_p813_snak(retrieval_date):
+    """Build the P813 (retrieved on) snak for the standard DPLA
+    reference shape — calendarmodel Gregorian, precision day."""
+    return {
+        "snaktype": "value",
+        "property": "P813",
+        "datavalue": {
+            "value": {
+                "time": "+" + retrieval_date.isoformat() + "T00:00:00Z",
+                "timezone": 0,
+                "before": 0,
+                "after": 0,
+                "precision": 11,
+                "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+            },
+            "type": "time",
+        },
+    }
+
+
+def _p813_already_today(reference):
+    """Return True iff the reference's P813 (retrieved on) snak already
+    carries today's date in its time value. Avoids emitting spurious
+    edits on references that were already refreshed today (e.g. an
+    item processed twice in the same UTC day).
+    """
+    today_iso = "+" + datetime.date.today().isoformat() + "T00:00:00Z"
+    for snak in (reference.get("snaks") or {}).get("P813") or []:
+        try:
+            if snak["datavalue"]["value"]["time"] == today_iso:
+                return True
+        except (KeyError, TypeError):
+            continue
+    return False
+
+
+def _flush_per_file_edits(mediaid, dpla_id):
+    """Drain every per-file accumulator into a single ``wbeditentity``
+    POST via :func:`_submit_per_item_edit`. Called at the end of each
+    ``process_one_from_sdc`` and ``process_one`` invocation; this is
+    the one POST per file that replaces the previous five-to-seven
+    separate API calls.
+
+    When any other edit fragments are present, opportunistically refresh
+    the ``P813`` (retrieved on) date on every other DPLA-authored claim
+    on the file to today. The premise: the bot has just re-verified the
+    file's structured data against DPLA's current source metadata, so
+    every DPLA assertion on the file is effectively "as-of today" — that
+    information is useful to downstream consumers and free to write
+    inside an edit we're making anyway. No spurious edits when the file
+    has nothing else to change.
+
+    After a successful write, invalidate the cached entity once so any
+    follow-up code reading from cache picks up the new revision.
+    """
+    qualifier_fragments = _build_qualifier_update_fragments(mediaid)
+    removal_fragments = [{"id": cid, "remove": ""} for cid in removals]
+    reference_updates = list(refclaims["claims"])
+
+    has_any_other_edit = bool(
+        claims["claims"]
+        or reference_updates
+        or qualifier_fragments
+        or removal_fragments
+    )
+    if has_any_other_edit:
+        touched_ids = set()
+        for frag in qualifier_fragments + removal_fragments + reference_updates:
+            fid = frag.get("id")
+            if fid:
+                touched_ids.add(fid)
+        reference_updates.extend(
+            _build_p813_refresh_fragments(mediaid, dpla_id, touched_ids)
+        )
+
+    _submit_per_item_edit(
         mediaid,
         dpla_id,
-        data=json.dumps(claims),
         summary=(
-            f"Added structured data claims from [[COM:DPLA|DPLA]] item"
+            f"Updating structured data claims from [[COM:DPLA|DPLA]] item"
             f" '[[dpla:{dpla_id}|{dpla_id}]]'."
             f" [[COM:DPLA/MOD|Leave feedback]]!"
         ),
+        new_claims=claims["claims"],
+        reference_updates=reference_updates,
+        qualifier_updates=qualifier_fragments,
+        removals=removal_fragments,
     )
-    print(" --- Saved new claims!")
-    tracker.increment(Result.SDC_CLAIMS_ADDED, claims_to_post)
+    # One terminal invalidation regardless of how many fragments landed
+    # — the file's MediaInfo revision now reflects the combined edit.
+    invalidate_entity(mediaid)
 
 
 def dpla_claims(
@@ -2112,12 +2376,14 @@ def _build_expected_from_parsed(
 
 
 def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=frozenset()):
-    """Walk DPLA-referenced claims on Commons, queue removals for any whose
-    comparable value isn't in `expected`. POSTs wbremoveclaims if needed.
+    """Walk DPLA-referenced claims on Commons; push the IDs of any
+    claims that should be removed (DPLA-authored but no longer
+    expected) onto the module-level ``removals`` accumulator. The
+    per-file dispatcher flushes them in the combined wbeditentity.
 
-    Shared by `dpla_claims` (legacy partner-API path) and
-    `process_one_from_sdc` (PR 4 partner-mode path). Same removal logic;
-    just different sources for `expected`.
+    Shared by ``dpla_claims`` (legacy partner-API path) and
+    ``process_one_from_sdc`` (partner-mode path). Same removal logic;
+    just different sources for ``expected``.
 
     ``protected_props`` is a set of property IDs whose existing
     DPLA-authored claims are NOT subject to reconciliation — they're
@@ -2136,21 +2402,23 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=froze
     reconciliation keeps maintenance-mode reruns safe until full
     chunking parity is added to the legacy builders (out of scope
     here).
+
+    No POST happens here — pushes onto the ``removals`` accumulator
+    instead. The dispatcher flushes them via the combined
+    ``wbeditentity`` payload using ``{"id": ..., "remove": ""}`` claim
+    entries.
     """
     # Use pywikibot's wbgetentities (via get_entity) rather than a direct
     # requests.get to Special:EntityData: Wikimedia rejects the default
     # python-requests UA with HTTP 403 (phab T400119), and pywikibot's
     # Site.simple_request sets a compliant UA plus maxlag/CSRF handling.
-    # Invalidate the cache so this read sees post-write state from
-    # `_post_new_claims` above; let errors propagate to the per-ordinal
-    # boundary in `_run_partner_mode`.
+    # Read from the cache populated at the file-boundary entry; no
+    # mid-flow writes have happened in the consolidated dispatcher.
     print(f" -- Accessing Commons ID {mediaid}")
-    invalidate_entity(mediaid)
     entity = get_entity(mediaid)
     print(f" -- Accessed Commons ID {mediaid}")
     statements = entity.get("statements") or {}
     dpla_claim_list = []
-    removals = []
     for prop in statements:
         for stmt in statements[prop]:
             if stmt.get("references"):
@@ -2279,20 +2547,6 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=froze
                 removals.append(claim[prop]["id"])
             elif claim[prop]["value"] not in expected[prop]:
                 removals.append(claim[prop]["id"])
-    if removals:
-        _submit_sdc_write(
-            "wbremoveclaims",
-            mediaid,
-            dpla_id,
-            claim="|".join(removals),
-            summary=(
-                f"Changing structured data claims from [[COM:DPLA|DPLA]]"
-                f" item '[[dpla:{dpla_id}|{dpla_id}]]'."
-                f" [[COM:DPLA/MOD|Leave feedback]]!"
-            ),
-        )
-        print(" --- Saved removals!")
-        tracker.increment(Result.SDC_REMOVALS, len(removals))
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
@@ -2554,17 +2808,13 @@ def _resolve_dpla_id(title, dpla_api):
 
 def process_one(mediaid, dpla_id):
     """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
-    global claims, refclaims
-
-    # Drop every prior file's cached entity at the file boundary. The cache
-    # locality the per-file check() / reconciler / amend_* calls rely on is
-    # scoped to ONE file's processing; without this clear, the module-level
-    # ``_entity_cache`` accumulates an entity per file processed and leaks
-    # memory monotonically across a long-running session (a 25-hour NARA
-    # run reached ~2.6 GB RSS before this clear was added). Pre-warm the
-    # cache so the ~25 add_* / check() calls below share one wbgetentities
-    # round-trip.
+    # Drop every prior file's cached entity at the file boundary so the
+    # cache doesn't leak entities across files (see _entity_cache
+    # docstring), and drain the per-file accumulators so the dispatcher
+    # only sees this file's fragments. Pre-warm the cache so the ~25
+    # add_* / check() calls below share one wbgetentities round-trip.
     _entity_cache.clear()
+    _reset_per_file_accumulators()
     get_entity(mediaid)
 
     # parsed() returns None on lookup failure (was: returned False and the
@@ -2591,9 +2841,6 @@ def process_one(mediaid, dpla_id):
         access,
         level,
     ) = parsed_result
-
-    claims = {"claims": []}
-    refclaims = {"claims": []}
 
     try:
         add_rs(mediaid, rs, dpla_id)
@@ -2631,8 +2878,10 @@ def process_one(mediaid, dpla_id):
     # this guard the same Commons response that the partner path treats
     # as a skip would crash the legacy entry points.
     try:
-        _post_new_refs(mediaid, dpla_id)
-        _post_new_claims(mediaid, dpla_id)
+        # Run the reconciler builder so it populates the ``removals``
+        # accumulator alongside the new-claim and new-ref accumulators
+        # built by the check() walk above. Then flush everything in
+        # one atomic wbeditentity per file.
         dpla_claims(
             mediaid,
             dpla_id,
@@ -2650,6 +2899,7 @@ def process_one(mediaid, dpla_id):
             access,
             level,
         )
+        _flush_per_file_edits(mediaid, dpla_id)
     except _MissingEntityError:
         logging.info(
             f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity does not"
@@ -2695,21 +2945,15 @@ def process_one_from_sdc(
     backfill ``_amend_p760_page_qualifier`` handles existing P760
     statements that lack it.
     """
-    global claims, refclaims
-
-    # Drop every prior file's cached entity at the file boundary. The cache
-    # locality the per-claim check() / reconciler / amend_* calls below
-    # rely on is scoped to ONE file's processing; without this clear, the
-    # module-level ``_entity_cache`` accumulates an entity per file
-    # processed and leaks memory monotonically across a long-running
-    # session (a 25-hour NARA run reached ~2.6 GB RSS before this clear
-    # was added). Pre-warm so the per-claim calls share one
+    # Drop every prior file's cached entity at the file boundary so the
+    # cache doesn't leak entities across files (see _entity_cache
+    # docstring), and drain the per-file accumulators so the dispatcher
+    # only sees this file's fragments. Pre-warm the cache so the
+    # per-claim check() / amend_* / reconciler calls below share one
     # wbgetentities round-trip.
     _entity_cache.clear()
+    _reset_per_file_accumulators()
     get_entity(mediaid)
-
-    claims = {"claims": []}
-    refclaims = {"claims": []}
 
     sdc_claims = sdc_payload.get("claims", [])
     first_check = True
@@ -2773,25 +3017,16 @@ def process_one_from_sdc(
             pywikibot.output(f" -- Adding [[:d:Property:{prop}]] to {mediaid}.")
             claims["claims"].append(claim)
 
-    _post_new_refs(mediaid, dpla_id)
-    _post_new_claims(mediaid, dpla_id)
-
-    # Backfill P2699/P6108 qualifiers onto any pre-existing DPLA-authored
-    # P7482 statement that lacks them. Every file uploaded BEFORE this PR
-    # shipped has a P7482 with only P973/P137/P459 — without this pass,
-    # ``check()`` finds the existing statement, returns False (no
-    # duplicate), and the new qualifiers never land on Commons. Idempotent
-    # by design: a qualifier whose value already matches what sdc.json (+
-    # per-ordinal download_url) says is silently skipped.
+    # Run the legacy-backfill amend builders and the reconciler so they
+    # populate the per-file accumulators (qualifier_amends,
+    # qualifier_removals, removals). All four accumulators (those plus
+    # the new-claims / new-refs lists populated by the check() walk
+    # above) are then flushed in one atomic wbeditentity per file.
     _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url)
-
-    # Backfill the per-ordinal P304 (page-number) qualifier onto any
-    # pre-existing DPLA-authored P760 statement that lacks it. Same
-    # legacy-state rationale as ``_amend_p7482_url_qualifiers`` above.
     _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number)
-
     expected = _build_expected_from_sdc(sdc_payload)
     _reconcile_existing_claims(mediaid, dpla_id, expected)
+    _flush_per_file_edits(mediaid, dpla_id)
 
 
 def _run_partner_mode(partner, ids_file):

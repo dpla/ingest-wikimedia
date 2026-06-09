@@ -16,7 +16,6 @@ A claim that contains any user-authored qualifier or reference is
 NOT safe — the wbeditentity round-trip would erase that data.
 """
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -617,201 +616,6 @@ def _api_error(code, info=""):
     return pywikibot.exceptions.APIError(code=code, info=info)
 
 
-def test_post_new_refs_raises_runtime_error_on_apierror(monkeypatch):
-    """Pywikibot's ``APIError`` for any code OTHER than ``no-such-entity``
-    must be re-raised as ``RuntimeError`` carrying mediaid + dpla_id +
-    Commons error code so the per-ordinal handler logs a useful traceback.
-    """
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_side_effect=_api_error("badtoken", info="Invalid token"),
-    )
-
-    with pytest.raises(RuntimeError) as excinfo:
-        sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    msg = str(excinfo.value)
-    assert "M12345" in msg
-    assert "abcdef01abcdef01abcdef01abcdef01" in msg
-    # The Commons error code must appear in the RuntimeError message so
-    # the per-ordinal ``logging.exception`` captures it without needing
-    # to unwrap the ``__cause__`` chain.
-    assert "badtoken" in msg, f"expected 'badtoken' in {msg!r}"
-
-
-def test_post_new_claims_raises_runtime_error_on_apierror(monkeypatch):
-    """Same contract for the claims POST helper — non-no-such-entity
-    APIErrors come out as RuntimeError with the code in the message."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        claims_payload=[{"some": "claim"}],
-        submit_side_effect=_api_error("abusefilter-disallowed", info="Rule X tripped."),
-    )
-
-    with pytest.raises(RuntimeError) as excinfo:
-        sdc_sync._post_new_claims("M67890", "fedcba98fedcba98fedcba98fedcba98")
-
-    msg = str(excinfo.value)
-    assert "M67890" in msg
-    assert "fedcba98fedcba98fedcba98fedcba98" in msg
-    assert "abusefilter-disallowed" in msg, f"expected error code in {msg!r}"
-
-
-def test_post_new_refs_runtime_error_caught_by_per_ordinal_handler(monkeypatch):
-    """The RuntimeError raised from inside ``_post_new_refs`` must be a
-    plain ``Exception`` subclass (not ``BaseException``), so the
-    ``except Exception:`` clause in ``process_one_from_sdc`` catches it
-    and the partner batch can continue with the next ordinal.
-
-    Regression guard against the pre-PR-#263 ``sys.exit()`` behaviour,
-    which raised ``SystemExit`` (a ``BaseException``) and bypassed the
-    per-ordinal handler — one failed write tanked the entire partner.
-    """
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_side_effect=_api_error("badtoken"),
-    )
-
-    skipped = False
-    try:
-        sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-    except Exception:
-        # Same ``except Exception:`` clause that wraps each ordinal in
-        # ``process_one_from_sdc`` — catching it here proves the
-        # per-ordinal handler will skip rather than abort the partner.
-        skipped = True
-
-    assert skipped, (
-        "RuntimeError from _post_new_refs must be an Exception subclass so"
-        " the per-ordinal handler in process_one_from_sdc catches it"
-    )
-
-
-def test_post_new_refs_success_path_increments_counter(monkeypatch):
-    """The happy path: ``simple_request().submit()`` returns success →
-    the SDC_REFS_ADDED counter increments by the number of refs posted."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"ref": "a"}, {"ref": "b"}, {"ref": "c"}],
-        submit_return={"success": 1, "entity": {}},
-    )
-
-    before = sdc_sync.tracker.count(Result.SDC_REFS_ADDED)
-    sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-    after = sdc_sync.tracker.count(Result.SDC_REFS_ADDED)
-    assert after == before + 3, (
-        f"SDC_REFS_ADDED should bump by 3; before={before}, after={after}"
-    )
-
-
-def test_post_new_claims_success_path_increments_counter(monkeypatch):
-    """Same happy-path contract for claims."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        claims_payload=[{"c": "a"}, {"c": "b"}],
-        submit_return={"success": 1, "entity": {}},
-    )
-
-    before = sdc_sync.tracker.count(Result.SDC_CLAIMS_ADDED)
-    sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
-    after = sdc_sync.tracker.count(Result.SDC_CLAIMS_ADDED)
-    assert after == before + 2
-
-
-def test_post_new_refs_uses_pywikibot_simple_request_with_csrf_token(monkeypatch):
-    """Verify the helper actually routes through pywikibot's
-    ``simple_request`` and passes the CSRF token from ``site.tokens``
-    (rather than a stale module-global ``token``, which the migration
-    deleted).
-    """
-    from tools import sdc_sync
-
-    fake_site = _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_return={"success": 1},
-    )
-
-    sdc_sync._post_new_refs("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    assert fake_site.simple_request.call_count == 1
-    kwargs = fake_site.simple_request.call_args.kwargs
-    assert kwargs["action"] == "wbeditentity"
-    assert kwargs["id"] == "M12345"
-    assert kwargs["bot"] is True
-    assert kwargs["token"] == "stub-csrf-token"
-    # The encoded claims payload should be the JSON of refclaims.
-    assert "ref" in kwargs["data"]
-
-
-# --------------------------------------------------------------------------
-# `no-such-entity` is treated as a clean skip, NOT a failure.
-#
-# When pywikibot raises ``APIError(code="no-such-entity")``, the
-# MediaInfo entity for the staged M-id doesn't exist — most commonly
-# because the file page was deleted by a Commons curator as a duplicate,
-# or because this is an SDC-only run for a file that wasn't uploaded
-# through our pipeline. Neither is the SDC phase's fault, and re-running
-# wouldn't help — the entity isn't coming back via retry. The phase
-# converts this specific APIError code into ``_MissingEntityError``,
-# which the per-ordinal handler logs at INFO (not ERROR) and counts
-# under ``SDC_ORDINALS_SKIPPED_MISSING_ENTITY`` (not ``..._ERROR``).
-# --------------------------------------------------------------------------
-
-
-def test_post_new_claims_no_such_entity_raises_missing_entity_error(monkeypatch):
-    """Claims POST helper must raise ``_MissingEntityError`` (not
-    ``RuntimeError``) when pywikibot reports ``no-such-entity``."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        claims_payload=[{"some": "claim"}],
-        submit_side_effect=_api_error("no-such-entity", info="⧼no-such-entity⧽"),
-    )
-
-    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
-        sdc_sync._post_new_claims("M12345", "abcdef01abcdef01abcdef01abcdef01")
-
-    assert "M12345" in str(excinfo.value)
-
-
-def test_post_new_refs_no_such_entity_raises_missing_entity_error(monkeypatch):
-    """Same contract for the refs POST helper."""
-    from tools import sdc_sync
-
-    _install_module_globals(
-        monkeypatch,
-        sdc_sync,
-        refclaims_payload=[{"some": "ref"}],
-        submit_side_effect=_api_error("no-such-entity"),
-    )
-
-    with pytest.raises(sdc_sync._MissingEntityError) as excinfo:
-        sdc_sync._post_new_refs("M67890", "fedcba98fedcba98fedcba98fedcba98")
-
-    assert "M67890" in str(excinfo.value)
-
-
 def test_submit_sdc_write_translates_no_such_entity_for_wbremoveclaims(monkeypatch):
     """The shared write helper translates ``APIError(no-such-entity)``
     for ANY action — proving the wbremoveclaims path
@@ -938,13 +742,14 @@ def test_legacy_process_one_treats_missing_entity_as_clean_skip(monkeypatch):
         monkeypatch.setattr(sdc_sync, name, lambda *_a, **_k: None)
     # `dpla_claims` calls `_reconcile_existing_claims` — stub it too.
     monkeypatch.setattr(sdc_sync, "dpla_claims", lambda *_a, **_k: None)
-    # The actual POST helper raises the missing-entity error.
+    # The combined per-file dispatcher raises the missing-entity error
+    # (the equivalent of the old _post_new_* POST helpers' failure
+    # surface, now consolidated into a single wbeditentity per file).
     monkeypatch.setattr(
         sdc_sync,
-        "_post_new_refs",
+        "_flush_per_file_edits",
         lambda *_a, **_k: (_ for _ in ()).throw(sdc_sync._MissingEntityError("M12345")),
     )
-    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *_a, **_k: None)
 
     counter_before = sdc_sync.tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
 
@@ -1090,7 +895,10 @@ def _stmt(stmt_id, prop, snaktype, value, qualifiers=None, references=None):
 
 
 def test_reconciler_queues_removal_for_stale_p170_string():
-    """Stale DPLA-referenced P170 qualifier (value not in `expected`) is queued for wbremoveclaims."""
+    """Stale DPLA-referenced P170 qualifier (value not in ``expected``)
+    is pushed onto the module-level ``removals`` accumulator. The
+    dispatcher flushes it via the combined wbeditentity payload's
+    ``{"id": ..., "remove": ""}`` claim entries."""
     from tools import sdc_sync
 
     stale_stmt = _stmt(
@@ -1107,27 +915,14 @@ def test_reconciler_queues_removal_for_stale_p170_string():
     entity = {"pageid": 999, "statements": {"P170": [stale_stmt]}}
     expected = {"P170": ["U.S. Senate. (03/04/1789)"]}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, mediaid, params))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert len(submit_calls) == 1
-    action, mediaid, params = submit_calls[0]
-    assert action == "wbremoveclaims"
-    assert mediaid == "M999"
-    assert params["claim"] == "M999$STALE", (
-        f"reconciler should queue the stale claim for removal; got {params['claim']!r}"
-    )
+    assert sdc_sync.removals == ["M999$STALE"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_reconciler_keeps_claim_when_value_matches_expected():
@@ -1514,21 +1309,14 @@ def test_reconciler_migrates_old_somevalue_to_new_value_typed(monkeypatch):
     stale_old = _somevalue_p571_claim("M999$OLD", "1945")
     entity = {"pageid": 999, "statements": {"P571": [stale_old]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$OLD")], submit_calls
+    assert sdc_sync.removals == ["M999$OLD"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_reconciler_leaves_value_typed_claim_alone_when_unchanged(monkeypatch):
@@ -1581,21 +1369,14 @@ def test_reconciler_removes_value_typed_claim_when_dpla_dropped_the_date(monkeyp
     )
     entity = {"pageid": 999, "statements": {"P571": [stale_live]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$STALE")], submit_calls
+    assert sdc_sync.removals == ["M999$STALE"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_check_time_kind_recognises_existing_value_typed_match():
@@ -1660,21 +1441,14 @@ def test_reconciler_queues_removal_for_malformed_commons_time_value():
     }
     entity = {"pageid": 999, "statements": {"P571": [malformed_stmt]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$BORK")], submit_calls
+    assert sdc_sync.removals == ["M999$BORK"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_check_time_kind_does_not_crash_on_malformed_commons_value():
@@ -1791,21 +1565,14 @@ def test_reconciler_migrates_plain_to_circa_when_dpla_adds_decorator(monkeypatch
     )
     entity = {"pageid": 999, "statements": {"P571": [on_commons]}}
 
-    submit_calls = []
-
-    def fake_submit(action, mediaid, dpla_id, **params):
-        submit_calls.append((action, params.get("claim")))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "_submit_sdc_write", side_effect=fake_submit),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._reconcile_existing_claims(
             "M999", "abc1234567890abcdef1234567890abcd", expected
         )
 
-    assert submit_calls == [("wbremoveclaims", "M999$EXACT")], submit_calls
+    assert sdc_sync.removals == ["M999$EXACT"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_check_time_kind_treats_circa_and_exact_as_distinct():
@@ -1957,22 +1724,14 @@ def test_reconciler_without_protection_would_remove_unrecognized_chunked_claim()
     entity = {"pageid": 999, "statements": {"P10358": [chunked_a1]}}
     expected = {"P10358": ["the full unchunked description text"]}
 
-    submit_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         # No protected_props — the chunked statement gets queued for removal
         # because ("chunk one text", "A1") isn't in expected["P10358"].
         sdc_sync._reconcile_existing_claims("M999", "abcdef", expected)
 
-    assert len(submit_calls) == 1
-    assert submit_calls[0][0] == "wbremoveclaims"
+    assert sdc_sync.removals == ["M999$chunkA1"]
+    sdc_sync._reset_per_file_accumulators()
 
 
 # ---------------------------------------------------------------------------
@@ -2049,8 +1808,10 @@ def _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=None):
 
 def test_amend_p7482_adds_missing_p2699_and_p6108(monkeypatch):
     """Existing DPLA-authored P7482 with only P973/P137/P459 — the
-    common case for every file uploaded before this PR. Sdc-sync should
-    POST wbsetqualifier for each missing qualifier and stop."""
+    common case for every file uploaded before this code shipped. The
+    builder pushes a (claimid, prop, snak) tuple onto the module-level
+    ``qualifier_amends`` accumulator for each missing qualifier; the
+    per-file dispatcher flushes them in the combined wbeditentity."""
     from tools import sdc_sync
 
     catalog_url = "https://example.org/item/abc"
@@ -2061,29 +1822,20 @@ def test_amend_p7482_adds_missing_p2699_and_p6108(monkeypatch):
     entity = {"pageid": 999, "statements": {"P7482": [legacy_stmt]}}
     payload = _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=iiif_url)
 
-    postqual_calls = []
-
-    def fake_postqual(claimid, prop, value):
-        postqual_calls.append((claimid, prop, value))
-
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(sdc_sync, "postqual", side_effect=fake_postqual),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p7482_url_qualifiers(
             "M999", "abcdef", payload, download_url=download_url
         )
 
-    # Both qualifiers were posted; both targeted the same existing claim.
-    by_prop = {c[1]: c for c in postqual_calls}
-    assert "P2699" in by_prop, postqual_calls
-    assert "P6108" in by_prop, postqual_calls
+    by_prop = {prop: (cid, snak) for (cid, prop, snak) in sdc_sync.qualifier_amends}
+    assert "P2699" in by_prop, sdc_sync.qualifier_amends
+    assert "P6108" in by_prop, sdc_sync.qualifier_amends
     assert by_prop["P2699"][0] == "M999$P7482"
     assert by_prop["P6108"][0] == "M999$P7482"
-    # Values are JSON-encoded strings (matches add_det's wbsetqualifier value).
-    assert json.loads(by_prop["P2699"][2]) == download_url
-    assert json.loads(by_prop["P6108"][2]) == iiif_url
+    assert by_prop["P2699"][1]["datavalue"]["value"] == download_url
+    assert by_prop["P6108"][1]["datavalue"]["value"] == iiif_url
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_amend_p7482_noop_when_qualifiers_already_match(monkeypatch):
@@ -2107,19 +1859,13 @@ def test_amend_p7482_noop_when_qualifiers_already_match(monkeypatch):
     entity = {"pageid": 999, "statements": {"P7482": [already_migrated]}}
     payload = _sdc_payload_with_p7482(catalog_url, iiif_manifest_url=iiif_url)
 
-    postqual_calls = []
     with (
         patch.object(sdc_sync, "get_entity", return_value=entity),
         patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
     ):
         sdc_sync._amend_p7482_url_qualifiers(
             "M999", "abcdef", payload, download_url=download_url
         )
-
-    assert postqual_calls == []
 
 
 def test_amend_p7482_skips_when_no_existing_statement(monkeypatch):
@@ -2132,13 +1878,9 @@ def test_amend_p7482_skips_when_no_existing_statement(monkeypatch):
     entity = {"pageid": 999, "statements": {}}  # no P7482
     payload = _sdc_payload_with_p7482("https://example.org/item/abc")
 
-    postqual_calls = []
     with (
         patch.object(sdc_sync, "get_entity", return_value=entity),
         patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
     ):
         sdc_sync._amend_p7482_url_qualifiers(
             "M999",
@@ -2146,8 +1888,6 @@ def test_amend_p7482_skips_when_no_existing_statement(monkeypatch):
             payload,
             download_url="https://example.org/files/abc.jpg",
         )
-
-    assert postqual_calls == []
 
 
 def test_amend_p7482_does_not_touch_foreign_statements(monkeypatch):
@@ -2171,19 +1911,13 @@ def test_amend_p7482_does_not_touch_foreign_statements(monkeypatch):
     entity = {"pageid": 999, "statements": {"P7482": [foreign_stmt]}}
     payload = _sdc_payload_with_p7482(catalog_url)
 
-    postqual_calls = []
     with (
         patch.object(sdc_sync, "get_entity", return_value=entity),
         patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
     ):
         sdc_sync._amend_p7482_url_qualifiers(
             "M999", "abcdef", payload, download_url="https://example.org/files/abc.jpg"
         )
-
-    assert postqual_calls == []
 
 
 def test_dpla_extra_qualifier_props_p7482_includes_new_url_quals():
@@ -2297,7 +2031,6 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing
     }
     entity = {"pageid": 999, "statements": {"P760": [no_p304_stmt]}}
 
-    postqual_calls = []
     submit_calls = []
     invalidate_calls = []
     with (
@@ -2312,26 +2045,23 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing
             "_submit_sdc_write",
             side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
         ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
     ):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=None
         )
-    assert postqual_calls == []
     assert submit_calls == []
     # No writes happened → no terminal invalidate.
     assert invalidate_calls == []
 
 
 def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none():
-    """Critical CodeRabbit-flagged case: file that USED to be in a
-    multi-file extension group (had P304="2") is now a singleton
-    (e.g. siblings were deleted). page_number is None in the new
-    computation, but the existing P304 must be removed — otherwise
-    the file keeps incorrect page metadata indefinitely, since the
-    reconciler doesn't diff P304."""
+    """File that USED to be in a multi-file extension group (had
+    P304="2") is now a singleton — ``page_number=None``. The builder
+    must push the stale snak hash onto ``qualifier_removals``; the
+    per-file dispatcher will exclude it from the wholesale-replace
+    qualifier set in the combined wbeditentity. Otherwise the file
+    keeps incorrect page metadata indefinitely since the reconciler
+    doesn't diff P304."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2356,35 +2086,21 @@ def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none()
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    submit_calls = []
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=None
         )
 
-    # wbremovequalifiers fired for the stale snak; no postqual.
-    assert len(submit_calls) == 1
-    action, _args, kw = submit_calls[0]
-    assert action == "wbremovequalifiers"
-    assert kw["qualifiers"] == "obsolete-hash"
-    assert postqual_calls == []
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "obsolete-hash")]
+    assert sdc_sync.qualifier_amends == []
+    sdc_sync._reset_per_file_accumulators()
 
 
-def test_amend_p760_page_qualifier_stamps_missing_p304_via_postqual():
-    """Existing DPLA-authored P760 with no P304 → postqual gets called
-    with the page-number value."""
+def test_amend_p760_page_qualifier_stamps_missing_p304_via_accumulator():
+    """Existing DPLA-authored P760 with no P304 → the builder pushes a
+    new-P304 snak onto ``qualifier_amends`` for the dispatcher to flush
+    in the combined wbeditentity."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2399,23 +2115,19 @@ def test_amend_p760_page_qualifier_stamps_missing_p304_via_postqual():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    assert len(postqual_calls) == 1
-    claimid, prop, value_json = postqual_calls[0]
+    assert len(sdc_sync.qualifier_amends) == 1
+    claimid, prop, snak = sdc_sync.qualifier_amends[0]
     assert claimid == "M999$p760id"
     assert prop == "P304"
-    assert json.loads(value_json) == "2"
+    assert snak["datavalue"]["value"] == "2"
+    assert sdc_sync.qualifier_removals == []
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_amend_p760_page_qualifier_idempotent_when_p304_already_matches():
@@ -2438,19 +2150,13 @@ def test_amend_p760_page_qualifier_idempotent_when_p304_already_matches():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    postqual_calls = []
     with (
         patch.object(sdc_sync, "get_entity", return_value=entity),
         patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
     ):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
-
-    assert postqual_calls == []
 
 
 def test_amend_p760_page_qualifier_skips_when_no_dpla_authored_p760():
@@ -2470,29 +2176,23 @@ def test_amend_p760_page_qualifier_skips_when_no_dpla_authored_p760():
     }
     entity = {"pageid": 999, "statements": {"P760": [foreign_p760]}}
 
-    postqual_calls = []
     with (
         patch.object(sdc_sync, "get_entity", return_value=entity),
         patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
     ):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=1
         )
-
-    assert postqual_calls == []
 
 
 def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
     """Renumber scenario: existing DPLA-authored P760 has P304="3"
     (from a prior sync), but the recomputed page_number is now 2 (a
     sibling ordinal got deleted, shifting this file's position). The
-    helper must remove the stale "3" qualifier via wbremovequalifiers
-    BEFORE adding the new "2"; otherwise the statement accumulates
-    conflicting page numbers indefinitely since the reconciler matches
-    P760 only by mainsnak value."""
+    builder must push both the stale snak-hash removal AND the new
+    snak addition onto the accumulators; the dispatcher folds them
+    together into a single wholesale-replace qualifier set on the
+    combined wbeditentity."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2517,43 +2217,26 @@ def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    submit_calls = []
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    # wbremovequalifiers was called for the stale snak hash.
-    assert len(submit_calls) == 1
-    action, _args, kw = submit_calls[0]
-    assert action == "wbremovequalifiers"
-    assert kw["claim"] == "M999$p760id"
-    assert kw["qualifiers"] == "stale-snak-hash-3"
-
-    # postqual added the new value.
-    assert len(postqual_calls) == 1
-    claimid, prop, value_json = postqual_calls[0]
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "stale-snak-hash-3")]
+    assert len(sdc_sync.qualifier_amends) == 1
+    claimid, prop, snak = sdc_sync.qualifier_amends[0]
     assert claimid == "M999$p760id"
     assert prop == "P304"
-    assert json.loads(value_json) == "2"
+    assert snak["datavalue"]["value"] == "2"
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
     """Mixed case: existing P304 has both the expected value AND a stale
-    one (e.g. a prior renumber wasn't cleaned up). Helper must remove
-    only the stale snak and NOT re-add the expected value."""
+    one (e.g. a prior renumber wasn't cleaned up). Builder must push
+    only the stale snak-hash removal onto ``qualifier_removals`` and
+    NOT add the expected value (it's already present)."""
     from tools import sdc_sync
 
     existing_p760 = {
@@ -2584,29 +2267,17 @@ def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
     }
     entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
 
-    submit_calls = []
-    postqual_calls = []
-    with (
-        patch.object(sdc_sync, "get_entity", return_value=entity),
-        patch.object(sdc_sync, "invalidate_entity"),
-        patch.object(
-            sdc_sync,
-            "_submit_sdc_write",
-            side_effect=lambda action, *a, **kw: submit_calls.append((action, a, kw)),
-        ),
-        patch.object(
-            sdc_sync, "postqual", side_effect=lambda *a: postqual_calls.append(a)
-        ),
-    ):
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    # Only the stale snak got removed; the expected value was already
-    # present, so no postqual.
-    assert len(submit_calls) == 1
-    assert submit_calls[0][2]["qualifiers"] == "stale-hash-3"
-    assert postqual_calls == []
+    # Only the stale snak got queued for removal; the expected value
+    # was already present, so no addition pushed.
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "stale-hash-3")]
+    assert sdc_sync.qualifier_amends == []
+    sdc_sync._reset_per_file_accumulators()
 
 
 def test_dpla_extra_qualifier_props_p760_includes_p304_and_p1545():
@@ -2889,14 +2560,11 @@ def test_amend_p760_page_qualifier_does_not_re_invalidate_when_p304_matches():
             "invalidate_entity",
             side_effect=lambda *a: invalidate_calls.append(a),
         ),
-        patch.object(sdc_sync, "postqual"),
     ):
         sdc_sync._amend_p760_page_qualifier(
             "M999", "abcdef", {"claims": []}, page_number=2
         )
 
-    # Idempotent path: no invalidate, no postqual. (The pre-PR version
-    # always invalidated at the end; the cleanup keeps it conditional.)
     assert invalidate_calls == []
 
 
@@ -2953,11 +2621,10 @@ def _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, current_medi
     fake_site = MagicMock()
     fake_site.simple_request.return_value = fake_request
     monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
-    monkeypatch.setattr(sdc_sync, "_post_new_refs", lambda *a, **kw: None)
-    monkeypatch.setattr(sdc_sync, "_post_new_claims", lambda *a, **kw: None)
     monkeypatch.setattr(sdc_sync, "_amend_p7482_url_qualifiers", lambda *a, **kw: None)
     monkeypatch.setattr(sdc_sync, "_amend_p760_page_qualifier", lambda *a, **kw: None)
     monkeypatch.setattr(sdc_sync, "_reconcile_existing_claims", lambda *a, **kw: None)
+    monkeypatch.setattr(sdc_sync, "_flush_per_file_edits", lambda *a, **kw: None)
 
 
 def test_process_one_from_sdc_clears_entity_cache_at_file_boundary(monkeypatch):
@@ -3084,3 +2751,334 @@ def test_process_one_cache_does_not_grow_across_many_files(monkeypatch, tmp_path
         f"{max(sizes)}); cache locality must be per-file"
     )
     sdc_sync._entity_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Single-edit dispatcher: every per-file accumulator drains into one
+# wbeditentity POST per file. The atomic-edit guarantee from #38.
+# ---------------------------------------------------------------------------
+
+
+def test_submit_per_item_edit_no_op_when_all_fragment_lists_empty():
+    """Empty accumulators → no POST. Files with nothing to change don't
+    generate spurious revisions."""
+    from tools import sdc_sync
+
+    submit_calls = []
+    with patch.object(
+        sdc_sync,
+        "_submit_sdc_write",
+        side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+    ):
+        sdc_sync._submit_per_item_edit("M999", "abcdef", summary="summary")
+    assert submit_calls == []
+
+
+def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
+    """Every fragment kind — new claims, reference updates, qualifier
+    updates, removals — gets bundled into a single ``wbeditentity``
+    POST with the combined claims list in ``data.claims``."""
+    import json
+
+    from tools import sdc_sync
+
+    new_claim = {
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"value": "abc", "type": "string"},
+        },
+        "type": "statement",
+        "rank": "normal",
+    }
+    ref_update = {"id": "M999$existing", "references": [{"snaks": {}}]}
+    qual_update = {"id": "M999$amend", "qualifiers": {"P459": []}}
+    removal = {"id": "M999$gone", "remove": ""}
+
+    submit_calls = []
+    with patch.object(
+        sdc_sync,
+        "_submit_sdc_write",
+        side_effect=lambda action, mediaid, dpla_id, **kw: submit_calls.append(
+            (action, mediaid, dpla_id, kw)
+        ),
+    ):
+        sdc_sync._submit_per_item_edit(
+            "M999",
+            "abcdef",
+            summary="combined edit",
+            new_claims=[new_claim],
+            reference_updates=[ref_update],
+            qualifier_updates=[qual_update],
+            removals=[removal],
+        )
+
+    assert len(submit_calls) == 1
+    action, mediaid, dpla_id, kw = submit_calls[0]
+    assert action == "wbeditentity"
+    assert mediaid == "M999"
+    payload = json.loads(kw["data"])
+    assert payload["claims"] == [new_claim, ref_update, qual_update, removal]
+
+
+def test_p813_refresh_skips_when_no_other_edits():
+    """No fragments in any accumulator → no POST, including no P813
+    refresh. The refresh only piggybacks on edits we're already making."""
+    from tools import sdc_sync
+
+    entity = {
+        "pageid": 999,
+        "statements": {
+            "P760": [
+                {
+                    "id": "M999$existing",
+                    "mainsnak": {
+                        "property": "P760",
+                        "snaktype": "value",
+                        "datavalue": {"value": "abcdef", "type": "string"},
+                    },
+                    "qualifiers": {"P459": _dpla_p459()},
+                    "references": [_dpla_reference("abcdef")],
+                }
+            ]
+        },
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    assert submit_calls == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def _stale_p813_ref(dpla_id):
+    """DPLA-shape reference with an old P813 date so the refresh path
+    will detect it as stale."""
+    return {
+        "snaks": {
+            "P854": [
+                {
+                    "snaktype": "value",
+                    "property": "P854",
+                    "datavalue": {
+                        "type": "string",
+                        "value": f"https://dp.la/item/{dpla_id}",
+                    },
+                }
+            ],
+            "P123": _qual_entity("P123", "Q2944483"),
+            "P813": [
+                {
+                    "snaktype": "value",
+                    "property": "P813",
+                    "datavalue": {
+                        "type": "time",
+                        "value": {
+                            "time": "+2024-01-01T00:00:00Z",
+                            "timezone": 0,
+                            "before": 0,
+                            "after": 0,
+                            "precision": 11,
+                            "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                        },
+                    },
+                }
+            ],
+        }
+    }
+
+
+def test_p813_refresh_added_when_other_edits_exist():
+    """When any other edit is being made on the file, the dispatcher
+    refreshes P813 on all DPLA-authored claims whose P813 isn't already
+    today's date."""
+    import datetime as _dt
+    import json
+
+    from tools import sdc_sync
+
+    old_claim = {
+        "id": "M999$old",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"value": "abcdef", "type": "string"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_stale_p813_ref("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [old_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    # Queue ONE unrelated removal so the dispatcher decides to edit.
+    sdc_sync.removals.append("M999$some-other-claim")
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    payload = json.loads(submit_calls[0][1]["data"])
+    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    refresh = [
+        c for c in payload["claims"] if c.get("id") == "M999$old" and "references" in c
+    ]
+    assert len(refresh) == 1
+    refreshed_p813 = refresh[0]["references"][0]["snaks"]["P813"][0]["datavalue"][
+        "value"
+    ]["time"]
+    assert refreshed_p813 == today_iso
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_p813_refresh_skips_claims_already_dated_today():
+    """A DPLA reference whose P813 is already today is not re-emitted."""
+    import datetime as _dt
+    import json
+
+    from tools import sdc_sync
+
+    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    fresh_ref = {
+        "snaks": {
+            "P854": [
+                {
+                    "snaktype": "value",
+                    "property": "P854",
+                    "datavalue": {
+                        "type": "string",
+                        "value": "https://dp.la/item/abcdef",
+                    },
+                }
+            ],
+            "P123": _qual_entity("P123", "Q2944483"),
+            "P813": [
+                {
+                    "snaktype": "value",
+                    "property": "P813",
+                    "datavalue": {
+                        "type": "time",
+                        "value": {
+                            "time": today_iso,
+                            "timezone": 0,
+                            "before": 0,
+                            "after": 0,
+                            "precision": 11,
+                            "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                        },
+                    },
+                }
+            ],
+        }
+    }
+    fresh_claim = {
+        "id": "M999$fresh",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"value": "abcdef", "type": "string"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [fresh_ref],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [fresh_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    sdc_sync.removals.append("M999$some-other-claim")
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    payload = json.loads(submit_calls[0][1]["data"])
+    fresh_refresh = [c for c in payload["claims"] if c.get("id") == "M999$fresh"]
+    assert fresh_refresh == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_p813_refresh_preserves_user_added_references():
+    """Files with a mix of DPLA-authored and user-added references get
+    ONLY the DPLA reference refreshed; user references are preserved
+    verbatim in the rewritten references list."""
+    import datetime as _dt
+    import json
+
+    from tools import sdc_sync
+
+    user_ref = {
+        "snaks": {
+            "P854": [
+                {
+                    "snaktype": "value",
+                    "property": "P854",
+                    "datavalue": {
+                        "type": "string",
+                        "value": "https://example.com/citation",
+                    },
+                }
+            ],
+        }
+    }
+    claim = {
+        "id": "M999$mixed",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"value": "abcdef", "type": "string"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [user_ref, _stale_p813_ref("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    sdc_sync.removals.append("M999$some-other-claim")
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    payload = json.loads(submit_calls[0][1]["data"])
+    refresh = next(
+        c
+        for c in payload["claims"]
+        if c.get("id") == "M999$mixed" and "references" in c
+    )
+    refs = refresh["references"]
+    assert refs[0] == user_ref
+    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    assert refs[1]["snaks"]["P813"][0]["datavalue"]["value"]["time"] == today_iso
+    sdc_sync._reset_per_file_accumulators()
