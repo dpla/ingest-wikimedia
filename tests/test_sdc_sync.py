@@ -2791,7 +2791,17 @@ def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
         "type": "statement",
         "rank": "normal",
     }
-    ref_update = {"id": "M999$existing", "references": [{"snaks": {}}]}
+    # Reference- and qualifier-update fragments carry ``type: "statement"``
+    # — wbeditentity rejects the bundle without it. The dispatcher
+    # backstops this by stamping the field on any fragment that's
+    # missing it, so callers may pass fragments with or without it
+    # interchangeably; the assertion below checks both fragments end up
+    # with it in the POSTed payload regardless of which side set it.
+    ref_update = {
+        "id": "M999$existing",
+        "type": "statement",
+        "references": [{"snaks": {}}],
+    }
     qual_update = {"id": "M999$amend", "qualifiers": {"P459": []}}
     removal = {"id": "M999$gone", "remove": ""}
 
@@ -2818,7 +2828,12 @@ def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
     assert action == "wbeditentity"
     assert mediaid == "M999"
     payload = json.loads(kw["data"])
-    assert payload["claims"] == [new_claim, ref_update, qual_update, removal]
+    # ``qual_update`` was passed in without ``type``; the dispatcher
+    # should have stamped it on. Assert against the dispatcher-stamped
+    # shape so this test enforces the invariant rather than enshrining
+    # the broken pre-fix one.
+    expected_qual_update = {**qual_update, "type": "statement"}
+    assert payload["claims"] == [new_claim, ref_update, expected_qual_update, removal]
 
 
 def test_p813_refresh_skips_when_no_other_edits():
@@ -3081,4 +3096,97 @@ def test_p813_refresh_preserves_user_added_references():
     assert refs[0] == user_ref
     today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
     assert refs[1]["snaks"]["P813"][0]["datavalue"]["value"]["time"] == today_iso
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_flush_emits_type_statement_on_every_non_removal_fragment():
+    """Regression: wbeditentity rejects the entire bundle with
+    ``invalid-claim: Type is missing`` unless every non-removal claim
+    entry carries ``type: "statement"``. The dispatcher's atomicity then
+    drops every other edit too — so a missing ``type`` on one fragment
+    silently blocks unrelated P2699 backfills, new-claim adds, and
+    removals on the same file.
+
+    Exercise the realistic mix: one queued qualifier-amend (drives a
+    qualifier-update fragment), one queued removal (drives a removal
+    fragment), and a DPLA-authored claim with a stale P813 reference
+    (drives a P813 refresh fragment). Assert every non-removal claim
+    in the POSTed payload carries ``type: "statement"``.
+    """
+    import json
+
+    from tools import sdc_sync
+
+    stale_claim = {
+        "id": "M999$stale",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"value": "abcdef", "type": "string"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_stale_p813_ref("abcdef")],
+    }
+    amend_target = {
+        "id": "M999$amend",
+        "mainsnak": {
+            "property": "P7482",
+            "snaktype": "value",
+            "datavalue": {
+                "type": "wikibase-entityid",
+                "value": {"entity-type": "item", "id": "Q74228490"},
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+    }
+    entity = {
+        "pageid": 999,
+        "statements": {
+            "P760": [stale_claim],
+            "P7482": [amend_target],
+        },
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    sdc_sync.qualifier_amends.append(
+        ("M999$amend", "P2699", sdc_sync._url_snak("P2699", "https://example.com/foo"))
+    )
+    sdc_sync.removals.append("M999$gone")
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    assert len(submit_calls) == 1, "dispatcher should POST exactly once"
+    payload = json.loads(submit_calls[0][1]["data"])
+    sent_claims = payload["claims"]
+    # Sanity: we should be sending one of each fragment kind so this
+    # test is actually exercising all three code paths.
+    kinds = {
+        "removal": [c for c in sent_claims if c.get("remove") == ""],
+        "qualifier": [
+            c for c in sent_claims if "qualifiers" in c and c.get("remove") != ""
+        ],
+        "reference": [
+            c for c in sent_claims if "references" in c and c.get("remove") != ""
+        ],
+    }
+    assert kinds["removal"], "removal fragment should be present"
+    assert kinds["qualifier"], "qualifier-update fragment should be present"
+    assert kinds["reference"], "P813 refresh fragment should be present"
+    for claim in sent_claims:
+        if claim.get("remove") == "":
+            continue  # removal entries don't take a type
+        assert claim.get("type") == "statement", (
+            f"non-removal fragment missing type:statement — wbeditentity "
+            f"would reject the bundle: {claim!r}"
+        )
     sdc_sync._reset_per_file_accumulators()
