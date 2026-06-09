@@ -3168,25 +3168,27 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
     assert len(submit_calls) == 1, "dispatcher should POST exactly once"
     payload = json.loads(submit_calls[0][1]["data"])
     sent_claims = payload["claims"]
-    # Sanity: we should be sending one of each fragment kind so this
-    # test is actually exercising all three code paths.
-    kinds = {
-        "removal": [c for c in sent_claims if c.get("remove") == ""],
-        "qualifier": [
-            c for c in sent_claims if "qualifiers" in c and c.get("remove") != ""
-        ],
-        "reference": [
-            c for c in sent_claims if "references" in c and c.get("remove") != ""
-        ],
-    }
-    assert kinds["removal"], "removal fragment should be present"
-    assert kinds["qualifier"], "qualifier-update fragment should be present"
-    assert kinds["reference"], "P813 refresh fragment should be present"
+    by_id = {c.get("id"): c for c in sent_claims}
+    # Sanity: every code path should be exercised by this fixture so
+    # the assertions below actually cover all three fragment kinds.
+    assert "M999$gone" in by_id, "removal fragment should be present"
+    assert "M999$amend" in by_id, "qualifier-update fragment should be present"
+    assert "M999$stale" in by_id, "P813 refresh fragment should be present"
     for claim in sent_claims:
         if claim.get("remove") == "":
-            continue  # removal entries don't take a type
+            continue  # removal entries are exempt from the type/mainsnak rule
         assert claim.get("type") == "statement", (
             f"non-removal fragment missing type:statement — wbeditentity "
+            f"would reject the bundle: {claim!r}"
+        )
+        # wbeditentity treats every non-removal claim as a
+        # wholesale-replace; partial fragments ``{id, qualifiers}`` /
+        # ``{id, references}`` get rejected with
+        # ``invalid-claim: Attribute "mainsnak" is missing`` and the
+        # atomic bundle (every OTHER edit in this file's per-file
+        # batch) is dropped with it.
+        assert "mainsnak" in claim, (
+            f"non-removal fragment missing mainsnak — wbeditentity "
             f"would reject the bundle: {claim!r}"
         )
     sdc_sync._reset_per_file_accumulators()
