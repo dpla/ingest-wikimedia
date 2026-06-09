@@ -48,7 +48,7 @@ Notable wiring:
 
 `Module:DPLA` reads the file's MediaInfo entity directly and renders a two-box block:
 
-- **Blue box** — every field is sourced from a DPLA-determined SDC statement (recognised by the `P459 = Q61848113` qualifier). Updated automatically when the SDC sync re-writes; no editor intervention.
+- **Blue box** — every field is sourced from a DPLA-determined SDC statement (recognised by the `P459 = Q61848113` qualifier). Updated automatically when the SDC sync rewrites; no editor intervention.
 - **Yellow box** — augmented from explicit template parameters (Artwork/Information-style names) plus any non-DPLA SDC statements on the same properties. The yellow box gives Commons editors a place to add corrections, translations, or supplementary metadata without conflicting with the bot's authoritative blue-box values.
 
 The module also writes three tracking categories per file with DPLA SDC: the DPLA umbrella category, the regional hub category (e.g. `Plains to Peaks Collective`), and the contributing institution category (e.g. `Denver Public Library`). When the hub partner is the institution itself (NARA, Smithsonian), the hub-role P9126 statement is omitted by the bot and the module falls back to the institution Q-ID for the hub category — preventing the "unknown partner" maintenance category for these special cases.
@@ -62,7 +62,7 @@ The module's existence is acknowledged in a handful of code comments inside the 
 - `ingest_wikimedia/sdc.py` — chunked-claim convention notes ("so the Lua [module] can reassemble the chunks").
 - `tools/sdc_sync.py` — same chunking notes; "unchunked variants of the same text are kept separate so the Lua template..."
 
-The pipeline does NOT directly invoke the module, render it client-side, or test it. Module:DPLA lives on Commons and is maintained as a Wikimedia-side artefact; this repo's responsibility is to write SDC the module can render correctly. See the test file at `commons.wikimedia.org/wiki/File:Plate_49_of_King's_1933_aerial_coverage_of_Denver,_Colorado_-_DPLA_-_4c3f5ad9bfac4097b95c9f8deb8e1a21.jpg` for a live render.
+The pipeline does NOT directly invoke the module, render it client-side, or test it. Module:DPLA lives on Commons and is maintained as a Wikimedia-side artefact; this repo's responsibility is to write SDC the module can render correctly. See [this test file on Commons](https://commons.wikimedia.org/wiki/File:Plate_49_of_King%27s_1933_aerial_coverage_of_Denver,_Colorado_-_DPLA_-_4c3f5ad9bfac4097b95c9f8deb8e1a21.jpg) for a live render.
 
 ## Planned transition
 

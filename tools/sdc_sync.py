@@ -2499,8 +2499,15 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=froze
                                         }
                                     )
                                 except (KeyError, IndexError, TypeError):
-                                    # P7482 statement without a P973 qualifier — skip it
-                                    pass
+                                    # P7482 statement without a P973 qualifier — skip
+                                    # it from reconciliation, but log the statement ID
+                                    # so operators can spot malformed DPLA-authored
+                                    # claims rather than have them vanish silently.
+                                    logging.debug(
+                                        "P7482 statement %s missing P973 qualifier; "
+                                        "skipping reconciliation",
+                                        stmt.get("id"),
+                                    )
                             elif dtype == "wikibase-entityid":
                                 dpla_claim_list.append(
                                     {
