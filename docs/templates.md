@@ -68,36 +68,54 @@ The pipeline does NOT directly invoke the module, render it client-side, or test
 
 The roadmap is to ship `{{DPLA metadata}}` as the *primary* format the pipeline writes at upload time, replacing the `{{Artwork}}`-based wikitext block. Two reasons:
 
-1. **Single source of truth.** Today the metadata is duplicated — once as wikitext templated by the uploader, once as SDC reconciled by the sync phase. Switching the primary display to `{{DPLA metadata}}` means the SDC IS the metadata, full stop. The file-page wikitext becomes a one-line `{{DPLA metadata}}` invocation that picks everything up from SDC.
+1. **Single source of truth.** Today the metadata is duplicated — once as wikitext templated by the uploader, once as SDC reconciled by the sync phase. Switching the primary display to `{{DPLA metadata}}` means the SDC IS the metadata, full stop. The file-page wikitext becomes a bare `{{DPLA metadata}}` invocation that picks everything up from SDC.
 2. **Live updates.** When `Module:DPLA` reads SDC, every file gets the current rendering of the current data — no need to re-edit thousands of wikitext blobs to push out a display change.
 
-### What would need to change in the uploader
+### Per-file lifecycle (planned)
 
-`get_wiki_text()` would need to be rewritten to emit (essentially) just `{{DPLA metadata}}` plus the licensing template — the rest comes from SDC. Concretely:
+Three edits per file, in order:
+
+1. **Upload.** The uploader writes `{{DPLA metadata}}` with explicit wikitext parameters for every available field (title, description, creator, date, institution, subject, source). Wikitext params are necessary here because MediaWiki's [upload API](https://www.mediawiki.org/wiki/API:Upload) doesn't allow SDC statements to be attached in the same request, and Commons will not tolerate a file landing with no readable description even briefly. The Lua module already supports the explicit-param path (yellow box on a fresh upload, with no SDC populated yet).
+2. **SDC sync.** A subsequent edit posts the same metadata as MediaInfo statements via `wbeditentity`. After this edit, the wikitext params and the SDC contain the same values — the displayed page now has the SDC-driven blue box *and* the param-driven yellow box, both rendering identical content.
+3. **Cleanup edit.** A one-time follow-up edit strips the now-redundant wikitext params, leaving a bare `{{DPLA metadata}}` invocation. From this point on the file's display is entirely SDC-driven, and any future DPLA sync that updates the source data flows through to the rendered page automatically — no wikitext re-edit needed.
+
+Step 3 matters because explicit wikitext params *override* SDC on display (see [`Template:DPLA metadata/doc`](https://commons.wikimedia.org/wiki/Template:DPLA_metadata/doc) on Commons). Leaving stale params in place would mask any future SDC corrections.
+
+### Adoption of community-uploaded files
+
+The duplicate-detection logic already handles a related case: a file from a DPLA partner that some Commons editor has already uploaded directly (typically from the partner's online catalog or from Flickr). When the pipeline detects this overlap and adopts the file into DPLA's system — renaming it to the canonical `... - DPLA - <id>.<ext>` form — the planned workflow migrates whatever metadata the original uploader recorded in the existing wikitext into `{{DPLA metadata}}`'s yellow-box parameters. SDC sync then layers the DPLA-authoritative values on top: blue box shows DPLA, yellow box preserves the migrated editor data verbatim.
+
+The migration step is not yet implemented; today's duplicate-detection flow handles the rename and the `{{Duplicate}}` tagging of the original (see [special-cases.md](special-cases.md#hash-drift-the-four-cases)), but leaves the wikitext at the new title in its `{{Artwork}}` form.
+
+### Uploader code changes required
+
+`ingest_wikimedia/wikimedia.py::get_wiki_text` would need to be rewritten to emit `{{DPLA metadata}}` with explicit params instead of an `{{Artwork}}` block:
 
 ```wikitext
 == {{int:filedesc}} ==
-{{DPLA metadata}}
+{{DPLA metadata
+ |title       = ...
+ |description = ...
+ |author      = ...
+ |date        = ...
+ |institution = ...
+ |subject     = ...
+}}
 
 == {{int:license-header}} ==
 {{<permissions-template>}}
 ```
 
-The licensing line stays separate because Commons' file curation conventions require the license template to be visible in the wikitext (not just SDC) for human review.
+The licensing line stays separate because Commons' file-curation conventions require the license template to be visible in the wikitext (not just SDC) for human review.
 
-### What would need to change in the phase order
-
-Today the upload phase writes wikitext *before* the SDC phase posts the SDC. If `{{DPLA metadata}}` is the primary format, the wikitext is empty of metadata until SDC arrives — files would temporarily look blank between upload and SDC sync. Two ways to handle this:
-
-1. **Reverse the phase order.** Make the uploader post a placeholder `{{DPLA metadata}}` block at upload, then have a new "SDC pre-stage" phase run *before* the upload commits, writing the SDC into a staging entity. This is doable but invasive — Commons' upload API doesn't allow SDC + file-page in one request, so the staging would still happen post-upload, just before publishing the wikitext.
-2. **Pre-populate template parameters.** Use the explicit-param path of `{{DPLA metadata}}` so the uploader writes `{{DPLA metadata|title=...|description=...|...}}` with the same values it would have put into `{{Artwork}}`. The Lua module already supports this (explicit params override SDC fallbacks). Then SDC sync lands the same values as structured data, and over time the params can be dropped from the wikitext as SDC becomes authoritative.
-
-Option 2 is the lower-risk path and is what's currently planned. The wikitext becomes a transition vehicle: explicit params today, gradual dropping of params as SDC coverage stabilises, eventually a bare `{{DPLA metadata}}`.
+The cleanup edit (step 3 of the lifecycle) would be a new piece of code — likely a separate maintenance pass that runs at some interval after SDC sync, scans for files where SDC and wikitext params agree, and strips the params.
 
 ### Workstreams the transition would touch
 
-- `ingest_wikimedia/wikimedia.py::get_wiki_text` — new template body.
-- Commons-side `Template:DPLA metadata/doc` — already updated to describe both the blue (SDC) and yellow (user/explicit-param) boxes.
+- `ingest_wikimedia/wikimedia.py::get_wiki_text` — new template body with explicit params.
+- A new maintenance pass (e.g. `tools/strip_redundant_params.py`) for step 3.
+- The adoption-migration path in `tools/uploader.py::_resolve_hash_drift` — extend the rename branches to salvage the original editor's wikitext into yellow-box params.
+- Commons-side [`Template:DPLA metadata/doc`](https://commons.wikimedia.org/wiki/Template:DPLA_metadata/doc) — already documents the planned lifecycle.
 - `Commons:Digital Public Library of America/Modeling` — already updated to describe the SDC properties the module reads.
 - Operator runbook in [operations.md](operations.md) — note the change in the "what's on a fresh upload" wording.
 - A staged rollout — flip one hub at a time so a regression doesn't take down every partner.
