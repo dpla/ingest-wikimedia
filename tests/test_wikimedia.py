@@ -287,36 +287,36 @@ def test_wiki_file_exists():
     mock_site.allimages.assert_called_once()
 
 
-ARTWORK = "== {{int:filedesc}} ==\n{{Artwork|title=Example}}"
+NEW_WIKITEXT = "== {{int:filedesc}} ==\n{{DPLA metadata|title=Example}}"
 
 
 def test_merge_preserved_wikitext_empty_existing():
-    result = merge_preserved_wikitext("", ARTWORK)
-    assert result == ARTWORK + "\n"
+    result = merge_preserved_wikitext("", NEW_WIKITEXT)
+    assert result == NEW_WIKITEXT + "\n"
 
 
 def test_merge_preserved_wikitext_preserves_pd_usgov():
     existing = "== {{int:license-header}} ==\n{{PD-USGov}}\n"
-    result = merge_preserved_wikitext(existing, ARTWORK)
-    assert result == ARTWORK + "\n\n{{PD-USGov}}\n"
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
+    assert result == NEW_WIKITEXT + "\n\n{{PD-USGov}}\n"
 
 
 def test_merge_preserved_wikitext_preserves_pd_usgov_variants():
     existing = "{{PD-USGov-Military-Army}} and {{PD-USGov-NARA}}"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{PD-USGov-Military-Army}}" in result
     assert "{{PD-USGov-NARA}}" in result
 
 
 def test_merge_preserved_wikitext_preserves_pd_usgov_with_params():
     existing = "{{PD-USGov|date=1986}}"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{PD-USGov|date=1986}}" in result
 
 
 def test_merge_preserved_wikitext_preserves_image_extracted():
     existing = "|other versions={{Image extracted|1=Parent Image.jpg}}"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{Image extracted|1=Parent Image.jpg}}" in result
 
 
@@ -326,7 +326,7 @@ def test_merge_preserved_wikitext_preserves_categories():
         "[[Category:Nancy and Ronald Reagan]]\n"
         "[[Category:Files uploaded by RandomUserGuy1738]]\n"
     )
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "[[Category:Ronald Reagan in 1986]]" in result
     assert "[[Category:Nancy and Ronald Reagan]]" in result
     assert "[[Category:Files uploaded by RandomUserGuy1738]]" in result
@@ -334,7 +334,7 @@ def test_merge_preserved_wikitext_preserves_categories():
 
 def test_merge_preserved_wikitext_preserves_category_with_sort_key():
     existing = "[[Category:Foo|Bar]]"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "[[Category:Foo|Bar]]" in result
 
 
@@ -361,10 +361,10 @@ def test_merge_preserved_wikitext_full_screenshot_case():
         "[[Category:Files uploaded by RandomUserGuy1738]]\n"
         "[[Category:1986 International Naval Review in New York]]\n"
     )
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
 
-    # Artwork comes first
-    assert result.startswith(ARTWORK)
+    # New wikitext comes first
+    assert result.startswith(NEW_WIKITEXT)
     # PD-USGov appears before any category
     pd_idx = result.index("{{PD-USGov}}")
     img_idx = result.index("{{Image extracted|1=Nancy Reagan during a trip.jpg}}")
@@ -389,18 +389,18 @@ def test_merge_preserved_wikitext_dedupes():
         "{{PD-USGov}} {{PD-USGov}} "
         "{{Image extracted|1=A.jpg}} {{Image extracted|1=A.jpg}}"
     )
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert result.count("[[Category:Foo]]") == 1
     assert result.count("{{PD-USGov}}") == 1
     assert result.count("{{Image extracted|1=A.jpg}}") == 1
 
 
-def test_merge_preserved_wikitext_no_metadata_returns_artwork_unchanged():
+def test_merge_preserved_wikitext_no_metadata_returns_new_wikitext_unchanged():
     existing = (
         "Some unrelated wikitext with no license, image-extracted, or categories."
     )
-    result = merge_preserved_wikitext(existing, ARTWORK)
-    assert result == ARTWORK + "\n"
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
+    assert result == NEW_WIKITEXT + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ def test_merge_preserved_wikitext_preserves_media_of_the_day():
         "=={{int:license-header}}==\n"
         "{{PD-USGov-Congress}}\n"
     )
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
 
     # The MOTD template survives with all three date components.
     assert "{{Media of the day|2023|2|18}}" in result
@@ -439,13 +439,13 @@ def test_merge_preserved_wikitext_preserves_media_of_the_day():
         "Assessment header must appear above the preserved MOTD template; "
         f"got assessment_idx={assessment_idx}, motd_idx={motd_idx}"
     )
-    # Assessment block goes BETWEEN the artwork and the license (matches
-    # Commons page-structure convention).
+    # Assessment block goes BETWEEN the new-wikitext block and the license
+    # (matches Commons page-structure convention).
     license_idx = result.index("{{PD-USGov-Congress}}")
-    artwork_end = len(ARTWORK)
-    assert artwork_end <= assessment_idx < license_idx, (
-        "Assessment block must go after artwork and before license; "
-        f"got artwork_end={artwork_end}, assessment_idx={assessment_idx}, "
+    new_wikitext_end = len(NEW_WIKITEXT)
+    assert new_wikitext_end <= assessment_idx < license_idx, (
+        "Assessment block must go after the new wikitext and before the license; "
+        f"got new_wikitext_end={new_wikitext_end}, assessment_idx={assessment_idx}, "
         f"license_idx={license_idx}"
     )
 
@@ -455,7 +455,7 @@ def test_merge_preserved_wikitext_preserves_picture_of_the_day():
     existing = (
         "== {{int:filedesc}} ==\nold description\n{{Picture of the day|2024|6|15}}\n"
     )
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{Picture of the day|2024|6|15}}" in result
     assert "=={{Assessment}}==" in result
 
@@ -466,7 +466,7 @@ def test_merge_preserved_wikitext_preserves_quality_image_featured_valued():
     survive too. They're conferred by Commons editorial processes and
     losing them in a rescue rewrite quietly demotes the file."""
     existing = "{{Featured picture}}\n{{Quality image}}\n{{Valued image}}\n"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{Featured picture}}" in result
     assert "{{Quality image}}" in result
     assert "{{Valued image}}" in result
@@ -479,7 +479,7 @@ def test_merge_preserved_wikitext_preserves_assessments_bundle():
     in one call (e.g. `{{Assessments|featured=1|quality=1}}`). Must be
     preserved with its parameters intact."""
     existing = "{{Assessments|featured=1|quality=1|com_nom=Foo.jpg}}"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{Assessments|featured=1|quality=1|com_nom=Foo.jpg}}" in result
 
 
@@ -488,7 +488,7 @@ def test_merge_preserved_wikitext_assessment_template_case_insensitive():
     lowercase `{{media of the day|...}}` variant. Both must be picked
     up by the preservation pattern."""
     existing = "{{media of the day|2023|2|18}}"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "{{media of the day|2023|2|18}}" in result
 
 
@@ -498,7 +498,7 @@ def test_merge_preserved_wikitext_no_assessment_header_when_no_templates():
     Otherwise every rescue would emit a dangling header above bare
     license templates."""
     existing = "{{PD-USGov}}\n[[Category:Foo]]"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert "=={{Assessment}}==" not in result
 
 
@@ -507,7 +507,7 @@ def test_merge_preserved_wikitext_dedupes_assessment_templates():
     featured twice) must collapse to a single entry — same dedup
     treatment as the other preserved-content groups."""
     existing = "{{Media of the day|2023|2|18}}\n{{Media of the day|2023|2|18}}\n"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert result.count("{{Media of the day|2023|2|18}}") == 1
 
 
@@ -517,7 +517,7 @@ def test_merge_preserved_wikitext_assessment_does_not_false_match_other_template
     is NOT the same as `{{Picture of the day|...}}` and shouldn't be
     preserved as if it were)."""
     existing = "{{Picture of the day request|reason=test}}"
-    result = merge_preserved_wikitext(existing, ARTWORK)
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     # The whole template should not be picked up — it's a request, not a
     # designation. (If it WERE matched, the Assessment header would also
     # appear.)

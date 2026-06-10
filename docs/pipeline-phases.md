@@ -109,7 +109,7 @@ Source: `tools/uploader.py`. The most complex phase.
 1. Reads `dpla-map.json` and `file-list.txt` from S3.
 2. Computes per-ordinal Commons file titles via `get_page_title()` and `compute_ordinal_exts_and_page_labels()` — see [special-cases.md](special-cases.md#title-generation) for the sanitization rules.
 3. For each ordinal: downloads the S3 object to a temp file, computes (or reads from S3 metadata) its SHA1, and decides how to upload it. The decision tree handles hash drift, redirects, and cross-item collisions — see [special-cases.md](special-cases.md#duplicate-detection-decision-tree) for the four cases.
-4. Composes Wikimedia file-page wikitext via `get_wiki_text()` — currently an `{{Artwork}}` block with `| source = {{DPLA|...}}` and `| Institution = {{Institution|wikidata=...}}` parameters. See [templates.md](templates.md).
+4. Composes Wikimedia file-page wikitext via `get_wiki_text()` — a `{{DPLA metadata}}` block with `| source = {{DPLA|...}}` and `| Institution = {{Institution|wikidata=...}}` parameters. See [templates.md](templates.md).
 5. Uploads via pywikibot's `site.upload()`. Catches `fileexists-shared-forbidden`, `filetype-badmime`, `filetype-banned`, `duplicate`, `no-change`, `backend-fail-internal` and other Wikimedia errors per the `IGNORE_WIKIMEDIA_WARNINGS` list (which suppresses cosmetic warnings but lets actual conflicts surface).
 6. After the per-ordinal loop, runs a **post-item orphan check**: probes `(page N+1)`, `(page N+2)`, etc. and tags any orphan from a previous run as `{{Duplicate|...}}` if its SHA1 matches a kept ordinal.
 7. Writes `upload-result.json` to S3 with one entry per ordinal (status / title / pageid / error). This sidecar is the SDC phase's source of truth for which Commons pages exist.

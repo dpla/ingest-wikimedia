@@ -16,6 +16,7 @@ dependencies = [
     "boto3>=1.35.49",
     "certifi>=2024.8.30",
     "click>=8.1.7",
+    "mwparserfromhell>=0.6.6",
     "pip-system-certs>=4.0",
     "python-magic>=0.4.27",
     "pywikibot>=9.4.1",

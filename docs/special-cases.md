@@ -119,7 +119,7 @@ Used when the redirect's target carries the same DPLA ID at the same logical pag
 
 ### `_resolve_redirect_overwrite`
 
-Used otherwise. Replaces the redirect text with fresh wikitext, optionally merging preserved license / category / `{{Image extracted|...}}` / assessment-class templates (`{{Picture of the day}}`, `{{Featured picture}}`, etc.) from the prior wikitext via `merge_preserved_wikitext`. The new `{{Artwork}}` block is always authoritative for the description; preserved blocks are appended.
+Used otherwise. Replaces the redirect text with fresh wikitext, optionally merging preserved license / category / `{{Image extracted|...}}` / assessment-class templates (`{{Picture of the day}}`, `{{Featured picture}}`, etc.) from the prior wikitext via `merge_preserved_wikitext`. The new `{{DPLA metadata}}` block is always authoritative for the description; preserved blocks are appended.
 
 ## CommonsDelinker integration
 
