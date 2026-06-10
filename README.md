@@ -20,7 +20,7 @@ A run is triggered from Slack (e.g. `/wikimedia-upload bpl`), dispatched through
 - **[docs/sidecars.md](docs/sidecars.md)** — The S3 sidecar files (`dpla-map.json`, `sdc.json`, `upload-result.json`, `file-list.txt`, `iiif.json`) that connect the phases. Schemas, writers, readers, lifecycle.
 - **[docs/sdc-sync.md](docs/sdc-sync.md)** — SDC sync phase in depth: the atomic single-`wbeditentity` dispatcher, every property the bot writes, idempotency via `check()`, the P1545 chunked-claim convention, the P813 refresh, and the Wikibase API gotchas (type/mainsnak required on partial-update fragments).
 - **[docs/special-cases.md](docs/special-cases.md)** — Duplicate detection (SHA1-based and title-based), the four hash-drift cases the uploader resolves, file renames, CommonsDelinker integration, redirect handling, orphan tagging.
-- **[docs/templates.md](docs/templates.md)** — How `{{Artwork}}` is currently emitted at upload, how `{{DPLA metadata}}` + `Module:DPLA` read SDC after upload, and the planned transition to `{{DPLA metadata}}` as the primary template.
+- **[docs/templates.md](docs/templates.md)** — How `{{DPLA metadata}}` is emitted at upload and read by `Module:DPLA` after SDC sync, how legacy `{{Artwork}}` files are migrated, and the per-file lifecycle (upload → SDC → wikitext cleanup).
 - **[docs/metrics.md](docs/metrics.md)** — The scheduled CIM-pageviews workflow that publishes monthly pageview data to Commons `Data:` pages, plus the GitHub Pages site that consumes them.
 - **[docs/maintenance-tools.md](docs/maintenance-tools.md)** — `verify-item`, `retirer`, `nuke`, `remimer`, `sign`, `get-incomplete-items`, `get-ids-retry`, `fix-unknown-categories`.
 

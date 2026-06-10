@@ -44,6 +44,13 @@ rights: dict
 subject_ids: dict
 _s3_partner: str | None = None
 _s3_client = None
+# When True (set by `--normalize-wikitext`), `_run_partner_mode` runs a
+# post-SDC wikitext-cleanup edit per item, stripping template params
+# whose values are now redundant against the SDC just written. Default
+# False during the rollout: enable per-partner after a smoke run, then
+# flip the global default once we've confirmed no regressions on a real
+# batch.
+_normalize_wikitext_enabled: bool = False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -114,6 +121,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "When using --partner, the IDs CSV path. Defaults to "
             "<PARTNER>/<PARTNER>.csv (matching the uploader's input convention)."
+        ),
+    )
+    p.add_argument(
+        "--normalize-wikitext",
+        dest="normalize_wikitext",
+        action="store_true",
+        default=False,
+        help=(
+            "After SDC sync, strip {{DPLA metadata}} template params whose "
+            "values are now redundant with SDC. Off by default while the "
+            "behavior is being rolled out per-partner."
         ),
     )
     return p
@@ -189,7 +207,7 @@ def _initialize() -> None:
     console-script entry point) does no I/O.
     """
     global parser, args, method, dpla_api, site, hubs, rights, subject_ids
-    global _s3_partner, _s3_client
+    global _s3_partner, _s3_client, _normalize_wikitext_enabled
 
     parser = _build_parser()
     args = parser.parse_args()
@@ -244,6 +262,8 @@ def _initialize() -> None:
         from ingest_wikimedia.s3 import S3Client
 
         _s3_client = S3Client()
+
+    _normalize_wikitext_enabled = bool(args.normalize_wikitext)
 
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
@@ -3091,6 +3111,94 @@ def process_one_from_sdc(
     _flush_per_file_edits(mediaid, dpla_id)
 
 
+_NORMALIZE_EDIT_SUMMARY = (
+    "Strip {{DPLA metadata}} template parameters now redundant with SDC "
+    "(values match what Module:DPLA renders from the structured data)."
+)
+
+
+def _normalize_wikitext_for_item(
+    s3, partner: str, dpla_id: str, ordinal_items: list
+) -> None:
+    """Per-item post-SDC wikitext cleanup: strip redundant template params.
+
+    Reads the item's dpla-map.json from S3 (no api.dp.la call), computes the
+    canonical ``{{DPLA metadata}}`` parameter dict via
+    :func:`ingest_wikimedia.wikimedia.dpla_metadata_params`, then walks every
+    ordinal's Commons page and asks
+    :func:`ingest_wikimedia.wikitext_normalize.normalize_page` to remove any
+    param whose value exactly matches the canonical value (i.e. is now
+    redundant with the SDC just written).
+
+    Best-effort: any S3 / pywikibot / parse failure is logged but never
+    raised. The SDC sync result is already committed and counted before
+    this runs; a normalize failure must not roll that back or fail the
+    partner batch.
+    """
+    from ingest_wikimedia import wikimedia, wikitext_normalize
+    from ingest_wikimedia.dpla import DPLA
+
+    try:
+        item_raw = s3.get_item_metadata(partner, dpla_id)
+    except Exception as e:
+        logging.warning(
+            f" -- normalize-wikitext: S3 read failed for {dpla_id}: {e!r}; skipping."
+        )
+        return
+    if not item_raw:
+        # dpla-map.json missing — get-ids-es never staged it, or the
+        # partner-mode item came from a path that doesn't write one.
+        # Nothing to compare against; skip silently.
+        return
+    try:
+        item_metadata = json.loads(item_raw)
+    except json.JSONDecodeError as e:
+        logging.warning(
+            f" -- normalize-wikitext: dpla-map.json parse failed for {dpla_id}: {e}; skipping."
+        )
+        return
+
+    try:
+        provider, data_provider = DPLA.get_provider_and_data_provider(
+            item_metadata, hubs
+        )
+    except Exception as e:
+        logging.warning(
+            f" -- normalize-wikitext: provider lookup failed for {dpla_id}: {e!r}; skipping."
+        )
+        return
+
+    try:
+        expected_params = wikimedia.dpla_metadata_params(
+            dpla_id, item_metadata, provider, data_provider
+        )
+    except Exception as e:
+        logging.warning(
+            f" -- normalize-wikitext: param compute failed for {dpla_id}: {e!r}; skipping."
+        )
+        return
+
+    for ord_str, data in ordinal_items:
+        title = data.get("title")
+        if not title or title == "?":
+            continue
+        try:
+            page = pywikibot.FilePage(site, title)
+            if not page.exists():
+                continue
+            wikitext_normalize.normalize_page(
+                page, expected_params, _NORMALIZE_EDIT_SUMMARY
+            )
+        except Exception:
+            # Log with traceback so notify_pipeline_fail's log summary
+            # surfaces the root cause if one item's normalization repeatedly
+            # blows up. Per-ordinal isolation here, not per-item — one bad
+            # title in a multi-page item shouldn't skip the others.
+            logging.exception(
+                f" -- normalize-wikitext: ordinal {ord_str} ({title}) for {dpla_id} failed; skipping."
+            )
+
+
 def _run_partner_mode(partner, ids_file):
     """Drive the SDC phase from precomputed S3 sidecars for a whole partner.
 
@@ -3373,6 +3481,11 @@ def _run_partner_mode(partner, ids_file):
             # counter and underreport mapping skips.
             if synced_this_item:
                 tracker.increment(Result.SDC_ITEMS_SYNCED)
+                # Post-SDC wikitext cleanup. Best-effort — any failure
+                # inside is logged and swallowed by the helper, so a bad
+                # parse on one item can't abort the partner batch.
+                if _normalize_wikitext_enabled:
+                    _normalize_wikitext_for_item(s3, partner, dpla_id, ordinal_items)
             elif had_ordinal_error:
                 # Every eligible ordinal raised at runtime — classify
                 # under the error bucket, not MAPPING. (Mixed-result

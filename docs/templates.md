@@ -128,7 +128,7 @@ A summary diagram:
        ▼                          ▼
  ┌─────────────────┐       ┌─────────────────────┐
  │ uploader writes │       │ sdc-sync writes     │
- │   {{Artwork}}   │       │   MediaInfo SDC     │
+ │ {{DPLA metadata}}│      │   MediaInfo SDC     │
  │   wikitext      │       │   (P760, P1476,     │
  │   (file page)   │       │    P195, P9126, …)  │
  └────────┬────────┘       └──────────┬──────────┘

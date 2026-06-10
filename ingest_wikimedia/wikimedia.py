@@ -313,10 +313,32 @@ def extract_strings_dict(data: dict, field_name1: str, field_name2: str) -> str:
     )
 
 
-def get_wiki_text(
+def dpla_metadata_params(
     dpla_id: str, item_metadata: dict, provider: dict, data_provider: dict
-) -> str:
-    """Turns DPLA item info into a wikitext document."""
+) -> dict:
+    """Compute the canonical `{{DPLA metadata}}` parameter dict for an item.
+
+    Single source of truth for the values the uploader writes into the
+    template wikitext. ``get_wiki_text`` formats this dict into the
+    rendered template; ``wikitext_normalize`` reads the same dict and
+    compares each value against what's already in the file's wikitext to
+    decide which params are redundant against SDC (the parameter is then
+    safe to strip because the SDC-backed render produces the same display).
+
+    Both callers must derive their expectations from this helper so the
+    two flows can never drift — the comparator side computing one value
+    while the writer side emits another would silently fail to strip
+    redundant params or, worse, strip params that don't actually match
+    the rendered output.
+
+    Returned shape mirrors the wikitext structure: top-level params are
+    string-valued, sub-template params (``source``, ``institution``,
+    ``creator``) are nested dicts whose ``name`` field carries the
+    sub-template's name and ``params`` carries its argument dict. A
+    sub-template entry whose ``params`` is empty (or whose ``creator``
+    value is the empty string) signals "do not emit this param" — both
+    the writer and the comparator skip it identically.
+    """
     data_provider_wiki_q = escape_wiki_strings(
         get_str(data_provider, WIKIDATA_FIELD_NAME)
     )
@@ -325,19 +347,72 @@ def get_wiki_text(
     permissions = get_permissions(
         rights_uri, get_permissions_template(rights_uri), data_provider_wiki_q
     )
+    # ``get_permissions_template`` returns the empty string for any
+    # ``edm:rights`` URI not in its allowlist; ``get_permissions`` can
+    # then surface either ``""`` or ``" | <qid>"`` (for unmapped
+    # RIGHTS_STATEMENTS URLs that still pick up the data-provider
+    # suffix). Wrapping either in ``{{...}}`` produces malformed wikitext
+    # (``{{}}`` / ``{{ | Q...}}``), so render the param as empty in that
+    # case — the row becomes ``| permission =`` instead of carrying a
+    # broken template invocation. Pre-empts the same shape leaking into
+    # the comparator side: ``_value_matches("", "")`` is trivially True,
+    # so a file whose wikitext already carries a blank ``| permission =``
+    # row stays consistent.
     source_resource = get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME)
-    creator_string = extract_strings(source_resource, DC_CREATOR_FIELD_NAME)
-    title_string = extract_strings(source_resource, DC_TITLE_FIELD_NAME)
-    description_string = extract_strings(source_resource, DC_DESCRIPTION_FIELD_NAME)
-    date_string = extract_strings_dict(
-        source_resource, DC_DATE_FIELD_NAME, EDM_TIMESPAN_DISPLAY_DATE
-    )
-    is_shown_at = escape_wiki_strings(get_str(item_metadata, EDM_IS_SHOWN_AT))
-    local_id = extract_strings(source_resource, DC_IDENTIFIER_FIELD_NAME)
+    permissions_clean = permissions.strip() if permissions else ""
+    permission_value = f"{{{{{permissions_clean}}}}}" if permissions_clean else ""
+    return {
+        "title": extract_strings(source_resource, DC_TITLE_FIELD_NAME),
+        "description": extract_strings(source_resource, DC_DESCRIPTION_FIELD_NAME),
+        "date": extract_strings_dict(
+            source_resource, DC_DATE_FIELD_NAME, EDM_TIMESPAN_DISPLAY_DATE
+        ),
+        "permission": permission_value,
+        "creator": {
+            "name": "InFi",
+            "params": {
+                # Positional args 1 and 2 — the {{InFi}} idiom is
+                # `{{InFi|<field-label>|<value>|id=fileinfotpl_aut}}`.
+                "1": "Creator",
+                "2": extract_strings(source_resource, DC_CREATOR_FIELD_NAME),
+                "id": "fileinfotpl_aut",
+            },
+        },
+        "source": {
+            "name": "DPLA",
+            "params": {
+                # Positional arg 1 — the data-provider Wikidata Q-ID.
+                "1": data_provider_wiki_q,
+                "hub": provider_wiki_q,
+                "url": escape_wiki_strings(get_str(item_metadata, EDM_IS_SHOWN_AT)),
+                "dpla_id": dpla_id,
+                "local_id": extract_strings(source_resource, DC_IDENTIFIER_FIELD_NAME),
+            },
+        },
+        "institution": {
+            "name": "Institution",
+            "params": {"wikidata": data_provider_wiki_q},
+        },
+    }
 
-    if creator_string:
+
+def get_wiki_text(
+    dpla_id: str, item_metadata: dict, provider: dict, data_provider: dict
+) -> str:
+    """Turns DPLA item info into a wikitext document."""
+    params = dpla_metadata_params(dpla_id, item_metadata, provider, data_provider)
+
+    # Every literal that the comparator side derives from ``params`` is
+    # sourced from ``params`` here too. Drifting the two — e.g. changing
+    # the creator label in ``dpla_metadata_params`` and forgetting to
+    # change it here — is the failure mode the single-source-of-truth
+    # contract exists to prevent. So no hardcoded ``"Creator"``,
+    # ``"fileinfotpl_aut"``, ``{{Institution|wikidata=...}}`` shape, etc.
+    creator_params = params["creator"]["params"]
+    creator_value = creator_params["2"]
+    if creator_value:
         creator_template = """
-        | Other fields 1 = {{ InFi | Creator | $creator | id=fileinfotpl_aut}}"""
+        | Other fields 1 = {{ InFi | $creator_label | $creator | id=$creator_id}}"""
     else:
         creator_template = ""
 
@@ -349,7 +424,7 @@ def get_wiki_text(
         | title = $title
         | description = $description
         | date = $date_string
-        | permission = {{$permissions}}
+        | permission = $permission
         | source = {{ DPLA
             | $data_provider
             | hub = $provider
@@ -357,21 +432,26 @@ def get_wiki_text(
             | dpla_id = $dpla_id
             | local_id = $local_id
         }}
-        | Institution = {{ Institution | wikidata = $data_provider }}
+        | Institution = {{ Institution | wikidata = $institution_wikidata }}
      }}"""
     )
 
+    source_params = params["source"]["params"]
+    institution_params = params["institution"]["params"]
     return Template(template_string).substitute(
-        creator=creator_string,
-        title=title_string,
-        description=description_string,
-        date_string=date_string,
-        permissions=permissions,
-        data_provider=data_provider_wiki_q,
-        provider=provider_wiki_q,
-        is_shown_at=is_shown_at,
-        dpla_id=dpla_id,
-        local_id=local_id,
+        creator=creator_value,
+        creator_label=creator_params["1"],
+        creator_id=creator_params["id"],
+        title=params["title"],
+        description=params["description"],
+        date_string=params["date"],
+        permission=params["permission"],
+        data_provider=source_params["1"],
+        provider=source_params["hub"],
+        is_shown_at=source_params["url"],
+        dpla_id=source_params["dpla_id"],
+        local_id=source_params["local_id"],
+        institution_wikidata=institution_params["wikidata"],
     )
 
 
@@ -619,8 +699,8 @@ _ASSESSMENT_TEMPLATE_RE = re.compile(
 )
 
 
-def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
-    """Append preserved metadata from existing_text to new_artwork.
+def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
+    """Append preserved metadata from existing_text to new_wikitext.
 
     Used when the uploader rewrites a file description after a title-drift
     move or redirect-overwrite. The new {{DPLA metadata}} wikitext is
@@ -630,9 +710,7 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
     rewrite.
 
     Result order (matches Commons page-structure convention):
-        1. new_artwork (the freshly generated {{DPLA metadata}} block; the
-           parameter name `new_artwork` is historical from the prior
-           {{Artwork}}-emitting code path)
+        1. new_wikitext (the freshly generated {{DPLA metadata}} block)
         2. preserved Assessment block (=={{Assessment}}== header + any
            {{Media of the day|...}}, {{Picture of the day|...}},
            {{Featured picture}}, {{Quality image}}, {{Valued image}},
@@ -648,7 +726,7 @@ def merge_preserved_wikitext(existing_text: str, new_artwork: str) -> str:
 
     Duplicates within each preserved group are collapsed.
     """
-    parts: list[str] = [new_artwork.rstrip()]
+    parts: list[str] = [new_wikitext.rstrip()]
     assessment = list(dict.fromkeys(_ASSESSMENT_TEMPLATE_RE.findall(existing_text)))
     if assessment:
         parts.append("")
