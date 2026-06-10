@@ -3118,7 +3118,7 @@ _NORMALIZE_EDIT_SUMMARY = (
 
 
 def _normalize_wikitext_for_item(
-    s3, partner: str, dpla_id: str, ordinal_items: list
+    s3, partner: str, dpla_id: str, ordinal_items: list[tuple[str, dict]]
 ) -> None:
     """Per-item post-SDC wikitext cleanup: strip redundant template params.
 
@@ -3257,7 +3257,8 @@ def _run_partner_mode(partner, ids_file):
                 sdc_raw = s3.get_sdc_json(partner, dpla_id)
             except ClientError as e:
                 logging.warning(
-                    f" -- S3 error reading sdc.json for {dpla_id}: {e!r}; skipping."
+                    f" -- S3 error reading sdc.json for {partner}/{dpla_id}:"
+                    f" {e!r}; skipping."
                 )
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
                 continue
@@ -3276,7 +3277,8 @@ def _run_partner_mode(partner, ids_file):
                 upload_raw = s3.get_upload_result(partner, dpla_id)
             except ClientError as e:
                 logging.warning(
-                    f" -- S3 error reading upload-result.json for {dpla_id}: {e!r}; skipping."
+                    f" -- S3 error reading upload-result.json for {partner}/{dpla_id}:"
+                    f" {e!r}; skipping."
                 )
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
                 continue
@@ -3304,7 +3306,7 @@ def _run_partner_mode(partner, ids_file):
                 file_list = s3.get_file_list(partner, dpla_id)
             except ClientError as e:
                 logging.warning(
-                    f" -- S3 error reading file-list.txt for {dpla_id}: {e!r};"
+                    f" -- S3 error reading file-list.txt for {partner}/{dpla_id}: {e!r};"
                     " continuing without P2699 qualifiers."
                 )
                 file_list = []
@@ -3346,8 +3348,18 @@ def _run_partner_mode(partner, ids_file):
             try:
                 ordinal_items = sorted(eligible.items(), key=lambda kv: int(kv[0]))
             except (TypeError, ValueError):
+                # Surface the offending key so operators can trace the
+                # data-quality issue back to upload-result.json. The sort
+                # key raises on the first int() that fails, but Python's
+                # sorted() doesn't expose which one — so we re-scan the
+                # keys here purely to find the culprit for logging.
+                bad_keys = [
+                    repr(k) for k in eligible if not str(k).lstrip("-").isdigit()
+                ]
                 logging.warning(
-                    f" -- upload-result ordinals malformed for {dpla_id}; skipping."
+                    f" -- upload-result ordinals malformed for {dpla_id}"
+                    f" (non-integer key(s): {', '.join(bad_keys) or '<unknown>'});"
+                    " skipping."
                 )
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
                 continue
