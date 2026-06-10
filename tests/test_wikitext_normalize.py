@@ -54,6 +54,7 @@ def test_dpla_metadata_params_has_every_expected_top_level_key():
         "creator",
         "source",
         "institution",
+        "languages",
     }
 
 
@@ -213,8 +214,9 @@ def test_normalize_preserves_non_english_wrapper_even_when_inner_matches():
     the value is also a valid Spanish rendering; losing it discards that
     metadata.
 
-    Phase 1 explicitly only unwraps ``{{en|...}}`` — every other language
-    code, even when the inner happens to match, gets preserved."""
+    The fixture's DPLA record declares no ``sourceResource.language``,
+    so only ``en`` is in the unwrap allowlist — any other language code,
+    even when the inner happens to match, gets preserved."""
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
     # The canonical title is "A Title". Wrap it in {{es|...}} as if a
     # Spanish-speaking editor confirmed the English value reads naturally
@@ -312,3 +314,110 @@ def test_normalize_returns_original_text_unchanged_when_nothing_strips():
     new_text, stripped = normalize(wikitext, params)
     assert stripped == []
     assert new_text == wikitext
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: per-item language unwrapping (Goal 3)
+# ---------------------------------------------------------------------------
+
+
+def _item_with_languages(*names):
+    """An ``_minimal_item()`` but with ``sourceResource.language`` set to
+    the supplied DPLA-style language entries (English-name only — the
+    iso639_3 field is intentionally omitted, mirroring the real-world
+    case where its value is unreliable per hub)."""
+    item = _minimal_item()
+    item["sourceResource"]["language"] = [{"name": n} for n in names]
+    return item
+
+
+def test_dpla_metadata_params_default_languages_is_en_only():
+    """An item with no language field still gets ``en`` in the allowlist —
+    canonical wikitext is English by convention."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    assert params["languages"] == {"en"}
+
+
+def test_dpla_metadata_params_extracts_declared_iso_codes():
+    """Each ``sourceResource.language[].name`` recognised by the map
+    contributes its ISO 639-1 code to the per-item allowlist."""
+    params = dpla_metadata_params(
+        "abc123",
+        _item_with_languages("Spanish", "French"),
+        _PROVIDER,
+        _DATA_PROVIDER,
+    )
+    assert params["languages"] == {"en", "es", "fr"}
+
+
+def test_dpla_metadata_params_ignores_unmapped_language_names():
+    """A language name not in the ISO map is silently dropped — its
+    wrappers stay strip-ineligible, the safe default. ``en`` is still
+    present from the seed."""
+    params = dpla_metadata_params(
+        "abc123",
+        _item_with_languages("Klingon", "Spanish"),
+        _PROVIDER,
+        _DATA_PROVIDER,
+    )
+    assert params["languages"] == {"en", "es"}
+
+
+def test_dpla_metadata_params_language_field_as_single_dict():
+    """Defensive: some legacy DPLA mappers emit a single-dict
+    ``language`` field rather than a list. The helper still extracts
+    the code without an isinstance error."""
+    item = _minimal_item()
+    item["sourceResource"]["language"] = {"name": "Spanish"}
+    params = dpla_metadata_params("abc123", item, _PROVIDER, _DATA_PROVIDER)
+    assert params["languages"] == {"en", "es"}
+
+
+def test_normalize_unwraps_dpla_declared_language():
+    """For an item whose DPLA record declares Spanish,
+    ``{{es|<canonical>}}`` around the canonical value is redundant
+    metadata (Module:DPLA can render the value in Spanish from SDC) and
+    is safely stripped."""
+    item = _item_with_languages("Spanish")
+    # Make the canonical title look Spanish so the wrapper-inner has a
+    # plausible reason to be there; the strip works on equality, not on
+    # any actual language detection.
+    item["sourceResource"]["title"] = ["Una Imagen Histórica"]
+    params = dpla_metadata_params("abc123", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = _build_full_wikitext(params).replace(
+        "| title = Una Imagen Histórica",
+        "| title = {{es|Una Imagen Histórica}}",
+    )
+    _, stripped = normalize(wikitext, params)
+    assert "title" in stripped
+
+
+def test_normalize_does_not_unwrap_undeclared_language_even_when_inner_matches():
+    """For an item whose DPLA record declares English only (or no
+    language at all), ``{{es|<canonical-english>}}`` survives the strip
+    even when the inner byte-matches the canonical value — the ``es``
+    tag is editor-contributed translation metadata, not redundant."""
+    item = _item_with_languages("English")
+    params = dpla_metadata_params("abc123", item, _PROVIDER, _DATA_PROVIDER)
+    assert "es" not in params["languages"]
+    wikitext = _build_full_wikitext(params).replace(
+        "| title = A Title",
+        "| title = {{es|A Title}}",
+    )
+    _, stripped = normalize(wikitext, params)
+    assert "title" not in stripped
+
+
+def test_normalize_preserves_langswitch_even_with_single_named_param():
+    """``{{LangSwitch|en=Foo}}`` is multilingual selector syntax. Always
+    preserved, regardless of what ``en=...`` happens to contain.
+    Defensive guard against any future change to
+    ``_language_wrapper_code`` mistakenly treating LangSwitch as a wrapper."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    wikitext = _build_full_wikitext(params).replace(
+        "| description = A description",
+        "| description = {{LangSwitch|en=A description|es=Una descripción}}",
+    )
+    new_text, stripped = normalize(wikitext, params)
+    assert "description" not in stripped
+    assert "{{LangSwitch|en=A description|es=Una descripción}}" in new_text

@@ -29,21 +29,19 @@ import mwparserfromhell
 # Pattern that identifies the family of Commons single-language wrapper
 # templates ({{en|...}}, {{es|...}}, {{de|...}}, {{pt-br|...}}, …).
 # Used solely to *recognise* a wrapper so we can decide whether stripping
-# the param around it is safe — Phase 1 never strips a non-English wrapper
-# (the language tag is an editor contribution and must be preserved), so
-# this pattern's job is wider than the unwrap path's. See
-# ``_LANGUAGES_SAFE_TO_UNWRAP`` for the narrower unwrap allowlist.
+# the param around it is safe — a non-matching wrapper (e.g. a language
+# code not in the item's allowlist) is still detected as "this is a
+# wrapper, don't compare" and the value survives the strip.
 _LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]+)*$")
 
-# Language wrappers whose inner text is, by construction, the canonical
-# English value the uploader writes. Phase 1 unwraps these only — an
-# ``{{en|Foo}}`` that wraps the bot-written English string is redundant
-# with what Module:DPLA would render from SDC, so stripping the wrapper
-# loses nothing. Any other language code (``{{es|...}}``, ``{{de|...}}``)
-# is editor-contributed translation that must survive the strip even if
-# the inner text happens to match byte-for-byte (e.g. ``{{es|A Title}}``
-# where the Spanish title coincidentally equals the English).
-_LANGUAGES_SAFE_TO_UNWRAP = frozenset({"en"})
+# Template name (case-folded) for the Commons {{LangSwitch|en=...|es=...}}
+# multilingual selector. Always preserved — the file has been explicitly
+# multilingualised by an editor, and stripping any branch would discard
+# their contribution. The wider _value_matches loop already treats any
+# template-wrapped value with named params as a mismatch (because
+# _language_wrapper_code returns None for it), but spelling LangSwitch
+# out keeps the intent explicit and makes the test for it grep-able.
+_LANGSWITCH_NAME = "langswitch"
 
 
 def _template_name(template) -> str:
@@ -96,7 +94,9 @@ def _canonical_value(value: str) -> str:
     return value.strip()
 
 
-def _value_matches(wikitext_value: str, expected: str) -> bool:
+def _value_matches(
+    wikitext_value: str, expected: str, languages: frozenset[str] | set[str]
+) -> bool:
     """Compare a wikitext value to its canonical-DPLA expectation.
 
     Direct equality on whitespace-normalized values handles every scalar
@@ -104,15 +104,22 @@ def _value_matches(wikitext_value: str, expected: str) -> bool:
     value is a wrapping ``{{PD-USGov}}``-style template invocation that
     the editor would copy verbatim.
 
-    As a fallback for editor-added ``{{en|...}}`` wrappers around the
-    canonical English string, that one specific language wrapper is
-    unwrapped before re-comparing — Module:DPLA's render is in English
-    anyway, so the wrapper is purely redundant. Every other language
-    wrapper (``{{es|...}}``, ``{{de|...}}``, …) is a deliberate editor
-    translation that survives the strip even if its inner text happens
-    to match the canonical English byte-for-byte. Other template-wrapped
-    values (``{{LangSwitch|...}}``, an Information sub-template, a
-    citation) are conservatively a mismatch for the same reason.
+    As a fallback for editor-added language wrappers around the canonical
+    value, a wikitext value of the form ``{{<code>|...}}`` is unwrapped
+    before re-comparing — but only if ``<code>`` is in ``languages``,
+    the per-item allowlist of safe-to-unwrap codes (always includes
+    ``en``, plus any ISO 639-1 codes derived from the DPLA record's
+    ``sourceResource.language`` field). For a non-English DPLA item
+    whose record declares Spanish, ``{{es|<canonical Spanish>}}`` is
+    safely unwrappable because the wrapper is purely a language-tag
+    annotation over a value the uploader already wrote in Spanish; for
+    an English item, ``{{es|A Title}}`` survives even when the inner
+    text byte-matches the canonical English (the ``es`` tag is editor-
+    contributed translation metadata, not a redundant wrapper).
+
+    Other template-wrapped values (``{{LangSwitch|...}}``, an Information
+    sub-template, a citation) are conservatively a mismatch — they
+    represent deliberate editor structure that the strip must preserve.
     """
     if _canonical_value(wikitext_value) == _canonical_value(expected):
         return True
@@ -120,9 +127,17 @@ def _value_matches(wikitext_value: str, expected: str) -> bool:
     parsed = mwparserfromhell.parse(wikitext_value)
     templates = parsed.filter_templates(recursive=False)
     if len(templates) == 1:
-        lang = _language_wrapper_code(templates[0])
-        if lang in _LANGUAGES_SAFE_TO_UNWRAP:
-            inner = str(templates[0].get(1).value)
+        tpl = templates[0]
+        # LangSwitch always preserves — defensive guard against any future
+        # change to _language_wrapper_code accidentally treating it as a
+        # wrapper. (Today it's already not a wrapper because the name
+        # doesn't match _LANG_CODE_RE, but spelling it out is cheap and
+        # makes the intent reviewable.)
+        if _template_name(tpl) == _LANGSWITCH_NAME:
+            return False
+        lang = _language_wrapper_code(tpl)
+        if lang is not None and lang in languages:
+            inner = str(tpl.get(1).value)
             return _canonical_value(inner) == _canonical_value(expected)
 
     return False
@@ -232,12 +247,18 @@ def normalize(wikitext: str, expected_params: dict) -> tuple[str, list[str]]:
         return wikitext, []
 
     stripped: list[str] = []
+    # Per-item unwrap allowlist. Items with no DPLA-supplied language
+    # entries still get English (the helper always seeds ``en``); items
+    # whose record declares Spanish/French/etc. get those codes added so
+    # an editor-wrapped Spanish title on a Spanish DPLA item is treated
+    # as redundant rather than as an editor contribution.
+    languages = expected_params.get("languages", frozenset({"en"}))
 
     for param_name in _SCALAR_PARAMS:
         param = _find_param(template, param_name)
         if param is None:
             continue
-        if _value_matches(str(param.value), expected_params[param_name]):
+        if _value_matches(str(param.value), expected_params[param_name], languages):
             template.remove(param, keep_field=False)
             stripped.append(param_name)
 

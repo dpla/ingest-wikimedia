@@ -27,6 +27,7 @@ from .dpla import (
     EDM_TIMESPAN_DISPLAY_DATE,
     EDM_IS_SHOWN_AT,
     DC_IDENTIFIER_FIELD_NAME,
+    DC_LANGUAGE_FIELD_NAME,
 )
 
 
@@ -313,6 +314,93 @@ def extract_strings_dict(data: dict, field_name1: str, field_name2: str) -> str:
     )
 
 
+# Commons-style language wrappers use ISO 639-1 codes (``{{es|...}}``,
+# not ``{{spa|...}}``). DPLA's ``sourceResource.language.name`` is the
+# English language name; this map covers the languages most commonly
+# present in DPLA records' language facets. Anything outside the map is
+# silently ignored — its values just stay strip-ineligible (the file's
+# wikitext keeps the wrapper), which is the safe default.
+_LANGUAGE_NAME_TO_ISO_639_1 = {
+    "english": "en",
+    "spanish": "es",
+    "french": "fr",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "dutch": "nl",
+    "russian": "ru",
+    "polish": "pl",
+    "swedish": "sv",
+    "norwegian": "no",
+    "danish": "da",
+    "finnish": "fi",
+    "czech": "cs",
+    "hungarian": "hu",
+    "greek": "el",
+    "turkish": "tr",
+    "arabic": "ar",
+    "hebrew": "he",
+    "chinese": "zh",
+    "japanese": "ja",
+    "korean": "ko",
+    "vietnamese": "vi",
+    "thai": "th",
+    "hindi": "hi",
+    "latin": "la",
+    "welsh": "cy",
+    "irish": "ga",
+    "ukrainian": "uk",
+    "romanian": "ro",
+    "bulgarian": "bg",
+    "serbian": "sr",
+    "croatian": "hr",
+    "slovak": "sk",
+    "slovenian": "sl",
+    "lithuanian": "lt",
+    "latvian": "lv",
+    "estonian": "et",
+    "icelandic": "is",
+    "catalan": "ca",
+}
+
+
+def _extract_unwrap_languages(item_metadata: dict) -> set[str]:
+    """Return the ISO 639-1 language codes the comparator may safely
+    unwrap for this item.
+
+    Always includes ``en`` (the canonical wikitext is English by
+    convention, and the legacy uploader emitted English strings even
+    for non-English-language items). Any additional codes come from
+    the item's ``sourceResource.language`` field — mapped from the
+    DPLA-supplied English-name to its 639-1 code via
+    :data:`_LANGUAGE_NAME_TO_ISO_639_1`.
+
+    Resilient to all shapes ``sourceResource.language`` can take in
+    practice — a missing field, a single dict, a list of dicts, or any
+    of those carrying ``name`` strings of mixed casing. The DPLA
+    ``iso639_3`` field is *not* consulted because in practice it
+    contains either the English language name or a 639-3 code
+    depending on the hub's mapper, so it isn't a reliable source for
+    639-1 codes; the ``name`` field is consistent.
+    """
+    languages: set[str] = {"en"}
+    source_resource = get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME)
+    raw = source_resource.get(DC_LANGUAGE_FIELD_NAME)
+    if raw is None:
+        return languages
+    entries = raw if isinstance(raw, list) else [raw]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        code = _LANGUAGE_NAME_TO_ISO_639_1.get(name.strip().casefold())
+        if code:
+            languages.add(code)
+    return languages
+
+
 def dpla_metadata_params(
     dpla_id: str, item_metadata: dict, provider: dict, data_provider: dict
 ) -> dict:
@@ -338,6 +426,12 @@ def dpla_metadata_params(
     sub-template entry whose ``params`` is empty (or whose ``creator``
     value is the empty string) signals "do not emit this param" — both
     the writer and the comparator skip it identically.
+
+    The non-rendered ``languages`` key carries the per-item allowlist
+    of ISO 639-1 codes the comparator may safely unwrap. Always
+    contains ``en``, plus any DPLA-supplied ``sourceResource.language``
+    entries the helper recognises. The writer side ignores this entry;
+    only :mod:`ingest_wikimedia.wikitext_normalize` reads it.
     """
     data_provider_wiki_q = escape_wiki_strings(
         get_str(data_provider, WIKIDATA_FIELD_NAME)
@@ -393,6 +487,7 @@ def dpla_metadata_params(
             "name": "Institution",
             "params": {"wikidata": data_provider_wiki_q},
         },
+        "languages": _extract_unwrap_languages(item_metadata),
     }
 
 
