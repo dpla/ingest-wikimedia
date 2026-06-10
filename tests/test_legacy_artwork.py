@@ -165,6 +165,48 @@ def test_trace_provenance_drops_reverted_intermediate_values():
     assert provenance == {"title": "Editor2"}
 
 
+def test_trace_provenance_delete_then_readd_attributes_to_restorer():
+    """Regression: a param that DPLA_bot originally set, then a
+    community editor deleted, then a different community editor
+    re-added with the same string value, must attribute to the
+    *re-adder* — not stay attributed to DPLA_bot.
+
+    Pre-fix, ``prior_seen`` was never cleared on deletion, so the
+    re-add looked like "value unchanged" and the provenance stayed
+    on DPLA_bot. A subsequent canonical-DPLA value change would have
+    then classified the re-added value as DPLA-originated and
+    stripped it — losing the community restoration.
+    """
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=Original}}"),
+        (2, "Deleter", "{{Artwork|}}"),  # title param deleted entirely
+        (3, "Restorer", "{{Artwork|title=Original}}"),  # community re-add
+    )
+    provenance = trace_param_provenance(revs)
+    assert provenance == {"title": "Restorer"}
+
+
+def test_plan_migration_imports_restored_community_value_when_canonical_differs():
+    """End-to-end of the delete-readd fix: when the canonical DPLA
+    title has since changed, the re-added community value is now an
+    actual community contribution that must be imported, not
+    discarded as DPLA-originated."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=Original}}"),
+        (2, "Deleter", "{{Artwork|}}"),
+        (3, "Restorer", "{{Artwork|title=Original}}"),
+    )
+    # Canonical title has since been updated by DPLA — so "Original"
+    # is now a community-only value.
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(title="Updated Canonical Title"),
+    )
+    assert plan is not None
+    assert plan.community_imports == {"title": "Original"}
+
+
 def test_trace_provenance_sorts_by_revid_not_input_order():
     """Out-of-order input still produces a chronologically correct
     walk — defensive against any caller that doesn't pre-sort."""
@@ -305,7 +347,10 @@ def test_plan_migration_records_source_permalink():
     """The permalink stamped onto every imported claim's P4656 ref
     points at the page's latest revision id at plan time, so a
     reviewer can trace any imported statement back to its wikitext
-    source."""
+    source. Spaces become underscores (Commons URL convention) and
+    the ``:`` namespace separator is percent-encoded (``%3A``) per
+    ``urllib.parse.urlencode`` semantics — that's the same form the
+    Wikipedia/Commons API responds with, so it's a recognisable URL."""
     revs = _make_revs(
         (1, "DPLA_bot", "{{Artwork|title=A Title}}"),
         (42, "Editor1", "{{Artwork|title=A Better Title}}"),
@@ -314,8 +359,30 @@ def test_plan_migration_records_source_permalink():
     assert plan is not None
     assert (
         plan.source_permalink
-        == "https://commons.wikimedia.org/w/index.php?title=File:Test_File.jpg&oldid=42"
+        == "https://commons.wikimedia.org/w/index.php?title=File%3ATest_File.jpg&oldid=42"
     )
+
+
+def test_plan_migration_permalink_encodes_ampersand_in_filename():
+    """Regression: filenames containing ``&`` are legal on Commons
+    (``File:Foo & Bar.jpg``). Hand-rolled spaces-only encoding put
+    the raw ``&`` into the URL, causing the query-string parser to
+    split there — ``title=File:Foo_`` would have been all the
+    permalink resolved to. ``urlencode`` percent-encodes it as
+    ``%26`` so the title round-trips through query parsing."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title}}"),
+        (42, "Editor1", "{{Artwork|title=A Better Title}}"),
+    )
+    plan = plan_migration("File:Foo & Bar.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "%26" in plan.source_permalink  # the ``&`` is encoded
+    # Sanity-check end-to-end query parsing matches what we expect.
+    from urllib.parse import parse_qs, urlsplit
+
+    parsed_qs = parse_qs(urlsplit(plan.source_permalink).query)
+    assert parsed_qs["title"] == ["File:Foo_&_Bar.jpg"]
+    assert parsed_qs["oldid"] == ["42"]
 
 
 # ---------------------------------------------------------------------------

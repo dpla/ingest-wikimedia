@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 from typing import Iterable
+from urllib.parse import urlencode
 
 import mwparserfromhell
 
@@ -238,6 +239,17 @@ def trace_param_provenance(
     prior_seen: dict[str, str] = {}
     for rev in sorted_revs:
         rev_params = parse_artwork_params(rev.text)
+        # Drop entries from prior_seen for params the current revision
+        # no longer carries. Without this, a delete → re-add of the
+        # same string at a later revision looks like "unchanged" (the
+        # post-delete value still matches the pre-delete value in
+        # prior_seen) and stays attributed to the original setter —
+        # misclassifying a community restoration as DPLA-originated
+        # and putting it on the strip list when the canonical value
+        # drifts. Pop them on disappearance so re-add registers as a
+        # fresh change attributed to the editor who restored it.
+        for stale in tuple(prior_seen.keys() - rev_params.keys()):
+            prior_seen.pop(stale, None)
         for key, value in rev_params.items():
             if value != prior_seen.get(key):
                 provenance[key] = rev.user
@@ -351,9 +363,23 @@ def _canonical_value_for_key(canonical_params: dict, key: str) -> str:
 def _build_permalink(file_title: str, oldid: int) -> str:
     """Return the Commons permalink for ``<file_title>`` at revision
     ``<oldid>``. Used as the P4656 (Wikimedia import URL) reference
-    value; permalinks are required by the property's usage notes."""
-    encoded = file_title.replace(" ", "_")
-    return f"https://commons.wikimedia.org/w/index.php?title={encoded}&oldid={oldid}"
+    value; permalinks are required by the property's usage notes.
+
+    Uses :func:`urllib.parse.urlencode` so reserved characters in the
+    title — particularly ``&`` (legal in Commons filenames like
+    ``File:Foo & Bar.jpg``), but also ``?``, ``#``, ``+`` — are
+    percent-encoded.  Hand-rolled "just replace spaces" encoding lets
+    such titles produce a URL the query-string parser truncates at
+    the literal ``&``, silently breaking the P4656 reference for an
+    arbitrary subset of filenames.
+
+    Spaces are converted to underscores first (Commons URL convention)
+    so the percent-encoded form mirrors what
+    ``[[Special:Permalink/<oldid>]]`` actually serves at the link.
+    """
+    return "https://commons.wikimedia.org/w/index.php?" + urlencode(
+        {"title": file_title.replace(" ", "_"), "oldid": oldid}
+    )
 
 
 # ---------------------------------------------------------------------------
