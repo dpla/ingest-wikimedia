@@ -26,13 +26,24 @@ import re
 
 import mwparserfromhell
 
-# ISO 639-1 / -2 / -3 codes the Commons {{xx|...}} language-wrapper convention
-# accepts. We don't need an authoritative list — we just need to recognise
-# "this looks like a language wrapper" so we never strip a wrapped value.
-# A template whose name matches this pattern AND that has exactly one
-# positional argument is treated as a language-tagged value; any positional
-# count beyond that is left alone (likely a normal sub-template).
+# Pattern that identifies the family of Commons single-language wrapper
+# templates ({{en|...}}, {{es|...}}, {{de|...}}, {{pt-br|...}}, …).
+# Used solely to *recognise* a wrapper so we can decide whether stripping
+# the param around it is safe — Phase 1 never strips a non-English wrapper
+# (the language tag is an editor contribution and must be preserved), so
+# this pattern's job is wider than the unwrap path's. See
+# ``_LANGUAGES_SAFE_TO_UNWRAP`` for the narrower unwrap allowlist.
 _LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]+)*$")
+
+# Language wrappers whose inner text is, by construction, the canonical
+# English value the uploader writes. Phase 1 unwraps these only — an
+# ``{{en|Foo}}`` that wraps the bot-written English string is redundant
+# with what Module:DPLA would render from SDC, so stripping the wrapper
+# loses nothing. Any other language code (``{{es|...}}``, ``{{de|...}}``)
+# is editor-contributed translation that must survive the strip even if
+# the inner text happens to match byte-for-byte (e.g. ``{{es|A Title}}``
+# where the Spanish title coincidentally equals the English).
+_LANGUAGES_SAFE_TO_UNWRAP = frozenset({"en"})
 
 
 def _template_name(template) -> str:
@@ -51,19 +62,27 @@ def _matches_template_name(template, expected: str) -> bool:
     return _template_name(template) == expected.casefold()
 
 
-def _is_language_wrapper(template) -> bool:
-    """Detect a single-language wrapper template like ``{{es|texto}}``.
+def _language_wrapper_code(template) -> str | None:
+    """Return the language code if ``template`` is a single-language
+    wrapper of the ``{{xx|texto}}`` shape, else None.
 
-    Returns True only for the "one positional arg, name is a language
-    code" shape. Anything with named args, multiple positionals, or a
-    non-language-code name is left alone.
+    A wrapper is the "one positional arg, name is a language code" shape.
+    Anything with named args, multiple positionals, or a non-language-code
+    name returns None — those are normal sub-templates or LangSwitch.
+
+    Returning the *code* rather than a bool lets callers decide what to
+    do with each language: Phase 1 only unwraps codes in
+    ``_LANGUAGES_SAFE_TO_UNWRAP`` (English), but the wider "this is a
+    wrapper, don't compare" check applies to any code.
     """
     name = _template_name(template)
     if not _LANG_CODE_RE.match(name):
-        return False
+        return None
     positionals = [p for p in template.params if p.showkey is False]
     named = [p for p in template.params if p.showkey is True]
-    return len(positionals) == 1 and not named
+    if len(positionals) != 1 or named:
+        return None
+    return name
 
 
 def _canonical_value(value: str) -> str:
@@ -85,21 +104,26 @@ def _value_matches(wikitext_value: str, expected: str) -> bool:
     value is a wrapping ``{{PD-USGov}}``-style template invocation that
     the editor would copy verbatim.
 
-    As a fallback for editor-added language tags, a wikitext value of the
-    shape ``{{<lang>|...}}`` is unwrapped before re-comparing — so the
-    canonical English ``"Foo"`` still matches ``{{en|Foo}}``.  Any other
-    template-wrapped value (``{{LangSwitch|...}}``, an Information
-    sub-template, a citation) is conservatively a mismatch — those
-    represent deliberate editor structure that the strip must preserve.
+    As a fallback for editor-added ``{{en|...}}`` wrappers around the
+    canonical English string, that one specific language wrapper is
+    unwrapped before re-comparing — Module:DPLA's render is in English
+    anyway, so the wrapper is purely redundant. Every other language
+    wrapper (``{{es|...}}``, ``{{de|...}}``, …) is a deliberate editor
+    translation that survives the strip even if its inner text happens
+    to match the canonical English byte-for-byte. Other template-wrapped
+    values (``{{LangSwitch|...}}``, an Information sub-template, a
+    citation) are conservatively a mismatch for the same reason.
     """
     if _canonical_value(wikitext_value) == _canonical_value(expected):
         return True
 
     parsed = mwparserfromhell.parse(wikitext_value)
     templates = parsed.filter_templates(recursive=False)
-    if len(templates) == 1 and _is_language_wrapper(templates[0]):
-        inner = str(templates[0].get(1).value)
-        return _canonical_value(inner) == _canonical_value(expected)
+    if len(templates) == 1:
+        lang = _language_wrapper_code(templates[0])
+        if lang in _LANGUAGES_SAFE_TO_UNWRAP:
+            inner = str(templates[0].get(1).value)
+            return _canonical_value(inner) == _canonical_value(expected)
 
     return False
 

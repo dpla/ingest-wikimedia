@@ -391,10 +391,17 @@ def get_wiki_text(
     """Turns DPLA item info into a wikitext document."""
     params = dpla_metadata_params(dpla_id, item_metadata, provider, data_provider)
 
-    creator_value = params["creator"]["params"]["2"]
+    # Every literal that the comparator side derives from ``params`` is
+    # sourced from ``params`` here too. Drifting the two — e.g. changing
+    # the creator label in ``dpla_metadata_params`` and forgetting to
+    # change it here — is the failure mode the single-source-of-truth
+    # contract exists to prevent. So no hardcoded ``"Creator"``,
+    # ``"fileinfotpl_aut"``, ``{{Institution|wikidata=...}}`` shape, etc.
+    creator_params = params["creator"]["params"]
+    creator_value = creator_params["2"]
     if creator_value:
         creator_template = """
-        | Other fields 1 = {{ InFi | Creator | $creator | id=fileinfotpl_aut}}"""
+        | Other fields 1 = {{ InFi | $creator_label | $creator | id=$creator_id}}"""
     else:
         creator_template = ""
 
@@ -414,13 +421,16 @@ def get_wiki_text(
             | dpla_id = $dpla_id
             | local_id = $local_id
         }}
-        | Institution = {{ Institution | wikidata = $data_provider }}
+        | Institution = {{ Institution | wikidata = $institution_wikidata }}
      }}"""
     )
 
     source_params = params["source"]["params"]
+    institution_params = params["institution"]["params"]
     return Template(template_string).substitute(
         creator=creator_value,
+        creator_label=creator_params["1"],
+        creator_id=creator_params["id"],
         title=params["title"],
         description=params["description"],
         date_string=params["date"],
@@ -430,6 +440,7 @@ def get_wiki_text(
         is_shown_at=source_params["url"],
         dpla_id=source_params["dpla_id"],
         local_id=source_params["local_id"],
+        institution_wikidata=institution_params["wikidata"],
     )
 
 

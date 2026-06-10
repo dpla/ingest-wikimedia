@@ -186,6 +186,28 @@ def test_normalize_preserves_language_wrapped_when_inner_doesnt_match():
     assert "{{es|Una descripción}}" in new_text
 
 
+def test_normalize_preserves_non_english_wrapper_even_when_inner_matches():
+    """A non-English wrapper like ``{{es|A Title}}`` where the inner text
+    happens to byte-match the canonical English value still must survive
+    the strip. The language tag is an editor contribution recording that
+    the value is also a valid Spanish rendering; losing it discards that
+    metadata.
+
+    Phase 1 explicitly only unwraps ``{{en|...}}`` — every other language
+    code, even when the inner happens to match, gets preserved."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    # The canonical title is "A Title". Wrap it in {{es|...}} as if a
+    # Spanish-speaking editor confirmed the English value reads naturally
+    # in Spanish too.
+    wikitext = _build_full_wikitext(params).replace(
+        "| title = A Title",
+        "| title = {{es|A Title}}",
+    )
+    new_text, stripped = normalize(wikitext, params)
+    assert "title" not in stripped
+    assert "{{es|A Title}}" in new_text
+
+
 def test_normalize_unwraps_language_tagged_canonical_english():
     """An editor who wrapped the canonical English string in ``{{en|...}}``
     didn't change the value — unwrap and treat as a match so the
@@ -203,15 +225,20 @@ def test_normalize_unwraps_language_tagged_canonical_english():
 def test_normalize_preserves_source_with_edited_subparam():
     """If the source sub-template's ``url`` was edited away from the
     canonical value, the whole source param must survive — partial
-    matches don't count."""
+    matches don't count.
+
+    Test fixture uses a non-URL-shaped edit token so CodeQL's
+    ``py/incomplete-url-substring-sanitization`` rule doesn't pattern-
+    match the ``substring in url`` shape as a security check.
+    """
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
     wikitext = _build_full_wikitext(params).replace(
         "url=https://example.org/item/123",
-        "url=https://editor-fixed.example.org/item/123",
+        "url=https://example.org/item/EDITED-BY-A-HUMAN-456",
     )
     new_text, stripped = normalize(wikitext, params)
     assert "source" not in stripped
-    assert "editor-fixed.example.org" in new_text
+    assert "EDITED-BY-A-HUMAN-456" in new_text
 
 
 def test_normalize_preserves_source_with_extra_param():
