@@ -136,7 +136,7 @@ def _value_matches(
         if _template_name(tpl) == _LANGSWITCH_NAME:
             return False
         lang = _language_wrapper_code(tpl)
-        if lang in languages:
+        if lang is not None and lang in languages:
             inner = str(tpl.get(1).value)
             return _canonical_value(inner) == _canonical_value(expected)
 
