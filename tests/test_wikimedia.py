@@ -1163,6 +1163,12 @@ def test_get_wiki_text_preserves_artwork_parameters_under_new_template():
         data_provider={"Wikidata": "Q2"},
     )
     for fragment in (
+        # Creator path: get_wiki_text conditionally emits `Other fields 1`
+        # with a Creator InFi template when the source record has any
+        # creator. Our fixture has one, so pin the full Creator fragment
+        # — otherwise a refactor that drops the conditional could
+        # silently lose every credited DPLA author.
+        "| Other fields 1 = {{ InFi | Creator | A Creator | id=fileinfotpl_aut}}",
         "| title = A Title",
         "| description = A description",
         "| date = 1900",
