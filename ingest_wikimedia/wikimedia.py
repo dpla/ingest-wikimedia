@@ -347,16 +347,27 @@ def dpla_metadata_params(
     permissions = get_permissions(
         rights_uri, get_permissions_template(rights_uri), data_provider_wiki_q
     )
+    # ``get_permissions_template`` returns the empty string for any
+    # ``edm:rights`` URI not in its allowlist; ``get_permissions`` can
+    # then surface either ``""`` or ``" | <qid>"`` (for unmapped
+    # RIGHTS_STATEMENTS URLs that still pick up the data-provider
+    # suffix). Wrapping either in ``{{...}}`` produces malformed wikitext
+    # (``{{}}`` / ``{{ | Q...}}``), so render the param as empty in that
+    # case — the row becomes ``| permission =`` instead of carrying a
+    # broken template invocation. Pre-empts the same shape leaking into
+    # the comparator side: ``_value_matches("", "")`` is trivially True,
+    # so a file whose wikitext already carries a blank ``| permission =``
+    # row stays consistent.
     source_resource = get_dict(item_metadata, SOURCE_RESOURCE_FIELD_NAME)
+    permissions_clean = permissions.strip() if permissions else ""
+    permission_value = f"{{{{{permissions_clean}}}}}" if permissions_clean else ""
     return {
         "title": extract_strings(source_resource, DC_TITLE_FIELD_NAME),
         "description": extract_strings(source_resource, DC_DESCRIPTION_FIELD_NAME),
         "date": extract_strings_dict(
             source_resource, DC_DATE_FIELD_NAME, EDM_TIMESPAN_DISPLAY_DATE
         ),
-        # Permission rendered as `{{<permissions>}}` — the value here is
-        # the inner template invocation without the wrapping braces.
-        "permission": f"{{{{{permissions}}}}}",
+        "permission": permission_value,
         "creator": {
             "name": "InFi",
             "params": {

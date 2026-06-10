@@ -66,6 +66,26 @@ def test_dpla_metadata_params_scalar_values_match_extract_strings():
     assert params["date"] == "1900"
 
 
+def test_dpla_metadata_params_permission_is_empty_for_unmapped_rights():
+    """When ``edm:rights`` is an unknown URI, ``get_permissions_template``
+    returns the empty string and the canonical ``permission`` value
+    must be empty too — never the malformed ``{{}}`` that wrapping an
+    empty string would produce. Same goes for an unmapped
+    RIGHTS_STATEMENTS URL, where ``get_permissions`` would otherwise
+    yield ``{{ | Qxxx}}``.
+
+    A blank permission means ``get_wiki_text`` renders a bare
+    ``| permission =`` row, which is graceful degradation; a literal
+    ``{{}}`` would have rendered as a broken template invocation.
+    """
+    item = _minimal_item()
+    item["rights"] = "https://example.org/unmapped-rights-uri"
+    params = dpla_metadata_params("abc123", item, _PROVIDER, _DATA_PROVIDER)
+    assert params["permission"] == ""
+    rendered = get_wiki_text("abc123", item, _PROVIDER, _DATA_PROVIDER)
+    assert "{{}}" not in rendered
+
+
 def test_dpla_metadata_params_permission_is_template_wrapped():
     """``permission`` is special: the rendered wikitext value is itself
     a ``{{<template>}}`` invocation, so the canonical value must include
