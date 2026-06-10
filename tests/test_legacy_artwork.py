@@ -496,3 +496,431 @@ def test_artwork_param_aliases_normalize_via_casefolded_lookup(alias, canonical)
     advertised alias resolves to its canonical key regardless of
     source casing."""
     assert ARTWORK_PARAM_TO_CANONICAL_KEY.get(alias.casefold()) == canonical
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b: integration layer (date materialisation, idempotency,
+# wikitext-rewrite, end-to-end executor)
+# ---------------------------------------------------------------------------
+
+
+from unittest.mock import MagicMock  # noqa: E402
+
+from ingest_wikimedia.legacy_artwork import (  # noqa: E402
+    LEGACY_MIGRATION_EDIT_SUMMARY,
+    MigrationResult,
+    entity_was_already_migrated,
+    fetch_revision_snapshots,
+    materialize_import_claims,
+    materialize_pending_date_claim,
+    migrate_legacy_file,
+    post_legacy_import_claims,
+    render_migrated_wikitext,
+)
+
+
+# --- materialize_pending_date_claim ---------------------------------------
+
+
+def test_materialize_pending_date_claim_parses_year_to_p571_value_typed():
+    """The placeholder expands to a value-typed P571 statement with the
+    structured wikibase time datavalue and the original string
+    preserved as a P1932 (stated as) qualifier."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "1900",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+        "type": "statement",
+    }
+    claim = materialize_pending_date_claim(placeholder)
+    assert claim is not None
+    assert claim["mainsnak"]["snaktype"] == "value"
+    assert claim["mainsnak"]["property"] == "P571"
+    assert claim["mainsnak"]["datatype"] == "time"
+    assert claim["mainsnak"]["datavalue"]["type"] == "time"
+    # P1932 preserves the verbatim source string.
+    assert claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == "1900"
+    # Reference uses P887/P4656, NOT DPLA-standard refs.
+    refs = claim["references"]
+    assert len(refs) == 1
+    assert set(refs[0]["snaks"]) == {"P887", "P4656"}
+
+
+def test_materialize_pending_date_claim_circa_stamps_p1480():
+    """Approximate dates ("ca. 1900") get the P1480 (sourcing
+    circumstances → Q5727902 circa) qualifier alongside P1932."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "ca. 1900",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    claim = materialize_pending_date_claim(placeholder)
+    assert claim is not None
+    assert "P1480" in claim["qualifiers"]
+    assert claim["qualifiers"]["P1480"][0]["datavalue"]["value"]["id"] == "Q5727902"
+
+
+def test_materialize_pending_date_claim_unparseable_falls_back_to_somevalue():
+    """When parse_dpla_date can't commit, the mainsnak goes ``somevalue``
+    so the statement still asserts an inception exists, with the
+    original string preserved on P1932."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "sometime in the 1800s maybe",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    claim = materialize_pending_date_claim(placeholder)
+    assert claim is not None
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    assert "datavalue" not in claim["mainsnak"]
+    assert claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == (
+        "sometime in the 1800s maybe"
+    )
+
+
+def test_materialize_import_claims_passes_through_non_date_claims():
+    """A title claim doesn't carry the placeholder marker — pass through."""
+    title_claim = {"type": "statement", "mainsnak": {"property": "P1476"}}
+    out = materialize_import_claims([title_claim])
+    assert out == [title_claim]
+
+
+def test_materialize_import_claims_swaps_only_date_placeholder():
+    """Mixed list — one pass-through, one materialised. Order preserved."""
+    title_claim = {"type": "statement", "mainsnak": {"property": "P1476"}}
+    date_placeholder = {
+        "type": "statement",
+        "_phase3a_pending_date_parse": "1900",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    out = materialize_import_claims([title_claim, date_placeholder])
+    assert len(out) == 2
+    assert out[0] == title_claim
+    assert out[1]["mainsnak"]["property"] == "P571"
+    assert "_phase3a_pending_date_parse" not in out[1]
+
+
+# --- entity_was_already_migrated ------------------------------------------
+
+
+def _entity_with_legacy_import(prop: str) -> dict:
+    return {
+        "statements": {
+            prop: [
+                {
+                    "mainsnak": {"property": prop},
+                    "references": [
+                        {
+                            "snaks": {
+                                "P887": [
+                                    {
+                                        "datavalue": {
+                                            "value": {
+                                                "entity-type": "item",
+                                                "id": "Q131783016",
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+
+def test_entity_was_already_migrated_detects_p887_q131783016_ref():
+    entity = _entity_with_legacy_import("P1476")
+    assert entity_was_already_migrated(entity) is True
+
+
+def test_entity_was_already_migrated_false_for_empty_entity():
+    assert entity_was_already_migrated({}) is False
+    assert entity_was_already_migrated({"statements": {}}) is False
+
+
+def test_entity_was_already_migrated_false_for_unrelated_p887_ref():
+    """A P887 ref pointing at a DIFFERENT Wikidata item doesn't count —
+    only the Q131783016 signature triggers the bail-out."""
+    entity = _entity_with_legacy_import("P1476")
+    entity["statements"]["P1476"][0]["references"][0]["snaks"]["P887"][0]["datavalue"][
+        "value"
+    ]["id"] = "Q99999999"
+    assert entity_was_already_migrated(entity) is False
+
+
+def test_entity_was_already_migrated_accepts_claims_key_legacy_shape():
+    """Some pywikibot helpers return MediaInfo entities with statements
+    under ``claims`` (the older key) rather than ``statements``. Read
+    either."""
+    entity = _entity_with_legacy_import("P1476")
+    entity["claims"] = entity.pop("statements")
+    assert entity_was_already_migrated(entity) is True
+
+
+# --- render_migrated_wikitext ---------------------------------------------
+
+
+def test_render_migrated_wikitext_swaps_artwork_for_dpla_metadata():
+    original = (
+        "== {{int:filedesc}} ==\n{{Artwork|title=Old}}\n{{PD-USGov}}\n[[Category:Foo]]"
+    )
+    new_block = "{{DPLA metadata|title=New}}"
+    result = render_migrated_wikitext(original, new_block)
+    assert "{{Artwork" not in result
+    assert "{{DPLA metadata|title=New}}" in result
+    # Page-level metadata survives.
+    assert "{{PD-USGov}}" in result
+    assert "[[Category:Foo]]" in result
+
+
+def test_render_migrated_wikitext_noop_when_no_legacy_template():
+    """Defensive: a page already migrated (or never legacy) is left
+    byte-identical so the caller's wikitext-changed comparison
+    behaves correctly."""
+    original = "{{DPLA metadata|title=Already there}}\n"
+    result = render_migrated_wikitext(original, "{{DPLA metadata|title=Other}}")
+    assert result == original
+
+
+def test_render_migrated_wikitext_swaps_information_template_too():
+    original = "{{Information|description=foo}}"
+    result = render_migrated_wikitext(original, "{{DPLA metadata|description=bar}}")
+    assert "{{Information" not in result
+    assert "{{DPLA metadata|description=bar}}" in result
+
+
+# --- post_legacy_import_claims --------------------------------------------
+
+
+def test_post_legacy_import_claims_submits_atomic_wbeditentity():
+    """One ``wbeditentity`` POST with all claims bundled. The request
+    action, id, csrf token, and JSON-serialised ``data`` payload are
+    the contract."""
+    import json as _json
+
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    request = MagicMock()
+    site.simple_request.return_value = request
+
+    claims = [{"type": "statement", "mainsnak": {"property": "P1476"}}]
+    post_legacy_import_claims("M42", claims, site)
+
+    site.simple_request.assert_called_once()
+    kwargs = site.simple_request.call_args.kwargs
+    assert kwargs["action"] == "wbeditentity"
+    assert kwargs["id"] == "M42"
+    assert kwargs["bot"] is True
+    assert kwargs["token"] == "CSRFTOKEN"
+    assert _json.loads(kwargs["data"]) == {"claims": claims}
+    request.submit.assert_called_once()
+
+
+# --- fetch_revision_snapshots ---------------------------------------------
+
+
+def test_fetch_revision_snapshots_projects_revid_user_text():
+    """The pywikibot Revision object's three relevant fields are
+    projected into the dataclass; anything else is dropped. Also pins
+    that content=True is the call shape (without it pywikibot doesn't
+    populate .text)."""
+
+    class _Rev:
+        def __init__(self, revid, user, text):
+            self.revid, self.user, self.text = revid, user, text
+
+    file_page = MagicMock()
+    file_page.revisions.return_value = [
+        _Rev(1, "DPLA_bot", "{{Artwork|title=A}}"),
+        _Rev(2, "Editor1", "{{Artwork|title=B}}"),
+    ]
+    snapshots = fetch_revision_snapshots(file_page)
+    assert len(snapshots) == 2
+    assert snapshots[0].revid == 1 and snapshots[0].user == "DPLA_bot"
+    assert snapshots[1].text == "{{Artwork|title=B}}"
+    file_page.revisions.assert_called_once_with(content=True)
+
+
+def test_fetch_revision_snapshots_tolerates_missing_user_and_text():
+    """Suppressed-author revisions can have ``user=None`` and missing
+    text. Coerce both to ``""`` so the planner just sees no params
+    for that revision."""
+
+    class _Rev:
+        revid = 7
+        user = None
+        text = None
+
+    file_page = MagicMock()
+    file_page.revisions.return_value = [_Rev()]
+    snapshots = fetch_revision_snapshots(file_page)
+    assert len(snapshots) == 1
+    assert snapshots[0].user == "" and snapshots[0].text == ""
+
+
+# --- migrate_legacy_file end-to-end ---------------------------------------
+
+
+def _mock_file_page(title: str, text: str, revisions: list):
+    page = MagicMock()
+    page.title.return_value = title
+    page.text = text
+    page.pageid = 42
+    page.revisions.return_value = revisions
+    return page
+
+
+def _site_with_empty_entity():
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    site.simple_request.return_value.submit.return_value = {"entities": {"M42": {}}}
+    return site
+
+
+def _item_md(title="A Title"):
+    return (
+        {
+            "rights": "http://creativecommons.org/publicdomain/zero/1.0/",
+            "isShownAt": "https://example.org/item/123",
+            "sourceResource": {
+                "title": [title],
+                "description": ["A description"],
+                "date": [{"displayDate": "1900"}],
+                "creator": ["A Creator"],
+                "identifier": ["local-1"],
+            },
+        },
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+
+def test_migrate_legacy_file_skips_when_no_legacy_template():
+    """A page already on the new template form returns the no-legacy
+    skip reason without POSTing anything to Wikibase."""
+
+    class _Rev:
+        revid, user, text = 1, "DPLA_bot", "{{DPLA metadata|title=A Title}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert isinstance(result, MigrationResult)
+    assert result.skipped_reason == "no-legacy-template"
+    # No wbeditentity POST anywhere in the call history.
+    assert all(
+        c.kwargs.get("action") != "wbeditentity"
+        for c in site.simple_request.call_args_list
+    )
+
+
+def test_migrate_legacy_file_skips_when_already_migrated():
+    """The idempotency check spots an existing P887/Q131783016 ref on
+    a P1476 statement and bails out before POSTing duplicates."""
+
+    class _Rev:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": _entity_with_legacy_import("P1476")}
+    }
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert result.skipped_reason == "already-migrated"
+    page.save.assert_not_called()
+
+
+def test_migrate_legacy_file_dpla_only_history_writes_no_imports():
+    """No community history → no imports, but the wikitext still gets
+    rewritten to the new template form so the canonical state is
+    consistent."""
+
+    class _Rev:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert result.imports_posted == 0
+    assert result.wikitext_changed is True
+    page.save.assert_called_once()
+    save_summary = page.save.call_args.kwargs.get("summary", "")
+    assert "Migrate legacy" in save_summary
+
+
+def test_migrate_legacy_file_imports_community_value_and_rewrites_wikitext():
+    """End-to-end happy path: DPLA_bot wrote the original, a community
+    editor changed the title, we import that community value and
+    rewrite the wikitext."""
+
+    class _Rev1:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    class _Rev2:
+        revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev2.text, [_Rev1(), _Rev2()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert result.imports_posted == 1
+    assert result.wikitext_changed is True
+
+    import json as _json
+
+    wbeditentity_calls = [
+        c
+        for c in site.simple_request.call_args_list
+        if c.kwargs.get("action") == "wbeditentity"
+    ]
+    assert len(wbeditentity_calls) == 1
+    posted = _json.loads(wbeditentity_calls[0].kwargs["data"])
+    assert len(posted["claims"]) == 1
+    assert posted["claims"][0]["mainsnak"]["property"] == "P1476"
+    assert (
+        posted["claims"][0]["mainsnak"]["datavalue"]["value"]["text"]
+        == "A Better Title"
+    )
+
+
+def test_legacy_migration_edit_summary_mentions_q131783016():
+    """The edit summary should mention the inferred-from-Wikitext
+    Wikidata item so reviewers can trace the migration's intent."""
+    assert "Q131783016" in LEGACY_MIGRATION_EDIT_SUMMARY
