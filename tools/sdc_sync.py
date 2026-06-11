@@ -3202,9 +3202,15 @@ def _post_sdc_cleanup_for_page(
             )
         return
 
-    # Strip path. ``normalize_page`` is a no-op for files without
-    # ``{{DPLA metadata}}`` (a hand-written stub, a file that was
-    # never DPLA-uploaded), so it's safe to call unconditionally here.
+    # Strip path. Bail before computing ``expected_params`` when the
+    # file has no ``{{DPLA metadata}}`` template either — a hand-written
+    # stub, or a non-DPLA upload that happens to share a Commons file
+    # title. ``dpla_metadata_params`` does real work (resolves the
+    # rights URI, builds the hub label, etc.) and would be wasted on
+    # a page that ``normalize_page`` is going to no-op anyway.
+    if not wikitext_normalize.has_dpla_metadata_template(text):
+        return
+
     if expected_params is None:
         try:
             expected_params = wikimedia.dpla_metadata_params(

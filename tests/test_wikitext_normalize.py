@@ -16,7 +16,7 @@ Two layers under test:
 from __future__ import annotations
 
 from ingest_wikimedia.wikimedia import dpla_metadata_params, get_wiki_text
-from ingest_wikimedia.wikitext_normalize import normalize
+from ingest_wikimedia.wikitext_normalize import canonicalize, normalize
 
 
 def _minimal_item():
@@ -529,3 +529,87 @@ def test_normalize_preserves_langswitch_even_with_single_named_param():
     new_text, stripped = normalize(wikitext, params)
     assert "description" not in stripped
     assert "{{LangSwitch|en=A description|es=Una descripción}}" in new_text
+
+
+# ---------------------------------------------------------------------------
+# canonicalize — whitespace shape enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_canonicalize_collapses_fully_stripped_template_to_single_line():
+    """When every param has been stripped from the ``{{DPLA metadata}}``
+    template, the canonical form is a single-line ``{{DPLA metadata}}``
+    invocation — not the multi-line skeleton mwparserfromhell leaves
+    behind after :func:`normalize`'s ``template.remove`` calls."""
+    indented_after_strip = "== {{int:filedesc}} ==\n     {{ DPLA metadata\n        }}\n"
+    result = canonicalize(indented_after_strip)
+    assert "{{DPLA metadata}}" in result
+    # The non-canonical residue is gone.
+    assert "{{ DPLA metadata" not in result
+    assert "        }}" not in result
+
+
+def test_canonicalize_inserts_blank_line_between_heading_and_template():
+    """The canonical shape has exactly one blank line between
+    ``== {{int:filedesc}} ==`` and ``{{DPLA metadata``. Files written
+    by the pre-#298 ``get_wiki_text`` (no blank line) get normalised."""
+    no_blank_line = "== {{int:filedesc}} ==\n{{DPLA metadata\n| title = Foo\n}}"
+    result = canonicalize(no_blank_line)
+    assert "== {{int:filedesc}} ==\n\n{{DPLA metadata" in result
+
+
+def test_canonicalize_left_justifies_indented_template():
+    """A historical upload that emitted the template indented (the
+    pre-#297 form, e.g. ``     {{ DPLA metadata``) gets left-justified
+    in canonical form, no leading whitespace on the ``{{`` or on any
+    ``| key = value`` line."""
+    indented = (
+        "== {{int:filedesc}} ==\n"
+        "     {{ DPLA metadata\n"
+        "        | title = Foo\n"
+        "        | dpla_id = abc123\n"
+        "     }}\n"
+    )
+    result = canonicalize(indented)
+    for line in result.splitlines():
+        # Lines that aren't the section header line shouldn't have
+        # leading whitespace either.
+        if line.startswith(" ") or line.startswith("\t"):
+            raise AssertionError(f"line has leading whitespace: {line!r}")
+    assert "{{DPLA metadata\n| title = Foo\n| dpla_id = abc123\n}}" in result
+
+
+def test_canonicalize_drops_space_between_opening_braces_and_name():
+    """``{{ DPLA metadata`` (with space) gets collapsed to
+    ``{{DPLA metadata``. mwparserfromhell preserves the source-text
+    whitespace inside template-name slots; the canonicalize pass
+    overrides it with the no-space form."""
+    spaced = "{{ DPLA metadata\n| title = Foo\n}}"
+    result = canonicalize(spaced)
+    assert "{{DPLA metadata" in result
+    assert "{{ DPLA metadata" not in result
+
+
+def test_canonicalize_no_op_on_already_canonical_text():
+    """The canonical shape is idempotent — running it on text that's
+    already canonical returns byte-identical output. Necessary for
+    the ``normalize_page`` "save only on change" guard not to fire
+    spuriously on files already in good shape."""
+    canonical = (
+        "== {{int:filedesc}} ==\n"
+        "\n"
+        "{{DPLA metadata\n"
+        "| title = Foo\n"
+        "| dpla_id = abc123\n"
+        "}}"
+    )
+    assert canonicalize(canonical) == canonical
+
+
+def test_canonicalize_returns_input_unchanged_when_no_dpla_metadata_template():
+    """Files without ``{{DPLA metadata}}`` (legacy ``{{Artwork}}``,
+    hand-written stubs, etc.) are out of scope for whitespace
+    canonicalisation here — that's the legacy-migrate dispatcher's
+    job upstream."""
+    untouched = "Just some prose.\n{{Artwork|title=Foo}}\n[[Category:Foo]]"
+    assert canonicalize(untouched) == untouched

@@ -1339,10 +1339,12 @@ def test_post_sdc_cleanup_dispatches_to_strip_on_new_template(monkeypatch):
 
 def test_post_sdc_cleanup_skips_when_neither_template_present(monkeypatch):
     """A file with neither template (hand-written wikitext, a stub,
-    a file that was never DPLA-uploaded) gets a quiet no-op. The
-    strip would also be a no-op in that case — short-circuiting saves
-    a parse + a save attempt."""
-    from ingest_wikimedia import legacy_artwork, wikitext_normalize
+    a file that was never DPLA-uploaded) gets a quiet no-op: the
+    dispatcher uses ``has_dpla_metadata_template`` to short-circuit
+    before computing ``expected_params`` or calling ``normalize_page``,
+    saving the parse + the rights-URI / hub-label resolution work
+    that ``dpla_metadata_params`` would do."""
+    from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
     from tools import sdc_sync
 
     fake_page = MagicMock(name="FilePage")
@@ -1361,6 +1363,12 @@ def test_post_sdc_cleanup_skips_when_neither_template_present(monkeypatch):
         "normalize_page",
         lambda *a, **kw: strip_calls.append((a, kw)),
     )
+    params_calls = []
+    monkeypatch.setattr(
+        wikimedia,
+        "dpla_metadata_params",
+        lambda *a, **kw: params_calls.append((a, kw)) or {},
+    )
 
     sdc_sync._post_sdc_cleanup_for_page(
         fake_page,
@@ -1371,11 +1379,8 @@ def test_post_sdc_cleanup_skips_when_neither_template_present(monkeypatch):
     )
 
     assert migrate_calls == []
-    # Note: normalize_page would itself no-op on no-template wikitext,
-    # so we don't gate strictly on call_count==0 — but ``normalize_page``
-    # IS still called in the strip branch; the dispatcher took the strip
-    # path because the legacy template wasn't found.
-    assert len(strip_calls) == 1
+    assert strip_calls == []
+    assert params_calls == []
 
 
 def test_post_sdc_cleanup_skips_when_page_missing(monkeypatch):

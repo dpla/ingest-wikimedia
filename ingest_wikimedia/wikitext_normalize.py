@@ -375,31 +375,114 @@ def _parse_inner_template(value: str, expected_name: str) -> dict | None:
     return {str(p.name).strip(): _canonical_value(str(p.value)) for p in tpl.params}
 
 
+def canonicalize(wikitext: str) -> str:
+    """Enforce the canonical whitespace shape on a ``{{DPLA metadata}}``
+    page.
+
+    The canonical shape is what :func:`ingest_wikimedia.wikimedia.get_wiki_text`
+    emits for a fresh upload:
+
+    .. code-block:: text
+
+        == {{int:filedesc}} ==
+
+        {{DPLA metadata
+        | title = ...
+        ...
+        }}
+
+    Specifically: left-justified template with no leading whitespace
+    on any line, exactly one blank line between the section heading
+    and the template, no space between the opening braces and the
+    template name, params one per line on ``| key = value``, closing
+    ``}}`` on its own line — or, when every param has been stripped,
+    the template collapses to single-line ``{{DPLA metadata}}``.
+
+    Pure: takes a wikitext string, returns a wikitext string. The
+    surrounding page-level metadata (license tags, categories,
+    assessment blocks, the section heading itself) is left untouched.
+    Files that don't contain a ``{{DPLA metadata}}`` template are
+    returned unchanged.
+    """
+    wikicode = mwparserfromhell.parse(wikitext)
+    template = _find_dpla_metadata_template(wikicode)
+    if template is None:
+        return wikitext
+
+    # Collect params, dropping leading/trailing whitespace from both
+    # name and value so the canonical form matches the renderer's
+    # whitespace-tolerant parse. Values may legitimately contain
+    # internal whitespace (multi-line descriptions, etc.) — only
+    # outer whitespace is trimmed.
+    params: list[tuple[str, str]] = []
+    for p in template.params:
+        params.append((str(p.name).strip(), str(p.value).strip()))
+
+    if not params:
+        canonical_template = "{{DPLA metadata}}"
+    else:
+        lines = ["{{DPLA metadata"]
+        for k, v in params:
+            lines.append(f"| {k} = {v}")
+        lines.append("}}")
+        canonical_template = "\n".join(lines)
+
+    wikicode.replace(template, canonical_template)
+    text = str(wikicode)
+
+    # Ensure exactly one blank line between the section heading and
+    # the template. The default ``get_wiki_text`` output emits this
+    # blank line; older pages may have a different separator (no
+    # blank line, indentation, multiple blank lines), which the
+    # regex normalises.
+    text = re.sub(
+        r"(==\s*\{\{int:filedesc\}\}\s*==)\s*\n\s*(\{\{DPLA metadata)",
+        r"\1\n\n\2",
+        text,
+    )
+
+    return text
+
+
 def normalize_page(file_page, expected_params: dict, edit_summary: str) -> bool:
-    """Apply :func:`normalize` to a pywikibot ``FilePage`` and save if changed.
+    """Strip redundant params + canonicalize whitespace on a pywikibot
+    ``FilePage``; save if any change resulted.
 
     Returns True when a save was performed, False when the page is a
-    redirect, already canonical, or otherwise out of scope (no params
-    to strip). All exceptions propagate to the caller, which is expected
-    to wrap this in a per-file try/except so a normalize failure doesn't
-    abort the SDC-sync batch.
+    redirect or the wikitext is already canonical and has no
+    redundant params. All exceptions propagate to the caller, which
+    is expected to wrap this in a per-file try/except so a normalize
+    failure doesn't abort the SDC-sync batch.
 
-    Redirect guard: pywikibot reads a redirect page's ``.text`` as the
-    redirect target's wikitext, but ``.save()`` writes to the redirect
-    page itself — saving would replace the ``#REDIRECT`` line with the
-    target's content and break the redirect. Skip redirects entirely;
-    the SDC sync targeted the target page anyway via its M-id.
+    Saves on any change — including whitespace-only canonicalisation
+    — so files where the params don't strip but the template was
+    written with non-canonical indentation (a hand-edit, a legacy
+    pre-#297 upload) get cleaned up on the same pass. The previous
+    behaviour gated the save on ``stripped`` being non-empty, which
+    left those pages permanently mis-formatted.
+
+    Redirect guard: pywikibot reads a redirect page's ``.text`` as
+    the redirect target's wikitext, but ``.save()`` writes to the
+    redirect page itself — saving would replace the ``#REDIRECT``
+    line with the target's content and break the redirect.
     """
     if file_page.isRedirectPage():
         return False
     original = file_page.text or ""
-    new_text, stripped = normalize(original, expected_params)
-    if not stripped:
+    stripped_text, stripped = normalize(original, expected_params)
+    canonical_text = canonicalize(stripped_text)
+    if canonical_text == original:
         return False
-    file_page.text = new_text
-    logging.info(
-        f" -- {file_page.title()}: stripping redundant DPLA-metadata params: "
-        f"{', '.join(stripped)}"
-    )
+    file_page.text = canonical_text
+    if stripped:
+        logging.info(
+            f" -- {file_page.title()}: stripping redundant DPLA-metadata params: "
+            f"{', '.join(stripped)}"
+        )
+    else:
+        logging.info(
+            f" -- {file_page.title()}: canonicalising DPLA-metadata template"
+            " whitespace (no redundant params to strip)."
+        )
     file_page.save(summary=edit_summary, minor=True, bot=True)
     return True
