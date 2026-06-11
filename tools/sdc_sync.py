@@ -188,6 +188,104 @@ class _MissingEntityError(Exception):
     """
 
 
+def _fetch_entity_for_cleanup_guard(mediaid: str) -> dict:
+    """Read ``mediaid``'s MediaInfo entity, bypassing the per-file cache.
+
+    The post-SDC cleanup's defensive guard wants the post-write entity
+    state, not a snapshot from earlier in the same process_one run.
+    ``get_entity`` caches by M-id within a file's processing window;
+    this helper goes straight to wbgetentities. Returns an empty dict
+    on no-such-entity (caller treats that as "no DPLA SDC", which is
+    correct — a missing entity has zero of anything).
+    """
+    try:
+        raw = site.simple_request(action="wbgetentities", ids=mediaid).submit()
+    except Exception:
+        raise
+    entities = raw.get("entities", {})
+    if not isinstance(entities, dict):
+        return {}
+    ent = entities.get(mediaid, {})
+    if not isinstance(ent, dict):
+        return {}
+    return ent
+
+
+def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
+    """True iff ``entity`` carries at least one statement with the
+    DPLA-attribution qualifier (``P459 = Q61848113``, "heuristic" →
+    "DPLA"). Mirrors :func:`Module:DPLA`'s ``isDplaDetermined`` filter
+    on Commons so the guard's notion of "has DPLA SDC" matches the
+    template renderer's notion exactly.
+    """
+    if not entity:
+        return False
+    statements = entity.get("statements") or entity.get("claims") or {}
+    if not isinstance(statements, dict):
+        return False
+    for stmt_list in statements.values():
+        if not isinstance(stmt_list, list):
+            continue
+        for stmt in stmt_list:
+            if not isinstance(stmt, dict):
+                continue
+            quals = stmt.get("qualifiers") or {}
+            for q in quals.get("P459", []):
+                dv = q.get("datavalue") if isinstance(q, dict) else None
+                if not isinstance(dv, dict):
+                    continue
+                val = dv.get("value")
+                if isinstance(val, dict) and val.get("id") == "Q61848113":
+                    return True
+    return False
+
+
+def _resolve_pageid_from_title(title: str) -> int | None:
+    """Look up the Commons page id for ``title`` via the live wiki API.
+
+    The fallback for upload-result.json sidecars where the uploader
+    recorded ``pageid: null`` or ``pageid: 0`` for a successfully
+    uploaded file (an upstream pywikibot FilePage-cache-invalidation
+    quirk). The file exists on Commons under ``title`` — Commons can
+    tell us the M-id; the uploader just failed to capture it.
+
+    Returns the pageid integer when the page exists and the API
+    answered with one. Returns ``None`` on any failure mode — page
+    actually doesn't exist (deleted, never uploaded), API error,
+    network blip — so the caller's existing skip path runs and the
+    skip is counted under :class:`Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID`.
+
+    Idempotent and safe to call from a hot loop — single ``query``
+    action against the live Commons API, no writes.
+    """
+    if not title:
+        return None
+    try:
+        result = site.simple_request(
+            action="query",
+            titles=title,
+            prop="info",
+        ).submit()
+    except Exception:
+        # Logged at the call site; let the caller drop into its
+        # existing skip path on any API failure.
+        return None
+    pages = result.get("query", {}).get("pages", {})
+    if not isinstance(pages, dict):
+        return None
+    for _api_key, page_info in pages.items():
+        if not isinstance(page_info, dict):
+            continue
+        if "missing" in page_info:
+            # Page genuinely doesn't exist on Commons — the upload
+            # presumably failed silently after recording UPLOADED.
+            return None
+        pid = page_info.get("pageid")
+        if isinstance(pid, int) and pid > 0:
+            return pid
+    return None
+
+
 def _truncate(text: str | None, limit: int = 500) -> str:
     """Return ``text`` shortened to ``limit`` chars with an ellipsis suffix.
 
@@ -3232,6 +3330,41 @@ def _post_sdc_cleanup_for_page(
                 " skipping strip."
             )
             return
+
+    # Defensive guard against the upstream null-pageid bug shape and
+    # any future regression: ``normalize_page`` strips wikitext params
+    # whose values match ``expected_params``, on the premise that the
+    # SDC just written carries the same value so the renderer will
+    # supply it. If the file's MediaInfo entity actually has no
+    # DPLA-attributed SDC (because the upload-result.json sidecar had
+    # a null/zero pageid, or the SDC write was silently dropped for
+    # some other reason, or the cleanup is racing a partial sync),
+    # the strip would leave the page with no metadata in EITHER
+    # representation. Refuse to strip in that state. The per-ordinal
+    # SDC writer is the only thing that should ever produce a
+    # DPLA-attributed claim; its absence is a reliable signal that
+    # this ordinal's SDC sync didn't actually fire.
+    mediaid = f"M{file_page.pageid}" if file_page.pageid else None
+    if mediaid:
+        try:
+            entity = _fetch_entity_for_cleanup_guard(mediaid)
+        except Exception:
+            # API failure during the guard is a hard skip — better
+            # than stripping against unknown SDC state.
+            logging.exception(
+                f" -- cleanup: entity fetch failed for {file_page.title()}"
+                f" ({mediaid}); skipping strip out of caution."
+            )
+            return
+        if not _entity_has_dpla_attributed_claims(entity):
+            logging.warning(
+                f" -- cleanup: '{file_page.title()}' ({mediaid}) for"
+                f" {dpla_id} has no DPLA-attributed SDC; skipping strip"
+                " to avoid wiping wikitext params without an SDC"
+                " counterpart (upstream sync likely never fired)."
+            )
+            return
+
     try:
         wikitext_normalize.normalize_page(
             file_page, expected_params, _NORMALIZE_EDIT_SUMMARY
@@ -3734,25 +3867,49 @@ def _run_partner_mode(partner, ids_file):
 
             for ord_str, data in ordinal_items:
                 pageid = data.get("pageid")
+                title = data.get("title", "?")
                 # `if not pageid` rather than `is None` — a recorded
                 # pageid of 0 is just as malformed as a missing one
                 # (no Commons MediaInfo entity has ID `M0`) and would
                 # otherwise propagate downstream as a confusing
                 # pywikibot APIError on the bogus mediaid. The
-                # uploader has historically written `pageid: 0` for
-                # successful new uploads when pywikibot's FilePage
-                # cache wasn't invalidated post-upload; treat that
-                # sidecar shape as a mapping skip until the upstream
-                # bug is fixed and the existing sidecars are
-                # backfilled.
+                # uploader has historically written ``pageid: 0`` (and
+                # since 2026-06 ``pageid: null``) for successful new
+                # uploads when pywikibot's FilePage cache wasn't
+                # invalidated post-upload.
+                #
+                # When ``title`` is present (which it almost always is —
+                # the uploader writes both fields), fall back to a
+                # Commons API lookup keyed on the title to recover the
+                # real pageid. Lets a re-run of ``sdc-sync`` self-heal
+                # past the upstream sidecar defect instead of silently
+                # repeating the same skip. ``_resolve_pageid_from_title``
+                # returns ``None`` on any failure (page deleted, API
+                # error) — in that case the original skip path runs.
+                if not pageid and title and title != "?":
+                    resolved = _resolve_pageid_from_title(title)
+                    if resolved:
+                        logging.info(
+                            f" -- Ordinal {ord_str}: upload-result pageid"
+                            f" was {data.get('pageid')!r}; resolved to"
+                            f" {resolved} via Commons title lookup."
+                        )
+                        pageid = resolved
                 if not pageid:
                     logging.warning(
                         f" -- Ordinal {ord_str}: missing/zero pageid"
-                        f" ({pageid!r}); skipping."
+                        f" ({data.get('pageid')!r}) for '{title}' and"
+                        " title→pageid fallback failed; skipping."
                     )
+                    tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID)
+                    # Treat as an ordinal error for item-level bucket
+                    # classification — an item where every ordinal had
+                    # null pageid should not silently fall into the
+                    # MAPPING bucket; it's a real failure that needs
+                    # the upstream uploader fix.
+                    had_ordinal_error = True
                     continue
                 mediaid = f"M{pageid}"
-                title = data.get("title", "?")
                 logging.info(f" -- Ordinal {ord_str}: {mediaid} ({title})")
 
                 # Snapshot write counters so we can detect whether this

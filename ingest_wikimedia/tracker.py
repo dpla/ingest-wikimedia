@@ -37,6 +37,13 @@ class Result(Enum):
     # (claim rejection, throttle, etc.) stay distinguishable from
     # not-our-problem skips.
     SDC_ORDINALS_SKIPPED_MISSING_ENTITY = auto()
+    # Ordinals where upload-result.json carries a missing / null / zero
+    # ``pageid`` and sdc-sync's title→pageid fallback couldn't resolve
+    # it from Commons either (page actually doesn't exist, API error,
+    # etc.). Distinguished from the generic ERROR bucket so operators
+    # can spot uploader sidecar defects in the Slack summary rather
+    # than having them blend in with runtime API failures.
+    SDC_ORDINALS_SKIPPED_MISSING_PAGEID = auto()
     # Items where every eligible ordinal hit the per-ordinal exception
     # path — i.e., the item didn't fail due to malformed data
     # (MAPPING) or missing sidecars (NO_SIDECAR), but because all of
