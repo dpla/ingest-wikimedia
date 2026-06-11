@@ -394,11 +394,17 @@ def notify_upload_complete(
         header=f"*Wikimedia {header_phrase}: {effective_label}*{dry_run_note}",
         plain_text=f"Wikimedia {plain_phrase}: {effective_label}",
         stats_lines=[
-            f"UPLOADED: {tracker.count(Result.UPLOADED):,}",
-            f"SKIPPED:  {tracker.count(Result.SKIPPED):,}",
-            f"FAILED:   {total_failed:,}",
-            f"BYTES:    {_format_bytes(tracker.count(Result.BYTES))}",
-            f"Runtime:  {runtime}",
+            f"UPLOADED:      {tracker.count(Result.UPLOADED):,}",
+            f"SKIPPED:       {tracker.count(Result.SKIPPED):,}",
+            # Per-class breakdown of the aggregate SKIPPED above. Lets
+            # operators tell upstream-gap skips (no S3 asset, downloader
+            # didn't stage) from MIME / ineligibility skips so the fix
+            # routes to the right team.
+            f"  not present: {tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT):,}",
+            f"  ineligible:  {tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE):,}",
+            f"FAILED:        {total_failed:,}",
+            f"BYTES:         {_format_bytes(tracker.count(Result.BYTES))}",
+            f"Runtime:       {runtime}",
         ],
     )
 

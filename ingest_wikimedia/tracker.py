@@ -5,6 +5,15 @@ class Result(Enum):
     DOWNLOADED = auto()
     FAILED = auto()
     SKIPPED = auto()
+    # Uploader skip-class breakdowns. Both also bump ``SKIPPED`` so
+    # legacy dashboards keep working — the granular counters add
+    # detail without replacing the aggregate. ``NOT_PRESENT`` covers
+    # the upstream gap (no S3 asset, downloader didn't stage the
+    # file). ``INELIGIBLE`` covers files that exist in S3 but the
+    # uploader chose not to upload (bad MIME, missing extension,
+    # download-only formats staged for conversion).
+    UPLOAD_SKIPPED_NOT_PRESENT = auto()
+    UPLOAD_SKIPPED_INELIGIBLE = auto()
     UPLOADED = auto()
     BYTES = auto()
     ITEM_NOT_PRESENT = auto()

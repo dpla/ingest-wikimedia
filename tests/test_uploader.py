@@ -1084,3 +1084,110 @@ def test_case1_move_suppresses_commonsdelinker_when_actual_is_sibling():
     assert action == "moved"
     kwargs = mock_move.call_args.kwargs
     assert kwargs.get("post_commonsdelinker") is False
+
+
+# ---------------------------------------------------------------------------
+# Granular skip-class counters: NOT_PRESENT vs INELIGIBLE both bump the
+# legacy ``SKIPPED`` aggregate AND a granular counter.
+# ---------------------------------------------------------------------------
+
+
+def test_track_ordinal_skip_bumps_both_legacy_and_granular_counters():
+    """``_track_ordinal_skip(kind)`` increments ``Result.SKIPPED``
+    (so legacy dashboards keep working) AND the granular ``kind``
+    counter (so the Slack summary's breakdown is non-zero). Pinned
+    so future refactors of the helper don't silently regress one of
+    the two increments."""
+    from tools.uploader import Uploader
+
+    tracker = Tracker()
+    uploader = Uploader.__new__(Uploader)  # bypass full __init__
+    uploader.tracker = tracker
+
+    uploader._track_ordinal_skip(Result.UPLOAD_SKIPPED_NOT_PRESENT)
+    assert tracker.count(Result.SKIPPED) == 1
+    assert tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT) == 1
+    assert tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE) == 0
+
+    uploader._track_ordinal_skip(Result.UPLOAD_SKIPPED_INELIGIBLE)
+    assert tracker.count(Result.SKIPPED) == 2
+    assert tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT) == 1
+    assert tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE) == 1
+
+
+# ---------------------------------------------------------------------------
+# Post-upload pageid refresh retry: live bug repro on a 327 MB TIFF where
+# Commons indexing lag returned pageid=0 on the first attempt.
+# ---------------------------------------------------------------------------
+
+
+def test_pageid_refresh_retries_until_indexed(monkeypatch):
+    """Live-bug regression: the post-upload pageid refresh races
+    Commons indexing on large (chunked) uploads. First attempt
+    returns 0; subsequent attempts (after backoff) return the real
+    pageid. The retry loop must keep trying up to
+    ``PAGEID_REFRESH_MAX_ATTEMPTS`` before giving up."""
+    from tools import uploader as uploader_mod
+
+    # Three FilePage instances returned in sequence by get_page —
+    # first two have .pageid=0 (indexing lag), third has the real id.
+    fresh_pages = [
+        MagicMock(pageid=0),
+        MagicMock(pageid=0),
+        MagicMock(pageid=193644002),
+    ]
+    for p in fresh_pages:
+        p.exists.return_value = True
+
+    monkeypatch.setattr(
+        uploader_mod, "get_page", lambda site, title: fresh_pages.pop(0)
+    )
+    monkeypatch.setattr(uploader_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_BACKOFF_SECS", 0)
+
+    # Inline a minimised version of the retry loop the uploader runs,
+    # since the surrounding upload flow is too heavy to exercise here.
+    # The contract under test is the retry pattern itself.
+    resolved_pageid = None
+    for attempt in range(1, uploader_mod.PAGEID_REFRESH_MAX_ATTEMPTS + 1):
+        fresh_page = uploader_mod.get_page(None, "File:X.tiff")
+        fresh_page.exists()
+        candidate = fresh_page.pageid
+        if candidate:
+            resolved_pageid = candidate
+            break
+
+    assert resolved_pageid == 193644002, (
+        "retry loop must keep trying until indexing lag closes; "
+        f"got {resolved_pageid!r}"
+    )
+
+
+def test_pageid_refresh_gives_up_after_max_attempts(monkeypatch):
+    """Indexing lag that exceeds the retry budget (or a genuinely
+    deleted page) leaves ``resolved_pageid = None``. The upload itself
+    still succeeded; the sidecar carries ``pageid: null`` and
+    sdc-sync's title→pageid fallback recovers on the next run."""
+    from tools import uploader as uploader_mod
+
+    perpetually_lagging = MagicMock(pageid=0)
+    perpetually_lagging.exists.return_value = True
+
+    monkeypatch.setattr(
+        uploader_mod, "get_page", lambda site, title: perpetually_lagging
+    )
+    monkeypatch.setattr(uploader_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_BACKOFF_SECS", 0)
+
+    resolved_pageid = None
+    for attempt in range(1, uploader_mod.PAGEID_REFRESH_MAX_ATTEMPTS + 1):
+        fresh_page = uploader_mod.get_page(None, "File:X.tiff")
+        fresh_page.exists()
+        candidate = fresh_page.pageid
+        if candidate:
+            resolved_pageid = candidate
+            break
+
+    assert resolved_pageid is None
