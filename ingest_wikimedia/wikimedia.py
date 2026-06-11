@@ -508,11 +508,14 @@ def get_wiki_text(
     else:
         creator_row = ""
 
+    # Blank line between the section heading and the template — the
+    # canonical shape ``wikitext_normalize`` enforces on save, so emit
+    # it from the start. Without the blank line, every post-SDC strip
+    # / migrate pass would re-save the page just to insert it.
     template_string = (
         "== {{int:filedesc}} ==\n"
-        "{{DPLA metadata"
-        + creator_row
-        + "\n| title = $title"
+        "\n"
+        "{{DPLA metadata" + creator_row + "\n| title = $title"
         "\n| description = $description"
         "\n| date = $date_string"
         "\n| permission = $permission"

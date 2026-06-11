@@ -20,6 +20,7 @@ from ingest_wikimedia.sdc import (
     parse_dpla_date,
     parse_nara_access_level,
 )
+from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
@@ -44,6 +45,12 @@ rights: dict
 subject_ids: dict
 _s3_partner: str | None = None
 _s3_client = None
+# Legacy-mode (``--file`` / ``--cat`` / ``--list``) DPLA-doc cache.
+# ``parsed()`` populates it during ``process_one``; the post-SDC
+# cleanup helper pops on read so the same S3 / api.dp.la doc isn't
+# re-fetched. One entry per in-flight ``dpla_id``; the pop keeps the
+# cache from growing past one entry in practice.
+_legacy_mode_doc_cache: dict[str, dict] = {}
 # When True (the default; see ``--normalize-wikitext`` in ``_build_parser``),
 # ``_run_partner_mode`` runs a post-SDC wikitext-cleanup edit per item,
 # stripping ``{{DPLA metadata}}`` params whose values are now redundant
@@ -2745,6 +2752,11 @@ def parsed(dpla_id, dpla_api):
 
     if dpla is None:
         return None
+    # Stash the raw doc so ``_post_sdc_cleanup_for_legacy_mode`` can
+    # reuse it after ``process_one`` returns, skipping a redundant
+    # S3 / api.dp.la fetch on the same dpla_id. Cache is per dpla_id
+    # and pop-on-read in the cleanup helper so it doesn't grow.
+    _legacy_mode_doc_cache[dpla_id] = dpla
     return _parse_dpla_doc(dpla, dpla_id)
 
 
@@ -3134,33 +3146,124 @@ _NORMALIZE_EDIT_SUMMARY = (
 )
 
 
-def _normalize_wikitext_for_item(
+def _post_sdc_cleanup_for_page(
+    file_page,
+    dpla_id: str,
+    item_metadata: dict,
+    provider: dict,
+    data_provider: dict,
+    *,
+    expected_params: dict | None = None,
+) -> None:
+    """Post-SDC wikitext cleanup for one Commons file page.
+
+    Dispatches based on the file's current wikitext shape:
+
+    * **Has** ``{{Artwork}}`` / ``{{Information}}`` / ``{{Photograph}}``
+      (the legacy DPLA wrappers): run
+      :func:`ingest_wikimedia.legacy_artwork.migrate_legacy_file` — walks
+      revision history, classifies community contributions vs DPLA-bot
+      values, imports community values as SDC statements with the
+      ``P887→Q131783016`` + ``P4656→<permalink>`` reference shape, then
+      rewrites the wikitext from the legacy form to ``{{DPLA metadata}}``.
+
+    * **Has** ``{{DPLA metadata}}`` (the post-#291 form): run
+      :func:`ingest_wikimedia.wikitext_normalize.normalize_page` — strips
+      template params whose values are now redundant with the
+      DPLA-attributed SDC just written.
+
+    * **Has neither** (rare — a hand-written wikitext or a stub): skip
+      silently. The blue box still renders from SDC; nothing to clean
+      up in the wikitext.
+
+    The dispatch is order-sensitive: the legacy-template check comes
+    first because the migration's revision-history walk is expensive
+    (one ``revisions()`` call per file), so we don't want to fire it on
+    files that are clearly already on the new template form.
+
+    ``expected_params`` is optional — when not supplied, the dispatcher
+    computes it from ``dpla_metadata_params``. Partner mode passes it
+    in so a multi-ordinal item doesn't redundantly recompute per
+    ordinal.
+    """
+    if not file_page.exists():
+        return
+
+    text = file_page.text or ""
+
+    if legacy_artwork.find_legacy_template(text) is not None:
+        # Migrate path. legacy_artwork handles its own provenance walk,
+        # SDC import, and wikitext rewrite. Re-fetching expected_params
+        # here would be wasted work — migrate_legacy_file recomputes
+        # them internally from item_metadata.
+        try:
+            legacy_artwork.migrate_legacy_file(
+                file_page=file_page,
+                item_metadata=item_metadata,
+                provider=provider,
+                data_provider=data_provider,
+                dpla_id=dpla_id,
+                site=site,
+            )
+        except Exception:
+            logging.exception(
+                f" -- cleanup: legacy migration of '{file_page.title()}'"
+                f" for {dpla_id} failed; skipping."
+            )
+        return
+
+    # Strip path. Bail before computing ``expected_params`` when the
+    # file has no ``{{DPLA metadata}}`` template either — a hand-written
+    # stub, or a non-DPLA upload that happens to share a Commons file
+    # title. ``dpla_metadata_params`` does real work (resolves the
+    # rights URI, builds the hub label, etc.) and would be wasted on
+    # a page that ``normalize_page`` is going to no-op anyway.
+    if not wikitext_normalize.has_dpla_metadata_template(text):
+        return
+
+    if expected_params is None:
+        try:
+            expected_params = wikimedia.dpla_metadata_params(
+                dpla_id, item_metadata, provider, data_provider
+            )
+        except Exception:
+            logging.exception(
+                f" -- cleanup: dpla_metadata_params failed for {dpla_id};"
+                " skipping strip."
+            )
+            return
+    try:
+        wikitext_normalize.normalize_page(
+            file_page, expected_params, _NORMALIZE_EDIT_SUMMARY
+        )
+    except Exception:
+        logging.exception(
+            f" -- cleanup: normalize_page on '{file_page.title()}' for"
+            f" {dpla_id} failed; skipping."
+        )
+
+
+def _post_sdc_cleanup_for_item(
     s3, partner: str, dpla_id: str, ordinal_items: list[tuple[str, dict]]
 ) -> None:
-    """Per-item post-SDC wikitext cleanup: strip redundant template params.
+    """Per-item post-SDC cleanup (partner mode).
 
-    Reads the item's dpla-map.json from S3 (no api.dp.la call), computes the
-    canonical ``{{DPLA metadata}}`` parameter dict via
-    :func:`ingest_wikimedia.wikimedia.dpla_metadata_params`, then walks every
-    ordinal's Commons page and asks
-    :func:`ingest_wikimedia.wikitext_normalize.normalize_page` to remove any
-    param whose value exactly matches the canonical value (i.e. is now
-    redundant with the SDC just written).
+    Reads ``dpla-map.json`` from S3, resolves provider / data_provider,
+    pre-computes the canonical params once for the item, then walks
+    every ordinal page through :func:`_post_sdc_cleanup_for_page`.
 
-    Best-effort: any S3 / pywikibot / parse failure is logged but never
-    raised. The SDC sync result is already committed and counted before
-    this runs; a normalize failure must not roll that back or fail the
-    partner batch.
+    Best-effort throughout: any S3 / pywikibot / parse failure is
+    logged but never raised. SDC sync has already committed and counted
+    before this runs; a cleanup failure must not roll that back or fail
+    the partner batch.
     """
-    from ingest_wikimedia import wikimedia, wikitext_normalize
+    from ingest_wikimedia import wikimedia
     from ingest_wikimedia.dpla import DPLA
 
     try:
         item_raw = s3.get_item_metadata(partner, dpla_id)
     except Exception as e:
-        logging.warning(
-            f" -- normalize-wikitext: S3 read failed for {dpla_id}: {e!r}; skipping."
-        )
+        logging.warning(f" -- cleanup: S3 read failed for {dpla_id}: {e!r}; skipping.")
         return
     if not item_raw:
         # dpla-map.json missing — get-ids-es never staged it, or the
@@ -3171,7 +3274,7 @@ def _normalize_wikitext_for_item(
         item_metadata = json.loads(item_raw)
     except json.JSONDecodeError as e:
         logging.warning(
-            f" -- normalize-wikitext: dpla-map.json parse failed for {dpla_id}: {e}; skipping."
+            f" -- cleanup: dpla-map.json parse failed for {dpla_id}: {e}; skipping."
         )
         return
 
@@ -3181,7 +3284,7 @@ def _normalize_wikitext_for_item(
         )
     except Exception as e:
         logging.warning(
-            f" -- normalize-wikitext: provider lookup failed for {dpla_id}: {e!r}; skipping."
+            f" -- cleanup: provider lookup failed for {dpla_id}: {e!r}; skipping."
         )
         return
 
@@ -3191,7 +3294,7 @@ def _normalize_wikitext_for_item(
         )
     except Exception as e:
         logging.warning(
-            f" -- normalize-wikitext: param compute failed for {dpla_id}: {e!r}; skipping."
+            f" -- cleanup: param compute failed for {dpla_id}: {e!r}; skipping."
         )
         return
 
@@ -3201,19 +3304,64 @@ def _normalize_wikitext_for_item(
             continue
         try:
             page = pywikibot.FilePage(site, title)
-            if not page.exists():
-                continue
-            wikitext_normalize.normalize_page(
-                page, expected_params, _NORMALIZE_EDIT_SUMMARY
-            )
         except Exception:
-            # Log with traceback so notify_pipeline_fail's log summary
-            # surfaces the root cause if one item's normalization repeatedly
-            # blows up. Per-ordinal isolation here, not per-item — one bad
-            # title in a multi-page item shouldn't skip the others.
             logging.exception(
-                f" -- normalize-wikitext: ordinal {ord_str} ({title}) for {dpla_id} failed; skipping."
+                f" -- cleanup: FilePage construction failed for ordinal"
+                f" {ord_str} ({title}) of {dpla_id}; skipping."
             )
+            continue
+        _post_sdc_cleanup_for_page(
+            page,
+            dpla_id,
+            item_metadata,
+            provider,
+            data_provider,
+            expected_params=expected_params,
+        )
+
+
+def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> None:
+    """Post-SDC cleanup for the ``--file`` / ``--cat`` / ``--list`` paths.
+
+    Mirrors :func:`_post_sdc_cleanup_for_item` for single-file modes:
+    reuses the DPLA item doc ``parsed()`` cached during ``process_one``
+    (popped on read from :data:`_legacy_mode_doc_cache`), resolves
+    provider / data_provider, then dispatches via
+    :func:`_post_sdc_cleanup_for_page`. On a cache miss (e.g. process_one
+    early-returned on a missing-ID before the cache populated, or the
+    cache was cleared by an earlier cleanup) the doc is fetched fresh
+    from S3 / api.dp.la so the cleanup still runs.
+
+    Best-effort: any failure is logged but doesn't raise.
+    """
+    from ingest_wikimedia.dpla import DPLA
+
+    doc = _legacy_mode_doc_cache.pop(dpla_id, None)
+    if doc is None:
+        try:
+            if _s3_partner is not None:
+                doc = _fetch_dpla_doc_from_s3(_s3_client, _s3_partner, dpla_id)
+                if doc is None:
+                    doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+            else:
+                doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+        except Exception:
+            logging.exception(
+                f" -- cleanup: DPLA-doc fetch failed for {dpla_id}; skipping."
+            )
+            return
+    if not doc:
+        return
+
+    try:
+        provider, data_provider = DPLA.get_provider_and_data_provider(doc, hubs)
+    except Exception as e:
+        logging.warning(
+            f" -- cleanup: provider lookup failed for {dpla_id}: {e!r}; skipping."
+        )
+        return
+
+    _post_sdc_cleanup_for_page(file_page, dpla_id, doc, provider, data_provider)
 
 
 def _run_legacy_migration_mode(partner: str, ids_file: str) -> None:
@@ -3709,7 +3857,7 @@ def _run_partner_mode(partner, ids_file):
                 # inside is logged and swallowed by the helper, so a bad
                 # parse on one item can't abort the partner batch.
                 if _normalize_wikitext_enabled:
-                    _normalize_wikitext_for_item(s3, partner, dpla_id, ordinal_items)
+                    _post_sdc_cleanup_for_item(s3, partner, dpla_id, ordinal_items)
             elif had_ordinal_error:
                 # Every eligible ordinal raised at runtime — classify
                 # under the error bucket, not MAPPING. (Mixed-result
@@ -3771,7 +3919,7 @@ def _run_partner_mode(partner, ids_file):
 # We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
 
 
-def _safe_process_one(mediaid: str, dpla_id: str) -> None:
+def _safe_process_one(mediaid: str, dpla_id: str, file_page=None) -> None:
     """Run ``process_one`` with the per-file exception boundary the
     legacy ``--list`` / ``--files`` / ``--cat`` loops need.
 
@@ -3786,18 +3934,40 @@ def _safe_process_one(mediaid: str, dpla_id: str) -> None:
     line 2015 — so a deleted file's ``_MissingEntityError`` bypasses
     that handler and surfaces here. Categorise it as MISSING_ENTITY
     (clean skip) instead of folding it into the generic ERROR bucket.
+
+    When ``file_page`` is supplied and ``--normalize-wikitext`` is on
+    (the default — see ``_build_parser``), runs the post-SDC strip /
+    legacy-migrate dispatcher on that page after the SDC sync. Mirrors
+    the partner-mode cleanup so every trigger path (hub-level,
+    per-institution, per-collection, single-id, ``--file``, ``--cat``,
+    ``--list``) ends with the same per-file cleanup.
     """
     try:
-        process_one(mediaid, dpla_id)
-    except _MissingEntityError:
-        logging.info(
-            f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity"
-            " does not exist; skipping (not an error)."
-        )
-        tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
-    except Exception:
-        logging.exception(f" -- {mediaid} for {dpla_id}: SDC sync failed; skipping.")
-        tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+        try:
+            process_one(mediaid, dpla_id)
+        except _MissingEntityError:
+            logging.info(
+                f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity"
+                " does not exist; skipping (not an error)."
+            )
+            tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+            return
+        except Exception:
+            logging.exception(
+                f" -- {mediaid} for {dpla_id}: SDC sync failed; skipping."
+            )
+            tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+            return
+
+        if _normalize_wikitext_enabled and file_page is not None:
+            _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id)
+    finally:
+        # Drop any stash ``parsed()`` left in the cache so a process_one
+        # error path (or a cleanup skip when ``file_page`` is None /
+        # normalize-wikitext disabled) doesn't leak the doc across files.
+        # On the happy path the cleanup helper already popped — the
+        # ``default=None`` makes this a no-op there.
+        _legacy_mode_doc_cache.pop(dpla_id, None)
 
 
 def main() -> None:
@@ -3829,9 +3999,14 @@ def main() -> None:
                 count += 1
                 print(f"{count}:\n - {args.lists}/{lists[x]} ({percent:.2f}% done)")
                 print("\n" + str(file).replace('""', '"'))
+                # Re-wrap as a FilePage so the post-SDC cleanup gets
+                # the right page-type handle. TextIOPageGenerator yields
+                # generic Page objects, but normalize_page / migrate
+                # both expect a FilePage (its .latest_file_info etc.).
+                file_page = pywikibot.FilePage(site, str(file))
                 mediaid = "M" + str(file.pageid)
                 dpla_id = _resolve_dpla_id(str(file), dpla_api)
-                _safe_process_one(mediaid, dpla_id)
+                _safe_process_one(mediaid, dpla_id, file_page=file_page)
 
             os.rename(working_file, os.path.join(args.lists, "COMPLETE-" + lists[x]))
 
@@ -3853,7 +4028,7 @@ def main() -> None:
     elif args.files:
         for title in args.files:
             print("\n" + title)
-            page = pywikibot.Page(site, title)
+            page = pywikibot.FilePage(site, title)
             if not page.exists():
                 print(f" -- Page not found on Commons: {title}")
                 continue
@@ -3861,7 +4036,7 @@ def main() -> None:
             dpla_id = _resolve_dpla_id(title, dpla_api)
             count += 1
             print(f"{count}: {mediaid}")
-            _safe_process_one(mediaid, dpla_id)
+            _safe_process_one(mediaid, dpla_id, file_page=page)
 
     elif args.cat:
         category = pywikibot.Category(site, args.cat)
@@ -3875,7 +4050,12 @@ def main() -> None:
             dpla_id = _resolve_dpla_id(title, dpla_api)
             count += 1
             print(f"{count}: {mediaid}")
-            _safe_process_one(mediaid, dpla_id)
+            # CategorizedPageGenerator yields generic Page objects;
+            # re-wrap as FilePage so the post-SDC cleanup gets the
+            # right type (its normalize / migrate helpers expect a
+            # FilePage handle).
+            file_page = pywikibot.FilePage(site, title)
+            _safe_process_one(mediaid, dpla_id, file_page=file_page)
             if args.limit and count >= args.limit:
                 print(f" -- Reached --limit {args.limit}, stopping.")
                 break
