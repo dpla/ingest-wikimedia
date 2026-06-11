@@ -20,6 +20,7 @@ from ingest_wikimedia.sdc import (
     parse_dpla_date,
     parse_nara_access_level,
 )
+from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
@@ -44,6 +45,12 @@ rights: dict
 subject_ids: dict
 _s3_partner: str | None = None
 _s3_client = None
+# Legacy-mode (``--file`` / ``--cat`` / ``--list``) DPLA-doc cache.
+# ``parsed()`` populates it during ``process_one``; the post-SDC
+# cleanup helper pops on read so the same S3 / api.dp.la doc isn't
+# re-fetched. One entry per in-flight ``dpla_id``; the pop keeps the
+# cache from growing past one entry in practice.
+_legacy_mode_doc_cache: dict[str, dict] = {}
 # When True (the default; see ``--normalize-wikitext`` in ``_build_parser``),
 # ``_run_partner_mode`` runs a post-SDC wikitext-cleanup edit per item,
 # stripping ``{{DPLA metadata}}`` params whose values are now redundant
@@ -2745,6 +2752,11 @@ def parsed(dpla_id, dpla_api):
 
     if dpla is None:
         return None
+    # Stash the raw doc so ``_post_sdc_cleanup_for_legacy_mode`` can
+    # reuse it after ``process_one`` returns, skipping a redundant
+    # S3 / api.dp.la fetch on the same dpla_id. Cache is per dpla_id
+    # and pop-on-read in the cleanup helper so it doesn't grow.
+    _legacy_mode_doc_cache[dpla_id] = dpla
     return _parse_dpla_doc(dpla, dpla_id)
 
 
@@ -3174,8 +3186,6 @@ def _post_sdc_cleanup_for_page(
     in so a multi-ordinal item doesn't redundantly recompute per
     ordinal.
     """
-    from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
-
     if not file_page.exists():
         return
 
@@ -3314,30 +3324,32 @@ def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> None:
     """Post-SDC cleanup for the ``--file`` / ``--cat`` / ``--list`` paths.
 
     Mirrors :func:`_post_sdc_cleanup_for_item` for single-file modes:
-    fetches the DPLA item doc (from S3 if --from-s3 is configured, else
-    api.dp.la), resolves provider / data_provider, then dispatches via
-    :func:`_post_sdc_cleanup_for_page`. The doc fetch is the same one
-    ``parsed()`` already made during ``process_one``; calling it again
-    here is a redundant HTTP round-trip per file, accepted as the cost
-    of keeping the cleanup helper signature symmetric across modes
-    (these modes are admin-only and not high-volume).
+    reuses the DPLA item doc ``parsed()`` cached during ``process_one``
+    (popped on read from :data:`_legacy_mode_doc_cache`), resolves
+    provider / data_provider, then dispatches via
+    :func:`_post_sdc_cleanup_for_page`. On a cache miss (e.g. process_one
+    early-returned on a missing-ID before the cache populated, or the
+    cache was cleared by an earlier cleanup) the doc is fetched fresh
+    from S3 / api.dp.la so the cleanup still runs.
 
     Best-effort: any failure is logged but doesn't raise.
     """
     from ingest_wikimedia.dpla import DPLA
 
-    try:
-        if _s3_partner is not None:
-            doc = _fetch_dpla_doc_from_s3(_s3_client, _s3_partner, dpla_id)
-            if doc is None:
+    doc = _legacy_mode_doc_cache.pop(dpla_id, None)
+    if doc is None:
+        try:
+            if _s3_partner is not None:
+                doc = _fetch_dpla_doc_from_s3(_s3_client, _s3_partner, dpla_id)
+                if doc is None:
+                    doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+            else:
                 doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
-        else:
-            doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
-    except Exception:
-        logging.exception(
-            f" -- cleanup: DPLA-doc fetch failed for {dpla_id}; skipping."
-        )
-        return
+        except Exception:
+            logging.exception(
+                f" -- cleanup: DPLA-doc fetch failed for {dpla_id}; skipping."
+            )
+            return
     if not doc:
         return
 
@@ -3931,21 +3943,31 @@ def _safe_process_one(mediaid: str, dpla_id: str, file_page=None) -> None:
     ``--list``) ends with the same per-file cleanup.
     """
     try:
-        process_one(mediaid, dpla_id)
-    except _MissingEntityError:
-        logging.info(
-            f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity"
-            " does not exist; skipping (not an error)."
-        )
-        tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
-        return
-    except Exception:
-        logging.exception(f" -- {mediaid} for {dpla_id}: SDC sync failed; skipping.")
-        tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
-        return
+        try:
+            process_one(mediaid, dpla_id)
+        except _MissingEntityError:
+            logging.info(
+                f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity"
+                " does not exist; skipping (not an error)."
+            )
+            tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
+            return
+        except Exception:
+            logging.exception(
+                f" -- {mediaid} for {dpla_id}: SDC sync failed; skipping."
+            )
+            tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+            return
 
-    if _normalize_wikitext_enabled and file_page is not None:
-        _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id)
+        if _normalize_wikitext_enabled and file_page is not None:
+            _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id)
+    finally:
+        # Drop any stash ``parsed()`` left in the cache so a process_one
+        # error path (or a cleanup skip when ``file_page`` is None /
+        # normalize-wikitext disabled) doesn't leak the doc across files.
+        # On the happy path the cleanup helper already popped — the
+        # ``default=None`` makes this a no-op there.
+        _legacy_mode_doc_cache.pop(dpla_id, None)
 
 
 def main() -> None:

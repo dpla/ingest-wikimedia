@@ -1237,6 +1237,78 @@ def test_safe_process_one_skips_cleanup_on_missing_entity(monkeypatch):
     assert called == []
 
 
+def test_safe_process_one_clears_doc_cache_on_missing_entity(monkeypatch):
+    """If ``process_one`` populates the doc cache via ``parsed()`` and
+    then raises ``_MissingEntityError`` before cleanup runs, the
+    ``finally`` in ``_safe_process_one`` must drop the cached entry —
+    otherwise the doc leaks across files in long ``--list`` runs."""
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+
+    def populate_then_raise(*_a):
+        sdc_sync._legacy_mode_doc_cache["dpla-1"] = {"some": "doc"}
+        raise sdc_sync._MissingEntityError("M1")
+
+    monkeypatch.setattr(sdc_sync, "process_one", populate_then_raise)
+    monkeypatch.setattr(sdc_sync, "_post_sdc_cleanup_for_legacy_mode", lambda *a: None)
+    sdc_sync._legacy_mode_doc_cache.clear()
+
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
+
+    assert "dpla-1" not in sdc_sync._legacy_mode_doc_cache
+
+
+def test_post_sdc_cleanup_for_legacy_mode_reuses_cached_doc(monkeypatch):
+    """The doc ``parsed()`` cached during ``process_one`` gets popped
+    and reused in the cleanup helper — no second S3 / api.dp.la fetch.
+    Locks in the optimisation so a refactor can't silently regress to
+    re-fetching the same doc."""
+    from ingest_wikimedia.dpla import DPLA
+    from tools import sdc_sync
+
+    cached_doc = {"id": "dpla-1", "sourceResource": {}, "provider": {"name": "p"}}
+    sdc_sync._legacy_mode_doc_cache.clear()
+    sdc_sync._legacy_mode_doc_cache["dpla-1"] = cached_doc
+
+    s3_fetches = []
+    api_fetches = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "_fetch_dpla_doc_from_s3",
+        lambda *a, **kw: s3_fetches.append(a) or None,
+    )
+    monkeypatch.setattr(
+        sdc_sync,
+        "_fetch_dpla_doc_from_api",
+        lambda *a, **kw: api_fetches.append(a) or None,
+    )
+
+    dispatch_calls = []
+
+    def fake_dispatch(file_page, dpla_id, doc, provider, data_provider):
+        dispatch_calls.append((dpla_id, doc, provider, data_provider))
+
+    monkeypatch.setattr(sdc_sync, "_post_sdc_cleanup_for_page", fake_dispatch)
+    monkeypatch.setattr(
+        DPLA,
+        "get_provider_and_data_provider",
+        staticmethod(lambda doc, hubs: ({"name": "p"}, {"name": "d"})),
+    )
+    monkeypatch.setattr(sdc_sync, "hubs", {}, raising=False)
+
+    sdc_sync._post_sdc_cleanup_for_legacy_mode(MagicMock(name="FilePage"), "dpla-1")
+
+    assert s3_fetches == []
+    assert api_fetches == []
+    assert len(dispatch_calls) == 1
+    assert dispatch_calls[0][1] is cached_doc
+    # Pop-on-read drains the cache so a second cleanup call on the
+    # same dpla_id (re-entry) would fall through to the fetch path.
+    assert "dpla-1" not in sdc_sync._legacy_mode_doc_cache
+
+
 # ---------------------------------------------------------------------------
 # _post_sdc_cleanup_for_page — strip-or-migrate dispatcher
 # ---------------------------------------------------------------------------
