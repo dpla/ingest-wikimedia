@@ -507,8 +507,10 @@ def test_artwork_param_aliases_normalize_via_casefolded_lookup(alias, canonical)
 from unittest.mock import MagicMock  # noqa: E402
 
 from ingest_wikimedia.legacy_artwork import (  # noqa: E402
+    LEGACY_MIGRATION_BASE_SUMMARY,
     LEGACY_MIGRATION_EDIT_SUMMARY,
     MigrationResult,
+    build_migration_summary,
     entity_was_already_migrated,
     fetch_revision_snapshots,
     materialize_import_claims,
@@ -976,6 +978,66 @@ def test_legacy_migration_edit_summary_mentions_q131783016():
     """The edit summary should mention the inferred-from-Wikitext
     Wikidata item so reviewers can trace the migration's intent."""
     assert "Q131783016" in LEGACY_MIGRATION_EDIT_SUMMARY
+
+
+def test_build_migration_summary_omits_community_clause_when_zero_claims():
+    """A DPLA-bot-only history where every wikitext value matched
+    the DPLA canonical value posts zero community-import claims —
+    the summary must not promise SDC-preservation behaviour that
+    didn't fire. Pre-fix, every migration carried the boilerplate
+    "community-contributed metadata preserved..." clause regardless
+    of whether any community values were actually imported."""
+    summary = build_migration_summary(0)
+    assert summary == LEGACY_MIGRATION_BASE_SUMMARY
+    assert "Q131783016" not in summary
+    assert "community-contributed" not in summary
+    assert "preserved" not in summary
+
+
+def test_build_migration_summary_includes_community_clause_when_claims_posted():
+    """A history with at least one community-edited wikitext value
+    posts that value as an SDC statement under the community-import
+    reference shape, and the summary documents that."""
+    summary = build_migration_summary(1)
+    assert "Q131783016" in summary
+    assert "preserved" in summary
+
+
+def test_migrate_legacy_file_uses_honest_summary_on_dpla_only_history():
+    """End-to-end: when no community values were detected on a file
+    (DPLA-bot-only revision history, every param matches canonical),
+    the wikitext save's edit summary uses the base form without the
+    community-preservation clause. Regression for the live case where
+    every Valuation Section / Smithsonian negative file carried the
+    misleading boilerplate."""
+
+    class _Rev1:
+        revid, user = 1, "DPLA_bot"
+        text = (
+            "== {{int:filedesc}} ==\n"
+            "{{ Artwork\n"
+            "| title = A Title\n"
+            "| source = {{ DPLA | Q1 | hub = Q2 |"
+            " url = https://example.org/item/123 |"
+            " dpla_id = abc | local_id = local-1 }}\n"
+            "| Institution = {{ Institution | wikidata = Q1 }}\n"
+            "}}\n"
+        )
+
+    page = _mock_file_page("File:Foo.jpg", _Rev1.text, [_Rev1()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    save_summary = page.save.call_args.kwargs["summary"]
+    assert save_summary == LEGACY_MIGRATION_BASE_SUMMARY
+    assert "Q131783016" not in save_summary
 
 
 def test_migrate_legacy_file_emits_canonical_whitespace():
