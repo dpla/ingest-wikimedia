@@ -760,11 +760,35 @@ def render_migrated_wikitext(
 # wbeditentity edit. Centralised so a future change to the wording
 # (e.g. linking to the Commons documentation page) doesn't need to be
 # hunted down across multiple call sites.
+#
+# ``LEGACY_MIGRATION_EDIT_SUMMARY`` is the with-community-claims form;
+# the base form (no community-preservation clause) is used when every
+# wikitext value already matched the DPLA-canonical value, so the
+# migration produced zero community-import claims. ``build_migration_summary``
+# picks the right form for the actual edit, so the wikitext save's
+# summary doesn't promise SDC-preservation behaviour that didn't fire.
+LEGACY_MIGRATION_BASE_SUMMARY = (
+    "Migrate legacy {{Artwork}} to {{DPLA metadata}} per DPLA SDC sync."
+)
 LEGACY_MIGRATION_EDIT_SUMMARY = (
-    "Migrate legacy {{Artwork}} to {{DPLA metadata}} per DPLA SDC sync; "
-    "community-contributed metadata preserved as SDC statements with "
+    LEGACY_MIGRATION_BASE_SUMMARY
+    + " Community-contributed metadata preserved as SDC statements with "
     "[[d:Q131783016|inferred-from-Wikitext]] reference."
 )
+
+
+def build_migration_summary(community_claim_count: int) -> str:
+    """Return the edit summary describing what this migration did.
+
+    Pass the number of community-import claims actually posted on
+    this file. Zero (DPLA-bot-only history, every wikitext value
+    already DPLA-canonical) → :data:`LEGACY_MIGRATION_BASE_SUMMARY`.
+    Non-zero → :data:`LEGACY_MIGRATION_EDIT_SUMMARY` with the
+    community-preservation clause appended.
+    """
+    if community_claim_count <= 0:
+        return LEGACY_MIGRATION_BASE_SUMMARY
+    return LEGACY_MIGRATION_EDIT_SUMMARY
 
 
 @dataclass
@@ -820,7 +844,7 @@ def migrate_legacy_file(
     dpla_id: str,
     site,
     bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
-    summary: str = LEGACY_MIGRATION_EDIT_SUMMARY,
+    summary: str | None = None,
 ) -> MigrationResult:
     """End-to-end legacy-Artwork migration for a single file.
 
@@ -857,6 +881,14 @@ def migrate_legacy_file(
         return MigrationResult(skipped_reason="already-migrated", plan=plan)
 
     claims = materialize_import_claims(build_legacy_import_claims(plan))
+    # Pick the accurate summary for what this migration actually did,
+    # unless the caller supplied a custom one. Without this, a
+    # DPLA-bot-only history (no community values to import) would still
+    # carry the boilerplate "community-contributed metadata preserved"
+    # clause on its wikitext save, promising SDC-preservation behaviour
+    # that didn't fire on this file.
+    if summary is None:
+        summary = build_migration_summary(len(claims))
     if claims:
         post_legacy_import_claims(mediaid, claims, site, summary=summary)
 
