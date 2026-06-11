@@ -1084,3 +1084,148 @@ def test_case1_move_suppresses_commonsdelinker_when_actual_is_sibling():
     assert action == "moved"
     kwargs = mock_move.call_args.kwargs
     assert kwargs.get("post_commonsdelinker") is False
+
+
+# ---------------------------------------------------------------------------
+# Granular skip-class counters: NOT_PRESENT vs INELIGIBLE both bump the
+# legacy ``SKIPPED`` aggregate AND a granular counter.
+# ---------------------------------------------------------------------------
+
+
+def test_track_ordinal_skip_bumps_both_legacy_and_granular_counters():
+    """``_track_ordinal_skip(kind)`` increments ``Result.SKIPPED``
+    (so legacy dashboards keep working) AND the granular ``kind``
+    counter (so the Slack summary's breakdown is non-zero). Pinned
+    so future refactors of the helper don't silently regress one of
+    the two increments."""
+    from tools.uploader import Uploader
+
+    tracker = Tracker()
+    uploader = Uploader.__new__(Uploader)  # bypass full __init__
+    uploader.tracker = tracker
+
+    uploader._track_ordinal_skip(Result.UPLOAD_SKIPPED_NOT_PRESENT)
+    assert tracker.count(Result.SKIPPED) == 1
+    assert tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT) == 1
+    assert tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE) == 0
+
+    uploader._track_ordinal_skip(Result.UPLOAD_SKIPPED_INELIGIBLE)
+    assert tracker.count(Result.SKIPPED) == 2
+    assert tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT) == 1
+    assert tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE) == 1
+
+
+# ---------------------------------------------------------------------------
+# Post-upload pageid refresh retry: live bug repro on a 327 MB TIFF where
+# Commons indexing lag returned pageid=0 on the first attempt.
+# ---------------------------------------------------------------------------
+
+
+def _uploader_for_helper_tests():
+    """Build an ``Uploader`` instance bypassing ``__init__`` for direct
+    invocation of internal helpers — sufficient when the helper only
+    touches ``self.site`` and doesn't need a real tracker / S3 / DPLA
+    wiring."""
+    from tools.uploader import Uploader
+
+    uploader = Uploader.__new__(Uploader)
+    uploader.site = MagicMock(name="site")
+    return uploader
+
+
+def test_pageid_refresh_retries_until_indexed(monkeypatch):
+    """Live-bug regression: the post-upload pageid refresh races
+    Commons indexing on large (chunked) uploads. First attempts
+    return 0; a subsequent attempt (after backoff) returns the real
+    pageid. Calls the actual ``_refresh_pageid_with_retries`` helper
+    on the ``Uploader`` class — per CR #302 review, an inline copy of
+    the retry loop would silently pass while production diverges."""
+    from tools import uploader as uploader_mod
+
+    # Three FilePage instances returned in sequence by get_page —
+    # first two have .pageid=0 (indexing lag), third has the real id.
+    fresh_pages = [
+        MagicMock(pageid=0),
+        MagicMock(pageid=0),
+        MagicMock(pageid=193644002),
+    ]
+    for p in fresh_pages:
+        p.exists.return_value = True
+
+    monkeypatch.setattr(
+        uploader_mod, "get_page", lambda site, title: fresh_pages.pop(0)
+    )
+    monkeypatch.setattr(uploader_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_BACKOFF_SECS", 0)
+
+    uploader = _uploader_for_helper_tests()
+    assert uploader._refresh_pageid_with_retries("File:X.tiff") == 193644002
+
+
+def test_pageid_refresh_gives_up_after_max_attempts(monkeypatch):
+    """Indexing lag that exceeds the retry budget (or a genuinely
+    deleted page) returns ``None``. The upload itself still
+    succeeded; the sidecar carries ``pageid: null`` and sdc-sync's
+    title→pageid fallback recovers on the next run."""
+    from tools import uploader as uploader_mod
+
+    perpetually_lagging = MagicMock(pageid=0)
+    perpetually_lagging.exists.return_value = True
+
+    monkeypatch.setattr(
+        uploader_mod, "get_page", lambda site, title: perpetually_lagging
+    )
+    monkeypatch.setattr(uploader_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_BACKOFF_SECS", 0)
+
+    uploader = _uploader_for_helper_tests()
+    assert uploader._refresh_pageid_with_retries("File:X.tiff") is None
+
+
+def test_pageid_refresh_returns_none_on_persistent_api_error(monkeypatch):
+    """API failure on every attempt (network down, persistent rate
+    limit) returns ``None`` rather than raising — the upload itself
+    succeeded so the call must not bubble the refresh failure up
+    through ``process_file``."""
+    from tools import uploader as uploader_mod
+
+    def raise_always(site, title):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(uploader_mod, "get_page", raise_always)
+    monkeypatch.setattr(uploader_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_BACKOFF_SECS", 0)
+
+    uploader = _uploader_for_helper_tests()
+    assert uploader._refresh_pageid_with_retries("File:X.tiff") is None
+
+
+def test_pageid_refresh_returns_immediately_on_first_success(monkeypatch):
+    """Small-file fast path: typical pageid lookup succeeds on
+    attempt 1 with zero added latency. Pin no-sleep + single
+    ``get_page`` call so a future regression that always sleeps
+    (or always retries) is caught."""
+    from tools import uploader as uploader_mod
+
+    fresh_page = MagicMock(pageid=42)
+    fresh_page.exists.return_value = True
+
+    get_page_calls = []
+
+    def stub_get_page(site, title):
+        get_page_calls.append(title)
+        return fresh_page
+
+    sleep_calls = []
+    monkeypatch.setattr(uploader_mod, "get_page", stub_get_page)
+    monkeypatch.setattr(uploader_mod.time, "sleep", lambda s: sleep_calls.append(s))
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(uploader_mod, "PAGEID_REFRESH_BACKOFF_SECS", 4)
+
+    uploader = _uploader_for_helper_tests()
+    assert uploader._refresh_pageid_with_retries("File:X.tiff") == 42
+    assert len(get_page_calls) == 1
+    assert sleep_calls == [], "no sleep on first-attempt-success path"

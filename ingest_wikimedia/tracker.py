@@ -5,6 +5,15 @@ class Result(Enum):
     DOWNLOADED = auto()
     FAILED = auto()
     SKIPPED = auto()
+    # Uploader skip-class breakdowns. Both also bump ``SKIPPED`` so
+    # legacy dashboards keep working — the granular counters add
+    # detail without replacing the aggregate. ``NOT_PRESENT`` covers
+    # the upstream gap (no S3 asset, downloader didn't stage the
+    # file). ``INELIGIBLE`` covers files that exist in S3 but the
+    # uploader chose not to upload (bad MIME, missing extension,
+    # download-only formats staged for conversion).
+    UPLOAD_SKIPPED_NOT_PRESENT = auto()
+    UPLOAD_SKIPPED_INELIGIBLE = auto()
     UPLOADED = auto()
     BYTES = auto()
     ITEM_NOT_PRESENT = auto()
@@ -22,6 +31,15 @@ class Result(Enum):
     SDC_REMOVALS = auto()
     SDC_ITEMS_SKIPPED_NO_SIDECAR = auto()
     SDC_ITEMS_SKIPPED_MAPPING = auto()
+    # Items where at least one ordinal synced cleanly AND at least
+    # one sibling ordinal hit ``had_ordinal_error`` (the typical
+    # shape: one ordinal's null-pageid skip + the rest succeeding).
+    # Distinguished from full-sync ``SDC_ITEMS_SYNCED`` so dashboards
+    # keying on "items fully done" don't accidentally count partial
+    # results as healthy. Items in this bucket DO get post-SDC
+    # cleanup on their synced ordinals — the partial state is real
+    # progress, not a failure to be retried wholesale.
+    SDC_ITEMS_PARTIALLY_SYNCED = auto()
     # Ordinals whose SDC sync raised an unexpected exception
     # (pywikibot APIError, network timeout, deep KeyError, etc.).
     # Per-ordinal granularity so transient failures don't abort the
@@ -37,6 +55,13 @@ class Result(Enum):
     # (claim rejection, throttle, etc.) stay distinguishable from
     # not-our-problem skips.
     SDC_ORDINALS_SKIPPED_MISSING_ENTITY = auto()
+    # Ordinals where upload-result.json carries a missing / null / zero
+    # ``pageid`` and sdc-sync's title→pageid fallback couldn't resolve
+    # it from Commons either (page actually doesn't exist, API error,
+    # etc.). Distinguished from the generic ERROR bucket so operators
+    # can spot uploader sidecar defects in the Slack summary rather
+    # than having them blend in with runtime API failures.
+    SDC_ORDINALS_SKIPPED_MISSING_PAGEID = auto()
     # Items where every eligible ordinal hit the per-ordinal exception
     # path — i.e., the item didn't fail due to malformed data
     # (MAPPING) or missing sidecars (NO_SIDECAR), but because all of

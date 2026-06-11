@@ -70,6 +70,14 @@ from ingest_wikimedia.wikimedia import (
 
 MAX_UPLOAD_RETRIES = 3
 UPLOAD_RETRY_BASE_DELAY_SECS = 5
+# Post-upload pageid-refresh retry budget. Commons accepts large
+# (chunked) uploads before its search/categorylinks index has caught
+# up; the immediate ``FilePage.exists()`` query then races indexing
+# and the resulting ``.pageid`` is missing or 0. A small bounded
+# retry closes the window for ~all realistic indexing-lag durations
+# without adding latency on the typical small-file fast path.
+PAGEID_REFRESH_MAX_ATTEMPTS = 3
+PAGEID_REFRESH_BACKOFF_SECS = 4
 UPLOAD_RETRY_MAX_DELAY_SECS = 60
 # pywikibot's async upload polls Commons indefinitely when the job queue is stuck.
 # This cap ensures a single hung upload never freezes the whole session.
@@ -190,6 +198,86 @@ class Uploader:
         self.dpla = dpla
         self.category_ensurer = category_ensurer
 
+    def _refresh_pageid_with_retries(self, page_title: str) -> int | None:
+        """Resolve the Commons pageid for ``page_title`` post-upload,
+        retrying with bounded backoff to ride out the indexing-lag
+        race that Commons exhibits on large (chunked) uploads.
+
+        Returns the pageid on success, or ``None`` when the budget is
+        exhausted without a real id (page still indexing, page genuinely
+        doesn't exist, persistent API failure). Caller records
+        ``pageid: None`` in the sidecar; ``sdc-sync``'s title→pageid
+        fallback recovers from that state on the next run.
+
+        Extracted from the inline loop in ``process_file`` so it can
+        be exercised directly in tests (per CR feedback on PR #302):
+        previously the test inlined the loop, which would silently
+        pass while production diverged. Single source of truth here.
+
+        See https://commons.wikimedia.org/wiki/File:Southern_Railway_Company,_Valuation_Section_22_-_DPLA_-_e314839e2ca3906b29bcbecc3d615740_(page_1).tiff
+        for the live incident this retry exists to handle.
+        """
+        for attempt in range(1, PAGEID_REFRESH_MAX_ATTEMPTS + 1):
+            try:
+                fresh_page = get_page(self.site, page_title)
+                fresh_page.exists()
+                candidate = fresh_page.pageid
+            except Exception as refresh_ex:
+                if attempt < PAGEID_REFRESH_MAX_ATTEMPTS:
+                    logging.warning(
+                        f"Uploaded {page_title} but post-upload"
+                        f" pageid refresh (attempt {attempt}/"
+                        f"{PAGEID_REFRESH_MAX_ATTEMPTS}) raised:"
+                        f" {refresh_ex!r}. Retrying after"
+                        f" {PAGEID_REFRESH_BACKOFF_SECS}s."
+                    )
+                    time.sleep(PAGEID_REFRESH_BACKOFF_SECS)
+                    continue
+                logging.warning(
+                    f"Uploaded {page_title} but post-upload"
+                    f" pageid refresh raised on final attempt"
+                    f" ({attempt}/{PAGEID_REFRESH_MAX_ATTEMPTS}):"
+                    f" {refresh_ex!r}. Recording pageid=None;"
+                    " sdc-sync's title→pageid fallback will"
+                    " recover on next run."
+                )
+                return None
+            if candidate:
+                return candidate
+            # Refresh returned but the pageid is still falsy
+            # (typically 0, the indexing-lag shape). Retry before
+            # giving up.
+            if attempt < PAGEID_REFRESH_MAX_ATTEMPTS:
+                logging.info(
+                    f"Uploaded {page_title}: post-upload pageid"
+                    f" refresh attempt {attempt}/"
+                    f"{PAGEID_REFRESH_MAX_ATTEMPTS} returned"
+                    f" {candidate!r}; retrying after"
+                    f" {PAGEID_REFRESH_BACKOFF_SECS}s (indexing lag)."
+                )
+                time.sleep(PAGEID_REFRESH_BACKOFF_SECS)
+            else:
+                logging.warning(
+                    f"Uploaded {page_title} but resolved pageid"
+                    f" is still {candidate!r} after"
+                    f" {PAGEID_REFRESH_MAX_ATTEMPTS} attempts;"
+                    " recording pageid=None, sdc-sync's"
+                    " title→pageid fallback will recover."
+                )
+        return None
+
+    def _track_ordinal_skip(self, skip_kind: Result) -> None:
+        """Bump both the aggregate ``Result.SKIPPED`` (which legacy
+        Slack summaries and dashboards key on) and the granular
+        ``skip_kind`` counter so operators can distinguish "upstream
+        gap, no S3 asset" (``UPLOAD_SKIPPED_NOT_PRESENT``) from
+        "S3 asset present but uploader chose not to upload"
+        (``UPLOAD_SKIPPED_INELIGIBLE``). Previously the four ordinal
+        skip sites all incremented ``Result.SKIPPED`` flat, leaving
+        the breakdown unrecoverable from metrics."""
+        self.tracker.increment(Result.SKIPPED)
+        self.tracker.increment(skip_kind)
+
     def process_file(
         self,
         dpla_id: str,
@@ -225,7 +313,7 @@ class Uploader:
             upload_comment = f'Uploading DPLA ID "[[dpla:{dpla_id}|{dpla_id}]]".'
             if not self.s3_client.s3_file_exists(s3_path):
                 logging.info(f"{dpla_id} {ordinal} not present.")
-                self.tracker.increment(Result.SKIPPED)
+                self._track_ordinal_skip(Result.UPLOAD_SKIPPED_NOT_PRESENT)
                 return {"status": ORDINAL_NOT_PRESENT}
 
             s3_object = self.s3_client.get_s3().Object(S3_BUCKET, s3_path)
@@ -233,7 +321,7 @@ class Uploader:
 
             if file_size == 0:
                 logging.info(f"Skipping {dpla_id} {ordinal}: File size is 0.")
-                self.tracker.increment(Result.SKIPPED)
+                self._track_ordinal_skip(Result.UPLOAD_SKIPPED_NOT_PRESENT)
                 return {"status": ORDINAL_NOT_PRESENT}
 
             sha1 = s3_object.metadata.get(CHECKSUM, "")
@@ -267,19 +355,19 @@ class Uploader:
                     )
                     if not dry_run:
                         self.s3_client.get_s3().Object(S3_BUCKET, s3_path).delete()
-                    self.tracker.increment(Result.SKIPPED)
+                    self._track_ordinal_skip(Result.UPLOAD_SKIPPED_INELIGIBLE)
                     return {"status": ORDINAL_INELIGIBLE}
 
             if not check_content_type(mime):
                 logging.info(f"Skipping {dpla_id} {ordinal}: Bad content type: {mime}")
-                self.tracker.increment(Result.SKIPPED)
+                self._track_ordinal_skip(Result.UPLOAD_SKIPPED_INELIGIBLE)
                 return {"status": ORDINAL_INELIGIBLE}
 
             if is_download_only(mime):
                 logging.info(
                     f"Skipping {dpla_id} {ordinal}: {mime} staged for conversion, not uploaded."
                 )
-                self.tracker.increment(Result.SKIPPED)
+                self._track_ordinal_skip(Result.UPLOAD_SKIPPED_INELIGIBLE)
                 return {"status": ORDINAL_INELIGIBLE}
 
             ext = mimetypes.guess_extension(mime)
@@ -288,7 +376,7 @@ class Uploader:
                 logging.info(
                     f"Skipping {dpla_id} {ordinal}: Unable to guess extension for {mime}"
                 )
-                self.tracker.increment(Result.SKIPPED)
+                self._track_ordinal_skip(Result.UPLOAD_SKIPPED_INELIGIBLE)
                 return {"status": ORDINAL_INELIGIBLE}
 
             page_title = get_page_title(
@@ -516,7 +604,21 @@ class Uploader:
                         f"file_exists={file_exists}, "
                         f"force_ignore_warnings={force_ignore_warnings})."
                     )
-                upload_warnings = True if prefers_direct else IGNORE_WIKIMEDIA_WARNINGS
+                # ``ignore_warnings`` on ``site.upload()`` is union-typed: a
+                # bool (``True`` = suppress every warning class) or a list
+                # of warning codes (suppress only the listed classes).
+                # Direct (non-chunked) uploads of files small enough to
+                # fit under the warnings threshold are trusted — we
+                # accept whatever Commons returns. Chunked uploads go
+                # through the larger-file flow where some warning
+                # classes are real (size limits, hash drift) — only
+                # the vetted ``IGNORE_WIKIMEDIA_WARNINGS`` set is
+                # suppressed. Mixed-type literal is intentional; the
+                # explicit type annotation documents the union for
+                # readers and silences the static-analysis flag.
+                upload_warnings: bool | list[str] = (
+                    True if prefers_direct else IGNORE_WIKIMEDIA_WARNINGS
+                )
 
                 result = None
                 # Avoid the `with executor:` context manager — its __exit__ calls
@@ -622,31 +724,28 @@ class Uploader:
                 # drift detection). sdc-sync's `if not pageid` guard
                 # (added in #252) cleanly skips None as a mapping
                 # malformed record without raising.
-                resolved_pageid = None
-                try:
-                    fresh_page = get_page(self.site, page_title)
-                    fresh_page.exists()
-                    resolved_pageid = fresh_page.pageid
-                except Exception as refresh_ex:
-                    logging.warning(
-                        f"Uploaded {page_title} but post-upload pageid"
-                        f" refresh raised: {refresh_ex!r}. Recording"
-                        " pageid=None; sdc-sync will skip this ordinal"
-                        " as malformed."
-                    )
-                if not resolved_pageid:
-                    if resolved_pageid is not None:
-                        # Refresh returned but produced a falsy value
-                        # (typically 0). Normalize to None so the
-                        # sidecar shape is uniformly "missing" rather
-                        # than the legacy bug shape.
-                        logging.warning(
-                            f"Uploaded {page_title} but resolved pageid"
-                            f" is {resolved_pageid!r}; recording"
-                            " pageid=None, sdc-sync will skip this"
-                            " ordinal as malformed."
-                        )
-                    resolved_pageid = None
+                # Indexing-lag race: Commons accepts the upload (especially
+                # for chunked uploads of files >100 MB) before its
+                # search/categorylinks index has caught up. The fresh
+                # ``FilePage.exists()`` query lands in that window and
+                # returns without a real ``.pageid`` (or returns 0).
+                # Live incident:
+                # https://commons.wikimedia.org/wiki/File:Southern_Railway_Company,_Valuation_Section_22_-_DPLA_-_e314839e2ca3906b29bcbecc3d615740_(page_1).tiff
+                # — a 327 MB TIFF whose first-ordinal pageid lookup
+                # raced indexing and produced ``pageid: null`` in the
+                # sidecar, cascading into a silent sdc-sync skip and
+                # eventually a wiped-wikitext page.
+                #
+                # Retry the refresh with bounded backoff so the lookup
+                # gets a few more shots before Commons has propagated.
+                # Typical case (small/medium files): first attempt
+                # succeeds, zero added latency. Large-file race case:
+                # 1-2 retries usually close the window. Hard failure
+                # (page genuinely deleted, API error, network down):
+                # falls through to the existing pageid=None branch and
+                # sdc-sync's title→pageid fallback picks up the slack
+                # on the next run.
+                resolved_pageid = self._refresh_pageid_with_retries(page_title)
                 return {
                     "status": ORDINAL_UPLOADED,
                     "title": page_title,

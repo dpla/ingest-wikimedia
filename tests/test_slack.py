@@ -332,12 +332,23 @@ def test_notify_upload_complete_non_retry_label_keeps_upload_only_header(tmp_pat
             "WIKIMEDIA_SESSION_LABEL": "si",
             "WIKIMEDIA_PARTNER_DIR": str(tmp_path),
         },
-        tracker_counts={Result.UPLOADED: 5, Result.SKIPPED: 10, Result.FAILED: 2},
+        tracker_counts={
+            Result.UPLOADED: 5,
+            Result.SKIPPED: 10,
+            Result.UPLOAD_SKIPPED_NOT_PRESENT: 3,
+            Result.UPLOAD_SKIPPED_INELIGIBLE: 7,
+            Result.FAILED: 2,
+        },
     )
     assert "Wikimedia Upload Complete" in captured["header"]
     assert "Retry Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
-    assert failed_lines == ["FAILED:   2"]
+    assert failed_lines == ["FAILED:        2"]
+    # Granular skip-class breakdown shows up under the aggregate
+    # SKIPPED. Lets operators distinguish upstream-gap (downloader
+    # didn't stage) from MIME / eligibility skips.
+    assert any("not present: 3" in s for s in captured["stats_lines"])
+    assert any("ineligible:  7" in s for s in captured["stats_lines"])
 
 
 def test_notify_upload_complete_with_retry_label_combines_failed_count(tmp_path):
@@ -363,12 +374,12 @@ def test_notify_upload_complete_with_retry_label_combines_failed_count(tmp_path)
     assert "Wikimedia Retry Complete" in captured["header"]
     assert "Upload Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
-    assert failed_lines == ["FAILED:   1"]
+    assert failed_lines == ["FAILED:        1"]
     # SKIPPED and UPLOADED stay as upload-phase only — each phase's SKIPPED
     # means a different thing (download = "already in S3"; upload = "already
     # on Commons") and conflating them would obscure the picture.
     skipped_lines = [s for s in captured["stats_lines"] if s.startswith("SKIPPED:")]
-    assert skipped_lines == ["SKIPPED:  80"]
+    assert skipped_lines == ["SKIPPED:       80"]
 
 
 def test_notify_upload_complete_with_retry_label_but_no_log_file(tmp_path):
@@ -388,7 +399,7 @@ def test_notify_upload_complete_with_retry_label_but_no_log_file(tmp_path):
     # Falls back gracefully — upload-only header, FAILED unchanged.
     assert "Wikimedia Upload Complete" in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
-    assert failed_lines == ["FAILED:   0"]
+    assert failed_lines == ["FAILED:        0"]
 
 
 def test_notify_upload_complete_upload_only_retry_ignores_stale_download_log(
@@ -416,7 +427,7 @@ def test_notify_upload_complete_upload_only_retry_ignores_stale_download_log(
     assert "Wikimedia Upload Complete" in captured["header"]
     assert "Retry Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
-    assert failed_lines == ["FAILED:   0"]
+    assert failed_lines == ["FAILED:        0"]
 
 
 def _capture_sdc_completion_message(env: dict, tracker_counts: dict) -> dict:
@@ -468,6 +479,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
         },
         tracker_counts={
             Result.SDC_ITEMS_SYNCED: 100,
+            Result.SDC_ITEMS_PARTIALLY_SYNCED: 9,
             Result.SDC_CLAIMS_ADDED: 250,
             Result.SDC_REFS_ADDED: 30,
             Result.SDC_REMOVALS: 4,
@@ -475,11 +487,13 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
             Result.SDC_ITEMS_SKIPPED_MAPPING: 1,
             Result.SDC_ITEMS_SKIPPED_ERROR: 3,
             Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY: 5,
+            Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID: 6,
             Result.SDC_ORDINALS_SKIPPED_ERROR: 7,
         },
     )
     stats = captured["stats_lines"]
     assert any(s.startswith("ITEMS SYNCED:") and "100" in s for s in stats)
+    assert any(s.startswith("ITEMS PARTIAL:") and "9" in s for s in stats)
     assert any(s.startswith("CLAIMS ADDED:") and "250" in s for s in stats)
     assert any(s.startswith("REFS ADDED:") and "30" in s for s in stats)
     assert any(s.startswith("REMOVALS:") and "4" in s for s in stats)
@@ -487,6 +501,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
     assert any("SKIPPED (mapping)" in s and "1" in s for s in stats)
     assert any("SKIPPED (error)" in s and "3" in s for s in stats)
     assert any("ORDINAL MISSING:" in s and "5" in s for s in stats)
+    assert any("ORDINAL NO PAGEID:" in s and "6" in s for s in stats)
     assert any("ORDINAL ERRORS:" in s and "7" in s for s in stats)
     assert any("Runtime:" in s and "42s" in s for s in stats)
 
@@ -556,4 +571,4 @@ def test_notify_upload_complete_clean_retry_still_titled_retry_complete(tmp_path
     assert "Wikimedia Retry Complete" in captured["header"]
     assert "Upload Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
-    assert failed_lines == ["FAILED:   0"]
+    assert failed_lines == ["FAILED:        0"]

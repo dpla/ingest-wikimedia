@@ -394,11 +394,17 @@ def notify_upload_complete(
         header=f"*Wikimedia {header_phrase}: {effective_label}*{dry_run_note}",
         plain_text=f"Wikimedia {plain_phrase}: {effective_label}",
         stats_lines=[
-            f"UPLOADED: {tracker.count(Result.UPLOADED):,}",
-            f"SKIPPED:  {tracker.count(Result.SKIPPED):,}",
-            f"FAILED:   {total_failed:,}",
-            f"BYTES:    {_format_bytes(tracker.count(Result.BYTES))}",
-            f"Runtime:  {runtime}",
+            f"UPLOADED:      {tracker.count(Result.UPLOADED):,}",
+            f"SKIPPED:       {tracker.count(Result.SKIPPED):,}",
+            # Per-class breakdown of the aggregate SKIPPED above. Lets
+            # operators tell upstream-gap skips (no S3 asset, downloader
+            # didn't stage) from MIME / ineligibility skips so the fix
+            # routes to the right team.
+            f"  not present: {tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT):,}",
+            f"  ineligible:  {tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE):,}",
+            f"FAILED:        {total_failed:,}",
+            f"BYTES:         {_format_bytes(tracker.count(Result.BYTES))}",
+            f"Runtime:       {runtime}",
         ],
     )
 
@@ -435,6 +441,7 @@ def notify_sdc_complete(
         plain_text=f"Wikimedia SDC complete: {effective_label}",
         stats_lines=[
             f"ITEMS SYNCED:         {tracker.count(Result.SDC_ITEMS_SYNCED):,}",
+            f"ITEMS PARTIAL:        {tracker.count(Result.SDC_ITEMS_PARTIALLY_SYNCED):,}",
             f"CLAIMS ADDED:         {tracker.count(Result.SDC_CLAIMS_ADDED):,}",
             f"REFS ADDED:           {tracker.count(Result.SDC_REFS_ADDED):,}",
             f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",
@@ -442,6 +449,7 @@ def notify_sdc_complete(
             f"SKIPPED (mapping):    {tracker.count(Result.SDC_ITEMS_SKIPPED_MAPPING):,}",
             f"SKIPPED (error):      {tracker.count(Result.SDC_ITEMS_SKIPPED_ERROR):,}",
             f"ORDINAL MISSING:      {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY):,}",
+            f"ORDINAL NO PAGEID:    {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID):,}",
             f"ORDINAL ERRORS:       {tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR):,}",
             f"Runtime:              {runtime}",
         ],

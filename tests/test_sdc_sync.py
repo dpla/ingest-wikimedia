@@ -1382,6 +1382,7 @@ def test_post_sdc_cleanup_dispatches_to_strip_on_new_template(monkeypatch):
 
     fake_page = MagicMock(name="FilePage")
     fake_page.exists.return_value = True
+    fake_page.pageid = 42
     fake_page.text = "{{DPLA metadata\n| title = A Title\n| dpla_id = dpla-1\n}}"
 
     migrate_calls = []
@@ -1395,6 +1396,34 @@ def test_post_sdc_cleanup_dispatches_to_strip_on_new_template(monkeypatch):
         wikitext_normalize,
         "normalize_page",
         lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+    # The cleanup guard fetches the entity to verify it carries
+    # DPLA-attributed SDC before stripping. Stub a passing entity so
+    # this test exercises the existing dispatch behaviour; the guard's
+    # refusal-on-empty-entity case has its own dedicated regression.
+    monkeypatch.setattr(
+        sdc_sync,
+        "_fetch_entity_for_cleanup_guard",
+        lambda mid: {
+            "statements": {
+                "P1476": [
+                    {
+                        "mainsnak": {"snaktype": "value"},
+                        "qualifiers": {
+                            "P459": [
+                                {
+                                    "snaktype": "value",
+                                    "datavalue": {
+                                        "value": {"id": "Q61848113"},
+                                        "type": "wikibase-entityid",
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        },
     )
 
     sdc_sync._post_sdc_cleanup_for_page(
@@ -3589,3 +3618,303 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
         "P813 refresh fragment must preserve existing qualifiers"
     )
     sdc_sync._reset_per_file_accumulators()
+
+
+# ---------------------------------------------------------------------------
+# pageid recovery + cleanup-guard: null-pageid live bug repro
+# (https://commons.wikimedia.org/wiki/File:Southern_Railway_Company,_Valuation_Section_22_-_DPLA_-_e314839e2ca3906b29bcbecc3d615740_(page_1).tiff)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_pageid_from_title_returns_pid_on_existing_page(monkeypatch):
+    """The fallback for upload-result.json sidecars with null/0
+    pageid: query Commons for the page id given the title."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.return_value = {
+        "query": {"pages": {"193644002": {"pageid": 193644002, "title": "File:X.tiff"}}}
+    }
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._resolve_pageid_from_title("File:X.tiff") == 193644002
+
+
+def test_resolve_pageid_from_title_returns_none_on_missing_page(monkeypatch):
+    """Page genuinely doesn't exist on Commons (upload silently
+    failed): no pageid to recover, caller drops into the existing
+    skip-with-counter path."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.return_value = {
+        "query": {"pages": {"-1": {"missing": "", "title": "File:Nope.tiff"}}}
+    }
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._resolve_pageid_from_title("File:Nope.tiff") is None
+
+
+def test_resolve_pageid_from_title_returns_none_on_api_error(monkeypatch):
+    """API failure during the fallback shouldn't crash the partner
+    batch — just signal "couldn't recover" so the call site falls
+    into its existing skip path."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._resolve_pageid_from_title("File:X.tiff") is None
+
+
+def test_resolve_pageid_from_title_returns_none_on_empty_title(monkeypatch):
+    """Bare empty/None title shouldn't even hit the API."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._resolve_pageid_from_title("") is None
+    assert sdc_sync._resolve_pageid_from_title(None) is None  # type: ignore[arg-type]
+    assert fake_site.simple_request.call_count == 0
+
+
+def test_entity_has_dpla_attributed_claims_finds_p459_q61848113():
+    """The cleanup guard's notion of "has DPLA SDC" matches
+    Module:DPLA's ``isDplaDetermined`` filter: at least one statement
+    with P459 = Q61848113 qualifier."""
+    from tools import sdc_sync
+
+    entity = {
+        "statements": {
+            "P195": [
+                {
+                    "mainsnak": {"snaktype": "value"},
+                    "qualifiers": {
+                        "P459": [
+                            {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": {"id": "Q61848113"},
+                                    "type": "wikibase-entityid",
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    }
+    assert sdc_sync._entity_has_dpla_attributed_claims(entity) is True
+
+
+def test_entity_has_dpla_attributed_claims_false_on_empty_entity():
+    """An empty entity (no-such-entity post-fetch, or zero claims) is
+    the bug shape the guard exists to catch — return False so the
+    cleanup refuses to strip wikitext."""
+    from tools import sdc_sync
+
+    assert sdc_sync._entity_has_dpla_attributed_claims({}) is False
+    assert sdc_sync._entity_has_dpla_attributed_claims({"statements": {}}) is False
+
+
+def test_entity_has_dpla_attributed_claims_false_on_unrelated_p459_value():
+    """Other heuristic determination Q-IDs (e.g. P459 = Q131783016
+    for inferred-from-Wikitext community-import claims) don't count
+    as DPLA-attributed."""
+    from tools import sdc_sync
+
+    entity = {
+        "statements": {
+            "P1476": [
+                {
+                    "mainsnak": {"snaktype": "value"},
+                    "qualifiers": {
+                        "P459": [
+                            {
+                                "snaktype": "value",
+                                "datavalue": {
+                                    "value": {"id": "Q131783016"},
+                                    "type": "wikibase-entityid",
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    }
+    assert sdc_sync._entity_has_dpla_attributed_claims(entity) is False
+
+
+def test_post_sdc_cleanup_for_page_refuses_strip_when_entity_has_no_dpla_sdc(
+    monkeypatch,
+):
+    """Live-bug regression
+    (https://commons.wikimedia.org/wiki/File:Southern_Railway_Company,_Valuation_Section_22_-_DPLA_-_e314839e2ca3906b29bcbecc3d615740_(page_1).tiff):
+    when the per-ordinal SDC write was skipped (upstream null pageid)
+    but the post-SDC cleanup ran anyway, the strip removed every
+    wikitext param matching the DPLA canonical value, leaving the
+    page with no metadata in either representation. The defensive
+    guard fetches the entity and refuses to strip when it has zero
+    DPLA-attributed claims."""
+    from ingest_wikimedia import wikimedia, wikitext_normalize
+    from tools import sdc_sync
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = True
+    fake_page.pageid = 193644002
+    fake_page.title.return_value = "File:Southern Railway.tiff"
+    fake_page.text = (
+        "{{DPLA metadata\n"
+        "| title = Southern Railway Company, Valuation Section 22\n"
+        "| dpla_id = e314839e2ca3906b29bcbecc3d615740\n"
+        "}}"
+    )
+
+    monkeypatch.setattr(
+        wikimedia,
+        "dpla_metadata_params",
+        lambda *a, **kw: {"title": "Southern Railway Company, Valuation Section 22"},
+    )
+    # Entity exists but is empty — no DPLA-attributed claims.
+    monkeypatch.setattr(
+        sdc_sync, "_fetch_entity_for_cleanup_guard", lambda mid: {"statements": {}}
+    )
+
+    strip_calls = []
+    monkeypatch.setattr(
+        wikitext_normalize,
+        "normalize_page",
+        lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "e314839e2ca3906b29bcbecc3d615740",
+        {
+            "sourceResource": {
+                "title": ["Southern Railway Company, Valuation Section 22"]
+            }
+        },
+        {"Wikidata": "Q518155"},
+        {"Wikidata": "Q59661038"},
+    )
+
+    assert strip_calls == [], (
+        "strip must not run against an entity with no DPLA-attributed SDC"
+    )
+
+
+def test_post_sdc_cleanup_for_page_strips_when_entity_has_dpla_sdc(monkeypatch):
+    """Happy path: the entity DOES carry DPLA-attributed SDC, the
+    guard passes, and the strip runs as before. Locks the guard in
+    as a *defensive* layer that only activates on the bug shape."""
+    from ingest_wikimedia import wikimedia, wikitext_normalize
+    from tools import sdc_sync
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = True
+    fake_page.pageid = 12345
+    fake_page.title.return_value = "File:Healthy.tiff"
+    fake_page.text = "{{DPLA metadata\n| title = X\n}}"
+
+    monkeypatch.setattr(
+        wikimedia, "dpla_metadata_params", lambda *a, **kw: {"title": "X"}
+    )
+    monkeypatch.setattr(
+        sdc_sync,
+        "_fetch_entity_for_cleanup_guard",
+        lambda mid: {
+            "statements": {
+                "P1476": [
+                    {
+                        "mainsnak": {"snaktype": "value"},
+                        "qualifiers": {
+                            "P459": [
+                                {
+                                    "snaktype": "value",
+                                    "datavalue": {
+                                        "value": {"id": "Q61848113"},
+                                        "type": "wikibase-entityid",
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        },
+    )
+
+    strip_calls = []
+    monkeypatch.setattr(
+        wikitext_normalize,
+        "normalize_page",
+        lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "dpla-id",
+        {"sourceResource": {"title": ["X"]}},
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+    assert len(strip_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Item-level outcome classification: partial-sync items distinct from
+# fully-synced. Per CR review on PR #302 — mixed-result items (one ordinal
+# synced, sibling ordinal hit MISSING_PAGEID / SKIPPED_ERROR) shouldn't be
+# silently counted as fully ``SDC_ITEMS_SYNCED``.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_item_outcome_full_sync():
+    """All ordinals synced cleanly → full ``SDC_ITEMS_SYNCED``."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=True, had_ordinal_error=False)
+        == Result.SDC_ITEMS_SYNCED
+    )
+
+
+def test_classify_item_outcome_partial_sync():
+    """Live-bug regression: at least one ordinal synced AND at
+    least one sibling ordinal hit the error / null-pageid skip
+    path → ``SDC_ITEMS_PARTIALLY_SYNCED``, not the full-sync
+    bucket. Dashboards keying on full-sync as "items healthy"
+    correctly excluded."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=True, had_ordinal_error=True)
+        == Result.SDC_ITEMS_PARTIALLY_SYNCED
+    )
+
+
+def test_classify_item_outcome_all_errored():
+    """No ordinals synced but at least one raised → error bucket,
+    not the no-progress mapping bucket."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=False, had_ordinal_error=True)
+        == Result.SDC_ITEMS_SKIPPED_ERROR
+    )
+
+
+def test_classify_item_outcome_no_progress():
+    """No ordinals synced AND no ordinals errored — every eligible
+    ordinal silently no-op'd somewhere. Mapping skip."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=False, had_ordinal_error=False)
+        == Result.SDC_ITEMS_SKIPPED_MAPPING
+    )
