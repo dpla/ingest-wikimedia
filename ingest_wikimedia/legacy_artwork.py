@@ -711,7 +711,7 @@ def _extract_dpla_metadata_template(block: str) -> str:
     """
     wikicode = mwparserfromhell.parse(block)
     for tpl in wikicode.filter_templates():
-        if _template_name(tpl).casefold() == "dpla metadata":
+        if _template_name(tpl) == "dpla metadata":
             return str(tpl)
     return block
 
