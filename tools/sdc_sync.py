@@ -44,13 +44,14 @@ rights: dict
 subject_ids: dict
 _s3_partner: str | None = None
 _s3_client = None
-# When True (set by `--normalize-wikitext`), `_run_partner_mode` runs a
-# post-SDC wikitext-cleanup edit per item, stripping template params
-# whose values are now redundant against the SDC just written. Default
-# False during the rollout: enable per-partner after a smoke run, then
-# flip the global default once we've confirmed no regressions on a real
-# batch.
-_normalize_wikitext_enabled: bool = False
+# When True (the default; see ``--normalize-wikitext`` in ``_build_parser``),
+# ``_run_partner_mode`` runs a post-SDC wikitext-cleanup edit per item,
+# stripping ``{{DPLA metadata}}`` params whose values are now redundant
+# against the SDC just written. This is the documented end of the
+# per-file lifecycle (upload → SDC → wikitext cleanup). ``--no-normalize-
+# wikitext`` disables it for diagnostic runs that need the pre-strip
+# wikitext intact.
+_normalize_wikitext_enabled: bool = True
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -139,12 +140,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--normalize-wikitext",
         dest="normalize_wikitext",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "After SDC sync, strip {{DPLA metadata}} template params whose "
-            "values are now redundant with SDC. Off by default while the "
-            "behavior is being rolled out per-partner."
+            "values are now redundant with SDC. On by default — the "
+            "strip is the documented end of the per-file lifecycle "
+            "(upload → SDC → wikitext cleanup). Pass --no-normalize-wikitext "
+            "to disable for diagnostic runs that need the pre-strip wikitext "
+            "intact."
         ),
     )
     return p
