@@ -52,8 +52,11 @@ def test_dpla_metadata_params_has_every_expected_top_level_key():
         "date",
         "permission",
         "creator",
-        "source",
+        "hub",
         "institution",
+        "url",
+        "dpla_id",
+        "local_id",
         "languages",
     }
 
@@ -97,29 +100,24 @@ def test_dpla_metadata_params_permission_is_template_wrapped():
     assert params["permission"] == "{{cc-zero}}"
 
 
-def test_dpla_metadata_params_source_subtemplate_carries_positional_and_named():
+def test_dpla_metadata_params_flat_source_fields():
+    """Source fields are flat scalars on the canonical-params dict —
+    no more nested ``source = {{DPLA|...}}`` sub-template. Each value
+    mirrors the wikitext key the uploader emits."""
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
-    source = params["source"]
-    assert source["name"] == "DPLA"
-    # Positional 1 is the data-provider Q-ID, mirroring the wikitext form
-    # `{{DPLA|<data_provider_qid>|hub=...|url=...|dpla_id=...|local_id=...}}`.
-    assert source["params"]["1"] == "Q2"
-    assert source["params"]["hub"] == "Q1"
-    assert source["params"]["dpla_id"] == "abc123"
-    assert source["params"]["local_id"] == "local-123"
-    assert source["params"]["url"] == "https://example.org/item/123"
+    assert params["institution"] == "Q2"
+    assert params["hub"] == "Q1"
+    assert params["dpla_id"] == "abc123"
+    assert params["local_id"] == "local-123"
+    assert params["url"] == "https://example.org/item/123"
 
 
-def test_dpla_metadata_params_creator_subtemplate_uses_infi_shape():
-    """``creator`` is emitted as ``{{InFi|Creator|<value>|id=fileinfotpl_aut}}``
-    on the wikitext side, so the canonical-params shape must mirror that
-    positional+named layout."""
+def test_dpla_metadata_params_creator_is_flat_string():
+    """``creator`` is a plain string on the canonical-params dict —
+    no ``{{InFi|Creator|...}}`` sub-template shape. Module:DPLA reads
+    the flat value directly."""
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
-    creator = params["creator"]
-    assert creator["name"] == "InFi"
-    assert creator["params"]["1"] == "Creator"
-    assert creator["params"]["2"] == "A Creator"
-    assert creator["params"]["id"] == "fileinfotpl_aut"
+    assert params["creator"] == "A Creator"
 
 
 def test_dpla_metadata_params_drives_get_wiki_text_unchanged():
@@ -131,6 +129,14 @@ def test_dpla_metadata_params_drives_get_wiki_text_unchanged():
     # Every canonical param value appears in the rendered wikitext.
     for expected in ("A Title", "A description", "1900", "{{cc-zero}}", "Q2", "Q1"):
         assert expected in rendered
+    # Flat shape: no ``{{DPLA|...}}`` sub-template inside the
+    # template params, no ``{{Institution|wikidata=...}}`` sub-template
+    # inside the params, no ``{{InFi|Creator|...}}`` sub-template inside
+    # the params. The wikitext that wraps ``{{DPLA metadata}}`` itself
+    # is still that template; we're only checking the param values.
+    assert "source = {{" not in rendered
+    assert "Institution = {{" not in rendered
+    assert "Other fields 1 = {{" not in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -139,30 +145,52 @@ def test_dpla_metadata_params_drives_get_wiki_text_unchanged():
 
 
 def _build_full_wikitext(params: dict) -> str:
-    """Produce a `{{DPLA metadata}}` wikitext block carrying every param
-    at its canonical value — i.e. the worst-case "fresh DPLA-bot upload
-    with nothing user-touched" case where every param is strippable."""
-    creator = params["creator"]["params"]["2"]
-    source_p = params["source"]["params"]
-    inst_p = params["institution"]["params"]
+    """Produce a flat-shape `{{DPLA metadata}}` wikitext block carrying
+    every param at its canonical value — i.e. the worst-case "fresh
+    DPLA-bot upload with nothing user-touched" case where every param
+    is strippable. Matches what ``get_wiki_text`` actually emits."""
     return (
         "== {{int:filedesc}} ==\n"
         "{{DPLA metadata\n"
-        f"| Other fields 1 = {{{{InFi|Creator|{creator}|id=fileinfotpl_aut}}}}\n"
+        f"| creator = {params['creator']}\n"
         f"| title = {params['title']}\n"
         f"| description = {params['description']}\n"
         f"| date = {params['date']}\n"
         f"| permission = {params['permission']}\n"
-        f"| source = {{{{DPLA|{source_p['1']}|hub={source_p['hub']}"
-        f"|url={source_p['url']}|dpla_id={source_p['dpla_id']}"
-        f"|local_id={source_p['local_id']}}}}}\n"
-        f"| Institution = {{{{Institution|wikidata={inst_p['wikidata']}}}}}\n"
+        f"| hub = {params['hub']}\n"
+        f"| institution = {params['institution']}\n"
+        f"| url = {params['url']}\n"
+        f"| dpla_id = {params['dpla_id']}\n"
+        f"| local_id = {params['local_id']}\n"
+        "}}\n"
+    )
+
+
+def _build_legacy_wikitext(params: dict) -> str:
+    """Produce a *legacy-shape* ``{{DPLA metadata}}`` wikitext block —
+    the pre-flat-shape form an existing Commons page may carry. Tests
+    the dual-path strip behaviour: every legacy-shape param should
+    strip identically to its flat-shape equivalent when the canonical
+    values match."""
+    return (
+        "== {{int:filedesc}} ==\n"
+        "{{DPLA metadata\n"
+        f"| Other fields 1 = {{{{InFi|Creator|{params['creator']}|id=fileinfotpl_aut}}}}\n"
+        f"| title = {params['title']}\n"
+        f"| description = {params['description']}\n"
+        f"| date = {params['date']}\n"
+        f"| permission = {params['permission']}\n"
+        f"| source = {{{{DPLA|{params['institution']}|hub={params['hub']}"
+        f"|url={params['url']}|dpla_id={params['dpla_id']}"
+        f"|local_id={params['local_id']}}}}}\n"
+        f"| Institution = {{{{Institution|wikidata={params['institution']}}}}}\n"
         "}}\n"
     )
 
 
 def test_normalize_strips_every_param_on_a_pristine_dpla_bot_upload():
-    """The all-match case: every param is canonical, every param goes."""
+    """The all-match case on flat shape: every param is canonical,
+    every param goes."""
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
     wikitext = _build_full_wikitext(params)
     new_text, stripped = normalize(wikitext, params)
@@ -171,13 +199,41 @@ def test_normalize_strips_every_param_on_a_pristine_dpla_bot_upload():
         "description",
         "date",
         "permission",
-        "source",
+        "creator",
+        "hub",
         "institution",
-        "other fields 1",
+        "url",
+        "dpla_id",
+        "local_id",
     }
     # Every value is gone from the new wikitext.
     for absent in ("A Title", "A description", "1900", "Q1", "Q2", "abc123"):
         assert absent not in new_text
+
+
+def test_normalize_strips_every_param_on_a_legacy_shape_upload():
+    """The all-match case on legacy shape: a file with the pre-flat
+    ``source = {{DPLA|...}}`` / ``Institution = {{Institution|...}}``
+    / ``Other fields 1 = {{InFi|Creator|...}}`` rows still strips
+    each row when its inner values match the flat-canonical
+    equivalents. Same redundancy contract, different encoding."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    wikitext = _build_legacy_wikitext(params)
+    new_text, stripped = normalize(wikitext, params)
+    # The legacy rows strip under their legacy keys; the flat rows
+    # absent in legacy-shape wikitext stay absent from `stripped`.
+    assert "source" in stripped
+    assert "Institution" in stripped
+    assert "Other fields 1" in stripped
+    assert "title" in stripped
+    assert "description" in stripped
+    assert "date" in stripped
+    assert "permission" in stripped
+    # Inner sub-template values are gone — the legacy strip removed
+    # the full row, not just the canonical text inside.
+    assert "{{DPLA|" not in new_text
+    assert "{{Institution|" not in new_text
+    assert "{{InFi|" not in new_text
 
 
 def test_normalize_preserves_param_with_edited_value():
@@ -244,17 +300,32 @@ def test_normalize_unwraps_language_tagged_canonical_english():
     assert "{{en|A description}}" not in new_text
 
 
-def test_normalize_preserves_source_with_edited_subparam():
-    """If the source sub-template's ``url`` was edited away from the
-    canonical value, the whole source param must survive — partial
-    matches don't count.
+def test_normalize_preserves_url_with_edited_value():
+    """If a flat-shape ``url`` was edited away from the canonical
+    value, that row must survive. Other flat rows still strip — the
+    per-row preservation is independent.
 
     Test fixture uses a non-URL-shaped edit token so CodeQL's
     ``py/incomplete-url-substring-sanitization`` rule doesn't pattern-
-    match the ``substring in url`` shape as a security check.
-    """
+    match the ``substring in url`` shape as a security check."""
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
     wikitext = _build_full_wikitext(params).replace(
+        "| url = https://example.org/item/123",
+        "| url = https://example.org/item/EDITED-BY-A-HUMAN-456",
+    )
+    new_text, stripped = normalize(wikitext, params)
+    assert "url" not in stripped
+    assert "EDITED-BY-A-HUMAN-456" in new_text
+    # title still strips — preservation is row-by-row.
+    assert "title" in stripped
+
+
+def test_normalize_preserves_legacy_source_with_edited_subparam():
+    """The dual-path strip on the legacy ``source = {{DPLA|...}}``
+    row still respects per-inner-arg matching: if any sub-template
+    arg is edited away from canonical, the whole row survives."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    wikitext = _build_legacy_wikitext(params).replace(
         "url=https://example.org/item/123",
         "url=https://example.org/item/EDITED-BY-A-HUMAN-456",
     )
@@ -263,11 +334,11 @@ def test_normalize_preserves_source_with_edited_subparam():
     assert "EDITED-BY-A-HUMAN-456" in new_text
 
 
-def test_normalize_preserves_source_with_extra_param():
+def test_normalize_preserves_legacy_source_with_extra_param():
     """An editor-added sub-template arg the bot doesn't know about
     counts as a mismatch — strip would lose the editor's addition."""
     params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
-    wikitext = _build_full_wikitext(params).replace(
+    wikitext = _build_legacy_wikitext(params).replace(
         "|local_id=local-123}}",
         "|local_id=local-123|note=editor added}}",
     )
@@ -287,12 +358,26 @@ def test_normalize_no_dpla_metadata_template_is_a_noop():
     assert new_text == wikitext
 
 
-def test_normalize_skips_creator_row_when_dpla_has_no_creator():
+def test_normalize_skips_flat_creator_row_when_dpla_has_no_creator():
     """When DPLA has no creator, the canonical creator value is empty —
-    so an existing ``Other fields 1`` row (added by an editor) is
+    so an existing flat ``creator =`` row (added by an editor) is
     treated as a community contribution and preserved."""
     item = _minimal_item()
     item["sourceResource"]["creator"] = []  # no canonical creator
+    params = dpla_metadata_params("abc123", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "{{DPLA metadata\n| creator = Editor-added creator\n| title = A Title\n}}"
+    )
+    _, stripped = normalize(wikitext, params)
+    assert "creator" not in stripped
+
+
+def test_normalize_skips_legacy_creator_row_when_dpla_has_no_creator():
+    """Same preservation rule for the legacy
+    ``Other fields 1 = {{InFi|Creator|...}}`` row: empty canonical
+    creator means any existing row is community-contributed."""
+    item = _minimal_item()
+    item["sourceResource"]["creator"] = []
     params = dpla_metadata_params("abc123", item, _PROVIDER, _DATA_PROVIDER)
     wikitext = (
         "{{DPLA metadata\n"
@@ -301,7 +386,30 @@ def test_normalize_skips_creator_row_when_dpla_has_no_creator():
         "}}"
     )
     _, stripped = normalize(wikitext, params)
-    assert "other fields 1" not in stripped
+    assert "Other fields 1" not in stripped
+
+
+def test_normalize_preserves_legacy_creator_with_extra_param():
+    """Symmetry with the legacy-source and legacy-institution strips:
+    an editor-added arg inside the ``{{InFi|...}}`` sub-template (e.g.
+    ``|note=editor added``) disqualifies the strip even when the
+    Creator name and id args still match canonical. Stripping would
+    silently lose the editor contribution."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "{{DPLA metadata\n"
+        "| Other fields 1 = {{InFi|Creator|A Creator|id=fileinfotpl_aut|note=editor added}}\n"
+        "| title = A Title\n"
+        "}}"
+    )
+    new_text, stripped = normalize(wikitext, params)
+    assert "Other fields 1" not in stripped
+    assert "note=editor added" in new_text
+    # Row-by-row independence: the canonical title row still strips —
+    # an extra-param violation on one row doesn't suppress the strip
+    # on a different, clean row. Mirrors the assertion in
+    # ``test_normalize_preserves_url_with_edited_value``.
+    assert "title" in stripped
 
 
 def test_normalize_returns_original_text_unchanged_when_nothing_strips():
