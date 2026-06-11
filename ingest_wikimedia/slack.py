@@ -441,6 +441,7 @@ def notify_sdc_complete(
         plain_text=f"Wikimedia SDC complete: {effective_label}",
         stats_lines=[
             f"ITEMS SYNCED:         {tracker.count(Result.SDC_ITEMS_SYNCED):,}",
+            f"ITEMS PARTIAL:        {tracker.count(Result.SDC_ITEMS_PARTIALLY_SYNCED):,}",
             f"CLAIMS ADDED:         {tracker.count(Result.SDC_CLAIMS_ADDED):,}",
             f"REFS ADDED:           {tracker.count(Result.SDC_REFS_ADDED):,}",
             f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",

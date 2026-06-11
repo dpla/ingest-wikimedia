@@ -198,6 +198,74 @@ class Uploader:
         self.dpla = dpla
         self.category_ensurer = category_ensurer
 
+    def _refresh_pageid_with_retries(self, page_title: str) -> int | None:
+        """Resolve the Commons pageid for ``page_title`` post-upload,
+        retrying with bounded backoff to ride out the indexing-lag
+        race that Commons exhibits on large (chunked) uploads.
+
+        Returns the pageid on success, or ``None`` when the budget is
+        exhausted without a real id (page still indexing, page genuinely
+        doesn't exist, persistent API failure). Caller records
+        ``pageid: None`` in the sidecar; ``sdc-sync``'s title→pageid
+        fallback recovers from that state on the next run.
+
+        Extracted from the inline loop in ``process_file`` so it can
+        be exercised directly in tests (per CR feedback on PR #302):
+        previously the test inlined the loop, which would silently
+        pass while production diverged. Single source of truth here.
+
+        See https://commons.wikimedia.org/wiki/File:Southern_Railway_Company,_Valuation_Section_22_-_DPLA_-_e314839e2ca3906b29bcbecc3d615740_(page_1).tiff
+        for the live incident this retry exists to handle.
+        """
+        for attempt in range(1, PAGEID_REFRESH_MAX_ATTEMPTS + 1):
+            try:
+                fresh_page = get_page(self.site, page_title)
+                fresh_page.exists()
+                candidate = fresh_page.pageid
+            except Exception as refresh_ex:
+                if attempt < PAGEID_REFRESH_MAX_ATTEMPTS:
+                    logging.warning(
+                        f"Uploaded {page_title} but post-upload"
+                        f" pageid refresh (attempt {attempt}/"
+                        f"{PAGEID_REFRESH_MAX_ATTEMPTS}) raised:"
+                        f" {refresh_ex!r}. Retrying after"
+                        f" {PAGEID_REFRESH_BACKOFF_SECS}s."
+                    )
+                    time.sleep(PAGEID_REFRESH_BACKOFF_SECS)
+                    continue
+                logging.warning(
+                    f"Uploaded {page_title} but post-upload"
+                    f" pageid refresh raised on final attempt"
+                    f" ({attempt}/{PAGEID_REFRESH_MAX_ATTEMPTS}):"
+                    f" {refresh_ex!r}. Recording pageid=None;"
+                    " sdc-sync's title→pageid fallback will"
+                    " recover on next run."
+                )
+                return None
+            if candidate:
+                return candidate
+            # Refresh returned but the pageid is still falsy
+            # (typically 0, the indexing-lag shape). Retry before
+            # giving up.
+            if attempt < PAGEID_REFRESH_MAX_ATTEMPTS:
+                logging.info(
+                    f"Uploaded {page_title}: post-upload pageid"
+                    f" refresh attempt {attempt}/"
+                    f"{PAGEID_REFRESH_MAX_ATTEMPTS} returned"
+                    f" {candidate!r}; retrying after"
+                    f" {PAGEID_REFRESH_BACKOFF_SECS}s (indexing lag)."
+                )
+                time.sleep(PAGEID_REFRESH_BACKOFF_SECS)
+            else:
+                logging.warning(
+                    f"Uploaded {page_title} but resolved pageid"
+                    f" is still {candidate!r} after"
+                    f" {PAGEID_REFRESH_MAX_ATTEMPTS} attempts;"
+                    " recording pageid=None, sdc-sync's"
+                    " title→pageid fallback will recover."
+                )
+        return None
+
     def _track_ordinal_skip(self, skip_kind: Result) -> None:
         """Bump both the aggregate ``Result.SKIPPED`` (which legacy
         Slack summaries and dashboards key on) and the granular
@@ -677,55 +745,7 @@ class Uploader:
                 # falls through to the existing pageid=None branch and
                 # sdc-sync's title→pageid fallback picks up the slack
                 # on the next run.
-                resolved_pageid = None
-                for attempt in range(1, PAGEID_REFRESH_MAX_ATTEMPTS + 1):
-                    try:
-                        fresh_page = get_page(self.site, page_title)
-                        fresh_page.exists()
-                        candidate = fresh_page.pageid
-                    except Exception as refresh_ex:
-                        if attempt < PAGEID_REFRESH_MAX_ATTEMPTS:
-                            logging.warning(
-                                f"Uploaded {page_title} but post-upload"
-                                f" pageid refresh (attempt {attempt}/"
-                                f"{PAGEID_REFRESH_MAX_ATTEMPTS}) raised:"
-                                f" {refresh_ex!r}. Retrying after"
-                                f" {PAGEID_REFRESH_BACKOFF_SECS}s."
-                            )
-                            time.sleep(PAGEID_REFRESH_BACKOFF_SECS)
-                            continue
-                        logging.warning(
-                            f"Uploaded {page_title} but post-upload"
-                            f" pageid refresh raised on final attempt"
-                            f" ({attempt}/{PAGEID_REFRESH_MAX_ATTEMPTS}):"
-                            f" {refresh_ex!r}. Recording pageid=None;"
-                            " sdc-sync's title→pageid fallback will"
-                            " recover on next run."
-                        )
-                        break
-                    if candidate:
-                        resolved_pageid = candidate
-                        break
-                    # Refresh returned but the pageid is still falsy
-                    # (typically 0, the indexing-lag shape). Retry
-                    # before giving up.
-                    if attempt < PAGEID_REFRESH_MAX_ATTEMPTS:
-                        logging.info(
-                            f"Uploaded {page_title}: post-upload pageid"
-                            f" refresh attempt {attempt}/"
-                            f"{PAGEID_REFRESH_MAX_ATTEMPTS} returned"
-                            f" {candidate!r}; retrying after"
-                            f" {PAGEID_REFRESH_BACKOFF_SECS}s (indexing lag)."
-                        )
-                        time.sleep(PAGEID_REFRESH_BACKOFF_SECS)
-                    else:
-                        logging.warning(
-                            f"Uploaded {page_title} but resolved pageid"
-                            f" is still {candidate!r} after"
-                            f" {PAGEID_REFRESH_MAX_ATTEMPTS} attempts;"
-                            " recording pageid=None, sdc-sync's"
-                            " title→pageid fallback will recover."
-                        )
+                resolved_pageid = self._refresh_pageid_with_retries(page_title)
                 return {
                     "status": ORDINAL_UPLOADED,
                     "title": page_title,

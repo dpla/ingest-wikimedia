@@ -31,6 +31,15 @@ class Result(Enum):
     SDC_REMOVALS = auto()
     SDC_ITEMS_SKIPPED_NO_SIDECAR = auto()
     SDC_ITEMS_SKIPPED_MAPPING = auto()
+    # Items where at least one ordinal synced cleanly AND at least
+    # one sibling ordinal hit ``had_ordinal_error`` (the typical
+    # shape: one ordinal's null-pageid skip + the rest succeeding).
+    # Distinguished from full-sync ``SDC_ITEMS_SYNCED`` so dashboards
+    # keying on "items fully done" don't accidentally count partial
+    # results as healthy. Items in this bucket DO get post-SDC
+    # cleanup on their synced ordinals — the partial state is real
+    # progress, not a failure to be retried wholesale.
+    SDC_ITEMS_PARTIALLY_SYNCED = auto()
     # Ordinals whose SDC sync raised an unexpected exception
     # (pywikibot APIError, network timeout, deep KeyError, etc.).
     # Per-ordinal granularity so transient failures don't abort the

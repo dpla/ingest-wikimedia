@@ -3864,3 +3864,57 @@ def test_post_sdc_cleanup_for_page_strips_when_entity_has_dpla_sdc(monkeypatch):
     )
 
     assert len(strip_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Item-level outcome classification: partial-sync items distinct from
+# fully-synced. Per CR review on PR #302 — mixed-result items (one ordinal
+# synced, sibling ordinal hit MISSING_PAGEID / SKIPPED_ERROR) shouldn't be
+# silently counted as fully ``SDC_ITEMS_SYNCED``.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_item_outcome_full_sync():
+    """All ordinals synced cleanly → full ``SDC_ITEMS_SYNCED``."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=True, had_ordinal_error=False)
+        == Result.SDC_ITEMS_SYNCED
+    )
+
+
+def test_classify_item_outcome_partial_sync():
+    """Live-bug regression: at least one ordinal synced AND at
+    least one sibling ordinal hit the error / null-pageid skip
+    path → ``SDC_ITEMS_PARTIALLY_SYNCED``, not the full-sync
+    bucket. Dashboards keying on full-sync as "items healthy"
+    correctly excluded."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=True, had_ordinal_error=True)
+        == Result.SDC_ITEMS_PARTIALLY_SYNCED
+    )
+
+
+def test_classify_item_outcome_all_errored():
+    """No ordinals synced but at least one raised → error bucket,
+    not the no-progress mapping bucket."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=False, had_ordinal_error=True)
+        == Result.SDC_ITEMS_SKIPPED_ERROR
+    )
+
+
+def test_classify_item_outcome_no_progress():
+    """No ordinals synced AND no ordinals errored — every eligible
+    ordinal silently no-op'd somewhere. Mapping skip."""
+    from tools.sdc_sync import _classify_item_outcome
+
+    assert (
+        _classify_item_outcome(synced_this_item=False, had_ordinal_error=False)
+        == Result.SDC_ITEMS_SKIPPED_MAPPING
+    )

@@ -479,6 +479,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
         },
         tracker_counts={
             Result.SDC_ITEMS_SYNCED: 100,
+            Result.SDC_ITEMS_PARTIALLY_SYNCED: 9,
             Result.SDC_CLAIMS_ADDED: 250,
             Result.SDC_REFS_ADDED: 30,
             Result.SDC_REMOVALS: 4,
@@ -492,6 +493,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
     )
     stats = captured["stats_lines"]
     assert any(s.startswith("ITEMS SYNCED:") and "100" in s for s in stats)
+    assert any(s.startswith("ITEMS PARTIAL:") and "9" in s for s in stats)
     assert any(s.startswith("CLAIMS ADDED:") and "250" in s for s in stats)
     assert any(s.startswith("REFS ADDED:") and "30" in s for s in stats)
     assert any(s.startswith("REMOVALS:") and "4" in s for s in stats)

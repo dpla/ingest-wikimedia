@@ -240,6 +240,30 @@ def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
     return False
 
 
+def _classify_item_outcome(synced_this_item: bool, had_ordinal_error: bool) -> Result:
+    """Map (synced_this_item, had_ordinal_error) to the item-level
+    tracker bucket the partner-mode loop should increment.
+
+    Three "made-progress" outcomes — full sync, partial sync, all-
+    ordinals-errored — plus one no-progress outcome (mapping skip).
+    The partial-sync case is broken out from full-sync so dashboards
+    keying on ``SDC_ITEMS_SYNCED`` as "items fully done" don't
+    silently treat mixed-result items (one ordinal synced, sibling
+    null-pageid / runtime-error ordinal skipped) as healthy. Both
+    full and partial outcomes still get the post-SDC cleanup pass
+    on whatever ordinals did sync; the partial state is real
+    progress, not a failure to retry wholesale. (Per CR review on
+    PR #302.)
+    """
+    if synced_this_item and had_ordinal_error:
+        return Result.SDC_ITEMS_PARTIALLY_SYNCED
+    if synced_this_item:
+        return Result.SDC_ITEMS_SYNCED
+    if had_ordinal_error:
+        return Result.SDC_ITEMS_SKIPPED_ERROR
+    return Result.SDC_ITEMS_SKIPPED_MAPPING
+
+
 def _resolve_pageid_from_title(title: str) -> int | None:
     """Look up the Commons page id for ``title`` via the live wiki API.
 
@@ -4004,26 +4028,20 @@ def _run_partner_mode(partner, ids_file):
                             f" -- Failed to touch '{title}' for category refresh: {e!r}"
                         )
                 synced_this_item = True
-            # Only count an item as synced if at least one ordinal actually
-            # made it past the pageid guard. An item whose every eligible
-            # ordinal lacked a pageid would otherwise inflate the synced
-            # counter and underreport mapping skips.
-            if synced_this_item:
-                tracker.increment(Result.SDC_ITEMS_SYNCED)
-                # Post-SDC wikitext cleanup. Best-effort — any failure
-                # inside is logged and swallowed by the helper, so a bad
-                # parse on one item can't abort the partner batch.
-                if _normalize_wikitext_enabled:
-                    _post_sdc_cleanup_for_item(s3, partner, dpla_id, ordinal_items)
-            elif had_ordinal_error:
-                # Every eligible ordinal raised at runtime — classify
-                # under the error bucket, not MAPPING. (Mixed-result
-                # items where some ordinals succeed go to SYNCED; the
-                # per-ordinal failures are still visible under
-                # SDC_ORDINALS_SKIPPED_ERROR.)
-                tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
-            else:
-                tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
+            # Item-level bucket classification + cleanup dispatch.
+            # ``_classify_item_outcome`` returns the bucket; cleanup
+            # runs for any progress-made outcome (full or partial).
+            outcome = _classify_item_outcome(synced_this_item, had_ordinal_error)
+            tracker.increment(outcome)
+            if (
+                outcome
+                in (
+                    Result.SDC_ITEMS_SYNCED,
+                    Result.SDC_ITEMS_PARTIALLY_SYNCED,
+                )
+                and _normalize_wikitext_enabled
+            ):
+                _post_sdc_cleanup_for_item(s3, partner, dpla_id, ordinal_items)
         completed = True
     except BaseException as exc:
         # The per-ordinal try/except above already swallows every routine
