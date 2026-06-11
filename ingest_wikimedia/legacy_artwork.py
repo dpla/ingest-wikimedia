@@ -862,16 +862,29 @@ def migrate_legacy_file(
 
     new_block = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
     rewritten = render_migrated_wikitext(file_page.text, new_block)
+    # ``new_block`` is the full upload-form template with every param
+    # populated from ``item_metadata`` — appropriate for a fresh upload
+    # but not for migration, where the SDC just written already carries
+    # the DPLA-attributed values. Run the same strip pass the post-SDC
+    # cleanup path uses on ``{{DPLA metadata}}`` files so the migrated
+    # wikitext ends up in the post-strip steady state in one save,
+    # instead of leaving the params populated and depending on a
+    # follow-up sdc-sync run to strip them. Community-contributed
+    # values whose ``canonical_value`` differs from
+    # ``canonical_params`` won't match and are preserved — the strip
+    # is value-equality, not blanket removal.
+    #
     # Canonical-whitespace pass: ``render_migrated_wikitext`` substitutes
     # only the template node, so any leading whitespace the legacy
     # ``{{Artwork}}`` block carried (the pre-#291 pretty-printed indent
     # of "     {{ Artwork") survives as a Text node before the new
-    # ``{{DPLA metadata}}`` template. ``canonicalize`` left-justifies the
-    # template and forces the canonical blank line between the section
-    # heading and the template, matching the shape ``get_wiki_text`` now
-    # emits for fresh uploads.
-    from .wikitext_normalize import canonicalize
+    # ``{{DPLA metadata}}`` template. ``canonicalize`` left-justifies
+    # the template and forces the canonical blank line between the
+    # section heading and the template, matching the shape
+    # ``get_wiki_text`` emits for fresh uploads.
+    from .wikitext_normalize import canonicalize, normalize
 
+    rewritten, _stripped = normalize(rewritten, canonical_params)
     rewritten = canonicalize(rewritten)
     wikitext_changed = rewritten != file_page.text
     if wikitext_changed:

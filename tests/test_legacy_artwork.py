@@ -1038,3 +1038,72 @@ def test_migrate_legacy_file_emits_canonical_whitespace():
     assert "== {{int:filedesc}} ==\n\n{{DPLA metadata" in saved_text, (
         f"missing canonical blank-line separator:\n{saved_text!r}"
     )
+
+
+def test_migrate_legacy_file_strips_params_matching_sdc_in_one_edit():
+    """Regression for the live bug observed on
+    https://commons.wikimedia.org/wiki/File:Indian_portrait,_bust_-_DPLA_-_1c4a5c6601e7daec71e04483a5c304a7.gif
+    where migration produced a fully-populated ``{{DPLA metadata}}``
+    template with every param verbatim (creator, title, date,
+    permission, hub, institution, url, dpla_id, local_id) — the
+    pre-strip steady state, not the post-strip steady state.
+
+    For a DPLA-bot-only revision history (no community contributions),
+    every wikitext param value matches the canonical ``item_metadata``,
+    so the strip pass must remove all of them — the migrated file
+    should end at the post-strip steady state ``{{DPLA metadata}}``
+    in the same edit as the migrate, not two edits later after a
+    follow-up sdc-sync pass.
+    """
+
+    class _Rev1:
+        revid, user = 1, "DPLA_bot"
+        text = (
+            "== {{int:filedesc}} ==\n"
+            "     {{ Artwork\n"
+            "        | Other fields 1 = {{ InFi | Creator |"
+            " A Creator | id=fileinfotpl_aut}}\n"
+            "        | title = A Title\n"
+            "        | description = A description\n"
+            "        | date = 1900\n"
+            "        | permission = {{NoC-US | Q1}}\n"
+            "        | source = {{ DPLA | Q1 | hub = Q2 |"
+            " url = https://example.org/item/123 |"
+            " dpla_id = abc | local_id = local-1 }}\n"
+            "        | Institution = {{ Institution | wikidata = Q1 }}\n"
+            "     }}\n"
+        )
+
+    page = _mock_file_page("File:Foo.jpg", _Rev1.text, [_Rev1()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    saved = page.text
+    # No DPLA-attributed params should remain in the wikitext. Each
+    # one is canonically present in SDC after the migration, so the
+    # display will render from there.
+    for key in (
+        "title",
+        "creator",
+        "date",
+        "permission",
+        "hub",
+        "institution",
+        "url",
+        "dpla_id",
+        "local_id",
+    ):
+        assert f"| {key}" not in saved, (
+            f"strip missed param {key!r}; full text:\n{saved}"
+        )
+    # The template itself is still present — collapsed to single line.
+    assert "{{DPLA metadata}}" in saved
+    # And only one save was issued.
+    assert page.save.call_count == 1
