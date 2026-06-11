@@ -143,50 +143,34 @@ def _value_matches(
     return False
 
 
-def _subtemplate_matches(wikitext_value: str, expected_subtemplate: dict) -> bool:
-    """Compare a sub-template param (e.g. ``| source = {{DPLA|...}}``) to
-    the canonical expectation.
+# Top-level scalar params on a flat-shape `{{DPLA metadata}}` invocation.
+# Every one is a string compared via `_value_matches`. The post-flat-shape
+# rewrite collapsed the previous `source` and `institution` sub-template
+# rows into flat scalars (hub / institution Q-ID / url / dpla_id /
+# local_id) so the comparator's dispatch is uniform across all rows.
+_SCALAR_PARAMS = (
+    "title",
+    "description",
+    "date",
+    "permission",
+    "creator",
+    "hub",
+    "institution",
+    "url",
+    "dpla_id",
+    "local_id",
+)
 
-    ``expected_subtemplate`` is the shape produced by
-    :func:`ingest_wikimedia.wikimedia.dpla_metadata_params` — ``name`` is
-    the inner template's name, ``params`` is its argument dict where
-    positional args are keyed by string indices (``"1"``, ``"2"``).
-
-    Returns True only when the wikitext value contains exactly one
-    template, that template's name matches, and every expected param is
-    present with the same value. Extra params on the wikitext side count
-    as a mismatch — we never strip when the editor added something we
-    don't know to match.
-    """
-    parsed = mwparserfromhell.parse(wikitext_value)
-    templates = parsed.filter_templates(recursive=False)
-    if len(templates) != 1:
-        return False
-    tpl = templates[0]
-    if not _matches_template_name(tpl, expected_subtemplate["name"]):
-        return False
-    expected_params = expected_subtemplate["params"]
-    wikitext_params = {
-        str(p.name).strip(): _canonical_value(str(p.value)) for p in tpl.params
-    }
-    if set(wikitext_params) != set(expected_params):
-        return False
-    return all(
-        wikitext_params[k] == _canonical_value(v) for k, v in expected_params.items()
-    )
-
-
-# Top-level params expected on a `{{DPLA metadata}}` invocation written by
-# the DPLA uploader, mapped to their kind (scalar vs. sub-template) so we
-# can dispatch to the right comparator. Names mirror what `get_wiki_text`
-# emits and what `dpla_metadata_params` returns.
-_SCALAR_PARAMS = ("title", "description", "date", "permission")
-_SUBTEMPLATE_PARAMS = ("source", "institution")
-# The uploader writes the creator on a numbered "Other fields" row
-# (``Other fields 1 = {{InFi|Creator|...}}``). Module:DPLA accepts both
-# that form and a top-level ``creator =`` param, but only the former is
-# what the current uploader emits, so that's what we look for here.
-_CREATOR_PARAM_NAME = "other fields 1"
+# Legacy param shapes that an older upload (pre-flat-shape) may carry.
+# Their canonical expectation comes from the same flat scalars in
+# `expected_params`; the comparator handles them in a fall-through path
+# at the bottom of `normalize` so the strip behavior is symmetric with
+# new-shape files. Each tuple is (wikitext-param-name, sub-template-name,
+# canonical-key-mapping) where the mapping says which inner sub-template
+# arg corresponds to which canonical-params key.
+_LEGACY_SOURCE_PARAM = "source"
+_LEGACY_INSTITUTION_PARAM = "Institution"
+_LEGACY_CREATOR_PARAM = "Other fields 1"
 
 
 def _find_dpla_metadata_template(wikicode):
@@ -254,37 +238,123 @@ def normalize(wikitext: str, expected_params: dict) -> tuple[str, list[str]]:
     # as redundant rather than as an editor contribution.
     languages = expected_params.get("languages", frozenset({"en"}))
 
+    # Flat-shape strip pass: every canonical param is a string scalar.
+    # ``creator`` is conditional — when DPLA has no creator value, the
+    # uploader doesn't emit the row, so an existing ``creator =`` row
+    # is an editor contribution we must preserve.
     for param_name in _SCALAR_PARAMS:
+        expected_value = expected_params.get(param_name, "")
+        if param_name == "creator" and not expected_value:
+            continue
         param = _find_param(template, param_name)
         if param is None:
             continue
-        if _value_matches(str(param.value), expected_params[param_name], languages):
+        if _value_matches(str(param.value), expected_value, languages):
             template.remove(param, keep_field=False)
             stripped.append(param_name)
 
-    for param_name in _SUBTEMPLATE_PARAMS:
-        param = _find_param(template, param_name)
-        if param is None:
-            continue
-        if _subtemplate_matches(str(param.value), expected_params[param_name]):
-            template.remove(param, keep_field=False)
-            stripped.append(param_name)
-
-    # Creator lives on `Other fields 1` as `{{InFi|Creator|<value>|id=...}}`.
-    # Only compare/strip when the expected creator is non-empty — when DPLA
-    # has no creator value, the uploader doesn't emit the row at all, so
-    # there's nothing to compare to.
-    creator_expected = expected_params["creator"]
-    creator_param = _find_param(template, _CREATOR_PARAM_NAME)
-    if (
-        creator_param is not None
-        and creator_expected["params"]["2"]
-        and _subtemplate_matches(str(creator_param.value), creator_expected)
-    ):
-        template.remove(creator_param, keep_field=False)
-        stripped.append(_CREATOR_PARAM_NAME)
+    # Legacy-shape strip pass. Pre-flat-shape uploads have
+    # ``source = {{DPLA|...}}`` / ``Institution = {{Institution|...}}``
+    # / ``Other fields 1 = {{InFi|Creator|...}}`` rows that carry the
+    # same canonical values in nested sub-template form. The
+    # comparator recognises each shape and strips when its inner
+    # values match the flat-canonical equivalents — same redundancy
+    # contract as the flat shape, just expressed via the legacy
+    # sub-template encoding.
+    _strip_legacy_source(template, expected_params, stripped)
+    _strip_legacy_institution(template, expected_params, stripped)
+    _strip_legacy_creator(template, expected_params, stripped)
 
     return str(wikicode), stripped
+
+
+def _strip_legacy_source(template, expected_params: dict, stripped: list[str]) -> None:
+    """Strip a legacy ``source = {{DPLA|<inst>|hub=...|url=...|dpla_id=...|local_id=...}}``
+    row when every inner param matches the flat-canonical equivalent.
+
+    The comparator compares the *parsed* sub-template params against
+    flat-canonical: hub→hub, positional-1→institution, url→url,
+    dpla_id→dpla_id, local_id→local_id. Extra args on the wikitext
+    side disqualify the strip (an editor may have added a param we
+    don't know to match)."""
+    param = _find_param(template, _LEGACY_SOURCE_PARAM)
+    if param is None:
+        return
+    parsed = _parse_inner_template(str(param.value), "dpla")
+    if parsed is None:
+        return
+    expected = {
+        "1": expected_params.get("institution", ""),
+        "hub": expected_params.get("hub", ""),
+        "url": expected_params.get("url", ""),
+        "dpla_id": expected_params.get("dpla_id", ""),
+        "local_id": expected_params.get("local_id", ""),
+    }
+    if set(parsed) != set(expected):
+        return
+    if all(parsed[k] == _canonical_value(v) for k, v in expected.items()):
+        template.remove(param, keep_field=False)
+        stripped.append(_LEGACY_SOURCE_PARAM)
+
+
+def _strip_legacy_institution(
+    template, expected_params: dict, stripped: list[str]
+) -> None:
+    """Strip a legacy ``Institution = {{Institution|wikidata=Q...}}`` row
+    when the inner Q-ID matches ``expected_params["institution"]``."""
+    param = _find_param(template, _LEGACY_INSTITUTION_PARAM)
+    if param is None:
+        return
+    parsed = _parse_inner_template(str(param.value), "institution")
+    if parsed is None:
+        return
+    if set(parsed) != {"wikidata"}:
+        return
+    if parsed["wikidata"] == _canonical_value(expected_params.get("institution", "")):
+        template.remove(param, keep_field=False)
+        stripped.append(_LEGACY_INSTITUTION_PARAM)
+
+
+def _strip_legacy_creator(template, expected_params: dict, stripped: list[str]) -> None:
+    """Strip a legacy ``Other fields 1 = {{InFi|Creator|<value>|id=fileinfotpl_aut}}``
+    row when its second positional arg matches ``expected_params["creator"]``.
+    Bails out when the expected creator is empty — same conservative
+    rule as the flat-shape creator strip."""
+    creator_expected = expected_params.get("creator", "")
+    if not creator_expected:
+        return
+    param = _find_param(template, _LEGACY_CREATOR_PARAM)
+    if param is None:
+        return
+    parsed = _parse_inner_template(str(param.value), "infi")
+    if parsed is None:
+        return
+    if parsed.get("1") != "Creator":
+        return
+    if parsed.get("2") != _canonical_value(creator_expected):
+        return
+    template.remove(param, keep_field=False)
+    stripped.append(_LEGACY_CREATOR_PARAM)
+
+
+def _parse_inner_template(value: str, expected_name: str) -> dict | None:
+    """Parse a single-template wikitext value into a flat
+    ``{param_name: stripped_value}`` dict, or None when the value
+    doesn't contain exactly one template with the given case-folded
+    name.
+
+    Positional args use string keys ``"1"``, ``"2"``, ... (matching
+    mwparserfromhell's convention). All values are whitespace-
+    stripped — the comparator wants to match the renderer's behavior,
+    not the source bytes."""
+    parsed = mwparserfromhell.parse(value)
+    templates = parsed.filter_templates(recursive=False)
+    if len(templates) != 1:
+        return None
+    tpl = templates[0]
+    if not _matches_template_name(tpl, expected_name):
+        return None
+    return {str(p.name).strip(): _canonical_value(str(p.value)) for p in tpl.params}
 
 
 def normalize_page(file_page, expected_params: dict, edit_summary: str) -> bool:

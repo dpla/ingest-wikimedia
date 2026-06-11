@@ -1150,12 +1150,14 @@ def test_get_wiki_text_emits_dpla_metadata_template():
     )
 
 
-def test_get_wiki_text_preserves_artwork_parameters_under_new_template():
-    """Locking-in regression: the parameter set the upload-time
-    wikitext writes is unchanged from the prior {{Artwork}}-based form
-    — title, description, date, permission, source (with the DPLA
-    sub-template), Institution. Pin each so a structural refactor of
-    `get_wiki_text` can't silently drop a field."""
+def test_get_wiki_text_emits_flat_param_shape():
+    """Locking-in regression: the flat-param shape Module:DPLA's
+    dual-path renderer expects. No nested ``{{DPLA|...}}`` /
+    ``{{Institution|...}}`` / ``{{InFi|Creator|...}}`` sub-templates
+    inside the template params — those caused the ``{|`` wikitable
+    leakage inside Module:DPLA's HTML ``<td>``. Pin each flat row so a
+    structural refactor of ``get_wiki_text`` can't silently re-introduce
+    a nested form."""
     result = get_wiki_text(
         dpla_id="abc123",
         item_metadata=_minimal_item_metadata(),
@@ -1163,21 +1165,28 @@ def test_get_wiki_text_preserves_artwork_parameters_under_new_template():
         data_provider={"Wikidata": "Q2"},
     )
     for fragment in (
-        # Creator path: get_wiki_text conditionally emits `Other fields 1`
-        # with a Creator InFi template when the source record has any
-        # creator. Our fixture has one, so pin the full Creator fragment
-        # — otherwise a refactor that drops the conditional could
-        # silently lose every credited DPLA author.
-        "| Other fields 1 = {{ InFi | Creator | A Creator | id=fileinfotpl_aut}}",
+        # Creator row is conditional — emitted only when DPLA has a
+        # creator string. Our fixture does, so pin the flat row.
+        "| creator = A Creator",
         "| title = A Title",
         "| description = A description",
         "| date = 1900",
-        "| permission =",
-        "| source = {{ DPLA",
-        "| Institution = {{ Institution | wikidata = Q2 }}",
-        "| dpla_id = abc123",
+        "| permission = {{cc-zero}}",
         "| hub = Q1",
+        "| institution = Q2",
+        "| url = https://example.org/item/123",
+        "| dpla_id = abc123",
+        "| local_id = local-123",
     ):
         assert fragment in result, (
             f"missing expected fragment {fragment!r} in:\n{result}"
         )
+    # No nested sub-templates inside the param values (the outer
+    # ``{{ DPLA metadata`` is the wrapper itself, which is expected;
+    # what we're guarding against is a *nested* ``{{ DPLA |...}}``
+    # source sub-template, recognisable by the ``|`` immediately
+    # after the name).
+    assert "{{ DPLA\n" not in result and "{{DPLA\n" not in result
+    assert "{{ DPLA |" not in result and "{{DPLA|" not in result
+    assert "{{ Institution " not in result and "{{Institution " not in result
+    assert "{{ InFi " not in result and "{{InFi " not in result

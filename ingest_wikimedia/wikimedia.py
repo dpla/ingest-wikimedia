@@ -419,13 +419,17 @@ def dpla_metadata_params(
     redundant params or, worse, strip params that don't actually match
     the rendered output.
 
-    Returned shape mirrors the wikitext structure: top-level params are
-    string-valued, sub-template params (``source``, ``institution``,
-    ``creator``) are nested dicts whose ``name`` field carries the
-    sub-template's name and ``params`` carries its argument dict. A
-    sub-template entry whose ``params`` is empty (or whose ``creator``
-    value is the empty string) signals "do not emit this param" — both
-    the writer and the comparator skip it identically.
+    Every parameter is a flat string. The previous ``source`` and
+    ``institution`` sub-template dicts have been collapsed into flat
+    ``hub`` / ``institution`` (Q-IDs) / ``url`` / ``dpla_id`` /
+    ``local_id`` scalars, and ``creator`` is now a plain creator-name
+    string. Module:DPLA's yellow box reads each flat param directly
+    via the same parametric helpers that drive the SDC-backed blue
+    box; no nested ``{{DPLA|...}}`` / ``{{Institution|...}}`` /
+    ``{{InFi|...}}`` sub-templates are emitted in the wikitext, which
+    eliminates the table-syntax-in-cell rendering bug those sub-
+    templates caused when their wikitext-table output landed inside
+    Module:DPLA's HTML ``<td>``.
 
     The non-rendered ``languages`` key carries the per-item allowlist
     of ISO 639-1 codes the comparator may safely unwrap. Always
@@ -462,31 +466,17 @@ def dpla_metadata_params(
             source_resource, DC_DATE_FIELD_NAME, EDM_TIMESPAN_DISPLAY_DATE
         ),
         "permission": permission_value,
-        "creator": {
-            "name": "InFi",
-            "params": {
-                # Positional args 1 and 2 — the {{InFi}} idiom is
-                # `{{InFi|<field-label>|<value>|id=fileinfotpl_aut}}`.
-                "1": "Creator",
-                "2": extract_strings(source_resource, DC_CREATOR_FIELD_NAME),
-                "id": "fileinfotpl_aut",
-            },
-        },
-        "source": {
-            "name": "DPLA",
-            "params": {
-                # Positional arg 1 — the data-provider Wikidata Q-ID.
-                "1": data_provider_wiki_q,
-                "hub": provider_wiki_q,
-                "url": escape_wiki_strings(get_str(item_metadata, EDM_IS_SHOWN_AT)),
-                "dpla_id": dpla_id,
-                "local_id": extract_strings(source_resource, DC_IDENTIFIER_FIELD_NAME),
-            },
-        },
-        "institution": {
-            "name": "Institution",
-            "params": {"wikidata": data_provider_wiki_q},
-        },
+        "creator": extract_strings(source_resource, DC_CREATOR_FIELD_NAME),
+        # Flat source-row params — Module:DPLA's yellow box reads each
+        # directly. ``institution`` and ``hub`` are Wikidata Q-IDs;
+        # the institution Q-ID doubles as the Institution row driver
+        # (Module:DPLA expands ``{{Institution|wikidata=<inst>}}`` on
+        # its side, not in the wikitext).
+        "hub": provider_wiki_q,
+        "institution": data_provider_wiki_q,
+        "url": escape_wiki_strings(get_str(item_metadata, EDM_IS_SHOWN_AT)),
+        "dpla_id": dpla_id,
+        "local_id": extract_strings(source_resource, DC_IDENTIFIER_FIELD_NAME),
         "languages": _extract_unwrap_languages(item_metadata),
     }
 
@@ -494,59 +484,52 @@ def dpla_metadata_params(
 def get_wiki_text(
     dpla_id: str, item_metadata: dict, provider: dict, data_provider: dict
 ) -> str:
-    """Turns DPLA item info into a wikitext document."""
+    """Turns DPLA item info into a wikitext document.
+
+    Emits the flat-param ``{{DPLA metadata}}`` shape Module:DPLA
+    expects post the dual-path rewrite: every value is a plain
+    string (Q-ID, URL, or text), no nested sub-templates whose
+    wikitext-table output would leak raw ``{|`` markup inside
+    Module:DPLA's HTML ``<td>``. ``creator`` is conditionally
+    emitted — the row is suppressed entirely when DPLA has no
+    creator string to avoid a blank ``creator =`` row.
+    """
     params = dpla_metadata_params(dpla_id, item_metadata, provider, data_provider)
 
-    # Every literal that the comparator side derives from ``params`` is
-    # sourced from ``params`` here too. Drifting the two — e.g. changing
-    # the creator label in ``dpla_metadata_params`` and forgetting to
-    # change it here — is the failure mode the single-source-of-truth
-    # contract exists to prevent. So no hardcoded ``"Creator"``,
-    # ``"fileinfotpl_aut"``, ``{{Institution|wikidata=...}}`` shape, etc.
-    creator_params = params["creator"]["params"]
-    creator_value = creator_params["2"]
-    if creator_value:
-        creator_template = """
-        | Other fields 1 = {{ InFi | $creator_label | $creator | id=$creator_id}}"""
+    if params["creator"]:
+        creator_row = """
+        | creator = $creator"""
     else:
-        creator_template = ""
+        creator_row = ""
 
     template_string = (
         """== {{int:filedesc}} ==
      {{ DPLA metadata"""
-        + creator_template
+        + creator_row
         + """
         | title = $title
         | description = $description
         | date = $date_string
         | permission = $permission
-        | source = {{ DPLA
-            | $data_provider
-            | hub = $provider
-            | url = $is_shown_at
-            | dpla_id = $dpla_id
-            | local_id = $local_id
-        }}
-        | Institution = {{ Institution | wikidata = $institution_wikidata }}
+        | hub = $hub
+        | institution = $institution
+        | url = $url
+        | dpla_id = $dpla_id
+        | local_id = $local_id
      }}"""
     )
 
-    source_params = params["source"]["params"]
-    institution_params = params["institution"]["params"]
     return Template(template_string).substitute(
-        creator=creator_value,
-        creator_label=creator_params["1"],
-        creator_id=creator_params["id"],
         title=params["title"],
         description=params["description"],
         date_string=params["date"],
         permission=params["permission"],
-        data_provider=source_params["1"],
-        provider=source_params["hub"],
-        is_shown_at=source_params["url"],
-        dpla_id=source_params["dpla_id"],
-        local_id=source_params["local_id"],
-        institution_wikidata=institution_params["wikidata"],
+        creator=params["creator"],
+        hub=params["hub"],
+        institution=params["institution"],
+        url=params["url"],
+        dpla_id=params["dpla_id"],
+        local_id=params["local_id"],
     )
 
 
@@ -820,6 +803,15 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     scraper expecting that wrapper would miss a bare template.
 
     Duplicates within each preserved group are collapsed.
+
+    TODO (Goal 2 follow-up): the title-drift rescue currently
+    overwrites the metadata template wholesale, discarding any
+    community-contributed template params an editor added between
+    the original upload and the rescue. The same provenance-aware
+    migration logic from :mod:`ingest_wikimedia.legacy_artwork`
+    would let us preserve community values as SDC imports first,
+    then overwrite. Out of scope for the flat-shape uploader PR;
+    flagged here so the integration point doesn't get lost.
     """
     parts: list[str] = [new_wikitext.rstrip()]
     assessment = list(dict.fromkeys(_ASSESSMENT_TEMPLATE_RE.findall(existing_text)))
