@@ -181,6 +181,17 @@ def _find_dpla_metadata_template(wikicode):
     return None
 
 
+def has_dpla_metadata_template(wikitext: str) -> bool:
+    """Public test for ``{{DPLA metadata}}`` presence in a wikitext string.
+
+    Lets ``tools/sdc_sync.py``'s post-SDC cleanup dispatcher decide
+    between the strip path (this module) and the migrate path
+    (:mod:`ingest_wikimedia.legacy_artwork`) without paying the cost
+    of a full parse + strip pass when the file isn't on the new
+    template form. Pure — no API calls."""
+    return _find_dpla_metadata_template(mwparserfromhell.parse(wikitext)) is not None
+
+
 def _normalize_param_name(param) -> str:
     return str(param.name).strip().casefold()
 

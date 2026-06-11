@@ -1197,6 +1197,4 @@ def test_get_wiki_text_emits_flat_param_shape():
     # editors viewing the page source saw as cosmetic noise.
     for line in result.splitlines():
         if line.startswith(" ") or line.startswith("\t"):
-            raise AssertionError(
-                f"line has leading whitespace: {line!r} in:\n{result}"
-            )
+            raise AssertionError(f"line has leading whitespace: {line!r} in:\n{result}")

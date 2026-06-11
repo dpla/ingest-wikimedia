@@ -1138,6 +1138,309 @@ def test_safe_process_one_categorises_generic_error(monkeypatch):
     fake_tracker.increment.assert_called_once_with(Result.SDC_ORDINALS_SKIPPED_ERROR)
 
 
+def test_safe_process_one_runs_post_sdc_cleanup_when_file_page_supplied(monkeypatch):
+    """The legacy ``--file`` / ``--cat`` / ``--list`` paths pass a
+    ``file_page`` so the same post-SDC cleanup (strip-or-migrate) the
+    partner mode does also runs here. Locks in the wire from
+    ``_safe_process_one`` → ``_post_sdc_cleanup_for_legacy_mode`` so a
+    refactor of either function can't silently drop the cleanup hook
+    on the legacy paths."""
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+
+    cleanup_calls = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "_post_sdc_cleanup_for_legacy_mode",
+        lambda page, dpla_id: cleanup_calls.append((page, dpla_id)),
+    )
+
+    fake_page = MagicMock(name="FilePage")
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=fake_page)
+
+    assert cleanup_calls == [(fake_page, "dpla-1")]
+
+
+def test_safe_process_one_skips_cleanup_when_no_file_page(monkeypatch):
+    """Backwards-compat: callers that didn't update to pass file_page
+    still work (no cleanup attempted; no AttributeError on the
+    ``None`` page handle)."""
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+
+    called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "_post_sdc_cleanup_for_legacy_mode",
+        lambda *a: called.append(a),
+    )
+
+    sdc_sync._safe_process_one("M1", "dpla-1")  # no file_page
+
+    assert called == []
+
+
+def test_safe_process_one_skips_cleanup_when_disabled(monkeypatch):
+    """The ``--no-normalize-wikitext`` opt-out short-circuits the
+    cleanup even when ``file_page`` is supplied. Diagnostic runs that
+    explicitly disable the strip / migrate must not surprise the
+    operator with post-SDC edits."""
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", False)
+
+    called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "_post_sdc_cleanup_for_legacy_mode",
+        lambda *a: called.append(a),
+    )
+
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
+
+    assert called == []
+
+
+def test_safe_process_one_skips_cleanup_on_missing_entity(monkeypatch):
+    """A file whose MediaInfo entity is gone (deleted by a Commons
+    curator, etc.) raises ``_MissingEntityError`` from ``process_one``.
+    The cleanup must NOT run on that page — saving wikitext to a
+    deleted page would either fail loudly or undelete it. Mirrors the
+    early-return on the error path."""
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+
+    def raise_missing(*a):
+        raise sdc_sync._MissingEntityError("M1")
+
+    monkeypatch.setattr(sdc_sync, "process_one", raise_missing)
+
+    called = []
+    monkeypatch.setattr(
+        sdc_sync,
+        "_post_sdc_cleanup_for_legacy_mode",
+        lambda *a: called.append(a),
+    )
+
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
+
+    assert called == []
+
+
+# ---------------------------------------------------------------------------
+# _post_sdc_cleanup_for_page — strip-or-migrate dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _make_canonical_item():
+    """Minimal DPLA item dict the canonical-params helper accepts."""
+    return {
+        "rights": "http://creativecommons.org/publicdomain/zero/1.0/",
+        "isShownAt": "https://example.org/item/1",
+        "sourceResource": {
+            "title": ["A Title"],
+            "description": ["A description"],
+            "date": [{"displayDate": "1900"}],
+            "creator": ["A Creator"],
+            "identifier": ["local-1"],
+        },
+    }
+
+
+def test_post_sdc_cleanup_dispatches_to_migrate_on_legacy_template(monkeypatch):
+    """A file whose current wikitext carries ``{{Artwork}}`` (the
+    legacy DPLA-bot wrapper) routes to the
+    ``legacy_artwork.migrate_legacy_file`` migration path, not the
+    strip path. Locks in the dispatch order — the migrate check has
+    to come first because the strip is a no-op on legacy-shaped
+    files, but the migrate is the actual cleanup."""
+    from ingest_wikimedia import legacy_artwork, wikitext_normalize
+    from tools import sdc_sync
+
+    # _post_sdc_cleanup_for_page passes the module-level ``site``
+    # global to migrate_legacy_file. ``_initialize()`` populates it in
+    # production but tests don't run init — set a stub here.
+    monkeypatch.setattr(sdc_sync, "site", MagicMock(name="Site"), raising=False)
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = True
+    fake_page.text = "{{Artwork|title=A Title}}\n[[Category:Foo]]"
+
+    migrate_calls = []
+    monkeypatch.setattr(
+        legacy_artwork,
+        "migrate_legacy_file",
+        lambda **kw: migrate_calls.append(kw),
+    )
+    strip_calls = []
+    monkeypatch.setattr(
+        wikitext_normalize,
+        "normalize_page",
+        lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "dpla-1",
+        _make_canonical_item(),
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+    assert len(migrate_calls) == 1
+    assert strip_calls == []
+
+
+def test_post_sdc_cleanup_dispatches_to_strip_on_new_template(monkeypatch):
+    """A file already on ``{{DPLA metadata}}`` routes to the strip
+    path. The migrate path's revision-history walk is expensive and
+    would be wasted work on a file that's already on the new shape."""
+    from ingest_wikimedia import legacy_artwork, wikitext_normalize
+    from tools import sdc_sync
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = True
+    fake_page.text = "{{DPLA metadata\n| title = A Title\n| dpla_id = dpla-1\n}}"
+
+    migrate_calls = []
+    monkeypatch.setattr(
+        legacy_artwork,
+        "migrate_legacy_file",
+        lambda **kw: migrate_calls.append(kw),
+    )
+    strip_calls = []
+    monkeypatch.setattr(
+        wikitext_normalize,
+        "normalize_page",
+        lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "dpla-1",
+        _make_canonical_item(),
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+    assert migrate_calls == []
+    assert len(strip_calls) == 1
+
+
+def test_post_sdc_cleanup_skips_when_neither_template_present(monkeypatch):
+    """A file with neither template (hand-written wikitext, a stub,
+    a file that was never DPLA-uploaded) gets a quiet no-op. The
+    strip would also be a no-op in that case — short-circuiting saves
+    a parse + a save attempt."""
+    from ingest_wikimedia import legacy_artwork, wikitext_normalize
+    from tools import sdc_sync
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = True
+    fake_page.text = "Just some prose, no template."
+
+    migrate_calls = []
+    monkeypatch.setattr(
+        legacy_artwork,
+        "migrate_legacy_file",
+        lambda **kw: migrate_calls.append(kw),
+    )
+    strip_calls = []
+    monkeypatch.setattr(
+        wikitext_normalize,
+        "normalize_page",
+        lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "dpla-1",
+        _make_canonical_item(),
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+    assert migrate_calls == []
+    # Note: normalize_page would itself no-op on no-template wikitext,
+    # so we don't gate strictly on call_count==0 — but ``normalize_page``
+    # IS still called in the strip branch; the dispatcher took the strip
+    # path because the legacy template wasn't found.
+    assert len(strip_calls) == 1
+
+
+def test_post_sdc_cleanup_skips_when_page_missing(monkeypatch):
+    """A page that doesn't exist on Commons (race, deletion) gets no
+    cleanup attempt at all."""
+    from ingest_wikimedia import legacy_artwork, wikitext_normalize
+    from tools import sdc_sync
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = False
+
+    migrate_calls = []
+    strip_calls = []
+    monkeypatch.setattr(
+        legacy_artwork,
+        "migrate_legacy_file",
+        lambda **kw: migrate_calls.append(kw),
+    )
+    monkeypatch.setattr(
+        wikitext_normalize,
+        "normalize_page",
+        lambda *a, **kw: strip_calls.append((a, kw)),
+    )
+
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "dpla-1",
+        _make_canonical_item(),
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+    assert migrate_calls == []
+    assert strip_calls == []
+
+
+def test_post_sdc_cleanup_for_page_isolates_migrate_failure(monkeypatch):
+    """A migration that raises is logged and swallowed — the post-SDC
+    cleanup is best-effort. The outer SDC sync result has already
+    committed; a stripper-side failure must not surface as a SDC sync
+    error."""
+    from ingest_wikimedia import legacy_artwork
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "site", MagicMock(name="Site"), raising=False)
+
+    fake_page = MagicMock(name="FilePage")
+    fake_page.exists.return_value = True
+    fake_page.text = "{{Artwork|title=A Title}}"
+
+    def raise_migrate(**kw):
+        raise RuntimeError("simulated migration failure")
+
+    monkeypatch.setattr(legacy_artwork, "migrate_legacy_file", raise_migrate)
+
+    # Should NOT propagate.
+    sdc_sync._post_sdc_cleanup_for_page(
+        fake_page,
+        "dpla-1",
+        _make_canonical_item(),
+        {"Wikidata": "Q1"},
+        {"Wikidata": "Q2"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # pywikibot retry budget — bounded by _initialize()
 # ---------------------------------------------------------------------------

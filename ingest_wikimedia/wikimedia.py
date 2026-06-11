@@ -510,9 +510,7 @@ def get_wiki_text(
 
     template_string = (
         "== {{int:filedesc}} ==\n"
-        "{{DPLA metadata"
-        + creator_row
-        + "\n| title = $title"
+        "{{DPLA metadata" + creator_row + "\n| title = $title"
         "\n| description = $description"
         "\n| date = $date_string"
         "\n| permission = $permission"
