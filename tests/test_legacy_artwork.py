@@ -1091,6 +1091,7 @@ def test_migrate_legacy_file_strips_params_matching_sdc_in_one_edit():
     # display will render from there.
     for key in (
         "title",
+        "description",
         "creator",
         "date",
         "permission",
