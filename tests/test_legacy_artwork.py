@@ -693,6 +693,58 @@ def test_render_migrated_wikitext_swaps_information_template_too():
     assert "{{DPLA metadata|description=bar}}" in result
 
 
+def test_render_migrated_wikitext_does_not_duplicate_section_heading():
+    """Regression for the bug where ``new_template_block`` carrying a
+    leading ``== {{int:filedesc}} ==`` heading (as produced by
+    :func:`get_wiki_text`) was substituted verbatim in place of the
+    legacy ``{{Artwork}}`` template, ending up with two consecutive
+    headings on the page (the original above + the new one inline).
+
+    The fix extracts just the ``{{DPLA metadata ...}}`` template from
+    ``new_template_block`` before substituting, so the section heading
+    that was already in the page above the legacy template stays put
+    and isn't duplicated below it.
+    """
+    original = (
+        "== {{int:filedesc}} ==\n"
+        "     {{ Artwork\n"
+        "        | title = Old\n"
+        "        | source = {{DPLA|Q1|hub=Q2|dpla_id=abc|local_id=loc|url=http://x}}\n"
+        "     }}\n"
+        "{{PD-USGov}}\n"
+        "[[Category:Foo]]"
+    )
+    # Real ``get_wiki_text`` output — full upload form including heading.
+    new_block = (
+        "== {{int:filedesc}} ==\n\n{{DPLA metadata\n| title = New\n| dpla_id = abc\n}}"
+    )
+    result = render_migrated_wikitext(original, new_block)
+    # Only one section heading in the result.
+    assert result.count("== {{int:filedesc}} ==") == 1, (
+        f"section heading duplicated:\n{result}"
+    )
+    # The new template invocation landed where the Artwork block was.
+    assert "{{DPLA metadata" in result
+    assert "{{Artwork" not in result
+    # Page-level content survives.
+    assert "{{PD-USGov}}" in result
+    assert "[[Category:Foo]]" in result
+
+
+def test_render_migrated_wikitext_accepts_template_only_block_for_back_compat():
+    """The previous test asserts the new caller contract — but the
+    extraction step must also be a no-op on the old caller contract
+    (a bare ``{{DPLA metadata|...}}`` invocation with no heading
+    wrapper). Locks in the back-compat path so an existing in-process
+    caller that pre-strips the heading still works."""
+    original = "== {{int:filedesc}} ==\n{{Artwork|title=Old}}\n[[Category:Foo]]"
+    new_block = "{{DPLA metadata|title=New}}"
+    result = render_migrated_wikitext(original, new_block)
+    assert result.count("== {{int:filedesc}} ==") == 1
+    assert "{{DPLA metadata|title=New}}" in result
+    assert "{{Artwork" not in result
+
+
 # --- post_legacy_import_claims --------------------------------------------
 
 
@@ -924,3 +976,65 @@ def test_legacy_migration_edit_summary_mentions_q131783016():
     """The edit summary should mention the inferred-from-Wikitext
     Wikidata item so reviewers can trace the migration's intent."""
     assert "Q131783016" in LEGACY_MIGRATION_EDIT_SUMMARY
+
+
+def test_migrate_legacy_file_emits_canonical_whitespace():
+    """End-to-end regression for the live bug observed on
+    https://commons.wikimedia.org/wiki/File:Possibly_Carlisle_Indian_School_football_team_-_DPLA_-_0037596b6b4904655f0f949db0a1ab8b_(page_2).tiff
+    where ``migrate_legacy_file`` produced wikitext with:
+
+    1. A duplicated ``== {{int:filedesc}} ==`` heading (the new
+       upload-form block was substituted verbatim in place of the
+       legacy template, on top of the existing heading); AND
+    2. The duplicated heading indented (the leading whitespace before
+       the original ``{{ Artwork`` block survived as a Text node).
+
+    The migration must produce the same canonical shape
+    :func:`get_wiki_text` emits for new uploads: section heading
+    left-justified at column 0, exactly one blank line, then the
+    template left-justified at column 0.
+    """
+
+    class _Rev1:
+        revid, user = 1, "DPLA_bot"
+        text = (
+            "== {{int:filedesc}} ==\n"
+            "     {{ Artwork\n"
+            "        | title = Possibly Carlisle Indian School football team\n"
+            "        | source = {{ DPLA | Q59661040 | hub = Q518155 |"
+            " url = http://x | dpla_id = abc | local_id = 123 }}\n"
+            "     }}\n"
+        )
+
+    page = _mock_file_page("File:Foo.jpg", _Rev1.text, [_Rev1()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    saved_text = page.text
+    # Exactly one section heading.
+    assert saved_text.count("== {{int:filedesc}} ==") == 1, (
+        f"section heading duplicated:\n{saved_text}"
+    )
+    # Heading left-justified — no leading indent on the heading line.
+    assert saved_text.startswith("== {{int:filedesc}} =="), (
+        f"heading not at column 0:\n{saved_text!r}"
+    )
+    # Template left-justified — no leading whitespace before the
+    # opening braces or before any param line.
+    for line in saved_text.splitlines():
+        if line.startswith("{{DPLA metadata") or line.startswith("| ") or line == "}}":
+            continue
+        assert not (line.startswith(" ") or line.startswith("\t")), (
+            f"line carries leading whitespace: {line!r}"
+        )
+    # Canonical blank line between the heading and the template.
+    assert "== {{int:filedesc}} ==\n\n{{DPLA metadata" in saved_text, (
+        f"missing canonical blank-line separator:\n{saved_text!r}"
+    )

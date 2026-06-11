@@ -694,18 +694,45 @@ def entity_was_already_migrated(entity: dict) -> bool:
     return False
 
 
+def _extract_dpla_metadata_template(block: str) -> str:
+    """Pull just the ``{{DPLA metadata ...}}`` template out of
+    ``block``. ``block`` is typically the full upload-form output of
+    :func:`ingest_wikimedia.wikimedia.get_wiki_text`, which includes a
+    leading ``== {{int:filedesc}} ==`` heading and a blank-line
+    separator. The migration rewrite only needs the template invocation
+    itself — the section heading already exists in the page being
+    migrated, and substituting the full block in place of ``{{Artwork}}``
+    duplicates the heading (the original above the legacy template
+    survives, and the new heading lands inline where the template was).
+
+    Falls back to the original block unchanged when no
+    ``{{DPLA metadata}}`` template is found in it — a defensive
+    no-op for callers that already pass just the template.
+    """
+    wikicode = mwparserfromhell.parse(block)
+    for tpl in wikicode.filter_templates():
+        if _template_name(tpl).casefold() == "dpla metadata":
+            return str(tpl)
+    return block
+
+
 def render_migrated_wikitext(
     original_text: str,
     new_template_block: str,
 ) -> str:
     """Replace the first legacy-template invocation in ``original_text``
-    with ``new_template_block``, preserving everything else verbatim.
+    with the ``{{DPLA metadata}}`` template invocation extracted from
+    ``new_template_block``, preserving everything else verbatim.
 
     ``new_template_block`` is the full ``{{DPLA metadata ...}}``
-    rendering, typically produced by
-    :func:`ingest_wikimedia.wikimedia.get_wiki_text`. The caller is
-    responsible for any param-stripping pass (Goal 1's
-    :mod:`wikitext_normalize`) — this helper just swaps the wrapper.
+    rendering as produced by
+    :func:`ingest_wikimedia.wikimedia.get_wiki_text` — including the
+    section heading and blank-line separator that's only relevant for
+    new uploads. Only the inner template invocation is substituted
+    here; the original ``== {{int:filedesc}} ==`` heading above the
+    legacy template stays put. The caller is responsible for any
+    param-stripping or whitespace canonicalisation pass
+    (:mod:`wikitext_normalize`) — this helper just swaps the wrapper.
 
     Returns the original text untouched when no legacy template is
     present (defensive — the executor's caller has already gated this
@@ -724,7 +751,8 @@ def render_migrated_wikitext(
             break
     if template is None:
         return original_text
-    wikicode.replace(template, new_template_block)
+    replacement = _extract_dpla_metadata_template(new_template_block)
+    wikicode.replace(template, replacement)
     return str(wikicode)
 
 
@@ -834,6 +862,17 @@ def migrate_legacy_file(
 
     new_block = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
     rewritten = render_migrated_wikitext(file_page.text, new_block)
+    # Canonical-whitespace pass: ``render_migrated_wikitext`` substitutes
+    # only the template node, so any leading whitespace the legacy
+    # ``{{Artwork}}`` block carried (the pre-#291 pretty-printed indent
+    # of "     {{ Artwork") survives as a Text node before the new
+    # ``{{DPLA metadata}}`` template. ``canonicalize`` left-justifies the
+    # template and forces the canonical blank line between the section
+    # heading and the template, matching the shape ``get_wiki_text`` now
+    # emits for fresh uploads.
+    from .wikitext_normalize import canonicalize
+
+    rewritten = canonicalize(rewritten)
     wikitext_changed = rewritten != file_page.text
     if wikitext_changed:
         file_page.text = rewritten
