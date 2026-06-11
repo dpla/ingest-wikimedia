@@ -3850,7 +3850,19 @@ def _run_partner_mode(partner, ids_file):
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
                 continue
 
-            synced_this_item = False
+            # Per-ordinal sync tracking. ``synced_ord_strs`` records
+            # which ordinals' ``process_one_from_sdc`` returned without
+            # raising — i.e. the ordinals the cleanup pass *should*
+            # touch. Filtering on this set when calling
+            # ``_post_sdc_cleanup_for_item`` keeps cleanup from
+            # running against ordinals that were skipped earlier in
+            # this same item (null pageid, missing-entity skip, etc.) —
+            # the defensive entity-guard inside ``_post_sdc_cleanup_for_page``
+            # would refuse the strip anyway, but routing past it
+            # avoids the wasted entity fetch and keeps the contract
+            # explicit. ``synced_this_item`` derives from the set
+            # below; classification is unchanged.
+            synced_ord_strs: set[str] = set()
             # Tracks whether any ordinal hit the per-ordinal exception
             # path (runtime failure) so an item with all-failed ordinals
             # is classified under SDC_ITEMS_SKIPPED_ERROR rather than
@@ -4027,11 +4039,15 @@ def _run_partner_mode(partner, ids_file):
                         logging.warning(
                             f" -- Failed to touch '{title}' for category refresh: {e!r}"
                         )
-                synced_this_item = True
+                synced_ord_strs.add(ord_str)
             # Item-level bucket classification + cleanup dispatch.
             # ``_classify_item_outcome`` returns the bucket; cleanup
-            # runs for any progress-made outcome (full or partial).
-            outcome = _classify_item_outcome(synced_this_item, had_ordinal_error)
+            # runs for any progress-made outcome (full or partial),
+            # against ONLY the ordinals that synced — partial-sync
+            # items must not retry cleanup on the ordinals that
+            # were skipped earlier in this loop (null pageid,
+            # missing entity, etc.).
+            outcome = _classify_item_outcome(bool(synced_ord_strs), had_ordinal_error)
             tracker.increment(outcome)
             if (
                 outcome
@@ -4041,7 +4057,10 @@ def _run_partner_mode(partner, ids_file):
                 )
                 and _normalize_wikitext_enabled
             ):
-                _post_sdc_cleanup_for_item(s3, partner, dpla_id, ordinal_items)
+                synced_items = [
+                    (o, d) for o, d in ordinal_items if o in synced_ord_strs
+                ]
+                _post_sdc_cleanup_for_item(s3, partner, dpla_id, synced_items)
         completed = True
     except BaseException as exc:
         # The per-ordinal try/except above already swallows every routine
