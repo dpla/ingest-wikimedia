@@ -405,6 +405,11 @@ def test_normalize_preserves_legacy_creator_with_extra_param():
     new_text, stripped = normalize(wikitext, params)
     assert "Other fields 1" not in stripped
     assert "note=editor added" in new_text
+    # Row-by-row independence: the canonical title row still strips —
+    # an extra-param violation on one row doesn't suppress the strip
+    # on a different, clean row. Mirrors the assertion in
+    # ``test_normalize_preserves_url_with_edited_value``.
+    assert "title" in stripped
 
 
 def test_normalize_returns_original_text_unchanged_when_nothing_strips():
