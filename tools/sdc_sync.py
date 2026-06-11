@@ -284,6 +284,18 @@ def _resolve_pageid_from_title(title: str) -> int | None:
     """
     if not title:
         return None
+    # ``upload-result.json`` records page titles WITHOUT the ``File:``
+    # namespace prefix — that's the form pywikibot's
+    # ``FilePage.title(with_ns=False)`` returns and what the uploader
+    # serialises into the sidecar. A bare ``titles=`` query against
+    # the Commons API resolves to the *main* namespace, which never
+    # contains DPLA file pages — so without this prefix the lookup
+    # always reports the title as missing and the fallback returns
+    # ``None`` on files that DO exist. Prepend the namespace
+    # explicitly when absent so the query lands in the File:
+    # namespace where the uploaded media actually lives.
+    if not title.lower().startswith("file:"):
+        title = "File:" + title
     try:
         result = site.simple_request(
             action="query",

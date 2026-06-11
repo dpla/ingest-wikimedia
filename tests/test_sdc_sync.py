@@ -3680,6 +3680,56 @@ def test_resolve_pageid_from_title_returns_none_on_empty_title(monkeypatch):
     assert fake_site.simple_request.call_count == 0
 
 
+def test_resolve_pageid_from_title_prepends_file_namespace(monkeypatch):
+    """Live-bug regression on the post-#302 deploy: ``upload-result.json``
+    stores titles WITHOUT the ``File:`` namespace prefix — that's the
+    form pywikibot's ``FilePage.title(with_ns=False)`` returns and what
+    the uploader serialises. A bare ``titles=<bare title>`` query
+    against the Commons API resolves to the *main* namespace, where
+    DPLA media files don't live; the response reports ``missing`` and
+    the fallback returned ``None`` even on files that actually exist
+    (e.g. the Southern Railway file the PR was supposed to self-heal).
+
+    Fix: the fallback prepends ``File:`` when absent so the lookup
+    lands in the correct namespace."""
+    from tools import sdc_sync
+
+    captured_titles = []
+
+    def stub_submit():
+        # Mirror MediaWiki's response shape for a File:-namespace hit.
+        return {
+            "query": {
+                "pages": {
+                    "193644002": {
+                        "pageid": 193644002,
+                        "ns": 6,
+                        "title": "File:X.tiff",
+                    }
+                }
+            }
+        }
+
+    def stub_simple_request(**kwargs):
+        captured_titles.append(kwargs.get("titles"))
+        m = MagicMock()
+        m.submit.side_effect = stub_submit
+        return m
+
+    fake_site = MagicMock()
+    fake_site.simple_request.side_effect = stub_simple_request
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    # Bare title — what upload-result.json actually stores.
+    assert sdc_sync._resolve_pageid_from_title("X.tiff") == 193644002
+    # Already-prefixed title — pass through unchanged.
+    assert sdc_sync._resolve_pageid_from_title("File:X.tiff") == 193644002
+
+    assert captured_titles == ["File:X.tiff", "File:X.tiff"], (
+        "both bare and File:-prefixed inputs must query File:X.tiff"
+    )
+
+
 def test_entity_has_dpla_attributed_claims_finds_p459_q61848113():
     """The cleanup guard's notion of "has DPLA SDC" matches
     Module:DPLA's ``isDplaDetermined`` filter: at least one statement
