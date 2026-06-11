@@ -389,6 +389,24 @@ def test_normalize_skips_legacy_creator_row_when_dpla_has_no_creator():
     assert "Other fields 1" not in stripped
 
 
+def test_normalize_preserves_legacy_creator_with_extra_param():
+    """Symmetry with the legacy-source and legacy-institution strips:
+    an editor-added arg inside the ``{{InFi|...}}`` sub-template (e.g.
+    ``|note=editor added``) disqualifies the strip even when the
+    Creator name and id args still match canonical. Stripping would
+    silently lose the editor contribution."""
+    params = dpla_metadata_params("abc123", _minimal_item(), _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "{{DPLA metadata\n"
+        "| Other fields 1 = {{InFi|Creator|A Creator|id=fileinfotpl_aut|note=editor added}}\n"
+        "| title = A Title\n"
+        "}}"
+    )
+    new_text, stripped = normalize(wikitext, params)
+    assert "Other fields 1" not in stripped
+    assert "note=editor added" in new_text
+
+
 def test_normalize_returns_original_text_unchanged_when_nothing_strips():
     """No-op preserves the input verbatim — important for the caller's
     "don't save if nothing changed" guard."""

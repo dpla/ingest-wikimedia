@@ -329,7 +329,14 @@ def _strip_legacy_creator(template, expected_params: dict, stripped: list[str]) 
     parsed = _parse_inner_template(str(param.value), "infi")
     if parsed is None:
         return
+    # Match the exact-keys check the source/institution legacy strips
+    # do. Any extra arg an editor added (e.g. an inline ``|note=``)
+    # disqualifies the strip — preserving the editor's contribution.
+    if set(parsed) != {"1", "2", "id"}:
+        return
     if parsed.get("1") != "Creator":
+        return
+    if parsed.get("id") != "fileinfotpl_aut":
         return
     if parsed.get("2") != _canonical_value(creator_expected):
         return
