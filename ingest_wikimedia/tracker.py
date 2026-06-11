@@ -45,9 +45,11 @@ class Result(Enum):
     SDC_ITEMS_SKIPPED_ERROR = auto()
     # Phase-3b legacy-Artwork migration counters. Driven by
     # tools/sdc_sync.py::_run_legacy_migration_mode (and any future
-    # standalone migration tool). Each is per-ordinal (one Commons
-    # file = one count) because that's the level at which the
-    # migration succeeds or fails.
+    # standalone migration tool). Tracking is at per-ordinal
+    # granularity — one Commons file = one migration attempt — with
+    # the exception of LEGACY_IMPORTS_POSTED, which sums the count
+    # of import claims across all files (same shape as
+    # SDC_CLAIMS_ADDED / BYTES — see the inline comment for that one).
     LEGACY_MIGRATED = auto()  # wikitext rewritten + any imports posted
     LEGACY_IMPORTS_POSTED = auto()  # community-import claims (sum across files)
     LEGACY_SKIPPED_NOT_LEGACY = auto()  # page didn't carry a legacy template

@@ -3232,10 +3232,19 @@ def _run_legacy_migration_mode(partner: str, ids_file: str) -> None:
          ``{{DPLA metadata}}``.
 
     Per-file exception boundary: any pywikibot APIError, S3 read
-    failure, or runtime error is logged with a traceback and counted
-    under :class:`Result.LEGACY_SKIPPED_ERROR`. The partner batch
-    keeps walking — same isolation pattern as
-    :func:`_run_partner_mode`'s ordinal loop.
+    failure, or runtime error on a single Commons file is logged with
+    a traceback and counted under
+    :class:`Result.LEGACY_SKIPPED_ERROR`. The remaining files for the
+    same item, and the partner batch as a whole, keep walking — same
+    per-ordinal isolation pattern as :func:`_run_partner_mode`. The
+    boundary lives inside :func:`_migrate_one_dpla_item`'s file loop,
+    not around the whole item, so one bad ordinal doesn't skip the
+    other ordinals' migration.
+
+    Item-level errors (e.g. S3 read failures on the
+    ``dpla-map.json`` / ``upload-result.json`` sidecars themselves)
+    skip the whole item — same as :func:`_run_partner_mode`. These
+    are caught in the outer loop below.
     """
     from botocore.exceptions import ClientError
 
@@ -3262,21 +3271,19 @@ def _run_legacy_migration_mode(partner: str, ids_file: str) -> None:
             logging.info(f"DPLA ID: {dpla_id} ({local_count}/{len(dpla_ids)})")
             try:
                 _migrate_one_dpla_item(s3, partner, dpla_id)
-            except _MissingEntityError:
-                # The MediaInfo entity doesn't exist — treat as "not
-                # legacy" (file gone, nothing to migrate). The migration
-                # only operates on existing pages.
-                logging.info(
-                    f" -- {dpla_id}: Commons MediaInfo entity missing; skipping."
-                )
-                tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
             except ClientError as e:
+                # Item-level sidecar read failure — affects every file
+                # for this item identically, so skip the whole item.
+                # Per-file errors are caught inside _migrate_one_dpla_item.
                 logging.warning(
                     f" -- S3 error during migration of {partner}/{dpla_id}:"
                     f" {e!r}; skipping."
                 )
                 tracker.increment(Result.LEGACY_SKIPPED_ERROR)
             except Exception:
+                # Item-level setup error (DPLA.get_provider_and_data_provider,
+                # JSON parse, etc.). Per-file errors are already isolated
+                # inside the loop and shouldn't reach here.
                 logging.exception(f" -- {dpla_id}: legacy migration failed; skipping.")
                 tracker.increment(Result.LEGACY_SKIPPED_ERROR)
         completed = True
@@ -3304,12 +3311,16 @@ def _run_legacy_migration_mode(partner: str, ids_file: str) -> None:
 
 
 def _migrate_one_dpla_item(s3, partner: str, dpla_id: str) -> None:
-    """Inner per-item handler for :func:`_run_legacy_migration_mode`.
+    """Inner handler for :func:`_run_legacy_migration_mode` — sidecar
+    loading, provider resolution, and the per-file migration loop.
 
-    Extracted so the per-item exception boundary in the outer loop
-    can wrap a single call and the body stays readable. All counter
-    updates happen here so the outer loop sees clean semantics —
-    "did we raise or not" is the only signal it needs.
+    The per-file exception boundary lives inside the loop here (not in
+    the outer caller) so one bad Commons file inside a multi-ordinal
+    item doesn't skip its siblings — same per-ordinal isolation
+    pattern :func:`_run_partner_mode` uses. Item-level setup errors
+    (missing sidecars, provider lookup failures) propagate up to the
+    outer loop, which classifies them under the same tracker bucket
+    but skips the whole item rather than individual files.
     """
     from ingest_wikimedia.dpla import DPLA
     from ingest_wikimedia.legacy_artwork import migrate_legacy_file
@@ -3349,18 +3360,37 @@ def _migrate_one_dpla_item(s3, partner: str, dpla_id: str) -> None:
         return
 
     for title in eligible_titles:
-        page = pywikibot.FilePage(site, title)
-        if not page.exists():
+        # Per-file exception boundary: a transient pywikibot APIError on
+        # one ordinal must not abort the remaining ordinals for this item.
+        # Matches the per-ordinal pattern in _run_partner_mode. The
+        # MissingEntity case is folded into NOT_LEGACY rather than ERROR
+        # because the file is just gone, not a real failure.
+        try:
+            page = pywikibot.FilePage(site, title)
+            if not page.exists():
+                tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+                continue
+            result = migrate_legacy_file(
+                file_page=page,
+                item_metadata=item_metadata,
+                provider=provider,
+                data_provider=data_provider,
+                dpla_id=dpla_id,
+                site=site,
+            )
+        except _MissingEntityError:
+            logging.info(
+                f" -- '{title}' for {dpla_id}: MediaInfo entity missing; skipping."
+            )
             tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
             continue
-        result = migrate_legacy_file(
-            file_page=page,
-            item_metadata=item_metadata,
-            provider=provider,
-            data_provider=data_provider,
-            dpla_id=dpla_id,
-            site=site,
-        )
+        except Exception:
+            logging.exception(
+                f" -- '{title}' for {dpla_id}: legacy migration failed; skipping."
+            )
+            tracker.increment(Result.LEGACY_SKIPPED_ERROR)
+            continue
+
         if result.skipped_reason == "no-legacy-template":
             tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
         elif result.skipped_reason == "already-migrated":

@@ -27,6 +27,7 @@ misrepresent the value as DPLA-sourced when it isn't.
 from __future__ import annotations
 
 import datetime
+import json
 from dataclasses import dataclass, field
 from typing import Iterable
 from urllib.parse import urlencode
@@ -772,14 +773,12 @@ def post_legacy_import_claims(
     — the caller catches it per-file so a single failure doesn't kill
     the partner batch.
     """
-    import json as _json
-
     site.simple_request(
         action="wbeditentity",
         id=mediaid,
         bot=True,
         token=site.tokens["csrf"],
-        data=_json.dumps({"claims": claims}),
+        data=json.dumps({"claims": claims}),
         summary=summary,
     ).submit()
 
