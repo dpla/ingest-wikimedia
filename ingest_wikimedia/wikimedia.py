@@ -496,27 +496,32 @@ def get_wiki_text(
     """
     params = dpla_metadata_params(dpla_id, item_metadata, provider, data_provider)
 
+    # Template literal is left-justified — the leading whitespace of
+    # the Python source indentation would otherwise carry through into
+    # the rendered wikitext. The wiki parser ignores leading whitespace
+    # on template-param lines (so the previous indented form rendered
+    # the same), but anything reading the page source — editors using
+    # the wikitext editor, future scripts diffing the wikitext, the
+    # ``wikitext_normalize`` comparator — sees the noise.
     if params["creator"]:
-        creator_row = """
-        | creator = $creator"""
+        creator_row = "\n| creator = $creator"
     else:
         creator_row = ""
 
     template_string = (
-        """== {{int:filedesc}} ==
-     {{ DPLA metadata"""
+        "== {{int:filedesc}} ==\n"
+        "{{DPLA metadata"
         + creator_row
-        + """
-        | title = $title
-        | description = $description
-        | date = $date_string
-        | permission = $permission
-        | hub = $hub
-        | institution = $institution
-        | url = $url
-        | dpla_id = $dpla_id
-        | local_id = $local_id
-     }}"""
+        + "\n| title = $title"
+        "\n| description = $description"
+        "\n| date = $date_string"
+        "\n| permission = $permission"
+        "\n| hub = $hub"
+        "\n| institution = $institution"
+        "\n| url = $url"
+        "\n| dpla_id = $dpla_id"
+        "\n| local_id = $local_id"
+        "\n}}"
     )
 
     return Template(template_string).substitute(

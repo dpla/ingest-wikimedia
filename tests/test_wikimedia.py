@@ -1139,12 +1139,13 @@ def test_get_wiki_text_emits_dpla_metadata_template():
         provider={"Wikidata": "Q1"},
         data_provider={"Wikidata": "Q2"},
     )
-    # The whole-template name appears with leading whitespace from the
-    # template_string formatting; assert on the unambiguous fragment.
-    assert "{{ DPLA metadata" in result, (
+    # The template literal is left-justified — no leading whitespace
+    # before ``{{DPLA metadata`` (the indented form leaked Python
+    # source-code indentation into the rendered wikitext).
+    assert "{{DPLA metadata" in result, (
         f"get_wiki_text must emit {{{{DPLA metadata}}}}; got:\n{result}"
     )
-    assert "{{ Artwork" not in result, (
+    assert "{{Artwork" not in result, (
         "get_wiki_text must NOT emit {{Artwork}} (replaced by "
         f"{{{{DPLA metadata}}}}); got:\n{result}"
     )
@@ -1190,3 +1191,12 @@ def test_get_wiki_text_emits_flat_param_shape():
     assert "{{ DPLA |" not in result and "{{DPLA|" not in result
     assert "{{ Institution " not in result and "{{Institution " not in result
     assert "{{ InFi " not in result and "{{InFi " not in result
+    # No leading whitespace on any param row — the rendered wikitext
+    # is left-justified. Python-source indentation in the previous
+    # triple-quoted template literal leaked into the output, which
+    # editors viewing the page source saw as cosmetic noise.
+    for line in result.splitlines():
+        if line.startswith(" ") or line.startswith("\t"):
+            raise AssertionError(
+                f"line has leading whitespace: {line!r} in:\n{result}"
+            )
