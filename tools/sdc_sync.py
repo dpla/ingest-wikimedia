@@ -124,6 +124,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--migrate-legacy",
+        dest="migrate_legacy",
+        action="store_true",
+        default=False,
+        help=(
+            "Instead of running SDC sync, migrate legacy {{Artwork}} files to "
+            "{{DPLA metadata}} for the supplied --partner. Walks each file's "
+            "revision history to distinguish DPLA-bot values (overwrite-safe) "
+            "from community contributions (preserved as SDC statements with "
+            "P887→Q131783016 + P4656 refs), then rewrites the wikitext."
+        ),
+    )
+    p.add_argument(
         "--normalize-wikitext",
         dest="normalize_wikitext",
         action="store_true",
@@ -3199,6 +3212,201 @@ def _normalize_wikitext_for_item(
             )
 
 
+def _run_legacy_migration_mode(partner: str, ids_file: str) -> None:
+    """Drive the legacy ``{{Artwork}}`` → ``{{DPLA metadata}}`` migration
+    for a whole partner.
+
+    Iterates the partner's IDs CSV — same input shape as
+    :func:`_run_partner_mode`'s SDC sync path. For each DPLA item:
+
+    1. Read ``dpla-map.json`` (canonical DPLA record) from S3 to drive
+       provenance comparison and produce the new template wikitext.
+    2. Read ``upload-result.json`` to discover the Commons file titles
+       this DPLA item maps to.
+    3. For each Commons file:
+       * Resolve the ``FilePage`` and walk its revision history.
+       * Plan the migration (DPLA-bot vs community provenance).
+       * Post any community-import SDC statements with the legacy
+         reference shape (P887→Q131783016 + P4656).
+       * Rewrite the wikitext, swapping the legacy template for
+         ``{{DPLA metadata}}``.
+
+    Per-file exception boundary: any pywikibot APIError, S3 read
+    failure, or runtime error on a single Commons file is logged with
+    a traceback and counted under
+    :class:`Result.LEGACY_SKIPPED_ERROR`. The remaining files for the
+    same item, and the partner batch as a whole, keep walking — same
+    per-ordinal isolation pattern as :func:`_run_partner_mode`. The
+    boundary lives inside :func:`_migrate_one_dpla_item`'s file loop,
+    not around the whole item, so one bad ordinal doesn't skip the
+    other ordinals' migration.
+
+    Item-level errors (e.g. S3 read failures on the
+    ``dpla-map.json`` / ``upload-result.json`` sidecars themselves)
+    skip the whole item — same as :func:`_run_partner_mode`. These
+    are caught in the outer loop below.
+    """
+    from botocore.exceptions import ClientError
+
+    from ingest_wikimedia.s3 import S3Client
+
+    # Mirrors _run_partner_mode's start-of-pipeline setup. Operators
+    # see the same phase-start / phase-complete Slack messages so
+    # wikimedia_upload_status can detect progress identically.
+    setup_logging(partner, "legacy-migration", logging.INFO)
+    notify_phase_start(partner, "legacy-migration")
+    start_time = time.time()
+    tracker.reset()
+
+    s3 = S3Client()
+    with open(ids_file) as f:
+        dpla_ids = [line.strip() for line in f if line.strip()]
+    logging.info(
+        f"Legacy-migration mode: {partner} — {len(dpla_ids)} items from {ids_file}"
+    )
+
+    completed = False
+    try:
+        for local_count, dpla_id in enumerate(dpla_ids, start=1):
+            logging.info(f"DPLA ID: {dpla_id} ({local_count}/{len(dpla_ids)})")
+            try:
+                _migrate_one_dpla_item(s3, partner, dpla_id)
+            except ClientError as e:
+                # Item-level sidecar read failure — affects every file
+                # for this item identically, so skip the whole item.
+                # Per-file errors are caught inside _migrate_one_dpla_item.
+                logging.warning(
+                    f" -- S3 error during migration of {partner}/{dpla_id}:"
+                    f" {e!r}; skipping."
+                )
+                tracker.increment(Result.LEGACY_SKIPPED_ERROR)
+            except Exception:
+                # Item-level setup error (DPLA.get_provider_and_data_provider,
+                # JSON parse, etc.). Per-file errors are already isolated
+                # inside the loop and shouldn't reach here.
+                logging.exception(f" -- {dpla_id}: legacy migration failed; skipping.")
+                tracker.increment(Result.LEGACY_SKIPPED_ERROR)
+        completed = True
+    except BaseException as exc:
+        logging.exception(
+            "Legacy migration aborted with unhandled exception (%s)",
+            type(exc).__name__,
+        )
+        raise
+    finally:
+        elapsed = time.time() - start_time
+        if completed:
+            logging.info("\n" + str(tracker))
+            logging.info(f"{elapsed} seconds.")
+            # No dedicated Slack notification helper yet — reuse the SDC
+            # phase's `notify_sdc_complete` is wrong semantically (this
+            # isn't an SDC sync), so just log to the local file. A
+            # later phase can add a `notify_legacy_complete` if this
+            # mode becomes routine.
+        else:
+            logging.warning(
+                "Legacy migration aborted before completion; suppressing"
+                " terminal COUNTS dump."
+            )
+
+
+def _migrate_one_dpla_item(s3, partner: str, dpla_id: str) -> None:
+    """Inner handler for :func:`_run_legacy_migration_mode` — sidecar
+    loading, provider resolution, and the per-file migration loop.
+
+    The per-file exception boundary lives inside the loop here (not in
+    the outer caller) so one bad Commons file inside a multi-ordinal
+    item doesn't skip its siblings — same per-ordinal isolation
+    pattern :func:`_run_partner_mode` uses. Item-level setup errors
+    (missing sidecars, provider lookup failures) propagate up to the
+    outer loop, which classifies them under the same tracker bucket
+    but skips the whole item rather than individual files.
+    """
+    from ingest_wikimedia.dpla import DPLA
+    from ingest_wikimedia.legacy_artwork import migrate_legacy_file
+
+    item_raw = s3.get_item_metadata(partner, dpla_id)
+    if not item_raw:
+        logging.info(f" -- {dpla_id}: no dpla-map.json on S3; skipping.")
+        tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+        return
+    item_metadata = json.loads(item_raw)
+
+    upload_raw = s3.get_upload_result(partner, dpla_id)
+    if not upload_raw:
+        logging.info(f" -- {dpla_id}: no upload-result.json on S3; skipping.")
+        tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+        return
+    upload_result = json.loads(upload_raw)
+
+    provider, data_provider = DPLA.get_provider_and_data_provider(item_metadata, hubs)
+    ordinals = upload_result.get("ordinals", {})
+    if not isinstance(ordinals, dict):
+        logging.warning(
+            f" -- {dpla_id}: upload-result.json has non-mapping ordinals; skipping."
+        )
+        tracker.increment(Result.LEGACY_SKIPPED_ERROR)
+        return
+
+    eligible_titles = [
+        data.get("title")
+        for data in ordinals.values()
+        if isinstance(data, dict)
+        and data.get("status") in ("UPLOADED", "SKIPPED")
+        and data.get("title")
+    ]
+    if not eligible_titles:
+        tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+        return
+
+    for title in eligible_titles:
+        # Per-file exception boundary: a transient pywikibot APIError on
+        # one ordinal must not abort the remaining ordinals for this item.
+        # Matches the per-ordinal pattern in _run_partner_mode. The
+        # MissingEntity case is folded into NOT_LEGACY rather than ERROR
+        # because the file is just gone, not a real failure.
+        try:
+            page = pywikibot.FilePage(site, title)
+            if not page.exists():
+                tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+                continue
+            result = migrate_legacy_file(
+                file_page=page,
+                item_metadata=item_metadata,
+                provider=provider,
+                data_provider=data_provider,
+                dpla_id=dpla_id,
+                site=site,
+            )
+        except _MissingEntityError:
+            logging.info(
+                f" -- '{title}' for {dpla_id}: MediaInfo entity missing; skipping."
+            )
+            tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+            continue
+        except Exception:
+            logging.exception(
+                f" -- '{title}' for {dpla_id}: legacy migration failed; skipping."
+            )
+            tracker.increment(Result.LEGACY_SKIPPED_ERROR)
+            continue
+
+        if result.skipped_reason == "no-legacy-template":
+            tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
+        elif result.skipped_reason == "already-migrated":
+            tracker.increment(Result.LEGACY_SKIPPED_ALREADY)
+        else:
+            tracker.increment(Result.LEGACY_MIGRATED)
+            if result.imports_posted:
+                tracker.increment(
+                    Result.LEGACY_IMPORTS_POSTED, amount=result.imports_posted
+                )
+            logging.info(
+                f" -- Migrated '{title}': {result.imports_posted} community"
+                f" import(s), wikitext_changed={result.wikitext_changed}"
+            )
+
+
 def _run_partner_mode(partner, ids_file):
     """Drive the SDC phase from precomputed S3 sidecars for a whole partner.
 
@@ -3669,12 +3877,20 @@ def main() -> None:
                 break
 
     elif args.partner:
-        # Partner-driven SDC phase (PR 4). Iterates the partner's IDs CSV and
-        # syncs each item's precomputed sdc.json against Commons. Designed to
-        # be the last step in a `get-ids-es → downloader → uploader → sdc-sync`
-        # pipeline chain.
         _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")
-        _run_partner_mode(args.partner, _ids_file)
+        if args.migrate_legacy:
+            # Phase 3b: legacy {{Artwork}} → {{DPLA metadata}} migration. A
+            # one-time operation per file, separate from the SDC sync that
+            # ``_run_partner_mode`` performs. Both walk the same partner IDs
+            # CSV; the migration mode is gated behind --migrate-legacy so
+            # an operator has to ask for it explicitly.
+            _run_legacy_migration_mode(args.partner, _ids_file)
+        else:
+            # Partner-driven SDC phase (PR 4). Iterates the partner's IDs CSV
+            # and syncs each item's precomputed sdc.json against Commons.
+            # Designed to be the last step in a
+            # `get-ids-es → downloader → uploader → sdc-sync` pipeline chain.
+            _run_partner_mode(args.partner, _ids_file)
 
 
 if __name__ == "__main__":

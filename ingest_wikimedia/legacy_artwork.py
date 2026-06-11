@@ -27,6 +27,7 @@ misrepresent the value as DPLA-sourced when it isn't.
 from __future__ import annotations
 
 import datetime
+import json
 from dataclasses import dataclass, field
 from typing import Iterable
 from urllib.parse import urlencode
@@ -506,3 +507,359 @@ def build_legacy_import_claims(plan: MigrationPlan) -> list[dict]:
         if claim is not None:
             claims.append(claim)
     return claims
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b integration layer — pywikibot + wbeditentity + wikitext rewrite.
+#
+# Everything above this line is pure logic over plain dicts and the
+# RevisionSnapshot dataclass. Everything below talks to pywikibot,
+# Wikibase, or the in-tree DPLA-API parser. Keeping the boundary
+# explicit lets the test suite cover the pure layer without mocks and
+# lets future callers (a separate maintenance tool, a one-shot
+# migration script) reuse the planner standalone.
+# ---------------------------------------------------------------------------
+
+
+def fetch_revision_snapshots(file_page) -> list[RevisionSnapshot]:
+    """Pull the full revision history of ``file_page`` into
+    :class:`RevisionSnapshot` records the planner consumes.
+
+    Requests revision text (``content=True``) so the planner can parse
+    each historical wikitext. On a long-tenure file with thousands of
+    revisions this is a non-trivial pywikibot call; callers running
+    against a partner batch should expect minutes of wall time per
+    high-traffic file. The cost is paid once at plan time — the result
+    of :func:`plan_migration` is a small dict the executor walks
+    cheaply.
+
+    Missing per-revision metadata (suppressed-author revisions, missing
+    text) is tolerated: empty user names become ``""`` and absent text
+    becomes ``""``, so :func:`parse_artwork_params` simply finds no
+    params and the revision contributes nothing to provenance.
+    """
+    snapshots: list[RevisionSnapshot] = []
+    for rev in file_page.revisions(content=True):
+        snapshots.append(
+            RevisionSnapshot(
+                revid=getattr(rev, "revid", 0),
+                user=getattr(rev, "user", "") or "",
+                text=getattr(rev, "text", "") or "",
+            )
+        )
+    return snapshots
+
+
+def materialize_pending_date_claim(
+    placeholder: dict,
+    today: datetime.date | None = None,
+) -> dict | None:
+    """Take a Phase-3a ``_phase3a_pending_date_parse`` placeholder claim
+    and materialise it into a real Wikibase P571 (inception) statement.
+
+    Reuses :func:`ingest_wikimedia.sdc.parse_dpla_date` for the parse —
+    the DPLA-date parser is the in-tree source of truth for the dozens
+    of display-date formats Commons receives, so duplicating it here
+    would just drift. When the parser commits to a structured time,
+    the claim is value-typed at the parser's chosen precision; when it
+    doesn't, the claim is left at ``somevalue`` with the raw string
+    preserved as a P1932 (stated as) qualifier. The P1480 circa
+    qualifier is stamped when the parser flagged the source as
+    approximate.
+
+    Reference shape is the legacy-import P887→Q131783016 +
+    P4656→permalink shape from :func:`_reference_snaks` — *not* the
+    DPLA-standard refs used by :mod:`ingest_wikimedia.sdc`'s
+    ``_build_date_claim``. The whole point of legacy-import is that
+    the value didn't come from DPLA and must not be misattributed.
+
+    Returns None when ``placeholder`` doesn't carry the expected
+    sentinel keys — the caller drops the claim from the import set
+    and the value stays in wikitext until a later phase.
+
+    ``today`` is accepted (currently unused) for symmetry with other
+    claim builders so a later phase can add a P813 retrieved-on
+    reference snak if useful without changing call sites.
+    """
+    from .sdc import parse_dpla_date  # late import to avoid cycle
+
+    del today  # currently unused; see docstring
+    raw_date = placeholder.get("_phase3a_pending_date_parse")
+    prop = placeholder.get("_property")
+    permalink_from = placeholder.get("_permalink")
+    if not raw_date or not prop or not permalink_from:
+        return None
+
+    parsed = parse_dpla_date(raw_date)
+    qualifiers: dict[str, list[dict]] = {
+        # P1932 (stated as) preserves the verbatim source string so a
+        # reader can recover what the editor actually wrote, even when
+        # the structured time has reduced precision.
+        "P1932": [
+            {
+                "snaktype": "value",
+                "property": "P1932",
+                "datatype": "string",
+                "datavalue": {"type": "string", "value": raw_date},
+            }
+        ]
+    }
+    if parsed is not None:
+        mainsnak = {
+            "snaktype": "value",
+            "property": prop,
+            "datatype": "time",
+            "datavalue": {"type": "time", "value": parsed["value"]},
+        }
+        if parsed.get("approximate"):
+            # P1480 (sourcing circumstances) = Q5727902 (circa); same
+            # encoding as ingest_wikimedia.sdc._build_date_claim.
+            qualifiers["P1480"] = [
+                {
+                    "snaktype": "value",
+                    "property": "P1480",
+                    "datatype": "wikibase-item",
+                    "datavalue": {
+                        "type": "wikibase-entityid",
+                        "value": {"entity-type": "item", "id": "Q5727902"},
+                    },
+                }
+            ]
+    else:
+        # ``somevalue`` preserves the legacy behaviour for un-parseable
+        # dates — the statement asserts "there is *some* inception
+        # value" without committing to which, and the P1932 qualifier
+        # carries the editor's display string.
+        mainsnak = {"snaktype": "somevalue", "property": prop, "datatype": "time"}
+
+    return {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": mainsnak,
+        "qualifiers": qualifiers,
+        "qualifiers-order": list(qualifiers.keys()),
+        "references": [_reference_snaks(permalink_from)],
+    }
+
+
+def materialize_import_claims(claims: list[dict]) -> list[dict]:
+    """Walk an import-claim list and substitute every Phase-3a date
+    placeholder for a real P571 time statement.
+
+    Claims without a placeholder marker pass through unchanged.
+    Placeholders whose date can't be expanded (parser failure paired
+    with missing sentinel keys — should never happen for in-tree
+    callers) are dropped silently rather than crashing the migration.
+    """
+    materialised: list[dict] = []
+    for claim in claims:
+        if "_phase3a_pending_date_parse" in claim:
+            real = materialize_pending_date_claim(claim)
+            if real is not None:
+                materialised.append(real)
+        else:
+            materialised.append(claim)
+    return materialised
+
+
+def entity_was_already_migrated(entity: dict) -> bool:
+    """Return True when ``entity`` (a wbgetentities-shaped MediaInfo
+    JSON blob) already carries at least one legacy-import statement.
+
+    Idempotency guard: if the executor's previous run posted SDC for a
+    file but crashed before rewriting the wikitext, a re-run sees the
+    page still in legacy form, would re-plan, and would re-post the
+    same claims — creating duplicates. Detecting our own reference
+    signature on any of the import properties is enough to bail out
+    cleanly; the operator then re-runs *just* the wikitext rewrite
+    via a follow-up tool (Phase 3b doesn't expose that yet, so the
+    today-practice is a manual re-edit).
+
+    Looks for a P887 reference snak whose target is exactly
+    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of any
+    Phase-3a-mapped property. Subtle: a non-DPLA editor could in
+    principle stamp the same ref shape on a hand-authored claim, but
+    that's the same semantic ("inferred from Wikitext") and the
+    skip-on-detect behaviour is still correct — we just don't add
+    duplicates.
+    """
+    statements = entity.get("statements") or entity.get("claims") or {}
+    for prop, _ in LEGACY_IMPORT_PROPERTY.values():
+        for stmt in statements.get(prop, []):
+            for ref in stmt.get("references", []):
+                for snak in ref.get("snaks", {}).get(PID_BASED_ON_HEURISTIC, []):
+                    target = snak.get("datavalue", {}).get("value", {}).get("id")
+                    if target == QID_INFERRED_FROM_WIKITEXT:
+                        return True
+    return False
+
+
+def render_migrated_wikitext(
+    original_text: str,
+    new_template_block: str,
+) -> str:
+    """Replace the first legacy-template invocation in ``original_text``
+    with ``new_template_block``, preserving everything else verbatim.
+
+    ``new_template_block`` is the full ``{{DPLA metadata ...}}``
+    rendering, typically produced by
+    :func:`ingest_wikimedia.wikimedia.get_wiki_text`. The caller is
+    responsible for any param-stripping pass (Goal 1's
+    :mod:`wikitext_normalize`) — this helper just swaps the wrapper.
+
+    Returns the original text untouched when no legacy template is
+    present (defensive — the executor's caller has already gated this
+    via the migration plan, but a stale text snapshot between plan and
+    write would otherwise mangle a non-legacy page).
+
+    Uses mwparserfromhell so license tags, categories, and any other
+    page-level structure survive in their original positions. Only
+    the legacy-template node itself is replaced.
+    """
+    wikicode = mwparserfromhell.parse(original_text)
+    template = None
+    for tpl in wikicode.filter_templates():
+        if _template_name(tpl) in LEGACY_TEMPLATE_NAMES:
+            template = tpl
+            break
+    if template is None:
+        return original_text
+    wikicode.replace(template, new_template_block)
+    return str(wikicode)
+
+
+# Edit summary the migration executor stamps on every wikitext save +
+# wbeditentity edit. Centralised so a future change to the wording
+# (e.g. linking to the Commons documentation page) doesn't need to be
+# hunted down across multiple call sites.
+LEGACY_MIGRATION_EDIT_SUMMARY = (
+    "Migrate legacy {{Artwork}} to {{DPLA metadata}} per DPLA SDC sync; "
+    "community-contributed metadata preserved as SDC statements with "
+    "[[d:Q131783016|inferred-from-Wikitext]] reference."
+)
+
+
+@dataclass
+class MigrationResult:
+    """End-state report from :func:`migrate_legacy_file`.
+
+    ``imports_posted`` is the number of community-import claims
+    actually written to the entity (post-materialisation, post-skip
+    for date-parse failures). ``wikitext_changed`` is whether the
+    page text was edited.
+    """
+
+    skipped_reason: str = ""
+    imports_posted: int = 0
+    wikitext_changed: bool = False
+    plan: MigrationPlan | None = None
+
+
+def post_legacy_import_claims(
+    mediaid: str,
+    claims: list[dict],
+    site,
+    summary: str = LEGACY_MIGRATION_EDIT_SUMMARY,
+) -> None:
+    """POST ``claims`` to ``mediaid`` as a single ``wbeditentity`` edit.
+
+    Mirrors :func:`tools.sdc_sync._submit_sdc_write`'s call pattern —
+    CSRF token from ``site.tokens['csrf']``, ``bot=True``, atomic
+    bundle — without importing it (the sdc_sync helper reads a
+    module-level ``site`` global; we want the explicit-argument form
+    so callers can pass a mocked site in tests).
+
+    Raises :class:`pywikibot.exceptions.APIError` on Wikibase rejection
+    — the caller catches it per-file so a single failure doesn't kill
+    the partner batch.
+    """
+    site.simple_request(
+        action="wbeditentity",
+        id=mediaid,
+        bot=True,
+        token=site.tokens["csrf"],
+        data=json.dumps({"claims": claims}),
+        summary=summary,
+    ).submit()
+
+
+def migrate_legacy_file(
+    *,
+    file_page,
+    item_metadata: dict,
+    provider: dict,
+    data_provider: dict,
+    dpla_id: str,
+    site,
+    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    summary: str = LEGACY_MIGRATION_EDIT_SUMMARY,
+) -> MigrationResult:
+    """End-to-end legacy-Artwork migration for a single file.
+
+    The order is load-bearing:
+
+    1. Plan from the live revision history.
+    2. Idempotency check against the file's MediaInfo entity — bail
+       out if a previous run already imported (avoids duplicates).
+    3. POST community-import SDC statements *first*. If this fails
+       the wikitext stays in legacy form, the next run will detect
+       no SDC, and a retry produces the same outcome.
+    4. *Then* rewrite the wikitext. If this fails after step 3
+       succeeded, the file carries the imported SDC but still has
+       the legacy template — a follow-up wikitext-only sweep would
+       complete the migration. The reverse order (rewrite first,
+       then SDC) would discard the wikitext provenance before the
+       SDC import landed, irrecoverably losing community values if
+       the SDC POST then failed.
+    """
+    from .wikimedia import dpla_metadata_params, get_wiki_text
+
+    title = file_page.title()
+    revisions = fetch_revision_snapshots(file_page)
+    canonical_params = dpla_metadata_params(
+        dpla_id, item_metadata, provider, data_provider
+    )
+    plan = plan_migration(title, revisions, canonical_params, bot_accounts)
+    if plan is None:
+        return MigrationResult(skipped_reason="no-legacy-template")
+
+    mediaid = f"M{file_page.pageid}"
+    entity = _fetch_entity_or_empty(site, mediaid)
+    if entity_was_already_migrated(entity):
+        return MigrationResult(skipped_reason="already-migrated", plan=plan)
+
+    claims = materialize_import_claims(build_legacy_import_claims(plan))
+    if claims:
+        post_legacy_import_claims(mediaid, claims, site, summary=summary)
+
+    new_block = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
+    rewritten = render_migrated_wikitext(file_page.text, new_block)
+    wikitext_changed = rewritten != file_page.text
+    if wikitext_changed:
+        file_page.text = rewritten
+        file_page.save(summary=summary, minor=False, bot=True)
+
+    return MigrationResult(
+        imports_posted=len(claims),
+        wikitext_changed=wikitext_changed,
+        plan=plan,
+    )
+
+
+def _fetch_entity_or_empty(site, mediaid: str) -> dict:
+    """Pull ``mediaid``'s MediaInfo entity via ``wbgetentities``, or
+    return an empty dict when the entity doesn't exist (file uploaded
+    but no SDC ever written).
+
+    Doesn't surface the missing-entity case as an error — for legacy
+    migration, "no SDC yet" is the most common starting state, and an
+    empty entity simply means
+    :func:`entity_was_already_migrated` returns False and the
+    executor proceeds to post the imports as fresh statements.
+    """
+    try:
+        raw = site.simple_request(action="wbgetentities", ids=mediaid).submit()
+    except Exception:  # noqa: BLE001 — best-effort fetch
+        return {}
+    entities = raw.get("entities", {})
+    return entities.get(mediaid, {}) if isinstance(entities, dict) else {}
