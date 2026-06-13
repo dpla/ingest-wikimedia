@@ -550,9 +550,119 @@ def fetch_revision_snapshots(file_page) -> list[RevisionSnapshot]:
     return snapshots
 
 
+_QID_HEURISTIC = "Q61848113"
+_QID_CIRCA = "Q5727902"
+_PID_DPLA_DETERMINATION = "P459"
+_PID_SOURCING_CIRCUMSTANCES = "P1480"
+
+
+def _expand_wikitext_for_date_parse(raw_date: str, site) -> str:
+    """If ``raw_date`` contains MediaWiki template markup, expand
+    templates server-side and return the rendered text. Otherwise
+    pass through unchanged.
+
+    The legacy ``{{Artwork}}`` ``| date = …`` value can legitimately
+    carry editor-applied template wrappers — most commonly
+    ``{{other date|~|1911}}``, ``{{circa|1911}}``, ``{{date|1911}}``
+    etc. Storing the raw markup in the SDC ``P1932`` qualifier (1)
+    defeats the dedup check below, because the renderer-style
+    "circa 1911" string never compares equal to "{{other date|~|
+    1911}}", and (2) renders as literal template text in
+    Module:DPLA's yellow-box row (Module:DPLA mitigates this at
+    display time but the upstream fix is to not store wikitext in a
+    structured-data string in the first place).
+
+    Falls back to the raw value when ``site`` is None, when no
+    template markup is detected (fast path), or when the API call
+    raises. The HTML residue that MediaWiki sometimes appends to a
+    template's plain-text rendering (e.g. the hidden
+    ``<div ...>date QS:P,…</div>`` micro-format ``{{other date}}``
+    emits) is stripped before return — that scaffolding is for the
+    rendered page, not for a normalised value string.
+    """
+    if not raw_date or "{{" not in raw_date or site is None:
+        return raw_date
+    try:
+        expanded = site.expand_text(raw_date)
+    except Exception:
+        return raw_date
+    # Strip any hidden HTML residue (QuickStatements micro-format etc.)
+    # the template's expansion may have appended; we want the plain
+    # human-readable rendering only.
+    import re
+
+    expanded = re.sub(r"<[^>]+>.*?</[^>]+>", "", expanded, flags=re.DOTALL)
+    expanded = re.sub(r"<[^>]+/?>", "", expanded)
+    return expanded.strip() or raw_date
+
+
+def _existing_dpla_date_matches_parsed(
+    entity: dict | None, prop: str, parsed: dict
+) -> bool:
+    """Return True iff ``entity`` already has a DPLA-attributed
+    statement on ``prop`` whose Wikibase time value and circa-flag
+    match ``parsed``.
+
+    "DPLA-attributed" means a ``P459 = Q61848113`` (determination
+    method = heuristic) qualifier — the same signal Module:DPLA's
+    ``dplaStatements`` uses to scope the blue-box render. The check
+    deliberately doesn't compare reference shape: the editor-edited
+    legacy value is a different source than DPLA's own sync, but if
+    the *semantic* value and approximate-flag match, there's no
+    user-contributed information to preserve — the editor's edit was
+    just a re-formatting of the DPLA value.
+
+    Match contract: ``time`` string and ``precision`` integer must
+    be exactly equal, AND ``parsed.approximate`` must agree with
+    whether the existing statement carries a
+    ``P1480 = Q5727902`` (circa) qualifier. Wikibase normalises the
+    time string at write time, so byte equality is the right test —
+    same-day with different ``before``/``after`` etc. would represent
+    a different uncertainty bound and should not be deduped.
+    """
+    if not entity or not parsed or not parsed.get("value"):
+        return False
+    parsed_value = parsed["value"]
+    parsed_time = parsed_value.get("time")
+    parsed_precision = parsed_value.get("precision")
+    if parsed_time is None or parsed_precision is None:
+        return False
+    parsed_circa = bool(parsed.get("approximate"))
+    statements = entity.get("statements") or entity.get("claims") or {}
+    for stmt in statements.get(prop, []):
+        # DPLA-attributed only.
+        is_dpla = False
+        for q in (stmt.get("qualifiers") or {}).get(_PID_DPLA_DETERMINATION, []):
+            qv = q.get("datavalue", {}).get("value", {}) or {}
+            if qv.get("id") == _QID_HEURISTIC:
+                is_dpla = True
+                break
+        if not is_dpla:
+            continue
+        ms = stmt.get("mainsnak") or {}
+        dv = ms.get("datavalue") or {}
+        if dv.get("type") != "time":
+            continue
+        v = dv.get("value") or {}
+        if v.get("time") != parsed_time or v.get("precision") != parsed_precision:
+            continue
+        existing_circa = False
+        for q in (stmt.get("qualifiers") or {}).get(_PID_SOURCING_CIRCUMSTANCES, []):
+            qv = q.get("datavalue", {}).get("value", {}) or {}
+            if qv.get("id") == _QID_CIRCA:
+                existing_circa = True
+                break
+        if existing_circa == parsed_circa:
+            return True
+    return False
+
+
 def materialize_pending_date_claim(
     placeholder: dict,
     today: datetime.date | None = None,
+    *,
+    site=None,
+    existing_entity: dict | None = None,
 ) -> dict | None:
     """Take a Phase-3a ``_phase3a_pending_date_parse`` placeholder claim
     and materialise it into a real Wikibase P571 (inception) statement.
@@ -577,6 +687,28 @@ def materialize_pending_date_claim(
     sentinel keys — the caller drops the claim from the import set
     and the value stays in wikitext until a later phase.
 
+    When ``site`` is provided, any template markup in the raw value
+    is expanded via MediaWiki's ``expandtemplates`` API before
+    parsing AND before being stored in the P1932 qualifier — see
+    :func:`_expand_wikitext_for_date_parse`. The DPLA-date parser
+    can't structurally read shapes like ``{{other date|~|1911}}``,
+    but DOES recognise the expanded ``circa 1911`` form, so the
+    expansion turns the somevalue fallback into a real value-typed
+    statement and avoids storing wikitext markup in a structured-
+    data string. Falls back to the raw value when no ``site`` is
+    passed or expansion fails.
+
+    When ``existing_entity`` is provided and the parser commits to a
+    structured value, the function checks whether ``entity`` already
+    carries a DPLA-attributed statement on the same property with the
+    same time + precision + circa flag — see
+    :func:`_existing_dpla_date_matches_parsed`. If so, returns None
+    to signal that the legacy import is a no-op duplicate (the
+    editor merely re-formatted the DPLA-supplied value as a wikitext
+    template; no community-contributed information would be lost by
+    dropping the import). Callers that don't provide
+    ``existing_entity`` get the pre-existing always-import behaviour.
+
     ``today`` is accepted (currently unused) for symmetry with other
     claim builders so a later phase can add a P813 retrieved-on
     reference snak if useful without changing call sites.
@@ -590,17 +722,35 @@ def materialize_pending_date_claim(
     if not raw_date or not prop or not permalink_from:
         return None
 
-    parsed = parse_dpla_date(raw_date)
+    # Expand any template markup so the value reflects what the editor
+    # actually saw on the page, not the raw wikitext syntax. The
+    # expanded form goes into both the parser and the P1932 qualifier;
+    # the raw markup is never stored as structured data.
+    value_for_parse = _expand_wikitext_for_date_parse(raw_date, site)
+    parsed = parse_dpla_date(value_for_parse)
+
+    # Dedup-against-DPLA: if the editor's wikitext value parses to
+    # something we already have on the entity as a DPLA-attributed
+    # claim, the migration import would be a literal duplicate. Drop
+    # it rather than create a parallel statement that the
+    # community-imports comparator can never strip cleanly.
+    if parsed is not None and _existing_dpla_date_matches_parsed(
+        existing_entity, prop, parsed
+    ):
+        return None
+
     qualifiers: dict[str, list[dict]] = {
-        # P1932 (stated as) preserves the verbatim source string so a
-        # reader can recover what the editor actually wrote, even when
-        # the structured time has reduced precision.
+        # P1932 (stated as) preserves the source string so a reader can
+        # recover what the editor actually wrote, even when the
+        # structured time has reduced precision. The pre-expansion
+        # form is what surfaces here when no expansion ran (no site,
+        # no template markup, or expand_text failed).
         "P1932": [
             {
                 "snaktype": "value",
                 "property": "P1932",
                 "datatype": "string",
-                "datavalue": {"type": "string", "value": raw_date},
+                "datavalue": {"type": "string", "value": value_for_parse},
             }
         ]
     }
@@ -642,7 +792,12 @@ def materialize_pending_date_claim(
     }
 
 
-def materialize_import_claims(claims: list[dict]) -> list[dict]:
+def materialize_import_claims(
+    claims: list[dict],
+    *,
+    site=None,
+    existing_entity: dict | None = None,
+) -> list[dict]:
     """Walk an import-claim list and substitute every Phase-3a date
     placeholder for a real P571 time statement.
 
@@ -650,11 +805,22 @@ def materialize_import_claims(claims: list[dict]) -> list[dict]:
     Placeholders whose date can't be expanded (parser failure paired
     with missing sentinel keys — should never happen for in-tree
     callers) are dropped silently rather than crashing the migration.
+
+    ``site`` and ``existing_entity`` are forwarded to
+    :func:`materialize_pending_date_claim` so the date materialiser
+    can (a) expand wikitext templates server-side before parsing and
+    (b) drop a community-import claim whose parsed value already
+    exists DPLA-attributed on the entity. Both are optional — when
+    neither is supplied, the function preserves the historical
+    always-import behaviour. The original caller signature is also
+    preserved for tests that pass only the claims list.
     """
     materialised: list[dict] = []
     for claim in claims:
         if "_phase3a_pending_date_parse" in claim:
-            real = materialize_pending_date_claim(claim)
+            real = materialize_pending_date_claim(
+                claim, site=site, existing_entity=existing_entity
+            )
             if real is not None:
                 materialised.append(real)
         else:
@@ -880,7 +1046,15 @@ def migrate_legacy_file(
     if entity_was_already_migrated(entity):
         return MigrationResult(skipped_reason="already-migrated", plan=plan)
 
-    claims = materialize_import_claims(build_legacy_import_claims(plan))
+    # Pass the just-fetched MediaInfo entity and the site through so the
+    # date materialiser can expand wikitext templates server-side AND
+    # skip importing a date that already exists DPLA-attributed on the
+    # entity (e.g. an editor reformatted the original ``1911?`` value
+    # as ``{{other date|~|1911}}`` — both parse to "circa 1911" so the
+    # legacy import would be a literal duplicate of the DPLA claim).
+    claims = materialize_import_claims(
+        build_legacy_import_claims(plan), site=site, existing_entity=entity
+    )
     # Pick the accurate summary for what this migration actually did,
     # unless the caller supplied a custom one. Without this, a
     # DPLA-bot-only history (no community values to import) would still
