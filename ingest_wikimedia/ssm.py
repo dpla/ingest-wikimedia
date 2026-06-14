@@ -54,6 +54,42 @@ def ssm_run(client, cmd: str, *, as_root: bool = False) -> str:
     raise TimeoutError(f"SSM command {cmd_id} did not complete within polling window")
 
 
+def fetch_memory_snapshot(client) -> tuple[int, int] | None:
+    """Return ``(total_mb, available_mb)`` from ``free -m`` on the
+    instance, or ``None`` if the command failed or its output couldn't
+    be parsed.
+
+    Callers shape the numbers for their own context — ``wikimedia_launch``
+    /``wikimedia_retry`` gate their startup on a headroom percentage,
+    while ``wikimedia_upload_status`` formats it as a Slack readout —
+    so this helper deliberately returns the raw pair rather than a
+    formatted string or a derived percentage. Centralising the shell
+    command + parsing here keeps the three call sites from drifting on
+    output handling (e.g., the divide-by-zero guard that landed here
+    but isn't in the older inline copies).
+    """
+    import logging
+
+    try:
+        raw = ssm_run(client, "free -m | awk 'NR==2{print $2, $7}'")
+    except Exception:
+        logging.exception("Failed to fetch instance memory snapshot")
+        return None
+    parts = raw.split()
+    if len(parts) != 2:
+        logging.warning("Unexpected free -m output: %r", raw)
+        return None
+    try:
+        total_mb, available_mb = int(parts[0]), int(parts[1])
+    except ValueError:
+        logging.warning("Could not parse free -m output: %r", raw)
+        return None
+    if total_mb <= 0:
+        logging.warning("Non-positive total memory in free -m output: %r", raw)
+        return None
+    return total_mb, available_mb
+
+
 def stage_and_launch_tmux(client, *, script: str, session_name: str, cwd: str) -> str:
     """Stage `script` to a file on the instance, then launch a detached
     tmux session that runs it. Returns whatever ssm_run returns (stdout).

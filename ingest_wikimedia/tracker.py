@@ -40,6 +40,14 @@ class Result(Enum):
     # cleanup on their synced ordinals — the partial state is real
     # progress, not a failure to be retried wholesale.
     SDC_ITEMS_PARTIALLY_SYNCED = auto()
+    # Distinct Commons file pages this SDC run actually wrote to — counted
+    # at per-ordinal granularity (one file page = one ordinal in partner
+    # mode; one file page per call in the legacy --file/--cat/--list
+    # paths). A page that received both a MediaInfo entity write AND a
+    # follow-up wikitext cleanup edit counts once.  Surfaces the real
+    # batch size to operators, who can't infer it from ITEMS_SYNCED alone
+    # (a 1-file item and a 1,000-file item both count once there).
+    SDC_PAGES_EDITED = auto()
     # Ordinals whose SDC sync raised an unexpected exception
     # (pywikibot APIError, network timeout, deep KeyError, etc.).
     # Per-ordinal granularity so transient failures don't abort the

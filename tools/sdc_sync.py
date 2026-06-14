@@ -2050,6 +2050,28 @@ def _build_expected_from_sdc(sdc_payload):
     return expected
 
 
+# Result counters that the SDC dispatcher bumps when ``_submit_per_item_edit``
+# actually POSTs a change. The "did this ordinal write anything?" check
+# in partner mode and ``_safe_process_one`` snapshots the sum of these
+# before vs. after ``process_one``; centralising the tuple here keeps
+# any future SDC write counter from silently slipping past the
+# snapshot delta (and the ``SDC_PAGES_EDITED`` accounting that hangs
+# off it).
+_SDC_WRITE_COUNTERS = (
+    Result.SDC_CLAIMS_ADDED,
+    Result.SDC_REFS_ADDED,
+    Result.SDC_REMOVALS,
+)
+
+
+def _sdc_writes_total() -> int:
+    """Sum of the tracker counters that ``_submit_per_item_edit``
+    increments per write. Used to detect whether a given
+    ``process_one`` call actually committed anything on Commons.
+    """
+    return sum(tracker.count(c) for c in _SDC_WRITE_COUNTERS)
+
+
 def _submit_sdc_write(action, mediaid, dpla_id, **params):
     """Submit an SDC write (wbeditentity or wbremoveclaims) through
     pywikibot's ``simple_request``.
@@ -3288,7 +3310,7 @@ def _post_sdc_cleanup_for_page(
     data_provider: dict,
     *,
     expected_params: dict | None = None,
-) -> None:
+) -> bool:
     """Post-SDC wikitext cleanup for one Commons file page.
 
     Dispatches based on the file's current wikitext shape:
@@ -3319,9 +3341,15 @@ def _post_sdc_cleanup_for_page(
     computes it from ``dpla_metadata_params``. Partner mode passes it
     in so a multi-ordinal item doesn't redundantly recompute per
     ordinal.
+
+    Returns ``True`` when the file page was actually saved (legacy
+    migration rewrote the wikitext, or normalize_page stripped a
+    param); ``False`` when the cleanup was a no-op or skipped.
+    Callers use this to track the per-page edit count for the SDC
+    summary.
     """
     if not file_page.exists():
-        return
+        return False
 
     text = file_page.text or ""
 
@@ -3331,7 +3359,7 @@ def _post_sdc_cleanup_for_page(
         # here would be wasted work — migrate_legacy_file recomputes
         # them internally from item_metadata.
         try:
-            legacy_artwork.migrate_legacy_file(
+            result = legacy_artwork.migrate_legacy_file(
                 file_page=file_page,
                 item_metadata=item_metadata,
                 provider=provider,
@@ -3344,7 +3372,8 @@ def _post_sdc_cleanup_for_page(
                 f" -- cleanup: legacy migration of '{file_page.title()}'"
                 f" for {dpla_id} failed; skipping."
             )
-        return
+            return False
+        return bool(getattr(result, "wikitext_changed", False))
 
     # Strip path. Bail before computing ``expected_params`` when the
     # file has no ``{{DPLA metadata}}`` template either — a hand-written
@@ -3353,7 +3382,7 @@ def _post_sdc_cleanup_for_page(
     # rights URI, builds the hub label, etc.) and would be wasted on
     # a page that ``normalize_page`` is going to no-op anyway.
     if not wikitext_normalize.has_dpla_metadata_template(text):
-        return
+        return False
 
     if expected_params is None:
         try:
@@ -3365,7 +3394,7 @@ def _post_sdc_cleanup_for_page(
                 f" -- cleanup: dpla_metadata_params failed for {dpla_id};"
                 " skipping strip."
             )
-            return
+            return False
 
     # Defensive guard against the upstream null-pageid bug shape and
     # any future regression: ``normalize_page`` strips wikitext params
@@ -3391,7 +3420,7 @@ def _post_sdc_cleanup_for_page(
                 f" -- cleanup: entity fetch failed for {file_page.title()}"
                 f" ({mediaid}); skipping strip out of caution."
             )
-            return
+            return False
         if not _entity_has_dpla_attributed_claims(entity):
             logging.warning(
                 f" -- cleanup: '{file_page.title()}' ({mediaid}) for"
@@ -3399,22 +3428,25 @@ def _post_sdc_cleanup_for_page(
                 " to avoid wiping wikitext params without an SDC"
                 " counterpart (upstream sync likely never fired)."
             )
-            return
+            return False
 
     try:
-        wikitext_normalize.normalize_page(
-            file_page, expected_params, _NORMALIZE_EDIT_SUMMARY
+        return bool(
+            wikitext_normalize.normalize_page(
+                file_page, expected_params, _NORMALIZE_EDIT_SUMMARY
+            )
         )
     except Exception:
         logging.exception(
             f" -- cleanup: normalize_page on '{file_page.title()}' for"
             f" {dpla_id} failed; skipping."
         )
+        return False
 
 
 def _post_sdc_cleanup_for_item(
     s3, partner: str, dpla_id: str, ordinal_items: list[tuple[str, dict]]
-) -> None:
+) -> set[str]:
     """Per-item post-SDC cleanup (partner mode).
 
     Reads ``dpla-map.json`` from S3, resolves provider / data_provider,
@@ -3425,27 +3457,34 @@ def _post_sdc_cleanup_for_item(
     logged but never raised. SDC sync has already committed and counted
     before this runs; a cleanup failure must not roll that back or fail
     the partner batch.
+
+    Returns the set of ``ord_str`` values whose file page was actually
+    rewritten by cleanup (legacy migration or wikitext strip). The
+    partner-mode caller unions this with the set of ordinals whose
+    SDC writes landed to derive a per-page edit count without
+    double-counting pages that had both kinds of edit.
     """
     from ingest_wikimedia import wikimedia
     from ingest_wikimedia.dpla import DPLA
 
+    edited: set[str] = set()
     try:
         item_raw = s3.get_item_metadata(partner, dpla_id)
     except Exception as e:
         logging.warning(f" -- cleanup: S3 read failed for {dpla_id}: {e!r}; skipping.")
-        return
+        return edited
     if not item_raw:
         # dpla-map.json missing — get-ids-es never staged it, or the
         # partner-mode item came from a path that doesn't write one.
         # Nothing to compare against; skip silently.
-        return
+        return edited
     try:
         item_metadata = json.loads(item_raw)
     except json.JSONDecodeError as e:
         logging.warning(
             f" -- cleanup: dpla-map.json parse failed for {dpla_id}: {e}; skipping."
         )
-        return
+        return edited
 
     try:
         provider, data_provider = DPLA.get_provider_and_data_provider(
@@ -3455,7 +3494,7 @@ def _post_sdc_cleanup_for_item(
         logging.warning(
             f" -- cleanup: provider lookup failed for {dpla_id}: {e!r}; skipping."
         )
-        return
+        return edited
 
     try:
         expected_params = wikimedia.dpla_metadata_params(
@@ -3465,7 +3504,7 @@ def _post_sdc_cleanup_for_item(
         logging.warning(
             f" -- cleanup: param compute failed for {dpla_id}: {e!r}; skipping."
         )
-        return
+        return edited
 
     for ord_str, data in ordinal_items:
         title = data.get("title")
@@ -3479,17 +3518,19 @@ def _post_sdc_cleanup_for_item(
                 f" {ord_str} ({title}) of {dpla_id}; skipping."
             )
             continue
-        _post_sdc_cleanup_for_page(
+        if _post_sdc_cleanup_for_page(
             page,
             dpla_id,
             item_metadata,
             provider,
             data_provider,
             expected_params=expected_params,
-        )
+        ):
+            edited.add(ord_str)
+    return edited
 
 
-def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> None:
+def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> bool:
     """Post-SDC cleanup for the ``--file`` / ``--cat`` / ``--list`` paths.
 
     Mirrors :func:`_post_sdc_cleanup_for_item` for single-file modes:
@@ -3501,7 +3542,10 @@ def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> None:
     cache was cleared by an earlier cleanup) the doc is fetched fresh
     from S3 / api.dp.la so the cleanup still runs.
 
-    Best-effort: any failure is logged but doesn't raise.
+    Best-effort: any failure is logged but doesn't raise. Returns
+    ``True`` if cleanup actually rewrote the page, else ``False`` —
+    used by :func:`_safe_process_one` to track per-page edit counts
+    for the SDC summary.
     """
     from ingest_wikimedia.dpla import DPLA
 
@@ -3518,9 +3562,9 @@ def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> None:
             logging.exception(
                 f" -- cleanup: DPLA-doc fetch failed for {dpla_id}; skipping."
             )
-            return
+            return False
     if not doc:
-        return
+        return False
 
     try:
         provider, data_provider = DPLA.get_provider_and_data_provider(doc, hubs)
@@ -3528,9 +3572,9 @@ def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> None:
         logging.warning(
             f" -- cleanup: provider lookup failed for {dpla_id}: {e!r}; skipping."
         )
-        return
+        return False
 
-    _post_sdc_cleanup_for_page(file_page, dpla_id, doc, provider, data_provider)
+    return _post_sdc_cleanup_for_page(file_page, dpla_id, doc, provider, data_provider)
 
 
 def _run_legacy_migration_mode(partner: str, ids_file: str) -> None:
@@ -3875,6 +3919,15 @@ def _run_partner_mode(partner, ids_file):
             # explicit. ``synced_this_item`` derives from the set
             # below; classification is unchanged.
             synced_ord_strs: set[str] = set()
+            # Per-item set of ord_strs whose Commons file page actually
+            # received an edit this run — populated from the SDC-write
+            # snapshot below (claim/ref/removal writes) and unioned with
+            # the set returned by post-SDC cleanup. Drives
+            # ``SDC_PAGES_EDITED``, so operators can read the real batch
+            # size off the Slack summary instead of inferring it from
+            # ``ITEMS SYNCED`` (which collapses 1-file and 1,000-file
+            # items into the same count).
+            pages_edited: set[str] = set()
             # Tracks whether any ordinal hit the per-ordinal exception
             # path (runtime failure) so an item with all-failed ordinals
             # is classified under SDC_ITEMS_SKIPPED_ERROR rather than
@@ -3962,11 +4015,7 @@ def _run_partner_mode(partner, ids_file):
 
                 # Snapshot write counters so we can detect whether this
                 # ordinal's sync actually changed anything on Commons.
-                writes_before = (
-                    tracker.count(Result.SDC_CLAIMS_ADDED)
-                    + tracker.count(Result.SDC_REFS_ADDED)
-                    + tracker.count(Result.SDC_REMOVALS)
-                )
+                writes_before = _sdc_writes_total()
                 # Per-ordinal exception boundary. Without this, any
                 # transient pywikibot APIError (rate limit, maxlag,
                 # transient 503), network timeout, or surprise
@@ -4027,11 +4076,7 @@ def _run_partner_mode(partner, ids_file):
                     tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
                     had_ordinal_error = True
                     continue
-                writes_after = (
-                    tracker.count(Result.SDC_CLAIMS_ADDED)
-                    + tracker.count(Result.SDC_REFS_ADDED)
-                    + tracker.count(Result.SDC_REMOVALS)
-                )
+                writes_after = _sdc_writes_total()
 
                 # If SDC actually changed for this ordinal, force a
                 # category re-render on the file page via a null edit.
@@ -4043,14 +4088,16 @@ def _run_partner_mode(partner, ids_file):
                 # after the SDC was added. Mirrors the touch pattern in
                 # ingest_wikimedia/categories.py's
                 # touch_files_for_institution().
-                if writes_after > writes_before and title and title != "?":
-                    try:
-                        pywikibot.FilePage(site, title).touch()
-                        logging.info(f" -- Touched '{title}' (category refresh).")
-                    except Exception as e:
-                        logging.warning(
-                            f" -- Failed to touch '{title}' for category refresh: {e!r}"
-                        )
+                if writes_after > writes_before:
+                    pages_edited.add(ord_str)
+                    if title and title != "?":
+                        try:
+                            pywikibot.FilePage(site, title).touch()
+                            logging.info(f" -- Touched '{title}' (category refresh).")
+                        except Exception as e:
+                            logging.warning(
+                                f" -- Failed to touch '{title}' for category refresh: {e!r}"
+                            )
                 synced_ord_strs.add(ord_str)
             # Item-level bucket classification + cleanup dispatch.
             # ``_classify_item_outcome`` returns the bucket; cleanup
@@ -4072,7 +4119,11 @@ def _run_partner_mode(partner, ids_file):
                 synced_items = [
                     (o, d) for o, d in ordinal_items if o in synced_ord_strs
                 ]
-                _post_sdc_cleanup_for_item(s3, partner, dpla_id, synced_items)
+                pages_edited |= _post_sdc_cleanup_for_item(
+                    s3, partner, dpla_id, synced_items
+                )
+            if pages_edited:
+                tracker.increment(Result.SDC_PAGES_EDITED, len(pages_edited))
         completed = True
     except BaseException as exc:
         # The per-ordinal try/except above already swallows every routine
@@ -4148,6 +4199,11 @@ def _safe_process_one(mediaid: str, dpla_id: str, file_page=None) -> None:
     per-institution, per-collection, single-id, ``--file``, ``--cat``,
     ``--list``) ends with the same per-file cleanup.
     """
+    # Snapshot SDC write counters so we can tell whether ``process_one``
+    # actually committed any change for this file. Mirrors the partner-
+    # mode pattern at the per-ordinal level so SDC_PAGES_EDITED is fed
+    # consistently across modes.
+    writes_before = _sdc_writes_total()
     try:
         try:
             process_one(mediaid, dpla_id)
@@ -4165,8 +4221,12 @@ def _safe_process_one(mediaid: str, dpla_id: str, file_page=None) -> None:
             tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
             return
 
+        sdc_wrote = _sdc_writes_total() > writes_before
+        cleanup_wrote = False
         if _normalize_wikitext_enabled and file_page is not None:
-            _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id)
+            cleanup_wrote = _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id)
+        if sdc_wrote or cleanup_wrote:
+            tracker.increment(Result.SDC_PAGES_EDITED)
     finally:
         # Drop any stash ``parsed()`` left in the cache so a process_one
         # error path (or a cleanup skip when ``file_page`` is None /
