@@ -17,6 +17,7 @@ from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
+    parse_date_range,
     parse_dpla_date,
     parse_nara_access_level,
 )
@@ -2841,9 +2842,14 @@ def _statement_comparable_value(stmt):
     Used by :func:`_reconcile_inferred_from_wikitext_dupes` to decide
     whether an inferred-from-Wikitext claim should be removed because
     an equivalent DPLA-authored statement now covers the same fact.
-    """
-    from ingest_wikimedia.sdc import parse_date_range, parse_dpla_date
 
+    Every non-None return is a 3-tuple ``(shape_tag, primary, secondary)``
+    with ``secondary`` set to ``None`` for shapes that have no second
+    field (string, item, time, range, p1932-string). Uniform arity keeps
+    static analysis happy without changing equivalence semantics —
+    shape_tag still discriminates type so cross-type values can't
+    collide.
+    """
     ms = stmt.get("mainsnak") or {}
     snaktype = ms.get("snaktype")
 
@@ -2853,15 +2859,15 @@ def _statement_comparable_value(stmt):
         v = dv.get("value")
         if dtype == "time":
             try:
-                return ("time", _time_claim_comparable(stmt))
+                return ("time", _time_claim_comparable(stmt), None)
             except (KeyError, TypeError):
                 return None
         if dtype == "string":
-            return ("string", v) if isinstance(v, str) else None
+            return ("string", v, None) if isinstance(v, str) else None
         if dtype == "monolingualtext" and isinstance(v, dict):
             return ("monolingual", v.get("text"), v.get("language"))
         if dtype == "wikibase-entityid" and isinstance(v, dict):
-            return ("item", v.get("id"))
+            return ("item", v.get("id"), None)
         return None
 
     if snaktype == "somevalue":
@@ -2879,7 +2885,7 @@ def _statement_comparable_value(stmt):
                 # collapses with a value-typed time mainsnak.
                 base = _time_comparable(parsed["value"])
                 key = f"{base}|circa" if parsed.get("approximate") else base
-                return ("time", key)
+                return ("time", key, None)
             rng = parse_date_range(s)
             if rng:
                 return ("date-range", rng[0], rng[1])
@@ -2890,7 +2896,7 @@ def _statement_comparable_value(stmt):
             # expand-then-store fix may carry raw wikitext here. The
             # range parser already matches the most common
             # ``{{other date|between|X|Y}}`` shape directly.
-            return ("p1932-string", s)
+            return ("p1932-string", s, None)
         return None
 
     return None
