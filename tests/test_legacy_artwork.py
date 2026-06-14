@@ -591,7 +591,11 @@ class _FakeSite:
 
 
 def _dpla_p571_statement(time_str, precision, *, circa=False):
-    """Build a wbgetentities-shaped DPLA-attributed P571 statement."""
+    """Build a wbgetentities-shaped DPLA-attributed P571 statement.
+    The ``value`` dict matches the canonical shape
+    ``ingest_wikimedia.sdc._wikibase_time`` emits — DPLA's own
+    pipeline always writes that exact shape, so the dedup
+    whole-value comparison sees identical dicts under normal use."""
     quals = {
         "P459": [
             {
@@ -621,7 +625,14 @@ def _dpla_p571_statement(time_str, precision, *, circa=False):
             "property": "P571",
             "datavalue": {
                 "type": "time",
-                "value": {"time": time_str, "precision": precision},
+                "value": {
+                    "time": time_str,
+                    "precision": precision,
+                    "before": 0,
+                    "after": 0,
+                    "timezone": 0,
+                    "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                },
             },
         },
         "qualifiers": quals,
@@ -745,9 +756,9 @@ def test_materialize_pending_date_claim_ignores_non_dpla_attributed_existing():
     assert claim is not None
 
 
-def test_materialize_import_claims_forwards_site_and_entity():
-    """The list-level wrapper has to forward both kwargs so the dedup
-    behaviour applies in the migration pipeline, not only in the
+def test_materialize_import_claims_forwards_existing_entity_for_dedup():
+    """The list-level wrapper has to forward ``existing_entity`` so the
+    dedup behaviour applies in the migration pipeline, not only in the
     per-claim helper. Verified by passing a dedup-triggering entity
     and asserting the date placeholder gets dropped from the output."""
     title_claim = {"type": "statement", "mainsnak": {"property": "P1476"}}
@@ -766,6 +777,58 @@ def test_materialize_import_claims_forwards_site_and_entity():
         [title_claim, date_placeholder], existing_entity=existing
     )
     assert out == [title_claim]  # date dropped, title preserved
+
+
+def test_materialize_import_claims_forwards_site_for_expansion():
+    """The list-level wrapper has to forward ``site`` so the template-
+    expansion behaviour applies in the migration pipeline. Verified by
+    passing a wikitext-template date placeholder and asserting the
+    expanded value appears in the materialised claim's P1932."""
+    date_placeholder = {
+        "type": "statement",
+        "_phase3a_pending_date_parse": "{{other date|~|1911}}",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    site = _FakeSite({"{{other date|~|1911}}": "circa 1911"})
+    out = materialize_import_claims([date_placeholder], site=site)
+    assert len(out) == 1
+    assert out[0]["qualifiers"]["P1932"][0]["datavalue"]["value"] == "circa 1911"
+
+
+def test_materialize_pending_date_claim_preserves_visible_inner_text():
+    """The hidden-microformat strip must not eat visible text inside
+    plain ``<span>``/``<i>`` wrappers (e.g. ``<span>circa 1911</span>``
+    from a formatting-focused template). Only display:none / aria-
+    hidden / QS-class scaffolding should disappear."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "{{some formatting template|1911}}",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    site = _FakeSite({"{{some formatting template|1911}}": "<span>circa 1911</span>"})
+    claim = materialize_pending_date_claim(placeholder, site=site)
+    assert claim is not None
+    # Visible inner text survived; outer <span> tag was stripped.
+    assert claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == "circa 1911"
+
+
+def test_materialize_pending_date_claim_skips_when_existing_value_full_match():
+    """Full whole-value match required: same time / precision /
+    before / after / timezone / calendarmodel. Any divergence in
+    those bound fields disqualifies the dedup."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "1911",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    # Build an existing statement whose ``before`` bound differs from
+    # the parser's canonical 0. Should NOT dedup.
+    diverging = _dpla_p571_statement("+1911-01-01T00:00:00Z", 9, circa=False)
+    diverging["mainsnak"]["datavalue"]["value"]["before"] = 5
+    existing = {"statements": {"P571": [diverging]}}
+    claim = materialize_pending_date_claim(placeholder, existing_entity=existing)
+    assert claim is not None  # different uncertainty bound, import preserved
 
 
 def test_materialize_import_claims_passes_through_non_date_claims():

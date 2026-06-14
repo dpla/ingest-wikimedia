@@ -586,12 +586,27 @@ def _expand_wikitext_for_date_parse(raw_date: str, site) -> str:
         expanded = site.expand_text(raw_date)
     except Exception:
         return raw_date
-    # Strip any hidden HTML residue (QuickStatements micro-format etc.)
-    # the template's expansion may have appended; we want the plain
-    # human-readable rendering only.
+    # Targeted-strip pass: ONLY remove paired tags whose attributes mark
+    # them as hidden microformat scaffolding — ``style="display: none"``
+    # / ``aria-hidden="true"`` / a QuickStatements ``qs`` class. Visible
+    # text inside ordinary ``<span>``/``<i>``/``<sup>`` wrappers (e.g.
+    # ``<span>circa 1911</span>`` from a language- or formatting-
+    # focused template) must survive — only the QS / display-none
+    # noise the date templates inject for downstream tooling should
+    # disappear. Generic tag-strip on the second pass removes the
+    # remaining bare tags but preserves their inner text.
     import re
 
-    expanded = re.sub(r"<[^>]+>.*?</[^>]+>", "", expanded, flags=re.DOTALL)
+    expanded = re.sub(
+        r"<(span|div)[^>]*"
+        r"(?:style\s*=\s*[\"'][^\"']*display\s*:\s*none[^\"']*[\"']"
+        r"|aria-hidden\s*=\s*[\"']true[\"']"
+        r"|class\s*=\s*[\"'][^\"']*\bqs\b[^\"']*[\"'])"
+        r"[^>]*>.*?</\1>",
+        "",
+        expanded,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     expanded = re.sub(r"<[^>]+/?>", "", expanded)
     return expanded.strip() or raw_date
 
@@ -623,9 +638,7 @@ def _existing_dpla_date_matches_parsed(
     if not entity or not parsed or not parsed.get("value"):
         return False
     parsed_value = parsed["value"]
-    parsed_time = parsed_value.get("time")
-    parsed_precision = parsed_value.get("precision")
-    if parsed_time is None or parsed_precision is None:
+    if not parsed_value.get("time") or parsed_value.get("precision") is None:
         return False
     parsed_circa = bool(parsed.get("approximate"))
     statements = entity.get("statements") or entity.get("claims") or {}
@@ -643,8 +656,16 @@ def _existing_dpla_date_matches_parsed(
         dv = ms.get("datavalue") or {}
         if dv.get("type") != "time":
             continue
-        v = dv.get("value") or {}
-        if v.get("time") != parsed_time or v.get("precision") != parsed_precision:
+        # Whole-value comparison (time, precision, before, after,
+        # timezone, calendarmodel) — divergence in any field implies
+        # a semantically different statement and must NOT dedup. Both
+        # sides go through ``_wikibase_time`` in ``ingest_wikimedia.sdc``,
+        # which pins ``before/after/timezone/calendarmodel`` to constants,
+        # so under normal pipeline use the dicts match exactly; a
+        # hand-edited statement with explicit uncertainty bounds would
+        # represent a different precision claim and is correctly
+        # excluded.
+        if (dv.get("value") or {}) != parsed_value:
             continue
         existing_circa = False
         for q in (stmt.get("qualifiers") or {}).get(_PID_SOURCING_CIRCUMSTANCES, []):
