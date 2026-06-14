@@ -34,6 +34,8 @@ from urllib.parse import urlencode
 
 import mwparserfromhell
 
+from ingest_wikimedia.sdc import parse_date_range, parse_dpla_date
+
 # DPLA's Commons-bot account names. Revisions authored by these accounts
 # are treated as DPLA-originated for the purpose of provenance
 # classification — any param value they last touched is safe to
@@ -611,6 +613,28 @@ def _expand_wikitext_for_date_parse(raw_date: str, site) -> str:
     return expanded.strip() or raw_date
 
 
+def _iter_dpla_attributed_statements(entity: dict | None, prop: str):
+    """Yield every DPLA-attributed statement on ``prop`` in ``entity``.
+
+    "DPLA-attributed" means the statement carries a
+    ``P459 = Q61848113`` (determination method = heuristic) qualifier —
+    the same signal Module:DPLA's ``dplaStatements`` uses to scope the
+    blue-box render. Both date matchers (structured time and range)
+    walk the same set of DPLA-attributed statements; this generator
+    keeps that contract in one place so a future change to the
+    attribution rule applies to both.
+    """
+    if not entity:
+        return
+    statements = entity.get("statements") or entity.get("claims") or {}
+    for stmt in statements.get(prop, []):
+        for q in (stmt.get("qualifiers") or {}).get(_PID_DPLA_DETERMINATION, []):
+            qv = q.get("datavalue", {}).get("value", {}) or {}
+            if qv.get("id") == _QID_HEURISTIC:
+                yield stmt
+                break
+
+
 def _existing_dpla_date_matches_parsed(
     entity: dict | None, prop: str, parsed: dict
 ) -> bool:
@@ -618,12 +642,9 @@ def _existing_dpla_date_matches_parsed(
     statement on ``prop`` whose Wikibase time value and circa-flag
     match ``parsed``.
 
-    "DPLA-attributed" means a ``P459 = Q61848113`` (determination
-    method = heuristic) qualifier — the same signal Module:DPLA's
-    ``dplaStatements`` uses to scope the blue-box render. The check
-    deliberately doesn't compare reference shape: the editor-edited
-    legacy value is a different source than DPLA's own sync, but if
-    the *semantic* value and approximate-flag match, there's no
+    The check deliberately doesn't compare reference shape: the editor-
+    edited legacy value is a different source than DPLA's own sync, but
+    if the *semantic* value and approximate-flag match, there's no
     user-contributed information to preserve — the editor's edit was
     just a re-formatting of the DPLA value.
 
@@ -635,23 +656,13 @@ def _existing_dpla_date_matches_parsed(
     same-day with different ``before``/``after`` etc. would represent
     a different uncertainty bound and should not be deduped.
     """
-    if not entity or not parsed or not parsed.get("value"):
+    if not parsed or not parsed.get("value"):
         return False
     parsed_value = parsed["value"]
     if not parsed_value.get("time") or parsed_value.get("precision") is None:
         return False
     parsed_circa = bool(parsed.get("approximate"))
-    statements = entity.get("statements") or entity.get("claims") or {}
-    for stmt in statements.get(prop, []):
-        # DPLA-attributed only.
-        is_dpla = False
-        for q in (stmt.get("qualifiers") or {}).get(_PID_DPLA_DETERMINATION, []):
-            qv = q.get("datavalue", {}).get("value", {}) or {}
-            if qv.get("id") == _QID_HEURISTIC:
-                is_dpla = True
-                break
-        if not is_dpla:
-            continue
+    for stmt in _iter_dpla_attributed_statements(entity, prop):
         ms = stmt.get("mainsnak") or {}
         dv = ms.get("datavalue") or {}
         if dv.get("type") != "time":
@@ -675,6 +686,44 @@ def _existing_dpla_date_matches_parsed(
                 break
         if existing_circa == parsed_circa:
             return True
+    return False
+
+
+def _existing_dpla_date_range_matches(
+    entity: dict | None, prop: str, range_value: tuple[int, int]
+) -> bool:
+    """Mirror of :func:`_existing_dpla_date_matches_parsed` for range-
+    shaped claims. Returns True when ``entity`` already carries a
+    DPLA-attributed statement on ``prop`` whose ``P1932`` stated-as
+    qualifier parses to the same ``(start_year, end_year)`` range.
+
+    ``parse_dpla_date`` returns None for any multi-year range, so a
+    range value can never land as a structured time and the existing
+    parsed-time matcher never fires for it. Without this fallback, the
+    legacy migration emits an inferred-from-Wikitext range claim
+    parallel to the DPLA one — see Group_Portrait_of_"Indians" Mission
+    Grove (M193555788) where ``{{other date|between|1934|1948}}`` was
+    preserved alongside DPLA's ``"1934 - 1948"`` as two P571 statements.
+
+    Match contract: both sides go through
+    :func:`ingest_wikimedia.sdc.parse_date_range` and must produce the
+    same ``(start, end)`` tuple — direction-agnostic, since the helper
+    canonicalises ``(min, max)``.
+    """
+    if not range_value:
+        return False
+    for stmt in _iter_dpla_attributed_statements(entity, prop):
+        # Range claims must be ``somevalue`` mainsnak — a value-typed
+        # time can't represent a multi-year range, so any DPLA range
+        # statement is encoded as somevalue + P1932 stated-as.
+        if (stmt.get("mainsnak") or {}).get("snaktype") != "somevalue":
+            continue
+        for q in (stmt.get("qualifiers") or {}).get("P1932", []):
+            qv = q.get("datavalue") or {}
+            if qv.get("type") != "string":
+                continue
+            if parse_date_range(qv.get("value") or "") == range_value:
+                return True
     return False
 
 
@@ -734,8 +783,6 @@ def materialize_pending_date_claim(
     claim builders so a later phase can add a P813 retrieved-on
     reference snak if useful without changing call sites.
     """
-    from .sdc import parse_dpla_date  # late import to avoid cycle
-
     del today  # currently unused; see docstring
     raw_date = placeholder.get("_phase3a_pending_date_parse")
     prop = placeholder.get("_property")
@@ -757,6 +804,18 @@ def materialize_pending_date_claim(
     # community-imports comparator can never strip cleanly.
     if parsed is not None and _existing_dpla_date_matches_parsed(
         existing_entity, prop, parsed
+    ):
+        return None
+    # Same check for the range case — ``parse_dpla_date`` returns None
+    # for any multi-year range, so the structured-time matcher above
+    # never fires for shapes like ``{{other date|between|1934|1948}}``.
+    # ``parse_date_range`` produces a canonical ``(start, end)`` key
+    # that compares equal across "1934 - 1948", "between 1934 and 1948",
+    # and the raw-wikitext fallback, so the inferred import dedupes
+    # cleanly against a DPLA somevalue+P1932 range claim.
+    range_value = parse_date_range(value_for_parse)
+    if range_value is not None and _existing_dpla_date_range_matches(
+        existing_entity, prop, range_value
     ):
         return None
 

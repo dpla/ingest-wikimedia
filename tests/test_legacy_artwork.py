@@ -756,6 +756,135 @@ def test_materialize_pending_date_claim_ignores_non_dpla_attributed_existing():
     assert claim is not None
 
 
+def _dpla_p571_range_statement(p1932_value, *, circa=False):
+    """Build a wbgetentities-shaped DPLA-attributed P571 *range* claim —
+    ``somevalue`` mainsnak with a P1932 stated-as qualifier carrying
+    the range string. Mirrors what
+    :func:`ingest_wikimedia.sdc._build_date_claim` emits when
+    ``parse_dpla_date`` returns None (the universal range path)."""
+    quals = {
+        "P459": [
+            {
+                "snaktype": "value",
+                "property": "P459",
+                "datavalue": {
+                    "type": "wikibase-entityid",
+                    "value": {"id": "Q61848113"},
+                },
+            }
+        ],
+        "P1932": [
+            {
+                "snaktype": "value",
+                "property": "P1932",
+                "datavalue": {"type": "string", "value": p1932_value},
+            }
+        ],
+    }
+    if circa:
+        quals["P1480"] = [
+            {
+                "snaktype": "value",
+                "property": "P1480",
+                "datavalue": {
+                    "type": "wikibase-entityid",
+                    "value": {"id": "Q5727902"},
+                },
+            }
+        ]
+    return {
+        "mainsnak": {
+            "snaktype": "somevalue",
+            "property": "P571",
+            "datatype": "time",
+        },
+        "qualifiers": quals,
+    }
+
+
+def test_materialize_pending_date_claim_skips_when_dpla_already_has_matching_range():
+    """The original bug — ``{{other date|between|1934|1948}}`` expanded
+    to ``between 1934 and 1948`` is semantically identical to DPLA's
+    ``1934 - 1948``. Both produce the same ``(1934, 1948)`` canonical
+    range key via :func:`ingest_wikimedia.sdc.parse_date_range`, so the
+    materialiser must drop the inferred-from-Wikitext import.
+
+    Mirrors M193555788 (Group_Portrait_of_"Indians" Mission Grove)
+    where this dedup failure caused two parallel P571 statements before
+    the range-matcher landed."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "{{other date|between|1934|1948}}",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    site = _FakeSite({"{{other date|between|1934|1948}}": "between 1934 and 1948"})
+    existing = {"statements": {"P571": [_dpla_p571_range_statement("1934 - 1948")]}}
+    claim = materialize_pending_date_claim(
+        placeholder, site=site, existing_entity=existing
+    )
+    assert claim is None
+
+
+def test_materialize_pending_date_claim_skips_range_match_across_format_variants():
+    """Range equivalence is direction- and separator-agnostic. Verify
+    every reasonable cross-pairing of editor-side and DPLA-side
+    formattings dedups, so we don't ship per-format dedup gaps."""
+    site = _FakeSite({})  # no expansion needed; values already in canonical text
+    cross_pairs = [
+        ("1934-1948", "between 1934 and 1948"),
+        ("between 1934 and 1948", "1934 - 1948"),
+        ("1934–1948", "1934/1948"),
+        ("1948 - 1934", "1934 - 1948"),  # reversed order canonicalises
+    ]
+    for editor_value, dpla_value in cross_pairs:
+        placeholder = {
+            "_phase3a_pending_date_parse": editor_value,
+            "_property": "P571",
+            "_permalink": "https://example/permalink",
+        }
+        existing = {"statements": {"P571": [_dpla_p571_range_statement(dpla_value)]}}
+        claim = materialize_pending_date_claim(
+            placeholder, site=site, existing_entity=existing
+        )
+        assert claim is None, (
+            f"editor={editor_value!r} vs dpla={dpla_value!r} should dedup"
+        )
+
+
+def test_materialize_pending_date_claim_imports_when_range_differs():
+    """A range with different endpoints is real community-contributed
+    information — must NOT dedup. The materialiser produces a
+    ``somevalue + P1932`` claim with the editor's range string."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "1950 - 1960",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    existing = {"statements": {"P571": [_dpla_p571_range_statement("1934 - 1948")]}}
+    claim = materialize_pending_date_claim(placeholder, existing_entity=existing)
+    assert claim is not None
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    assert claim["qualifiers"]["P1932"][0]["datavalue"]["value"] == "1950 - 1960"
+
+
+def test_materialize_pending_date_claim_range_match_requires_dpla_attribution():
+    """A non-DPLA-attributed (no P459 = Q61848113) existing range claim
+    must NOT trigger the range dedup — same safety bar as the
+    structured-time matcher. Mirror of
+    ``test_materialize_pending_date_claim_ignores_non_dpla_attributed_existing``
+    for the range path."""
+    placeholder = {
+        "_phase3a_pending_date_parse": "1934 - 1948",
+        "_property": "P571",
+        "_permalink": "https://example/permalink",
+    }
+    naked = _dpla_p571_range_statement("1934 - 1948")
+    naked["qualifiers"].pop("P459", None)
+    existing = {"statements": {"P571": [naked]}}
+    claim = materialize_pending_date_claim(placeholder, existing_entity=existing)
+    assert claim is not None
+
+
 def test_materialize_import_claims_forwards_existing_entity_for_dedup():
     """The list-level wrapper has to forward ``existing_entity`` so the
     dedup behaviour applies in the migration pipeline, not only in the

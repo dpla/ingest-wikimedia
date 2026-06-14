@@ -1178,6 +1178,66 @@ def parse_dpla_date(date_string: str) -> dict | None:
     return None
 
 
+# Year-range patterns. ``parse_dpla_date`` deliberately returns None for any
+# multi-year range, so ranges always land as ``somevalue + P1932`` claims;
+# this helper produces an equivalence key so two range-shaped claims (one
+# from DPLA, one inferred-from-Wikitext) can be recognised as the same
+# statement and the inferred dupe pruned. Requires 3- or 4-digit years on
+# both sides so an ISO-month string like ``"1934-12"`` can't pretend to be
+# a range — single-date parsing handles those.
+_RANGE_DASH = re.compile(r"^(\d{3,4})\s*[-/–—]\s*(\d{3,4})$")
+_RANGE_BETWEEN = re.compile(
+    r"^between\s+(\d{3,4})\s+(?:and|to|-|–|—)\s+(\d{3,4})$",
+    re.IGNORECASE,
+)
+_RANGE_FROM_TO = re.compile(
+    r"^(?:from\s+)?(\d{3,4})\s+(?:to|–|—)\s+(\d{3,4})$",
+    re.IGNORECASE,
+)
+# Raw-wikitext fallback: if ``_expand_wikitext_for_date_parse`` couldn't
+# reach the API or the value was stored before expansion was wired up,
+# the P1932 qualifier carries literal ``{{other date|between|X|Y}}``
+# markup. Match it directly so the reconciler can still dedup.
+_RANGE_OTHER_DATE_BETWEEN = re.compile(
+    r"^\{\{\s*other[ _]date\s*\|\s*between\s*\|\s*(\d{3,4})\s*\|\s*(\d{3,4})\s*\}\}$",
+    re.IGNORECASE,
+)
+
+
+def parse_date_range(date_string: str) -> tuple[int, int] | None:
+    """Parse a year-range string into ``(start_year, end_year)`` with
+    ``start <= end``, or return ``None`` for non-range / unparseable
+    inputs. Used purely for equivalence checks between two range-shaped
+    claims; never used to build structured Wikibase time values.
+
+    Recognised shapes (post wikitext-expansion or raw):
+
+      * ``YYYY - YYYY`` / ``YYYY-YYYY`` / ``YYYY–YYYY`` / ``YYYY/YYYY``
+      * ``between YYYY and YYYY``
+      * ``(from) YYYY to YYYY``
+      * ``{{other date|between|YYYY|YYYY}}`` (raw wikitext fallback)
+
+    Returns ``None`` for single dates, BC dates, prose, or anything else
+    ``parse_dpla_date`` already handles — callers try the single-date
+    parser first and fall back to this helper only on its None result.
+
+    Year 0 returns None, matching ``parse_dpla_date``: proleptic
+    Gregorian has no year 0 and any downstream key built from it would
+    collide with the year-1 form.
+    """
+    if not date_string:
+        return None
+    s = date_string.strip()
+    for rx in (_RANGE_DASH, _RANGE_BETWEEN, _RANGE_FROM_TO, _RANGE_OTHER_DATE_BETWEEN):
+        m = rx.match(s)
+        if m:
+            a, b = int(m[1]), int(m[2])
+            if a == 0 or b == 0:
+                return None
+            return (min(a, b), max(a, b))
+    return None
+
+
 def _build_date_claim(
     date: str,
     dpla_id: str,
