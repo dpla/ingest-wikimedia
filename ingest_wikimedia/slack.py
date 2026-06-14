@@ -442,6 +442,7 @@ def notify_sdc_complete(
         stats_lines=[
             f"ITEMS SYNCED:         {tracker.count(Result.SDC_ITEMS_SYNCED):,}",
             f"ITEMS PARTIAL:        {tracker.count(Result.SDC_ITEMS_PARTIALLY_SYNCED):,}",
+            f"PAGES EDITED:         {tracker.count(Result.SDC_PAGES_EDITED):,}",
             f"CLAIMS ADDED:         {tracker.count(Result.SDC_CLAIMS_ADDED):,}",
             f"REFS ADDED:           {tracker.count(Result.SDC_REFS_ADDED):,}",
             f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",

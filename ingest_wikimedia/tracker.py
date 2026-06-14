@@ -40,6 +40,23 @@ class Result(Enum):
     # cleanup on their synced ordinals — the partial state is real
     # progress, not a failure to be retried wholesale.
     SDC_ITEMS_PARTIALLY_SYNCED = auto()
+    # Qualifier-only ``wbeditentity`` fragments committed by the SDC
+    # dispatcher. Exists so the write-delta detection that feeds
+    # ``SDC_PAGES_EDITED`` doesn't miss a page edit whose only fragment
+    # was a qualifier amend (rare — needs every DPLA claim on the file
+    # to already carry today's ``P813``, so the opportunistic refresh
+    # adds no reference-update fragments — but real). Not surfaced in
+    # the SDC Slack summary; counted purely so ``_sdc_writes_total()``
+    # picks up the change.
+    SDC_QUALIFIER_UPDATES = auto()
+    # Distinct Commons file pages this SDC run actually wrote to — counted
+    # at per-ordinal granularity (one file page = one ordinal in partner
+    # mode; one file page per call in the legacy --file/--cat/--list
+    # paths). A page that received both a MediaInfo entity write AND a
+    # follow-up wikitext cleanup edit counts once.  Surfaces the real
+    # batch size to operators, who can't infer it from ITEMS_SYNCED alone
+    # (a 1-file item and a 1,000-file item both count once there).
+    SDC_PAGES_EDITED = auto()
     # Ordinals whose SDC sync raised an unexpected exception
     # (pywikibot APIError, network timeout, deep KeyError, etc.).
     # Per-ordinal granularity so transient failures don't abort the

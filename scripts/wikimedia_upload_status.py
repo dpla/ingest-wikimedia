@@ -15,7 +15,7 @@ import boto3
 import requests
 
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
-from ingest_wikimedia.ssm import REGION, ssm_run
+from ingest_wikimedia.ssm import REGION, fetch_memory_snapshot, ssm_run
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
@@ -258,18 +258,44 @@ def get_phase_and_progress(
     return "Unknown", log_mtime
 
 
-def post_to_slack(token: str, rows: list[tuple[str, str]]) -> None:
+def _format_memory_line(snapshot: tuple[int, int] | None) -> str | None:
+    """Format a ``fetch_memory_snapshot`` pair as the Slack readout
+    line, or return ``None`` if no snapshot was obtained.
+
+    Caller-side formatting (rather than baking the string into the
+    shared helper) keeps ``wikimedia_launch`` / ``wikimedia_retry``
+    free to apply their own headroom-threshold semantics on the same
+    raw pair without ferrying a parsed format back through a regex.
+    """
+    if snapshot is None:
+        return None
+    total_mb, available_mb = snapshot
+    used_mb = total_mb - available_mb
+    pct_available = available_mb * 100 // total_mb
+    return f"Memory: {used_mb:,} / {total_mb:,} MB used ({pct_available}% available)"
+
+
+def post_to_slack(
+    token: str,
+    rows: list[tuple[str, str]],
+    memory_line: str | None = None,
+) -> None:
     lines = "\n".join(f"`{session:<32}` {phase}" for session, phase in rows)
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Wikimedia Upload Status"},
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": lines}},
+    ]
+    if memory_line:
+        blocks.append(
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": memory_line}]}
+        )
     payload = {
         "channel": SLACK_CHANNEL,
         "text": "Wikimedia Upload Status",
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Wikimedia Upload Status"},
-            },
-            {"type": "section", "text": {"type": "mrkdwn", "text": lines}},
-        ],
+        "blocks": blocks,
     }
     resp = requests.post(
         SLACK_API_URL,
@@ -320,7 +346,11 @@ def main() -> None:
     if not sessions:
         print("No active wikimedia sessions.")
         if notify_if_idle:
-            post_to_slack(token, [("(none)", "No active Wikimedia upload sessions.")])
+            post_to_slack(
+                token,
+                [("(none)", "No active Wikimedia upload sessions.")],
+                memory_line=_format_memory_line(fetch_memory_snapshot(ssm)),
+            )
             print("Posted idle status to Slack.")
         return
 
@@ -452,15 +482,20 @@ def main() -> None:
         # This is a defensive fallback that should never fire.
         return session, "Generating IDs"
 
-    with ThreadPoolExecutor(max_workers=min(len(sessions), 8)) as executor:
+    # Memory snapshot is independent of every per-session fetch — submit it
+    # to the same executor so the SSM round-trip overlaps with the session
+    # phase resolution rather than serializing after it.
+    with ThreadPoolExecutor(max_workers=min(len(sessions) + 1, 8)) as executor:
+        memory_future = executor.submit(fetch_memory_snapshot, ssm)
         futures = {executor.submit(fetch, s): s for s in sessions}
         for future in as_completed(futures):
             session, phase = future.result()
             results[session] = phase
             print(f"{session}: {phase}")
+        memory_line = _format_memory_line(memory_future.result())
 
     rows = [(s, results[s]) for s in sessions if s in results]
-    post_to_slack(token, rows)
+    post_to_slack(token, rows, memory_line=memory_line)
     print("Posted to Slack.")
 
 

@@ -1088,6 +1088,7 @@ def test_safe_process_one_passes_through_on_success(monkeypatch):
     from tools import sdc_sync
 
     fake_tracker = MagicMock()
+    fake_tracker.count.return_value = 0
     monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
     monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
 
@@ -1147,16 +1148,19 @@ def test_safe_process_one_runs_post_sdc_cleanup_when_file_page_supplied(monkeypa
     on the legacy paths."""
     from tools import sdc_sync
 
-    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    fake_tracker = MagicMock()
+    fake_tracker.count.return_value = 0
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
     monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
     monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
 
     cleanup_calls = []
-    monkeypatch.setattr(
-        sdc_sync,
-        "_post_sdc_cleanup_for_legacy_mode",
-        lambda page, dpla_id: cleanup_calls.append((page, dpla_id)),
-    )
+
+    def _record(page, dpla_id):
+        cleanup_calls.append((page, dpla_id))
+        return False
+
+    monkeypatch.setattr(sdc_sync, "_post_sdc_cleanup_for_legacy_mode", _record)
 
     fake_page = MagicMock(name="FilePage")
     sdc_sync._safe_process_one("M1", "dpla-1", file_page=fake_page)
@@ -1170,7 +1174,9 @@ def test_safe_process_one_skips_cleanup_when_no_file_page(monkeypatch):
     ``None`` page handle)."""
     from tools import sdc_sync
 
-    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    fake_tracker = MagicMock()
+    fake_tracker.count.return_value = 0
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
     monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
     monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
 
@@ -1178,7 +1184,7 @@ def test_safe_process_one_skips_cleanup_when_no_file_page(monkeypatch):
     monkeypatch.setattr(
         sdc_sync,
         "_post_sdc_cleanup_for_legacy_mode",
-        lambda *a: called.append(a),
+        lambda *a: called.append(a) or False,
     )
 
     sdc_sync._safe_process_one("M1", "dpla-1")  # no file_page
@@ -1193,7 +1199,9 @@ def test_safe_process_one_skips_cleanup_when_disabled(monkeypatch):
     operator with post-SDC edits."""
     from tools import sdc_sync
 
-    monkeypatch.setattr(sdc_sync, "tracker", MagicMock())
+    fake_tracker = MagicMock()
+    fake_tracker.count.return_value = 0
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
     monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
     monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", False)
 
@@ -1201,12 +1209,120 @@ def test_safe_process_one_skips_cleanup_when_disabled(monkeypatch):
     monkeypatch.setattr(
         sdc_sync,
         "_post_sdc_cleanup_for_legacy_mode",
-        lambda *a: called.append(a),
+        lambda *a: called.append(a) or False,
     )
 
     sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
 
     assert called == []
+
+
+def test_safe_process_one_increments_pages_edited_when_sdc_wrote(monkeypatch):
+    """A successful ``process_one`` that committed SDC changes must
+    bump ``SDC_PAGES_EDITED`` once. Detected via the write-counter
+    snapshot delta (claims/refs/removals after > before)."""
+    from tools import sdc_sync
+
+    counts = {
+        Result.SDC_CLAIMS_ADDED: 0,
+        Result.SDC_REFS_ADDED: 0,
+        Result.SDC_REMOVALS: 0,
+    }
+    fake_tracker = MagicMock()
+    fake_tracker.count.side_effect = lambda r: counts.get(r, 0)
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+
+    def write_some_claims(*_a):
+        # Simulate process_one's effect: it bumped CLAIMS_ADDED via the
+        # SDC dispatcher.
+        counts[Result.SDC_CLAIMS_ADDED] += 5
+
+    monkeypatch.setattr(sdc_sync, "process_one", write_some_claims)
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", False)
+
+    sdc_sync._safe_process_one("M1", "dpla-1")
+
+    fake_tracker.increment.assert_called_once_with(Result.SDC_PAGES_EDITED)
+
+
+def test_safe_process_one_increments_pages_edited_when_cleanup_wrote(monkeypatch):
+    """Even if SDC made no changes (file already in sync), a wikitext
+    cleanup that actually saved still counts the page as edited.
+    Cleanup-only edits are rare but they're real bytes-on-the-wire."""
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    fake_tracker.count.return_value = 0  # SDC wrote nothing
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+    monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+    # Cleanup helper claims it wrote — drives the cleanup_wrote branch.
+    monkeypatch.setattr(sdc_sync, "_post_sdc_cleanup_for_legacy_mode", lambda *_a: True)
+
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
+
+    fake_tracker.increment.assert_called_once_with(Result.SDC_PAGES_EDITED)
+
+
+def test_safe_process_one_counts_page_once_when_both_paths_wrote(monkeypatch):
+    """A file that received both an SDC write AND a wikitext cleanup
+    must count as ONE edited page, not two. Otherwise the operator-
+    facing PAGES EDITED total inflates beyond the real file count."""
+    from tools import sdc_sync
+
+    counts = {
+        Result.SDC_CLAIMS_ADDED: 0,
+        Result.SDC_REFS_ADDED: 0,
+        Result.SDC_REMOVALS: 0,
+    }
+    fake_tracker = MagicMock()
+    fake_tracker.count.side_effect = lambda r: counts.get(r, 0)
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+    monkeypatch.setattr(
+        sdc_sync,
+        "process_one",
+        lambda *_: counts.__setitem__(
+            Result.SDC_CLAIMS_ADDED, counts[Result.SDC_CLAIMS_ADDED] + 1
+        ),
+    )
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+    monkeypatch.setattr(sdc_sync, "_post_sdc_cleanup_for_legacy_mode", lambda *_a: True)
+
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
+
+    page_increments = [
+        c
+        for c in fake_tracker.increment.call_args_list
+        if c.args == (Result.SDC_PAGES_EDITED,)
+    ]
+    assert len(page_increments) == 1
+
+
+def test_safe_process_one_does_not_increment_pages_edited_when_nothing_wrote(
+    monkeypatch,
+):
+    """The no-op case: process_one ran cleanly but committed no edits
+    (file already in sync), and cleanup didn't either. Nothing got
+    written to Commons → PAGES EDITED must stay flat."""
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    fake_tracker.count.return_value = 0
+    monkeypatch.setattr(sdc_sync, "tracker", fake_tracker)
+    monkeypatch.setattr(sdc_sync, "process_one", lambda *a: None)
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True)
+    monkeypatch.setattr(
+        sdc_sync, "_post_sdc_cleanup_for_legacy_mode", lambda *_a: False
+    )
+
+    sdc_sync._safe_process_one("M1", "dpla-1", file_page=MagicMock())
+
+    page_increments = [
+        c
+        for c in fake_tracker.increment.call_args_list
+        if c.args == (Result.SDC_PAGES_EDITED,)
+    ]
+    assert page_increments == []
 
 
 def test_safe_process_one_skips_cleanup_on_missing_entity(monkeypatch):
@@ -3243,6 +3359,51 @@ def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
     # the broken pre-fix one.
     expected_qual_update = {**qual_update, "type": "statement"}
     assert payload["claims"] == [new_claim, ref_update, expected_qual_update, removal]
+
+
+def test_submit_per_item_edit_increments_qualifier_counter():
+    """Qualifier-only fragments still represent a real ``wbeditentity``
+    write on a Commons file, so the dispatcher must bump
+    ``SDC_QUALIFIER_UPDATES``. That counter is in ``_SDC_WRITE_COUNTERS``,
+    so ``_sdc_writes_total()`` picks up the change and
+    ``SDC_PAGES_EDITED`` counts the page — the rare case where every
+    DPLA claim on the file is already on today's P813 (so the
+    opportunistic refresh adds no reference fragments) and the only
+    write left in the bundle is the qualifier amend."""
+    from tools import sdc_sync
+
+    qual_update = {"id": "M999$amend", "qualifiers": {"P459": []}}
+
+    fake_tracker = MagicMock()
+    with (
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=lambda *a, **kw: None),
+    ):
+        sdc_sync._submit_per_item_edit(
+            "M999",
+            "abcdef",
+            summary="qualifier-only edit",
+            qualifier_updates=[qual_update],
+        )
+
+    fake_tracker.increment.assert_called_once_with(Result.SDC_QUALIFIER_UPDATES, 1)
+
+
+def test_sdc_writes_total_includes_qualifier_updates():
+    """The write-delta source used by the partner-mode loop and
+    ``_safe_process_one`` to detect "did this ordinal write anything?"
+    must include qualifier updates — otherwise the rare qualifier-only
+    commit slips past ``SDC_PAGES_EDITED``."""
+    from tools import sdc_sync
+
+    counts = {r: 0 for r in sdc_sync._SDC_WRITE_COUNTERS}
+    fake_tracker = MagicMock()
+    fake_tracker.count.side_effect = lambda r: counts.get(r, 0)
+    with patch.object(sdc_sync, "tracker", fake_tracker):
+        before = sdc_sync._sdc_writes_total()
+        counts[Result.SDC_QUALIFIER_UPDATES] = 3
+        after = sdc_sync._sdc_writes_total()
+    assert after - before == 3
 
 
 def test_p813_refresh_skips_when_no_other_edits():

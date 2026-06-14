@@ -427,3 +427,78 @@ def test_get_phase_and_progress_returns_none_tuple_when_no_log_exists():
             label="bpl+nonexistent",
         )
     assert result == (None, 0)
+
+
+def test_format_memory_line_formats_pair():
+    """``_format_memory_line`` turns the raw ``(total, available)``
+    pair from ``ingest_wikimedia.ssm.fetch_memory_snapshot`` into the
+    Slack-friendly ``"used / total MB used (pct% available)"`` line.
+    The OOM-watching readout has to be parseable at a glance — pin
+    the exact format so a future thousands-separator or label tweak
+    is noticed."""
+    from scripts.wikimedia_upload_status import _format_memory_line
+
+    # used = total - available = 7700 - 3200 = 4500
+    # pct_available = 3200 * 100 // 7700 = 41
+    assert (
+        _format_memory_line((7700, 3200))
+        == "Memory: 4,500 / 7,700 MB used (41% available)"
+    )
+
+
+def test_format_memory_line_passes_through_none():
+    """When the shared helper couldn't fetch a snapshot it returns
+    ``None``; the formatter has to propagate that so the caller can
+    omit the memory block from the Slack post rather than emit a
+    misleading row."""
+    from scripts.wikimedia_upload_status import _format_memory_line
+
+    assert _format_memory_line(None) is None
+
+
+def test_post_to_slack_includes_memory_line_when_provided():
+    """``post_to_slack`` adds the memory snapshot as a context block at
+    the bottom of the message. Omitted when ``memory_line`` is None
+    (so the message degrades gracefully on snapshot failure)."""
+    from unittest.mock import MagicMock, patch
+
+    from scripts.wikimedia_upload_status import post_to_slack
+
+    fake_resp = MagicMock()
+    fake_resp.json.return_value = {"ok": True}
+    fake_resp.raise_for_status.return_value = None
+
+    rows = [("wikimedia-bpl", "Uploading")]
+    with patch(
+        "scripts.wikimedia_upload_status.requests.post", return_value=fake_resp
+    ) as mock_post:
+        post_to_slack(
+            "tok", rows, memory_line="Memory: 4,500 / 7,700 MB used (41% available)"
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    block_texts = [
+        elem["text"]
+        for block in payload["blocks"]
+        if block["type"] == "context"
+        for elem in block["elements"]
+    ]
+    assert any("41% available" in text for text in block_texts)
+
+
+def test_post_to_slack_omits_memory_block_when_none():
+    """No memory line → no context block — the message degrades to just
+    the session phase summary."""
+    from unittest.mock import MagicMock, patch
+
+    from scripts.wikimedia_upload_status import post_to_slack
+
+    fake_resp = MagicMock()
+    fake_resp.json.return_value = {"ok": True}
+    fake_resp.raise_for_status.return_value = None
+
+    with patch(
+        "scripts.wikimedia_upload_status.requests.post", return_value=fake_resp
+    ) as mock_post:
+        post_to_slack("tok", [("wikimedia-bpl", "Uploading")], memory_line=None)
+    payload = mock_post.call_args.kwargs["json"]
+    assert not any(b.get("type") == "context" for b in payload["blocks"])

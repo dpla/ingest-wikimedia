@@ -4,7 +4,7 @@ import base64
 import re
 from unittest.mock import MagicMock
 
-from ingest_wikimedia.ssm import ssm_run, stage_and_launch_tmux
+from ingest_wikimedia.ssm import fetch_memory_snapshot, ssm_run, stage_and_launch_tmux
 
 
 def _make_client_returning(stdout: str) -> MagicMock:
@@ -233,3 +233,35 @@ def test_stage_and_launch_tmux_script_filename_is_deterministic_per_session():
     assert path_A1 != path_B, (
         f"different session names must produce different paths: {path_A1} vs {path_B}"
     )
+
+
+def test_fetch_memory_snapshot_parses_free_output():
+    """``free -m | awk 'NR==2{print $2,$7}'`` emits ``"<total> <available>"``;
+    helper returns the parsed ``(total, available)`` pair."""
+    client = _make_client_returning("7700 3200")
+    assert fetch_memory_snapshot(client) == (7700, 3200)
+
+
+def test_fetch_memory_snapshot_returns_none_on_ssm_failure():
+    """An SSM failure must downgrade to ``None`` rather than raise —
+    every caller (status reporter, launch gate, retry gate) needs to
+    be free to apply its own policy when the snapshot is unavailable."""
+    client = MagicMock()
+    client.send_command.return_value = {"Command": {"CommandId": "x"}}
+    client.exceptions.InvocationDoesNotExist = type(
+        "_FakeInvocationDoesNotExist", (Exception,), {}
+    )
+    client.get_command_invocation.return_value = {
+        "Status": "Failed",
+        "StandardErrorContent": "boom",
+    }
+    assert fetch_memory_snapshot(client) is None
+
+
+def test_fetch_memory_snapshot_returns_none_on_malformed_output():
+    """Defensive: any ``free`` output that doesn't yield two positive
+    ints must downgrade to ``None`` (rather than emit a misleading
+    snapshot or raise a ``ZeroDivisionError`` downstream)."""
+    assert fetch_memory_snapshot(_make_client_returning("not numeric")) is None
+    assert fetch_memory_snapshot(_make_client_returning("0 0")) is None
+    assert fetch_memory_snapshot(_make_client_returning("7700")) is None  # single token

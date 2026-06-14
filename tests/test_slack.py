@@ -480,6 +480,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
         tracker_counts={
             Result.SDC_ITEMS_SYNCED: 100,
             Result.SDC_ITEMS_PARTIALLY_SYNCED: 9,
+            Result.SDC_PAGES_EDITED: 1234,
             Result.SDC_CLAIMS_ADDED: 250,
             Result.SDC_REFS_ADDED: 30,
             Result.SDC_REMOVALS: 4,
@@ -494,6 +495,7 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
     stats = captured["stats_lines"]
     assert any(s.startswith("ITEMS SYNCED:") and "100" in s for s in stats)
     assert any(s.startswith("ITEMS PARTIAL:") and "9" in s for s in stats)
+    assert any(s.startswith("PAGES EDITED:") and "1,234" in s for s in stats)
     assert any(s.startswith("CLAIMS ADDED:") and "250" in s for s in stats)
     assert any(s.startswith("REFS ADDED:") and "30" in s for s in stats)
     assert any(s.startswith("REMOVALS:") and "4" in s for s in stats)
@@ -504,6 +506,17 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
     assert any("ORDINAL NO PAGEID:" in s and "6" in s for s in stats)
     assert any("ORDINAL ERRORS:" in s and "7" in s for s in stats)
     assert any("Runtime:" in s and "42s" in s for s in stats)
+
+    # PAGES EDITED belongs in the leading "scope" block (ITEMS SYNCED /
+    # ITEMS PARTIAL / PAGES EDITED) — it's the per-file-page batch size,
+    # paired with the per-item counts. Pin the order so a stray refactor
+    # doesn't bury it next to the SKIPPED footer where operators won't
+    # notice it.
+    def _idx(prefix: str) -> int:
+        return next(i for i, s in enumerate(stats) if s.startswith(prefix))
+
+    assert _idx("ITEMS SYNCED:") < _idx("ITEMS PARTIAL:") < _idx("PAGES EDITED:")
+    assert _idx("PAGES EDITED:") < _idx("CLAIMS ADDED:")
 
 
 def test_notify_sdc_complete_dry_run_adds_suffix():
