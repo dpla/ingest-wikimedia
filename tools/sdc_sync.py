@@ -323,6 +323,74 @@ def _resolve_pageid_from_title(title: str) -> int | None:
     return None
 
 
+def _find_existing_commons_files_by_dpla_id(dpla_id: str) -> dict[str, dict]:
+    """Find every Commons file whose title carries ``dpla_id`` and map
+    each by its ordinal-from-filename.
+
+    Returns ``{ord_str: {"title": <title-without-File:>, "pageid": <int>}}``.
+    Empty dict on any failure mode — caller's existing skip path runs.
+
+    Uses CirrusSearch ``intitle:<dpla_id>`` which exact-matches the
+    32-hex DPLA ID anywhere in the title. The DPLA ID is unique enough
+    that the result set is bounded by the item's file count
+    (typically 1, occasionally 20–30 for multi-page archival items).
+    Within-item ordinal collisions are impossible — Commons titles
+    must be unique, and the bot produces deterministic (page N)
+    suffixes per ordinal.
+
+    Used by the SDC eligibility-discovery fallback: when the
+    uploader couldn't confirm an ordinal (NOT_PRESENT / INELIGIBLE /
+    FAILED) but a Commons file with that DPLA ID and ordinal already
+    exists from a prior successful run, sync SDC against the existing
+    file rather than skipping the data-side work because of a transient
+    binary-side failure.
+    """
+    if not dpla_id:
+        return {}
+    try:
+        result = site.simple_request(
+            action="query",
+            list="search",
+            srnamespace=6,
+            srsearch=f'intitle:"{dpla_id}"',
+            # 50 hits comfortably exceeds the largest multi-file items
+            # in DPLA's corpus (P.D. records / microfilm reels run
+            # 20–30 pages). Bumping further has no cost when the actual
+            # hit count is small.
+            srlimit=50,
+            srprop="",
+        ).submit()
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for hit in result.get("query", {}).get("search", []) or []:
+        if not isinstance(hit, dict):
+            continue
+        title = hit.get("title")
+        pageid = hit.get("pageid")
+        if not isinstance(title, str) or not isinstance(pageid, int) or pageid <= 0:
+            continue
+        # ``upload-result.json`` records titles without the ``File:``
+        # prefix; mirror that here so downstream lookups (which
+        # re-prepend ``File:`` themselves) work uniformly.
+        bare_title = title[5:] if title.lower().startswith("file:") else title
+        # The intitle search can surface files where the DPLA ID
+        # appears outside the canonical `- DPLA - <id> [(page N)].<ext>`
+        # tail (e.g. a hand-named file that happened to mention the
+        # ID in its title). Confirm via the shared extractor that
+        # this hit's title actually carries the DPLA-tail anchor we
+        # produce; skip otherwise rather than guess the ordinal.
+        if extract_dpla_id_from_commons_title(bare_title) != dpla_id:
+            continue
+        ordinal = wikimedia.extract_page_ordinal_from_commons_title(bare_title)
+        # Single-file items have no `(page N)` suffix — the uploader
+        # serialises them as ordinal "1" in upload-result.json, so
+        # mirror that here.
+        ord_str = str(ordinal) if ordinal is not None else "1"
+        out[ord_str] = {"title": bare_title, "pageid": pageid}
+    return out
+
+
 def _truncate(text: str | None, limit: int = 500) -> str:
     """Return ``text`` shortened to ``limit`` chars with an ellipsis suffix.
 
@@ -4053,12 +4121,58 @@ def _run_partner_mode(partner, ids_file):
                 )
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
                 continue
-            eligible = {
-                ord_str: data
-                for ord_str, data in ordinals.items()
-                if isinstance(data, dict)
-                and data.get("status") in ("UPLOADED", "SKIPPED")
-            }
+            eligible: dict[str, dict] = {}
+            unresolved_ords: list[str] = []
+            for ord_str, data in ordinals.items():
+                if not isinstance(data, dict):
+                    continue
+                if data.get("status") in ("UPLOADED", "SKIPPED"):
+                    eligible[ord_str] = data
+                else:
+                    # NOT_PRESENT / INELIGIBLE / FAILED — the upload phase
+                    # couldn't confirm this ordinal in *this* run, but the
+                    # file may exist on Commons from a prior run. Defer to
+                    # the post-loop Commons discovery pass below.
+                    unresolved_ords.append(ord_str)
+
+            # Data-side phases (SDC sync, template migration) operate on
+            # the Commons file, which is independent of whether the
+            # current run successfully refreshed the S3 binary. When the
+            # upload phase left ordinals as NOT_PRESENT/INELIGIBLE/
+            # FAILED, search Commons by DPLA-ID for any existing files
+            # and graft them onto ``eligible``. Lets a transient binary-
+            # side failure (broken upstream URL, S3 hiccup) NOT block
+            # data-side maintenance of files that are already on Commons.
+            #
+            # Lazy: the search only fires if at least one ordinal needs
+            # rescuing — healthy items where everything UPLOADED/SKIPPED
+            # this run pay zero extra API cost.
+            if unresolved_ords:
+                discovered = _find_existing_commons_files_by_dpla_id(dpla_id)
+                rescued = 0
+                for ord_str in unresolved_ords:
+                    found = discovered.get(ord_str)
+                    if not found:
+                        continue
+                    # Preserve the original status string for traceability
+                    # (Slack summaries / logs can still distinguish "this
+                    # run didn't upload" from "this run uploaded fresh"),
+                    # but inject the discovered title+pageid so the
+                    # per-ordinal sync path treats the file as syncable.
+                    eligible[ord_str] = {
+                        **ordinals[ord_str],
+                        "title": found["title"],
+                        "pageid": found["pageid"],
+                        "discovered_via_dpla_id": True,
+                    }
+                    rescued += 1
+                if rescued:
+                    logging.info(
+                        f" -- Recovered {rescued} ordinal(s) via Commons "
+                        f"intitle:{dpla_id} discovery (upload phase reported "
+                        "non-eligible status but file exists on Commons)."
+                    )
+
             if not eligible:
                 logging.info(" -- No SDC-eligible ordinals; skipping.")
                 tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)

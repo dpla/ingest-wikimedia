@@ -4343,3 +4343,126 @@ def test_inferred_dupe_cleanup_skips_property_with_no_dpla_claim():
         sdc_sync._reconcile_inferred_from_wikitext_dupes("M999")
     assert sdc_sync.removals == []
     sdc_sync._reset_per_file_accumulators()
+
+
+# ---------------------------------------------------------------------------
+# _find_existing_commons_files_by_dpla_id — Commons-side discovery primitive
+# that decouples SDC eligibility from the upload phase's per-ordinal status.
+# Lets a file already on Commons get its SDC re-synced when the current
+# run's binary path failed (e.g. NARA upstream URLs went stale).
+# ---------------------------------------------------------------------------
+
+
+def _search_hit(pageid: int, title: str) -> dict:
+    """Build a CirrusSearch result hit in the shape Commons returns."""
+    return {"pageid": pageid, "ns": 6, "title": title}
+
+
+def test_find_existing_commons_files_returns_ordinal_map(monkeypatch):
+    """The happy path: search returns N hits, helper parses each
+    title's ``(page N)`` suffix into an ord_str and pairs it with the
+    pageid. Titles are returned without the ``File:`` prefix to match
+    what upload-result.json carries."""
+    from tools import sdc_sync
+
+    dpla_id = "1cac77c12985e6c4a35039031ea49c07"
+    hits = [
+        _search_hit(101521797, f"File:Foo - DPLA - {dpla_id} (page 1).jpg"),
+        _search_hit(101521981, f"File:Foo - DPLA - {dpla_id} (page 19).jpg"),
+        _search_hit(101522004, f"File:Foo - DPLA - {dpla_id} (page 20).jpg"),
+    ]
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.return_value = {
+        "query": {"search": hits}
+    }
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    found = sdc_sync._find_existing_commons_files_by_dpla_id(dpla_id)
+    assert found == {
+        "1": {"title": f"Foo - DPLA - {dpla_id} (page 1).jpg", "pageid": 101521797},
+        "19": {"title": f"Foo - DPLA - {dpla_id} (page 19).jpg", "pageid": 101521981},
+        "20": {"title": f"Foo - DPLA - {dpla_id} (page 20).jpg", "pageid": 101522004},
+    }
+
+
+def test_find_existing_commons_files_single_file_item(monkeypatch):
+    """Single-file DPLA items don't carry the ``(page N)`` suffix —
+    helper maps them to ord_str ``"1"`` since the uploader's single-
+    ordinal items always serialize as ordinal 1 in upload-result.json."""
+    from tools import sdc_sync
+
+    dpla_id = "deadbeef00000000000000000000beef"
+    hits = [_search_hit(12345, f"File:A single file - DPLA - {dpla_id}.jpg")]
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.return_value = {
+        "query": {"search": hits}
+    }
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    found = sdc_sync._find_existing_commons_files_by_dpla_id(dpla_id)
+    assert found == {
+        "1": {"title": f"A single file - DPLA - {dpla_id}.jpg", "pageid": 12345}
+    }
+
+
+def test_find_existing_commons_files_returns_empty_on_no_hits(monkeypatch):
+    """File never made it to Commons (or was deleted) — empty result
+    set. Caller's existing skip path runs unchanged."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.return_value = {
+        "query": {"search": []}
+    }
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._find_existing_commons_files_by_dpla_id("a" * 32) == {}
+
+
+def test_find_existing_commons_files_returns_empty_on_api_error(monkeypatch):
+    """Transient Commons API failure during discovery must not abort
+    the partner batch — return ``{}`` and the caller's skip path runs."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.side_effect = RuntimeError("boom")
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._find_existing_commons_files_by_dpla_id("a" * 32) == {}
+
+
+def test_find_existing_commons_files_returns_empty_on_blank_dpla_id(monkeypatch):
+    """Defense-in-depth — never issue an unbounded ``intitle:""``
+    search just because the DPLA ID was empty."""
+    from tools import sdc_sync
+
+    fake_site = MagicMock()
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    assert sdc_sync._find_existing_commons_files_by_dpla_id("") == {}
+    assert sdc_sync._find_existing_commons_files_by_dpla_id(None) == {}  # type: ignore[arg-type]
+    assert fake_site.simple_request.call_count == 0
+
+
+def test_find_existing_commons_files_skips_non_canonical_titles(monkeypatch):
+    """A search hit whose title contains the DPLA ID but doesn't match
+    the canonical ``- DPLA - <id> (page N).<ext>`` pattern (someone
+    uploaded a file with that ID embedded mid-title, or with a non-
+    file extension) is skipped rather than guessing an ordinal."""
+    from tools import sdc_sync
+
+    dpla_id = "1cac77c12985e6c4a35039031ea49c07"
+    hits = [
+        # Canonical — keep.
+        _search_hit(1, f"File:Foo - DPLA - {dpla_id} (page 1).jpg"),
+        # ID is in title but not in the canonical position — skip.
+        _search_hit(2, f"File:Notes on {dpla_id} - other text.txt"),
+    ]
+    fake_site = MagicMock()
+    fake_site.simple_request.return_value.submit.return_value = {
+        "query": {"search": hits}
+    }
+    monkeypatch.setattr(sdc_sync, "site", fake_site, raising=False)
+
+    found = sdc_sync._find_existing_commons_files_by_dpla_id(dpla_id)
+    assert list(found.keys()) == ["1"]
