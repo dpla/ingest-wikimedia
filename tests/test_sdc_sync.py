@@ -3361,6 +3361,51 @@ def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
     assert payload["claims"] == [new_claim, ref_update, expected_qual_update, removal]
 
 
+def test_submit_per_item_edit_increments_qualifier_counter():
+    """Qualifier-only fragments still represent a real ``wbeditentity``
+    write on a Commons file, so the dispatcher must bump
+    ``SDC_QUALIFIER_UPDATES``. That counter is in ``_SDC_WRITE_COUNTERS``,
+    so ``_sdc_writes_total()`` picks up the change and
+    ``SDC_PAGES_EDITED`` counts the page — the rare case where every
+    DPLA claim on the file is already on today's P813 (so the
+    opportunistic refresh adds no reference fragments) and the only
+    write left in the bundle is the qualifier amend."""
+    from tools import sdc_sync
+
+    qual_update = {"id": "M999$amend", "qualifiers": {"P459": []}}
+
+    fake_tracker = MagicMock()
+    with (
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "_submit_sdc_write", side_effect=lambda *a, **kw: None),
+    ):
+        sdc_sync._submit_per_item_edit(
+            "M999",
+            "abcdef",
+            summary="qualifier-only edit",
+            qualifier_updates=[qual_update],
+        )
+
+    fake_tracker.increment.assert_called_once_with(Result.SDC_QUALIFIER_UPDATES, 1)
+
+
+def test_sdc_writes_total_includes_qualifier_updates():
+    """The write-delta source used by the partner-mode loop and
+    ``_safe_process_one`` to detect "did this ordinal write anything?"
+    must include qualifier updates — otherwise the rare qualifier-only
+    commit slips past ``SDC_PAGES_EDITED``."""
+    from tools import sdc_sync
+
+    counts = {r: 0 for r in sdc_sync._SDC_WRITE_COUNTERS}
+    fake_tracker = MagicMock()
+    fake_tracker.count.side_effect = lambda r: counts.get(r, 0)
+    with patch.object(sdc_sync, "tracker", fake_tracker):
+        before = sdc_sync._sdc_writes_total()
+        counts[Result.SDC_QUALIFIER_UPDATES] = 3
+        after = sdc_sync._sdc_writes_total()
+    assert after - before == 3
+
+
 def test_p813_refresh_skips_when_no_other_edits():
     """No fragments in any accumulator → no POST, including no P813
     refresh. The refresh only piggybacks on edits we're already making."""

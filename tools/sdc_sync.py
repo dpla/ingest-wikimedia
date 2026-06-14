@@ -2061,6 +2061,10 @@ _SDC_WRITE_COUNTERS = (
     Result.SDC_CLAIMS_ADDED,
     Result.SDC_REFS_ADDED,
     Result.SDC_REMOVALS,
+    # Qualifier-only edits are real ``wbeditentity`` writes that
+    # otherwise wouldn't bump any of the above. Include here so the
+    # delta-detection feeding ``SDC_PAGES_EDITED`` doesn't miss them.
+    Result.SDC_QUALIFIER_UPDATES,
 )
 
 
@@ -2171,9 +2175,13 @@ def _submit_per_item_edit(
 
     The dispatcher tracker-counts ``new_claims`` under
     ``SDC_CLAIMS_ADDED``, ``reference_updates`` under
-    ``SDC_REFS_ADDED``, and ``removals`` under ``SDC_REMOVALS``.
-    Qualifier-only amends are not separately counted (they ride along
-    on a claim that's already accounted for or on a legacy backfill).
+    ``SDC_REFS_ADDED``, ``removals`` under ``SDC_REMOVALS``, and
+    ``qualifier_updates`` under ``SDC_QUALIFIER_UPDATES``. The
+    qualifier counter is not surfaced in the Slack summary — it
+    exists so the ``SDC_PAGES_EDITED`` write-delta detection picks
+    up the rare qualifier-only commit (every DPLA claim on the file
+    already carries today's ``P813``, so the opportunistic refresh
+    adds no reference fragments).
 
     No-op when every fragment list is empty.
     """
@@ -2217,6 +2225,8 @@ def _submit_per_item_edit(
         tracker.increment(Result.SDC_REFS_ADDED, len(reference_updates))
     if removals:
         tracker.increment(Result.SDC_REMOVALS, len(removals))
+    if qualifier_updates:
+        tracker.increment(Result.SDC_QUALIFIER_UPDATES, len(qualifier_updates))
 
 
 def _build_qualifier_update_fragments(mediaid):
