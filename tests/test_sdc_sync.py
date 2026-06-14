@@ -4129,3 +4129,217 @@ def test_classify_item_outcome_no_progress():
         _classify_item_outcome(synced_this_item=False, had_ordinal_error=False)
         == Result.SDC_ITEMS_SKIPPED_MAPPING
     )
+
+
+# ---------------------------------------------------------------------------
+# _reconcile_inferred_from_wikitext_dupes — idempotency cleanup. Removes
+# inferred-from-Wikitext claims (P887 → Q131783016 reference) whose
+# comparable value equals a DPLA-attributed claim on the same property.
+# Covers the M193555788 (Mission Grove) case where the legacy migrator
+# preserved {{other date|between|1934|1948}} alongside DPLA's
+# "1934 - 1948" because the structured-time matcher couldn't see ranges.
+# ---------------------------------------------------------------------------
+
+
+def _inferred_from_wikitext_reference(
+    permalink="https://commons.wikimedia.org/w/index.php?oldid=1227892018",
+):
+    """Reference snak set the legacy migration importer stamps on
+    every claim it adds: P887 → Q131783016 ("inferred from Wikitext")
+    plus P4656 → permalink. Recognised by the dedup cleanup as "this
+    is one of ours, safe to remove if equivalent to DPLA's"."""
+    return {
+        "snaks": {
+            "P887": _qual_entity("P887", "Q131783016"),
+            "P4656": [
+                {
+                    "snaktype": "value",
+                    "property": "P4656",
+                    "datavalue": {"type": "string", "value": permalink},
+                }
+            ],
+        }
+    }
+
+
+def _p571_somevalue_with_p1932(stmt_id, p1932_value, references=None, p459=True):
+    """Build a P571 somevalue+P1932 statement — the canonical shape for
+    a range-shaped claim, used for both the DPLA-attributed and the
+    inferred-from-Wikitext sides of the dedup test."""
+    quals = {
+        "P1932": _qual_string("P1932", p1932_value),
+    }
+    if p459:
+        quals["P459"] = _dpla_p459()
+    return _stmt(
+        stmt_id=stmt_id,
+        prop="P571",
+        snaktype="somevalue",
+        value=None,
+        qualifiers=quals,
+        references=references or [],
+    )
+
+
+def test_inferred_dupe_cleanup_removes_equivalent_range_claim():
+    """Mission Grove repro — DPLA's P571 somevalue+P1932="1934 - 1948"
+    and an inferred-from-Wikitext P571 somevalue+P1932="{{other date|
+    between|1934|1948}}" should dedup to one claim; the inferred
+    statement gets queued for removal."""
+    from tools import sdc_sync
+
+    dpla_claim = _p571_somevalue_with_p1932(
+        "M999$DPLA",
+        "1934 - 1948",
+        references=[_dpla_reference()],
+    )
+    inferred_claim = _p571_somevalue_with_p1932(
+        "M999$INFERRED",
+        "{{other date|between|1934|1948}}",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,  # inferred claims don't carry the DPLA-determination qualifier
+    )
+    entity = {
+        "pageid": 999,
+        "statements": {"P571": [dpla_claim, inferred_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M999")
+    assert sdc_sync.removals == ["M999$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_preserves_distinct_range_claim():
+    """Inferred range that does NOT match DPLA's range is real
+    community-contributed information — never queue for removal."""
+    from tools import sdc_sync
+
+    dpla_claim = _p571_somevalue_with_p1932(
+        "M999$DPLA",
+        "1934 - 1948",
+        references=[_dpla_reference()],
+    )
+    inferred_claim = _p571_somevalue_with_p1932(
+        "M999$DISTINCT",
+        "1950 - 1960",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {
+        "pageid": 999,
+        "statements": {"P571": [dpla_claim, inferred_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M999")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_ignores_foreign_community_claim():
+    """Safety bar: a community claim that happens to encode the same
+    range as DPLA but lacks the P887 → Q131783016 inferred-from-
+    Wikitext fingerprint is third-party content and must NOT be touched.
+    Same string equivalence; only the reference shape distinguishes them."""
+    from tools import sdc_sync
+
+    dpla_claim = _p571_somevalue_with_p1932(
+        "M999$DPLA",
+        "1934 - 1948",
+        references=[_dpla_reference()],
+    )
+    foreign_claim = _p571_somevalue_with_p1932(
+        "M999$FOREIGN",
+        "between 1934 and 1948",
+        references=[_foreign_reference()],
+        p459=False,
+    )
+    entity = {
+        "pageid": 999,
+        "statements": {"P571": [dpla_claim, foreign_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M999")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_removes_equivalent_single_date_claim():
+    """Idempotency for non-range claims: if a single-date inferred-
+    from-Wikitext claim parses to the same canonical time as a DPLA
+    value-typed time claim, remove the inferred one. Covers the case
+    where DPLA drifts into emitting the structured time for a value
+    the importer had previously preserved as somevalue+P1932="1945"."""
+    from tools import sdc_sync
+
+    # Hand-built value-typed time statement — _stmt's generic builder
+    # doesn't cover the time mainsnak shape (no other reconciler test
+    # needed it).
+    dpla_claim = {
+        "id": "M999$DPLA",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datatype": "time",
+            "datavalue": {
+                "type": "time",
+                "value": {
+                    "time": "+1945-01-01T00:00:00Z",
+                    "precision": 9,
+                    "before": 0,
+                    "after": 0,
+                    "timezone": 0,
+                    "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                },
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference()],
+    }
+    inferred_claim = _p571_somevalue_with_p1932(
+        "M999$INFERRED",
+        "1945",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {
+        "pageid": 999,
+        "statements": {"P571": [dpla_claim, inferred_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M999")
+    assert sdc_sync.removals == ["M999$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_skips_property_with_no_dpla_claim():
+    """When no DPLA-attributed claim exists on a property, even a
+    matching inferred-from-Wikitext claim must stay — there's no
+    duplication to clean up."""
+    from tools import sdc_sync
+
+    inferred_claim = _p571_somevalue_with_p1932(
+        "M999$ALONE",
+        "1934 - 1948",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {
+        "pageid": 999,
+        "statements": {"P571": [inferred_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M999")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()

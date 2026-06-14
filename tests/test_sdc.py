@@ -893,3 +893,116 @@ def test_next_series_letter_advances_past_z_without_corruption():
     assert seen[27] == "AB"
     # The persisted state matches the last value returned.
     assert letters[("P10358", "en")] == "AB"
+
+
+# ---------------------------------------------------------------------------
+# parse_date_range — year-range equivalence helper used purely for dedup
+# between range-shaped somevalue+P1932 claims. parse_dpla_date deliberately
+# returns None for any range, so this is the only path to recognise two
+# different formattings of the same range as the same fact.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_date_range_dash_variants():
+    """All separator variants between two 4-digit years yield the same
+    (start, end) tuple."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("1934 - 1948") == (1934, 1948)
+    assert parse_date_range("1934-1948") == (1934, 1948)
+    assert parse_date_range("1934–1948") == (1934, 1948)  # en-dash
+    assert parse_date_range("1934—1948") == (1934, 1948)  # em-dash
+    assert parse_date_range("1934/1948") == (1934, 1948)
+
+
+def test_parse_date_range_between():
+    """``between X and Y`` is the prose form produced by ``{{other date|
+    between|X|Y}}`` after wikitext expansion. Case-insensitive."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("between 1934 and 1948") == (1934, 1948)
+    assert parse_date_range("Between 1934 and 1948") == (1934, 1948)
+    assert parse_date_range("BETWEEN 1934 AND 1948") == (1934, 1948)
+
+
+def test_parse_date_range_from_to():
+    """``X to Y`` (and ``from X to Y``) covers a less common DPLA shape."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("1934 to 1948") == (1934, 1948)
+    assert parse_date_range("from 1934 to 1948") == (1934, 1948)
+
+
+def test_parse_date_range_other_date_template_raw_wikitext():
+    """When ``_expand_wikitext_for_date_parse`` couldn't reach the API
+    (or the value was stored before the expand-then-store fix), the
+    P1932 qualifier carries literal ``{{other date|between|X|Y}}``
+    markup. The range parser still recognises it so the reconciler can
+    dedup these legacy-encoded statements without a second API round
+    trip to expand them."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("{{other date|between|1934|1948}}") == (1934, 1948)
+    # Tolerate optional whitespace and the ``other_date`` underscored
+    # alias MediaWiki accepts for template names.
+    assert parse_date_range("{{ other date | between | 1934 | 1948 }}") == (
+        1934,
+        1948,
+    )
+    assert parse_date_range("{{other_date|between|1934|1948}}") == (1934, 1948)
+
+
+def test_parse_date_range_canonicalises_min_max():
+    """Reversed-order inputs canonicalise to ``(min, max)`` so two
+    range claims that disagree on direction (e.g. ``"1948 - 1934"`` and
+    ``"1934 - 1948"``) still dedup. Wikibase has no semantic for
+    direction on a P1932 qualifier; both encode the same span."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("1948 - 1934") == (1934, 1948)
+    assert parse_date_range("between 1948 and 1934") == (1934, 1948)
+
+
+def test_parse_date_range_rejects_year_zero():
+    """Year 0 is undefined in proleptic Gregorian — same rule as
+    ``parse_dpla_date``. Refuse to produce a comparable that would
+    collide with a year-1 claim."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("0 - 1948") is None
+    assert parse_date_range("1934 - 0") is None
+
+
+def test_parse_date_range_rejects_single_year_and_year_month():
+    """Single years and ISO year-month strings must NOT register as
+    ranges — those are the domain of ``parse_dpla_date``. The dash
+    pattern requires 3-4 digits on BOTH sides, which excludes the
+    ``YYYY-MM`` shape (month digits are 1-2)."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("1945") is None
+    assert parse_date_range("1945-06") is None
+    assert parse_date_range("1945-06-07") is None
+
+
+def test_parse_date_range_rejects_free_prose():
+    """Strings that contain a range-like substring but extra prose
+    around it (e.g. ``"around 1934-1948 era"``) must fall back to
+    ``None``. The regexes are anchored to ``^…$`` so any non-range
+    residue refuses the match — mirrors ``parse_dpla_date``'s
+    conservative-fallback contract."""
+    from ingest_wikimedia.sdc import parse_date_range
+
+    assert parse_date_range("around 1934-1948 era") is None
+    assert parse_date_range("Civil War 1861-1865") is None
+    assert parse_date_range("") is None
+
+
+def test_parse_dpla_date_still_returns_none_for_ranges():
+    """Regression guard — parse_date_range is a *separate* helper, NOT a
+    fallback path inside parse_dpla_date. ``_build_date_claim`` must
+    keep its somevalue-fallback behaviour for ranges so the raw DPLA
+    string is preserved in P1932 instead of being silently coerced to a
+    single year."""
+    assert parse_dpla_date("1934 - 1948") is None
+    assert parse_dpla_date("between 1934 and 1948") is None

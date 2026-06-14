@@ -17,6 +17,7 @@ from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
+    parse_date_range,
     parse_dpla_date,
     parse_nara_access_level,
 )
@@ -2507,6 +2508,7 @@ def dpla_claims(
     _reconcile_existing_claims(
         mediaid, dpla_id, expected, protected_props=CHUNKABLE_PROPS
     )
+    _reconcile_inferred_from_wikitext_dupes(mediaid)
 
 
 def _build_expected_from_parsed(
@@ -2819,6 +2821,151 @@ def _reconcile_existing_claims(mediaid, dpla_id, expected, protected_props=froze
                 removals.append(claim[prop]["id"])
             elif claim[prop]["value"] not in expected[prop]:
                 removals.append(claim[prop]["id"])
+
+
+def _statement_comparable_value(stmt):
+    """Comparable key for ``stmt`` that is stable across equivalent
+    encoding shapes — value-typed time vs. somevalue+P1932 stated-as
+    parsing to the same structured date, range-shaped P1932 across the
+    "1934 - 1948" / "between 1934 and 1948" / raw-wikitext variants,
+    and the simple value-typed shapes (string, monolingualtext, item).
+
+    Every return is tagged with a shape discriminator so cross-type
+    values (e.g. a P571 time and a P217 string of digits) can never
+    accidentally compare equal.
+
+    Returns ``None`` for shapes the dedup helper can't reason about
+    (malformed datavalues, novalue snaks, somevalue claims with no
+    P1932 qualifier). Callers treat ``None`` as "skip this statement"
+    rather than as a match.
+
+    Used by :func:`_reconcile_inferred_from_wikitext_dupes` to decide
+    whether an inferred-from-Wikitext claim should be removed because
+    an equivalent DPLA-authored statement now covers the same fact.
+
+    Every non-None return is a 3-tuple ``(shape_tag, primary, secondary)``
+    with ``secondary`` set to ``None`` for shapes that have no second
+    field (string, item, time, range, p1932-string). Uniform arity keeps
+    static analysis happy without changing equivalence semantics —
+    shape_tag still discriminates type so cross-type values can't
+    collide.
+    """
+    ms = stmt.get("mainsnak") or {}
+    snaktype = ms.get("snaktype")
+
+    if snaktype == "value":
+        dv = ms.get("datavalue") or {}
+        dtype = dv.get("type")
+        v = dv.get("value")
+        if dtype == "time":
+            try:
+                return ("time", _time_claim_comparable(stmt), None)
+            except (KeyError, TypeError):
+                return None
+        if dtype == "string":
+            return ("string", v, None) if isinstance(v, str) else None
+        if dtype == "monolingualtext" and isinstance(v, dict):
+            return ("monolingual", v.get("text"), v.get("language"))
+        if dtype == "wikibase-entityid" and isinstance(v, dict):
+            return ("item", v.get("id"), None)
+        return None
+
+    if snaktype == "somevalue":
+        for q in (stmt.get("qualifiers") or {}).get("P1932", []):
+            qv = q.get("datavalue") or {}
+            if qv.get("type") != "string":
+                continue
+            s = (qv.get("value") or "").strip()
+            if not s:
+                continue
+            parsed = parse_dpla_date(s)
+            if parsed and parsed.get("value"):
+                # Same shape (and circa-bit suffix) as
+                # ``_time_claim_comparable`` so a somevalue+P1932="1945"
+                # collapses with a value-typed time mainsnak.
+                base = _time_comparable(parsed["value"])
+                key = f"{base}|circa" if parsed.get("approximate") else base
+                return ("time", key, None)
+            rng = parse_date_range(s)
+            if rng:
+                return ("date-range", rng[0], rng[1])
+            # Literal-string fallback — only matches another P1932
+            # qualifier whose stated-as text is byte-identical. The
+            # inferred-from-Wikitext writer stores the post-expansion
+            # value, but legacy migrations that ran before the
+            # expand-then-store fix may carry raw wikitext here. The
+            # range parser already matches the most common
+            # ``{{other date|between|X|Y}}`` shape directly.
+            return ("p1932-string", s, None)
+        return None
+
+    return None
+
+
+def _is_inferred_from_wikitext_reference(reference):
+    """Return True iff ``reference`` carries the legacy-migration import
+    fingerprint — a ``P887 = Q131783016`` snak ("based on heuristic =
+    inferred from Wikitext"). The legacy ``{{Artwork}}`` →
+    ``{{DPLA metadata}}`` importer stamps this on every claim it writes,
+    so it's a sufficient marker for "we added this during migration."
+    Parallel of :func:`_is_dpla_reference` for the inferred-import side.
+    """
+    snaks = (reference or {}).get("snaks") or {}
+    for snak in snaks.get("P887") or []:
+        try:
+            if snak["datavalue"]["value"]["id"] == "Q131783016":
+                return True
+        except (KeyError, TypeError):
+            continue
+    return False
+
+
+def _reconcile_inferred_from_wikitext_dupes(mediaid):
+    """Remove inferred-from-Wikitext claims whose comparable value
+    equals a DPLA-attributed claim on the same property.
+
+    Pushes statement IDs onto the module-level ``removals`` accumulator
+    — same channel ``_reconcile_existing_claims`` uses, so the per-file
+    dispatcher flushes both kinds of removal in one wbeditentity.
+
+    Idempotency contract: a file migrated with the legacy
+    ``{{Artwork}}`` importer can carry an inferred-from-Wikitext claim
+    parallel to a DPLA-authored one whenever the migrator couldn't
+    recognise their semantic equivalence (notably for year ranges, see
+    M193555788 with ``{{other date|between|1934|1948}}`` and
+    ``"1934 - 1948"``). On the next sdc-sync re-run, the improved
+    comparable logic — :func:`_statement_comparable_value` plus
+    :func:`ingest_wikimedia.sdc.parse_date_range` — recognises the two
+    statements as the same fact and queues the inferred one for
+    removal. Same rule covers the DPLA-drifts-into-match case (e.g. a
+    later DPLA edit produces a value that happens to equal a
+    previously-preserved community claim): nothing branches on whether
+    the equivalence is new or was always there.
+
+    Safety: only removes statements whose references carry the exact
+    ``P887 → Q131783016`` fingerprint. Third-party community claims
+    that happen to equal a DPLA value are never touched — this routine
+    operates strictly on the import set the migration emitted.
+    """
+    entity = get_entity(mediaid)
+    statements = entity.get("statements") or {}
+    for stmts in statements.values():
+        dpla_comparables = set()
+        inferred_stmts = []
+        for stmt in stmts:
+            refs = stmt.get("references") or []
+            if any(_is_dpla_reference(ref) for ref in refs):
+                comp = _statement_comparable_value(stmt)
+                if comp is not None:
+                    dpla_comparables.add(comp)
+            elif any(_is_inferred_from_wikitext_reference(ref) for ref in refs):
+                inferred_stmts.append(stmt)
+        if not dpla_comparables:
+            continue
+        for stmt in inferred_stmts:
+            comp = _statement_comparable_value(stmt)
+            if comp is not None and comp in dpla_comparables:
+                removals.append(stmt["id"])
 
 
 def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
@@ -3303,6 +3450,7 @@ def process_one_from_sdc(
     _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number)
     expected = _build_expected_from_sdc(sdc_payload)
     _reconcile_existing_claims(mediaid, dpla_id, expected)
+    _reconcile_inferred_from_wikitext_dupes(mediaid)
     _flush_per_file_edits(mediaid, dpla_id)
 
 
