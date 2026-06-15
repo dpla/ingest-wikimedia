@@ -666,10 +666,30 @@ def test_init_partner_worker_builds_slot_budget_from_arg(monkeypatch):
     fake_queue = MagicMock()
     fake_site = MagicMock(name="pywikibot_Site")
 
+    constructed = {}
+
+    class _SpyBudget:
+        def __init__(self, budget):
+            constructed["budget"] = budget
+
+    # Fake WorkerSlotBudget so construction does no filesystem work
+    # (a real budget=12 would create 12 slot files in the shared
+    # /tmp/sdc-sync-worker-slots dir), and register the module global for
+    # auto-restore so a leaked enabled budget can't bleed into later
+    # worker-task tests. WorkerSlotBudget's own behaviour is covered by
+    # test_worker_slots.py.
+    monkeypatch.setattr(
+        sdc_sync, "_worker_slot_budget", sdc_sync._worker_slot_budget, raising=False
+    )
+    monkeypatch.setattr(sdc_sync, "WorkerSlotBudget", _SpyBudget)
+
     with patch("pywikibot.Site", return_value=fake_site):
         sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, True, 12)
 
-    assert sdc_sync._worker_slot_budget.budget == 12
+    assert constructed["budget"] == 12, (
+        "budget value must plumb through to construction"
+    )
+    assert isinstance(sdc_sync._worker_slot_budget, _SpyBudget)
 
 
 def test_run_partner_mode_dispatches_to_pool_when_workers_above_one(

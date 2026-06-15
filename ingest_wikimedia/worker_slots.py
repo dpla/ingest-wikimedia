@@ -70,10 +70,23 @@ benign degradation, not a correctness break.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import logging
 import os
 import time
+
+# Mode for slot files: owner read/write only. They carry no data (the
+# flock is the whole signal), so group/other access buys nothing and a
+# stricter mode keeps another local account from interfering with the
+# lock files on a shared host.
+_SLOT_FILE_MODE = 0o600
+
+# errnos ``flock(LOCK_NB)`` raises specifically for "another holder has
+# it" — the only condition that warrants moving on to the next slot /
+# polling. Any other OSError (EACCES, ENOLCK, EIO, …) is a real fault
+# that must propagate rather than spin forever.
+_FLOCK_CONTENDED_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 
 # Box-wide shared directory holding the slot lock files. Fixed path so
 # every ``sdc-sync`` process on the host contends over the same set.
@@ -157,14 +170,19 @@ class WorkerSlotBudget:
         while True:
             for i in range(self.budget):
                 path = os.path.join(self.slot_dir, f"slot-{i}")
-                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, _SLOT_FILE_MODE)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     return fd
-                except OSError:
-                    # Slot held by another worker/session — try the next.
+                except OSError as e:
                     os.close(fd)
-                    continue
+                    if e.errno in _FLOCK_CONTENDED_ERRNOS:
+                        # Slot held by another worker/session — try the
+                        # next one. Any other errno (permission, ENOLCK,
+                        # I/O) is a real fault: re-raise rather than spin
+                        # forever masking it.
+                        continue
+                    raise
             # Every slot busy. Log once so an operator watching the log
             # can see the budget is saturated (expected under heavy
             # concurrency), then poll.

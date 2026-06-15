@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import WMC_UPLOAD_CHUNK_SIZE
+from ingest_wikimedia.worker_slots import WorkerSlotBudget
 from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     _post_item_orphan_check,
@@ -16,6 +17,12 @@ from tools.uploader import (
     is_dup_sha1_sibling_at_expected_title,
     select_upload_chunk_size,
 )
+
+
+# A disabled budget (budget <= 0) whose acquire() is a no-op context
+# manager — the touch helper now acquires a slot internally, so its unit
+# tests just need a budget object that never blocks.
+_DISABLED_BUDGET = WorkerSlotBudget(0)
 
 
 def _ensurer_with(newly_created: set[str]) -> MagicMock:
@@ -32,7 +39,9 @@ def test_skips_when_category_ensurer_is_none():
         patch("tools.uploader.time.sleep") as sleep_mock,
         patch("tools.uploader.touch_institution_files") as touch_mock,
     ):
-        _post_upload_touch_new_institutions(MagicMock(), None, dry_run=False)
+        _post_upload_touch_new_institutions(
+            MagicMock(), None, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
     sleep_mock.assert_not_called()
     touch_mock.assert_not_called()
 
@@ -43,7 +52,9 @@ def test_skips_when_dry_run():
         patch("tools.uploader.time.sleep") as sleep_mock,
         patch("tools.uploader.touch_institution_files") as touch_mock,
     ):
-        _post_upload_touch_new_institutions(MagicMock(), ensurer, dry_run=True)
+        _post_upload_touch_new_institutions(
+            MagicMock(), ensurer, dry_run=True, slot_budget=_DISABLED_BUDGET
+        )
     sleep_mock.assert_not_called()
     touch_mock.assert_not_called()
 
@@ -54,7 +65,9 @@ def test_skips_when_newly_created_is_empty():
         patch("tools.uploader.time.sleep") as sleep_mock,
         patch("tools.uploader.touch_institution_files") as touch_mock,
     ):
-        _post_upload_touch_new_institutions(MagicMock(), ensurer, dry_run=False)
+        _post_upload_touch_new_institutions(
+            MagicMock(), ensurer, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
     sleep_mock.assert_not_called()
     touch_mock.assert_not_called()
 
@@ -67,7 +80,9 @@ def test_sleeps_then_touches_each_newly_created_qid():
         patch("tools.uploader.touch_institution_files", return_value=4) as touch_mock,
         patch("tools.uploader._REPLICATION_SETTLE_SECS", 10),
     ):
-        _post_upload_touch_new_institutions(site, ensurer, dry_run=False)
+        _post_upload_touch_new_institutions(
+            site, ensurer, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
 
     sleep_mock.assert_called_once_with(10)
     assert touch_mock.call_count == 3
@@ -96,7 +111,9 @@ def test_per_qid_exception_does_not_stop_remaining_qids(caplog):
         ) as touch_mock,
         caplog.at_level(_logging.INFO),
     ):
-        _post_upload_touch_new_institutions(MagicMock(), ensurer, dry_run=False)
+        _post_upload_touch_new_institutions(
+            MagicMock(), ensurer, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
 
     qids_attempted = {call.args[1] for call in touch_mock.call_args_list}
     assert qids_attempted == {"Q_good_1", "Q_bad", "Q_good_2"}

@@ -1396,6 +1396,18 @@ def main(
 
     dpla.check_partner(partner)
 
+    # Box-wide Commons-write budget, shared with the SDC-sync phase
+    # (same flock slot dir). The uploader is single-process, so it holds
+    # exactly one slot while working an item — counting as one writer
+    # against the shared cap so concurrent upload + SDC-sync sessions
+    # across the host don't collectively overrun Commons' maxlag
+    # threshold. Per-item acquire (not whole-run) so the uploader doesn't
+    # stall at startup holding a slot through its S3 reads when the pool
+    # is momentarily full, and briefly frees the slot between items.
+    # budget <= 0 disables it (no-op). Built before the try so the
+    # post-upload touch in the finally can reuse it.
+    slot_budget = WorkerSlotBudget(workers_budget)
+
     try:
         local_fs.setup_temp_dir()
         setup_logging(partner, "upload", logging.INFO)
@@ -1407,17 +1419,6 @@ def main(
         logging.info(f"Starting upload for {partner}")
 
         dpla_ids = load_ids(ids_file)
-
-        # Box-wide Commons-write budget, shared with the SDC-sync phase
-        # (same flock slot dir). The uploader is single-process, so it
-        # holds exactly one slot while working an item — counting as one
-        # writer against the shared cap so concurrent upload + SDC-sync
-        # sessions across the host don't collectively overrun Commons'
-        # maxlag threshold. Per-item acquire (not whole-run) so the
-        # uploader doesn't stall at startup holding a slot through its
-        # S3 reads when the pool is momentarily full, and briefly frees
-        # the slot between items. budget <= 0 disables it (no-op).
-        slot_budget = WorkerSlotBudget(workers_budget)
 
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
             with slot_budget.acquire():
@@ -1436,7 +1437,12 @@ def main(
         # run of fix-unknown-categories to clean up after the fact.  The 10s
         # pause is a cheap belt-and-suspenders against very-late ensure()
         # calls — for typical runs replication has settled long before this.
-        _post_upload_touch_new_institutions(commons_site, category_ensurer, dry_run)
+        #
+        # Passes the slot budget through: these touches are Commons writes,
+        # so the helper holds a slot around them (see its docstring).
+        _post_upload_touch_new_institutions(
+            commons_site, category_ensurer, dry_run, slot_budget
+        )
         notify_upload_complete(
             # Bare partner slug, not "wikimedia-<partner>" — notify_upload_complete
             # always prepends "wikimedia-" itself (matching the bare-label
@@ -1665,10 +1671,18 @@ def _post_item_orphan_check(
 
 
 def _post_upload_touch_new_institutions(
-    commons_site, category_ensurer: CategoryEnsurer, dry_run: bool
+    commons_site,
+    category_ensurer: CategoryEnsurer,
+    dry_run: bool,
+    slot_budget: WorkerSlotBudget,
 ) -> None:
     """At end-of-run, force-rerender files for any institutions whose P8464
-    was first added this session — see touch_institution_files() docstring."""
+    was first added this session — see touch_institution_files() docstring.
+
+    These touches are Commons writes, so they're done under a box-wide slot
+    (``slot_budget``). The slot is acquired *after* the early-return guards
+    so the common no-op case (no new institutions) never blocks waiting for
+    capacity it doesn't need."""
     if not category_ensurer or dry_run:
         return
     newly_created = category_ensurer.newly_created
@@ -1681,14 +1695,15 @@ def _post_upload_touch_new_institutions(
     )
     time.sleep(_REPLICATION_SETTLE_SECS)
     total = 0
-    for inst_qid in sorted(newly_created):
-        try:
-            n = touch_institution_files(commons_site, inst_qid)
-        except Exception as e:
-            logging.warning(f"Search/touch for {inst_qid} failed: {e}")
-            continue
-        logging.info(f"  Touched {n} files for {inst_qid}")
-        total += n
+    with slot_budget.acquire():
+        for inst_qid in sorted(newly_created):
+            try:
+                n = touch_institution_files(commons_site, inst_qid)
+            except Exception as e:
+                logging.warning(f"Search/touch for {inst_qid} failed: {e}")
+                continue
+            logging.info(f"  Touched {n} files for {inst_qid}")
+            total += n
     logging.info(
         f"Post-upload touch complete: {total} files across {len(newly_created)} institution(s)"
     )

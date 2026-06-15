@@ -15,6 +15,7 @@ fd is ever returned for the caller to remember to close.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import os
 import threading
@@ -145,6 +146,27 @@ def test_dead_holder_auto_releases_slot(tmp_path):
     t.start()
     t.join(timeout=3)
     assert proceeded == [True], "slot should have been free after holder fd closed"
+
+
+def test_acquire_reraises_non_contention_oserror(tmp_path, monkeypatch):
+    """A non-contention OSError from flock (e.g. ENOLCK / EACCES) must
+    propagate, not be swallowed as "slot busy" and spun on forever. Only
+    EAGAIN/EWOULDBLOCK mean contention."""
+    budget = WorkerSlotBudget(budget=1, slot_dir=str(tmp_path))
+
+    def boom(fd, op):
+        raise OSError(errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(fcntl, "flock", boom)
+    raised = None
+    try:
+        with budget.acquire():
+            pass
+    except OSError as e:
+        raised = e
+    assert raised is not None and raised.errno == errno.ENOLCK, (
+        "non-contention flock errno must propagate, not loop forever"
+    )
 
 
 def test_acquire_releases_on_exception_in_block(tmp_path):
