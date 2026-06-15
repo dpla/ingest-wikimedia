@@ -588,6 +588,40 @@ def test_run_partner_mode_uses_inline_loop_when_workers_is_one(tmp_path, monkeyp
     )
 
 
+def test_init_partner_worker_binds_mapping_tables_to_module_globals(monkeypatch):
+    """Regression for CodeRabbit's review of #308: with spawn start_method,
+    worker processes re-import the module fresh. ``hubs`` / ``rights`` /
+    ``subject_ids`` are module-level type annotations (lines 44-46) that
+    only get bound when the parent's ``_initialize()`` runs. Workers
+    skip ``_initialize()``, so without explicit injection the cleanup
+    path (``_post_sdc_cleanup_for_item`` → ``DPLA.get_provider_and_data_provider``)
+    would NameError on every item and silently log + skip cleanup for
+    the whole batch.
+
+    The initializer must accept the parent's already-fetched mapping
+    tables via ``initargs`` and bind them to the worker's module
+    globals before any item processing starts."""
+    from tools import sdc_sync
+
+    fake_queue = MagicMock()
+    fake_site = MagicMock(name="pywikibot_Site")
+    fake_hubs = {"some-hub": {"Wikidata": "Q1"}}
+    fake_rights = {"http://rightsstatements.org/foo": "Q2"}
+    fake_subject_ids = {"subject-name": {"id": ["Q3"]}}
+
+    with patch("pywikibot.Site", return_value=fake_site):
+        sdc_sync._init_partner_worker(
+            fake_queue, fake_hubs, fake_rights, fake_subject_ids
+        )
+
+    assert sdc_sync.hubs is fake_hubs
+    assert sdc_sync.rights is fake_rights
+    assert sdc_sync.subject_ids is fake_subject_ids
+    # Sanity: the worker should also have set site + logged in (so the
+    # initializer hasn't accidentally regressed the existing setup).
+    fake_site.login.assert_called_once()
+
+
 def test_run_partner_mode_dispatches_to_pool_when_workers_above_one(
     tmp_path, monkeypatch
 ):

@@ -4070,7 +4070,13 @@ def _run_partner_mode_parallel(partner, dpla_ids, workers):
         with ctx.Pool(
             processes=workers,
             initializer=_init_partner_worker,
-            initargs=(log_queue,),
+            # Pickle the parent's already-fetched mapping tables across
+            # to each worker so the cleanup path (which calls
+            # ``DPLA.get_provider_and_data_provider`` with ``hubs``)
+            # doesn't NameError under spawn start_method. Sharing one
+            # snapshot also means workers and parent agree on the data
+            # even if ingestion3 updates mid-run.
+            initargs=(log_queue, hubs, rights, subject_ids),
         ) as pool:
             for delta in pool.imap_unordered(_worker_partner_task, tasks):
                 if delta:
@@ -4079,11 +4085,11 @@ def _run_partner_mode_parallel(partner, dpla_ids, workers):
         listener.stop()
 
 
-def _init_partner_worker(log_queue):
+def _init_partner_worker(log_queue, hubs_data, rights_data, subject_ids_data):
     """Per-worker setup for the ``--workers > 1`` partner-mode Pool.
 
     Each multiprocessing worker process re-imports this module (with
-    spawn start_method) and runs this initializer once. Two jobs:
+    spawn start_method) and runs this initializer once. Four jobs:
 
     1. **Fresh pywikibot session per worker.** Each worker gets its
        own ``site``/login pair so HTTP sessions, CSRF tokens, and the
@@ -4091,13 +4097,35 @@ def _init_partner_worker(log_queue):
        the parent's already-opened sockets is a recipe for half-broken
        connections; we always re-login here.)
 
-    2. **Route log records to the parent.** Replace the root logger's
+    2. **Inject the mapping tables the parent already fetched.**
+       ``hubs``, ``rights``, and ``subject_ids`` are bound at parent-
+       process ``_initialize()`` time from ingestion3 + the local
+       ``rights.json``. With spawn start_method the worker re-imports
+       this module fresh — those module globals are declared (lines
+       44-46) but not bound, so first access from the cleanup path
+       (``_post_sdc_cleanup_for_item`` → ``DPLA.get_provider_and_data_provider``
+       at line 3744) would NameError. The parent pickles its already-
+       fetched copies into ``initargs`` and the worker binds them on
+       init, so cleanup works in parallel mode and all workers see
+       identical data (no per-worker re-fetch drift between the parent
+       and ingestion3).
+
+    3. **Route log records to the parent.** Replace the root logger's
        handlers with a single ``QueueHandler`` that pushes records to
        the shared multiprocessing queue. The parent runs a
        ``QueueListener`` that drains records to the per-partner SDC
        log file. Keeps log lines atomic and ordered by completion
        time across workers — much safer than letting N processes
        open the same file descriptor.
+
+    4. **Apply the parent's normalize-wikitext flag.** ``_workers``
+       and ``_normalize_wikitext_enabled`` are also module globals
+       the parent's ``_initialize()`` flips from ``args``; the
+       worker's freshly-imported defaults (workers=1, normalize=True)
+       happen to match production today, but we set
+       ``_normalize_wikitext_enabled`` explicitly here so a future
+       parent invocation with ``--no-normalize-wikitext`` doesn't
+       silently re-enable the strip in workers.
     """
     import logging.handlers
 
@@ -4107,9 +4135,12 @@ def _init_partner_worker(log_queue):
     pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
 
-    global site
+    global site, hubs, rights, subject_ids
     site = pywikibot.Site("commons", "commons")
     site.login()
+    hubs = hubs_data
+    rights = rights_data
+    subject_ids = subject_ids_data
 
     qh = logging.handlers.QueueHandler(log_queue)
     root = logging.getLogger()
