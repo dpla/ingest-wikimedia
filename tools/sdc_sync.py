@@ -209,17 +209,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Box-wide cap on concurrent SDC worker slots across ALL "
-            "sdc-sync sessions on the host. Every item-processing path "
-            "checks out a flock-backed slot before its per-item Commons "
-            "work — the parallel workers (--workers >1) and the "
-            "single-process path (--workers 1) alike — so the total "
-            "concurrent Commons-write load is bounded by this value "
+            "sdc-sync sessions on the host. In partner mode, every "
+            "item-processing path checks out a flock-backed slot before "
+            "its per-item Commons work — the parallel workers (--workers "
+            ">1) and the single-process path (--workers 1) alike — so the "
+            "total concurrent Commons-write load is bounded by this value "
             "regardless of how many sessions run or how many workers each "
             "was launched with; excess workers block until a slot frees. "
             "0 (default) disables the budget (acquire is a no-op). Set to "
             "~16 in production so 6+ concurrent sessions cooperatively "
             "share Commons capacity without oversubscribing the parser "
-            "pool."
+            "pool. The single-purpose manual modes (--list / --file / "
+            "--cat) do NOT participate in the budget."
         ),
     )
     return p
@@ -4253,6 +4254,10 @@ def _worker_partner_task(args):
             total,
             partner,
         )
+        # Count items that crash before the inner per-ordinal handler runs
+        # (e.g. an acquire()/setup fault); otherwise they drop silently from
+        # the tally while the per-ordinal handler owns the routine failures.
+        tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
     return tracker.diff(prior)
 
 

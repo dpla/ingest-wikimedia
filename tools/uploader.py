@@ -1367,9 +1367,11 @@ class Uploader:
         "wikimedia sessions on the host, shared with the SDC-sync phase. "
         "The uploader is single-process (no parallelism), so it checks out "
         "exactly ONE slot while working an item — making it count as one "
-        "writer against the shared budget alongside SDC-sync workers. 0 "
-        "(default) disables the budget. See "
-        "ingest_wikimedia.worker_slots.WorkerSlotBudget."
+        "writer against the shared budget alongside SDC-sync workers. "
+        "0 (default) disables the budget — correct for a standalone run, "
+        "which has no peers to coordinate with. Pass --workers-budget 16 "
+        "to join the shared box-wide cap (the launch workflow does this). "
+        "See ingest_wikimedia.worker_slots.WorkerSlotBudget."
     ),
 )
 def main(

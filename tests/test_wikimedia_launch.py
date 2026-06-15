@@ -281,26 +281,15 @@ def test_invalid_workers_budget_fails_fast(bad_value):
     assert exit_info.code == 1
 
 
-def test_workers_budget_zero_is_accepted():
+def test_workers_budget_zero_is_accepted(capsys):
     """--workers-budget 0 is the explicit 'disabled' value and must NOT
     trip the validation gate (0 is a valid sentinel, distinct from a
     negative error)."""
-    # Reaches past the workers/budget validation; the partner slug is
-    # bogus so it exits later (target validation), but NOT at the budget
-    # gate. We assert the error message isn't the budget one.
-    import scripts.wikimedia_launch as launch_mod
-
-    with patch(
-        "sys.argv",
-        [
-            "wikimedia_launch.py",
-            "--partner",
-            "not-a-real-hub",
-            "--workers-budget",
-            "0",
-        ],
-    ):
-        try:
-            launch_mod.main()
-        except SystemExit:
-            pass  # exits later for an unrelated reason; that's fine
+    exit_info = _run_main(["--partner", "not-a-real-hub", "--workers-budget", "0"])
+    assert exit_info is not None and exit_info.code == 1, (
+        "expected SystemExit(1) for the bogus partner after budget validation"
+    )
+    err = capsys.readouterr().err
+    assert "Invalid --workers-budget value" not in err, (
+        f"--workers-budget 0 must pass the budget gate, not trip it; got: {err!r}"
+    )
