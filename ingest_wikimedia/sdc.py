@@ -1238,6 +1238,74 @@ def parse_date_range(date_string: str) -> tuple[int, int] | None:
     return None
 
 
+# Raw ``{{other date|MODIFIER|args...}}`` wikitext. Legacy migration runs
+# before the expand-then-store fix (PR #304) stored this markup verbatim
+# in the P1932 stated-as qualifier instead of its rendered text, so a
+# claim's comparable key never matched the DPLA-sourced equivalent (which
+# carries the *rendered* string, e.g. "circa 1911"). This recogniser
+# converts the markup to the plain display string ``parse_dpla_date``
+# understands so the two dedup.
+_OTHER_DATE_TEMPLATE_RE = re.compile(
+    r"^\{\{\s*other[ _]date\s*\|(.+?)\}\}$", re.IGNORECASE | re.DOTALL
+)
+# Modifiers whose meaning ``parse_dpla_date`` can also represent, mapped
+# to the display-string shape it parses. Anything outside this set
+# (before/after/century/season/…) is intentionally NOT converted: the
+# DPLA side can't represent those either, so they stay as raw-string
+# comparables that only match on byte-identical text — conservative, so
+# an unrecognised modifier can never cause a wrong dedup/removal.
+#
+# These are ``{{other date}}`` *modifier tokens* — a different vocabulary
+# from ``parse_dpla_date``'s display-string decorators (``_DATE_PREFIX``).
+# We normalise every spelling here to the canonical ``"circa "`` prefix
+# before handing off, so this set doesn't need to stay in sync with what
+# ``parse_dpla_date`` strips — it only needs to recognise the template's
+# own circa spellings (incl. bare ``c`` / ``ca`` the template accepts).
+_OTHER_DATE_CIRCA_MODIFIERS = frozenset({"~", "circa", "c", "c.", "ca", "ca."})
+
+
+def parse_other_date_template(value: str) -> str | None:
+    """Convert a raw ``{{other date|...}}`` wikitext value into the plain
+    display string :func:`parse_dpla_date` understands, or ``None`` when
+    the input isn't an ``{{other date}}`` template or uses a modifier
+    DPLA can't represent.
+
+    Handles only the modifiers with an exact ``parse_dpla_date``
+    equivalent:
+
+      * circa family (``~`` / ``circa`` / ``c`` / ``c.`` / ``ca`` /
+        ``ca.``) + a single date  → ``"circa <date>"``
+      * ``?`` (uncertain) + a single date                → ``"<date>?"``
+      * ``s`` / ``decade`` + a year                       → ``"<year>s"``
+
+    Ranges (``{{other date|between|X|Y}}``) are NOT handled here —
+    :func:`parse_date_range` already matches that markup directly.
+
+    Conservative by design: returns ``None`` (caller keeps the raw
+    string, which only matches byte-identical text) rather than guessing
+    at unsupported modifiers, so this can never widen a dedup into a
+    wrong removal.
+    """
+    if not value:
+        return None
+    m = _OTHER_DATE_TEMPLATE_RE.match(value.strip())
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group(1).split("|")]
+    modifier = parts[0].lower() if parts else ""
+    rest = [p for p in parts[1:] if p]
+    if not rest:
+        return None
+    date_arg = rest[0]
+    if modifier in _OTHER_DATE_CIRCA_MODIFIERS:
+        return f"circa {date_arg}"
+    if modifier == "?":
+        return f"{date_arg}?"
+    if modifier in ("s", "decade"):
+        return f"{date_arg}s"
+    return None
+
+
 def _build_date_claim(
     date: str,
     dpla_id: str,

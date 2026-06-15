@@ -4561,6 +4561,112 @@ def test_inferred_dupe_cleanup_removes_equivalent_single_date_claim():
     sdc_sync._reset_per_file_accumulators()
 
 
+def test_inferred_dupe_cleanup_removes_legacy_other_date_circa_markup():
+    """Real-world repro (M180313608): a legacy inferred-from-Wikitext
+    claim that predates the expand-then-store fix carries raw
+    ``{{other date|~|1911}}`` markup in P1932, while the DPLA-sourced
+    claim is a value-typed +1911 time with a P1480 circa qualifier.
+    Before the {{other date}} expander these never deduped (one
+    comparable was ``('time', …|circa)``, the other a raw p1932-string).
+    Now the inferred claim is removed."""
+    from tools import sdc_sync
+
+    dpla_claim = {
+        "id": "M180$DPLA",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datatype": "time",
+            "datavalue": {
+                "type": "time",
+                "value": {
+                    "time": "+1911-01-01T00:00:00Z",
+                    "precision": 9,
+                    "before": 0,
+                    "after": 0,
+                    "timezone": 0,
+                    "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                },
+            },
+        },
+        # DPLA stamps P459 (heuristic) + P1480 (circa) on the circa date.
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P1480": _qual_entity("P1480", "Q5727902"),
+        },
+        "references": [_dpla_reference()],
+    }
+    inferred_claim = _p571_somevalue_with_p1932(
+        "M180$INFERRED",
+        "{{other date|~|1911}}",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {
+        "pageid": 180,
+        "statements": {"P571": [dpla_claim, inferred_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M180")
+    assert sdc_sync.removals == ["M180$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_keeps_other_date_markup_when_dpla_date_differs():
+    """Safety: a legacy {{other date|~|1911}} inferred claim must NOT be
+    removed when the DPLA-sourced date is a *different* year — the
+    expander makes equivalent values dedup, not all {{other date}}
+    values vanish."""
+    from tools import sdc_sync
+
+    dpla_claim = {
+        "id": "M180$DPLA",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datatype": "time",
+            "datavalue": {
+                "type": "time",
+                "value": {
+                    "time": "+1925-01-01T00:00:00Z",
+                    "precision": 9,
+                    "before": 0,
+                    "after": 0,
+                    "timezone": 0,
+                    "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                },
+            },
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P1480": _qual_entity("P1480", "Q5727902"),
+        },
+        "references": [_dpla_reference()],
+    }
+    inferred_claim = _p571_somevalue_with_p1932(
+        "M180$INFERRED",
+        "{{other date|~|1911}}",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {
+        "pageid": 180,
+        "statements": {"P571": [dpla_claim, inferred_claim]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M180")
+    assert sdc_sync.removals == [], "different year must not dedup"
+    sdc_sync._reset_per_file_accumulators()
+
+
 def test_inferred_dupe_cleanup_skips_property_with_no_dpla_claim():
     """When no DPLA-attributed claim exists on a property, even a
     matching inferred-from-Wikitext claim must stay — there's no
