@@ -4076,7 +4076,13 @@ def _run_partner_mode_parallel(partner, dpla_ids, workers):
             # doesn't NameError under spawn start_method. Sharing one
             # snapshot also means workers and parent agree on the data
             # even if ingestion3 updates mid-run.
-            initargs=(log_queue, hubs, rights, subject_ids),
+            initargs=(
+                log_queue,
+                hubs,
+                rights,
+                subject_ids,
+                _normalize_wikitext_enabled,
+            ),
         ) as pool:
             for delta in pool.imap_unordered(_worker_partner_task, tasks):
                 if delta:
@@ -4085,7 +4091,13 @@ def _run_partner_mode_parallel(partner, dpla_ids, workers):
         listener.stop()
 
 
-def _init_partner_worker(log_queue, hubs_data, rights_data, subject_ids_data):
+def _init_partner_worker(
+    log_queue,
+    hubs_data,
+    rights_data,
+    subject_ids_data,
+    normalize_wikitext_enabled,
+):
     """Per-worker setup for the ``--workers > 1`` partner-mode Pool.
 
     Each multiprocessing worker process re-imports this module (with
@@ -4135,12 +4147,13 @@ def _init_partner_worker(log_queue, hubs_data, rights_data, subject_ids_data):
     pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
 
-    global site, hubs, rights, subject_ids
+    global site, hubs, rights, subject_ids, _normalize_wikitext_enabled
     site = pywikibot.Site("commons", "commons")
     site.login()
     hubs = hubs_data
     rights = rights_data
     subject_ids = subject_ids_data
+    _normalize_wikitext_enabled = bool(normalize_wikitext_enabled)
 
     qh = logging.handlers.QueueHandler(log_queue)
     root = logging.getLogger()

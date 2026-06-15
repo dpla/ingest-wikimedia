@@ -611,7 +611,11 @@ def test_init_partner_worker_binds_mapping_tables_to_module_globals(monkeypatch)
 
     with patch("pywikibot.Site", return_value=fake_site):
         sdc_sync._init_partner_worker(
-            fake_queue, fake_hubs, fake_rights, fake_subject_ids
+            fake_queue,
+            fake_hubs,
+            fake_rights,
+            fake_subject_ids,
+            True,
         )
 
     assert sdc_sync.hubs is fake_hubs
@@ -620,6 +624,35 @@ def test_init_partner_worker_binds_mapping_tables_to_module_globals(monkeypatch)
     # Sanity: the worker should also have set site + logged in (so the
     # initializer hasn't accidentally regressed the existing setup).
     fake_site.login.assert_called_once()
+
+
+def test_init_partner_worker_propagates_normalize_wikitext_flag(monkeypatch):
+    """Regression for the second CodeRabbit finding on #308:
+    ``--no-normalize-wikitext`` flips the parent's
+    ``_normalize_wikitext_enabled`` global, but with spawn start_method
+    workers re-import the module and pick up the default ``True``.
+    The parent must pass the resolved flag via ``initargs`` and the
+    initializer must bind it; otherwise a parent opt-out is silently
+    ignored for every item processed in parallel mode."""
+    from tools import sdc_sync
+
+    fake_queue = MagicMock()
+    fake_site = MagicMock(name="pywikibot_Site")
+
+    # Force the module default to True so we can detect the worker
+    # correctly overrides it down to False via initargs.
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True, raising=False)
+
+    with patch("pywikibot.Site", return_value=fake_site):
+        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, False)
+    assert sdc_sync._normalize_wikitext_enabled is False
+
+    # And the opposite — initargs flag True overrides a worker that
+    # happened to start with the global at False.
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", False, raising=False)
+    with patch("pywikibot.Site", return_value=fake_site):
+        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, True)
+    assert sdc_sync._normalize_wikitext_enabled is True
 
 
 def test_run_partner_mode_dispatches_to_pool_when_workers_above_one(
