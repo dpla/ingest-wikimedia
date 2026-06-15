@@ -34,6 +34,16 @@ on:
         description: "SDC-only backfill — skip download + upload phases, just re-enumerate IDs and run sdc-sync"
         type: boolean
         default: false
+      workers:
+        description: "SDC-sync worker processes per session (parallelism). 1 = single-process."
+        required: false
+        type: string
+        default: "4"
+      workers_budget:
+        description: "Box-wide cap on concurrent SDC worker slots across all sessions (0 = unlimited)"
+        required: false
+        type: string
+        default: "16"
 
 permissions:
   contents: read
@@ -71,6 +81,8 @@ jobs:
           INPUT_MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days }}
           INPUT_REFRESH_ONLY: ${{ github.event.inputs.refresh_only }}
           INPUT_SDC_ONLY: ${{ github.event.inputs.sdc_only }}
+          INPUT_WORKERS: ${{ github.event.inputs.workers }}
+          INPUT_WORKERS_BUDGET: ${{ github.event.inputs.workers_budget }}
         run: |
           python scripts/wikimedia_launch.py \
             --partner "$INPUT_PARTNER" \
@@ -78,4 +90,6 @@ jobs:
             --response-url "$INPUT_RESPONSE_URL" \
             --max-age-days "$INPUT_MAX_AGE_DAYS" \
             --refresh-only "$INPUT_REFRESH_ONLY" \
-            --sdc-only "$INPUT_SDC_ONLY"
+            --sdc-only "$INPUT_SDC_ONLY" \
+            --workers "$INPUT_WORKERS" \
+            --workers-budget "$INPUT_WORKERS_BUDGET"

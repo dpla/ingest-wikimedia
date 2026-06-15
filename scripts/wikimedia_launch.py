@@ -128,6 +128,13 @@ def main() -> None:
     parser.add_argument("--max-age-days", default="")
     parser.add_argument("--refresh-only", default="false")
     parser.add_argument("--sdc-only", default="false")
+    # Keep in sync with .github/workflows/wikimedia-launch.yml inputs.workers
+    # / inputs.workers_budget (currently 4 / 16), which the workflow always
+    # passes explicitly. These defaults only apply to a bare manual launch —
+    # they let it behave like a workflow launch (4 SDC workers under a
+    # box-wide cap of 16) rather than silently running single-worker, no cap.
+    parser.add_argument("--workers", default="4")
+    parser.add_argument("--workers-budget", default="16")
     args = parser.parse_args()
 
     force = _parse_bool(args.force)
@@ -162,6 +169,34 @@ def main() -> None:
             _slack_fail(
                 response_url,
                 f"Invalid --max-age-days value: {args.max_age_days!r} (must be a positive integer).",
+            )
+
+    # SDC-sync parallelism knobs. Empty string (workflow input left
+    # blank) falls back to the conservative default rather than failing
+    # the whole launch. --workers must be >= 1; --workers-budget >= 0
+    # (0 = unlimited / disabled).
+    sdc_workers = 4
+    if args.workers.strip():
+        try:
+            sdc_workers = int(args.workers)
+            if sdc_workers < 1:
+                raise ValueError
+        except ValueError:
+            _slack_fail(
+                response_url,
+                f"Invalid --workers value: {args.workers!r} (must be an integer >= 1).",
+            )
+    sdc_workers_budget = 16
+    if args.workers_budget.strip():
+        try:
+            sdc_workers_budget = int(args.workers_budget)
+            if sdc_workers_budget < 0:
+                raise ValueError
+        except ValueError:
+            _slack_fail(
+                response_url,
+                f"Invalid --workers-budget value: {args.workers_budget!r}"
+                " (must be an integer >= 0; 0 disables the budget).",
             )
 
     # --partner may be a shlex-encoded list: 'bpl "indiana|Indiana State Library"'
@@ -836,6 +871,16 @@ def main() -> None:
             f"{is_last_env}; "
             f"{single_item_env}"
         )
+        # SDC-sync parallelism options. --workers > 1 enables the
+        # multiprocessing pool; --workers-budget caps concurrent worker
+        # slots box-wide. Both values are already validated above.
+        sdc_opts = f" --workers {sdc_workers} --workers-budget {sdc_workers_budget}"
+        # The uploader is single-process but shares the same box-wide
+        # Commons-write budget (one slot per item) so concurrent upload
+        # and SDC-sync sessions across the host don't collectively
+        # overrun maxlag. Only the budget — no --workers (no upload
+        # parallelism).
+        upload_opts = f" --workers-budget {sdc_workers_budget}"
         if sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which
             # also refreshes sdc.json sidecars from the latest ingestion3
@@ -845,7 +890,7 @@ def main() -> None:
             pipeline_steps = [
                 f"cd {base}",
                 get_ids_cmd,
-                f"sdc-sync --partner {canonical} --ids-file {csv_file}",
+                f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}",
             ]
         else:
             dl_age_opt = (
@@ -858,7 +903,7 @@ def main() -> None:
                 f"downloader {dl_age_opt}{dl_notify_opt}{csv_file} {canonical}",
             ]
             if not refresh_only:
-                pipeline_steps.append(f"uploader {csv_file} {canonical}")
+                pipeline_steps.append(f"uploader {csv_file} {canonical}{upload_opts}")
                 # SDC sync is the final step of every upload run: it reads
                 # the per-item sdc.json (staged by get-ids-es) and
                 # upload-result.json (written by uploader) sidecars and
@@ -866,7 +911,7 @@ def main() -> None:
                 # refresh_only because no upload phase ran — there's no
                 # upload-result.json to drive from.
                 pipeline_steps.append(
-                    f"sdc-sync --partner {canonical} --ids-file {csv_file}"
+                    f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}"
                 )
         target_steps = " && ".join(pipeline_steps)
         target_blocks.append(

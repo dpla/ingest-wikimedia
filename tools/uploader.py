@@ -30,6 +30,7 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.worker_slots import WorkerSlotBudget
 from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
@@ -1357,7 +1358,25 @@ class Uploader:
 @click.argument("partner")
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
-def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
+@click.option(
+    "--workers-budget",
+    type=int,
+    default=0,
+    help=(
+        "Box-wide cap on concurrent Commons-writing processes across ALL "
+        "wikimedia sessions on the host, shared with the SDC-sync phase. "
+        "The uploader is single-process (no parallelism), so it checks out "
+        "exactly ONE slot while working an item — making it count as one "
+        "writer against the shared budget alongside SDC-sync workers. "
+        "0 (default) disables the budget — correct for a standalone run, "
+        "which has no peers to coordinate with. Pass --workers-budget 16 "
+        "to join the shared box-wide cap (the launch workflow does this). "
+        "See ingest_wikimedia.worker_slots.WorkerSlotBudget."
+    ),
+)
+def main(
+    ids_file, partner: str, dry_run: bool, verbose: bool, workers_budget: int
+) -> None:
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 
@@ -1379,6 +1398,18 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
 
     dpla.check_partner(partner)
 
+    # Box-wide Commons-write budget, shared with the SDC-sync phase
+    # (same flock slot dir). The uploader is single-process, so it holds
+    # exactly one slot while working an item — counting as one writer
+    # against the shared cap so concurrent upload + SDC-sync sessions
+    # across the host don't collectively overrun Commons' maxlag
+    # threshold. Per-item acquire (not whole-run) so the uploader doesn't
+    # stall at startup holding a slot through its S3 reads when the pool
+    # is momentarily full, and briefly frees the slot between items.
+    # budget <= 0 disables it (no-op). Built before the try so the
+    # post-upload touch in the finally can reuse it.
+    slot_budget = WorkerSlotBudget(workers_budget)
+
     try:
         local_fs.setup_temp_dir()
         setup_logging(partner, "upload", logging.INFO)
@@ -1392,7 +1423,10 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
         dpla_ids = load_ids(ids_file)
 
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
-            uploader.process_item(dpla_id, providers_json, partner, verbose, dry_run)
+            with slot_budget.acquire():
+                uploader.process_item(
+                    dpla_id, providers_json, partner, verbose, dry_run
+                )
 
     finally:
         elapsed = time.time() - start_time
@@ -1405,7 +1439,12 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
         # run of fix-unknown-categories to clean up after the fact.  The 10s
         # pause is a cheap belt-and-suspenders against very-late ensure()
         # calls — for typical runs replication has settled long before this.
-        _post_upload_touch_new_institutions(commons_site, category_ensurer, dry_run)
+        #
+        # Passes the slot budget through: these touches are Commons writes,
+        # so the helper holds a slot around them (see its docstring).
+        _post_upload_touch_new_institutions(
+            commons_site, category_ensurer, dry_run, slot_budget
+        )
         notify_upload_complete(
             # Bare partner slug, not "wikimedia-<partner>" — notify_upload_complete
             # always prepends "wikimedia-" itself (matching the bare-label
@@ -1634,10 +1673,18 @@ def _post_item_orphan_check(
 
 
 def _post_upload_touch_new_institutions(
-    commons_site, category_ensurer: CategoryEnsurer, dry_run: bool
+    commons_site,
+    category_ensurer: CategoryEnsurer,
+    dry_run: bool,
+    slot_budget: WorkerSlotBudget,
 ) -> None:
     """At end-of-run, force-rerender files for any institutions whose P8464
-    was first added this session — see touch_institution_files() docstring."""
+    was first added this session — see touch_institution_files() docstring.
+
+    These touches are Commons writes, so they're done under a box-wide slot
+    (``slot_budget``). The slot is acquired *after* the early-return guards
+    so the common no-op case (no new institutions) never blocks waiting for
+    capacity it doesn't need."""
     if not category_ensurer or dry_run:
         return
     newly_created = category_ensurer.newly_created
@@ -1650,14 +1697,15 @@ def _post_upload_touch_new_institutions(
     )
     time.sleep(_REPLICATION_SETTLE_SECS)
     total = 0
-    for inst_qid in sorted(newly_created):
-        try:
-            n = touch_institution_files(commons_site, inst_qid)
-        except Exception as e:
-            logging.warning(f"Search/touch for {inst_qid} failed: {e}")
-            continue
-        logging.info(f"  Touched {n} files for {inst_qid}")
-        total += n
+    with slot_budget.acquire():
+        for inst_qid in sorted(newly_created):
+            try:
+                n = touch_institution_files(commons_site, inst_qid)
+            except Exception as e:
+                logging.warning(f"Search/touch for {inst_qid} failed: {e}")
+                continue
+            logging.info(f"  Touched {n} files for {inst_qid}")
+            total += n
     logging.info(
         f"Post-upload touch complete: {total} files across {len(newly_created)} institution(s)"
     )

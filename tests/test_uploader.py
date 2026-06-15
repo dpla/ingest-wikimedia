@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import WMC_UPLOAD_CHUNK_SIZE
+from ingest_wikimedia.worker_slots import WorkerSlotBudget
 from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     _post_item_orphan_check,
@@ -16,6 +17,12 @@ from tools.uploader import (
     is_dup_sha1_sibling_at_expected_title,
     select_upload_chunk_size,
 )
+
+
+# A disabled budget (budget <= 0) whose acquire() is a no-op context
+# manager — the touch helper now acquires a slot internally, so its unit
+# tests just need a budget object that never blocks.
+_DISABLED_BUDGET = WorkerSlotBudget(0)
 
 
 def _ensurer_with(newly_created: set[str]) -> MagicMock:
@@ -32,7 +39,9 @@ def test_skips_when_category_ensurer_is_none():
         patch("tools.uploader.time.sleep") as sleep_mock,
         patch("tools.uploader.touch_institution_files") as touch_mock,
     ):
-        _post_upload_touch_new_institutions(MagicMock(), None, dry_run=False)
+        _post_upload_touch_new_institutions(
+            MagicMock(), None, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
     sleep_mock.assert_not_called()
     touch_mock.assert_not_called()
 
@@ -43,7 +52,9 @@ def test_skips_when_dry_run():
         patch("tools.uploader.time.sleep") as sleep_mock,
         patch("tools.uploader.touch_institution_files") as touch_mock,
     ):
-        _post_upload_touch_new_institutions(MagicMock(), ensurer, dry_run=True)
+        _post_upload_touch_new_institutions(
+            MagicMock(), ensurer, dry_run=True, slot_budget=_DISABLED_BUDGET
+        )
     sleep_mock.assert_not_called()
     touch_mock.assert_not_called()
 
@@ -54,7 +65,9 @@ def test_skips_when_newly_created_is_empty():
         patch("tools.uploader.time.sleep") as sleep_mock,
         patch("tools.uploader.touch_institution_files") as touch_mock,
     ):
-        _post_upload_touch_new_institutions(MagicMock(), ensurer, dry_run=False)
+        _post_upload_touch_new_institutions(
+            MagicMock(), ensurer, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
     sleep_mock.assert_not_called()
     touch_mock.assert_not_called()
 
@@ -67,7 +80,9 @@ def test_sleeps_then_touches_each_newly_created_qid():
         patch("tools.uploader.touch_institution_files", return_value=4) as touch_mock,
         patch("tools.uploader._REPLICATION_SETTLE_SECS", 10),
     ):
-        _post_upload_touch_new_institutions(site, ensurer, dry_run=False)
+        _post_upload_touch_new_institutions(
+            site, ensurer, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
 
     sleep_mock.assert_called_once_with(10)
     assert touch_mock.call_count == 3
@@ -96,7 +111,9 @@ def test_per_qid_exception_does_not_stop_remaining_qids(caplog):
         ) as touch_mock,
         caplog.at_level(_logging.INFO),
     ):
-        _post_upload_touch_new_institutions(MagicMock(), ensurer, dry_run=False)
+        _post_upload_touch_new_institutions(
+            MagicMock(), ensurer, dry_run=False, slot_budget=_DISABLED_BUDGET
+        )
 
     qids_attempted = {call.args[1] for call in touch_mock.call_args_list}
     assert qids_attempted == {"Q_good_1", "Q_bad", "Q_good_2"}
@@ -1229,3 +1246,83 @@ def test_pageid_refresh_returns_immediately_on_first_success(monkeypatch):
     assert uploader._refresh_pageid_with_retries("File:X.tiff") == 42
     assert len(get_page_calls) == 1
     assert sleep_calls == [], "no sleep on first-attempt-success path"
+
+
+# --------------------------------------------------------------------------
+# Box-wide Commons-write budget wiring (shared with the SDC-sync phase).
+# The uploader is single-process but must check out one slot per item so
+# it counts as one writer against the shared cap. Verifies main() builds
+# the budget from --workers-budget and wraps each process_item in acquire().
+# --------------------------------------------------------------------------
+
+
+def test_main_acquires_one_budget_slot_per_item():
+    """main() must construct a WorkerSlotBudget from --workers-budget and
+    enter its acquire() context exactly once per DPLA item, around the
+    process_item call. A spy budget records the constructed budget value
+    and counts context entries."""
+    from click.testing import CliRunner
+
+    import tools.uploader as up
+
+    acquire_calls = []
+    constructed_budget = {}
+
+    class _SpyBudget:
+        def __init__(self, budget):
+            constructed_budget["value"] = budget
+
+        def acquire(self):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def _cm():
+                acquire_calls.append(True)
+                yield
+
+            return _cm()
+
+    processed = []
+
+    # Mock the heavy setup seams so main() runs its loop without touching
+    # AWS / Commons / disk. ToolsContext.init returns a context whose
+    # getters yield mocks; the Uploader's process_item just records the id.
+    fake_ctx = MagicMock()
+    fake_ctx.get_tracker.return_value = Tracker()
+    fake_ctx.get_local_fs.return_value = MagicMock()
+    fake_ctx.get_s3_client.return_value = MagicMock()
+    fake_dpla = MagicMock()
+    fake_dpla.get_providers_data.return_value = {}
+    fake_ctx.get_dpla.return_value = fake_dpla
+
+    def fake_process_item(dpla_id, *a, **kw):
+        processed.append(dpla_id)
+
+    with (
+        patch.object(up.ToolsContext, "init", return_value=fake_ctx),
+        patch.object(up, "get_site", return_value=MagicMock()),
+        patch.object(up, "CategoryEnsurer", return_value=MagicMock()),
+        patch.object(up, "WorkerSlotBudget", _SpyBudget),
+        patch.object(up, "setup_logging"),
+        patch.object(up, "notify_phase_start"),
+        patch.object(up, "notify_upload_complete"),
+        patch.object(up, "_post_upload_touch_new_institutions"),
+        patch.object(up, "load_ids", return_value=["id_a", "id_b", "id_c"]),
+        patch.object(up.Uploader, "process_item", side_effect=fake_process_item),
+    ):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            # ids_file is a click.File argument; create a throwaway file
+            # (load_ids is mocked, so contents don't matter).
+            with open("ids.csv", "w") as fh:
+                fh.write("id_a\nid_b\nid_c\n")
+            result = runner.invoke(
+                up.main, ["ids.csv", "nara", "--workers-budget", "16"]
+            )
+
+    assert result.exit_code == 0, result.output
+    assert constructed_budget["value"] == 16, "budget not built from --workers-budget"
+    assert processed == ["id_a", "id_b", "id_c"], "all items must be processed"
+    assert len(acquire_calls) == 3, (
+        f"expected one slot acquire per item; got {len(acquire_calls)}"
+    )
