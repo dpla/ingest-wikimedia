@@ -209,17 +209,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Box-wide cap on concurrent SDC worker slots across ALL "
-            "sdc-sync sessions on the host. In parallel mode (--workers "
-            ">1), each worker checks out a flock-backed slot before its "
-            "per-item Commons work, so the total concurrent Commons-write "
-            "load is bounded by this value regardless of how many "
-            "sessions run or how many workers each was launched with — "
-            "excess workers block until a slot frees. 0 (default) "
-            "disables the budget. Set to ~16 in production so 6+ "
-            "concurrent sessions cooperatively share Commons capacity "
-            "without oversubscribing the parser pool. Has no effect at "
-            "--workers 1 (the single-process path doesn't go through the "
-            "worker pool)."
+            "sdc-sync sessions on the host. Every item-processing path "
+            "checks out a flock-backed slot before its per-item Commons "
+            "work — the parallel workers (--workers >1) and the "
+            "single-process path (--workers 1) alike — so the total "
+            "concurrent Commons-write load is bounded by this value "
+            "regardless of how many sessions run or how many workers each "
+            "was launched with; excess workers block until a slot frees. "
+            "0 (default) disables the budget (acquire is a no-op). Set to "
+            "~16 in production so 6+ concurrent sessions cooperatively "
+            "share Commons capacity without oversubscribing the parser "
+            "pool."
         ),
     )
     return p
@@ -4678,14 +4678,17 @@ def _run_partner_mode(partner, ids_file):
     completed = False
     try:
         if workers <= 1:
-            # Single-process: identical to pre-PR behaviour. Parent's
-            # module-level tracker is mutated in-place; no Pool, no
-            # logging queue, no delta merge. Keeps the no-parallelism
-            # path bit-for-bit unchanged.
+            # Single-process: parent's module-level tracker is mutated
+            # in-place; no Pool, no logging queue, no delta merge. Still
+            # acquires one box-wide slot per item so a 1-worker session
+            # counts against --workers-budget like the parallel path
+            # (no-op when the budget is 0, so a plain run is unchanged).
+            slot_budget = WorkerSlotBudget(_workers_budget)
             for local_count, dpla_id in enumerate(dpla_ids, start=1):
-                _process_one_partner_item(
-                    s3, partner, dpla_id, local_count, len(dpla_ids)
-                )
+                with slot_budget.acquire():
+                    _process_one_partner_item(
+                        s3, partner, dpla_id, local_count, len(dpla_ids)
+                    )
         else:
             _run_partner_mode_parallel(partner, dpla_ids, workers)
         completed = True
