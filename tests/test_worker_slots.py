@@ -69,7 +69,11 @@ def test_acquire_picks_a_free_slot_when_some_are_held(tmp_path):
     """With budget 3 and slots 0 and 1 held by foreign sessions,
     acquire() takes slot 2 rather than blocking."""
     budget = WorkerSlotBudget(budget=3, slot_dir=str(tmp_path))
-    held = [_hold_raw_flock(str(tmp_path), 0), _hold_raw_flock(str(tmp_path), 1)]
+    # Build incrementally so a fd from a successful open is tracked for
+    # cleanup even if a later open raises (no leak window).
+    held = []
+    held.append(_hold_raw_flock(str(tmp_path), 0))
+    held.append(_hold_raw_flock(str(tmp_path), 1))
     try:
         acquired = []
 
