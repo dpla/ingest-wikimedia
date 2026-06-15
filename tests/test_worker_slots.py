@@ -5,10 +5,16 @@ dir so they don't touch the real ``/tmp/sdc-sync-worker-slots`` other
 processes on a dev box might use. Cross-process behaviour (the part that
 actually matters) is verified by holding raw flocks on the slot files
 to simulate other sessions, rather than spawning real subprocesses.
+
+The flock helpers below open/close their fds within a single lexical
+scope (``_foreign_flock`` is a context manager; ``_slot_is_held`` opens
+and closes inside one call) so resource lifetime is obvious — no bare
+fd is ever returned for the caller to remember to close.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import threading
@@ -17,12 +23,30 @@ import time
 from ingest_wikimedia.worker_slots import WorkerSlotBudget
 
 
-def _hold_raw_flock(slot_dir, index):
-    """Open + non-blocking-flock slot-<index> the way a foreign session
-    would, returning the held fd. Caller closes it to release."""
+@contextlib.contextmanager
+def _foreign_flock(slot_dir, index):
+    """Hold an exclusive flock on slot-<index> the way a foreign session
+    would, releasing it (closing the fd) on context exit."""
     fd = os.open(os.path.join(slot_dir, f"slot-{index}"), os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    return fd
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _slot_is_held(slot_dir, index) -> bool:
+    """Return True iff slot-<index> can't be exclusively flock'd right
+    now (i.e. something else holds it). Opens and closes its own fd, so
+    it never perturbs the lock state it's probing."""
+    fd = os.open(os.path.join(slot_dir, f"slot-{index}"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False  # we got the lock → nobody else holds it
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
 
 
 def test_creates_slot_files_for_budget(tmp_path):
@@ -48,33 +72,18 @@ def test_acquire_holds_a_slot_for_block_duration(tmp_path):
     it frees."""
     budget = WorkerSlotBudget(budget=1, slot_dir=str(tmp_path))
     with budget.acquire():
-        # The single slot is now held by us — a foreign non-blocking
-        # flock attempt must fail.
-        fd = os.open(os.path.join(tmp_path, "slot-0"), os.O_RDWR)
-        try:
-            failed = False
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                failed = True
-            assert failed, "slot-0 should be held while inside acquire()"
-        finally:
-            os.close(fd)
-    # Outside the block the slot is free again — foreign flock succeeds.
-    fd = _hold_raw_flock(str(tmp_path), 0)
-    os.close(fd)
+        assert _slot_is_held(str(tmp_path), 0), (
+            "slot-0 should be held while inside acquire()"
+        )
+    # Outside the block the slot is free again.
+    assert not _slot_is_held(str(tmp_path), 0)
 
 
 def test_acquire_picks_a_free_slot_when_some_are_held(tmp_path):
     """With budget 3 and slots 0 and 1 held by foreign sessions,
     acquire() takes slot 2 rather than blocking."""
     budget = WorkerSlotBudget(budget=3, slot_dir=str(tmp_path))
-    # Build incrementally so a fd from a successful open is tracked for
-    # cleanup even if a later open raises (no leak window).
-    held = []
-    held.append(_hold_raw_flock(str(tmp_path), 0))
-    held.append(_hold_raw_flock(str(tmp_path), 1))
-    try:
+    with _foreign_flock(str(tmp_path), 0), _foreign_flock(str(tmp_path), 1):
         acquired = []
 
         def worker():
@@ -87,30 +96,30 @@ def test_acquire_picks_a_free_slot_when_some_are_held(tmp_path):
         t.join(timeout=2)
         assert acquired == [True], "should have taken the one free slot (slot-2)"
         assert not t.is_alive()
-    finally:
-        for fd in held:
-            os.close(fd)
 
 
 def test_acquire_blocks_until_a_slot_frees(tmp_path):
     """budget 1, slot already held by a foreign session: acquire()
     blocks, then proceeds once the foreign holder releases."""
     budget = WorkerSlotBudget(budget=1, slot_dir=str(tmp_path))
-    foreign_fd = _hold_raw_flock(str(tmp_path), 0)
-
     proceeded = threading.Event()
 
     def worker():
         with budget.acquire():
             proceeded.set()
 
+    # ExitStack so the foreign hold can be released mid-test (not just at
+    # block end) while still guaranteeing release if an assert fails.
+    stack = contextlib.ExitStack()
+    stack.enter_context(_foreign_flock(str(tmp_path), 0))
     t = threading.Thread(target=worker)
     t.start()
-    # While the foreign session holds the only slot, the worker must NOT
-    # have proceeded.
-    assert not proceeded.wait(timeout=0.6), "worker entered before a slot was free"
-    # Release the foreign hold; the worker should now acquire promptly.
-    os.close(foreign_fd)
+    try:
+        # While the foreign session holds the only slot, the worker must
+        # NOT have proceeded.
+        assert not proceeded.wait(timeout=0.6), "worker entered before a slot was free"
+    finally:
+        stack.close()  # release the foreign hold
     assert proceeded.wait(timeout=3), "worker did not proceed after slot freed"
     t.join(timeout=1)
 
@@ -121,10 +130,10 @@ def test_dead_holder_auto_releases_slot(tmp_path):
     flock release on close IS the mechanism that protects against a
     crashed worker, so assert it directly."""
     budget = WorkerSlotBudget(budget=1, slot_dir=str(tmp_path))
-    # Simulate a worker that grabbed the slot then died without an
-    # orderly release — i.e. just the fd vanishing.
-    dead_fd = _hold_raw_flock(str(tmp_path), 0)
-    os.close(dead_fd)  # process death == fd close, from the kernel's view
+    # Grab the slot then immediately release the fd — process death is,
+    # from the kernel's view, just the fd closing.
+    with _foreign_flock(str(tmp_path), 0):
+        pass
 
     proceeded = []
 
@@ -148,5 +157,4 @@ def test_acquire_releases_on_exception_in_block(tmp_path):
     except ValueError:
         pass
     # Slot must be free despite the exception.
-    fd = _hold_raw_flock(str(tmp_path), 0)
-    os.close(fd)
+    assert not _slot_is_held(str(tmp_path), 0)
