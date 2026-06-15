@@ -122,8 +122,25 @@ class WorkerSlotBudget:
         both tolerate the file/dir already existing, and neither
         truncates — so a session starting up never disturbs the locks
         another session is already holding on the same files.
+
+        Validates that an existing slot directory is owned by the
+        current user before reusing it. Catches a future deployment-
+        model change where the host gains other local accounts — an
+        attacker who can write into our slot dir can `unlink` a held
+        lock file, forcing a new inode the next time we ``os.open``
+        it and silently breaking the exclusion invariant. On today's
+        single-tenant EC2 the check is a no-op; the cost is one
+        ``os.stat`` per session start.
         """
         os.makedirs(self.slot_dir, exist_ok=True)
+        st = os.stat(self.slot_dir)
+        if st.st_uid != os.getuid():
+            raise RuntimeError(
+                f"Worker slot dir {self.slot_dir!r} is owned by uid "
+                f"{st.st_uid}, not the current user (uid {os.getuid()}); "
+                "refusing to use it (an attacker with write access could "
+                "unlink held lock files and break the exclusion invariant)."
+            )
         for i in range(self.budget):
             path = os.path.join(self.slot_dir, f"slot-{i}")
             # "a" creates-if-absent without truncating; immediately

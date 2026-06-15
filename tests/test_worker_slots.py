@@ -21,6 +21,8 @@ import os
 import threading
 import time
 
+import pytest
+
 from ingest_wikimedia.worker_slots import WorkerSlotBudget
 
 
@@ -55,6 +57,21 @@ def test_creates_slot_files_for_budget(tmp_path):
     WorkerSlotBudget(budget=4, slot_dir=str(tmp_path))
     slots = sorted(p.name for p in tmp_path.iterdir())
     assert slots == ["slot-0", "slot-1", "slot-2", "slot-3"]
+
+
+def test_rejects_slot_dir_owned_by_a_different_user(tmp_path, monkeypatch):
+    """An existing slot dir whose owner doesn't match the current uid is
+    refused. An attacker with write access to our slot directory can
+    ``unlink`` a held lock file, forcing a new inode the next time we
+    ``os.open`` it and silently breaking the exclusion invariant — so
+    we fail closed on any ownership mismatch rather than running on a
+    potentially-hostile directory."""
+    import os as real_os
+
+    real_uid = real_os.getuid()
+    monkeypatch.setattr("os.getuid", lambda: real_uid + 1)
+    with pytest.raises(RuntimeError, match="owned by uid"):
+        WorkerSlotBudget(budget=2, slot_dir=str(tmp_path))
 
 
 def test_disabled_budget_creates_no_files_and_acquires_freely(tmp_path):
