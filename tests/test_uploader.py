@@ -805,6 +805,138 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
     assert action == "upload_and_tag"
 
 
+def _build_uploader_with_dpla_raising(exc: Exception) -> "object":
+    """Like ``_build_uploader_with_dpla`` but DPLA API raises ``exc`` on
+    every ``get_item_metadata`` call. Used to exercise the "colliding
+    DPLA item couldn't be verified" branches of ``_resolve_hash_drift``.
+    """
+    from tools.uploader import Uploader
+
+    dpla = MagicMock()
+    dpla.get_item_metadata.side_effect = exc
+    return Uploader(
+        tracker=Tracker(),
+        local_fs=MagicMock(),
+        s3_client=MagicMock(),
+        dpla=dpla,
+        site=MagicMock(),
+        category_ensurer=None,
+    )
+
+
+def _make_http_404_error() -> Exception:
+    """Synthesise a ``requests``-shaped HTTPError with response.status_code
+    == 404. Mirrors the shape ``DPLA.get_item_metadata``'s
+    ``response.raise_for_status()`` produces when the DPLA API has dropped
+    the item. Not constructing a real ``requests.HTTPError`` so the test
+    doesn't pull in ``requests`` for a duck-typed check the production
+    code reads via ``getattr``.
+    """
+    err = Exception("404 Client Error: Not Found")
+    err.response = MagicMock()  # type: ignore[attr-defined]
+    err.response.status_code = 404
+    return err
+
+
+def test_resolve_hash_drift_404_on_colliding_id_falls_through_to_migration():
+    """REGRESSION: when the colliding file's DPLA ID returns 404, the
+    bot used to silently fall back to ``upload_only`` — producing a
+    duplicate on Commons beside the orphaned older title. The 404 is
+    in fact the strongest possible signal that the existing file is
+    an orphan from a removed DPLA item; we now legitimately own this
+    content under the new ID and should migrate (move/tag), not
+    duplicate. This is the bug that flooded the Indiana Riley Old
+    Home Society session with duplicates on 2026-06-15."""
+    uploader = _build_uploader_with_dpla_raising(_make_http_404_error())
+    existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
+    # Case 3 setup: nothing at the intended title → simple move. We
+    # patch _move_to_correct_title so the test doesn't drive a real
+    # pywikibot move; the assertion is just that we don't bail out
+    # to ``upload_only``.
+    intended_page = MagicMock()
+    intended_page.exists.return_value = False
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch.object(uploader, "_move_to_correct_title"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=2,
+            wiki_markup="",
+        )
+    assert action == "moved", (
+        "404 on the colliding DPLA ID is the rename signal — the orphan "
+        "must be migrated to our new title, not left in place beside a "
+        "duplicate upload."
+    )
+
+
+def test_resolve_hash_drift_non_404_exception_stays_on_upload_only():
+    """Conservative fallback: non-404 exceptions (network timeout, 5xx,
+    JSON parse error, etc.) don't carry the same "old ID is gone"
+    meaning a 404 does. Keep these on the existing ``upload_only``
+    path so a transient DPLA API blip doesn't trigger a destructive
+    move on a file that still has a valid sibling item."""
+
+    class FlakyConnError(Exception):
+        pass
+
+    uploader = _build_uploader_with_dpla_raising(FlakyConnError("connection reset"))
+    existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
+    # No need to set up intended_page — upload_only returns before get_page.
+    action = uploader._resolve_hash_drift(
+        existing_file=_drift_existing_file(existing_title),
+        page_title=intended_title,
+        dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ordinal=2,
+        wiki_markup="",
+    )
+    assert action == "upload_only"
+
+
+def test_resolve_hash_drift_5xx_response_stays_on_upload_only():
+    """Sister case to the 404 test: a 5xx-shaped HTTPError must NOT
+    take the 404 branch. Pin the exact status check so a refactor that
+    broadens the gate (e.g. to ``status >= 400``) is caught."""
+    err = Exception("503 Service Unavailable")
+    err.response = MagicMock()  # type: ignore[attr-defined]
+    err.response.status_code = 503
+
+    uploader = _build_uploader_with_dpla_raising(err)
+    existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
+    action = uploader._resolve_hash_drift(
+        existing_file=_drift_existing_file(existing_title),
+        page_title=intended_title,
+        dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ordinal=2,
+        wiki_markup="",
+    )
+    assert action == "upload_only"
+
+
+def test_resolve_hash_drift_valid_cross_item_collision_uploads_only():
+    """Existing positive case (no regression): when the colliding DPLA
+    item IS still valid, the cross-item-collision branch returns
+    ``upload_only`` — our hash gets its own title and we leave the
+    other valid item's file untouched."""
+    uploader = _build_uploader_with_dpla(other_item_exists=True)
+    existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
+    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
+    action = uploader._resolve_hash_drift(
+        existing_file=_drift_existing_file(existing_title),
+        page_title=intended_title,
+        dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ordinal=2,
+        wiki_markup="",
+    )
+    assert action == "upload_only"
+
+
 # --------------------------------------------------------------------------
 # select_upload_chunk_size — pin the OOM-prevention contract: files above
 # LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES MUST force chunked upload even when
