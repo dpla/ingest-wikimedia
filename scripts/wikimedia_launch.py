@@ -866,11 +866,16 @@ def main() -> None:
             f"{is_last_env}; "
             f"{single_item_env}"
         )
-        # SDC-sync parallelism options, shared by both invocation sites
-        # below. --workers > 1 enables the multiprocessing pool;
-        # --workers-budget caps concurrent worker slots box-wide. Both
-        # values are already validated above.
+        # SDC-sync parallelism options. --workers > 1 enables the
+        # multiprocessing pool; --workers-budget caps concurrent worker
+        # slots box-wide. Both values are already validated above.
         sdc_opts = f" --workers {sdc_workers} --workers-budget {sdc_workers_budget}"
+        # The uploader is single-process but shares the same box-wide
+        # Commons-write budget (one slot per item) so concurrent upload
+        # and SDC-sync sessions across the host don't collectively
+        # overrun maxlag. Only the budget — no --workers (no upload
+        # parallelism).
+        upload_opts = f" --workers-budget {sdc_workers_budget}"
         if sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which
             # also refreshes sdc.json sidecars from the latest ingestion3
@@ -893,7 +898,7 @@ def main() -> None:
                 f"downloader {dl_age_opt}{dl_notify_opt}{csv_file} {canonical}",
             ]
             if not refresh_only:
-                pipeline_steps.append(f"uploader {csv_file} {canonical}")
+                pipeline_steps.append(f"uploader {csv_file} {canonical}{upload_opts}")
                 # SDC sync is the final step of every upload run: it reads
                 # the per-item sdc.json (staged by get-ids-es) and
                 # upload-result.json (written by uploader) sidecars and

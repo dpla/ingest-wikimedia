@@ -30,6 +30,7 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.worker_slots import WorkerSlotBudget
 from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
@@ -1357,7 +1358,23 @@ class Uploader:
 @click.argument("partner")
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
-def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
+@click.option(
+    "--workers-budget",
+    type=int,
+    default=0,
+    help=(
+        "Box-wide cap on concurrent Commons-writing processes across ALL "
+        "wikimedia sessions on the host, shared with the SDC-sync phase. "
+        "The uploader is single-process (no parallelism), so it checks out "
+        "exactly ONE slot while working an item — making it count as one "
+        "writer against the shared budget alongside SDC-sync workers. 0 "
+        "(default) disables the budget. See "
+        "ingest_wikimedia.worker_slots.WorkerSlotBudget."
+    ),
+)
+def main(
+    ids_file, partner: str, dry_run: bool, verbose: bool, workers_budget: int
+) -> None:
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
 
@@ -1391,8 +1408,22 @@ def main(ids_file, partner: str, dry_run: bool, verbose: bool) -> None:
 
         dpla_ids = load_ids(ids_file)
 
+        # Box-wide Commons-write budget, shared with the SDC-sync phase
+        # (same flock slot dir). The uploader is single-process, so it
+        # holds exactly one slot while working an item — counting as one
+        # writer against the shared cap so concurrent upload + SDC-sync
+        # sessions across the host don't collectively overrun Commons'
+        # maxlag threshold. Per-item acquire (not whole-run) so the
+        # uploader doesn't stall at startup holding a slot through its
+        # S3 reads when the pool is momentarily full, and briefly frees
+        # the slot between items. budget <= 0 disables it (no-op).
+        slot_budget = WorkerSlotBudget(workers_budget)
+
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
-            uploader.process_item(dpla_id, providers_json, partner, verbose, dry_run)
+            with slot_budget.acquire():
+                uploader.process_item(
+                    dpla_id, providers_json, partner, verbose, dry_run
+                )
 
     finally:
         elapsed = time.time() - start_time

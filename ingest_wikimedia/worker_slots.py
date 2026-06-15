@@ -1,33 +1,49 @@
-"""Cross-session worker-slot budget for SDC sync parallelism.
+"""Cross-session box-wide budget for concurrent Commons-writing work.
 
 The SDC sync ``--workers N`` flag (PR #308) parallelizes one partner run
 across N worker processes. But the wiki EC2 box typically runs 6+
-concurrent ``sdc-sync`` sessions, and Commons' MediaWiki parser pool
-only tolerates ~16 concurrent bot writes before maxlag starts to bind.
-A per-session worker count can't see the other sessions, so 6 sessions
-× 4 workers = 24 writers would oversubscribe.
+concurrent wikimedia sessions, and Commons' MediaWiki parser pool only
+tolerates ~16 concurrent bot writes before maxlag starts to bind. A
+per-session worker count can't see the other sessions, so 6 sessions ×
+4 workers = 24 writers would oversubscribe.
 
 This module provides a *box-wide* semaphore that all sessions share:
 a fixed directory of N slot files, each acquired with a non-blocking
-``fcntl.flock``. A worker checks out a slot before its per-item Commons
-work and releases it on return. When more workers than slots exist
-across all sessions, the excess block until a slot frees.
+``fcntl.flock``. A process checks out a slot before its per-item Commons
+work and releases it on return. When more would-be writers than slots
+exist across all sessions, the excess block until a slot frees.
 
-What the cap actually bounds: the number of DPLA *items* being actively
-synced at once across the box, which is N. Because each item's worker
-issues its per-ordinal Commons writes sequentially, that also bounds the
-number of concurrent write *streams* to N — a deliberately loose proxy
-for "concurrent writes", not a tight per-write rate limit. A 1-ordinal
-item and a 1500-ordinal item each occupy exactly one slot, so a slot
-held by a large item represents far more write work than one held by a
-small item. That's acceptable here: the real per-process safety net
-against overrunning Commons is pywikibot's own ``maxlag`` backoff (each
-worker has its own session and honors it independently); the slot budget
-is the coarser, cross-session throttle that keeps the *number* of
-simultaneously-writing sessions bounded so they don't collectively
+Both Commons-writing phases draw from the same pool:
+
+  * **SDC sync** — each pool worker (``--workers N``) holds one slot per
+    item it processes.
+  * **Uploader** — single-process (no parallelism), but holds one slot
+    per item too, so it counts as one writer against the shared cap
+    alongside SDC-sync workers. (The downloader is deliberately NOT in
+    the pool: it writes to source sites, not Commons, so it contends for
+    a different resource.)
+
+So the cap bounds the number of DPLA *items* being actively written to
+Commons at once across the whole box — summed over every upload and
+SDC-sync session — to N. Because each item's writer issues its
+per-ordinal Commons writes sequentially, that also bounds the number of
+concurrent write *streams* to N: a deliberately loose proxy for
+"concurrent writes", not a tight per-write rate limit. A 1-ordinal item
+and a 1500-ordinal item each occupy exactly one slot, so a slot held by
+a large item represents far more write work than one held by a small
+item. That's acceptable here: the real per-process safety net against
+overrunning Commons is pywikibot's own ``maxlag`` backoff (each process
+has its own session and honors it independently); the slot budget is the
+coarser, cross-session throttle that keeps the *number* of
+simultaneously-writing processes bounded so they don't collectively
 stampede the parser pool. Per-write slot acquisition would make the cap
 a tight write-rate bound but at the cost of ~1 lock cycle per ordinal
 (1500+ on a large item) for no practical gain over maxlag.
+
+Note: a long-running uploader holding a slot for the duration of a big
+item can make SDC-sync workers (or other uploaders) block waiting for
+capacity — that is the intended cooperative throttle, not a bug. Size N
+with the combined upload + SDC-sync population in mind.
 
 Why flock slot files rather than a SysV/POSIX semaphore:
 
