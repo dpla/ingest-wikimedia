@@ -25,6 +25,7 @@ from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
+from ingest_wikimedia.worker_slots import WorkerSlotBudget
 
 # Module-level SDC tracker. Counters accumulate across one invocation of
 # main() — the helpers (`_post_new_refs`, `_post_new_claims`,
@@ -67,6 +68,22 @@ _normalize_wikitext_enabled: bool = True
 # time so tests can monkeypatch the module global directly without needing
 # to construct an argparse Namespace.
 _workers: int = 1
+
+# Box-wide cap on concurrent SDC worker slots across ALL sdc-sync sessions
+# on the host — see ingest_wikimedia.worker_slots.WorkerSlotBudget. Workers
+# in parallel mode (workers > 1) check out a slot before their per-item
+# Commons work, so the total concurrent Commons-write load is bounded by
+# this value no matter how many sessions run or how many workers each was
+# launched with. 0 disables the budget (unlimited). Set from
+# ``args.workers_budget`` at main() time.
+_workers_budget: int = 0
+
+# Per-worker WorkerSlotBudget instance. Defaults to a disabled (no-op)
+# budget so ``_worker_slot_budget.acquire()`` is always safe to call even
+# before a worker runs its initializer; _init_partner_worker replaces it
+# with a real budget built from _workers_budget. _worker_partner_task
+# acquires a slot from it around each item's Commons work.
+_worker_slot_budget = WorkerSlotBudget(0)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -183,6 +200,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "are independent: every ordinal of every item has a "
             "unique M-id, so workers never write to the same Commons "
             "MediaInfo entity."
+        ),
+    )
+    p.add_argument(
+        "--workers-budget",
+        dest="workers_budget",
+        type=int,
+        default=0,
+        help=(
+            "Box-wide cap on concurrent SDC worker slots across ALL "
+            "sdc-sync sessions on the host. In parallel mode (--workers "
+            ">1), each worker checks out a flock-backed slot before its "
+            "per-item Commons work, so the total concurrent Commons-write "
+            "load is bounded by this value regardless of how many "
+            "sessions run or how many workers each was launched with — "
+            "excess workers block until a slot frees. 0 (default) "
+            "disables the budget. Set to ~16 in production so 6+ "
+            "concurrent sessions cooperatively share Commons capacity "
+            "without oversubscribing the parser pool. Has no effect at "
+            "--workers 1 (the single-process path doesn't go through the "
+            "worker pool)."
         ),
     )
     return p
@@ -461,6 +498,7 @@ def _initialize() -> None:
     """
     global parser, args, method, dpla_api, site, hubs, rights, subject_ids
     global _s3_partner, _s3_client, _normalize_wikitext_enabled, _workers
+    global _workers_budget
 
     parser = _build_parser()
     args = parser.parse_args()
@@ -518,6 +556,7 @@ def _initialize() -> None:
 
     _normalize_wikitext_enabled = bool(args.normalize_wikitext)
     _workers = max(1, int(getattr(args, "workers", 1) or 1))
+    _workers_budget = max(0, int(getattr(args, "workers_budget", 0) or 0))
 
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
@@ -4082,6 +4121,7 @@ def _run_partner_mode_parallel(partner, dpla_ids, workers):
                 rights,
                 subject_ids,
                 _normalize_wikitext_enabled,
+                _workers_budget,
             ),
         ) as pool:
             for delta in pool.imap_unordered(_worker_partner_task, tasks):
@@ -4097,6 +4137,7 @@ def _init_partner_worker(
     rights_data,
     subject_ids_data,
     normalize_wikitext_enabled,
+    workers_budget,
 ):
     """Per-worker setup for the ``--workers > 1`` partner-mode Pool.
 
@@ -4138,6 +4179,13 @@ def _init_partner_worker(
        ``_normalize_wikitext_enabled`` explicitly here so a future
        parent invocation with ``--no-normalize-wikitext`` doesn't
        silently re-enable the strip in workers.
+
+    5. **Build the box-wide worker-slot budget.** ``workers_budget``
+       is the parent's ``--workers-budget`` value; each worker
+       constructs its own :class:`WorkerSlotBudget` pointed at the
+       shared on-disk slot dir, so every worker across every session
+       contends over the same flock'd slot files. ``budget <= 0``
+       yields a disabled (no-op) budget.
     """
     import logging.handlers
 
@@ -4148,12 +4196,14 @@ def _init_partner_worker(
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
 
     global site, hubs, rights, subject_ids, _normalize_wikitext_enabled
+    global _worker_slot_budget
     site = pywikibot.Site("commons", "commons")
     site.login()
     hubs = hubs_data
     rights = rights_data
     subject_ids = subject_ids_data
     _normalize_wikitext_enabled = bool(normalize_wikitext_enabled)
+    _worker_slot_budget = WorkerSlotBudget(workers_budget)
 
     qh = logging.handlers.QueueHandler(log_queue)
     root = logging.getLogger()
@@ -4184,7 +4234,17 @@ def _worker_partner_task(args):
         # parent's instance can't cross the process boundary cleanly
         # (boto3 sessions hold sockets / credentials state).
         s3 = _get_partner_s3_client()
-        _process_one_partner_item(s3, partner, dpla_id, idx, total)
+        # Check out one box-wide slot for the duration of this item.
+        # The budget caps how many items sync concurrently across all
+        # sessions (= a loose, item-granular proxy for concurrent write
+        # streams — see worker_slots.py for why per-item, not per-write).
+        # When the budget is disabled (workers_budget <= 0) this is a
+        # no-op. Acquiring once around the whole item — through the fast
+        # S3 reads and all the per-ordinal writes — keeps the acquire in
+        # one place; pywikibot's per-worker maxlag backoff remains the
+        # real per-write safety net.
+        with _worker_slot_budget.acquire():
+            _process_one_partner_item(s3, partner, dpla_id, idx, total)
     except Exception:
         logging.exception(
             "Worker task crashed processing %s (idx %s/%s) in partner %s",

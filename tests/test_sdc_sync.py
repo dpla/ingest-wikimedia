@@ -616,6 +616,7 @@ def test_init_partner_worker_binds_mapping_tables_to_module_globals(monkeypatch)
             fake_rights,
             fake_subject_ids,
             True,
+            0,  # workers_budget — disabled for this test
         )
 
     assert sdc_sync.hubs is fake_hubs
@@ -644,15 +645,31 @@ def test_init_partner_worker_propagates_normalize_wikitext_flag(monkeypatch):
     monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", True, raising=False)
 
     with patch("pywikibot.Site", return_value=fake_site):
-        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, False)
+        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, False, 0)
     assert sdc_sync._normalize_wikitext_enabled is False
 
     # And the opposite — initargs flag True overrides a worker that
     # happened to start with the global at False.
     monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", False, raising=False)
     with patch("pywikibot.Site", return_value=fake_site):
-        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, True)
+        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, True, 0)
     assert sdc_sync._normalize_wikitext_enabled is True
+
+
+def test_init_partner_worker_builds_slot_budget_from_arg(monkeypatch):
+    """The worker initializer must construct a WorkerSlotBudget from the
+    ``workers_budget`` initarg and bind it to the module global the
+    task path acquires from. Verifies the budget value plumbs through
+    so a parent's --workers-budget actually caps the worker pool."""
+    from tools import sdc_sync
+
+    fake_queue = MagicMock()
+    fake_site = MagicMock(name="pywikibot_Site")
+
+    with patch("pywikibot.Site", return_value=fake_site):
+        sdc_sync._init_partner_worker(fake_queue, {}, {}, {}, True, 12)
+
+    assert sdc_sync._worker_slot_budget.budget == 12
 
 
 def test_run_partner_mode_dispatches_to_pool_when_workers_above_one(

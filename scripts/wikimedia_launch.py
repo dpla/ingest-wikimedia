@@ -128,6 +128,8 @@ def main() -> None:
     parser.add_argument("--max-age-days", default="")
     parser.add_argument("--refresh-only", default="false")
     parser.add_argument("--sdc-only", default="false")
+    parser.add_argument("--workers", default="1")
+    parser.add_argument("--workers-budget", default="0")
     args = parser.parse_args()
 
     force = _parse_bool(args.force)
@@ -162,6 +164,34 @@ def main() -> None:
             _slack_fail(
                 response_url,
                 f"Invalid --max-age-days value: {args.max_age_days!r} (must be a positive integer).",
+            )
+
+    # SDC-sync parallelism knobs. Empty string (workflow input left
+    # blank) falls back to the conservative default rather than failing
+    # the whole launch. --workers must be >= 1; --workers-budget >= 0
+    # (0 = unlimited / disabled).
+    sdc_workers = 4
+    if args.workers.strip():
+        try:
+            sdc_workers = int(args.workers)
+            if sdc_workers < 1:
+                raise ValueError
+        except ValueError:
+            _slack_fail(
+                response_url,
+                f"Invalid --workers value: {args.workers!r} (must be an integer >= 1).",
+            )
+    sdc_workers_budget = 16
+    if args.workers_budget.strip():
+        try:
+            sdc_workers_budget = int(args.workers_budget)
+            if sdc_workers_budget < 0:
+                raise ValueError
+        except ValueError:
+            _slack_fail(
+                response_url,
+                f"Invalid --workers-budget value: {args.workers_budget!r}"
+                " (must be an integer >= 0; 0 disables the budget).",
             )
 
     # --partner may be a shlex-encoded list: 'bpl "indiana|Indiana State Library"'
@@ -836,6 +866,11 @@ def main() -> None:
             f"{is_last_env}; "
             f"{single_item_env}"
         )
+        # SDC-sync parallelism options, shared by both invocation sites
+        # below. --workers > 1 enables the multiprocessing pool;
+        # --workers-budget caps concurrent worker slots box-wide. Both
+        # values are already validated above.
+        sdc_opts = f" --workers {sdc_workers} --workers-budget {sdc_workers_budget}"
         if sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which
             # also refreshes sdc.json sidecars from the latest ingestion3
@@ -845,7 +880,7 @@ def main() -> None:
             pipeline_steps = [
                 f"cd {base}",
                 get_ids_cmd,
-                f"sdc-sync --partner {canonical} --ids-file {csv_file}",
+                f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}",
             ]
         else:
             dl_age_opt = (
@@ -866,7 +901,7 @@ def main() -> None:
                 # refresh_only because no upload phase ran — there's no
                 # upload-result.json to drive from.
                 pipeline_steps.append(
-                    f"sdc-sync --partner {canonical} --ids-file {csv_file}"
+                    f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}"
                 )
         target_steps = " && ".join(pipeline_steps)
         target_blocks.append(
