@@ -115,6 +115,35 @@ class Tracker:
         for value in Result:
             self.data[value] = 0
 
+    def snapshot(self) -> dict["Result", int]:
+        """Return a shallow copy of the counter state, suitable for
+        per-task delta computation across a multiprocessing Pool.
+
+        Pair with :meth:`diff` to compute what changed during a unit of
+        work, and :meth:`merge` on the parent's tracker to absorb the
+        delta returned from a worker process.
+        """
+        return dict(self.data)
+
+    def diff(self, prior: dict["Result", int]) -> dict["Result", int]:
+        """Return ``{key: self.data[key] - prior[key]}`` for every
+        counter, treating missing keys in ``prior`` as zero. Used to
+        capture only the counts a worker added during one task —
+        contrast with returning the full ``self.data`` from a
+        long-lived worker, which would double-count across tasks."""
+        return {key: self.data[key] - prior.get(key, 0) for key in self.data}
+
+    def merge(self, delta: dict["Result", int]) -> None:
+        """Add each counter in ``delta`` into ``self.data``. Used by
+        the parent process to aggregate per-task deltas returned from
+        ``multiprocessing.Pool`` workers. Unknown keys in ``delta``
+        (e.g. an enum added in a future Tracker schema) are silently
+        ignored rather than raising — workers can be slightly newer
+        than the parent during a rolling deploy."""
+        for key, count in delta.items():
+            if key in self.data:
+                self.data[key] += count
+
     def __str__(self) -> str:
         result = "COUNTS:\n"
         for key in self.data:

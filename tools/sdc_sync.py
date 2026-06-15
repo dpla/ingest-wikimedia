@@ -61,6 +61,13 @@ _legacy_mode_doc_cache: dict[str, dict] = {}
 # wikitext intact.
 _normalize_wikitext_enabled: bool = True
 
+# Number of worker processes for partner-mode SDC sync. Default 1 keeps the
+# pre-PR single-process behaviour; values > 1 enable the multiprocessing
+# Pool dispatch in ``_run_partner_mode``. Set from ``args.workers`` at main()
+# time so tests can monkeypatch the module global directly without needing
+# to construct an argparse Namespace.
+_workers: int = 1
+
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the argparse parser. Pure — no side effects."""
@@ -157,6 +164,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "(upload → SDC → wikitext cleanup). Pass --no-normalize-wikitext "
             "to disable for diagnostic runs that need the pre-strip wikitext "
             "intact."
+        ),
+    )
+    p.add_argument(
+        "--workers",
+        dest="workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker processes for partner-mode SDC sync. "
+            "Default 1 keeps the single-process behaviour unchanged. "
+            "N>1 dispatches per-DPLA-item work to a multiprocessing "
+            "Pool, with each worker holding its own pywikibot session "
+            "and per-task counter deltas merged into the parent's "
+            "Tracker. Wall-clock scales roughly linearly with N up to "
+            "Commons-side parser-pool headroom (~8-16 across all "
+            "concurrent sessions before maxlag starts to bind). Items "
+            "are independent: every ordinal of every item has a "
+            "unique M-id, so workers never write to the same Commons "
+            "MediaInfo entity."
         ),
     )
     return p
@@ -434,7 +460,7 @@ def _initialize() -> None:
     console-script entry point) does no I/O.
     """
     global parser, args, method, dpla_api, site, hubs, rights, subject_ids
-    global _s3_partner, _s3_client, _normalize_wikitext_enabled
+    global _s3_partner, _s3_client, _normalize_wikitext_enabled, _workers
 
     parser = _build_parser()
     args = parser.parse_args()
@@ -491,6 +517,7 @@ def _initialize() -> None:
         _s3_client = S3Client()
 
     _normalize_wikitext_enabled = bool(args.normalize_wikitext)
+    _workers = max(1, int(getattr(args, "workers", 1) or 1))
 
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
@@ -3998,6 +4025,145 @@ def _migrate_one_dpla_item(s3, partner: str, dpla_id: str) -> None:
             )
 
 
+def _run_partner_mode_parallel(partner, dpla_ids, workers):
+    """Dispatch partner-mode SDC sync across ``workers`` processes.
+
+    Each worker process runs :func:`_process_one_partner_item` against
+    one DPLA item at a time via ``Pool.imap_unordered``; the parent
+    aggregates per-task counter deltas into the module-level tracker.
+
+    Item-level safety: every ordinal of every item has a unique
+    MediaInfo M-id, so two workers handling different items never
+    write to the same Commons entity. The pywikibot ``Site`` is
+    re-initialized per worker (see :func:`_init_partner_worker`),
+    isolating HTTP sessions and CSRF tokens.
+
+    Logging: workers route records through a ``multiprocessing.Queue``
+    to a ``QueueListener`` thread in the parent, which dispatches them
+    to the per-partner SDC log file the parent already opened.
+
+    Uses ``spawn`` start_method explicitly so workers don't inherit
+    the parent's pywikibot session sockets — fork-then-use of a live
+    session has been a source of half-broken connections in similar
+    bot setups.
+    """
+    import logging.handlers
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    log_queue = ctx.Manager().Queue(-1)
+
+    # Reuse the file handler(s) the parent's setup_logging already
+    # attached to the root logger — the QueueListener drains worker
+    # records into the same destinations the parent writes to.
+    listener_targets = list(logging.getLogger().handlers)
+    listener = logging.handlers.QueueListener(
+        log_queue, *listener_targets, respect_handler_level=True
+    )
+    listener.start()
+
+    tasks = [
+        (partner, dpla_id, idx, len(dpla_ids))
+        for idx, dpla_id in enumerate(dpla_ids, start=1)
+    ]
+    try:
+        with ctx.Pool(
+            processes=workers,
+            initializer=_init_partner_worker,
+            initargs=(log_queue,),
+        ) as pool:
+            for delta in pool.imap_unordered(_worker_partner_task, tasks):
+                if delta:
+                    tracker.merge(delta)
+    finally:
+        listener.stop()
+
+
+def _init_partner_worker(log_queue):
+    """Per-worker setup for the ``--workers > 1`` partner-mode Pool.
+
+    Each multiprocessing worker process re-imports this module (with
+    spawn start_method) and runs this initializer once. Two jobs:
+
+    1. **Fresh pywikibot session per worker.** Each worker gets its
+       own ``site``/login pair so HTTP sessions, CSRF tokens, and the
+       maxlag-retry config are isolated. (Even with fork, inheriting
+       the parent's already-opened sockets is a recipe for half-broken
+       connections; we always re-login here.)
+
+    2. **Route log records to the parent.** Replace the root logger's
+       handlers with a single ``QueueHandler`` that pushes records to
+       the shared multiprocessing queue. The parent runs a
+       ``QueueListener`` that drains records to the per-partner SDC
+       log file. Keeps log lines atomic and ordered by completion
+       time across workers — much safer than letting N processes
+       open the same file descriptor.
+    """
+    import logging.handlers
+
+    import pywikibot
+
+    pywikibot.config.max_retries = _PYWIKIBOT_MAX_RETRIES
+    pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
+    pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
+
+    global site
+    site = pywikibot.Site("commons", "commons")
+    site.login()
+
+    qh = logging.handlers.QueueHandler(log_queue)
+    root = logging.getLogger()
+    root.handlers = [qh]
+    root.setLevel(logging.INFO)
+
+
+def _worker_partner_task(args):
+    """Pool worker entrypoint — snapshot the worker's tracker, run
+    one item end-to-end, return the per-task counter delta.
+
+    Pool workers are reused across many tasks; snapshotting before
+    each task and returning the diff gives the parent only what THIS
+    item contributed, so the merge into the parent's tracker is
+    correct regardless of how many tasks each worker ends up handling.
+
+    Top-level exception boundary mirrors the per-ordinal try/except
+    inside ``_process_one_partner_item``: a routine SDC-write failure
+    is already caught and counted as ``SDC_ORDINALS_SKIPPED_ERROR``
+    in there; reaching this handler means something outside the loop
+    raised. Catch and log so a single bad item doesn't kill the whole
+    pool batch.
+    """
+    partner, dpla_id, idx, total = args
+    prior = tracker.snapshot()
+    try:
+        # Workers create their own S3Client lazily on first use; the
+        # parent's instance can't cross the process boundary cleanly
+        # (boto3 sessions hold sockets / credentials state).
+        s3 = _get_partner_s3_client()
+        _process_one_partner_item(s3, partner, dpla_id, idx, total)
+    except Exception:
+        logging.exception(
+            "Worker task crashed processing %s (idx %s/%s) in partner %s",
+            dpla_id,
+            idx,
+            total,
+            partner,
+        )
+    return tracker.diff(prior)
+
+
+def _get_partner_s3_client():
+    """Lazy per-worker S3Client. Cached on the module-level
+    ``_s3_client`` so subsequent tasks in the same worker reuse the
+    same boto3 session."""
+    global _s3_client
+    if _s3_client is None:
+        from ingest_wikimedia.s3 import S3Client
+
+        _s3_client = S3Client()
+    return _s3_client
+
+
 def _process_one_partner_item(s3, partner, dpla_id, idx, total):
     """Process one DPLA item end-to-end in partner mode — read S3
     sidecars, drive per-ordinal SDC sync against Commons, run the
@@ -4025,8 +4191,7 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         sdc_raw = s3.get_sdc_json(partner, dpla_id)
     except ClientError as e:
         logging.warning(
-            f" -- S3 error reading sdc.json for {partner}/{dpla_id}:"
-            f" {e!r}; skipping."
+            f" -- S3 error reading sdc.json for {partner}/{dpla_id}: {e!r}; skipping."
         )
         tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
         return
@@ -4057,9 +4222,7 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
     try:
         upload_result = json.loads(upload_raw)
     except json.JSONDecodeError as e:
-        logging.warning(
-            f" -- upload-result.json failed to parse: {e}; skipping."
-        )
+        logging.warning(f" -- upload-result.json failed to parse: {e}; skipping.")
         tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
         return
 
@@ -4188,9 +4351,7 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         # key raises on the first int() that fails, but Python's
         # sorted() doesn't expose which one — so we re-scan the
         # keys here purely to find the culprit for logging.
-        bad_keys = [
-            repr(k) for k in eligible if not str(k).lstrip("-").isdigit()
-        ]
+        bad_keys = [repr(k) for k in eligible if not str(k).lstrip("-").isdigit()]
         logging.warning(
             f" -- upload-result ordinals malformed for {dpla_id}"
             f" (non-integer key(s): {', '.join(bad_keys) or '<unknown>'});"
@@ -4357,12 +4518,8 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         )
         and _normalize_wikitext_enabled
     ):
-        synced_items = [
-            (o, d) for o, d in ordinal_items if o in synced_ord_strs
-        ]
-        pages_edited |= _post_sdc_cleanup_for_item(
-            s3, partner, dpla_id, synced_items
-        )
+        synced_items = [(o, d) for o, d in ordinal_items if o in synced_ord_strs]
+        pages_edited |= _post_sdc_cleanup_for_item(s3, partner, dpla_id, synced_items)
     if pages_edited:
         tracker.increment(Result.SDC_PAGES_EDITED, len(pages_edited))
 
@@ -4386,7 +4543,6 @@ def _run_partner_mode(partner, ids_file):
     downloader/uploader pattern) so `wikimedia-upload-status` can detect
     progress; final summary posted via `notify_sdc_complete`.
     """
-    from botocore.exceptions import ClientError
 
     from ingest_wikimedia.s3 import S3Client
 
@@ -4410,11 +4566,24 @@ def _run_partner_mode(partner, ids_file):
     with open(ids_file) as f:
         dpla_ids = [line.strip() for line in f if line.strip()]
 
-    logging.info(f"Partner mode: {partner} — {len(dpla_ids)} items from {ids_file}")
+    workers = _workers
+    logging.info(
+        f"Partner mode: {partner} — {len(dpla_ids)} items from {ids_file}"
+        f" (workers={workers})"
+    )
     completed = False
     try:
-        for local_count, dpla_id in enumerate(dpla_ids, start=1):
-            _process_one_partner_item(s3, partner, dpla_id, local_count, len(dpla_ids))
+        if workers <= 1:
+            # Single-process: identical to pre-PR behaviour. Parent's
+            # module-level tracker is mutated in-place; no Pool, no
+            # logging queue, no delta merge. Keeps the no-parallelism
+            # path bit-for-bit unchanged.
+            for local_count, dpla_id in enumerate(dpla_ids, start=1):
+                _process_one_partner_item(
+                    s3, partner, dpla_id, local_count, len(dpla_ids)
+                )
+        else:
+            _run_partner_mode_parallel(partner, dpla_ids, workers)
         completed = True
     except BaseException as exc:
         # The per-ordinal try/except above already swallows every routine

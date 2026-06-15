@@ -549,6 +549,97 @@ def test_truncate_helper_returns_under_limit_unchanged_and_truncates_long():
     assert sdc_sync._truncate(None) == ""
 
 
+def test_run_partner_mode_uses_inline_loop_when_workers_is_one(tmp_path, monkeypatch):
+    """At the default ``_workers == 1``, partner mode must NOT spin up
+    a multiprocessing Pool — it calls ``_process_one_partner_item``
+    directly in the parent process. Preserves bit-for-bit single-
+    process behaviour and avoids spawn-import overhead for runs that
+    don't ask for parallelism."""
+    from tools import sdc_sync
+
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text("abcdef01abcdef01abcdef01abcdef01\n")
+
+    item_calls = []
+    parallel_calls = []
+
+    def fake_process_one_partner_item(s3, partner, dpla_id, idx, total):
+        item_calls.append((partner, dpla_id, idx, total))
+
+    def fake_parallel(partner, dpla_ids, workers):
+        parallel_calls.append((partner, list(dpla_ids), workers))
+
+    monkeypatch.setattr(sdc_sync, "_workers", 1, raising=False)
+    monkeypatch.setattr(
+        sdc_sync, "_process_one_partner_item", fake_process_one_partner_item
+    )
+    monkeypatch.setattr(sdc_sync, "_run_partner_mode_parallel", fake_parallel)
+    with (
+        patch.object(sdc_sync, "setup_logging"),
+        patch.object(sdc_sync, "notify_phase_start"),
+        patch.object(sdc_sync, "notify_sdc_complete"),
+        patch("ingest_wikimedia.s3.S3Client", return_value=MagicMock()),
+    ):
+        sdc_sync._run_partner_mode("nara", str(ids_file))
+
+    assert parallel_calls == [], "Pool path must not run at workers=1"
+    assert item_calls == [("nara", "abcdef01abcdef01abcdef01abcdef01", 1, 1)], (
+        f"expected one inline call to _process_one_partner_item; got {item_calls!r}"
+    )
+
+
+def test_run_partner_mode_dispatches_to_pool_when_workers_above_one(
+    tmp_path, monkeypatch
+):
+    """When ``_workers > 1``, partner mode hands the per-item work
+    off to ``_run_partner_mode_parallel`` and does NOT call
+    ``_process_one_partner_item`` directly. The Pool path owns
+    iteration; the parent's only per-item work is merging deltas."""
+    from tools import sdc_sync
+
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text(
+        "aaaa1111aaaa1111aaaa1111aaaa1111\nbbbb2222bbbb2222bbbb2222bbbb2222\n"
+    )
+
+    item_calls = []
+    parallel_calls = []
+
+    def fake_process_one_partner_item(s3, partner, dpla_id, idx, total):
+        item_calls.append((partner, dpla_id, idx, total))
+
+    def fake_parallel(partner, dpla_ids, workers):
+        parallel_calls.append((partner, list(dpla_ids), workers))
+
+    monkeypatch.setattr(sdc_sync, "_workers", 4, raising=False)
+    monkeypatch.setattr(
+        sdc_sync, "_process_one_partner_item", fake_process_one_partner_item
+    )
+    monkeypatch.setattr(sdc_sync, "_run_partner_mode_parallel", fake_parallel)
+    with (
+        patch.object(sdc_sync, "setup_logging"),
+        patch.object(sdc_sync, "notify_phase_start"),
+        patch.object(sdc_sync, "notify_sdc_complete"),
+        patch("ingest_wikimedia.s3.S3Client", return_value=MagicMock()),
+    ):
+        sdc_sync._run_partner_mode("nara", str(ids_file))
+
+    assert item_calls == [], (
+        f"inline _process_one_partner_item must NOT fire under Pool dispatch;"
+        f" got {item_calls!r}"
+    )
+    assert parallel_calls == [
+        (
+            "nara",
+            [
+                "aaaa1111aaaa1111aaaa1111aaaa1111",
+                "bbbb2222bbbb2222bbbb2222bbbb2222",
+            ],
+            4,
+        )
+    ], f"expected one parallel dispatch with 4 workers; got {parallel_calls!r}"
+
+
 def _install_module_globals(
     monkeypatch,
     sdc_sync,
