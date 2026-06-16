@@ -649,6 +649,12 @@ def file_has_inbound_usage(site: BaseSite, filename: str) -> bool:
             gulimit=1,
             fulimit=1,
         ).submit()
+        # Parse inside the try too: an unexpected payload shape must fail
+        # open (treated as "used"), not raise or fall through to False.
+        for page in result.get("query", {}).get("pages", {}).values():
+            if page.get("globalusage") or page.get("fileusage"):
+                return True
+        return False
     except Exception as e:
         logging.warning(
             "Could not check usage for [[File:%s]] (%s); "
@@ -657,10 +663,6 @@ def file_has_inbound_usage(site: BaseSite, filename: str) -> bool:
             e,
         )
         return True
-    for page in result.get("query", {}).get("pages", {}).values():
-        if page.get("globalusage") or page.get("fileusage"):
-            return True
-    return False
 
 
 def post_commonsdelinker_request(

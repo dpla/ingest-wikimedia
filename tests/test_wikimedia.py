@@ -1016,6 +1016,14 @@ def test_file_has_inbound_usage_fails_open_on_error():
     assert file_has_inbound_usage(site, "F.jpg") is True
 
 
+def test_file_has_inbound_usage_fails_open_on_malformed_payload():
+    """An unexpected payload shape (parse error) must also fail OPEN, not
+    raise or fall through to False — the parse runs inside the try."""
+    # `pages` as a list rather than the expected dict → .values() raises.
+    site = _usage_site({"query": {"pages": ["unexpected"]}})
+    assert file_has_inbound_usage(site, "F.jpg") is True
+
+
 def test_post_commonsdelinker_request_skips_when_no_usage():
     """No inbound usage → no filemovers edit (nothing to relink)."""
     site = _usage_site({"query": {"pages": {"-1": {}}}})
