@@ -230,9 +230,12 @@ def get_phase_and_progress(
 
     if log_file.endswith("-upload.log"):
         if dpla_id_count == 0:
-            # dpla_id_count == 0 means no items logged yet — uploader just started.
-            # Staleness here would be a false positive from the normal start-up lag.
-            return "Uploading (starting...)", log_mtime
+            # No items logged yet. Distinguish a genuine just-started session
+            # ("starting...") from one parked behind the box-wide cap before
+            # its first item ("queued"). Staleness is suppressed either way —
+            # no progress yet is expected, not a stall.
+            start_state = "queued" if waiting_on_slots else "starting..."
+            return f"Uploading ({start_state}){slot_suffix}", log_mtime
         # Use the COUNTS: terminal marker as the definitive completion signal.
         # dpla_id_count is logged at the start of each item, not after all its
         # files finish, so count arithmetic alone can fire too early.
@@ -257,7 +260,8 @@ def get_phase_and_progress(
         # summary surfaces the real synced count via the tracker's
         # SDC_ITEMS_SYNCED line.
         if dpla_id_count == 0:
-            return f"SDC syncing (starting...){slot_suffix}", log_mtime
+            start_state = "queued" if waiting_on_slots else "starting..."
+            return f"SDC syncing ({start_state}){slot_suffix}", log_mtime
         if counts_marker > 0:
             return (
                 f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)",
@@ -289,8 +293,12 @@ def _format_memory_line(snapshot: tuple[int, int] | None) -> str | None:
 
 
 def _format_slots_line(ssm) -> str | None:
-    """Report box-wide SDC slot headroom (free count) for the status post,
-    or ``None`` if no budget-enabled session has created the slot dir."""
+    """Report box-wide worker-slot headroom (free count) for the status post,
+    or ``None`` if no budget-enabled session has created the slot dir.
+
+    The cap is shared by every Commons-writing phase — uploader (uploads,
+    renames, template migrations, purges) as well as sdc-sync — so the line
+    is not SDC-specific."""
     try:
         out = ssm_run(
             ssm,
@@ -322,7 +330,7 @@ def _format_slots_line(ssm) -> str | None:
     # smooths a transient all-held/all-free blip into a representative reading.
     held = round(statistics.median(held_samples))
     free = max(0, total - held)
-    return f"SDC slots: ~{free} free of {total} ({held} held)"
+    return f"Worker slots: ~{free} free of {total} ({held} held)"
 
 
 def post_to_slack(

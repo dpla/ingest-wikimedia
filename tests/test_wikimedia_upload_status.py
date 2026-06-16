@@ -353,6 +353,29 @@ def test_get_phase_and_progress_reports_sdc_starting_with_no_items():
     assert phase == "SDC syncing (starting...)"
 
 
+def test_get_phase_and_progress_reports_sdc_queued_when_waiting():
+    """An -sdc.log with no items logged yet whose tail is the slot-budget
+    wait message is "queued" (parked behind the cap), not "starting..."."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260525-200000-minnesota-sdc.log",
+        awk_counts=[0, 0, 0, 0],
+        csv_total=10,
+        tail=" -- All 16 worker slots busy; waiting for capacity.",
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-minnesota",
+            hub="minnesota",
+            label="minnesota",
+        )
+    assert phase == "SDC syncing (queued) ⏸ waiting on slots"
+
+
 def test_main_picks_latest_active_label_by_mtime_when_earlier_label_aborted():
     """Regression: when a multi-target session has an EARLIER label whose
     phase ended without a COUNTS terminal marker (e.g. an SDC sync that
@@ -545,7 +568,7 @@ def test_format_slots_line_reports_free_headroom():
     out = "TOTAL 24\n16\n14\n17\n15\n"
     with patch("scripts.wikimedia_upload_status.ssm_run", return_value=out):
         line = _format_slots_line(object())
-    assert line == "SDC slots: ~8 free of 24 (16 held)"
+    assert line == "Worker slots: ~8 free of 24 (16 held)"
 
 
 def test_format_slots_line_none_when_no_slot_dir():
