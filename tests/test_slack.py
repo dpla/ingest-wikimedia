@@ -519,6 +519,31 @@ def test_notify_sdc_complete_stats_reflect_tracker_counts():
     assert _idx("PAGES EDITED:") < _idx("CLAIMS ADDED:")
 
 
+def test_notify_sdc_complete_reports_slot_wait_contention():
+    """SLOT WAIT shows the per-worker average (aggregate worker-seconds ÷
+    workers) as a share of runtime — a stable whole-run contention figure,
+    not a point-in-time slot-count snapshot."""
+    tracker = MagicMock(spec=Tracker)
+    # 240 worker-seconds aggregate ÷ 4 workers = 60s avg/worker; over a
+    # 300s runtime that's 20%.
+    counts = {Result.SDC_SLOT_WAIT_SECONDS: 240}
+    tracker.count.side_effect = lambda r: counts.get(r, 0)
+    captured: dict = {}
+    with (
+        patch.dict(os.environ, {"DPLA_SLACK_BOT_TOKEN": "x"}, clear=True),
+        patch("ingest_wikimedia.slack._post_completion_notice") as mock_post,
+    ):
+        mock_post.side_effect = lambda **kwargs: captured.update(kwargs)
+        notify_sdc_complete(
+            tracker=tracker,
+            partner_label="nara",
+            elapsed_seconds=300.0,
+            workers=4,
+        )
+    line = next(s for s in captured["stats_lines"] if s.startswith("SLOT WAIT"))
+    assert "20%" in line
+
+
 def test_notify_sdc_complete_dry_run_adds_suffix():
     """`dry_run=True` appends the same italicized note as upload-complete."""
     tracker = MagicMock(spec=Tracker)

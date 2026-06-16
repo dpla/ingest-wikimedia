@@ -607,6 +607,7 @@ def test_run_partner_mode_acquires_one_slot_per_item_when_workers_is_one(
     class _SpyBudget:
         def __init__(self, budget):
             self.budget = budget
+            self.total_wait_seconds = 0.0
 
         @contextlib.contextmanager
         def acquire(self):
