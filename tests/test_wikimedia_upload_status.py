@@ -502,3 +502,27 @@ def test_post_to_slack_omits_memory_block_when_none():
         post_to_slack("tok", [("wikimedia-bpl", "Uploading")], memory_line=None)
     payload = mock_post.call_args.kwargs["json"]
     assert not any(b.get("type") == "context" for b in payload["blocks"])
+
+
+def test_format_slots_line_reports_free_headroom():
+    """Median of the held-count samples → free = total − held; reports the
+    stable headroom count, not who holds what."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _format_slots_line
+
+    # TOTAL 24, held samples [16,14,17,15] → median 15.5 → 16 held → 8 free.
+    out = "TOTAL 24\n16\n14\n17\n15\n"
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value=out):
+        line = _format_slots_line(object())
+    assert line == "SDC slots: ~8 free of 24 (16 held)"
+
+
+def test_format_slots_line_none_when_no_slot_dir():
+    """No slot dir (no budget-enabled session has run) → no line."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _format_slots_line
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value="NODIR\n"):
+        assert _format_slots_line(object()) is None

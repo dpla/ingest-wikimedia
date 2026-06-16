@@ -97,6 +97,9 @@ class Result(Enum):
     LEGACY_SKIPPED_NOT_LEGACY = auto()  # page didn't carry a legacy template
     LEGACY_SKIPPED_ALREADY = auto()  # already migrated (idempotency hit)
     LEGACY_SKIPPED_ERROR = auto()  # raised at runtime, isolated by exc boundary
+    # Aggregate worker-seconds blocked on a box-wide slot (WorkerSlotBudget
+    # contention). Summed across workers; the consumer divides by worker count.
+    SDC_SLOT_WAIT_SECONDS = auto()
 
 
 class Tracker:

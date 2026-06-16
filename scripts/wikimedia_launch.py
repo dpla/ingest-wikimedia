@@ -129,12 +129,12 @@ def main() -> None:
     parser.add_argument("--refresh-only", default="false")
     parser.add_argument("--sdc-only", default="false")
     # Keep in sync with .github/workflows/wikimedia-launch.yml inputs.workers
-    # / inputs.workers_budget (currently 4 / 16), which the workflow always
+    # / inputs.workers_budget (currently 6 / 24), which the workflow always
     # passes explicitly. These defaults only apply to a bare manual launch —
-    # they let it behave like a workflow launch (4 SDC workers under a
-    # box-wide cap of 16) rather than silently running single-worker, no cap.
-    parser.add_argument("--workers", default="4")
-    parser.add_argument("--workers-budget", default="16")
+    # they let it behave like a workflow launch (6 SDC workers under a
+    # box-wide cap of 24) rather than silently running single-worker, no cap.
+    parser.add_argument("--workers", default="6")
+    parser.add_argument("--workers-budget", default="24")
     args = parser.parse_args()
 
     force = _parse_bool(args.force)

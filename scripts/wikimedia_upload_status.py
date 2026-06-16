@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shlex
+import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
@@ -16,6 +17,7 @@ import requests
 
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.ssm import REGION, fetch_memory_snapshot, ssm_run
+from ingest_wikimedia.worker_slots import DEFAULT_SLOT_DIR
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
@@ -275,10 +277,45 @@ def _format_memory_line(snapshot: tuple[int, int] | None) -> str | None:
     return f"Memory: {used_mb:,} / {total_mb:,} MB used ({pct_available}% available)"
 
 
+def _format_slots_line(ssm) -> str | None:
+    """Report box-wide SDC slot headroom (free count) for the status post,
+    or ``None`` if no budget-enabled session has created the slot dir."""
+    try:
+        out = ssm_run(
+            ssm,
+            f"D={DEFAULT_SLOT_DIR}; "
+            f'if [ ! -d "$D" ]; then echo NODIR; exit 0; fi; '
+            f'echo "TOTAL $(ls "$D" 2>/dev/null | wc -l)"; '
+            f"for i in 1 2 3 4; do lslocks 2>/dev/null | grep -c sdc-sync-worker-slots; sleep 1; done",
+        )
+    except Exception as e:
+        logging.warning("Could not read slot headroom: %s", e)
+        return None
+    # Parse "TOTAL <n>" followed by the integer held-count samples.
+    total = None
+    held_samples: list[int] = []
+    for ln in (out or "").splitlines():
+        ln = ln.strip()
+        if ln == "NODIR":
+            return None
+        if ln.startswith("TOTAL "):
+            total = int(ln.split()[1])
+        elif ln.isdigit():
+            held_samples.append(int(ln))
+    if not total or not held_samples:
+        return None
+    # Median of the samples: slot ownership churns every few seconds, so this
+    # smooths a transient all-held/all-free blip into a representative reading.
+    held = round(statistics.median(held_samples))
+    free = max(0, total - held)
+    return f"SDC slots: ~{free} free of {total} ({held} held)"
+
+
 def post_to_slack(
     token: str,
     rows: list[tuple[str, str]],
     memory_line: str | None = None,
+    slots_line: str | None = None,
 ) -> None:
     lines = "\n".join(f"`{session:<32}` {phase}" for session, phase in rows)
     blocks: list[dict] = [
@@ -288,9 +325,13 @@ def post_to_slack(
         },
         {"type": "section", "text": {"type": "mrkdwn", "text": lines}},
     ]
-    if memory_line:
+    context_bits = [b for b in (slots_line, memory_line) if b]
+    if context_bits:
         blocks.append(
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": memory_line}]}
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "   •   ".join(context_bits)}],
+            }
         )
     payload = {
         "channel": SLACK_CHANNEL,
@@ -485,17 +526,19 @@ def main() -> None:
     # Memory snapshot is independent of every per-session fetch — submit it
     # to the same executor so the SSM round-trip overlaps with the session
     # phase resolution rather than serializing after it.
-    with ThreadPoolExecutor(max_workers=min(len(sessions) + 1, 8)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(sessions) + 2, 8)) as executor:
         memory_future = executor.submit(fetch_memory_snapshot, ssm)
+        slots_future = executor.submit(_format_slots_line, ssm)
         futures = {executor.submit(fetch, s): s for s in sessions}
         for future in as_completed(futures):
             session, phase = future.result()
             results[session] = phase
             print(f"{session}: {phase}")
         memory_line = _format_memory_line(memory_future.result())
+        slots_line = slots_future.result()
 
     rows = [(s, results[s]) for s in sessions if s in results]
-    post_to_slack(token, rows, memory_line=memory_line)
+    post_to_slack(token, rows, memory_line=memory_line, slots_line=slots_line)
     print("Posted to Slack.")
 
 

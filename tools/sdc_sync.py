@@ -4237,6 +4237,7 @@ def _worker_partner_task(args):
     """
     partner, dpla_id, idx, total = args
     prior = tracker.snapshot()
+    wait_before = _worker_slot_budget.total_wait_seconds
     try:
         # Workers create their own S3Client lazily on first use; the
         # parent's instance can't cross the process boundary cleanly
@@ -4265,6 +4266,12 @@ def _worker_partner_task(args):
         # (e.g. an acquire()/setup fault); otherwise they drop silently from
         # the tally while the per-ordinal handler owns the routine failures.
         tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
+    # Fold this task's slot-wait into the tracker so the parent aggregates
+    # contention across all workers (worker-seconds). Whole seconds only —
+    # sub-second waits (uncontended acquires) round to 0 and don't clutter.
+    wait_delta = round(_worker_slot_budget.total_wait_seconds - wait_before)
+    if wait_delta:
+        tracker.increment(Result.SDC_SLOT_WAIT_SECONDS, wait_delta)
     return tracker.diff(prior)
 
 
@@ -4701,6 +4708,10 @@ def _run_partner_mode(partner, ids_file):
                     _process_one_partner_item(
                         s3, partner, dpla_id, local_count, len(dpla_ids)
                     )
+            # One process, so its accumulated wait IS the session total.
+            slot_wait = round(slot_budget.total_wait_seconds)
+            if slot_wait:
+                tracker.increment(Result.SDC_SLOT_WAIT_SECONDS, slot_wait)
         else:
             _run_partner_mode_parallel(partner, dpla_ids, workers)
         completed = True
@@ -4744,6 +4755,7 @@ def _run_partner_mode(partner, ids_file):
                 tracker=tracker,
                 partner_label=partner,
                 elapsed_seconds=elapsed,
+                workers=workers,
             )
         else:
             logging.warning(

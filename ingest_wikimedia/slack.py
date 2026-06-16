@@ -414,6 +414,7 @@ def notify_sdc_complete(
     partner_label: str,
     elapsed_seconds: float,
     dry_run: bool = False,
+    workers: int = 1,
 ) -> None:
     """Post the SDC phase's completion summary to #tech-alerts.
 
@@ -423,6 +424,9 @@ def notify_sdc_complete(
     uploading new files; "items synced" is the per-DPLA-ID count, and the
     SKIPPED_* lines surface items the partner-mode loop bailed on because
     their sidecars were missing or malformed.
+
+    ``workers`` turns the aggregate worker-seconds in ``SDC_SLOT_WAIT_SECONDS``
+    into a per-worker average for the SLOT WAIT line.
     """
     token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
     if not token:
@@ -434,6 +438,12 @@ def notify_sdc_complete(
     )
     runtime = _format_runtime(elapsed_seconds)
     dry_run_note = " _(dry run)_" if dry_run else ""
+
+    # Box-wide-slot contention: aggregate worker-seconds waited / workers =
+    # average per worker; expressed as a share of runtime so it reads as
+    # "this session spent ~X% of its time throttled by the budget."
+    avg_wait = tracker.count(Result.SDC_SLOT_WAIT_SECONDS) / max(1, workers)
+    wait_pct = (avg_wait / elapsed_seconds * 100) if elapsed_seconds > 0 else 0
 
     _post_completion_notice(
         token=token,
@@ -452,6 +462,7 @@ def notify_sdc_complete(
             f"ORDINAL MISSING:      {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY):,}",
             f"ORDINAL NO PAGEID:    {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID):,}",
             f"ORDINAL ERRORS:       {tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR):,}",
+            f"SLOT WAIT (avg/wkr):  {_format_runtime(avg_wait)} ({wait_pct:.0f}% of runtime)",
             f"Runtime:              {runtime}",
         ],
     )

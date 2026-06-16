@@ -197,3 +197,37 @@ def test_acquire_releases_on_exception_in_block(tmp_path):
         pass
     # Slot must be free despite the exception.
     assert not _slot_is_held(str(tmp_path), 0)
+
+
+def test_total_wait_seconds_zero_when_uncontended(tmp_path):
+    """An acquire that finds a free slot on the first scan adds ~0 to the
+    cumulative wait counter, so an uncontended session reports no
+    contention."""
+    budget = WorkerSlotBudget(budget=2, slot_dir=str(tmp_path))
+    with budget.acquire():
+        pass
+    assert budget.total_wait_seconds < 0.5
+
+
+def test_total_wait_seconds_accumulates_when_blocked(tmp_path):
+    """When the only slot is held by a foreign session, acquire() blocks
+    and the blocked time is added to total_wait_seconds once it proceeds."""
+    budget = WorkerSlotBudget(budget=1, slot_dir=str(tmp_path))
+    proceeded = threading.Event()
+
+    def worker():
+        with budget.acquire():
+            proceeded.set()
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(_foreign_flock(str(tmp_path), 0))
+    t = threading.Thread(target=worker)
+    t.start()
+    try:
+        # Hold the only slot long enough that the worker must poll-wait.
+        assert not proceeded.wait(timeout=0.8)
+    finally:
+        stack.close()  # release so the worker can proceed
+    assert proceeded.wait(timeout=3)
+    t.join(timeout=1)
+    assert budget.total_wait_seconds > 0.3

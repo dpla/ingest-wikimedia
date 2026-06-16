@@ -111,6 +111,10 @@ class WorkerSlotBudget:
     def __init__(self, budget: int, slot_dir: str = DEFAULT_SLOT_DIR):
         self.budget = budget
         self.slot_dir = slot_dir
+        # Cumulative seconds this process spent blocked in acquire() waiting
+        # for a free slot. ~0 when the budget isn't contended; grows under
+        # saturation. Callers read it to report slot contention.
+        self.total_wait_seconds = 0.0
         if budget > 0:
             self._ensure_slot_files()
 
@@ -169,7 +173,9 @@ class WorkerSlotBudget:
 
         fd = None
         try:
+            start = time.monotonic()
             fd = self._acquire_slot_fd()
+            self.total_wait_seconds += time.monotonic() - start
             yield
         finally:
             if fd is not None:
