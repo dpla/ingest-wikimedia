@@ -20,6 +20,7 @@ from ingest_wikimedia.sdc import (
     parse_date_range,
     parse_dpla_date,
     parse_nara_access_level,
+    parse_other_date_template,
 )
 from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
@@ -3013,7 +3014,16 @@ def _statement_comparable_value(stmt):
             s = (qv.get("value") or "").strip()
             if not s:
                 continue
-            parsed = parse_dpla_date(s)
+            # Legacy inferred-from-Wikitext claims written before the
+            # expand-then-store fix carry raw ``{{other date|~|1911}}``
+            # markup here instead of its rendered text. Convert the
+            # supported modifiers to the display string parse_dpla_date
+            # understands so they collapse with the DPLA-sourced claim
+            # (which carries the rendered "circa 1911" / value-typed
+            # time). Non-template / unsupported-modifier values pass
+            # through unchanged.
+            parse_input = parse_other_date_template(s) or s
+            parsed = parse_dpla_date(parse_input)
             if parsed and parsed.get("value"):
                 # Same shape (and circa-bit suffix) as
                 # ``_time_claim_comparable`` so a somevalue+P1932="1945"
@@ -3021,16 +3031,13 @@ def _statement_comparable_value(stmt):
                 base = _time_comparable(parsed["value"])
                 key = f"{base}|circa" if parsed.get("approximate") else base
                 return ("time", key, None)
+            # Range parser sees the RAW value — it matches the
+            # ``{{other date|between|X|Y}}`` markup directly.
             rng = parse_date_range(s)
             if rng:
                 return ("date-range", rng[0], rng[1])
             # Literal-string fallback — only matches another P1932
-            # qualifier whose stated-as text is byte-identical. The
-            # inferred-from-Wikitext writer stores the post-expansion
-            # value, but legacy migrations that ran before the
-            # expand-then-store fix may carry raw wikitext here. The
-            # range parser already matches the most common
-            # ``{{other date|between|X|Y}}`` shape directly.
+            # qualifier whose stated-as text is byte-identical.
             return ("p1932-string", s, None)
         return None
 

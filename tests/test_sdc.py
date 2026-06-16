@@ -1006,3 +1006,82 @@ def test_parse_dpla_date_still_returns_none_for_ranges():
     single year."""
     assert parse_dpla_date("1934 - 1948") is None
     assert parse_dpla_date("between 1934 and 1948") is None
+
+
+# ---------------------------------------------------------------------------
+# parse_other_date_template — convert raw {{other date|MODIFIER|...}} wikitext
+# (legacy inferred-from-Wikitext claims written before the expand-then-store
+# fix) into the display string parse_dpla_date understands, so the reconciler
+# comparable matches the DPLA-sourced equivalent. Conservative: only the
+# modifiers DPLA can represent; None otherwise.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_other_date_template_circa_family():
+    """The reported case (M180313608): every circa-marker spelling maps to
+    'circa <date>', which parse_dpla_date turns into year-precision +
+    approximate — matching the DPLA value-typed time + P1480 circa."""
+    from ingest_wikimedia.sdc import parse_other_date_template
+
+    for raw in (
+        "{{other date|~|1911}}",
+        "{{other date|circa|1911}}",
+        "{{other date|c|1911}}",
+        "{{other date|c.|1911}}",
+        "{{other date|ca|1911}}",
+        "{{other date|ca.|1911}}",
+    ):
+        assert parse_other_date_template(raw) == "circa 1911", raw
+
+
+def test_parse_other_date_template_uncertain_and_decade():
+    from ingest_wikimedia.sdc import parse_other_date_template
+
+    assert parse_other_date_template("{{other date|?|1945}}") == "1945?"
+    assert parse_other_date_template("{{other date|s|1910}}") == "1910s"
+    assert parse_other_date_template("{{other date|decade|1910}}") == "1910s"
+
+
+def test_parse_other_date_template_tolerates_whitespace_and_underscore_alias():
+    from ingest_wikimedia.sdc import parse_other_date_template
+
+    assert parse_other_date_template("{{ other date | ~ | 1911 }}") == "circa 1911"
+    assert parse_other_date_template("{{other_date|~|1911}}") == "circa 1911"
+
+
+def test_parse_other_date_template_preserves_month_precision():
+    """The circa wrapper is stripped to the inner date verbatim, so a
+    YYYY-MM inner value keeps month precision once parse_dpla_date runs."""
+    from ingest_wikimedia.sdc import parse_other_date_template
+
+    assert parse_other_date_template("{{other date|c.|1911-06}}") == "circa 1911-06"
+
+
+def test_parse_other_date_template_returns_none_for_unsupported_modifiers():
+    """between/before/after/century/season have no parse_dpla_date
+    equivalent — return None so the caller keeps the raw string (which
+    only matches byte-identical text). Critical: never widen a dedup into
+    a wrong removal by guessing at a modifier DPLA can't represent.
+    ``between`` is handled separately by parse_date_range, so None here
+    is correct too."""
+    from ingest_wikimedia.sdc import parse_other_date_template
+
+    for raw in (
+        "{{other date|between|1934|1948}}",
+        "{{other date|before|1911}}",
+        "{{other date|after|1911}}",
+        "{{other date|century|19}}",
+        "{{other date|spring|1911}}",
+    ):
+        assert parse_other_date_template(raw) is None, raw
+
+
+def test_parse_other_date_template_returns_none_for_non_template():
+    from ingest_wikimedia.sdc import parse_other_date_template
+
+    assert parse_other_date_template("circa 1911") is None
+    assert parse_other_date_template("1911") is None
+    assert parse_other_date_template("") is None
+    assert parse_other_date_template("{{some other template|x}}") is None
+    # Template present but no date argument → None (nothing to convert).
+    assert parse_other_date_template("{{other date|~}}") is None
