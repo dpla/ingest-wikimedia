@@ -16,6 +16,7 @@ from ingest_wikimedia.wikimedia import (
     extract_page_ordinal_from_commons_title,
     extract_strings,
     extract_strings_dict,
+    file_has_inbound_usage,
     is_same_item_redirect_relic,
     merge_preserved_wikitext,
     post_commonsdelinker_request,
@@ -929,7 +930,10 @@ def test_post_commonsdelinker_request_uses_appendtext_not_read_modify_write():
     `appendtext` is server-side atomic: no read, no basetimestamp, no
     race. This test pins both halves of that contract.
     """
-    site = MagicMock()
+    # Old.jpg has inbound usage, so the usage gate lets the post through.
+    site = _usage_site(
+        {"query": {"pages": {"-1": {"globalusage": [{"title": "w:en:Example"}]}}}}
+    )
     # If anything tries to read page.text the test fails loudly: that
     # would mean we slipped back into the naive form.
     page_text_accessed = MagicMock(
@@ -967,6 +971,60 @@ def test_post_commonsdelinker_request_uses_appendtext_not_read_modify_write():
     assert "|New.jpg" in kwargs["appendtext"]
     # page.save must not be called — that path re-introduces the read.
     page.save.assert_not_called()
+
+
+def _usage_site(submit_return=None, submit_exc=None):
+    """A mock site whose simple_request(...).submit() returns the given
+    query result (or raises). Used to drive the usage gate."""
+    site = MagicMock()
+    sub = site.simple_request.return_value.submit
+    if submit_exc is not None:
+        sub.side_effect = submit_exc
+    else:
+        sub.return_value = submit_return
+    return site
+
+
+def test_file_has_inbound_usage_one_combined_request_global_or_local():
+    """Global and local usage are fetched in a SINGLE request
+    (prop=globalusage|fileusage); usage in either class counts as used,
+    and neither counts as unused. ``redirects`` must not be set."""
+    # global only
+    site = _usage_site({"query": {"pages": {"-1": {"globalusage": [{"x": 1}]}}}})
+    assert file_has_inbound_usage(site, "F.jpg") is True
+    # exactly one API request, with the combined prop and no redirect-following
+    assert site.simple_request.call_count == 1
+    _, kwargs = site.simple_request.call_args
+    assert kwargs["action"] == "query"
+    assert set(kwargs["prop"].split("|")) == {"globalusage", "fileusage"}
+    assert kwargs["titles"] == "File:F.jpg"
+    assert "redirects" not in kwargs
+
+    # local only
+    site = _usage_site({"query": {"pages": {"-1": {"fileusage": [{"title": "X"}]}}}})
+    assert file_has_inbound_usage(site, "F.jpg") is True
+
+    # neither
+    site = _usage_site({"query": {"pages": {"-1": {}}}})
+    assert file_has_inbound_usage(site, "F.jpg") is False
+
+
+def test_file_has_inbound_usage_fails_open_on_error():
+    """A query error must fail OPEN (return True) so a needed relink is
+    never silently dropped on a transient API failure."""
+    site = _usage_site(submit_exc=RuntimeError("api down"))
+    assert file_has_inbound_usage(site, "F.jpg") is True
+
+
+def test_post_commonsdelinker_request_skips_when_no_usage():
+    """No inbound usage → no filemovers edit (nothing to relink)."""
+    site = _usage_site({"query": {"pages": {"-1": {}}}})
+    with patch("ingest_wikimedia.wikimedia.pywikibot.Page") as PageCtor:
+        post_commonsdelinker_request(
+            site, old_filename="Old.jpg", new_filename="New.jpg"
+        )
+    site.editpage.assert_not_called()
+    PageCtor.assert_not_called()
 
 
 def test_tag_as_duplicate_uses_prependtext_not_read_modify_write():
