@@ -967,12 +967,38 @@ class Uploader:
             try:
                 other_item = self.dpla.get_item_metadata(existing_dpla_id)
             except Exception as ex:
-                logging.warning(
-                    f"Hash drift for {dpla_id} {ordinal}: failed to verify "
-                    f"colliding DPLA item {existing_dpla_id}: {ex}; "
-                    f"falling back to upload_only."
-                )
-                return "upload_only"
+                # A 404 from the DPLA API for the colliding file's DPLA ID
+                # is the strongest possible signal that the existing
+                # Commons file is an orphan: that ID no longer resolves to
+                # any item, so the previous bot upload's DPLA-side anchor
+                # is gone. Treat it exactly like ``other_item is None`` —
+                # fall through to the Case 1/2/3 migration so we move the
+                # orphan to the new ID's title (or upload-and-tag it),
+                # rather than silently creating a duplicate alongside it.
+                #
+                # Distinguishing 404 from other exceptions matters because
+                # the catch-all path is reached by network timeouts, 5xx
+                # responses, JSON parse errors, etc. — none of which carry
+                # the same definitive "the old ID is gone" meaning. Those
+                # stay on the conservative ``upload_only`` fallback so a
+                # transient API blip doesn't trigger a destructive move on
+                # a file that still has a valid sibling item.
+                status = getattr(getattr(ex, "response", None), "status_code", None)
+                if status == 404:
+                    logging.info(
+                        f"Hash drift for {dpla_id} {ordinal}: colliding "
+                        f"DPLA item {existing_dpla_id} no longer exists "
+                        f"(404); treating [[File:{actual_filename}]] as "
+                        f"an orphan and migrating."
+                    )
+                    other_item = None
+                else:
+                    logging.warning(
+                        f"Hash drift for {dpla_id} {ordinal}: failed to verify "
+                        f"colliding DPLA item {existing_dpla_id}: {ex}; "
+                        f"falling back to upload_only."
+                    )
+                    return "upload_only"
             if other_item:
                 logging.info(
                     f"Hash drift for {dpla_id} {ordinal}: "
