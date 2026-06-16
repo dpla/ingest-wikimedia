@@ -631,6 +631,40 @@ def build_title_drift_move_reason(
     return candidates[-1]
 
 
+def file_has_inbound_usage(site: BaseSite, filename: str) -> bool:
+    """Return True if bare-named ``filename`` is used on another wiki
+    (``globalusage``) or a local Commons page (``fileusage``).
+
+    Both classes are fetched in one request (capped at one row each). No
+    ``redirects``: we want usage recorded against *this* title, not a
+    redirect target. Fails open (returns True) on any error so a needed
+    relink is never silently dropped.
+    """
+    api_site = typing.cast(APISite, site)
+    try:
+        result = api_site.simple_request(
+            action="query",
+            prop="globalusage|fileusage",
+            titles=f"File:{filename}",
+            gulimit=1,
+            fulimit=1,
+        ).submit()
+        # Parse inside the try too: an unexpected payload shape must fail
+        # open (treated as "used"), not raise or fall through to False.
+        for page in result.get("query", {}).get("pages", {}).values():
+            if page.get("globalusage") or page.get("fileusage"):
+                return True
+        return False
+    except Exception as e:
+        logging.warning(
+            "Could not check usage for [[File:%s]] (%s); "
+            "assuming used and posting CommonsDelinker request.",
+            filename,
+            e,
+        )
+        return True
+
+
 def post_commonsdelinker_request(
     site: BaseSite, old_filename: str, new_filename: str
 ) -> None:
@@ -639,6 +673,9 @@ def post_commonsdelinker_request(
     Both filenames should be bare (without the 'File:' namespace prefix).
     Each call makes one edit, matching the one-request-per-edit convention
     used by other editors on that page.
+
+    No-ops when ``old_filename`` has no inbound usage to relink (see
+    ``file_has_inbound_usage``).
 
     Uses the MediaWiki `appendtext` API parameter rather than the naive
     read-modify-write (`page.text = page.text + template; page.save()`).
@@ -661,6 +698,13 @@ def post_commonsdelinker_request(
         primary; conflicting concurrent edits can no longer cause
         spurious rejections.
     """
+    if not file_has_inbound_usage(site, old_filename):
+        logging.info(
+            " -- No inbound usage for [[File:%s]]; skipping CommonsDelinker "
+            "request (nothing to relink).",
+            old_filename,
+        )
+        return
     page = pywikibot.Page(site, COMMONSDELINKER_PAGE)
     template = (
         f"{{{{universal replace"
