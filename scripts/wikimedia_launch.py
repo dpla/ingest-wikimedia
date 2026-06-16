@@ -175,7 +175,7 @@ def main() -> None:
     # blank) falls back to the conservative default rather than failing
     # the whole launch. --workers must be >= 1; --workers-budget >= 0
     # (0 = unlimited / disabled).
-    sdc_workers = 4
+    sdc_workers = 6
     if args.workers.strip():
         try:
             sdc_workers = int(args.workers)
@@ -186,7 +186,7 @@ def main() -> None:
                 response_url,
                 f"Invalid --workers value: {args.workers!r} (must be an integer >= 1).",
             )
-    sdc_workers_budget = 16
+    sdc_workers_budget = 24
     if args.workers_budget.strip():
         try:
             sdc_workers_budget = int(args.workers_budget)

@@ -526,3 +526,14 @@ def test_format_slots_line_none_when_no_slot_dir():
 
     with patch("scripts.wikimedia_upload_status.ssm_run", return_value="NODIR\n"):
         assert _format_slots_line(object()) is None
+
+
+def test_format_slots_line_none_when_lslocks_absent():
+    """lslocks missing → NODATA → no line (rather than a misleading "all
+    free" from grep -c on empty stdin)."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _format_slots_line
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value="NODATA\n"):
+        assert _format_slots_line(object()) is None

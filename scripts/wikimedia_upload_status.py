@@ -285,6 +285,9 @@ def _format_slots_line(ssm) -> str | None:
             ssm,
             f"D={DEFAULT_SLOT_DIR}; "
             f'if [ ! -d "$D" ]; then echo NODIR; exit 0; fi; '
+            # Without lslocks, grep -c on empty stdin returns 0 and we'd
+            # silently report "all free" — so bail to NODATA instead of lying.
+            f"command -v lslocks >/dev/null 2>&1 || {{ echo NODATA; exit 0; }}; "
             f'echo "TOTAL $(ls "$D" 2>/dev/null | wc -l)"; '
             f"for i in 1 2 3 4; do lslocks 2>/dev/null | grep -c sdc-sync-worker-slots; sleep 1; done",
         )
@@ -296,7 +299,7 @@ def _format_slots_line(ssm) -> str | None:
     held_samples: list[int] = []
     for ln in (out or "").splitlines():
         ln = ln.strip()
-        if ln == "NODIR":
+        if ln in ("NODIR", "NODATA"):
             return None
         if ln.startswith("TOTAL "):
             total = int(ln.split()[1])

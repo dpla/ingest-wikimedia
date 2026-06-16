@@ -230,4 +230,5 @@ def test_total_wait_seconds_accumulates_when_blocked(tmp_path):
         stack.close()  # release so the worker can proceed
     assert proceeded.wait(timeout=3)
     t.join(timeout=1)
+    assert not t.is_alive(), "worker thread should exit after slot release"
     assert budget.total_wait_seconds > 0.3

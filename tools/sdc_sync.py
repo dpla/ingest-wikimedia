@@ -4267,9 +4267,11 @@ def _worker_partner_task(args):
         # the tally while the per-ordinal handler owns the routine failures.
         tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
     # Fold this task's slot-wait into the tracker so the parent aggregates
-    # contention across all workers (worker-seconds). Whole seconds only —
-    # sub-second waits (uncontended acquires) round to 0 and don't clutter.
-    wait_delta = round(_worker_slot_budget.total_wait_seconds - wait_before)
+    # contention across all workers (worker-seconds). Diff the *floored*
+    # cumulative wait rather than rounding the per-task delta: whole-second
+    # boundary crossings telescope to int(total), so sustained sub-second
+    # waits aren't each rounded away to 0.
+    wait_delta = int(_worker_slot_budget.total_wait_seconds) - int(wait_before)
     if wait_delta:
         tracker.increment(Result.SDC_SLOT_WAIT_SECONDS, wait_delta)
     return tracker.diff(prior)
@@ -4709,7 +4711,7 @@ def _run_partner_mode(partner, ids_file):
                         s3, partner, dpla_id, local_count, len(dpla_ids)
                     )
             # One process, so its accumulated wait IS the session total.
-            slot_wait = round(slot_budget.total_wait_seconds)
+            slot_wait = int(slot_budget.total_wait_seconds)
             if slot_wait:
                 tracker.increment(Result.SDC_SLOT_WAIT_SECONDS, slot_wait)
         else:
