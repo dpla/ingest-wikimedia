@@ -17,7 +17,7 @@ import requests
 
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.ssm import REGION, fetch_memory_snapshot, ssm_run
-from ingest_wikimedia.worker_slots import DEFAULT_SLOT_DIR
+from ingest_wikimedia.worker_slots import DEFAULT_SLOT_DIR, SLOTS_BUSY_LOG_MARKER
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
@@ -184,8 +184,19 @@ def get_phase_and_progress(
 
     # Append a staleness warning to any active (non-complete) phase whose log
     # hasn't been updated in _STALE_SECONDS. Completed phases never get this.
+    # A session is "waiting on slots" when its *last* log line is the box-wide
+    # budget's wait message — i.e. all its workers are currently blocked on the
+    # cap. Keyed on the last line (not anywhere in the tail) so a session that
+    # waited briefly and then resumed isn't flagged.
+    last_log_line = tail.splitlines()[-1] if tail else ""
+    waiting_on_slots = SLOTS_BUSY_LOG_MARKER in last_log_line
+    slot_suffix = " ⏸ waiting on slots" if waiting_on_slots else ""
+
     stale_suffix = ""
-    if counts_marker == 0 and now > 0 and log_mtime > 0:
+    # A blocked session legitimately stops writing to its log while polling,
+    # so don't also flag it as idle/hung — the slot suffix already explains
+    # the silence.
+    if counts_marker == 0 and now > 0 and log_mtime > 0 and not waiting_on_slots:
         idle = now - log_mtime
         if idle > _STALE_SECONDS:
             idle_min = idle // 60
@@ -231,7 +242,7 @@ def get_phase_and_progress(
                 log_mtime,
             )
         return (
-            f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){stale_suffix}",
+            f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){slot_suffix}{stale_suffix}",
             log_mtime,
         )
 
@@ -246,14 +257,14 @@ def get_phase_and_progress(
         # summary surfaces the real synced count via the tracker's
         # SDC_ITEMS_SYNCED line.
         if dpla_id_count == 0:
-            return "SDC syncing (starting...)", log_mtime
+            return f"SDC syncing (starting...){slot_suffix}", log_mtime
         if counts_marker > 0:
             return (
                 f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)",
                 log_mtime,
             )
         return (
-            f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}",
+            f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){slot_suffix}{stale_suffix}",
             log_mtime,
         )
 

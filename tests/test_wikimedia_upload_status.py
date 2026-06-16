@@ -127,6 +127,8 @@ def _fake_ssm_for_phase(
     csv_total: int,
     *,
     mtime: int = 1700000000,
+    now: int | None = None,
+    tail: str = "last log line",
 ):
     """Build a fake `ssm_run` that returns the precheck + counts payload
     `get_phase_and_progress` expects, with the named log file and counts.
@@ -145,13 +147,15 @@ def _fake_ssm_for_phase(
     call_count = [0]
     sep = "__WM_SEP__"
 
+    now_val = mtime if now is None else now
+
     def fake_ssm_run(_client, _command, **_kwargs):
         call_count[0] += 1
         if call_count[0] == 1:
             return f"{mtime}\n{log_filename}\n"
-        # now and mtime both come from the same `mtime` parameter so the
-        # staleness suffix never fires (now == mtime → idle == 0).
-        body = f"{mtime}\n{mtime}\n{sep}\nlast log line\n{sep}\n"
+        # Default now == mtime so the staleness suffix never fires (idle == 0);
+        # callers pass an explicit later ``now`` to exercise staleness.
+        body = f"{now_val}\n{mtime}\n{sep}\n{tail}\n{sep}\n"
         body += "\n".join(str(n) for n in awk_counts) + "\n"
         body += f"{csv_total}\n"
         return body
@@ -275,6 +279,32 @@ def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
     # mtime is the second tuple element — present so callers can compare
     # across labels (see test_main_picks_latest_active_label_by_mtime).
     assert log_mtime > 0
+
+
+def test_get_phase_and_progress_flags_waiting_on_slots():
+    """When the sdc-log tail's last line is the slot-budget wait message,
+    the phase is annotated 'waiting on slots' — and the idle/stale warning
+    is suppressed (a blocked session legitimately stops writing its log)."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260616-000000-nara+x-sdc.log",
+        awk_counts=[100, 0, 0, 0],
+        csv_total=200,
+        mtime=1700000000,
+        now=1700000000
+        + 3600,  # 1h since last log write — would be "idle" if not waiting
+        tail=" -- All 16 worker slots busy; waiting for capacity.",
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None, session="wikimedia-nara+x", hub="nara", label="nara+x"
+        )
+    assert phase.startswith("SDC syncing")
+    assert "waiting on slots" in phase
+    assert "idle" not in phase, "stale/idle warning must be suppressed while waiting"
 
 
 def test_get_phase_and_progress_reports_sdc_complete():

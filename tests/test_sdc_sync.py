@@ -1666,6 +1666,54 @@ def test_post_sdc_cleanup_for_legacy_mode_reuses_cached_doc(monkeypatch):
     assert "dpla-1" not in sdc_sync._legacy_mode_doc_cache
 
 
+def test_post_sdc_cleanup_for_item_isolates_per_page_failures(monkeypatch, caplog):
+    """A per-page cleanup failure is isolated: the failing page is skipped and
+    its siblings still count. (See _post_sdc_cleanup_for_item for why this must
+    not propagate.)"""
+    import json
+    import logging as _logging
+
+    from ingest_wikimedia import wikimedia
+    from ingest_wikimedia.dpla import DPLA
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_item_metadata.return_value = json.dumps({"id": "d1", "sourceResource": {}})
+    monkeypatch.setattr(sdc_sync, "hubs", {}, raising=False)
+    monkeypatch.setattr(sdc_sync, "site", MagicMock(name="site"), raising=False)
+    monkeypatch.setattr(
+        DPLA,
+        "get_provider_and_data_provider",
+        staticmethod(lambda doc, hubs: ({"name": "p"}, {"name": "d"})),
+    )
+    monkeypatch.setattr(
+        wikimedia, "dpla_metadata_params", lambda *a, **kw: {"title": "x"}
+    )
+    monkeypatch.setattr(
+        sdc_sync.pywikibot, "FilePage", lambda site, title: MagicMock(name=title)
+    )
+
+    calls = []
+
+    def fake_page_cleanup(page, *a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("Maximum retries attempted without success.")
+        return True
+
+    monkeypatch.setattr(sdc_sync, "_post_sdc_cleanup_for_page", fake_page_cleanup)
+
+    with caplog.at_level(_logging.ERROR):
+        edited = sdc_sync._post_sdc_cleanup_for_item(
+            s3, "nara", "d1", [("1", {"title": "T1"}), ("2", {"title": "T2"})]
+        )
+
+    # No exception propagated; the failing page is skipped, the sibling counts.
+    assert edited == {"2"}
+    assert len(calls) == 2, "both pages must be attempted despite the first failing"
+    assert any("post-SDC cleanup failed" in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # _post_sdc_cleanup_for_page — strip-or-migrate dispatcher
 # ---------------------------------------------------------------------------
