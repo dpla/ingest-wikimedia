@@ -1085,3 +1085,69 @@ def test_parse_other_date_template_returns_none_for_non_template():
     assert parse_other_date_template("{{some other template|x}}") is None
     # Template present but no date argument → None (nothing to convert).
     assert parse_other_date_template("{{other date|~}}") is None
+
+
+def _p9126_roles(out):
+    """(mainsnak Q-ID, P3831 role Q-ID) pairs from _build_contributed_claims."""
+
+    def _qid(v):
+        return "Q" + str(v["numeric-id"])
+
+    return [
+        (
+            _qid(c["mainsnak"]["datavalue"]["value"]),
+            _qid(c["qualifiers"]["P3831"][0]["datavalue"]["value"]),
+        )
+        for c in out
+    ]
+
+
+def test_build_contributed_claims_content_hub_shape():
+    """Pins the content-hub P9126 role shape (see _build_contributed_claims
+    for the model). Exact Q-IDs are asserted because they must match what is
+    already on Commons — a value change forces a remove+re-add on re-sync."""
+    import datetime
+
+    from ingest_wikimedia.sdc import (
+        CONTENT_HUB_QIDS,
+        Q_DPLA,
+        Q_NARA,
+        Q_ROLE_AGGREGATOR,
+        Q_ROLE_CONTRIBUTING,
+        Q_ROLE_REPOSITORY,
+        Q_SMITHSONIAN,
+        _build_contributed_claims,
+    )
+
+    assert {Q_NARA, Q_SMITHSONIAN} <= CONTENT_HUB_QIDS
+    date = datetime.date(2026, 6, 16)
+    for hub in (Q_NARA, Q_SMITHSONIAN):
+        roles = _p9126_roles(_build_contributed_claims(hub, "Q999", "abc", date))
+        assert roles == [
+            (Q_DPLA, Q_ROLE_AGGREGATOR),
+            (hub, Q_ROLE_REPOSITORY),
+            ("Q999", Q_ROLE_CONTRIBUTING),
+        ]
+
+
+def test_build_contributed_claims_service_hub_shape():
+    """Service hubs are aggregating intermediaries (aggregator role, like
+    DPLA); their institution is a distinct organization (repository) that
+    also lands in P195."""
+    import datetime
+
+    from ingest_wikimedia.sdc import (
+        Q_DPLA,
+        Q_ROLE_AGGREGATOR,
+        Q_ROLE_REPOSITORY,
+        _build_contributed_claims,
+    )
+
+    roles = _p9126_roles(
+        _build_contributed_claims("Q12345", "Q67890", "abc", datetime.date(2026, 6, 16))
+    )
+    assert roles == [
+        (Q_DPLA, Q_ROLE_AGGREGATOR),
+        ("Q12345", Q_ROLE_AGGREGATOR),
+        ("Q67890", Q_ROLE_REPOSITORY),
+    ]
