@@ -99,6 +99,12 @@ DEFAULT_SLOT_DIR = "/tmp/sdc-sync-worker-slots"
 # keeps latency low without busy-spinning.
 _POLL_INTERVAL_SECONDS = 0.5
 
+# Stable fragment of the "all slots held" log line. Status tooling greps
+# the sdc-sync log tail for this to tell that a session's workers are
+# blocked on the cap; keep it in the format string below so the two can't
+# drift.
+SLOTS_BUSY_LOG_MARKER = "worker slots busy"
+
 
 class WorkerSlotBudget:
     """A box-wide N-permit semaphore backed by ``fcntl.flock`` slot files.
@@ -211,8 +217,9 @@ class WorkerSlotBudget:
             # concurrency), then poll.
             if not waited_logged:
                 logging.info(
-                    " -- All %d worker slots busy; waiting for capacity.",
+                    " -- All %d %s; waiting for capacity.",
                     self.budget,
+                    SLOTS_BUSY_LOG_MARKER,
                 )
                 waited_logged = True
             time.sleep(_POLL_INTERVAL_SECONDS)

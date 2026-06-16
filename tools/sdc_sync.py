@@ -3818,14 +3818,30 @@ def _post_sdc_cleanup_for_item(
                 f" {ord_str} ({title}) of {dpla_id}; skipping."
             )
             continue
-        if _post_sdc_cleanup_for_page(
-            page,
-            dpla_id,
-            item_metadata,
-            provider,
-            data_provider,
-            expected_params=expected_params,
-        ):
+        # Best-effort, per page: the post-SDC cleanup (wikitext strip /
+        # legacy migration) loads the page text, which can hit a transient
+        # Commons API timeout under concurrency. The item's SDC has already
+        # synced and been counted by the time we get here, so a cleanup
+        # failure must NOT escape to the worker-task boundary — that would
+        # mis-count the item as SDC_ITEMS_SKIPPED_ERROR (double-counting an
+        # already-synced item) and skip the PAGES_EDITED tally for its other
+        # pages. Skip this page; it re-cleans idempotently on a later run.
+        try:
+            saved = _post_sdc_cleanup_for_page(
+                page,
+                dpla_id,
+                item_metadata,
+                provider,
+                data_provider,
+                expected_params=expected_params,
+            )
+        except Exception:
+            logging.exception(
+                f" -- cleanup: post-SDC cleanup failed for ordinal {ord_str}"
+                f" ({title}) of {dpla_id}; skipping (SDC already synced)."
+            )
+            continue
+        if saved:
             edited.add(ord_str)
     return edited
 
