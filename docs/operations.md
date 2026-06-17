@@ -253,8 +253,17 @@ uploader <partner>.csv <partner>
 Reads each item's precomputed `sdc.json` and `upload-result.json` from S3, and for every ordinal whose upload status is `UPLOADED` or `SKIPPED`, posts MediaInfo statements (and references) to the corresponding Commons file via the wbeditentity API. Idempotent — re-syncing a fully-synced item produces zero writes.
 
 ```bash
-sdc-sync --partner <partner> --ids-file <partner>.csv
+sdc-sync --partner <partner> --ids-file <partner>.csv --workers 6 --workers-budget 24
 ```
+
+`--workers N` runs the partner sync across N worker processes (the launcher and workflow default to `6`); `--workers-budget N` caps concurrent Commons writers box-wide across all sessions (default `24`). See [Worker-slot budget](#worker-slot-budget) below.
+
+**Wikitext cleanup runs in this phase too.** After posting SDC for an ordinal, sdc-sync also reconciles the file's wikitext:
+
+- Files still on a legacy `{{Artwork}}` / `{{Information}}` / `{{Photograph}}` wrapper are auto-migrated to `{{DPLA metadata}}` — walking each file's revision history to separate DPLA-bot values (overwrite-safe) from community contributions (preserved as SDC with `P887→Q131783016` + `P4656` permalink references), then rewriting the wikitext.
+- Files already on `{{DPLA metadata}}` have template params that are now redundant with SDC stripped out.
+
+This cleanup is on by default; pass `--no-normalize-wikitext` to leave the pre-strip wikitext intact for diagnostic runs. (A separate explicit one-time mode, `sdc-sync --migrate-legacy`, runs the legacy migration *instead of* a normal sync — see [maintenance tools](maintenance-tools.md).)
 
 All phases are idempotent — re-running is safe and picks up where it left off.
 
@@ -309,6 +318,8 @@ Inputs:
 - `max_age_days` (optional integer): for `refresh_only` runs, re-download files older than N days in S3 (default: 365)
 - `refresh_only` (boolean, default `false`): run `get-ids-es → downloader` only — skip the upload and SDC phases (see "Alternate run modes" above)
 - `sdc_only` (boolean, default `false`): run `get-ids-es → sdc-sync` only — skip the download and upload phases (see "Alternate run modes" above). Mutually exclusive with `refresh_only`.
+- `workers` (string, default `"6"`): number of SDC-sync worker processes per session. `1` runs single-process; higher values parallelize the partner sync across that many processes. Passed through to `sdc-sync --workers`.
+- `workers_budget` (string, default `"24"`): box-wide cap on concurrent Commons-writing slots shared across all sessions on EC2 (`0` = unlimited). Passed through to `sdc-sync --workers-budget` and the uploader's `--workers-budget`. See [Worker-slot budget](#worker-slot-budget). Both inputs are blank-safe — an empty value falls back to the launcher default (`6` / `24`).
 
 Steps:
 1. Installs `boto3` and `requests`
@@ -410,6 +421,35 @@ aws ssm send-command \
 
 Or trigger `/wikimedia-status` from Slack.
 
+### Worker-slot budget
+
+SDC-sync parallelism (`--workers N`) and the uploader share a single **box-wide** budget of concurrent Commons writers, so the 6+ sessions that typically run at once don't collectively overrun Commons' parser pool (which binds on maxlag past ~16 concurrent bot writes). The budget is a set of flock-backed slot files — one permit each — under:
+
+```text
+/tmp/sdc-sync-worker-slots/slot-0 … slot-N
+```
+
+Each SDC worker (and the single-process uploader) checks out one slot per item it writes and releases it on return; slots auto-release if the holding process dies (the flock drops on `close`/exit). The downloader does **not** participate — it writes to source sites, not Commons.
+
+Inspect live holders:
+
+```bash
+# Who currently holds a slot
+lslocks | grep sdc-sync-worker-slots
+# Or just see the slot files
+ls /tmp/sdc-sync-worker-slots/
+```
+
+**Budget-consistency invariant**: the budget value (`24` in production) must be identical across all concurrent sessions for the cap to mean what it says. In practice every session inherits it from the same launch-time default, so they agree. If two sessions disagree (e.g. 24 vs 8), the effective cap is the *larger* N — a benign degradation, not a correctness break.
+
+**Detecting a session blocked on the cap**: when every slot is held, a worker logs a line containing `worker slots busy` before it polls for capacity. Grep the sdc-sync log tail for that marker to tell that a session is waiting on the budget rather than stuck:
+
+```bash
+tail -200 /home/ec2-user/ingest-wikimedia/<partner>/logs/<latest>-sdc.log | grep "worker slots busy"
+```
+
+A reboot that clears `/tmp` is safe — it also kills every slot holder, so there's nothing to preserve.
+
 ### Log files
 
 Logs are written to `/home/ec2-user/ingest-wikimedia/<partner>/logs/` with names like:
@@ -429,6 +469,7 @@ Key log lines:
 | `Skipping <id>: Already exists on commons.` | File already on Commons, skipping |
 | `COUNTS:` followed by `UPLOADED: N`, `SKIPPED: N`, `FAILED: N`, `BYTES: N` | Phase complete |
 | `Bad provider.` | Data provider not configured for upload |
+| ` -- All N worker slots busy; waiting for capacity.` | SDC/upload worker blocked on the box-wide [worker-slot budget](#worker-slot-budget) — expected under heavy concurrency |
 
 ### Slack notifications
 

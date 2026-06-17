@@ -124,22 +124,33 @@ Source: `tools/uploader.py`. The most complex phase.
 
 Source: `tools/sdc_sync.py`. See [sdc-sync.md](sdc-sync.md) for the full SDC deep dive. This section covers the phase's role in the pipeline.
 
-**Inputs.** Partner mode: `--partner <partner> [--ids-file PATH]`. Legacy mode: `--file "File:Title.jpg"` (repeatable) or `--cat <Category>` or `--lists <dir>` (Slack runs never use the legacy mode).
+**Inputs.** Partner mode: `--partner <partner> [--ids-file PATH]`, plus:
+
+- `--workers N` (default 1) — number of worker processes for partner-mode sync. `N > 1` dispatches per-DPLA-item work to a spawn-start `multiprocessing.Pool`, each worker holding its own pywikibot session; `N = 1` keeps the single-process path. Production launches pass `6`.
+- `--workers-budget N` (default 0) — box-wide cap on concurrent Commons-writing items across **all** sdc-sync and uploader sessions on the host (see [architecture.md § Intra-host write throttle](architecture.md#intra-host-write-throttle-workerslotbudget)). `0` disables it; production launches pass `24`. Must be identical across concurrent sessions.
+- `--migrate-legacy` — swaps SDC sync for the standalone legacy-Artwork migration mode (see below).
+- `--normalize-wikitext` / `--no-normalize-wikitext` (default on) — controls the post-SDC wikitext-cleanup strip.
+
+Legacy mode: `--file "File:Title.jpg"` (repeatable) or `--cat <Category>` or `--lists <dir>` (Slack runs never use the legacy mode; these single-purpose manual modes do not participate in the worker-slot budget).
 
 **What it does (partner mode).**
 
 1. Reads the IDs CSV.
-2. For each item: reads `sdc.json`, `upload-result.json`, and `file-list.txt` from S3. Items missing any of these sidecars are skipped (counter `SDC_ITEMS_SKIPPED_NO_SIDECAR`).
-3. Filters to ordinals whose `upload-result.json` status is `UPLOADED` or `SKIPPED`. Computes per-ordinal P304 page numbers via `_compute_page_numbers()` for multi-file extension groups (e.g. items with both jpg and pdf get separate page-number sequences per extension).
-4. For each eligible ordinal: looks up its `download_url` from `file-list.txt` by 1-based index, derives `mediaid = M<pageid>` from `upload-result.json`, then calls `process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url, page_number)`.
-5. Inside `process_one_from_sdc`: walks the staged `sdc.json` claims, runs the `check()` matcher against current Commons-side state, accumulates new claims / qualifier amends / reference updates / removals into per-file lists, then **flushes everything as one `wbeditentity` revision** via `_flush_per_file_edits()`. The previous design (multiple separate `wbsetclaim` / `wbsetqualifier` / `wbremoveclaims` POSTs per file) could leak orphaned stale statements if an intermediate call failed; the consolidated dispatcher is all-or-nothing per file.
+2. **Dispatch.** When `--workers 1` (the default), the parent walks items in-process. When `--workers > 1`, items are dispatched one-per-task to a `multiprocessing.Pool` via `imap_unordered`; each worker re-logs into Commons, processes one item end-to-end, and returns its per-task counter delta, which the parent merges into the shared `Tracker`. Every ordinal of every item has a unique M-id, so workers never write to the same MediaInfo entity. **Either path** acquires one box-wide `WorkerSlotBudget` slot around each item (a no-op when `--workers-budget` is 0), so a 1-worker session still counts against the cap exactly like a parallel one; time spent blocked on a slot accrues into `SDC_SLOT_WAIT_SECONDS`.
+3. Per item (`_process_one_partner_item`): reads `sdc.json`, `upload-result.json`, and `file-list.txt` from S3. Items missing the `sdc.json` / `upload-result.json` sidecars are skipped (counter `SDC_ITEMS_SKIPPED_NO_SIDECAR`); a missing `file-list.txt` is non-fatal (P2699 qualifiers are simply not materialized).
+4. Filters to ordinals whose `upload-result.json` status is `UPLOADED` or `SKIPPED`. Computes per-ordinal P304 page numbers via `_compute_page_numbers()` for multi-file extension groups (e.g. items with both jpg and pdf get separate page-number sequences per extension).
+5. For each eligible ordinal: looks up its `download_url` from `file-list.txt` by 1-based index, derives `mediaid = M<pageid>` from `upload-result.json`, then calls `process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url, page_number)`.
+6. Inside `process_one_from_sdc`: walks the staged `sdc.json` claims, runs the `check()` matcher against current Commons-side state, accumulates new claims / qualifier amends / reference updates / removals into per-file lists, then **flushes everything as one `wbeditentity` revision** via `_flush_per_file_edits()`. The previous design (multiple separate `wbsetclaim` / `wbsetqualifier` / `wbremoveclaims` POSTs per file) could leak orphaned stale statements if an intermediate call failed; the consolidated dispatcher is all-or-nothing per file.
+7. **Post-SDC wikitext cleanup** (on by default; `--no-normalize-wikitext` disables). For each synced file, dispatches on the page's current wikitext shape: a `{{DPLA metadata}}` page gets its now-redundant params stripped (`wikitext_normalize.normalize_page`); a legacy `{{Artwork}}` / `{{Information}}` / `{{Photograph}}` page is run through the same migration as `--migrate-legacy` (see below). This strip is the documented end of the per-file lifecycle (upload → SDC → wikitext cleanup).
 
 **Per-ordinal qualifiers materialised at write time** (not baked into `sdc.json`, because they vary per ordinal):
 
 - P304 (page number) qualifier on P760, only when the ordinal is part of a multi-file extension group.
 - P2699 (URL) qualifier on P7482, with the per-ordinal direct download URL from `file-list.txt`.
 
-**Counters tracked.** `SDC_ITEMS_SYNCED`, `SDC_CLAIMS_ADDED`, `SDC_REFS_ADDED`, `SDC_REMOVALS`, `SDC_ITEMS_SKIPPED_NO_SIDECAR`, `SDC_ITEMS_SKIPPED_MAPPING`, `SDC_ORDINALS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_MISSING_ENTITY`, `SDC_ITEMS_SKIPPED_ERROR`. The error / mapping / missing-entity split is deliberate — operators need to distinguish bad-data items from bad-network items from upload-never-happened items.
+**Legacy-Artwork migration mode (`--migrate-legacy`).** Instead of running SDC sync, `sdc-sync --partner <partner> --migrate-legacy` walks the same partner IDs CSV and migrates each item's Commons files from the legacy `{{Artwork}}` form to `{{DPLA metadata}}`. For each file it walks the revision history to distinguish DPLA-bot-authored values (overwrite-safe with canonical data) from community contributions, preserves the community values by importing them as SDC statements with the `P887 → Q131783016` ("inferred from Wikitext") + `P4656` (Wikimedia import URL permalink) reference shape, then rewrites the wikitext. The exact same migration also runs automatically inside the post-SDC cleanup pass whenever a normal sync encounters a file still in the legacy form, so the standalone mode is just a way to drive it for a whole partner without re-syncing. `ingest_wikimedia/legacy_artwork.py` holds the logic; counters land in the `LEGACY_*` set.
+
+**Counters tracked.** Sync counters: `SDC_ITEMS_SYNCED` (item fully synced — every eligible ordinal succeeded), `SDC_ITEMS_PARTIALLY_SYNCED` (at least one ordinal synced *and* at least one sibling ordinal errored — broken out so dashboards keying on "items fully done" don't count mixed results as healthy), `SDC_CLAIMS_ADDED`, `SDC_REFS_ADDED`, `SDC_REMOVALS`, `SDC_QUALIFIER_UPDATES`, `SDC_PAGES_EDITED` (distinct Commons file pages actually written), `SDC_ITEMS_SKIPPED_NO_SIDECAR`, `SDC_ITEMS_SKIPPED_MAPPING`, `SDC_ITEMS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_MISSING_ENTITY`, `SDC_ORDINALS_SKIPPED_MISSING_PAGEID` (uploader recorded a null/zero pageid and the title→pageid fallback couldn't resolve it either), and `SDC_SLOT_WAIT_SECONDS` (aggregate worker-seconds blocked on a `WorkerSlotBudget` slot, summed across workers). The error / mapping / missing-entity split is deliberate — operators need to distinguish bad-data items from bad-network items from upload-never-happened items. Migration mode adds the `LEGACY_*` set (`LEGACY_MIGRATED`, `LEGACY_IMPORTS_POSTED`, `LEGACY_SKIPPED_NOT_LEGACY`, `LEGACY_SKIPPED_ALREADY`, `LEGACY_SKIPPED_ERROR`).
 
 ---
 
@@ -178,7 +189,7 @@ logging.info("\n" + str(tracker))
 notify_*_complete(tracker, partner_label, elapsed, dry_run)
 ```
 
-The SDC phase resets the tracker at the start of `_run_partner_mode` so per-partner counts don't accumulate across invocations in the same process.
+The SDC phase resets the tracker at the start of `_run_partner_mode` so per-partner counts don't accumulate across invocations in the same process. Its completion call differs from the other phases': `notify_sdc_complete(tracker=, partner_label=, elapsed_seconds=, workers=)` passes the sync's worker count rather than `dry_run`, so the Slack summary can report the average per-worker slot wait (`SDC_SLOT_WAIT_SECONDS / workers`).
 
 ## Phase-start notifications
 

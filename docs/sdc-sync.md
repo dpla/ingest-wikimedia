@@ -2,18 +2,23 @@
 
 The `sdc-sync` phase reconciles each DPLA-uploaded Commons file's MediaInfo structured data against the per-item `sdc.json` envelope staged by `get-ids-es`. It is the only phase that talks to Commons' Wikibase API directly.
 
-This document covers the *internals* — every property the bot writes, the atomic dispatcher design, idempotency, chunked claims, and known Wikibase API gotchas. For the phase's role in the pipeline, see [pipeline-phases.md](pipeline-phases.md#4-sdc-sync--sdc-sync).
+This document covers the *internals* — the worker model and box-wide write budget, every property the bot writes, the atomic dispatcher design, idempotency, chunked claims, legacy `{{Artwork}}` migration, the post-SDC wikitext cleanup, and known Wikibase API gotchas. For the phase's role in the pipeline, see [pipeline-phases.md](pipeline-phases.md#4-sdc-sync--sdc-sync).
 
 ## Table of contents
 
 1. [Entry points](#entry-points)
-2. [The atomic dispatcher](#the-atomic-dispatcher)
-3. [What the bot writes (per property)](#what-the-bot-writes-per-property)
-4. [The canonical reference triple](#the-canonical-reference-triple)
-5. [Idempotency: `check()`](#idempotency-check)
-6. [Chunked claims](#chunked-claims)
-7. [The P813 refresh](#the-p813-refresh)
-8. [Wikibase API gotchas](#wikibase-api-gotchas)
+2. [Parallelism & worker model](#parallelism--worker-model)
+3. [Box-wide worker-slot budget](#box-wide-worker-slot-budget)
+4. [Eligibility, ordinal rescue & pageid self-heal](#eligibility-ordinal-rescue--pageid-self-heal)
+5. [The atomic dispatcher](#the-atomic-dispatcher)
+6. [What the bot writes (per property)](#what-the-bot-writes-per-property)
+7. [The canonical reference triple](#the-canonical-reference-triple)
+8. [Idempotency: `check()`](#idempotency-check)
+9. [Chunked claims](#chunked-claims)
+10. [The P813 refresh](#the-p813-refresh)
+11. [Legacy `{{Artwork}}` migration](#legacy-artwork-migration)
+12. [Post-SDC wikitext normalization (strip)](#post-sdc-wikitext-normalization-strip)
+13. [Wikibase API gotchas](#wikibase-api-gotchas)
 
 ---
 
@@ -22,18 +27,67 @@ This document covers the *internals* — every property the bot writes, the atom
 ```python
 # Partner mode (Slack-launched runs)
 sdc-sync --partner <partner> [--ids-file <path>]
+         [--workers N] [--workers-budget N]
+         [--normalize-wikitext | --no-normalize-wikitext]
 
-# Legacy modes (operator runs, not used in pipeline)
+# Legacy {{Artwork}} → {{DPLA metadata}} migration (partner-scoped sub-command)
+sdc-sync --partner <partner> --migrate-legacy [--ids-file <path>]
+
+# Manual modes (operator runs, not used in pipeline)
 sdc-sync --file "File:Title.jpg" [--file "File:Other.jpg" ...]
 sdc-sync --cat <Commons-category> [--recurse] [--limit N]
 sdc-sync --lists <directory-of-txt-files>
 ```
 
-**Partner mode** drives off the S3 sidecars only (no `api.dp.la` calls). It iterates the IDs CSV, reads `sdc.json` + `upload-result.json` + `file-list.txt` per item, picks `UPLOADED` / `SKIPPED` ordinals from `upload-result.json`, and calls `process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url, page_number)` per ordinal.
+`_build_parser()` (`tools/sdc_sync.py`) defines every flag. The defaults that matter:
 
-**Legacy mode** builds claims at runtime via `parsed()`, fetching the source document either from S3 (`--from-s3 <partner>`) or from `api.dp.la` directly (one retry on network failure). Calls `process_one(mediaid, dpla_id)`. `--file` is repeatable (pass once per title); `--lists` reads every `.txt` file in a directory as a list of titles. Slack-launched runs never go through this path; it remains supported for one-off operator runs.
+| Flag | argparse default | Production value | Set by |
+|---|---|---|---|
+| `--workers` | `1` | `6` | launcher, not sdc-sync |
+| `--workers-budget` | `0` (disabled) | `24` | launcher, not sdc-sync |
+| `--normalize-wikitext` / `--no-normalize-wikitext` | on (`default=True`, `BooleanOptionalAction`) | on | — |
+| `--migrate-legacy` | `False` | `False` | — |
 
-Both paths converge on the per-file accumulators + atomic `wbeditentity` dispatcher.
+The production `6` / `24` figures come from the launcher `scripts/wikimedia_launch.py` (`--workers default="6"`, `--workers-budget default="24"`) and `.github/workflows/wikimedia-launch.yml`, which always pass them explicitly — **not** from sdc-sync's own defaults. Run `sdc-sync --partner <p>` by hand and you get single-worker, no slot budget.
+
+**Partner mode** drives off the S3 sidecars only (no `api.dp.la` calls). It iterates the IDs CSV, reads `sdc.json` + `upload-result.json` + `file-list.txt` per item, picks `UPLOADED` / `SKIPPED` ordinals from `upload-result.json`, and calls `process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url, page_number)` per ordinal. (Ordinals the uploader left in a non-eligible state are still rescued — see [Eligibility, ordinal rescue & pageid self-heal](#eligibility-ordinal-rescue--pageid-self-heal).)
+
+**Manual modes** (`--file` / `--cat` / `--lists`) build claims at runtime via `parsed()`, fetching the source document either from S3 (`--from-s3 <partner>`) or from `api.dp.la` directly (one retry on network failure). Calls `process_one(mediaid, dpla_id)`. `--file` is repeatable (pass once per title); `--lists` reads every `.txt` file in a directory as a list of titles. Slack-launched runs don't use these modes; they remain supported for one-off operator runs.
+
+**Note — the post-SDC cleanup runs on *every* mode.** Whether the file arrived via partner mode or a manual `--file`/`--cat`/`--lists` run, the per-file lifecycle ends the same way: after SDC sync the dispatcher runs the wikitext-cleanup pass (`_post_sdc_cleanup_for_page`), which strips redundant `{{DPLA metadata}}` params and, on any file still carrying a legacy `{{Artwork}}` template, auto-migrates it. So a manual rerun is *not* a pure SDC-only path the way it once was — see [Post-SDC wikitext normalization](#post-sdc-wikitext-normalization-strip) and [Legacy `{{Artwork}}` migration](#legacy-artwork-migration).
+
+All paths converge on the per-file accumulators + atomic `wbeditentity` dispatcher.
+
+## Parallelism & worker model
+
+Partner mode fans out per-DPLA-item work across a `multiprocessing.Pool` sized by `--workers N`. `_run_partner_mode_parallel(partner, dpla_ids, workers)` builds the pool with an explicit **spawn** context (`multiprocessing.get_context("spawn")`) so workers don't inherit the parent's pywikibot sockets, then dispatches via `pool.imap_unordered(_worker_partner_task, tasks)`. `--workers 1` keeps the original single-process path unchanged.
+
+The unit of parallelism is the DPLA item, never the M-id: every ordinal of every item has a unique MediaInfo entity, so no two workers ever write the same Commons entity.
+
+- **Per-worker pywikibot login.** `_init_partner_worker(...)` runs once per worker as the Pool `initializer`: it builds a fresh `pywikibot.Site("commons", "commons")` and calls `site.login()`, so each worker holds its own authenticated session. It also receives the parent's `hubs` / `rights` / `subject-ids` data and the `--no-normalize-wikitext` / `--workers-budget` settings so workers behave identically to the parent.
+- **Per-task tracker deltas.** Each task (`_worker_partner_task`) snapshots the worker's `Tracker` before the item (`tracker.snapshot()`), processes the item, and returns the diff; the parent merges every delta back with `tracker.merge(delta)`. Counters therefore aggregate correctly across workers without shared mutable state.
+- **Log aggregation.** Workers route their `logging` records through a `QueueHandler` into a `Manager().Queue`; the parent runs a `logging.handlers.QueueListener` against its real handlers, so all worker output interleaves into one log stream.
+
+Wall-clock scales roughly linearly with `N` up to Commons-side parser-pool headroom — which is exactly what the slot budget below exists to bound.
+
+## Box-wide worker-slot budget
+
+`WorkerSlotBudget` (`ingest_wikimedia/worker_slots.py`) caps concurrent Commons-write load **across every `sdc-sync` and `uploader` process on the host**, not just within one run. It is a set of `N` `fcntl`-flock lock files at `/tmp/sdc-sync-worker-slots/slot-0` … `slot-N-1` (`DEFAULT_SLOT_DIR = "/tmp/sdc-sync-worker-slots"`), where `N` is `--workers-budget`. To start its per-item Commons work a process must `flock` an exclusive lock on one slot file; if all `N` are held it blocks until one frees.
+
+- **Every item checks out a slot — even at `--workers 1`.** Both the parallel path (around each `_process_one_partner_item` call) and the single-process partner loop wrap the per-item work in `with slot_budget.acquire():`. The uploader (`tools/uploader.py`) builds a `WorkerSlotBudget(workers_budget)` and acquires a slot per item too, so **upload sessions and sdc-sync sessions across the whole box cooperatively share the same cap** — the budget protects the MediaWiki parser pool / `maxlag` regardless of how many runs are live or how many workers each launched with.
+- **The budget value must be identical across concurrent sessions.** Slots are positional lock files; two sessions launched with different `--workers-budget` would disagree on how many slots exist. Production pins it at `24` for all sessions.
+- **`budget <= 0` disables it** — `acquire()` becomes a no-op `contextmanager` (the manual `--file`/`--cat`/`--lists` modes never acquire a slot at all, independent of the budget value).
+- **Crash-safe.** `flock` locks release automatically when the holding fd is closed *or the process dies*, so a killed worker never strands a slot — no reaper or cleanup pass is needed.
+- **Wait time is measured.** Time spent blocked on a slot is accumulated into the `SDC_SLOT_WAIT_SECONDS` tracker counter and surfaced in the Slack summary, so oversubscription shows up as visible queueing.
+
+## Eligibility, ordinal rescue & pageid self-heal
+
+Whether an ordinal gets an SDC sync is **decoupled from the upload-result status of *this* run.** The uploader writes `UPLOADED` / `SKIPPED` for ordinals it confirmed, but also `NOT_PRESENT` / `INELIGIBLE` / `FAILED` for ordinals it couldn't confirm (broken upstream URL, S3 hiccup, etc.). Those last three don't block data-side maintenance:
+
+- **Commons discovery rescue.** Any ordinal left non-eligible is deferred to a post-loop pass that calls `_find_existing_commons_files_by_dpla_id(dpla_id)` — a CirrusSearch `intitle:` query scoped to namespace 6 (`File:`). If a matching Commons file already exists from a prior run, its title + pageid are grafted onto the eligible set (tagged `discovered_via_dpla_id`) and synced normally. The search is lazy: it only fires when at least one ordinal needs rescuing, so healthy items pay zero extra API cost.
+- **Pageid self-heal.** `_resolve_pageid_from_title(...)` repairs sidecars whose recorded pageid is null or `0` by resolving it from the file title, so a malformed `upload-result.json` doesn't strand an otherwise-syncable ordinal.
+
+Ordinals that can't be salvaged are counted distinctly: `SDC_ORDINALS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_MISSING_ENTITY` (Commons returned `no-such-entity` for the M-id), and `SDC_ORDINALS_SKIPPED_MISSING_PAGEID`. Item-level outcomes split full from partial progress: `_classify_item_outcome` returns `SDC_ITEMS_PARTIALLY_SYNCED` when an item has at least one synced ordinal *and* at least one errored sibling, so a dashboard keying on `SDC_ITEMS_SYNCED` doesn't read mixed-result items as fully healthy.
 
 ## The atomic dispatcher
 
@@ -132,6 +186,8 @@ Every DPLA-authored statement also carries a `P459 = Q61848113` (determination m
 
 **Time comparison** uses `_time_claim_comparable` and the canonical `time|precision[|circa]` comparable string from `_extract_comparable_value` — so a `2026-06-01` precision-day claim matches an existing `2026-06-01` precision-day claim regardless of which property they're on.
 
+**The `time` branch and the somevalue → value-typed migration.** The `time` kind handles `P571` when `parse_dpla_date` produced a value-typed date, mirroring the `item`/`string`/`somevalue` branches above. Crucially, a Commons statement carrying the *old* `somevalue + P1932` date shape does **not** match the new value-typed time claim, so `check()` returns "add" for the value-typed claim — and on the same reconcile cycle the stale `somevalue` statement is queued for removal by `_reconcile_existing_claims` (its `P1932` verbatim string is no longer in `expected` once the `sdc.json` carries the value-typed equivalent). One pass migrates the file from the old shape to the new without ever leaving the date duplicated. A malformed Commons time datavalue (missing `time`/`precision`) is treated as non-matching so the bad statement is replaced rather than crashing the ordinal.
+
 ## Chunked claims
 
 Wikibase enforces a 1500-character cap on `string` and `monolingualtext` values. DPLA descriptions and titles often exceed this. The bot splits long values into per-chunk statements, each carrying a `P1545` (series ordinal) qualifier to preserve ordering.
@@ -165,6 +221,42 @@ When the dispatcher is making *any* other edit on a file, it also refreshes `P81
 **Conditional.** `_build_p813_refresh_fragments` is only invoked when the per-file dispatcher already has other edits to make (`has_any_other_edit`). Files where nothing else changed do *not* generate spurious revisions just to bump P813.
 
 **Cosmetic note on diffs.** When `P813` changes, Wikibase's diff renderer shows the entire reference (URL, publisher, retrieved date) twice — once removed, once added — because reference identity is content-hash, not a stable ID. The data is correct; the diff is just noisy. Switching to `wbsetreference` for in-place reference updates is theoretically possible but would break the atomic-bundle property (separate API calls per refreshed reference) without changing the visual diff in any documented way.
+
+## Legacy `{{Artwork}}` migration
+
+Some early DPLA uploads used the `{{Artwork}}` template instead of `{{DPLA metadata}}`. `ingest_wikimedia/legacy_artwork.py` migrates them. It reaches files two ways:
+
+- **As a standalone sub-command.** `--migrate-legacy` (with `--partner`) runs `_run_legacy_migration_mode` instead of an SDC sync — it walks the partner's IDs CSV and migrates every legacy file.
+- **Opportunistically, on every mode.** The post-SDC cleanup dispatcher (`_post_sdc_cleanup_for_page`) inspects each file's wikitext after sync; if `legacy_artwork.find_legacy_template(text)` finds a `{{Artwork}}` invocation still present, it auto-migrates that file inline. So legacy files surface and convert during ordinary partner runs, not only under `--migrate-legacy`.
+
+**Preserving community edits.** A naive overwrite would clobber translations and corrections made by Commons editors after the original DPLA upload. The migrator walks the file's revision history (`fetch_revision_snapshots` → `trace_param_provenance` → `classify_param_provenance`) to label each `{{Artwork}}` parameter value as **DPLA-bot-authored** (members of `DPLA_BOT_ACCOUNTS`, overwrite-safe) or **community-contributed**. Community values that differ from the canonical DPLA value are not discarded — they're preserved as SDC import statements carrying a distinct reference shape:
+
+```
+P887 (based on heuristic) → Q131783016 (inferred from Wikitext)
+P4656 (Wikimedia import URL) → <revision permalink>
+```
+
+so the provenance of the editor's contribution survives on the entity.
+
+**Write order is load-bearing.** The SDC import is POSTed **first**, the wikitext rewrite **second**. If the process dies between them, the file stays in legacy `{{Artwork}}` form (it'll be retried) — the reverse order would irrecoverably lose the community values before they were captured in SDC.
+
+**Idempotency.** `entity_was_already_migrated` returns true when any mapped property already carries the legacy-import reference signature (`P887 → Q131783016`), so a re-run is a cheap no-op rather than a double migration.
+
+**Counters** (in `ingest_wikimedia/tracker.py`): `LEGACY_MIGRATED`, `LEGACY_IMPORTS_POSTED`, `LEGACY_SKIPPED_NOT_LEGACY`, `LEGACY_SKIPPED_ALREADY`, `LEGACY_SKIPPED_ERROR`.
+
+## Post-SDC wikitext normalization (strip)
+
+`ingest_wikimedia/wikitext_normalize.py` is the final step of the per-file lifecycle: **upload → SDC → wikitext cleanup.** It is **on by default** (`--normalize-wikitext` / `--no-normalize-wikitext`, a `BooleanOptionalAction`) and runs on every trigger mode via `_post_sdc_cleanup_for_page`.
+
+Once the SDC the bot just wrote makes a `{{DPLA metadata}}` template param redundant, the template param is pure duplication on the file page. `normalize(wikitext, expected_params)` strips each scalar param (`title`, `description`, `date`, `creator`, `hub`, `institution`, `url`, `dpla_id`, `local_id`, `permission`) whose verbatim value matches the canonical DPLA value. It is conservative on every edge case — missing template, multiple templates, an unrecognised wrapping template, a param it can't compare — all leave that param untouched, because the cost of an un-stripped match is just a redundant param the next pass catches, while the cost of a wrong strip is data loss.
+
+**Safety guard against stripping the wrong file.** Before stripping anything, the dispatcher confirms the entity actually carries DPLA-attributed SDC via `_entity_has_dpla_attributed_claims` (a statement with the `P459 = Q61848113` qualifier — the same "this is OUR claim" marker described above). If the entity has no DPLA-attributed claims, the strip is refused: there's nothing the wikitext would be redundant *with*.
+
+**Per-item language unwrapping.** For non-English items, an editor may have wrapped the canonical value in a single-language template (e.g. `{{es|<canonical Spanish title>}}`). `_value_matches` unwraps such a `{{<code>|...}}` wrapper before comparing — but **only** if `<code>` is in the per-item allowlist of safe-to-unwrap codes. That allowlist (`_extract_unwrap_languages` in `ingest_wikimedia/wikimedia.py`) always seeds `en` and adds any ISO-639-1 codes derived from the record's `sourceResource.language`. So `{{es|…}}` is unwrapped (and the param stripped) on a Spanish-declared item, but on an English item `{{es|A Title}}` survives even if the inner text byte-matches the canonical English — there the `es` tag is editor-contributed translation metadata, not a redundant wrapper. `{{LangSwitch|…}}` and other non-language-wrapper templates are always treated as a mismatch and preserved.
+
+> Note: this unwrapping affects **comparison only**. The SDC monolingualtext claims the bot writes (`P1476`, `P10358`, …) are still hardcoded `language="en"` — see `_build_monolingual_claim` in `ingest_wikimedia/sdc.py`. Don't infer that the written claim language tracks the source language.
+
+**`{{other date}}` expansion + year-range dedup.** On re-sync, `_reconcile_inferred_from_wikitext_dupes(mediaid)` (called from `process_one_from_sdc`) removes inferred-from-Wikitext date claims that have become redundant with a DPLA-attributed date claim. The comparison expands `{{other date}}` invocations (`parse_other_date_template`) and treats year-range equivalence (`parse_date_range`, both in `sdc.py`) as a match — so an inferred date claim whose comparable value equals a DPLA-attributed claim is pruned even when the two were written in different syntaxes.
 
 ## Wikibase API gotchas
 

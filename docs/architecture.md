@@ -38,8 +38,9 @@ AWS SSM  →  EC2  (i-033eff6c8c168f999, "wiki downloads")
     │  Per target, sequentially:
     │    1. get-ids-es <partner> > <partner>.csv
     │    2. downloader <partner>.csv <partner>
-    │    3. uploader   <partner>.csv <partner>
-    │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv
+    │    3. uploader   <partner>.csv <partner> --workers-budget 24
+    │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv \
+    │                    --workers 6 --workers-budget 24
     ▼
 S3 (s3://dpla-wikimedia/)        Wikimedia Commons
     sidecars + media bytes       file pages + MediaInfo SDC
@@ -142,6 +143,34 @@ Session conflict rules:
 
 GitHub Actions concurrency keys layer over the SSM-level conflict detection. The Lambda passes `concurrency_key = sha256(shlex.join(targets))[:16]`; two identical dispatches collapse to the same group and queue. Different targets get different keys and run in parallel inside the workflow (the EC2-side conflict check is what serialises them if needed).
 
+### Intra-host write throttle (`WorkerSlotBudget`)
+
+The session-conflict rules above keep *distinct targets* from clobbering each other, but they don't bound how hard the box collectively hammers Commons. That's a separate, finer-grained layer.
+
+Two phases write to Commons: the **uploader** (single-process) and **sdc-sync** (parallelised across a spawn-start `multiprocessing.Pool` via `--workers N`). Each sdc-sync worker — and the uploader — does per-DPLA-*item* work, and Commons' MediaWiki parser pool only tolerates a limited number of concurrent bot writes before maxlag starts to bind. Per-session worker counts can't see each other, so 6 sessions × 6 workers would oversubscribe.
+
+`ingest_wikimedia/worker_slots.py` provides `WorkerSlotBudget`: a box-wide N-permit semaphore backed by `N` `fcntl`-flock slot files under `/tmp/sdc-sync-worker-slots` (`--workers-budget N`). Every writer — each sdc-sync Pool worker *and* the single-process uploader — checks out exactly one slot per item before its per-item Commons work and releases it on return, so **all upload and sdc-sync sessions on the host contend over the same cap**. The downloader is deliberately not in the pool (it writes to source sites, not Commons). `budget <= 0` disables the semaphore (acquire is a no-op); `flock` makes it crash-safe (a dead holder's slot frees automatically when its fd closes).
+
+```text
+  --workers-budget 24  →  /tmp/sdc-sync-worker-slots/{slot-0 … slot-23}
+                                  ▲  ▲  ▲          ▲   ▲
+   ┌───────────────────────┐     │  │  │          │   │   (24 flock'd slot files,
+   │ sdc-sync session A     │     │  │  │          │   │    box-wide, shared)
+   │  Pool(--workers 6)     │─────┘  │  │          │   │
+   │   w1 w2 w3 w4 w5 w6     │────────┘  │          │   │
+   └───────────────────────┘  (1 slot/item)        │   │
+   ┌───────────────────────┐                       │   │
+   │ sdc-sync session B …   │───────────────────────┘   │
+   └───────────────────────┘  (its 6 workers …)         │
+   ┌───────────────────────┐                            │
+   │ uploader (any session) │────────────────────────────┘
+   └───────────────────────┘  (single process, 1 slot/item)
+```
+
+**Invariant: the budget value must be identical across every concurrent session.** It is the cap's whole meaning — if two sessions disagree (24 vs 12), the effective cap degrades to the larger value while the smaller-budget session only ever competes for the lower slots. In practice the value comes from one launch-time default (see below), so all sessions agree.
+
+`tools/sdc_sync.py` itself defaults to `--workers 1 --workers-budget 0` (the single-process, no-cap path, so a hand-run sdc-sync behaves exactly as before). The production values **6 / 24** come from `scripts/wikimedia_launch.py` and the `workers` / `workers_budget` inputs on `wikimedia-launch.yml`: the launcher appends `--workers 6 --workers-budget 24` to the sdc-sync step and `--workers-budget 24` to the uploader step. The cap therefore belongs to the launch path, not to the tool's own defaults.
+
 ## Failure semantics
 
 Inside a target block, steps are chained with `&&` — any step failing aborts that target's remaining steps and triggers the `||` failure handler. The handler runs `notify_pipeline_fail()` from `ingest_wikimedia.slack`, which reads `WIKIMEDIA_LAST_EXIT` and posts a #tech-alerts message including:
@@ -175,7 +204,9 @@ The downloader and uploader also handle per-item failures internally; they only 
 | SSM client | `ingest_wikimedia/ssm.py` | `ssm_run`, `stage_and_launch_tmux` |
 | Slack helpers | `ingest_wikimedia/slack.py` | All `notify_*` functions, `notify_pipeline_fail`, log summariser |
 | Tracker | `ingest_wikimedia/tracker.py` | Per-phase counter set, used in completion messages |
-| SDC builders | `ingest_wikimedia/sdc.py` | `build_claims_for_doc`, P1545 chunking, rights mapping, NARA XML parsing |
+| SDC builders | `ingest_wikimedia/sdc.py` | `build_claims_for_doc`, P1545 chunking, rights mapping, NARA XML parsing, content-hub/service-hub partnership model (P195 + P3831 roles, `CONTENT_HUB_QIDS`) |
+| Legacy migration | `ingest_wikimedia/legacy_artwork.py` | `{{Artwork}}`→`{{DPLA metadata}}` migration: provenance walk, community-value import as SDC, wikitext rewrite |
+| Worker-slot budget | `ingest_wikimedia/worker_slots.py` | Box-wide `flock`-backed concurrent-Commons-write cap shared across all upload + sdc-sync sessions |
 | Wikimedia helpers | `ingest_wikimedia/wikimedia.py` | Title generation, hash-drift handling, CommonsDelinker post |
 | Banlist | `ingest_wikimedia/banlist.py` + `dpla-id-banlist.txt` | Per-DPLA-ID skip list |
 

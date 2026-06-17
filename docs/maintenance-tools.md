@@ -13,6 +13,7 @@ These tools sit alongside the four pipeline phases but are not part of the Slack
 | [`nuke`](#nuke) | Hard-delete S3 contents for a list of DPLA IDs |
 | [`get-ids-retry`](#get-ids-retry) | Parse logs to build per-hub retry CSVs |
 | [`fix-unknown-categories`](#fix-unknown-categories) | Backfill maintenance categories after partner registry changes |
+| [`sdc-sync --migrate-legacy`](#sdc-sync---migrate-legacy) | One-time migration of legacy `{{Artwork}}` files to `{{DPLA metadata}}` |
 
 ---
 
@@ -201,6 +202,35 @@ Source: `tools/fix_unknown_categories.py`.
 Walks Commons looking for files in `Category:Media contributed by the Digital Public Library of America with unknown partner` or `... with unknown institution` — files where the Lua module couldn't resolve a hub or institution category from SDC. For each, attempts to re-resolve against current `institutions_v2.json` mappings and writes the corrected categories back via wikitext edit.
 
 Used after a major `institutions_v2.json` change (new hub added, institution moved between hubs, partner names normalised) to clean up the maintenance categories that accumulated under the old mappings.
+
+---
+
+## `sdc-sync --migrate-legacy`
+
+Source: `tools/sdc_sync.py` (`_run_legacy_migration_mode`).
+
+A one-time bulk migration mode of the same `sdc-sync` entrypoint that runs Phase 4. Instead of running an SDC sync, `--migrate-legacy` walks the partner's files and migrates any still wrapped in the legacy `{{Artwork}}` (or `{{Information}}` / `{{Photograph}}`) template to `{{DPLA metadata}}`. For each file it:
+
+1. Walks the file's revision history to separate DPLA-bot values (overwrite-safe) from community contributions.
+2. Imports the community values as SDC statements, referenced with `P887`→`Q131783016` (inferred from) + `P4656` (imported-from permalink).
+3. Rewrites the wikitext from the legacy wrapper to `{{DPLA metadata}}`.
+
+```bash
+sdc-sync --partner <partner> --migrate-legacy
+```
+
+**In-pipeline vs. explicit mode.** The same legacy migration — *plus* the redundant-param strip — also runs automatically as the wikitext-cleanup step of **every** partner-mode SDC sync (i.e. on every Phase 4 ordinal; see [operations](operations.md#phase-4-sdc-sync-sdc-sync)). The dispatch is per-file: legacy-wrapped files get migrated, `{{DPLA metadata}}` files get stripped, anything else is skipped. `--migrate-legacy` is the explicit one-time mode that does *only* the migration walk across a whole partner, for clearing a backlog of legacy files in one pass rather than waiting for each to be touched by a regular sync.
+
+### `--workers` / `--workers-budget`
+
+`sdc-sync` accepts two parallelism flags, normally set by the launcher / workflow (defaults `6` / `24`) but settable by hand for a manual partner sync:
+
+- `--workers N` — number of worker processes for partner-mode SDC sync. Argparse default is **`1`** (single-process, standalone-safe); the launcher and workflow pass **`6`**. `N>1` dispatches per-DPLA-item work to a multiprocessing pool, each worker holding its own pywikibot session. Items are independent (every ordinal has a unique M-id), so workers never write to the same MediaInfo entity.
+- `--workers-budget N` — box-wide cap on concurrent Commons-writing slots shared across **all** sdc-sync sessions on the host (and the uploader). Argparse default is **`0`** (unlimited / budget disabled); the launcher and workflow pass **`24`** (production runs `~16`+ to keep 6+ concurrent sessions from oversubscribing Commons' parser pool). The single-purpose manual modes (`--list` / `--file` / `--cat`) do not participate in the budget. See [Worker-slot budget](operations.md#worker-slot-budget) for the slot mechanics and ops inspection.
+
+### `--no-normalize-wikitext`
+
+The post-SDC wikitext cleanup (legacy migration + redundant-param strip) is **on by default** on every partner sync. Pass `--no-normalize-wikitext` to disable the strip for diagnostic runs that need the pre-cleanup wikitext left intact.
 
 ---
 

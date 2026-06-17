@@ -54,9 +54,11 @@ Pre-commit hooks use [ruff](https://docs.astral.sh/ruff/) for linting and format
 ```text
 get-ids-es <partner> [--institution NAME ...] [--collection NAME] [--single-id ID]
 downloader <ids.csv> <partner> [--max-age-days N] [--notify-complete] [--overwrite] [--dry-run] [--verbose]
-uploader   <ids.csv> <partner> [--dry-run] [--verbose]
-sdc-sync   --partner <partner> [--ids-file PATH]
+uploader   <ids.csv> <partner> [--workers-budget N] [--dry-run] [--verbose]
+sdc-sync   --partner <partner> [--ids-file PATH] [--workers N] [--workers-budget N] [--migrate-legacy] [--no-normalize-wikitext]
 sdc-sync   --file "File:Title.jpg" [--file ...] | --cat <Category> | --lists <dir>
 ```
 
 Pass `--help` to any command for full option details. In practice nothing here is invoked by hand — runs are launched via Slack and orchestrated by `scripts/wikimedia_launch.py`. See [docs/architecture.md](docs/architecture.md) for the dispatch chain.
+
+`sdc-sync`'s concurrency flags default to single-process, no-budget when run standalone (`--workers 1`, `--workers-budget 0`); the launcher and retry workflows pass `--workers 6 --workers-budget 24` so concurrent sessions cooperatively share the box-wide Commons-write cap. The uploader is single-process and likewise defaults to `--workers-budget 0` standalone, joining the shared budget only when the launcher sets it. `--migrate-legacy` runs the legacy `{{Artwork}}` → `{{DPLA metadata}}` migration instead of an SDC sync; `--no-normalize-wikitext` disables the default post-SDC strip of redundant `{{DPLA metadata}}` template params.
