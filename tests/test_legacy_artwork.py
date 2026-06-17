@@ -274,10 +274,9 @@ def _canonical_params(**overrides) -> dict:
         "description": "A description",
         "date": "1900",
         "permission": "{{Cc-zero}}",
-        "creator": {
-            "name": "InFi",
-            "params": {"1": "Creator", "2": "A Creator", "id": "fileinfotpl_aut"},
-        },
+        # creator is a plain string in dpla_metadata_params (extract_strings),
+        # NOT an {{InFi|Creator|...}} dict — see _canonical_value_for_key.
+        "creator": "A Creator",
         "source": {"name": "DPLA", "params": {}},
         "institution": {"name": "Institution", "params": {}},
         "languages": frozenset({"en"}),
@@ -341,6 +340,35 @@ def test_plan_migration_skips_community_value_that_matches_canonical():
     assert plan is not None
     assert plan.community_imports == {}
     assert plan.dpla_originated_params["title"] == "A Title"
+
+
+def test_plan_migration_imports_creator_param_that_differs_from_canonical():
+    """Regression: canonical 'creator' is a plain string (extract_strings),
+    not an {{InFi|Creator|...}} dict. A file whose Artwork template carries
+    a community creator that differs from canonical must be imported — and
+    must not raise ``AttributeError: 'str' object has no attribute 'get'``
+    (the old _canonical_value_for_key called .get() on the string)."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|creator=A Creator}}"),
+        (2, "Editor1", "{{Artwork|creator=Someone Else}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports == {"creator": "Someone Else"}
+    assert "creator" not in plan.dpla_originated_params
+
+
+def test_plan_migration_skips_creator_param_matching_canonical():
+    """A community editor restating DPLA's creator verbatim is redundant —
+    canonical creator (a string) compares equal, so no import."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|creator=A Creator}}"),
+        (2, "Editor1", "{{Artwork|creator=A Creator}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports == {}
+    assert plan.dpla_originated_params.get("creator") == "A Creator"
 
 
 def test_plan_migration_records_source_permalink():
