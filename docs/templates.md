@@ -1,47 +1,47 @@
 # Templates and the Lua Module
 
-How the pipeline uses Commons templates to display item metadata — and how the planned transition from the legacy `{{Artwork}}`-based wikitext to the SDC-backed `{{DPLA metadata}}` will work.
+How the pipeline uses Commons templates to display item metadata — and how the transition from the legacy `{{Artwork}}`-based wikitext to the SDC-backed `{{DPLA metadata}}` works.
 
 This document is the *pipeline's* view of the templates. For the user-facing template documentation (what editors see and how they augment it), see the [Template:DPLA metadata/doc](https://commons.wikimedia.org/wiki/Template:DPLA_metadata/doc) page on Commons.
 
-## Current state: `{{DPLA metadata}}` with explicit params at upload, then SDC
+## Current state: flat-param `{{DPLA metadata}}` at upload, then SDC, then strip
 
-As of [PR #291](https://github.com/dpla/ingest-wikimedia/pull/291), the uploader writes a fully-rendered `{{DPLA metadata}}` block as the file page's wikitext at upload time. After SDC sync lands the same metadata as MediaInfo statements, the explicit params and the SDC carry the same values; the file page renders both side-by-side (yellow-box from params + blue-box from SDC) until the planned cleanup pass strips the now-redundant params (see [Planned transition](#planned-transition) below).
+The uploader writes a fully-rendered `{{DPLA metadata}}` block as the file page's wikitext at upload time. After SDC sync lands the same metadata as MediaInfo statements, the explicit params and the SDC carry the same values; the file page renders both side-by-side (yellow box from params + blue box from SDC). A post-SDC cleanup pass then strips the now-redundant params — this pass is implemented and on by default (see [Per-file lifecycle](#per-file-lifecycle) below), not a future plan.
 
 ### Upload-time wikitext
 
-`get_wiki_text(dpla_id, item_metadata, provider, data_provider)` in `ingest_wikimedia/wikimedia.py` composes the file-page wikitext. The current template literal:
+`get_wiki_text(dpla_id, item_metadata, provider, data_provider)` in `ingest_wikimedia/wikimedia.py` composes the file-page wikitext. The shape is **flat**: every param is a top-level scalar — there are no `{{InFi}}` / `{{DPLA}}` / `{{Institution}}` sub-templates inside the block. The template literal:
 
 ```wikitext
 == {{int:filedesc}} ==
-{{ DPLA metadata
-   | Other fields 1 = {{ InFi | Creator | <creator> | id=fileinfotpl_aut }}
-   | title       = <title>
-   | description = <description>
-   | date        = <date_string>
-   | permission  = {{<permissions-template>}}
-   | source      = {{ DPLA
-                       | <data-provider>
-                       | hub      = <provider>
-                       | url      = <isShownAt>
-                       | dpla_id  = <dpla_id>
-                       | local_id = <local_id>
-                   }}
-   | Institution = {{ Institution | wikidata = <data-provider-qid> }}
+
+{{DPLA metadata
+| creator = <creator>
+| title = <title>
+| description = <description>
+| date = <date_string>
+| permission = {{<permissions-template>}}
+| hub = <provider-qid>
+| institution = <data-provider-qid>
+| url = <isShownAt>
+| dpla_id = <dpla_id>
+| local_id = <local_id>
 }}
 ```
 
 Notable wiring:
 
-- The wrapper template is `{{DPLA metadata}}` (the DPLA-owned template backed by `Module:DPLA`), not `{{Artwork}}`. PR #291 swapped just the wrapper name; the inner parameter set is the same one the prior `{{Artwork}}`-based uploader had been emitting.
-- The `| Other fields 1` row is included only when a creator is present. It uses the same `{{InFi|Creator|…}}` idiom Artwork had, which the DPLA template renders compatibly. Once SDC sync lands the value as a creator statement, the cleanup pass would replace this row with a top-level `|creator=` param (yellow-box-compatible) before stripping it entirely.
-- `| source = {{DPLA|...}}` is the DPLA-specific source sub-template. `Template:DPLA` on Commons renders DPLA's catalog link, hub attribution, and local identifier inside the source slot. This `Template:DPLA` is distinct from `Module:DPLA` (the Lua module backing `{{DPLA metadata}}`); the sub-template stays for legacy pages even after the SDC sync lands the same data as `P7482` / `P760` / `P9126` claims.
-- `| permission = {{<permissions-template>}}` resolves to one of `NKC`, `NoC-US`, `PD-US`, `cc-zero`, or a CC-by/by-sa code per `license_to_markup_code()` (mapping is in `ingest_wikimedia/wikimedia.py`).
-- `| Institution = {{Institution|wikidata=...}}` uses Commons' standard `{{Institution}}` template for the institution row.
+- The wrapper template is `{{DPLA metadata}}` (the DPLA-owned template backed by `Module:DPLA`), not `{{Artwork}}`.
+- **The values are computed by `dpla_metadata_params(dpla_id, item_metadata, provider, data_provider)`, the single source of truth feeding both the writer (`get_wiki_text`) and the post-SDC comparator (`wikitext_normalize`).** Both sides derive their expectations from this one helper, so the value the uploader emits and the value the strip pass tests against can never drift.
+- **Why flat.** The previous nested sub-templates (`{{DPLA|...}}` in `source`, `{{Institution|...}}`, `{{InFi|Creator|…}}` in `Other fields 1`) emitted wikitext-table markup that, when it landed inside `Module:DPLA`'s HTML `<td>`, produced a table-syntax-in-cell rendering bug. Collapsing to flat scalars — which the module's yellow box reads directly via the same parametric helpers that drive the blue box — eliminates that bug.
+- The `| creator` row is **suppressed entirely** when DPLA has no creator string, to avoid a blank `creator =` row. The template also accepts `author` and `artist` as aliases for `creator` (editor familiarity with `{{Information}}` / `{{Artwork}}` conventions); `creator` is preferred for the [archival-records sense the SAA assigns to it](https://dictionary.archivists.org/entry/creator.html), which matches DPLA's source collections better than "Author."
+- `| permission` resolves to one of `NKC`, `NoC-US`, `PD-US`, `cc-zero`, or a CC-by/by-sa code per `license_to_markup_code()` (mapping is in `ingest_wikimedia/wikimedia.py`), wrapped as `{{...}}`. When the rights URI is unmapped, the param renders **empty** (`| permission =`) rather than a malformed `{{}}` invocation.
+- `| hub` and `| institution` are Wikidata Q-IDs (provider and data-provider respectively). The institution Q-ID doubles as the Institution-row driver: `Module:DPLA` expands `{{Institution|wikidata=<inst>}}` on its side, so no `{{Institution}}` sub-template appears in the wikitext.
+- `| url` / `| dpla_id` / `| local_id` carry DPLA's catalog link, the DPLA item id, and the contributor's local identifier as plain strings. The DPLA-specific source rendering (catalog link, hub attribution, local identifier) is done by `Module:DPLA` from these scalars, not by a `{{DPLA|...}}` sub-template in the wikitext. (`Template:DPLA`, the source sub-template, is distinct from `Module:DPLA`; it still appears on un-migrated legacy pages — see below.)
 
-### Files uploaded before PR #291
+### Files uploaded in the legacy `{{Artwork}}` form
 
-Pages already on Commons keep their `{{Artwork}}` blocks until they're individually edited. There's no backfill pass yet; `Module:DPLA` happily renders an `{{Artwork}}`-wikitext file's SDC the same way it renders a `{{DPLA metadata}}`-wikitext file's, so the visible difference is only in the wikitext-tab view, not the rendered file description.
+Older pages on Commons carry `{{Artwork}}` blocks (or the older nested-`{{DPLA metadata}}` sub-template form). `Module:DPLA` renders an `{{Artwork}}`-wikitext file's SDC the same way it renders a flat-`{{DPLA metadata}}` file's, so the visible difference is only in the wikitext-tab view, not the rendered file description. The legacy `{{Artwork}}` → `{{DPLA metadata}}` migration is implemented and runs from the post-SDC cleanup dispatcher (see [Legacy migration](#legacy-artwork--dpla-metadata-migration-implemented) below).
 
 ### Post-upload rendering: `{{DPLA metadata}}` + `Module:DPLA`
 
@@ -69,48 +69,47 @@ The module's existence is acknowledged in a handful of code comments inside the 
 
 The pipeline does NOT directly invoke the module, render it client-side, or test it. Module:DPLA lives on Commons and is maintained as a Wikimedia-side artefact; this repo's responsibility is to write SDC the module can render correctly. See [this test file on Commons](https://commons.wikimedia.org/wiki/File:Plate_49_of_King%27s_1933_aerial_coverage_of_Denver,_Colorado_-_DPLA_-_4c3f5ad9bfac4097b95c9f8deb8e1a21.jpg) for a live render.
 
-## Planned transition
+## The per-file lifecycle and the strip/migrate pass
 
-The roadmap is to ship `{{DPLA metadata}}` as the *primary* format the pipeline writes at upload time, replacing the `{{Artwork}}`-based wikitext block. Two reasons:
-
-1. **Single source of truth.** Today the metadata is duplicated — once as wikitext templated by the uploader, once as SDC reconciled by the sync phase. Switching the primary display to `{{DPLA metadata}}` means the SDC IS the metadata, full stop. The file-page wikitext becomes a bare `{{DPLA metadata}}` invocation that picks everything up from SDC.
-2. **Live updates.** When `Module:DPLA` reads SDC, every file gets the current rendering of the current data — no need to re-edit thousands of wikitext blobs to push out a display change.
+The goal is for SDC to *be* the metadata: once a file's display is entirely SDC-driven, any future DPLA sync that updates the source data flows through to the rendered page automatically via `Module:DPLA`, with no wikitext re-edit needed across thousands of files. Two forces make this work — wikitext params are needed at upload (the [upload API](https://www.mediawiki.org/wiki/API:Upload) can't attach SDC in the same request, and Commons won't tolerate a file landing with no readable description even briefly), but stale params left behind would *override* SDC on display and mask future corrections, so they have to be stripped once the SDC counterpart exists.
 
 ### Per-file lifecycle
 
 Three edits per file, in order:
 
-1. **Upload — *done* (PR #291).** The uploader writes `{{DPLA metadata}}` with explicit wikitext parameters: `title`, `description`, `date`, `permission`, `source` (as a `{{DPLA|...}}` sub-template carrying catalog link, hub attribution, local identifier), `Institution`, plus a `{{InFi|Creator|…}}` row in `Other fields 1` when a creator is known. Wikitext params are necessary at this step because MediaWiki's [upload API](https://www.mediawiki.org/wiki/API:Upload) doesn't allow SDC statements to be attached in the same request, and Commons will not tolerate a file landing with no readable description even briefly. The Lua module renders these params in the yellow box on a fresh upload (with no SDC populated yet).
-2. **SDC sync — *done* (existing phase).** A subsequent edit posts the same metadata as MediaInfo statements via `wbeditentity`. After this edit, the wikitext params and the SDC contain the same values — the displayed page now has the SDC-driven blue box *and* the param-driven yellow box, both rendering identical content.
-3. **Cleanup edit — *planned*.** A one-time follow-up edit will strip the now-redundant wikitext params, leaving a bare `{{DPLA metadata}}` invocation plus the licensing template. From this point on the file's display is entirely SDC-driven, and any future DPLA sync that updates the source data flows through to the rendered page automatically — no wikitext re-edit needed.
+1. **Upload.** The uploader writes flat-param `{{DPLA metadata}}` (the shape above). The module renders these params in the yellow box on a fresh upload, before any SDC is populated.
+2. **SDC sync.** A subsequent edit posts the same metadata as MediaInfo statements via `wbeditentity`. After this edit, the wikitext params and the SDC contain the same values — the displayed page now has the SDC-driven blue box *and* the param-driven yellow box, both rendering identical content.
+3. **Post-SDC cleanup.** A follow-up edit strips the now-redundant wikitext params, leaving (when every param strips) a bare single-line `{{DPLA metadata}}` invocation plus the licensing template. From this point on the file's display is entirely SDC-driven. The licensing template stays in the wikitext because Commons' file-curation conventions require the license to remain visible there (not just in SDC) for human review.
 
-Step 3 matters because explicit wikitext params *override* SDC on display (see [`Template:DPLA metadata/doc`](https://commons.wikimedia.org/wiki/Template:DPLA_metadata/doc) on Commons). Leaving stale params in place would mask any future SDC corrections. As of June 2026, files uploaded by PR #291 are in the intermediate "step 1 done, awaiting step 3" state.
+### The post-SDC cleanup pass (implemented, on by default)
 
-### Adoption of community-uploaded files
+Step 3 is implemented in `ingest_wikimedia/wikitext_normalize.py` and runs from `tools/sdc_sync.py`. It is **on by default** — there is no separate `tools/strip_redundant_params.py`; the logic lives in `wikitext_normalize`.
 
-The duplicate-detection logic already handles a related case: a file from a DPLA partner that some Commons editor has already uploaded directly (typically from the partner's online catalog or from Flickr). When the pipeline detects this overlap and adopts the file into DPLA's system — renaming it to the canonical `... - DPLA - <id>.<ext>` form — the planned workflow migrates whatever metadata the original uploader recorded in the existing wikitext into `{{DPLA metadata}}`'s yellow-box parameters. SDC sync then layers the DPLA-authoritative values on top: blue box shows DPLA, yellow box preserves the migrated editor data verbatim.
+- **Entry point.** `tools/sdc_sync.py::_post_sdc_cleanup_for_page` is the dispatcher. After the SDC write for a page, it inspects the current wikitext: a flat-`{{DPLA metadata}}` page goes through the strip path (`wikitext_normalize.normalize_page`); a legacy `{{Artwork}}` (or `{{Information}}` / `{{Photograph}}`) page goes through the migration path (see below).
+- **Flag.** `--normalize-wikitext` / `--no-normalize-wikitext` (default on). Pass `--no-normalize-wikitext` for diagnostic runs that need the pre-strip wikitext intact. The flag propagates to worker processes in partner mode.
+- **What it strips.** `normalize` removes each `{{DPLA metadata}}` param whose value equals the SDC-backed value computed by `dpla_metadata_params` (compared via `_value_matches`). `canonicalize` then enforces the canonical whitespace shape: left-justified template, exactly one blank line after `== {{int:filedesc}} ==`, one `| key = value` per line, closing `}}` on its own line — or, when *every* param has been stripped, collapse to a single-line `{{DPLA metadata}}`.
+- **Safety guard.** Before stripping, the dispatcher fetches the file's MediaInfo entity and refuses to strip if it has *no* DPLA-attributed SDC (`_entity_has_dpla_attributed_claims`). This prevents the failure mode where a dropped or null-pageid SDC write would otherwise leave the page with metadata in *neither* representation. An API failure during the guard is also a hard skip.
 
-The migration step is not yet implemented; today's duplicate-detection flow handles the rename and the `{{Duplicate}}` tagging of the original (see [special-cases.md](special-cases.md#hash-drift-the-four-cases)), but leaves the wikitext at the new title in its `{{Artwork}}` form.
+### The dual-path comparator
 
-### Code changes — current and remaining
+`wikitext_normalize` is shape-tolerant: it strips both the **new flat params** and the **old nested sub-template rows**, so old- and new-shape pages converge to the same stripped output. The legacy-row strippers — `_strip_legacy_source` (`source = {{DPLA|...}}`), `_strip_legacy_institution` (`Institution = {{Institution|wikidata=...}}`), and `_strip_legacy_creator` (`Other fields 1 = {{InFi|Creator|…}}`) — parse each sub-template's inner params and compare them against the flat-canonical equivalents via `_value_matches`. Any unexpected extra arg on the wikitext side disqualifies the strip (an editor may have added something the comparator doesn't know to match).
 
-**Done in PR #291:** `ingest_wikimedia/wikimedia.py::get_wiki_text` was switched from `{{Artwork}}` to `{{DPLA metadata}}` as the wrapper template. The inner parameter set kept the same shape (title / description / date / permission / source-via-`{{DPLA|...}}` / Institution / Creator-via-`InFi`), so no rewrite was needed — just the one-line wrapper-name change. The yellow user-contributed box on a fresh upload is now populated by these params automatically; SDC sync layers the blue box on top in the subsequent phase.
+Two finer behaviours of the comparator:
 
-The template also accepts `author` and `artist` as aliases for `creator` (for editor familiarity with `{{Information}}` and `{{Artwork}}` conventions); `creator` is preferred because of the [archival-records sense the SAA assigns to it](https://dictionary.archivists.org/entry/creator.html), which matches DPLA's source collections better than "Author."
+- **Language-wrapper unwrapping.** A non-rendered `languages` key on the params dict (built by `_extract_unwrap_languages`) carries the per-item allowlist of ISO 639-1 codes the comparator may safely unwrap — always `en`, plus any language the DPLA record itself declares in `sourceResource.language`. The comparator will unwrap a single-language wrapper like `{{es|...}}` only for an allowlisted language; `{{LangSwitch}}` and any unknown/un-allowlisted wrapper are always preserved (the file was deliberately multilingualised by an editor).
+- **Date dedup in migration.** When migrating, an editor's `{{other date|...}}` / circa / year-range value is expanded server-side (`_expand_wikitext_for_date_parse`, via MediaWiki `expandtemplates`) and checked against DPLA's existing `P571` (`_existing_dpla_date_matches_parsed` / `_existing_dpla_date_range_matches`) so a value like `{{other date|between|1934|1948}}` doesn't get imported as a parallel statement alongside the DPLA date it already matches.
 
-**Remaining for step 3 (cleanup):** a new maintenance pass (e.g. `tools/strip_redundant_params.py`) that runs at some interval after SDC sync, scans for files where SDC and wikitext params agree, and strips the params, leaving `{{DPLA metadata}}` as a bare invocation. The licensing template stays separate because Commons' file-curation conventions require the license to remain visible in the wikitext (not just SDC) for human review.
+### Legacy `{{Artwork}}` → `{{DPLA metadata}}` migration (implemented)
 
-### Workstreams the transition would touch
+The migration is implemented in `ingest_wikimedia/legacy_artwork.py` (`migrate_legacy_file`, `plan_migration`, `build_legacy_import_claims`) and runs via the `--migrate-legacy` mode of `tools/sdc_sync.py` as well as from the post-SDC cleanup dispatcher when it encounters a legacy template.
 
-- ~~`ingest_wikimedia/wikimedia.py::get_wiki_text` — new template body with explicit params.~~ Done in PR #291.
-- A new maintenance pass (e.g. `tools/strip_redundant_params.py`) for step 3.
-- The adoption-migration path in `tools/uploader.py::Uploader._resolve_hash_drift` — extend the rename branches to salvage the original editor's wikitext into yellow-box params.
-- Commons-side [`Template:DPLA metadata/doc`](https://commons.wikimedia.org/wiki/Template:DPLA_metadata/doc) — already documents the planned lifecycle.
-- `Commons:Digital Public Library of America/Modeling` — already updated to describe the SDC properties the module reads.
-- Operator runbook in [operations.md](operations.md) — note the change in the "what's on a fresh upload" wording.
-- A staged rollout — flip one hub at a time so a regression doesn't take down every partner.
+The problem it solves: a legacy file may carry community edits made years after the original DPLA upload. A naïve overwrite would discard them. So `plan_migration` walks the file's revision history to separate values DPLA's bot last touched (safe to overwrite with canonical data) from values a community editor contributed (must be preserved). Community values are preserved as SDC *imports* — statements carrying a `P887 → Q131783016` ("inferred from Wikitext") + `P4656 → <permalink-to-source-revision>` reference shape, deliberately *without* the standard DPLA qualifiers (`P459/Q61848113`, `P813`) that would misrepresent them as DPLA-sourced.
 
-No code changes have landed for this transition yet; no TODO/FIXME comments in `tools/uploader.py` or `ingest_wikimedia/wikimedia.py` reference it.
+The order is load-bearing and crash-safe: **SDC import first, wikitext rewrite second.** If the rewrite fails after the import succeeded, the file carries the imported SDC but still has the legacy template, and a follow-up sweep completes it; the reverse order could irrecoverably lose community values. An `entity_was_already_migrated` idempotency guard (it looks for the `P887 → Q131783016` reference shape on the entity) makes re-runs safe. The migrated wikitext is run through the same strip + `canonicalize` pass as the flat-`{{DPLA metadata}}` path, so a migrated file lands in the post-strip steady state in one save.
+
+### Remaining work
+
+One narrow gap remains: the uploader's **duplicate-detection adoption-rename path** — when the pipeline adopts a file a Commons editor already uploaded directly (from the partner's catalog or Flickr) and renames it to the canonical `... - DPLA - <id>.<ext>` form — does **not** itself invoke this provenance-aware migration. `_resolve_hash_drift` / `merge_preserved_wikitext` (in `tools/uploader.py` and `ingest_wikimedia/wikimedia.py`) currently overwrite the metadata template wholesale, discarding any community-contributed params an editor added between the original upload and the rescue. A `TODO` on `merge_preserved_wikitext` flags the integration point: the `legacy_artwork` provenance logic should preserve community values as SDC imports first, then overwrite. (The rename and `{{Duplicate}}` tagging of the original work today — see [special-cases.md](special-cases.md#hash-drift-the-four-cases).)
 
 ## How SDC and templates interact today
 
@@ -146,4 +145,4 @@ A summary diagram:
    └──────────────────────────────────────────────┘
 ```
 
-In the planned future state (step 3 of the lifecycle), the left branch's wikitext params get stripped — the file page wikitext becomes a bare `{{DPLA metadata}}` invocation, and all displayed metadata comes from the SDC sync's writes via `Module:DPLA`. Until that pass exists, the explicit params and the SDC carry redundant copies of the same values.
+Step 3 of the lifecycle (the post-SDC cleanup pass) then strips the left branch's redundant params — once every param is stripped the file-page wikitext becomes a bare single-line `{{DPLA metadata}}` invocation plus the licensing template, and all displayed metadata comes from the SDC sync's writes via `Module:DPLA`. Between the SDC write and the strip, the explicit params and the SDC carry redundant copies of the same values; the cleanup pass runs in the same `sdc_sync` invocation by default.

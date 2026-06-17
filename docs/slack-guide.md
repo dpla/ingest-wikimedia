@@ -190,15 +190,44 @@ If your kill argument matches zero active sessions, the response says so but no 
 /wikimedia-status
 ```
 
-Posts to #tech-alerts with each active session and its current phase + progress:
+Posts to #tech-alerts a **Wikimedia Upload Status** header block, one row per active session (the session name in a fixed-width backtick column, followed by its current phase + progress), and a trailing context line summarising box-wide worker-slot and memory headroom:
 
 ```text
-🟢 Active Wikimedia upload sessions
-• wikimedia-bpl — Uploading (3,214 / 11,503, ~28%)
-• wikimedia-indiana+indiana-state-library — SDC syncing (812 / 4,002, ~20%)
+Wikimedia Upload Status
+
+`wikimedia-bpl                    ` Uploading (3,214 / 11,503, ~28%)
+`wikimedia-indiana+indiana-state-l` [indiana+indiana-state-library] SDC syncing (812 / 4,002, ~20%) ⏸ waiting on slots
+`wikimedia-pa+free-library-of-phila` Uploading (queued)
+
+Worker slots: ~4 free of 16 (12 held)   •   Memory: 21,480 / 31,008 MB used (30% available)
 ```
 
-The status workflow runs automatically every 6 hours and posts only when something is active. The Slack-triggered version always posts (so an empty result confirms "nothing's running" rather than looking like the command silently failed).
+Phase annotations you may see on a row:
+
+- **`⏸ waiting on slots`** — every one of that session's workers is currently blocked on the box-wide worker-slot cap (`--workers-budget`). The session is healthy, just throttled while it waits for a slot to free.
+- **`(queued)`** — the session is parked behind the cap and hasn't logged its first item yet (vs. `starting...`, which means it's launching but not budget-blocked).
+- **`⚠ idle Nm`** — the session's log hasn't been written to in over 30 minutes and it isn't slot-blocked, so it may be hung.
+
+The trailing context line:
+
+- **Worker slots** — box-wide free/held slot count (the median of four `lslocks` samples). This cap is shared by both the uploader and sdc-sync, so it reflects total Commons-writing concurrency across every session, not SDC alone. Omitted if no budget-enabled session has set up the slot directory.
+- **Memory** — used / total MB on the EC2 box, with percent available.
+
+The status workflow runs automatically every 6 hours and the Slack-triggered version (`/wikimedia-status`) runs on demand. **Both always post**, even when nothing is running — an idle run posts `No active Wikimedia upload sessions.` along with the memory line, so an empty result confirms "nothing's running" rather than looking like the command silently failed.
+
+### Reading the SDC completion summary
+
+When the SDC phase finishes, #tech-alerts gets a **Wikimedia SDC Complete** message with a block of counts. Most are self-explanatory, but a few are easy to misread:
+
+- **ITEMS SYNCED** — DPLA items where every eligible ordinal posted successfully.
+- **ITEMS PARTIAL** — items where at least one ordinal synced *and* at least one sibling ordinal errored. These are not counted under ITEMS SYNCED, so a healthy-looking run can still have partials worth checking.
+- **PAGES EDITED** — the number of distinct Commons file pages actually written. This is the real batch size: a one-file item and a thousand-file item both count as a single synced item, so PAGES EDITED is the figure you can't infer from ITEMS SYNCED.
+- **CLAIMS ADDED / REFS ADDED / REMOVALS** — statements added, references added, and statements removed across all pages.
+- **SKIPPED (no sidecar) / (mapping) / (error)** — items the partner-mode loop bailed on before writing anything, by reason: no `sdc.json` staged, a mapping problem, or a runtime error.
+- **ORDINAL MISSING** — ordinals whose Commons MediaInfo entity no longer exists (`no-such-entity`, usually a file deleted as a duplicate). Not a failure — the rest of the item's ordinals still count.
+- **ORDINAL NO PAGEID** — the uploader sidecar had a null pageid and the title→pageid fallback also failed, so that ordinal couldn't be located.
+- **ORDINAL ERRORS** — per-ordinal runtime exceptions, isolated so one bad ordinal doesn't sink its siblings.
+- **SLOT WAIT (avg/wkr)** — average time each worker spent blocked on the box-wide slot budget, shown as `Nm (X% of runtime)`. A high percentage means the session was throttled by the cap for much of its run.
 
 ---
 
