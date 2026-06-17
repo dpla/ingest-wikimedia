@@ -68,10 +68,26 @@ Q_PUBLIC_DOMAIN = "Q19652"
 Q_COPYRIGHTED = "Q50423863"
 Q_CC0_PD_SOMEWHERE = "Q88088423"
 Q_PD_MARK_RAW = "Q6938433"
-Q_SMITHSONIAN = "Q518155"
-Q_PUBLISHER = "Q393351"
-Q_AGGREGATOR = "Q108296843"
-Q_CONTRIBUTING_INSTITUTION = "Q108296919"
+# DPLA distinguishes two kinds of hub, which take different SDC partnership
+# shapes (see ``_build_contributed_claims``):
+#   * Content hub — a large institution that IS the data provider (NARA,
+#     Smithsonian, ...). It is itself a repository and sits in P195; its
+#     "data providers" are internal departments, not independent orgs.
+#   * Service hub — an aggregating intermediary; its institutions are
+#     distinct organizations that sit in P195.
+# institutions_v2.json carries no hub-type flag, so content-hub membership
+# is enumerated here.
+Q_NARA = "Q518155"  # National Archives and Records Administration
+Q_SMITHSONIAN = "Q131626"  # Smithsonian Institution
+CONTENT_HUB_QIDS = frozenset({Q_NARA, Q_SMITHSONIAN})
+
+# object-has-role (P3831) qualifier values, named for their actual Wikidata
+# roles. A service hub's hub is an ``aggregator`` (like DPLA itself); its
+# institution is a ``repository``. A content hub is itself a ``repository``;
+# its contributing department is a ``custodial unit``.
+Q_ROLE_AGGREGATOR = "Q393351"
+Q_ROLE_REPOSITORY = "Q108296843"
+Q_ROLE_CONTRIBUTING = "Q108296919"
 Q_NARA_ITEM = "Q11723795"
 Q_NARA_FILE_UNIT = "Q59221146"
 
@@ -893,10 +909,22 @@ def _build_contributed_claims(
 ) -> list[dict]:
     """Build the three-statement P9126 chain (DPLA + hub + institution).
 
-    Each statement gets a P3831 (object of statement) qualifier identifying
-    the role: publisher for DPLA, aggregator for the hub, contributing
-    institution for the institution. The Smithsonian-hub case promotes
-    the hub to fill both hub and institution slots.
+    Each statement gets a P3831 (object has role) qualifier encoding DPLA's
+    two hub models:
+
+      * Content hub (NARA, Smithsonian, ...): the hub IS the providing
+        institution — a ``repository`` that also sits in P195 — and the
+        "institution" is an internal department, tagged as the
+        ``contributing`` (custodial) unit. DPLA is the ``aggregator`` above.
+      * Service hub (everything else): the hub is an aggregating
+        intermediary (``aggregator``, like DPLA) and the institution is a
+        distinct organization (``repository``) that also sits in P195.
+
+    These role/P195 shapes match what is already on Commons; the read side
+    (Module:DPLA) and ``dpla_claims()`` depend on them, so changing them
+    without a coordinated Commons-side rewrite would make every existing
+    P9126 statement look "unexpected" and trigger a remove+re-add on every
+    re-sync.
     """
     out: list[dict] = []
 
@@ -911,20 +939,13 @@ def _build_contributed_claims(
         claim["qualifiers"]["P3831"] = [_qualifier_item_snak("P3831", role_qid)]
         return claim
 
-    # The role qualifiers below intentionally MATCH what sdc-sync.add_contributed
-    # has been writing to Commons. Smithsonian's path distinguishes
-    # aggregator/contributing-institution; the non-Smithsonian path uses
-    # publisher/aggregator for hub/institution respectively. Changing these
-    # values without a coordinated Commons-side rewrite would make every
-    # existing P9126 statement look "unexpected" to dpla_claims() and trigger
-    # a remove+re-add on every re-sync.
-    out.append(_with_role(Q_DPLA, Q_PUBLISHER))
-    if hub == Q_SMITHSONIAN:
-        out.append(_with_role(Q_SMITHSONIAN, Q_AGGREGATOR))
-        out.append(_with_role(institution, Q_CONTRIBUTING_INSTITUTION))
+    out.append(_with_role(Q_DPLA, Q_ROLE_AGGREGATOR))
+    if hub in CONTENT_HUB_QIDS:
+        out.append(_with_role(hub, Q_ROLE_REPOSITORY))
+        out.append(_with_role(institution, Q_ROLE_CONTRIBUTING))
     else:
-        out.append(_with_role(hub, Q_PUBLISHER))
-        out.append(_with_role(institution, Q_AGGREGATOR))
+        out.append(_with_role(hub, Q_ROLE_AGGREGATOR))
+        out.append(_with_role(institution, Q_ROLE_REPOSITORY))
     return out
 
 
@@ -1446,9 +1467,10 @@ def build_claims_for_doc(
             )
         )
 
-    # P195 — collection (one statement; Smithsonian uses hub-as-institution).
+    # P195 — collection (one statement). A content hub is itself the
+    # collection/repository; a service hub's collection is its institution.
     if institution:
-        coll_qid = Q_SMITHSONIAN if hub == Q_SMITHSONIAN else institution
+        coll_qid = hub if hub in CONTENT_HUB_QIDS else institution
         claims.append(
             formattedclaim(
                 "P195",
