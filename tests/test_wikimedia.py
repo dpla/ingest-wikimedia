@@ -999,14 +999,49 @@ def test_file_has_inbound_usage_one_combined_request_global_or_local():
     assert set(kwargs["prop"].split("|")) == {"globalusage", "fileusage"}
     assert kwargs["titles"] == "File:F.jpg"
     assert "redirects" not in kwargs
+    # fileusage limit must be >=2: the file's own page always occupies one
+    # row (self-reference), so a limit of 1 could only ever return self and
+    # would mask a genuine second user.
+    assert kwargs["fulimit"] == 2
 
-    # local only
+    # local only (another page embeds it)
     site = _usage_site({"query": {"pages": {"-1": {"fileusage": [{"title": "X"}]}}}})
     assert file_has_inbound_usage(site, "F.jpg") is True
 
     # neither
     site = _usage_site({"query": {"pages": {"-1": {}}}})
     assert file_has_inbound_usage(site, "F.jpg") is False
+
+
+def test_file_has_inbound_usage_ignores_self_reference():
+    """A DPLA file page lists itself in fileusage — {{Artwork}}/{{Information}}
+    with no image param auto-displays the page's own image. That self-row is
+    not an external relink target, so a file used ONLY by itself is unused.
+    (This is what made the CommonsDelinker gate fire for every file.)"""
+    site = _usage_site(
+        {"query": {"pages": {"-1": {"fileusage": [{"title": "File:F.jpg"}]}}}}
+    )
+    assert file_has_inbound_usage(site, "F.jpg") is False
+
+
+def test_file_has_inbound_usage_counts_other_user_alongside_self():
+    """Self-reference plus a genuine external user → used. fulimit=2 ensures
+    the non-self row is fetched even though self occupies one slot."""
+    site = _usage_site(
+        {
+            "query": {
+                "pages": {
+                    "-1": {
+                        "fileusage": [
+                            {"title": "File:F.jpg"},
+                            {"title": "File:Some gallery page.jpg"},
+                        ]
+                    }
+                }
+            }
+        }
+    )
+    assert file_has_inbound_usage(site, "F.jpg") is True
 
 
 def test_file_has_inbound_usage_fails_open_on_error():

@@ -633,26 +633,37 @@ def build_title_drift_move_reason(
 
 def file_has_inbound_usage(site: BaseSite, filename: str) -> bool:
     """Return True if bare-named ``filename`` is used on another wiki
-    (``globalusage``) or a local Commons page (``fileusage``).
+    (``globalusage``) or by *another* local Commons page (``fileusage``).
 
-    Both classes are fetched in one request (capped at one row each). No
-    ``redirects``: we want usage recorded against *this* title, not a
+    The file's OWN description page is excluded from ``fileusage``: a DPLA
+    file page renders ``{{Artwork}}``/``{{Information}}`` with no explicit
+    image param, which auto-displays the page's own image, so the file is
+    listed as a user of itself. That self-reference is not an external
+    relink target — counting it made the gate fire for *every* file,
+    defeating its whole purpose. Because of that guaranteed self-row,
+    ``fileusage`` is fetched with a limit of 2: self plus at most one other
+    user is enough to tell "used by something else" from "only itself".
+
+    No ``redirects``: we want usage recorded against *this* title, not a
     redirect target. Fails open (returns True) on any error so a needed
     relink is never silently dropped.
     """
     api_site = typing.cast(APISite, site)
+    self_title = f"File:{filename}"
     try:
         result = api_site.simple_request(
             action="query",
             prop="globalusage|fileusage",
-            titles=f"File:{filename}",
+            titles=self_title,
             gulimit=1,
-            fulimit=1,
+            fulimit=2,
         ).submit()
         # Parse inside the try too: an unexpected payload shape must fail
         # open (treated as "used"), not raise or fall through to False.
         for page in result.get("query", {}).get("pages", {}).values():
-            if page.get("globalusage") or page.get("fileusage"):
+            if page.get("globalusage"):
+                return True
+            if any(u.get("title") != self_title for u in page.get("fileusage", [])):
                 return True
         return False
     except Exception as e:
