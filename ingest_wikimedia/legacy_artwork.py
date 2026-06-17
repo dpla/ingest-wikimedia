@@ -346,20 +346,16 @@ def plan_migration(
 def _canonical_value_for_key(canonical_params: dict, key: str) -> str:
     """Pull the comparable canonical value for a key.
 
-    Scalar keys (title/description/date/permission) live at the top
-    level. The creator key is special: ``dpla_metadata_params`` emits
-    creator inside the ``{{InFi|Creator|...}}`` sub-template shape, so
-    the comparable canonical value is the second positional. Source,
-    institution, etc. are sub-template valued and not handled in
+    title/description/date/permission/creator are all scalar strings in
+    ``dpla_metadata_params``'s output — creator included (it comes from
+    ``extract_strings``, not an ``{{InFi|Creator|...}}`` sub-template dict).
+    Source, institution, etc. are sub-template valued and not handled in
     Phase 3a's scalar mapping — return empty so the equality check
-    correctly classifies them as "different" and they fall through
-    to community-import or dpla-originated based on provenance only.
+    classifies them as "different" and they fall through to community-import
+    or dpla-originated based on provenance only.
     """
-    if key in ("title", "description", "date", "permission"):
+    if key in ("title", "description", "date", "permission", "creator"):
         return str(canonical_params.get(key, ""))
-    if key == "creator":
-        creator = canonical_params.get("creator", {})
-        return str(creator.get("params", {}).get("2", ""))
     return ""
 
 
