@@ -1035,6 +1035,20 @@ def test_post_commonsdelinker_request_skips_when_no_usage():
     PageCtor.assert_not_called()
 
 
+def test_post_commonsdelinker_request_check_usage_false_skips_query_and_posts():
+    """``check_usage=False`` posts without querying usage at all. Callers
+    that move-then-relink pass this after running the usage check BEFORE the
+    move, where the old title is still the live file rather than a redirect."""
+    site = MagicMock()
+    with patch("ingest_wikimedia.wikimedia.pywikibot.Page"):
+        post_commonsdelinker_request(
+            site, old_filename="Old.jpg", new_filename="New.jpg", check_usage=False
+        )
+    # No usage query issued, and the request was posted.
+    site.simple_request.assert_not_called()
+    site.editpage.assert_called_once()
+
+
 def test_tag_as_duplicate_uses_prependtext_not_read_modify_write():
     """tag_as_duplicate must use site.editpage(prependtext=...) rather
     than `file_page.text = tag + file_page.text; file_page.save()`.

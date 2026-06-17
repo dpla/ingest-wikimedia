@@ -1235,6 +1235,57 @@ def test_case1_move_suppresses_commonsdelinker_when_actual_is_sibling():
     assert kwargs.get("post_commonsdelinker") is False
 
 
+def test_move_to_correct_title_checks_usage_before_move_and_skips_when_unused():
+    """The inbound-usage gate must run BEFORE the move: afterward the old
+    title is a redirect and the usage query is unreliable. When the live
+    file has no inbound usage, no CommonsDelinker request is posted."""
+    uploader = _build_uploader_with_dpla()
+    existing = _drift_existing_file("Old Title - DPLA - a (page 1).jpg")
+    intended = _make_intended_page("New Title - DPLA - b (page 1).jpg")
+    order = []
+    existing.move.side_effect = lambda *a, **k: order.append("move")
+
+    def _usage(_site, _name):
+        order.append("usage_check")
+        return False
+
+    with (
+        patch("tools.uploader.file_has_inbound_usage", side_effect=_usage),
+        patch("tools.uploader.post_commonsdelinker_request") as mock_post,
+    ):
+        uploader._move_to_correct_title(existing, intended, "a", "Case 3")
+
+    assert order == ["usage_check", "move"], (
+        "usage must be checked before the move (old title becomes a redirect)"
+    )
+    mock_post.assert_not_called()
+
+
+def test_move_to_correct_title_posts_with_check_usage_false_when_used():
+    """When the live file IS used, the request is posted after the move with
+    check_usage=False — the pre-move decision is authoritative, so the
+    post-move (redirect) re-check is bypassed."""
+    uploader = _build_uploader_with_dpla()
+    existing = _drift_existing_file("Old Title - DPLA - a (page 1).jpg")
+    intended = _make_intended_page("New Title - DPLA - b (page 1).jpg")
+    order = []
+    existing.move.side_effect = lambda *a, **k: order.append("move")
+
+    def _usage(_site, _name):
+        order.append("usage_check")
+        return True
+
+    with (
+        patch("tools.uploader.file_has_inbound_usage", side_effect=_usage),
+        patch("tools.uploader.post_commonsdelinker_request") as mock_post,
+    ):
+        uploader._move_to_correct_title(existing, intended, "a", "Case 3")
+
+    assert order == ["usage_check", "move"]
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs.get("check_usage") is False
+
+
 # ---------------------------------------------------------------------------
 # Granular skip-class counters: NOT_PRESENT vs INELIGIBLE both bump the
 # legacy ``SKIPPED`` aggregate AND a granular counter.

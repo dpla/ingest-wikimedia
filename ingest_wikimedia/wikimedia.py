@@ -666,7 +666,7 @@ def file_has_inbound_usage(site: BaseSite, filename: str) -> bool:
 
 
 def post_commonsdelinker_request(
-    site: BaseSite, old_filename: str, new_filename: str
+    site: BaseSite, old_filename: str, new_filename: str, check_usage: bool = True
 ) -> None:
     """Append a universal-replace request to CommonsDelinker's filemovers page.
 
@@ -675,7 +675,12 @@ def post_commonsdelinker_request(
     used by other editors on that page.
 
     No-ops when ``old_filename`` has no inbound usage to relink (see
-    ``file_has_inbound_usage``).
+    ``file_has_inbound_usage``). Callers that move-then-relink MUST run that
+    check *before* the move and pass ``check_usage=False`` here: once the
+    file has moved, ``old_filename`` is a redirect and the usage query is
+    unreliable (it can transiently read as "used" right after the move,
+    defeating the gate). The internal check remains the default for any
+    caller that asks about a title that has not just been moved.
 
     Uses the MediaWiki `appendtext` API parameter rather than the naive
     read-modify-write (`page.text = page.text + template; page.save()`).
@@ -698,7 +703,7 @@ def post_commonsdelinker_request(
         primary; conflicting concurrent edits can no longer cause
         spurious rejections.
     """
-    if not file_has_inbound_usage(site, old_filename):
+    if check_usage and not file_has_inbound_usage(site, old_filename):
         logging.info(
             " -- No inbound usage for [[File:%s]]; skipping CommonsDelinker "
             "request (nothing to relink).",
