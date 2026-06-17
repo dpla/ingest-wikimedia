@@ -469,7 +469,7 @@ Key log lines:
 | `Skipping <id>: Already exists on commons.` | File already on Commons, skipping |
 | `COUNTS:` followed by `UPLOADED: N`, `SKIPPED: N`, `FAILED: N`, `BYTES: N` | Phase complete |
 | `Bad provider.` | Data provider not configured for upload |
-| `All N worker slots busy; waiting for capacity.` | SDC/upload worker blocked on the box-wide [worker-slot budget](#worker-slot-budget) — expected under heavy concurrency |
+| ` -- All N worker slots busy; waiting for capacity.` | SDC/upload worker blocked on the box-wide [worker-slot budget](#worker-slot-budget) — expected under heavy concurrency |
 
 ### Slack notifications
 

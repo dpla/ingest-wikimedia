@@ -196,7 +196,7 @@ Posts to #tech-alerts a **Wikimedia Upload Status** header block, one row per ac
 Wikimedia Upload Status
 
 `wikimedia-bpl                    ` Uploading (3,214 / 11,503, ~28%)
-`wikimedia-indiana+indiana-state-l` [indiana+indiana-state-library] SDC syncing (812 / 4,002, ~20%) ⏸ waiting on slots
+`wikimedia-indiana+indiana-state-l` SDC syncing (812 / 4,002, ~20%) ⏸ waiting on slots
 `wikimedia-pa+free-library-of-phila` Uploading (queued)
 
 Worker slots: ~4 free of 16 (12 held)   •   Memory: 21,480 / 31,008 MB used (30% available)
