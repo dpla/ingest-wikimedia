@@ -66,6 +66,7 @@ from ingest_wikimedia.wikimedia import (
     ERROR_NOCHANGE,
     ERROR_BACKEND_FAIL,
     get_site,
+    file_has_inbound_usage,
     post_commonsdelinker_request,
 )
 
@@ -790,6 +791,9 @@ class Uploader:
         reason = build_title_drift_move_reason(
             old_filename, new_filename, dpla_id, self.site.user()
         )
+        # Gate before the move, while old_filename is still the live file
+        # (see post_commonsdelinker_request docstring).
+        needs_relink = file_has_inbound_usage(self.site, old_filename)
         logging.info(
             f"Title drift redirect detected — moving "
             f"[[File:{old_filename}]] → [[File:{new_filename}]]"
@@ -800,7 +804,16 @@ class Uploader:
             movetalk=False,
             noredirect=False,  # leave a redirect at the old title
         )
-        post_commonsdelinker_request(self.site, old_filename, new_filename)
+        if needs_relink:
+            post_commonsdelinker_request(
+                self.site, old_filename, new_filename, check_usage=False
+            )
+        else:
+            logging.info(
+                " -- No inbound usage for [[File:%s]]; skipping CommonsDelinker "
+                "request (nothing to relink).",
+                old_filename,
+            )
 
         # Fresh FilePage for the now-real file page at the intended title
         return get_page(self.site, wiki_file_page.title())
@@ -880,6 +893,11 @@ class Uploader:
         reason = build_title_drift_move_reason(
             actual_filename, intended_filename, dpla_id, self.site.user()
         )
+        # Gate before the move, while actual_filename is still the live file
+        # (see post_commonsdelinker_request docstring).
+        needs_relink = post_commonsdelinker and file_has_inbound_usage(
+            self.site, actual_filename
+        )
         logging.info(
             f"Title drift ({case_label}): moving "
             f"[[File:{actual_filename}]] → [[File:{intended_filename}]]"
@@ -890,15 +908,23 @@ class Uploader:
             movetalk=False,
             noredirect=False,
         )
-        if post_commonsdelinker:
-            post_commonsdelinker_request(self.site, actual_filename, intended_filename)
-        else:
+        if needs_relink:
+            post_commonsdelinker_request(
+                self.site, actual_filename, intended_filename, check_usage=False
+            )
+        elif not post_commonsdelinker:
             logging.info(
                 f"Suppressing CommonsDelinker request "
                 f"[[File:{actual_filename}]] → [[File:{intended_filename}]]: "
                 f"actual_filename is one of this item's current asset "
                 f"positions and will be overwritten with different content "
                 f"by a later ordinal in this session."
+            )
+        else:
+            logging.info(
+                " -- No inbound usage for [[File:%s]]; skipping CommonsDelinker "
+                "request (nothing to relink).",
+                actual_filename,
             )
 
         if wiki_markup:
