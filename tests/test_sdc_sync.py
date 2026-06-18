@@ -322,9 +322,19 @@ def test_check_dpla_only_match_no_reference_captures_ref():
     assert result == (False, "M999$ours")
 
 
-def test_check_no_qualifier_match_stamps_p459_via_add_det():
-    """An existing matching statement with no qualifiers triggers
-    branch 2's add_det call (wbsetqualifier — non-destructive)."""
+def test_check_bare_match_defers_to_add_ref_not_add_det():
+    """A matching statement with neither a qualifier nor a reference (e.g. a
+    rights claim a foreign bot wrote) must be healed by the caller's add_ref
+    full-claim rewrite alone — NOT also by add_det.
+
+    Regression for the rights-license bug: when both fire, the dispatcher
+    emits two same-id fragments (add_ref's full claim with the DPLA reference,
+    and add_det's qualifier-only fragment built from the cached reference-less
+    statement). wbeditentity applies same-id fragments as wholesale replacements
+    in array order, so the qualifier fragment's empty references silently erase
+    the reference, and the file renders no license until a second sync pass.
+    The bare statement's id equals the captured ref, so check() must return
+    (False, ref) without calling add_det."""
     from tools import sdc_sync
 
     empty_stmt = _item_statement("M999$empty", "Q19652")
@@ -334,8 +344,98 @@ def test_check_no_qualifier_match_stamps_p459_via_add_det():
         patch.object(sdc_sync, "add_det", return_value=None) as mock_add_det,
     ):
         result = sdc_sync.check("M999", ("item", "Q19652"), "P6216")
-    mock_add_det.assert_called_once_with("M999", "M999$empty")
-    assert result == (None, "M999$empty")
+    mock_add_det.assert_not_called()
+    assert result == (False, "M999$empty")
+
+
+def test_check_no_qualifier_but_referenced_still_uses_add_det():
+    """A matching statement with no qualifiers but that already carries a
+    reference is NOT captured for ref-stamping (loop 1 requires no references),
+    so its id != ref and add_det remains the path that stamps P459 — there is
+    no competing reference fragment to clobber here."""
+    from tools import sdc_sync
+
+    ref_no_qual = _item_statement(
+        "M999$refnoqual", "Q19652", references=[_dpla_reference()]
+    )
+    fake_entity = {"pageid": 999, "statements": {"P6216": [ref_no_qual]}}
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=fake_entity),
+        patch.object(sdc_sync, "add_det", return_value=None) as mock_add_det,
+    ):
+        result = sdc_sync.check("M999", ("item", "Q19652"), "P6216")
+    mock_add_det.assert_called_once_with("M999", "M999$refnoqual")
+    assert result == (None, "")
+
+
+def test_check_bare_string_match_defers_to_add_ref():
+    """The string branch has the same two-loop pattern as item: a bare match
+    (no qualifier, no reference) must defer to add_ref, not also queue add_det."""
+    from tools import sdc_sync
+
+    bare = _stmt("M999$str", "P760", "value", "abc123")
+    entity = {"pageid": 999, "statements": {"P760": [bare]}}
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "add_det", return_value=None) as mock_add_det,
+    ):
+        result = sdc_sync.check("M999", ("string", "abc123"), "P760")
+    mock_add_det.assert_not_called()
+    assert result == (False, "M999$str")
+
+
+def test_check_bare_monolingualtext_match_defers_to_add_ref():
+    """Same guard for the monolingualtext branch (titles/descriptions)."""
+    from tools import sdc_sync
+
+    bare = {
+        "id": "M999$ml",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P1476",
+            "datavalue": {
+                "value": {"text": "A Title", "language": "en"},
+                "type": "monolingualtext",
+            },
+        },
+    }
+    entity = {"pageid": 999, "statements": {"P1476": [bare]}}
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "add_det", return_value=None) as mock_add_det,
+    ):
+        result = sdc_sync.check("M999", ("monolingualtext", "A Title"), "P1476")
+    mock_add_det.assert_not_called()
+    assert result == (False, "M999$ml")
+
+
+def test_check_bare_time_match_defers_to_add_ref():
+    """Same guard for the time branch (P571) — flagged by CodeRabbit."""
+    from tools import sdc_sync
+
+    bare = {
+        "id": "M999$t",
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datavalue": {
+                "value": _time_value("+1945-01-01T00:00:00Z", 9),
+                "type": "time",
+            },
+        },
+    }
+    entity = {"pageid": 999, "statements": {"P571": [bare]}}
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "add_det", return_value=None) as mock_add_det,
+    ):
+        result = sdc_sync.check("M999", ("time", "+1945-01-01T00:00:00Z|P9"), "P571")
+    mock_add_det.assert_not_called()
+    assert result == (False, "M999$t")
 
 
 def test_check_no_matching_statement_adds_new():
