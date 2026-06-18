@@ -1,3 +1,4 @@
+{% raw %}
 # Pipeline Phases
 
 Four sequential phases per target. All four are idempotent — re-running picks up where it left off. All four operate per-partner, reading and writing under `s3://dpla-wikimedia/<partner>/images/<sharded-prefix>/<dpla-id>/` (see [sidecars.md](sidecars.md) for the path layout and file inventory).
@@ -201,3 +202,4 @@ The SDC phase resets the tracker at the start of `_run_partner_mode` so per-part
 | `downloader` | ⬇ | `wikimedia-<label>: starting downloader` |
 | `uploader` | ⬆ | `wikimedia-<label>: starting uploader` |
 | `sdc-sync` | 🔗 | `wikimedia-<label>: starting sdc-sync` |
+{% endraw %}

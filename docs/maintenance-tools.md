@@ -1,3 +1,4 @@
+{% raw %}
 # Maintenance Tools
 
 These tools sit alongside the four pipeline phases but are not part of the Slack-launched pipeline chain. They are invoked manually by operators (usually via SSM on EC2) for specific maintenance jobs.
@@ -247,3 +248,4 @@ aws ssm send-command \
 ```
 
 No Slack slash command exists for any of these — they're considered "operator-level" maintenance, and the operational friction of going through SSM is intentional.
+{% endraw %}

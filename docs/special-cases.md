@@ -1,3 +1,4 @@
+{% raw %}
 # Special Cases: Duplicate Detection, File Renames, CommonsDelinker
 
 The uploader carries the bulk of the pipeline's "what if Commons-side state doesn't match what I'm about to upload?" logic. This document covers:
@@ -252,3 +253,4 @@ UPLOADED and SKIPPED ordinals carry a `title` and `pageid` and are eligible for 
 ## Limitations
 
 **Duplicate detection is SHA1-only.** `find_file_by_hash` queries Commons' `allimages?sha1=...`, so the entire decision tree above keys on exact byte-for-byte hash matches. It does **not** catch visually-identical re-encodes: a different encoding of the same image produces different bytes → a different SHA1 → no match, so the uploader treats it as net-new (or uploads a new version over the existing title). This is known and accepted behavior, not a bug.
+{% endraw %}

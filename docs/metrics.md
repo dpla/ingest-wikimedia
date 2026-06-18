@@ -1,3 +1,4 @@
+{% raw %}
 # Metrics
 
 A separate, scheduled workflow tracks monthly pageview metrics for DPLA-uploaded files on Wikimedia Commons. This is independent of the ingest pipeline — it does not upload, does not move files, and does not call any of the four pipeline phases.
@@ -124,3 +125,4 @@ The only connection is the bot identity (`User:DPLA bot`), and `dpla-id-banlist.
 - **Removing a category** — remove `{{views from category}}` from its category page; the next `data` job will stop touching it. The Commons `Data:Views/<category>.tab` and `.chart` pages can be deleted manually if desired.
 - **Manual catch-up after a data outage** — trigger the workflow manually with `mode=data` (admin-only via GitHub Actions UI). The 120-minute timeout is sized for the full category set.
 - **Bot password rotation** — rotate `PYWIKIBOT_PASSWORD` in the repo's secret store. No code change needed.
+{% endraw %}

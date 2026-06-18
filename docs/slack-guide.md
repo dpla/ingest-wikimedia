@@ -1,3 +1,4 @@
+{% raw %}
 # Slack Guide
 
 Non-technical reference for triggering Wikimedia upload runs from Slack. Every command in this guide is something you type into a Slack channel; nothing here requires shell access or a GitHub login. For the full operations reference, see [operations.md](operations.md).
@@ -302,3 +303,4 @@ Re-downloads any S3 key older than 30 days. No uploads, no SDC sync. The complet
 | Scheduled status report (every 6 h, only when sessions active) | #tech-alerts |
 | `/wikimedia-upload retry` immediate response | Ephemeral to you |
 | `/wikimedia-upload refresh` download-complete summary | #tech-alerts |
+{% endraw %}

@@ -1,3 +1,4 @@
+{% raw %}
 # Wikimedia Upload Pipeline — Operations Guide
 
 This guide covers running, monitoring, and troubleshooting the DPLA Wikimedia upload pipeline. The pipeline uploads public-domain media from DPLA partner collections to Wikimedia Commons.
@@ -544,3 +545,4 @@ du -sh /home/ec2-user/ingest-wikimedia/*/logs/
 ```
 
 Old logs can be deleted safely — they are not read by the pipeline after the run completes.
+{% endraw %}

@@ -1,3 +1,4 @@
+{% raw %}
 # SDC Sync
 
 The `sdc-sync` phase reconciles each DPLA-uploaded Commons file's MediaInfo structured data against the per-item `sdc.json` envelope staged by `get-ids-es`. It is the only phase that talks to Commons' Wikibase API directly.
@@ -281,3 +282,4 @@ The hash-preserving merge is what keeps a P2699 backfill from re-stamping every 
 ### Regression test
 
 The shape contract — every hand-built dict in `wbeditentity`'s `data.claims` list that isn't a removal must carry `type: "statement"` AND `mainsnak` — is asserted by the regression test `test_flush_emits_type_statement_on_every_non_removal_fragment`. Tests that mock `_submit_sdc_write` don't catch this class of bug because they never inspect the actual payload shape; the regression test exercises a realistic mix of fragment kinds (new claim, qualifier amend, P813 refresh, removal) and asserts both fields are present on every non-removal entry of the bundle. New fragment builders should be added to the same scenario so the contract stays enforced.
+{% endraw %}
