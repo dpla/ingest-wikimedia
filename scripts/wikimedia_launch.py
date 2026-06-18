@@ -156,6 +156,29 @@ def _build_get_ids_command(
     return cmd + f" > {csv_file}"
 
 
+def _target_label(
+    canonical: str, institutions: tuple[str, ...], collection: str | None
+) -> str:
+    """Format a batch target as the pipe-separated string shown in Slack.
+
+    For a combined-institution target (multiple institutions from a single
+    QID under one hub), shows the first institution + a ``(+N more)`` hint —
+    the full list would blow up the Slack message width for QIDs with many
+    sub-institutions. A collection target is either institution-scoped
+    (``hub|institution|collection``) or hub-wide with an empty institution
+    slot (``hub||collection``).
+    """
+    if collection:
+        if institutions:
+            return f"`{canonical}|{institutions[0]}|{collection}`"
+        return f"`{canonical}||{collection}`"
+    if len(institutions) == 1:
+        return f"`{canonical}|{institutions[0]}`"
+    if institutions:
+        return f"`{canonical}|{institutions[0]} (+{len(institutions) - 1} more)`"
+    return f"`{canonical}`"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--partner", required=True)
@@ -949,24 +972,6 @@ def main() -> None:
     pipeline_cmd = f"{setup} && {{ {'; '.join(target_blocks)}; }}"
 
     if slack_token:
-
-        def _target_label(c: str, insts: tuple[str, ...], col: str | None) -> str:
-            """Format a batch target as the pipe-separated string shown in Slack.
-
-            For a combined-institution target (multiple institutions from a
-            single QID under one hub), shows the first institution + a
-            ``(+N more)`` hint — full list would blow up the Slack message
-            width for QIDs with many sub-institutions.
-            """
-            if col:
-                # Collection-level is always single-institution by construction.
-                return f"`{c}|{insts[0]}|{col}`"
-            if len(insts) == 1:
-                return f"`{c}|{insts[0]}`"
-            if insts:
-                return f"`{c}|{insts[0]} (+{len(insts) - 1} more)`"
-            return f"`{c}`"
-
         single_item_targets = [
             (c, lbl, did) for c, _, lbl, did, _ in targets if did is not None
         ]

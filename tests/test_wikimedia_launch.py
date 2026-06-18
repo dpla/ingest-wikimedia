@@ -343,3 +343,30 @@ def test_get_ids_command_single_id_takes_precedence():
     """--single-id re-stages via get-ids-es regardless of hub (incl. NARA)."""
     cmd = _build("nara", dpla_id="abc123")
     assert cmd == "get-ids-es nara --single-id abc123 > out.csv"
+
+
+def _label(canonical, institutions=(), collection=None):
+    import scripts.wikimedia_launch as launch_mod
+
+    return launch_mod._target_label(canonical, institutions, collection)
+
+
+def test_target_label_hub_wide_collection_does_not_crash():
+    """A hub-wide collection target (institutions=()) must render without an
+    IndexError on the Slack message path — it has no institution to index."""
+    assert _label("nara", collection="General Records") == "`nara||General Records`"
+
+
+def test_target_label_institution_collection():
+    assert _label("bpl", ("Boston Public Library",), "Maps") == (
+        "`bpl|Boston Public Library|Maps`"
+    )
+
+
+def test_target_label_single_and_multi_institution():
+    assert _label("bpl", ("A",)) == "`bpl|A`"
+    assert _label("bpl", ("A", "B", "C")) == "`bpl|A (+2 more)`"
+
+
+def test_target_label_hub_only():
+    assert _label("bpl") == "`bpl`"
