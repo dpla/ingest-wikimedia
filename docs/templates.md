@@ -1,3 +1,4 @@
+{% raw %}
 # Templates and the Lua Module
 
 How the pipeline uses Commons templates to display item metadata — and how the transition from the legacy `{{Artwork}}`-based wikitext to the SDC-backed `{{DPLA metadata}}` works.
@@ -146,3 +147,4 @@ A summary diagram:
 ```
 
 Step 3 of the lifecycle (the post-SDC cleanup pass) then strips the left branch's redundant params — once every param is stripped the file-page wikitext becomes a bare single-line `{{DPLA metadata}}` invocation plus the licensing template, and all displayed metadata comes from the SDC sync's writes via `Module:DPLA`. Between the SDC write and the strip, the explicit params and the SDC carry redundant copies of the same values; the cleanup pass runs in the same `sdc_sync` invocation by default.
+{% endraw %}

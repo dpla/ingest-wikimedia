@@ -1,3 +1,4 @@
+{% raw %}
 # S3 Sidecars
 
 The four pipeline phases communicate via JSON / text sidecar files in S3, plus the media bytes themselves. Every sidecar for a DPLA item lives under one prefix:
@@ -254,3 +255,4 @@ The phases hand off via these sidecars:
 | Download → SDC (separate pass) | `file-list.txt` | sdc-sync uses per-ordinal URL for `P2699` qualifier |
 
 This decoupling is what lets `sdc-sync` re-run independently of the other phases (the `sdc_only` mode), and lets `refresh-only` re-download without disturbing already-uploaded files.
+{% endraw %}

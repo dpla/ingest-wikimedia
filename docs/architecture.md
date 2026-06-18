@@ -1,3 +1,4 @@
+{% raw %}
 # Pipeline Architecture
 
 This document describes how an upload run flows from a Slack slash command through the dispatch chain into a long-running pipeline on EC2, and how the components fit together. For operator-level instructions (how to *use* the pipeline), see [slack-guide.md](slack-guide.md) and [operations.md](operations.md).
@@ -211,3 +212,4 @@ The downloader and uploader also handle per-item failures internally; they only 
 | Banlist | `ingest_wikimedia/banlist.py` + `dpla-id-banlist.txt` | Per-DPLA-ID skip list |
 
 The shared library (`ingest_wikimedia/`) is deliberately layered so `partners.py` is stdlib-only — the Lambda only needs that one module and `urllib`, no AWS SDK, no requests, no pywikibot. That keeps the Lambda cold-start fast.
+{% endraw %}
