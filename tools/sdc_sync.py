@@ -1017,6 +1017,21 @@ def check(mediaid, qid, prop):
             if statement["mainsnak"]["datavalue"]["value"]["id"] == qid[
                 1
             ] and not statement.get("qualifiers"):
+                if statement["id"] == ref:
+                    # This is the same statement loop 1 captured for
+                    # ref-stamping (no references, safe to amend). The caller
+                    # rewrites it as a full formattedclaim — mainsnak + P459
+                    # qualifier + DPLA reference — in one reference-update
+                    # fragment. Calling add_det too would queue a SECOND,
+                    # qualifier-only fragment for the same claim id, built from
+                    # the cached (still reference-less) statement; the dispatcher
+                    # concatenates it after the reference fragment, and
+                    # wbeditentity applies same-id fragments as wholesale
+                    # replacements in array order — so the qualifier fragment's
+                    # empty references silently erase the reference we just
+                    # added (the file then renders no license until a second
+                    # pass). Deferring to add_ref adds both in one fragment.
+                    return False, ref
                 return add_det(mediaid, statement["id"]), ref
 
         if any(
