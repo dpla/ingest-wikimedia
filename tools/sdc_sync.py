@@ -1082,6 +1082,13 @@ def check(mediaid, qid, prop):
                 if statement["mainsnak"]["datavalue"][
                     "value"
                 ] == target_value and not statement.get("qualifiers"):
+                    if statement["id"] == ref:
+                        # See the item branch: add_ref already rewrites this
+                        # statement as a full claim with the P459 qualifier and
+                        # the DPLA reference; also calling add_det would queue a
+                        # competing same-id qualifier-only fragment whose stale
+                        # empty references erase the reference. Defer to add_ref.
+                        return False, ref
                     return add_det(mediaid, statement["id"]), ref
 
         if any(
@@ -1126,6 +1133,13 @@ def check(mediaid, qid, prop):
                 if statement["mainsnak"]["datavalue"]["value"][
                     "text"
                 ] == target_value and not statement.get("qualifiers"):
+                    if statement["id"] == ref:
+                        # See the item branch: add_ref already rewrites this
+                        # statement as a full claim with the P459 qualifier and
+                        # the DPLA reference; also calling add_det would queue a
+                        # competing same-id qualifier-only fragment whose stale
+                        # empty references erase the reference. Defer to add_ref.
+                        return False, ref
                     return add_det(mediaid, statement["id"]), ref
 
         if any(
@@ -1246,6 +1260,13 @@ def check(mediaid, qid, prop):
             if _statement_value_time_matches(statement) and not statement.get(
                 "qualifiers"
             ):
+                if statement["id"] == ref:
+                    # See the item branch: add_ref already rewrites this
+                    # statement as a full claim with the P459 qualifier and the
+                    # DPLA reference; also calling add_det would queue a
+                    # competing same-id qualifier-only fragment whose stale empty
+                    # references erase the reference. Defer to add_ref.
+                    return False, ref
                 return add_det(mediaid, statement["id"]), ref
 
         if any(
