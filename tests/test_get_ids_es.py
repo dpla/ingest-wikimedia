@@ -69,22 +69,26 @@ def _invoke(*args: str):
         return runner.invoke(get_ids_es.main, list(args))
 
 
-def test_collection_requires_exactly_one_institution_zero():
-    """``--collection`` with no ``--institution`` must fail validation
-    (collection scoping is per-institution)."""
+def test_collection_without_institution_is_hub_wide():
+    """``--collection`` with no ``--institution`` is valid: the collection
+    is matched across every upload-eligible institution in the hub (some
+    collections span multiple institutions). It must pass validation and
+    reach the ID-generation path (the stubbed ``fetch_subjects_json``
+    sentinel proves it got past validation)."""
     result = _invoke(
         "bpl",
         "--collection",
         "Some Collection",
     )
-    assert result.exit_code == 1, result.output
-    assert "exactly one --institution" in result.output
+    assert isinstance(result.exception, RuntimeError)
+    assert "stop-after-validation" in str(result.exception)
 
 
-def test_collection_requires_exactly_one_institution_many():
-    """``--collection`` with multiple ``--institution`` values must fail
-    validation — combining a collection scope across institutions is
-    not meaningful."""
+def test_collection_with_multiple_institutions_passes():
+    """``--collection`` combined with multiple ``--institution`` values is
+    accepted at the tool level — the ES query simply ANDs the collection
+    with the institution set. (The launch script restricts pipe-target
+    SYNTAX to zero or one institution; the tool itself is permissive.)"""
     result = _invoke(
         "bpl",
         "--institution",
@@ -94,8 +98,15 @@ def test_collection_requires_exactly_one_institution_many():
         "--collection",
         "Some Collection",
     )
+    assert isinstance(result.exception, RuntimeError)
+    assert "stop-after-validation" in str(result.exception)
+
+
+def test_collection_empty_string_rejected():
+    """An empty ``--collection`` value is still rejected."""
+    result = _invoke("bpl", "--collection", "   ")
     assert result.exit_code == 1, result.output
-    assert "exactly one --institution" in result.output
+    assert "--collection cannot be empty" in result.output
 
 
 def test_multiple_institutions_pass_validation_and_combine():

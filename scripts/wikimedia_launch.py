@@ -8,8 +8,11 @@ all targets run sequentially), and posts a Slack confirmation to #tech-alerts.
 
 Each target in --partner is a hub slug ("bpl"), a hub|institution pair
 ("indiana|Indiana State Library"), a hub|institution|collection triple
-("bpl|Digital Commonwealth|Boston City Archives"), a Wikidata QID ("Q1234567"),
-or a 32-hex-char DPLA item ID ("abc123def456789012345678901234ab").  Multiple
+("bpl|Digital Commonwealth|Boston City Archives"), a hub||collection triple with
+an empty institution slot ("nara||General Records of the United States
+Government") that matches the collection across every upload-eligible
+institution in the hub, a Wikidata QID ("Q1234567"), or a 32-hex-char DPLA item
+ID ("abc123def456789012345678901234ab").  Multiple
 targets run sequentially in one tmux session; a failing target posts a Slack
 error and continues with the next target.
 
@@ -118,6 +121,39 @@ def _slack_fail(response_url: str, msg: str, *, operational: bool = False) -> No
             except Exception as e:
                 logging.warning("Fallback post to #tech-alerts also failed: %s", e)
     sys.exit(1)
+
+
+def _build_get_ids_command(
+    canonical: str,
+    institutions: tuple[str, ...],
+    collection: str | None,
+    dpla_id: str | None,
+    csv_file: str,
+) -> str:
+    """Build the get-ids command that stages the ID CSV for one target.
+
+    Routing rules:
+    - A ``--single-id`` target re-runs get-ids-es so dpla-map.json and sdc.json
+      are restaged with the current mapping code before download/upload/sync.
+    - Hub-level NARA with no institution and no collection uses get-ids-nara
+      (its bespoke NARA catalog walk). A NARA *collection* target (e.g.
+      ``nara||General Records…``) must instead go through get-ids-es, which is
+      the only path that filters on ``sourceResource.collection.title``.
+    - Every other target uses get-ids-es, repeating ``--institution`` per
+      resolved name (ORed in the ES dataProvider filter) and adding
+      ``--collection`` when set. Omitting ``--institution`` matches the
+      collection across every upload-eligible institution in the hub.
+    """
+    if dpla_id is not None:
+        return f"get-ids-es {canonical} --single-id {shlex.quote(dpla_id)} > {csv_file}"
+    if canonical == "nara" and not institutions and collection is None:
+        return f"get-ids-nara > {csv_file}"
+    cmd = f"get-ids-es {canonical}"
+    for inst in institutions:
+        cmd += f" --institution {shlex.quote(inst)}"
+    if collection is not None:
+        cmd += f" --collection {shlex.quote(collection)}"
+    return cmd + f" > {csv_file}"
 
 
 def main() -> None:
@@ -243,10 +279,11 @@ def main() -> None:
         #                     uploader, one sdc-sync — so the operator sees
         #                     one tmux session and one set of Slack
         #                     notifications instead of N chained sessions.
-        if collection is not None and len(institutions) != 1:
+        if collection is not None and len(institutions) > 1:
             skipped_warnings.append(
-                f"Collection '{collection}' requires exactly one institution"
-                " (collection scoping is per-institution)."
+                f"Collection '{collection}' cannot be combined with multiple"
+                " institutions. Use one institution (hub|institution|collection)"
+                " or none (hub||collection, matched across the whole hub)."
             )
             return
         stripped: list[str] = []
@@ -277,8 +314,11 @@ def main() -> None:
                     f"'{canonical}': not upload-eligible per institutions_v2.json."
                 )
                 return
-        if collection is not None:
+        if collection is not None and institutions:
             target_str = f"{canonical}|{institutions[0]}|{collection}"
+        elif collection is not None:
+            # Hub-wide collection: empty institution slot (hub||collection).
+            target_str = f"{canonical}||{collection}"
         elif len(institutions) == 1:
             target_str = f"{canonical}|{institutions[0]}"
         elif institutions:
@@ -326,9 +366,13 @@ def main() -> None:
                     f"'{target_str}': collection name normalizes to an empty slug."
                 )
                 return
-            label = f"{canonical}+{inst_label}+{coll_label}"
+            # Hub-wide collection has no institution slug (inst_label is None,
+            # filtered out below) → hub+collection; the session-label parser
+            # treats the collection slug as the hub's suffix, same shape as an
+            # institution slug.
+            label = "+".join(p for p in (canonical, inst_label, coll_label) if p)
         else:
-            label = f"{canonical}+{inst_label}" if inst_label is not None else canonical
+            label = "+".join(p for p in (canonical, inst_label) if p)
         if label in seen_session_labels:
             skipped_warnings.append(
                 f"'{target_str}': normalizes to the same session label ('{label}') as a previous target."
@@ -386,9 +430,17 @@ def main() -> None:
                 continue
             if len(token_parts) == 3:
                 _, institution, collection = token_parts
-                _add_target(
-                    canonical, institutions=(institution,), collection=collection
-                )
+                if institution.strip() == "":
+                    # hub||collection — empty institution slot means "match the
+                    # collection across every upload-eligible institution in the
+                    # hub" (some collections span multiple institutions). No real
+                    # item has an empty institution, so the empty slot is
+                    # unambiguous.
+                    _add_target(canonical, institutions=(), collection=collection)
+                else:
+                    _add_target(
+                        canonical, institutions=(institution,), collection=collection
+                    )
             else:
                 _, institution = token_parts
                 _add_target(canonical, institutions=(institution,))
@@ -689,20 +741,21 @@ def main() -> None:
             elif collection is not None:
                 # Collection-level request conflicts with:
                 #   1. An existing hub-level session for the same hub
-                #   2. An existing institution-level session for the same institution
-                #      (the collection is a subset; running both simultaneously would
-                #      duplicate work, though it is technically idempotent)
+                #   2. An existing institution-level session for the institution the
+                #      collection is scoped to (the collection is a subset; running
+                #      both duplicates work, though it is technically idempotent)
                 #   3. An existing session for the exact same collection label
                 # A collection does NOT conflict with a different collection from the
                 # same institution — those are independent, disjoint subsets.
-                # ``institutions`` is exactly one element when collection is set
-                # (enforced by _add_target).
-                inst_label = f"{canonical}+{_slugify(institutions[0])}"
+                # A hub-wide collection (hub||collection) has no single institution
+                # — ``institutions`` is empty — so only the hub-level and exact-label
+                # conflicts apply.
                 conflicts_this = (
-                    canonical in existing_labels
-                    or inst_label in existing_labels
-                    or label in existing_labels
+                    canonical in existing_labels or label in existing_labels
                 )
+                if institutions:
+                    inst_label = f"{canonical}+{_slugify(institutions[0])}"
+                    conflicts_this = conflicts_this or inst_label in existing_labels
             elif dpla_id is None:
                 # Institution-level (or multi-institution-combined) requests
                 # conflict with:
@@ -817,34 +870,9 @@ def main() -> None:
         # Use a per-target CSV filename so concurrent institution-level and
         # collection-level sessions don't clobber each other's ID lists.
         csv_file = f"{session_label}.csv"
-        if dpla_id is not None:
-            # Single-item target: re-run get-ids-es in ``--single-id`` mode so
-            # dpla-map.json AND sdc.json are staged with the latest mapping
-            # code before the downloader/uploader/sdc-sync chain reads them.
-            # Without this re-staging, sdc-sync would diff against whatever
-            # sdc.json the partner's last full run produced — silently missing
-            # any subsequent ingest_wikimedia.sdc changes (e.g. PR #279's
-            # opportunistic date parsing, PR #278's NARA stdlib XML).
-            # ``resolve-dpla-ids`` (the pre-launch eligibility check) is
-            # still useful because it short-circuits ineligible IDs with a
-            # clean Slack message before the tmux session is even launched,
-            # but the per-item S3 staging it does is superseded here.
-            get_ids_cmd = (
-                f"get-ids-es {canonical}"
-                f" --single-id {shlex.quote(dpla_id)} > {csv_file}"
-            )
-        elif canonical == "nara" and not institutions:
-            get_ids_cmd = f"get-ids-nara > {csv_file}"
-        else:
-            get_ids_cmd = f"get-ids-es {canonical}"
-            # ``--institution`` is repeated per name when the QID resolved
-            # to multiple institutions under this hub; get-ids-es ORs them
-            # in the Elasticsearch dataProvider filter.
-            for inst in institutions:
-                get_ids_cmd += f" --institution {shlex.quote(inst)}"
-            if collection is not None:
-                get_ids_cmd += f" --collection {shlex.quote(collection)}"
-            get_ids_cmd += f" > {csv_file}"
+        get_ids_cmd = _build_get_ids_command(
+            canonical, institutions, collection, dpla_id, csv_file
+        )
         # Export the session label (and single-item flag) before the group so the
         # failure handler and logging have the correct context even if cd itself fails.
         # WIKIMEDIA_SINGLE_ITEM must be explicitly unset for hub targets so that it

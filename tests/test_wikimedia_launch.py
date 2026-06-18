@@ -293,3 +293,53 @@ def test_workers_budget_zero_is_accepted(capsys):
     assert "Invalid --workers-budget value" not in err, (
         f"--workers-budget 0 must pass the budget gate, not trip it; got: {err!r}"
     )
+
+
+def _build(canonical, institutions=(), collection=None, dpla_id=None):
+    import scripts.wikimedia_launch as launch_mod
+
+    return launch_mod._build_get_ids_command(
+        canonical, institutions, collection, dpla_id, "out.csv"
+    )
+
+
+def test_get_ids_command_nara_hub_uses_get_ids_nara():
+    """Hub-level NARA with no institution/collection takes the bespoke
+    get-ids-nara catalog walk."""
+    assert _build("nara") == "get-ids-nara > out.csv"
+
+
+def test_get_ids_command_nara_collection_routes_to_get_ids_es():
+    """A NARA *collection* target (nara||collection) must go through
+    get-ids-es — get-ids-nara has no collection filter and would silently
+    ingest the entire hub instead of the requested collection."""
+    cmd = _build("nara", collection="General Records of the United States Government")
+    assert cmd.startswith("get-ids-es nara")
+    assert "get-ids-nara" not in cmd
+    assert "--collection 'General Records of the United States Government'" in cmd
+    assert "--institution" not in cmd
+
+
+def test_get_ids_command_hub_wide_collection_omits_institution():
+    """Hub-wide collection on a non-NARA hub: --collection with no
+    --institution, matched across every eligible institution."""
+    cmd = _build("bpl", collection="Maps")
+    assert cmd == "get-ids-es bpl --collection Maps > out.csv"
+
+
+def test_get_ids_command_institution_collection_combines_both():
+    cmd = _build("bpl", institutions=("Boston Public Library",), collection="Maps")
+    assert cmd == (
+        "get-ids-es bpl --institution 'Boston Public Library' --collection Maps > out.csv"
+    )
+
+
+def test_get_ids_command_multiple_institutions_repeat_flag():
+    cmd = _build("bpl", institutions=("A", "B"))
+    assert cmd == "get-ids-es bpl --institution A --institution B > out.csv"
+
+
+def test_get_ids_command_single_id_takes_precedence():
+    """--single-id re-stages via get-ids-es regardless of hub (incl. NARA)."""
+    cmd = _build("nara", dpla_id="abc123")
+    assert cmd == "get-ids-es nara --single-id abc123 > out.csv"

@@ -177,8 +177,11 @@ def build_query(
     "--collection",
     default=None,
     help=(
-        "Restrict to items in a specific collection title. Requires exactly"
-        " one --institution (collection scoping is per-institution)."
+        "Restrict to items in a specific collection title. Combine with"
+        " --institution to scope the collection to specific institution(s);"
+        " omit --institution to match the collection across every"
+        " upload-eligible institution in the hub (some collections span"
+        " multiple institutions)."
     ),
 )
 @click.option(
@@ -238,13 +241,10 @@ def main(
         if not collection:
             print("--collection cannot be empty.", file=sys.stderr)
             sys.exit(1)
-        if len(institutions) != 1:
-            print(
-                "--collection requires exactly one --institution to be specified"
-                " (collection scoping is per-institution).",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        # No institution-count requirement: a collection can be scoped to one
+        # or more --institution flags, or left hub-wide (no --institution), in
+        # which case it is matched across every upload-eligible institution in
+        # the hub. Some DPLA collections span multiple institutions.
 
     try:
         DPLA.check_partner(partner)

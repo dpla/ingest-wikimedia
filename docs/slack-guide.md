@@ -83,6 +83,16 @@ Use `hub|institution|collection` to scope down to a single named collection with
 
 The collection name must match exactly what appears in `sourceResource.collection.title` for items in DPLA's index. If you're not sure of the exact string, run an institution-level upload instead — extra items are skipped at item level by eligibility, so over-scoping is cheap.
 
+### Hub-wide collections (cross-institution)
+
+Not every collection belongs to a single institution — some span multiple `dataProvider`s under one hub (NARA record groups are the common case: e.g. *General Records of the United States Government* sits under "National Archives at Washington, DC — Textual Reference," not "College Park"). To match a collection across **every** upload-eligible institution in the hub, leave the institution slot empty — `hub||collection` (two pipes, nothing between them):
+
+```text
+/wikimedia-upload "nara||General Records of the United States Government"
+```
+
+This matches the collection title across all of the hub's eligible institutions, so you don't have to know — or guess — which `dataProvider` holds it. (No real item has an empty institution, so the empty slot is unambiguous.) The standard item-level eligibility filters — rights and a usable media asset — still apply, so over-scoping remains cheap. The two-pipe form is required: `hub|collection` would be read as `hub|institution` and can't be distinguished from one.
+
 ## 4. Wikidata QID
 
 If you know a hub's or institution's Wikidata QID, pass it instead of a slug. The launcher resolves QIDs against `institutions_v2.json`:
