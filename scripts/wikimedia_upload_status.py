@@ -499,7 +499,14 @@ def main() -> None:
             print("Posted idle status to Slack.")
         return
 
-    results: dict[str, str] = {}
+    # Maps original session name → (display_id, phase) pair. ``fetch``
+    # now returns ``display_id`` (the active label) as the first
+    # element, distinct from the tmux session name we used to index
+    # by, so the session-name → result mapping is rebuilt here from
+    # the ``futures`` dict (which remembers the submitting session for
+    # each future) to preserve the order of the original ``tmux ls``
+    # output in the Slack readout.
+    results: dict[str, tuple[str, str]] = {}
 
     def fetch(session: str) -> tuple[str, str]:
         suffix = session.removeprefix("wikimedia-")
@@ -598,13 +605,14 @@ def main() -> None:
         slots_future = executor.submit(_format_slots_line, ssm)
         futures = {executor.submit(fetch, s): s for s in sessions}
         for future in as_completed(futures):
-            session, phase = future.result()
-            results[session] = phase
-            print(f"{session}: {phase}")
+            session = futures[future]
+            display_id, phase = future.result()
+            results[session] = (display_id, phase)
+            print(f"{display_id}: {phase}")
         memory_line = _format_memory_line(memory_future.result())
         slots_line = slots_future.result()
 
-    rows = [(s, results[s]) for s in sessions if s in results]
+    rows = [results[s] for s in sessions if s in results]
     post_to_slack(token, rows, memory_line=memory_line, slots_line=slots_line)
     print("Posted to Slack.")
 

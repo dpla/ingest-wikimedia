@@ -824,3 +824,68 @@ def test_post_to_slack_payload_contains_multiple_section_blocks_for_busy_day():
     for block in section_blocks:
         assert block["text"]["text"].strip(), "Empty section block emitted"
     assert json.dumps(payload)
+
+
+def test_main_rows_use_display_id_from_fetch_not_session_name():
+    """Regression: ``fetch()`` returns ``(display_id, phase)`` where
+    ``display_id`` is the active label, NOT the tmux session name. The
+    rows-construction in ``main()`` must therefore key the
+    intermediate results dict by session name (so ``sessions``-ordered
+    lookup works), not by the display id returned from ``fetch``.
+
+    Without this mapping the payload's rows are empty — caught by
+    CodeRabbit on PR #328 after the first push of the refactor."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import main
+
+    sessions_out = "wikimedia-bpl+phillips-academy: 1 windows\n"
+    captured, fake_post = _capture_slack_post()
+
+    # Patch the helpers ``fetch`` calls so the real ``fetch`` returns
+    # a deterministic ``(label, phase)`` pair where label differs from
+    # the session name. The real ThreadPoolExecutor runs, so we
+    # exercise the actual row-construction path.
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok-xxx", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch(
+            "scripts.wikimedia_upload_status.ssm_run",
+            return_value=sessions_out,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status._format_slots_line",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.find_active_label",
+            return_value=("bpl+phillips-academy", 1700000000),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            return_value=("Uploading (1 / 1, ~100.0%)", 1700000000),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.requests.post",
+            side_effect=fake_post,
+        ),
+    ):
+        main()
+
+    payload = captured["payload"]
+    section_blocks = [b for b in payload["blocks"] if b.get("type") == "section"]
+    assert section_blocks, (
+        "Slack post must include at least one section block — empty "
+        "rows would indicate the session-name → display-id mapping is "
+        "broken (the bug CodeRabbit caught on PR #328)."
+    )
+    text = section_blocks[0]["text"]["text"]
+    assert "bpl+phillips-academy" in text
+    assert "Uploading" in text
