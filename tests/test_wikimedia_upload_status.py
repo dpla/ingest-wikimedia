@@ -590,3 +590,237 @@ def test_format_slots_line_none_when_lslocks_absent():
 
     with patch("scripts.wikimedia_upload_status.ssm_run", return_value="NODATA\n"):
         assert _format_slots_line(object()) is None
+
+
+# ---------------------------------------------------------------------------
+# find_active_label — single-SSM-call refactor of the per-label walk
+
+
+def test_find_active_label_picks_freshest_log_across_labels():
+    """Returns the label whose log was most recently modified. The single
+    SSM call returns ``<mtime> <filename>`` for the freshest match; the
+    helper parses out the label."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import find_active_label
+
+    # Latest-mtime log file in the partner dir is the upload log for
+    # bpl+phillips-academy. The helper should pick that label.
+    with patch(
+        "scripts.wikimedia_upload_status.ssm_run",
+        return_value="1700005000.000000000 20260528-091047-bpl+phillips-academy-upload.log",
+    ):
+        result = find_active_label(
+            client=None,
+            labels=["bpl+phillips-academy", "bpl+boston-city-archives"],
+        )
+    assert result is not None
+    label, mtime = result
+    assert label == "bpl+phillips-academy"
+    assert mtime == 1700005000
+
+
+def test_find_active_label_returns_none_when_no_logs_match():
+    """An empty ``find`` output (no log files for any label yet) returns
+    ``None`` so the caller can report ``Generating IDs`` for a brand-new
+    session that hasn't yet written any downstream phase log."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import find_active_label
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value=""):
+        result = find_active_label(client=None, labels=["bpl+phillips-academy"])
+    assert result is None
+
+
+def test_find_active_label_returns_none_for_empty_label_list():
+    """Defensive: empty label list short-circuits without an SSM round
+    trip. The helper is reached only via `parse_session_labels`, which
+    can return an empty list on a malformed session name."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import find_active_label
+
+    with patch("scripts.wikimedia_upload_status.ssm_run") as ssm:
+        result = find_active_label(client=None, labels=[])
+    assert result is None
+    assert not ssm.called, "Empty label list must skip the SSM round trip"
+
+
+def test_find_active_label_groups_multi_hub_labels_into_single_find():
+    """Regression: when labels span multiple hubs (the multi-institution
+    batch case that motivated this refactor), the helper issues exactly
+    one SSM round trip whose ``find`` invocation lists every relevant
+    partner log directory. The previous design called
+    ``get_phase_and_progress`` per label — O(labels) round trips."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import find_active_label
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        return "1700000000.0 20260528-091047-bpl+phillips-academy-upload.log"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        find_active_label(
+            client=None,
+            labels=[
+                "bpl+phillips-academy",
+                "nara+ronald-reagan-library",
+                "texas+harrison-county-historical-museum",
+            ],
+        )
+    assert len(captured) == 1, "Multi-hub labels must use one SSM round trip"
+    cmd = captured[0]
+    # All three hubs' log directories should appear in the single find expression.
+    assert "bpl/logs" in cmd
+    assert "nara/logs" in cmd
+    assert "texas/logs" in cmd
+
+
+def test_find_active_label_picks_active_when_earlier_label_aborted():
+    """Regression analog of the pre-refactor ``main_picks_latest_active_label``
+    test: an earlier label whose phase aborted without a COUNTS marker
+    must NOT eclipse a later label whose phase is currently progressing.
+
+    Under the new design, ``find_active_label`` resolves this purely by
+    log-mtime: the aborted phase's last log write is hours stale, the
+    active phase's was seconds ago. The freshest log file wins, and
+    that's the active label."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import find_active_label
+
+    # ``find ... | sort -rn | head -1`` returns the highest-mtime line;
+    # we just have to feed it that one line. The active CFLA SDC log
+    # would be ranked above the aborted Clinton SDC log because its
+    # mtime is later.
+    with patch(
+        "scripts.wikimedia_upload_status.ssm_run",
+        return_value="1700018000.0 20260528-140954-nara+center-for-legislative-archives-sdc.log",
+    ):
+        result = find_active_label(
+            client=None,
+            labels=[
+                "nara+william-j-clinton-library",
+                "nara+dwight-d-eisenhower-library",
+                "nara+center-for-legislative-archives",
+            ],
+        )
+    assert result is not None
+    label, _ = result
+    assert label == "nara+center-for-legislative-archives", (
+        "Active later label must win the freshest-log selection"
+    )
+
+
+def test_find_active_label_rejects_filename_not_in_label_list():
+    """Defensive: if the ``find`` regex's alternation somehow returns a
+    label that isn't in ``labels`` (regex prefix collision in a edge
+    case), the helper returns ``None`` rather than reporting a stray
+    label."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import find_active_label
+
+    with patch(
+        "scripts.wikimedia_upload_status.ssm_run",
+        return_value="1700000000.0 20260528-091047-some+other-hub-upload.log",
+    ):
+        result = find_active_label(client=None, labels=["bpl+phillips-academy"])
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Slack output safety — multi-block splitting
+
+
+def _capture_slack_post():
+    """Build a ``(captured, fake_post)`` pair for the ``post_to_slack``
+    integration tests. Each test only needs to read one or two fields
+    off the captured payload, so a tiny mock that stashes the body is
+    sufficient — no full ``requests.Response`` surface needed."""
+
+    class _R:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ok": True}
+
+    captured: dict[str, object] = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return _R()
+
+    return captured, fake_post
+
+
+def test_format_rows_into_blocks_single_block_when_under_limit():
+    from scripts.wikimedia_upload_status import _format_rows_into_blocks
+
+    rows = [
+        ("bpl+phillips-academy", "Uploading (10 / 100 items, ~10.0%)"),
+        ("nara+ronald-reagan-library", "SDC syncing (5 / 50, ~10.0%)"),
+    ]
+    blocks = _format_rows_into_blocks(rows)
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "section"
+    assert "bpl+phillips-academy" in blocks[0]["text"]["text"]
+    assert "nara+ronald-reagan-library" in blocks[0]["text"]["text"]
+
+
+def test_format_rows_into_blocks_splits_when_over_block_limit():
+    """If the total text would exceed a single block's char budget,
+    rows are spread across multiple section blocks rather than
+    triggering Slack's ``invalid_blocks`` rejection."""
+    from scripts.wikimedia_upload_status import (
+        _SLACK_BLOCK_SOFT_LIMIT,
+        _format_rows_into_blocks,
+    )
+
+    # Build enough rows that the cumulative text definitely exceeds one
+    # block's budget. Each row formats to ~100 chars; 50 rows clears
+    # the soft limit even with the active-label display ids.
+    rows = [(f"session-{i:03d}", "Uploading (1 / 1)" * 5) for i in range(50)]
+    blocks = _format_rows_into_blocks(rows)
+    assert len(blocks) >= 2, "Many rows must split into multiple blocks"
+    for block in blocks:
+        assert block["type"] == "section"
+        assert len(block["text"]["text"]) <= _SLACK_BLOCK_SOFT_LIMIT, (
+            "Each block's text must stay under the per-block limit"
+        )
+
+
+def test_post_to_slack_payload_contains_multiple_section_blocks_for_busy_day():
+    """End-to-end: many rows produce a valid payload with multiple
+    section blocks (header + N sections + optional context), each
+    section well under Slack's per-block char limit."""
+    import json
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import (
+        _SLACK_BLOCK_SOFT_LIMIT,
+        post_to_slack,
+    )
+
+    rows = [(f"session-{i:03d}", "Uploading (1 / 1)" * 5) for i in range(60)]
+    captured, fake_post = _capture_slack_post()
+    with patch("scripts.wikimedia_upload_status.requests.post", side_effect=fake_post):
+        post_to_slack("tok-xxx", rows)
+
+    payload = captured["payload"]
+    assert payload["channel"] == "C02HEU2L3"
+    assert payload["text"] == "Wikimedia Upload Status"
+    section_blocks = [b for b in payload["blocks"] if b.get("type") == "section"]
+    assert len(section_blocks) >= 2, "Busy day should produce multiple section blocks"
+    for block in section_blocks:
+        assert len(block["text"]["text"]) <= _SLACK_BLOCK_SOFT_LIMIT
+    for block in section_blocks:
+        assert block["text"]["text"].strip(), "Empty section block emitted"
+    assert json.dumps(payload)
