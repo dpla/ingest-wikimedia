@@ -47,7 +47,12 @@ from concurrent.futures import ThreadPoolExecutor
 import click
 
 from ingest_wikimedia.banlist import Banlist
-from ingest_wikimedia.dpla import DPLA
+from ingest_wikimedia.common import get_dict, get_list
+from ingest_wikimedia.dpla import (
+    DC_TITLE_FIELD_NAME,
+    DPLA,
+    SOURCE_RESOURCE_FIELD_NAME,
+)
 from ingest_wikimedia.partners import PARTNER_HUBS
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
@@ -66,6 +71,7 @@ from ingest_wikimedia.staging import (
     stage_item_to_s3,
     stage_sdc_to_s3,
 )
+from ingest_wikimedia.wikimedia import get_page_title
 
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 10
@@ -80,6 +86,46 @@ IS_SHOWN_AT_FIELD = "isShownAt"
 IIIF_DERIVABLE_ISSHOWNAT_PATTERNS = [
     "*/cdm/ref/collection/*/id/*",  # CONTENTdm
 ]
+
+# Characters stripped from the start of a title before case-folded sort.
+# Without this, ASCII-sort puts every quote-wrapped title (`"YOU BET I'M ..."`)
+# and every paren-wrapped title (`(Title Index ...)`) ahead of every alphabetic
+# title — which buries the "this is alphabetical" intuition the sort is meant
+# to provide. Strip leading punctuation so the first letter dominates ordering.
+_TITLE_SORT_STRIP = " \"'(<[-_."
+
+
+def _title_sort_key(source: dict, dpla_id: str) -> str:
+    """Return a sort key approximating Commons file-name alphabetical order.
+
+    Built from the same ``get_page_title`` the uploader uses, so the sort
+    order matches the actual Commons title prefix exactly (including all
+    its character normalisations: ``:`` → ``-``, ``[`` → ``(``, etc.).
+
+    Multi-ordinal items stay grouped because all their ordinals share the
+    same title prefix and only the ``(page N)`` suffix differs — and the
+    uploader iterates ordinals 1..N in numeric order within each item.
+
+    Items with no ``sourceResource.title`` cluster at the prefix Commons
+    would actually generate for them (which is just the DPLA-ID-only
+    suffix), keeping their position predictable rather than scattering.
+    Ties on the title prefix fall back to ``dpla_id`` for stable order.
+    """
+    # Same title selection the uploader uses (titles[0] of
+    # sourceResource.title), so the sort prefix matches the actual
+    # Commons file name exactly.
+    titles = get_list(get_dict(source, SOURCE_RESOURCE_FIELD_NAME), DC_TITLE_FIELD_NAME)
+    title = titles[0] if titles else ""
+    # ``get_list`` only validates the OUTER container — non-string list
+    # elements (e.g. ``["title", 42]``) still pass through. Coerce to "" so
+    # ``get_page_title``'s slice (``item_title[:181]``) doesn't crash on
+    # malformed records.
+    if not isinstance(title, str):
+        title = ""
+    full = get_page_title(title, dpla_id, "", page=None)
+    # Strip the ' - DPLA - <id>' suffix so the human-readable prefix dominates.
+    prefix = full.rsplit(" - DPLA - ", 1)[0]
+    return prefix.casefold().lstrip(_TITLE_SORT_STRIP) + "\x00" + dpla_id
 
 
 def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
@@ -299,6 +345,11 @@ def main(
     # internally but pre-deduping bounds phase-1 memory by unique subjects
     # rather than total occurrences across the hub.
     dpla_ids: list[str] = []
+    # Parallel list to dpla_ids: sort key per ID, used only to order the
+    # final IDs CSV by Commons-title alphabetical order. Populated during
+    # phase 1 while ``source`` is still in scope; we'd otherwise have to
+    # re-read every dpla-map.json from S3 just to recover the title.
+    sort_keys: list[str] = []
     subject_queries: set[tuple[str, str]] = set()
 
     # Single-ID mode: pre-check the banlist BEFORE the ES round-trip so the
@@ -394,9 +445,8 @@ def main(
                 future.add_done_callback(_on_s3_done(dpla_id))
 
                 dpla_ids.append(dpla_id)
+                sort_keys.append(_title_sort_key(source, dpla_id))
                 subject_queries.update(collect_subject_queries(source))
-
-                print(dpla_id)
 
             if single_id is not None:
                 # No pagination — single-id mode is a one-shot lookup.
@@ -509,6 +559,15 @@ def main(
     if sdc_failed[0]:
         print(f"Error: {sdc_failed[0]} sdc.json writes failed", file=sys.stderr)
         raise SystemExit(1)
+
+    # Emit the IDs CSV sorted by Commons title prefix so downloader,
+    # uploader, and sdc-sync all process items in human-readable alphabetic
+    # order. Sorting is done at the very end (after staging completes) so a
+    # mid-run crash never produces a partial-but-misleading CSV; the launch
+    # script chains phases with ``&&`` so the CSV is only consumed when this
+    # tool exits cleanly anyway.
+    for _, dpla_id in sorted(zip(sort_keys, dpla_ids)):
+        print(dpla_id)
 
 
 if __name__ == "__main__":
