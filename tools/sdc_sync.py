@@ -2698,8 +2698,6 @@ def _build_reference_refresh_fragments(mediaid, dpla_id, already_touched_ids):
     only when the bundle is otherwise non-empty) — so a file where every DPLA
     reference is already canonical gets no spurious edit.
     """
-    import copy as _copy
-
     # One date for the whole file's rebuilds, so fragments built either side
     # of a UTC midnight boundary still agree on the retrieved date.
     today = datetime.date.today()
@@ -2741,9 +2739,9 @@ def _build_reference_refresh_fragments(mediaid, dpla_id, already_touched_ids):
                     {
                         "id": stmt_id,
                         "type": "statement",
-                        "mainsnak": _copy.deepcopy(stmt["mainsnak"]),
+                        "mainsnak": copy.deepcopy(stmt["mainsnak"]),
                         "rank": stmt.get("rank", "normal"),
-                        "qualifiers": _copy.deepcopy(stmt.get("qualifiers") or {}),
+                        "qualifiers": copy.deepcopy(stmt.get("qualifiers") or {}),
                         "references": new_refs,
                     }
                 )
