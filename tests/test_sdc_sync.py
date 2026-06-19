@@ -3808,6 +3808,40 @@ def test_coalesce_merges_reference_and_qualifier_fragments_for_one_id():
     assert merged["references"] == [dpla_ref]
 
 
+def test_coalesce_does_not_resurrect_removed_qualifier():
+    """If the edit intends to delete a qualifier (its hash is in
+    removed_qualifier_hashes_by_id), the union must not re-add it even when a
+    colliding fragment still carries that stale snak — otherwise the merge
+    would undo an authoritative qualifier removal."""
+    from tools import sdc_sync
+
+    stale = {
+        "hash": "deadbeef",
+        "snaktype": "value",
+        "property": "P1545",
+        "datavalue": {"type": "string", "value": "A2"},
+    }
+    reduced = {
+        "id": "M1$q",
+        "type": "statement",
+        "mainsnak": {"property": "P275"},
+        "qualifiers": {"P459": _dpla_p459()},
+    }
+    stale_carrier = {
+        "id": "M1$q",
+        "type": "statement",
+        "mainsnak": {"property": "P275"},
+        "qualifiers": {"P459": _dpla_p459(), "P1545": [stale]},
+    }
+
+    out = sdc_sync._coalesce_same_id_fragments(
+        [reduced, stale_carrier], {"M1$q": {"deadbeef"}}
+    )
+    assert len(out) == 1
+    assert "P1545" not in out[0]["qualifiers"]  # removed snak not resurrected
+    assert "P459" in out[0]["qualifiers"]
+
+
 def test_coalesce_dedupes_identical_references_ignoring_hash():
     """Two fragments carrying the same reference (one with a server hash,
     one without) merge to a single reference, not a duplicate."""
