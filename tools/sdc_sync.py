@@ -627,7 +627,7 @@ def formattedclaim(prop, value, value_type, dpla_id):
     # retrieved date. ``_is_dpla_reference`` keys on the P123 publisher
     # snak to recognise this reference shape on read-back.
     ref_url = pywikibot.Claim(site, "P854", is_reference=True)
-    ref_url.setTarget(f"https://dp.la/item/{dpla_id}")
+    ref_url.setTarget(_dpla_item_url(dpla_id))
     ref_publisher = pywikibot.Claim(site, "P123", is_reference=True)
     ref_publisher.setTarget(pywikibot.ItemPage(repo, "Q2944483"))
     today = datetime.date.today()
@@ -2500,7 +2500,7 @@ def _submit_per_item_edit(
     # lacks this field, and atomicity means one malformed fragment
     # silently drops every other edit on the file. The two known
     # builders (``_build_qualifier_update_fragments`` /
-    # ``_build_p813_refresh_fragments``) set it themselves, but adding
+    # ``_build_reference_refresh_fragments``) set it themselves, but adding
     # the guard here makes any future builder that forgets — or any
     # external caller passing hand-built fragments — fail closed
     # instead of nuking the whole edit. Removals (``{"id": ...,
@@ -2611,29 +2611,96 @@ def _build_qualifier_update_fragments(mediaid):
     return fragments
 
 
-def _build_p813_refresh_fragments(mediaid, dpla_id, already_touched_ids):
-    """Build reference-update fragments that refresh the ``P813``
-    (retrieved on) date in each DPLA-authored claim's reference to
-    today's date.
+def _dpla_item_url(dpla_id):
+    """The dp.la item URL used as the P854 (reference URL) value in a DPLA
+    reference. Single source so the value the writers stamp and the value
+    ``_dpla_reference_is_canonical`` compares against can't drift apart."""
+    return f"https://dp.la/item/{dpla_id}"
 
-    Only fires for claims NOT already covered by another fragment in
-    this file's edit (``already_touched_ids``). For each remaining
-    DPLA-authored claim on the file, we replace just the DPLA reference
-    in the claim's references list, leaving any user-added references
-    untouched. Claims whose DPLA reference's P813 is already today's
-    date are skipped — no spurious edit on already-fresh references.
 
-    Conditional on the dispatcher already deciding to make some other
-    edit on this file (the call site only constructs these fragments
-    when ``combined_claims`` is otherwise non-empty). The point is to
-    refresh "as-of" dates across every DPLA assertion on a file we're
-    touching anyway, signalling to downstream consumers that the
-    metadata was re-verified against DPLA on that date — without
-    introducing a wave of edits on files where nothing else changed.
+def _string_snak(prop, value):
+    """A value-typed string snak in wbeditentity wire shape."""
+    return {
+        "snaktype": "value",
+        "property": prop,
+        "datavalue": {"type": "string", "value": value},
+    }
+
+
+def _entity_snak(prop, qid):
+    """A value-typed wikibase-item snak; ``numeric-id`` is derived from the
+    QID so the numeric and string forms can't fall out of sync."""
+    return {
+        "snaktype": "value",
+        "property": prop,
+        "datavalue": {
+            "type": "wikibase-entityid",
+            "value": {"entity-type": "item", "numeric-id": int(qid[1:]), "id": qid},
+        },
+    }
+
+
+def _build_dpla_reference(dpla_id, retrieved=None):
+    """The canonical DPLA reference as a wbeditentity reference dict: the
+    3-snak group ``P854`` (this item's dp.la URL) + ``P123`` (publisher =
+    DPLA, Q2944483) + ``P813`` (retrieved date, default today). Same shape
+    ``formattedclaim`` stamps on new claims (P813 via the shared
+    ``_build_p813_snak``), so a rebuilt reference is indistinguishable from
+    a freshly authored one."""
+    return {
+        "snaks": {
+            "P854": [_string_snak("P854", _dpla_item_url(dpla_id))],
+            "P123": [_entity_snak("P123", "Q2944483")],
+            "P813": [_build_p813_snak(retrieved or datetime.date.today())],
+        }
+    }
+
+
+def _dpla_reference_is_canonical(reference, dpla_id):
+    """True iff ``reference`` is already the complete, current DPLA reference
+    — publisher = DPLA (P123), this item's dp.la URL (P854), and today's
+    retrieved date (P813). A DPLA reference missing or wrong on any of these
+    is treated as needing a rebuild, so the refresh repairs a partial
+    reference (e.g. a foreign-bot rights claim that only ever carried P123)
+    in the same write that refreshes the date — no separate reconcile pass.
+
+    Identity keys on the P123 publisher marker (via ``_is_dpla_reference``);
+    a reference that lost P123 entirely reads as foreign and is left
+    untouched here — a deliberate known limitation, since "repairing" it
+    would risk overwriting a genuinely third-party reference."""
+    if not _is_dpla_reference(reference):
+        return False
+    expected_url = _dpla_item_url(dpla_id)
+    snaks = reference.get("snaks") or {}
+    p854_ok = any(
+        (snak.get("datavalue") or {}).get("value") == expected_url
+        for snak in snaks.get("P854") or []
+    )
+    return p854_ok and _p813_already_today(reference)
+
+
+def _build_reference_refresh_fragments(mediaid, dpla_id, already_touched_ids):
+    """Build reference-update fragments that make each DPLA-authored claim's
+    DPLA reference *canonical and current* — the full P854+P123+P813-today
+    triple — rewriting it wholesale rather than only swapping the P813 date.
+
+    This both refreshes the "as-of" retrieved date AND repairs a partial or
+    stale DPLA reference (e.g. one a foreign bot wrote with P123 but no P854)
+    in a single write — relying on the fact that re-asserting an identical
+    reference is a Wikibase no-op, so the only claims that actually change are
+    those whose DPLA reference isn't already canonical. User-added (non-DPLA)
+    references are preserved verbatim; a duplicate second DPLA reference (rare
+    legacy state) is collapsed to the single canonical one.
+
+    Only fires for claims NOT already covered by another fragment in this
+    file's edit (``already_touched_ids``), and only when the dispatcher is
+    already making some other edit on the file (the call site builds these
+    only when the bundle is otherwise non-empty) — so a file where every DPLA
+    reference is already canonical gets no spurious edit.
     """
-    import copy as _copy
-
-    today_p813_snak = _build_p813_snak(datetime.date.today())
+    # One date for the whole file's rebuilds, so fragments built either side
+    # of a UTC midnight boundary still agree on the retrieved date.
+    today = datetime.date.today()
     entity = get_entity(mediaid)
     fragments = []
     for prop_stmts in (entity.get("statements") or {}).values():
@@ -2644,42 +2711,37 @@ def _build_p813_refresh_fragments(mediaid, dpla_id, already_touched_ids):
             existing_refs = stmt.get("references") or []
             if not existing_refs:
                 continue
-            # Locate the DPLA reference; preserve every user-added
-            # reference unchanged. If multiple references match (rare;
-            # legacy duplicates) refresh all of them.
+            # Rebuild the (first) DPLA reference to canonical; preserve every
+            # user-added reference verbatim and at its position; drop any
+            # extra duplicate DPLA references.
             new_refs = []
             changed = False
+            seen_dpla = False
             for ref in existing_refs:
                 if not _is_dpla_reference(ref):
                     new_refs.append(ref)
                     continue
-                if _p813_already_today(ref):
-                    new_refs.append(ref)
+                if seen_dpla:
+                    changed = True  # duplicate DPLA reference — drop it
                     continue
-                refreshed = _copy.deepcopy(ref)
-                refreshed.setdefault("snaks", {})["P813"] = [today_p813_snak]
-                # Drop the snaks-hashes for the refreshed P813 so
-                # Wikibase recomputes it on save (the snak content
-                # changed); leave the other snaks alone.
-                snaks_order = refreshed.get("snaks-order") or []
-                if "P813" not in snaks_order:
-                    snaks_order = list(snaks_order) + ["P813"]
-                    refreshed["snaks-order"] = snaks_order
-                new_refs.append(refreshed)
-                changed = True
+                seen_dpla = True
+                if _dpla_reference_is_canonical(ref, dpla_id):
+                    new_refs.append(ref)
+                else:
+                    new_refs.append(_build_dpla_reference(dpla_id, today))
+                    changed = True
             if changed:
                 # Same wholesale-replace contract as
-                # _build_qualifier_update_fragments: include the
-                # statement's existing mainsnak / qualifiers / rank so
-                # wbeditentity preserves them and only diffs the
-                # references field.
+                # _build_qualifier_update_fragments: include the statement's
+                # existing mainsnak / qualifiers / rank so wbeditentity
+                # preserves them and only diffs the references field.
                 fragments.append(
                     {
                         "id": stmt_id,
                         "type": "statement",
-                        "mainsnak": _copy.deepcopy(stmt["mainsnak"]),
+                        "mainsnak": copy.deepcopy(stmt["mainsnak"]),
                         "rank": stmt.get("rank", "normal"),
-                        "qualifiers": _copy.deepcopy(stmt.get("qualifiers") or {}),
+                        "qualifiers": copy.deepcopy(stmt.get("qualifiers") or {}),
                         "references": new_refs,
                     }
                 )
@@ -2729,14 +2791,16 @@ def _flush_per_file_edits(mediaid, dpla_id):
     the one POST per file that replaces the previous five-to-seven
     separate API calls.
 
-    When any other edit fragments are present, opportunistically refresh
-    the ``P813`` (retrieved on) date on every other DPLA-authored claim
-    on the file to today. The premise: the bot has just re-verified the
-    file's structured data against DPLA's current source metadata, so
-    every DPLA assertion on the file is effectively "as-of today" — that
-    information is useful to downstream consumers and free to write
-    inside an edit we're making anyway. No spurious edits when the file
-    has nothing else to change.
+    When any other edit fragments are present, opportunistically make
+    every other DPLA-authored claim's DPLA reference canonical and current
+    — the full P854+P123+P813-today triple — via
+    ``_build_reference_refresh_fragments``. This both refreshes the
+    "retrieved on" date (the bot has just re-verified the file against
+    DPLA's source metadata, so every assertion is effectively "as-of
+    today") AND repairs a partial or stale DPLA reference left by an older
+    sync or a foreign bot. Re-asserting an already-canonical reference is a
+    Wikibase no-op, so there are no spurious edits when the file has
+    nothing else to change.
 
     After a successful write, invalidate the cached entity once so any
     follow-up code reading from cache picks up the new revision.
@@ -2758,7 +2822,7 @@ def _flush_per_file_edits(mediaid, dpla_id):
             if fid:
                 touched_ids.add(fid)
         reference_updates.extend(
-            _build_p813_refresh_fragments(mediaid, dpla_id, touched_ids)
+            _build_reference_refresh_fragments(mediaid, dpla_id, touched_ids)
         )
 
     _submit_per_item_edit(

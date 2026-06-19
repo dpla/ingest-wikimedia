@@ -4168,6 +4168,124 @@ def test_p813_refresh_preserves_user_added_references():
     sdc_sync._reset_per_file_accumulators()
 
 
+def test_reference_refresh_repairs_partial_dpla_reference():
+    """A DPLA reference that is the publisher marker (P123) but is MISSING
+    P854 — e.g. one a foreign bot wrote, or an older sdc-sync left partial —
+    is rebuilt to the full canonical P854+P123+P813 triple, EVEN when its
+    P813 is already today (the old date-only refresh would have skipped it).
+    This is the shape repair that lets us always re-assert the expected
+    reference without a separate reconcile pass."""
+    import datetime as _dt
+    import json
+
+    from tools import sdc_sync
+
+    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    partial_ref = {
+        "snaks": {
+            # No P854 — the partial/broken shape.
+            "P123": _qual_entity("P123", "Q2944483"),
+            "P813": [
+                {
+                    "snaktype": "value",
+                    "property": "P813",
+                    "datavalue": {
+                        "type": "time",
+                        "value": {
+                            "time": today_iso,
+                            "timezone": 0,
+                            "before": 0,
+                            "after": 0,
+                            "precision": 11,
+                            "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                        },
+                    },
+                }
+            ],
+        }
+    }
+    claim = {
+        "id": "M999$partial",
+        "mainsnak": {
+            "property": "P275",
+            "snaktype": "value",
+            "datavalue": {
+                "value": {"entity-type": "item", "numeric-id": 6938433},
+                "type": "wikibase-entityid",
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [partial_ref],
+    }
+    entity = {"pageid": 999, "statements": {"P275": [claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    sdc_sync.removals.append("M999$some-other-claim")
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    payload = json.loads(submit_calls[0][1]["data"])
+    repaired = next(c for c in payload["claims"] if c.get("id") == "M999$partial")
+    ref_snaks = repaired["references"][0]["snaks"]
+    assert ref_snaks["P854"][0]["datavalue"]["value"] == "https://dp.la/item/abcdef"
+    assert ref_snaks["P123"][0]["datavalue"]["value"]["id"] == "Q2944483"
+    assert ref_snaks["P813"][0]["datavalue"]["value"]["time"] == today_iso
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_reference_refresh_skips_fully_canonical_reference():
+    """A DPLA reference already at the full canonical shape (P854 for this
+    item + P123 + P813 today) produces no fragment — no spurious edit."""
+    import json
+
+    from tools import sdc_sync
+
+    canonical = sdc_sync._build_dpla_reference("abcdef")
+    claim = {
+        "id": "M999$canon",
+        "mainsnak": {
+            "property": "P275",
+            "snaktype": "value",
+            "datavalue": {
+                "value": {"entity-type": "item", "numeric-id": 6938433},
+                "type": "wikibase-entityid",
+            },
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [canonical],
+    }
+    entity = {"pageid": 999, "statements": {"P275": [claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    sdc_sync.removals.append("M999$some-other-claim")
+
+    submit_calls = []
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "invalidate_entity"),
+        patch.object(
+            sdc_sync,
+            "_submit_sdc_write",
+            side_effect=lambda *a, **kw: submit_calls.append((a, kw)),
+        ),
+    ):
+        sdc_sync._flush_per_file_edits("M999", "abcdef")
+
+    payload = json.loads(submit_calls[0][1]["data"])
+    assert [c for c in payload["claims"] if c.get("id") == "M999$canon"] == []
+    sdc_sync._reset_per_file_accumulators()
+
+
 def test_flush_emits_type_statement_on_every_non_removal_fragment():
     """Regression: wbeditentity rejects the entire bundle with
     ``invalid-claim: Type is missing`` unless every non-removal claim
