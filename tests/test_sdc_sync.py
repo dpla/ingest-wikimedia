@@ -3750,6 +3750,116 @@ def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
     assert payload["claims"] == [new_claim, ref_update, expected_qual_update, removal]
 
 
+def test_coalesce_passes_through_when_no_collision():
+    """A bundle with no repeated statement id is returned unchanged (same
+    objects, same order) — the common case must not be perturbed."""
+    from tools import sdc_sync
+
+    frags = [
+        {"mainsnak": {"property": "P760"}, "type": "statement"},  # new claim, no id
+        {"id": "M1$a", "type": "statement", "references": [{"snaks": {}}]},
+        {"id": "M1$b", "type": "statement", "qualifiers": {"P459": []}},
+        {"id": "M1$gone", "remove": ""},
+    ]
+    assert sdc_sync._coalesce_same_id_fragments(frags) == frags
+
+
+def test_coalesce_merges_reference_and_qualifier_fragments_for_one_id():
+    """The bug's shape: a reference-update fragment (full DPLA reference) and
+    a qualifier-only fragment (stale empty references) for the SAME id must
+    fold into one fragment carrying BOTH — not two entries where the second
+    wholesale-replaces and erases the first's reference."""
+    from tools import sdc_sync
+
+    dpla_ref = {"snaks": {"P123": _qual_entity("P123", "Q2944483")}}
+    ref_fragment = {
+        "id": "M1$rights",
+        "type": "statement",
+        "mainsnak": {
+            "property": "P275",
+            "snaktype": "value",
+            "datavalue": {
+                "value": {"entity-type": "item", "numeric-id": 6938433},
+                "type": "wikibase-entityid",
+            },
+        },
+        "rank": "normal",
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [dpla_ref],
+    }
+    qual_fragment = {
+        "id": "M1$rights",
+        "type": "statement",
+        "mainsnak": ref_fragment["mainsnak"],
+        "rank": "normal",
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [],  # the stale, reference-less cache copy
+    }
+
+    out = sdc_sync._coalesce_same_id_fragments([ref_fragment, qual_fragment])
+
+    assert len(out) == 1
+    merged = out[0]
+    assert merged["id"] == "M1$rights"
+    # P459 appears once (deduped), not twice.
+    assert len(merged["qualifiers"]["P459"]) == 1
+    # The DPLA reference survived — it is NOT erased by the qualifier
+    # fragment's empty reference set.
+    assert merged["references"] == [dpla_ref]
+
+
+def test_coalesce_does_not_resurrect_removed_qualifier():
+    """If the edit intends to delete a qualifier (its hash is in
+    removed_qualifier_hashes_by_id), the union must not re-add it even when a
+    colliding fragment still carries that stale snak — otherwise the merge
+    would undo an authoritative qualifier removal."""
+    from tools import sdc_sync
+
+    stale = {
+        "hash": "deadbeef",
+        "snaktype": "value",
+        "property": "P1545",
+        "datavalue": {"type": "string", "value": "A2"},
+    }
+    reduced = {
+        "id": "M1$q",
+        "type": "statement",
+        "mainsnak": {"property": "P275"},
+        "qualifiers": {"P459": _dpla_p459()},
+    }
+    stale_carrier = {
+        "id": "M1$q",
+        "type": "statement",
+        "mainsnak": {"property": "P275"},
+        "qualifiers": {"P459": _dpla_p459(), "P1545": [stale]},
+    }
+
+    out = sdc_sync._coalesce_same_id_fragments(
+        [reduced, stale_carrier], {"M1$q": {"deadbeef"}}
+    )
+    assert len(out) == 1
+    assert "P1545" not in out[0]["qualifiers"]  # removed snak not resurrected
+    assert "P459" in out[0]["qualifiers"]
+
+
+def test_coalesce_dedupes_identical_references_ignoring_hash():
+    """Two fragments carrying the same reference (one with a server hash,
+    one without) merge to a single reference, not a duplicate."""
+    from tools import sdc_sync
+
+    ref_no_hash = {"snaks": {"P123": _qual_entity("P123", "Q2944483")}}
+    ref_with_hash = {
+        "hash": "abc123",
+        "snaks": {"P123": _qual_entity("P123", "Q2944483")},
+    }
+    a = {"id": "M1$x", "mainsnak": {"property": "P275"}, "references": [ref_no_hash]}
+    b = {"id": "M1$x", "mainsnak": {"property": "P275"}, "references": [ref_with_hash]}
+
+    out = sdc_sync._coalesce_same_id_fragments([a, b])
+    assert len(out) == 1
+    assert len(out[0]["references"]) == 1
+
+
 def test_submit_per_item_edit_increments_qualifier_counter():
     """Qualifier-only fragments still represent a real ``wbeditentity``
     write on a Commons file, so the dispatcher must bump

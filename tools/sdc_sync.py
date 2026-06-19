@@ -2294,6 +2294,133 @@ def _submit_sdc_write(action, mediaid, dpla_id, **params):
         ) from e
 
 
+def _snak_content_key(snak):
+    """Stable content key for a snak, ignoring the volatile ``hash`` key
+    Wikibase assigns. Two snaks with the same property + value compare equal
+    regardless of whether one carries a server-assigned hash."""
+    return json.dumps({k: v for k, v in snak.items() if k != "hash"}, sort_keys=True)
+
+
+def _reference_content_key(reference):
+    """Stable content key for a reference group, keyed on its snak set and
+    ignoring the volatile per-reference ``hash`` / ``snaks-order`` keys. Two
+    references carrying the same snaks (e.g. the same P854+P123+P813 triple)
+    compare equal even if only one has a server hash."""
+    return json.dumps(
+        {
+            prop: sorted(_snak_content_key(s) for s in slist)
+            for prop, slist in (reference.get("snaks") or {}).items()
+        },
+        sort_keys=True,
+    )
+
+
+def _merge_fragment_group(frags, removed_qualifier_hashes=frozenset()):
+    """Merge several non-removal claim fragments that target the same
+    statement id into one, unioning their qualifiers and references.
+
+    mainsnak/rank are taken from the first fragment that carries a mainsnak
+    (the real builders always do); qualifier snaks and reference groups are
+    deduplicated by content (ignoring server-assigned hashes) so a value
+    present in more than one fragment lands exactly once.
+
+    ``removed_qualifier_hashes`` is the set of existing-qualifier snak hashes
+    this file's edit intends to *delete* (from the ``qualifier_removals``
+    accumulator). A qualifier-update fragment has already excluded them, but
+    a different colliding fragment could still carry the stale snak; skipping
+    any snak whose hash is in this set keeps the union from resurrecting a
+    qualifier the edit means to remove.
+    """
+    merged = {"id": frags[0]["id"], "type": "statement"}
+    for frag in frags:
+        if "mainsnak" in frag:
+            merged["mainsnak"] = copy.deepcopy(frag["mainsnak"])
+            merged["rank"] = frag.get("rank", "normal")
+            break
+
+    quals, qual_keys = {}, set()
+    refs, ref_keys = [], set()
+    for frag in frags:
+        for prop, slist in (frag.get("qualifiers") or {}).items():
+            for snak in slist:
+                if snak.get("hash") in removed_qualifier_hashes:
+                    continue
+                key = (prop, _snak_content_key(snak))
+                if key in qual_keys:
+                    continue
+                qual_keys.add(key)
+                quals.setdefault(prop, []).append(copy.deepcopy(snak))
+        for ref in frag.get("references") or []:
+            key = _reference_content_key(ref)
+            if key in ref_keys:
+                continue
+            ref_keys.add(key)
+            cleaned = copy.deepcopy(ref)
+            cleaned.pop("snaks-order", None)
+            refs.append(cleaned)
+    if quals:
+        merged["qualifiers"] = quals
+    if refs:
+        merged["references"] = refs
+    return merged
+
+
+def _coalesce_same_id_fragments(fragments, removed_qualifier_hashes_by_id=None):
+    """Fold non-removal claim fragments that target the same statement id
+    into a single fragment, unioning their qualifiers and references.
+
+    ``wbeditentity`` applies every id-bearing claim entry in ``data.claims``
+    as a *wholesale replacement* of that statement, in array order — so two
+    entries for one id silently clobber each other: the later one's
+    (possibly empty or stale) qualifier/reference sets erase whatever the
+    earlier one set. That is a silent-data-loss footgun whenever two
+    independently-built fragments (e.g. an add_ref reference rewrite and an
+    add_det qualifier amend) land on the same claim in one edit.
+
+    Only ids that actually appear more than once are merged; every other
+    fragment — new-claim creates (no ``id``), removals, and singleton
+    id-bearing fragments — is passed through untouched, in its original
+    position. So a collision-free bundle (the overwhelming common case) is
+    returned byte-for-byte unchanged.
+    """
+    removed_by_id = removed_qualifier_hashes_by_id or {}
+    groups = {}
+    for frag in fragments:
+        fid = frag.get("id")
+        if fid and frag.get("remove") != "":
+            groups.setdefault(fid, []).append(frag)
+    collided = {fid for fid, group in groups.items() if len(group) > 1}
+    if not collided:
+        return fragments
+
+    # Reaching here means two fragments targeted one statement id — the
+    # upstream guards (check()'s ref-stamp/qualifier dedup, _build_p813_
+    # refresh_fragments' touched_ids) are expected to prevent that. Merging
+    # resolves it safely, but log it so a regression in those guards is
+    # visible rather than silently absorbed.
+    logging.warning(
+        " -- Coalesced %d statement id(s) with multiple fragments in one"
+        " edit (%s); merging qualifiers + references to avoid silent"
+        " wbeditentity clobber.",
+        len(collided),
+        ", ".join(sorted(collided)),
+    )
+
+    out, emitted = [], set()
+    for frag in fragments:
+        fid = frag.get("id")
+        if fid in collided and frag.get("remove") != "":
+            if fid in emitted:
+                continue  # later occurrences folded into the first
+            emitted.add(fid)
+            out.append(
+                _merge_fragment_group(groups[fid], removed_by_id.get(fid, frozenset()))
+            )
+        else:
+            out.append(frag)
+    return out
+
+
 def _submit_per_item_edit(
     mediaid,
     dpla_id,
@@ -2383,6 +2510,21 @@ def _submit_per_item_edit(
         if fragment.get("remove") == "":
             continue
         fragment.setdefault("type", "statement")
+
+    # Coalesce fragments that target the same statement id. wbeditentity
+    # treats each id-bearing claim entry as a wholesale replacement, so two
+    # entries for one id silently clobber — the later one's qualifiers/
+    # references erase the earlier's. Merging them into one fragment makes
+    # the combined edit carry every qualifier and reference exactly once,
+    # regardless of which builders contributed them. The removed-qualifier
+    # hash map (from this file's ``qualifier_removals``) is passed so the
+    # union can't resurrect a snak the edit intends to delete.
+    removed_qualifier_hashes_by_id = {}
+    for claimid, snak_hash in qualifier_removals:
+        removed_qualifier_hashes_by_id.setdefault(claimid, set()).add(snak_hash)
+    all_fragments = _coalesce_same_id_fragments(
+        all_fragments, removed_qualifier_hashes_by_id
+    )
 
     _submit_sdc_write(
         "wbeditentity",
