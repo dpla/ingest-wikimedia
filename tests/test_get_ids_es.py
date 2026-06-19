@@ -334,3 +334,94 @@ def test_single_id_rejects_mismatched_id_from_es():
     assert result.exit_code == 1, result.output
     assert "mismatched" in result.output
     assert returned_id in result.output
+
+
+# ---------------------------------------------------------------------------
+# _title_sort_key — CSV output ordering by Commons file-name
+
+
+def _key(source: dict, dpla_id: str = "abc") -> str:
+    from tools.get_ids_es import _title_sort_key
+
+    return _title_sort_key(source, dpla_id)
+
+
+def _sr(title):
+    # DPLA's sourceResource.title is canonically a list; mirror that
+    # shape here so the helper sees what it would see in production.
+    # (String-form is treated as missing by ``get_list``, matching the
+    # uploader's title selection — keep test fixtures faithful to that.)
+    if isinstance(title, str):
+        title = [title]
+    return {"sourceResource": {"title": title}}
+
+
+def test_sort_key_alphabetical_basic():
+    """Plain alphabetic titles sort A < B < C — the human-obvious case."""
+    keys = [_key(_sr(t)) for t in ["Apple", "Banana", "Cherry"]]
+    assert keys == sorted(keys)
+
+
+def test_sort_key_strips_leading_quotes_and_parens():
+    """A leading quote or paren must not bury the title beneath every
+    letter — that would defeat the whole point of alphabetic sort. The
+    NARA hub in particular has thousands of titles like '"YOU BET …"'
+    and '(Title Index …)' that, without normalisation, would cluster
+    at the top of the CSV ahead of every alphabetic title."""
+    quoted = _key(_sr('"YOU BET I\'M GOING BACK TO SEA"'))
+    parend = _key(_sr("(Title Index to World War II Posters)"))
+    plain_y = _key(_sr("Yellowstone"))
+    plain_t = _key(_sr("Treaty document"))
+    # Quoted "Y..." sorts near plain "Y..." titles, not before "A".
+    assert sorted([quoted, plain_t, plain_y]) == [plain_t, plain_y, quoted]
+    # Paren'd "Title..." sorts near plain "T...".
+    assert sorted([parend, plain_t, plain_y]) == [parend, plain_t, plain_y]
+
+
+def test_sort_key_case_insensitive():
+    """``apple`` and ``Apple`` sort adjacently regardless of case so a
+    hub with mixed-case titles doesn't show an upper-case block then a
+    lower-case block."""
+    assert _key(_sr("apple"))[:5] == _key(_sr("Apple"))[:5]
+
+
+def test_sort_key_multi_ordinal_items_stay_grouped():
+    """All ordinals of a multi-page item share the same item title, so
+    they end up adjacent in the CSV. Within an item, the uploader
+    iterates ordinals 1..N in numeric order, giving '(page 1), (page 2)'
+    sequencing for free."""
+    same_title = _sr("Minutes of the House Committee")
+    k1 = _key(same_title, "0000aaa")
+    k2 = _key(same_title, "0000bbb")
+    other = _key(_sr("Notes on a meeting"), "0000ccc")
+    sorted_keys = sorted([k1, other, k2])
+    assert sorted_keys == [k1, k2, other], (
+        "Identical-title items must stay adjacent before the next title"
+    )
+
+
+def test_sort_key_handles_missing_title():
+    """Items without ``sourceResource.title`` (or with a non-string,
+    non-list shape) must still produce a stable key, not raise."""
+    assert isinstance(_key({}), str)
+    assert isinstance(_key({"sourceResource": {}}), str)
+    assert isinstance(_key({"sourceResource": {"title": None}}), str)
+    assert isinstance(_key({"sourceResource": {"title": 42}}), str)
+
+
+def test_sort_key_list_title_uses_first():
+    """When ``sourceResource.title`` is a list (the common DPLA shape),
+    the first element drives the sort — same convention the uploader
+    uses when building the Commons title."""
+    list_form = _key({"sourceResource": {"title": ["Zebra", "Aardvark"]}})
+    str_form = _key(_sr("Zebra"))
+    # First-element form should sort like the equivalent string form.
+    assert list_form[:5] == str_form[:5]
+
+
+def test_sort_key_dpla_id_tiebreaks_identical_titles():
+    """Two items with identical titles fall back to DPLA-ID order, so
+    the sort is fully deterministic across re-runs."""
+    a = _key(_sr("Same Title"), "00000000000000000000000000000001")
+    b = _key(_sr("Same Title"), "00000000000000000000000000000002")
+    assert a < b
