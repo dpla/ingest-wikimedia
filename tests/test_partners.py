@@ -143,3 +143,35 @@ def test_resolve_wikidata_id_no_matches_returns_empty():
         {"Some Hub": {"Wikidata": "QX", "upload": True, "institutions": {}}}
     ):
         assert resolve_wikidata_id("Q-does-not-exist") == []
+
+
+def test_resolve_wikidata_id_same_hub_overlap_picks_up_eligible_institution():
+    """Edge case: a QID matches both the hub-level entry AND an
+    institution within the same hub. If the hub itself is not
+    upload-eligible but the institution is, the institution-level
+    match must still be returned. The first version of this fix
+    used a ``continue`` on the hub-level match, which skipped the
+    institution scan within that hub and dropped this case silently
+    (caught by CodeRabbit on PR #326)."""
+    data = {
+        "Hub Opted Out With One Opted In": {
+            "Wikidata": "QSAME",
+            "upload": False,
+            "institutions": {
+                # Same QID as the hub, but opted in at the institution level.
+                "Self-listed Institution": {"Wikidata": "QSAME", "upload": True},
+            },
+        },
+    }
+    with (
+        _mock_institutions(data),
+        patch.dict(
+            "ingest_wikimedia.partners._SLUG_BY_HUB_NAME",
+            {"hub opted out with one opted in": "overlap-hub"},
+        ),
+    ):
+        results = resolve_wikidata_id("QSAME")
+    # Hub-level match dropped (hub.upload=false).
+    assert ("overlap-hub", None) not in results
+    # Institution-level match preserved (institution.upload=true).
+    assert results == [("overlap-hub", "Self-listed Institution")]

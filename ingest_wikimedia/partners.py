@@ -296,10 +296,13 @@ def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | Non
         if canonical is None:
             continue
         hub_upload = bool(hub_data.get("upload"))
-        if hub_data.get("Wikidata") == qid:
-            if hub_upload:
-                results.append((canonical, None))
-            continue
+        if hub_data.get("Wikidata") == qid and hub_upload:
+            results.append((canonical, None))
+        # Don't ``continue`` on a hub-level QID match — if the same
+        # QID is also used by an institution within this hub, that
+        # match needs to be considered for institution-level
+        # eligibility (hub.upload=false + inst.upload=true is a valid
+        # combination).
         for inst_name, inst_data in hub_data.get("institutions", {}).items():
             if inst_data.get("Wikidata") != qid:
                 continue
