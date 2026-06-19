@@ -267,9 +267,27 @@ def canonical_matches_session_component(
 def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | None]]:
     """Return (canonical_slug, institution_or_None) pairs matching a Wikidata QID.
 
-    Searches hub-level and institution-level Wikidata fields in institutions_v2.json.
-    Returns an empty list if no match. Multiple matches are possible when the same
-    QID appears under different hubs or institutions in the JSON.
+    Searches hub-level and institution-level Wikidata fields in
+    institutions_v2.json. Returns an empty list if no match. Multiple
+    matches are possible when the same QID appears under different
+    hubs or institutions in the JSON.
+
+    Filters out non-upload-eligible matches using the same rule as
+    :func:`is_item_upload_eligible`:
+
+    * Hub-level match (institution=None) is kept only if the hub
+      itself has ``upload: True``.
+    * Institution-level match is kept only if the hub OR the
+      institution has ``upload: True``.
+
+    Without this filter, a QID like ``Q131454`` (Library of Congress)
+    that appears in the JSON as an *institution* under many hubs
+    (where it's listed but not opted in for upload) AND as a hub
+    (the ``lc`` slug, which is also not upload-eligible) would route
+    the launcher onto the broader ``lc`` hub scope and produce the
+    misleading ``Skipped targets: 'lc'`` error. Filtering here keeps
+    eligibility on the QID resolution side, where the data shape is
+    available, instead of leaking that knowledge into every caller.
     """
     institutions = _get_institutions(timeout)
     results: list[tuple[str, str | None]] = []
@@ -277,10 +295,17 @@ def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | Non
         canonical = _SLUG_BY_HUB_NAME.get(hub_name.lower())
         if canonical is None:
             continue
-        if hub_data.get("Wikidata") == qid:
+        hub_upload = bool(hub_data.get("upload"))
+        if hub_data.get("Wikidata") == qid and hub_upload:
             results.append((canonical, None))
-        else:
-            for inst_name, inst_data in hub_data.get("institutions", {}).items():
-                if inst_data.get("Wikidata") == qid:
-                    results.append((canonical, inst_name))
+        # Don't ``continue`` on a hub-level QID match — if the same
+        # QID is also used by an institution within this hub, that
+        # match needs to be considered for institution-level
+        # eligibility (hub.upload=false + inst.upload=true is a valid
+        # combination).
+        for inst_name, inst_data in hub_data.get("institutions", {}).items():
+            if inst_data.get("Wikidata") != qid:
+                continue
+            if hub_upload or bool(inst_data.get("upload")):
+                results.append((canonical, inst_name))
     return results
