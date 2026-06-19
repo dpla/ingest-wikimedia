@@ -24,6 +24,14 @@ SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
 _SDC_COMPLETE_PREFIX = "SDC complete"
 
+# Slack Block Kit caps a single ``section`` block's text element at 3000
+# characters. A hub-busy day with many active sessions can collectively
+# exceed that on row count alone, so the formatter splits across multiple
+# ``section`` blocks rather than dropping rows. Keep a safety margin
+# under the hard cap so a single row with an unexpectedly long phase
+# string can't tip a near-full block over.
+_SLACK_BLOCK_SOFT_LIMIT = 2800
+
 
 def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
@@ -42,6 +50,54 @@ _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 # A session that hasn't written a log line in this many seconds is considered hung.
 # Uploads normally complete items in seconds; downloads in seconds to low minutes.
 _STALE_SECONDS = 1800  # 30 minutes
+
+
+def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
+    """Return ``(label, log_mtime)`` for the most-recently-written log file
+    across all labels in this session, or ``None`` if no matching log exists.
+
+    A wikimedia-upload session runs its labels sequentially (downloader →
+    uploader → sdc-sync per label, then on to the next label), so at any
+    moment **at most one label is active**. The freshest log file across
+    all labels in the session uniquely identifies that label — an aborted
+    earlier label's last log write is hours stale, while the running one
+    is being written right now.
+
+    Picking the active label this way takes one SSM round-trip per
+    session regardless of label count. Previously the script polled
+    ``get_phase_and_progress`` once per label, which scaled the SSM round
+    trips linearly with batch size and pushed multi-institution sessions
+    past Slack's three-second slash-command ack deadline. See PR #325-vintage
+    multi-institution batches accumulating 50+ labels each.
+    """
+    if not labels:
+        return None
+
+    # Group labels by hub so we touch each partner log directory exactly once.
+    hubs = sorted({lbl.split("+")[0] for lbl in labels})
+    paths = " ".join(
+        shlex.quote(f"/home/ec2-user/ingest-wikimedia/{PARTNER_DIR.get(h, h)}/logs")
+        for h in hubs
+    )
+    label_alt = "|".join(re.escape(lbl) for lbl in labels)
+    cmd = (
+        f"find {paths} -maxdepth 1 -type f -name '*.log' "
+        f"-regextype posix-extended "
+        f"-regex '.*-({label_alt})-(download|upload|sdc)\\.log' "
+        f"-printf '%T@ %f\\n' 2>/dev/null | sort -rn | head -1"
+    )
+    out = ssm_run(client, cmd).strip()
+    if not out:
+        return None
+    mtime_str, _, filename = out.partition(" ")
+    # Identify which of our labels matched via the per-label helper —
+    # same anchored-pattern logic the rest of this file uses, so
+    # suffix-collision (e.g. ``bpl+phillips-academy`` vs
+    # ``bpl+phillips-academy-andover``) is handled exactly once.
+    for lbl in labels:
+        if re.search(log_filename_pattern_for_label(lbl), filename):
+            return lbl, int(float(mtime_str))
+    return None
 
 
 def get_phase_and_progress(
@@ -333,20 +389,46 @@ def _format_slots_line(ssm) -> str | None:
     return f"Worker slots: ~{free} free of {total} ({held} held)"
 
 
+def _format_rows_into_blocks(rows: list[tuple[str, str]]) -> list[dict]:
+    """Format ``rows`` into one or more Slack ``section`` blocks, each
+    holding at most ``_SLACK_BLOCK_SOFT_LIMIT`` chars of text.
+
+    Splitting across multiple blocks keeps a busy-day readout renderable
+    when the cumulative row count would push a single block past the
+    3000-char per-text cap (which produced the ``invalid_blocks``
+    failure that motivated this helper). Individual rows are already
+    bounded by ``fetch``'s display contract (active label, not tmux
+    session name), so per-row truncation isn't needed.
+    """
+    chunks: list[list[str]] = [[]]
+    cur_len = 0
+    for display_id, phase in rows:
+        line = f"`{display_id}` {phase}"
+        if chunks[-1] and cur_len + len(line) + 1 > _SLACK_BLOCK_SOFT_LIMIT:
+            chunks.append([])
+            cur_len = 0
+        chunks[-1].append(line)
+        cur_len += len(line) + 1
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}
+        for lines in chunks
+        if lines
+    ]
+
+
 def post_to_slack(
     token: str,
     rows: list[tuple[str, str]],
     memory_line: str | None = None,
     slots_line: str | None = None,
 ) -> None:
-    lines = "\n".join(f"`{session:<32}` {phase}" for session, phase in rows)
     blocks: list[dict] = [
         {
             "type": "header",
             "text": {"type": "plain_text", "text": "Wikimedia Upload Status"},
         },
-        {"type": "section", "text": {"type": "mrkdwn", "text": lines}},
     ]
+    blocks.extend(_format_rows_into_blocks(rows))
     context_bits = [b for b in (slots_line, memory_line) if b]
     if context_bits:
         blocks.append(
@@ -417,7 +499,14 @@ def main() -> None:
             print("Posted idle status to Slack.")
         return
 
-    results: dict[str, str] = {}
+    # Maps original session name → (display_id, phase) pair. ``fetch``
+    # now returns ``display_id`` (the active label) as the first
+    # element, distinct from the tmux session name we used to index
+    # by, so the session-name → result mapping is rebuilt here from
+    # the ``futures`` dict (which remembers the submitting session for
+    # each future) to preserve the order of the original ``tmux ls``
+    # output in the Slack readout.
+    results: dict[str, tuple[str, str]] = {}
 
     def fetch(session: str) -> tuple[str, str]:
         suffix = session.removeprefix("wikimedia-")
@@ -472,78 +561,41 @@ def main() -> None:
                 logging.exception(
                     "Failed to get retry status for %s (%s)", session, label
                 )
-                return session, "Unknown (error)"
-            return (
-                session,
-                f"[{label}] {phase}" if phase is not None else f"[{label}] Starting...",
-            )
+                return label, "Unknown (error)"
+            return label, phase if phase is not None else "Starting..."
 
         labels = parse_session_labels(suffix)
         if not labels:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
 
-        # Walk every label in the pipeline and collect each one's phase
-        # string and log mtime. We need ALL labels (not a forward-walk that
-        # short-circuits at the first non-complete one) because a label
-        # earlier in the pipeline can be "non-complete" — e.g. its SDC
-        # phase aborted without writing the COUNTS: terminal marker — yet
-        # a later label is actively progressing right now. Reporting the
-        # first non-complete label in that case freezes the Slack notice
-        # on the aborted phase forever.  Pick the label with the LATEST
-        # log mtime among those still in-flight; an active label always
-        # wins over an aborted earlier one because its log was just
-        # written, while the abort's last log write is hours stale.
-        per_label: list[tuple[str, str | None, int]] = []
-        for label in labels:
-            hub = label.split("+")[0]
-            try:
-                phase, log_mtime = get_phase_and_progress(ssm, session, hub, label)
-            except Exception:
-                logging.exception("Failed to get status for %s (%s)", session, label)
-                phase, log_mtime = "Unknown (error)", 0
-            per_label.append((label, phase, log_mtime))
+        # See find_active_label's docstring.
+        try:
+            active = find_active_label(ssm, labels)
+        except Exception:
+            logging.exception("Failed to find active label for %s", session)
+            return labels[0], "Unknown (error)"
 
-        def _is_complete(phase: str | None) -> bool:
-            return phase is not None and (
-                phase.startswith(_UPLOAD_COMPLETE_PREFIX)
-                or phase.startswith(_DOWNLOAD_COMPLETE_PREFIX)
-                or phase.startswith(_SDC_COMPLETE_PREFIX)
-            )
+        # For multi-label batches, suffix a "(+N more)" annotation so the
+        # reader can see this row is one slice of a larger session.
+        def _with_batch_suffix(label: str) -> str:
+            return f"{label} (+{len(labels) - 1} more)" if multi else label
 
-        # Labels with a log AND not in a "complete" terminal state.
-        active = [
-            (lbl, phase, mtime)
-            for lbl, phase, mtime in per_label
-            if phase is not None and not _is_complete(phase)
-        ]
-        if active:
-            # Latest write wins — see comment above for the rationale.
-            lbl, phase, _ = max(active, key=lambda t: t[2])
-            return session, f"[{lbl}] {phase}" if multi else phase
+        if active is None:
+            # No log file matches any label yet — pipeline is in
+            # get-ids-es, before any downstream phase has written.
+            return _with_batch_suffix(labels[0]), "Generating IDs"
 
-        # No active labels.  Either everything completed, or the
-        # pipeline is between phases (no log yet for the next label).
-        # Prefer the LAST completed label in pipeline order when present;
-        # otherwise fall back to the first no-log label as "Generating IDs"
-        # (the pipeline's resting state before any phase writes a log).
-        completed = [(lbl, phase) for lbl, phase, _ in per_label if _is_complete(phase)]
-        if completed:
-            lbl, phase = completed[-1]
-            return session, f"[{lbl}] {phase}" if multi else phase
-
-        first_pending = next(
-            (lbl for lbl, phase, _ in per_label if phase is None), None
-        )
-        if first_pending is not None:
-            return (
-                session,
-                f"[{first_pending}] Generating IDs" if multi else "Generating IDs",
-            )
-        # `per_label` is built directly from `labels`, which we already
-        # checked is non-empty, so every reachable path above returned.
-        # This is a defensive fallback that should never fire.
-        return session, "Generating IDs"
+        label, _ = active
+        hub = label.split("+")[0]
+        try:
+            phase, _ = get_phase_and_progress(ssm, session, hub, label)
+        except Exception:
+            logging.exception("Failed to get status for %s (%s)", session, label)
+            return _with_batch_suffix(label), "Unknown (error)"
+        return _with_batch_suffix(
+            label
+        ), phase if phase is not None else "Generating IDs"
 
     # Memory snapshot is independent of every per-session fetch — submit it
     # to the same executor so the SSM round-trip overlaps with the session
@@ -553,13 +605,14 @@ def main() -> None:
         slots_future = executor.submit(_format_slots_line, ssm)
         futures = {executor.submit(fetch, s): s for s in sessions}
         for future in as_completed(futures):
-            session, phase = future.result()
-            results[session] = phase
-            print(f"{session}: {phase}")
+            session = futures[future]
+            display_id, phase = future.result()
+            results[session] = (display_id, phase)
+            print(f"{display_id}: {phase}")
         memory_line = _format_memory_line(memory_future.result())
         slots_line = slots_future.result()
 
-    rows = [(s, results[s]) for s in sessions if s in results]
+    rows = [results[s] for s in sessions if s in results]
     post_to_slack(token, rows, memory_line=memory_line, slots_line=slots_line)
     print("Posted to Slack.")
 
