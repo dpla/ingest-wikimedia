@@ -116,6 +116,12 @@ def _title_sort_key(source: dict, dpla_id: str) -> str:
     # Commons file name exactly.
     titles = get_list(get_dict(source, SOURCE_RESOURCE_FIELD_NAME), DC_TITLE_FIELD_NAME)
     title = titles[0] if titles else ""
+    # ``get_list`` only validates the OUTER container — non-string list
+    # elements (e.g. ``["title", 42]``) still pass through. Coerce to "" so
+    # ``get_page_title``'s slice (``item_title[:181]``) doesn't crash on
+    # malformed records.
+    if not isinstance(title, str):
+        title = ""
     full = get_page_title(title, dpla_id, "", page=None)
     # Strip the ' - DPLA - <id>' suffix so the human-readable prefix dominates.
     prefix = full.rsplit(" - DPLA - ", 1)[0]

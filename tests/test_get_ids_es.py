@@ -407,6 +407,10 @@ def test_sort_key_handles_missing_title():
     assert isinstance(_key({"sourceResource": {}}), str)
     assert isinstance(_key({"sourceResource": {"title": None}}), str)
     assert isinstance(_key({"sourceResource": {"title": 42}}), str)
+    # List-of-non-string: ``get_list`` only validates the outer list, so
+    # a non-string first element reaches ``get_page_title`` and would
+    # crash on ``item_title[:181]`` without the explicit isinstance guard.
+    assert isinstance(_key({"sourceResource": {"title": [42]}}), str)
 
 
 def test_sort_key_list_title_uses_first():
