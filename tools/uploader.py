@@ -699,7 +699,9 @@ class Uploader:
 
                 logging.info(f"Uploaded to {wikimedia_url(page_title)}")
                 if drift_old_filename:
-                    self._tag_drift_duplicate(drift_old_filename, page_title, dpla_id)
+                    self._tag_drift_duplicate(
+                        drift_old_filename, page_title, wiki_markup, dpla_id
+                    )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
                 # `wiki_file_page.pageid` is stale for net-new uploads:
@@ -1131,11 +1133,69 @@ class Uploader:
         self,
         old_filename: str,
         new_filename: str,
+        wiki_markup: str,
         dpla_id: str,
     ) -> None:
-        """Tag a stranded file page as a duplicate after its hash was uploaded elsewhere."""
+        """Tag a stranded file as duplicate of the new (correct-title)
+        file, AND carry any community-contributed metadata from the
+        old page across to the new one before the admin-side delete.
+
+        Mirrors what ``_move_to_correct_title`` and
+        ``_resolve_redirect_overwrite`` already do in the move and
+        redirect-overwrite paths: license tags, assessment templates,
+        ``{{Image extracted}}`` parents, and category links community
+        editors have added are preserved via
+        :func:`merge_preserved_wikitext`.
+
+        Rescue and tag are independent best-effort steps — a failure
+        on either is logged and does NOT block the other. The old
+        file's revision history still contains the community
+        contributions even if the rescue's save fails, so manual
+        recovery from page history is always possible.
+        """
+        old_page = get_page(self.site, f"File:{old_filename}")
+
+        # Rescue community contributions, if any.
         try:
-            old_page = get_page(self.site, f"File:{old_filename}")
+            if old_page.exists():
+                merged = merge_preserved_wikitext(old_page.text or "", wiki_markup)
+                # Equality means nothing matched merge_preserved_wikitext's
+                # patterns. Skip the save so we don't emit a no-op revision
+                # on the new file (the other two preserve sites — move,
+                # redirect-overwrite — don't need this guard because their
+                # destination text always differs from wiki_markup before
+                # the merge, but here new_page already carries wiki_markup
+                # from the upload we just completed).
+                if merged.rstrip() != wiki_markup.rstrip():
+                    # `get_page` is a constructor — no API hit — and we
+                    # know the page exists and isn't a redirect because
+                    # we just uploaded it. Skip the exists/redirect
+                    # round-trips and write directly.
+                    new_page = get_page(self.site, f"File:{new_filename}")
+                    new_page.text = merged
+                    new_page.save(
+                        summary=(
+                            f"Rescue community-contributed metadata from "
+                            f"[[File:{old_filename}]] (DPLA ID "
+                            f"[[dpla:{dpla_id}|{dpla_id}]])"
+                        ),
+                        minor=False,
+                    )
+                    logging.info(
+                        f"Rescued community-contributed metadata from "
+                        f"[[File:{old_filename}]] into "
+                        f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
+                    )
+        except Exception as ex:
+            logging.warning(
+                f"Failed to rescue community contributions from "
+                f"[[File:{old_filename}]]: {ex}"
+            )
+
+        # Tag the stranded file. Independent of the rescue: even if the
+        # save above failed, queue the old title for speedy deletion so
+        # the search-time SHA1 collision is resolved.
+        try:
             tag_as_duplicate(
                 self.site,
                 old_page,

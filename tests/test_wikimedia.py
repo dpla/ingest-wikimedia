@@ -3,6 +3,7 @@ from ingest_wikimedia.wikimedia import (
     COMMONSDELINKER_PAGE,
     MAX_COMMENT_BYTES,
     build_title_drift_move_reason,
+    escape_template_param,
     get_site,
     get_page_title,
     get_wiki_text,
@@ -402,6 +403,112 @@ def test_merge_preserved_wikitext_no_metadata_returns_new_wikitext_unchanged():
     )
     result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
     assert result == NEW_WIKITEXT + "\n"
+
+
+def test_merge_preserved_wikitext_dedupes_against_new_wikitext():
+    """If the new wikitext already carries the same category /
+    license / image-extracted template that the existing page has,
+    the rescue must NOT re-emit it. MediaWiki silently dedupes
+    repeated category memberships at render time, but the saved
+    wikitext source would show two ``[[Category:X]]`` lines and
+    confuse Commons editors reviewing the rescue edit.
+
+    Regression: caught in production on rev 1235738403 (Heartland
+    "1813 Five Francs Coin" rescue) where the new file already had
+    ``[[Category:Gifts to Charles Lindbergh]]`` and the old file
+    contributed the same category — the merged result re-emitted it.
+    """
+    new_with_category = NEW_WIKITEXT + "\n\n[[Category:Already Present]]\n"
+    existing = (
+        "{{PD-USGov}}\n"
+        "{{Image extracted|1=Parent.jpg}}\n"
+        "[[Category:Already Present]]\n"
+        "[[Category:Brand New From Existing]]\n"
+    )
+    result = merge_preserved_wikitext(existing, new_with_category)
+    # The duplicate category must appear exactly once.
+    assert result.count("[[Category:Already Present]]") == 1
+    # The new category from the existing page must still be added.
+    assert "[[Category:Brand New From Existing]]" in result
+    # Non-category preserves that aren't in new_wikitext go through normally.
+    assert "{{PD-USGov}}" in result
+    assert "{{Image extracted|1=Parent.jpg}}" in result
+
+
+def test_merge_preserved_wikitext_dedupes_non_category_templates_too():
+    """Same dedup contract applies to PD-USGov, Image-extracted,
+    and Assessment templates — not just categories."""
+    new_with_pd = NEW_WIKITEXT + "\n{{PD-USGov}}\n"
+    existing = "{{PD-USGov}}\n[[Category:Foo]]\n"
+    result = merge_preserved_wikitext(existing, new_with_pd)
+    assert result.count("{{PD-USGov}}") == 1
+    assert "[[Category:Foo]]" in result
+
+
+def test_merge_preserved_wikitext_categories_flow_without_blank_line():
+    """When the new wikitext already ends with a category line,
+    the rescued categories must append directly — no blank-line
+    separator between the existing categories and the rescued ones.
+
+    Regression: same Heartland rescue rev 1235738403 had a blank
+    line between the new wikitext's last category and the rescued
+    block, making the source diff look like two separate category
+    groups rather than one contiguous block.
+    """
+    new_ending_in_category = (
+        "{{ Artwork | title = X }}\n\n[[Category:NewA]]\n[[Category:NewB]]\n"
+    )
+    existing = "[[Category:OldA]]\n[[Category:OldB]]\n"
+    result = merge_preserved_wikitext(existing, new_ending_in_category)
+    # All four categories should appear, contiguous, no blank line between.
+    lines = [ln for ln in result.splitlines() if ln.strip()]
+    cat_indices = [i for i, ln in enumerate(lines) if ln.startswith("[[Category:")]
+    # The four category lines must occupy four consecutive positions.
+    assert cat_indices == list(range(cat_indices[0], cat_indices[0] + 4))
+    # The rescued categories come after the existing ones (preserve order).
+    assert lines[cat_indices[0]] == "[[Category:NewA]]"
+    assert lines[cat_indices[0] + 1] == "[[Category:NewB]]"
+    assert lines[cat_indices[0] + 2] == "[[Category:OldA]]"
+    assert lines[cat_indices[0] + 3] == "[[Category:OldB]]"
+    # No blank line inside the category block.
+    cat_block_text = "\n".join(result.splitlines()[cat_indices[0] : cat_indices[0] + 4])
+    assert "\n\n" not in cat_block_text
+
+
+def test_merge_preserved_wikitext_overlapping_category_names():
+    """Two categories that share a name-prefix (e.g.
+    ``[[Category:American]]`` and ``[[Category:American history]]``)
+    are distinct categories — the dedup must NOT filter one because
+    it appears as a substring of the other. The closing ``]]``
+    terminator on every preserve pattern already prevents this in
+    practice (``[[Category:American]]`` is not a substring of
+    ``[[Category:American history]]``), but pinning the contract by
+    test rules out the regression if the regex shape changes."""
+    new_with_longer = NEW_WIKITEXT + "\n\n[[Category:American history]]\n"
+    existing = "[[Category:American]]\n"
+    result = merge_preserved_wikitext(existing, new_with_longer)
+    assert "[[Category:American history]]" in result
+    assert "[[Category:American]]" in result
+    # Both appear exactly once.
+    assert (
+        result.count("[[Category:American]]\n")
+        + result.count("[[Category:American]]")
+        - result.count("[[Category:American history]]")
+        == 1
+    )
+
+
+def test_merge_preserved_wikitext_blank_line_still_present_when_new_does_not_end_in_category():
+    """The blank-line separator is only suppressed when the new
+    wikitext already ends with a category line. When it ends with
+    a template (the common path — new wikitext is a freshly
+    generated ``{{DPLA metadata}}`` block with no categories), the
+    rescue still emits a blank line before the categories for
+    readability."""
+    existing = "[[Category:OldA]]\n[[Category:OldB]]\n"
+    # NEW_WIKITEXT ends with `{{DPLA metadata|title=Example}}` — not a category.
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
+    assert "{{DPLA metadata|title=Example}}\n\n[[Category:OldA]]" in result
 
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +1303,121 @@ def test_tag_as_duplicate_idempotency_detects_whitespace_variants():
             f"prior tag {prior_tag!r} should have been detected; "
             f"editpage was called {site.editpage.call_count} time(s)"
         )
+
+
+def test_escape_template_param_replaces_equals_with_magic_word():
+    """`=` inside a template positional parameter is interpreted by
+    the MediaWiki parser as a named-parameter separator. The escape
+    must replace every `=` with the ``{{=}}`` magic word so the
+    rendered text is identical but the parser sees no splitter."""
+    assert escape_template_param("no equals") == "no equals"
+    assert escape_template_param("a=b") == "a{{=}}b"
+    assert escape_template_param("multi=one=two") == "multi{{=}}one{{=}}two"
+    assert escape_template_param("") == ""
+
+
+def test_tag_as_duplicate_escapes_equals_in_filename():
+    """Regression: a Spot Pond Reservoir file with a DPLA-preserved
+    source title containing ``"height of camera objective = 6.5
+    feet"`` produced a `{{Duplicate|...=...|...}}` template that
+    MediaWiki parsed as a named parameter, breaking the link and
+    showing an empty positional-1 slot. The bug was visible on
+    Commons rev 1234551826.
+
+    The fix: escape `=` in the correct-filename parameter via the
+    standard ``{{=}}`` magic word."""
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(lambda self: "")
+    file_page.title.return_value = "Stranded.jpg"
+
+    nasty_title = (
+        'Distribution Department, "height of camera objective = 6.5 feet", '
+        "Ston - DPLA - 01e81012a2a12fa66704075773b08b0c.jpg"
+    )
+    tag_as_duplicate(
+        site,
+        file_page,
+        correct_filename=nasty_title,
+        reason="Other file has the correct title.",
+    )
+
+    assert site.editpage.call_count == 1
+    _, kwargs = site.editpage.call_args
+    rendered = kwargs["prependtext"]
+    # A bare `=` between the first `|` and the second `|` would be the
+    # bug — assert there's no raw `=` between the template-open and the
+    # reason parameter separator.
+    duplicate_open = rendered.index("{{Duplicate|")
+    first_pipe = duplicate_open + len("{{Duplicate|")
+    # Find the SECOND pipe (parameter separator between filename and reason).
+    second_pipe = rendered.index("|", first_pipe + 1)
+    filename_param = rendered[first_pipe:second_pipe]
+    # The filename param must NOT contain a raw `=` — only the {{=}} form.
+    assert "=" not in filename_param.replace("{{=}}", ""), (
+        f"raw `=` survived inside template-parameter position: {filename_param!r}"
+    )
+    assert "{{=}}" in filename_param, (
+        f"escape did not fire on title with `=`: {filename_param!r}"
+    )
+
+
+def test_tag_as_duplicate_escapes_equals_in_reason():
+    """The reason parameter is the second positional param of
+    ``{{Duplicate}}`` — same template-parser hazard. Today the
+    default reason has no `=`, but any future change that introduces
+    one (e.g. embedding a URL fragment) must not break the template."""
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(lambda self: "")
+    file_page.title.return_value = "Stranded.jpg"
+
+    tag_as_duplicate(
+        site,
+        file_page,
+        correct_filename="Correct.jpg",
+        reason="see https://example.org/?id=42 for context",
+    )
+
+    rendered = site.editpage.call_args.kwargs["prependtext"]
+    assert "?id{{=}}42" in rendered
+    assert "?id=42" not in rendered.replace("?id{{=}}42", "")
+
+
+def test_post_commonsdelinker_request_escapes_equals_in_filenames():
+    """Same `=` escape contract applies to the
+    ``{{universal replace|<old>|<new>|reason=...}}`` template that
+    ``post_commonsdelinker_request`` posts to the CommonsDelinker
+    page. Filenames with `=` would otherwise corrupt the positional
+    params and the delinker would silently no-op."""
+    site = MagicMock()
+    # ``pywikibot.Page(site, ...)`` rejects a MagicMock site, so stub
+    # the page constructor too. ``file_has_inbound_usage`` returns True
+    # so the post path is reached.
+    with (
+        patch("ingest_wikimedia.wikimedia.pywikibot.Page", return_value=MagicMock()),
+        patch("ingest_wikimedia.wikimedia.file_has_inbound_usage", return_value=True),
+    ):
+        post_commonsdelinker_request(
+            site,
+            old_filename="Foo = bar.jpg",
+            new_filename="Foo = bar - DPLA - abc.jpg",
+            check_usage=True,
+        )
+
+    assert site.editpage.call_count == 1
+    appended = site.editpage.call_args.kwargs.get("appendtext", "")
+    # Both positional params must use the {{=}} escape.
+    assert "|Foo {{=}} bar.jpg|" in appended
+    assert "|Foo {{=}} bar - DPLA - abc.jpg|" in appended
+    # And no raw `=` in the positional-param region (the `reason=` named
+    # param is fine; that's a legitimate named-param assignment).
+    template_body = appended[
+        appended.index("{{universal replace") : appended.index("|reason=")
+    ]
+    assert "=" not in template_body.replace("{{=}}", ""), (
+        f"raw `=` survived in positional region: {template_body!r}"
+    )
 
 
 def test_tag_as_duplicate_idempotency_does_not_match_unrelated_templates():
