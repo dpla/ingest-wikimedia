@@ -1509,3 +1509,199 @@ def test_main_acquires_one_budget_slot_per_item():
     assert len(acquire_calls) == 3, (
         f"expected one slot acquire per item; got {len(acquire_calls)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _tag_drift_duplicate — rescue + tag combined operation
+#
+# Case 2 hash-drift (``upload_and_tag``) is the only title-correction path
+# where the bot must explicitly preserve community-contributed metadata
+# from the file it's about to queue for deletion (the move and redirect
+# paths do this via merge_preserved_wikitext inline). _tag_drift_duplicate
+# now does both: rescue community categories/licenses/assessments into the
+# new (correct-title) file, then tag the old one. The two steps are
+# independently best-effort so a rescue failure does not block the tag.
+
+
+_NEW_WIKI_MARKUP = "{{DPLA metadata}}\n"
+_DPLA_ID = "abcdef0123456789abcdef0123456789"
+
+
+def _drift_uploader_with_pages(
+    old_text: str,
+    *,
+    old_exists: bool = True,
+    save_raises: Exception | None = None,
+    tag_raises: Exception | None = None,
+):
+    """Build ``(uploader, old_page, new_page)`` for direct invocation of
+    ``_tag_drift_duplicate``. The new page is a write-only sink — we
+    just upload + save into it; nothing reads its state."""
+    from tools.uploader import Uploader
+
+    uploader = Uploader.__new__(Uploader)
+    uploader.site = MagicMock(name="site")
+
+    old_page = MagicMock(name="old_page")
+    old_page.text = old_text
+    old_page.exists.return_value = old_exists
+
+    new_page = MagicMock(name="new_page")
+    if save_raises is not None:
+        new_page.save.side_effect = save_raises
+    return uploader, old_page, new_page
+
+
+def _patch_get_page(old_page, new_page):
+    """Side-effect for ``get_page`` that returns the right mock by title.
+    Tests use ``File:old.jpg`` and ``File:new.jpg`` consistently."""
+
+    def _side(_site, title):
+        if title == "File:old.jpg":
+            return old_page
+        if title == "File:new.jpg":
+            return new_page
+        raise AssertionError(f"unexpected get_page title: {title!r}")
+
+    return _side
+
+
+def _call_tag_drift(uploader, old_page, new_page, **patches):
+    """Invoke ``_tag_drift_duplicate`` with the standard arg shape so
+    each test asserts on outcomes instead of plumbing the call."""
+    extras = {f"tools.uploader.{name}": value for name, value in patches.items()}
+    with patch(
+        "tools.uploader.get_page",
+        side_effect=_patch_get_page(old_page, new_page),
+    ):
+        if extras:
+            from contextlib import ExitStack
+
+            with ExitStack() as stack:
+                for target, value in extras.items():
+                    stack.enter_context(patch(target, value))
+                uploader._tag_drift_duplicate(
+                    "old.jpg", "new.jpg", _NEW_WIKI_MARKUP, _DPLA_ID
+                )
+        else:
+            uploader._tag_drift_duplicate(
+                "old.jpg", "new.jpg", _NEW_WIKI_MARKUP, _DPLA_ID
+            )
+
+
+def test_rescue_preserves_community_categories_into_new_file():
+    """The headline rescue: a community-curated category on the old
+    file must end up in the new file's wikitext."""
+    old_text = (
+        "{{Information|description=Old description}}\n"
+        "[[Category:Curated by community]]\n"
+        "[[Category:Some 1842 thing]]\n"
+    )
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+
+    with patch("tools.uploader.tag_as_duplicate"):
+        _call_tag_drift(uploader, old_page, new_page)
+
+    assert new_page.save.called, (
+        "Save must be called when the old page has community categories"
+    )
+    saved_text = new_page.text
+    assert "[[Category:Curated by community]]" in saved_text
+    assert "[[Category:Some 1842 thing]]" in saved_text
+    assert saved_text.lstrip().startswith("{{DPLA metadata}}")
+
+
+def test_rescue_preserves_assessment_and_license_templates():
+    """Featured-picture / PD-USGov templates survive the rescue."""
+    old_text = (
+        "=={{Assessment}}==\n"
+        "{{Featured picture|com|nominator=Curator}}\n"
+        "{{PD-USGov-Military}}\n"
+        "[[Category:Notable images]]\n"
+    )
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+
+    with patch("tools.uploader.tag_as_duplicate"):
+        _call_tag_drift(uploader, old_page, new_page)
+
+    saved_text = new_page.text
+    assert "{{Featured picture|com|nominator=Curator}}" in saved_text
+    assert "{{PD-USGov-Military}}" in saved_text
+    assert "[[Category:Notable images]]" in saved_text
+
+
+def test_rescue_no_save_when_nothing_to_preserve():
+    """If the old page has nothing in merge_preserved_wikitext's
+    pattern set, the new page must NOT be saved — calling save() on
+    identical content would emit a no-op revision on Commons."""
+    # Information template alone is NOT in the preserve set.
+    old_text = "{{Information|description=Plain text}}\n"
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+
+    with patch("tools.uploader.tag_as_duplicate"):
+        _call_tag_drift(uploader, old_page, new_page)
+
+    assert not new_page.save.called
+
+
+def test_rescue_skips_when_old_page_does_not_exist():
+    """Defensive: if the old page is gone (concurrent admin action),
+    don't crash — skip the rescue and proceed with the tag attempt."""
+    uploader, old_page, new_page = _drift_uploader_with_pages(
+        old_text="", old_exists=False
+    )
+
+    with patch("tools.uploader.tag_as_duplicate") as tag_mock:
+        _call_tag_drift(uploader, old_page, new_page)
+
+    assert not new_page.save.called
+    # Tag still runs — best-effort independence.
+    assert tag_mock.called
+
+
+def test_rescue_save_failure_does_not_block_tag(caplog):
+    """A save() failure mid-rescue must not block the subsequent tag.
+    The old page history still has the community contributions, so
+    manual recovery remains possible. Tag must still fire so the
+    duplicate-resolution path completes."""
+    import logging
+
+    uploader, old_page, new_page = _drift_uploader_with_pages(
+        old_text="[[Category:Community]]\n",
+        save_raises=RuntimeError("API timeout"),
+    )
+
+    with (
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+        caplog.at_level(logging.WARNING),
+    ):
+        _call_tag_drift(uploader, old_page, new_page)
+
+    assert any("Failed to rescue" in r.message for r in caplog.records)
+    # Tag must still fire — independent best-effort.
+    assert tag_mock.called
+
+
+def test_tag_failure_does_not_swallow_successful_rescue(caplog):
+    """Symmetric: if the tag step fails, the rescue is still recorded
+    in logs and the new page's saved text reflects the merge."""
+    import logging
+
+    uploader, old_page, new_page = _drift_uploader_with_pages(
+        old_text="[[Category:Community]]\n",
+    )
+
+    with (
+        patch(
+            "tools.uploader.tag_as_duplicate",
+            side_effect=RuntimeError("Commons API down"),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        _call_tag_drift(uploader, old_page, new_page)
+
+    # Rescue succeeded.
+    assert new_page.save.called
+    assert "[[Category:Community]]" in new_page.text
+    # Tag failure is logged but didn't raise.
+    assert any("Failed to tag" in r.message for r in caplog.records)
