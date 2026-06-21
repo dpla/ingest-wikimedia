@@ -77,6 +77,25 @@ def _break_query_string_pattern(title: str) -> str:
     return title
 
 
+def escape_template_param(value: str) -> str:
+    """Escape `=` to ``{{=}}`` for safe use inside a template parameter.
+
+    The MediaWiki template parser treats ``=`` in a parameter as the
+    separator between parameter name and value: ``{{Foo|a=b|c=d}}`` parses
+    as named params ``a=b`` and ``c=d``. When a positional parameter's
+    value happens to contain ``=``, the parser splits at the first ``=``
+    and the positional value is lost. DPLA preserves equals signs from
+    source titles (e.g. ``"height of camera objective = 6.5 feet"`` on a
+    Massachusetts Archives photo) so this is a real shape callers can
+    produce, observed breaking a ``{{Duplicate}}`` tag in the wild.
+
+    The ``{{=}}`` magic word renders as a literal ``=`` after parsing,
+    so it's safe to insert anywhere ``=`` would otherwise be consumed
+    by the parser.
+    """
+    return value.replace("=", "{{=}}")
+
+
 def get_page_title(
     item_title: str, dpla_identifier: str, suffix: str, page=None
 ) -> str:
@@ -724,8 +743,8 @@ def post_commonsdelinker_request(
     page = pywikibot.Page(site, COMMONSDELINKER_PAGE)
     template = (
         f"{{{{universal replace"
-        f"|{old_filename}"
-        f"|{new_filename}"
+        f"|{escape_template_param(old_filename)}"
+        f"|{escape_template_param(new_filename)}"
         f"|reason={_COMMONSDELINKER_REASON}}}}}"
     )
     summary = f"universal replace: [[File:{old_filename}]] → [[File:{new_filename}]]"
@@ -901,24 +920,36 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     new_stripped = new_wikitext.rstrip()
     parts: list[str] = [new_stripped]
 
-    def _fresh(items: list[str]) -> list[str]:
-        """Items, deduped against each other AND against the new wikitext.
-        ``new_stripped`` already carries some of what the regexes find
-        in ``existing_text`` (especially common categories); re-emitting
-        those produces duplicates in the saved wikitext."""
-        return [i for i in dict.fromkeys(items) if i not in new_stripped]
+    def _fresh(pattern: "re.Pattern[str]") -> list[str]:
+        """Items the existing text emits for ``pattern``, deduped both
+        against each other AND against what the SAME pattern extracts
+        from the new wikitext.
 
-    assessment = _fresh(_ASSESSMENT_TEMPLATE_RE.findall(existing_text))
+        Dedup is by exact regex-match equality, not substring
+        containment, so e.g. ``[[Category:American]]`` and
+        ``[[Category:American history]]`` are correctly treated as
+        distinct even though one is a prefix of the other inside the
+        ``[[Category:…]]`` shell. (Practically prevented today by the
+        closing ``]]`` / ``}}`` terminator on every preserve pattern,
+        but matching by set membership is the right contract.)"""
+        already_present = set(pattern.findall(new_stripped))
+        return [
+            i
+            for i in dict.fromkeys(pattern.findall(existing_text))
+            if i not in already_present
+        ]
+
+    assessment = _fresh(_ASSESSMENT_TEMPLATE_RE)
     if assessment:
         parts.append("")
         parts.append("=={{Assessment}}==")
         parts.extend(assessment)
     for pattern in (_PD_USGOV_RE, _IMAGE_EXTRACTED_RE):
-        group = _fresh(pattern.findall(existing_text))
+        group = _fresh(pattern)
         if group:
             parts.append("")
             parts.extend(group)
-    categories = _fresh(_CATEGORY_RE.findall(existing_text))
+    categories = _fresh(_CATEGORY_RE)
     if categories:
         # Append directly (no blank line) when the new wikitext already
         # ends with a category line, so existing + rescued categories
@@ -974,7 +1005,13 @@ def tag_as_duplicate(
             f"already tagged as duplicate."
         )
         return
-    tag = f"{{{{Duplicate|{correct_filename}|{reason}}}}}"
+    # Escape `=` so a filename or reason containing literal equals signs
+    # doesn't break the template — see escape_template_param.
+    tag = (
+        f"{{{{Duplicate"
+        f"|{escape_template_param(correct_filename)}"
+        f"|{escape_template_param(reason)}}}}}"
+    )
     summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
     # Trailing newline so the tag sits on its own line above whatever
     # wikitext currently starts the page.

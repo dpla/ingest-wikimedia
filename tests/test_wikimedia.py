@@ -3,6 +3,7 @@ from ingest_wikimedia.wikimedia import (
     COMMONSDELINKER_PAGE,
     MAX_COMMENT_BYTES,
     build_title_drift_move_reason,
+    escape_template_param,
     get_site,
     get_page_title,
     get_wiki_text,
@@ -472,6 +473,29 @@ def test_merge_preserved_wikitext_categories_flow_without_blank_line():
     # No blank line inside the category block.
     cat_block_text = "\n".join(result.splitlines()[cat_indices[0] : cat_indices[0] + 4])
     assert "\n\n" not in cat_block_text
+
+
+def test_merge_preserved_wikitext_overlapping_category_names():
+    """Two categories that share a name-prefix (e.g.
+    ``[[Category:American]]`` and ``[[Category:American history]]``)
+    are distinct categories — the dedup must NOT filter one because
+    it appears as a substring of the other. The closing ``]]``
+    terminator on every preserve pattern already prevents this in
+    practice (``[[Category:American]]`` is not a substring of
+    ``[[Category:American history]]``), but pinning the contract by
+    test rules out the regression if the regex shape changes."""
+    new_with_longer = NEW_WIKITEXT + "\n\n[[Category:American history]]\n"
+    existing = "[[Category:American]]\n"
+    result = merge_preserved_wikitext(existing, new_with_longer)
+    assert "[[Category:American history]]" in result
+    assert "[[Category:American]]" in result
+    # Both appear exactly once.
+    assert (
+        result.count("[[Category:American]]\n")
+        + result.count("[[Category:American]]")
+        - result.count("[[Category:American history]]")
+        == 1
+    )
 
 
 def test_merge_preserved_wikitext_blank_line_still_present_when_new_does_not_end_in_category():
@@ -1279,6 +1303,121 @@ def test_tag_as_duplicate_idempotency_detects_whitespace_variants():
             f"prior tag {prior_tag!r} should have been detected; "
             f"editpage was called {site.editpage.call_count} time(s)"
         )
+
+
+def test_escape_template_param_replaces_equals_with_magic_word():
+    """`=` inside a template positional parameter is interpreted by
+    the MediaWiki parser as a named-parameter separator. The escape
+    must replace every `=` with the ``{{=}}`` magic word so the
+    rendered text is identical but the parser sees no splitter."""
+    assert escape_template_param("no equals") == "no equals"
+    assert escape_template_param("a=b") == "a{{=}}b"
+    assert escape_template_param("multi=one=two") == "multi{{=}}one{{=}}two"
+    assert escape_template_param("") == ""
+
+
+def test_tag_as_duplicate_escapes_equals_in_filename():
+    """Regression: a Spot Pond Reservoir file with a DPLA-preserved
+    source title containing ``"height of camera objective = 6.5
+    feet"`` produced a `{{Duplicate|...=...|...}}` template that
+    MediaWiki parsed as a named parameter, breaking the link and
+    showing an empty positional-1 slot. The bug was visible on
+    Commons rev 1234551826.
+
+    The fix: escape `=` in the correct-filename parameter via the
+    standard ``{{=}}`` magic word."""
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(lambda self: "")
+    file_page.title.return_value = "Stranded.jpg"
+
+    nasty_title = (
+        'Distribution Department, "height of camera objective = 6.5 feet", '
+        "Ston - DPLA - 01e81012a2a12fa66704075773b08b0c.jpg"
+    )
+    tag_as_duplicate(
+        site,
+        file_page,
+        correct_filename=nasty_title,
+        reason="Other file has the correct title.",
+    )
+
+    assert site.editpage.call_count == 1
+    _, kwargs = site.editpage.call_args
+    rendered = kwargs["prependtext"]
+    # A bare `=` between the first `|` and the second `|` would be the
+    # bug — assert there's no raw `=` between the template-open and the
+    # reason parameter separator.
+    duplicate_open = rendered.index("{{Duplicate|")
+    first_pipe = duplicate_open + len("{{Duplicate|")
+    # Find the SECOND pipe (parameter separator between filename and reason).
+    second_pipe = rendered.index("|", first_pipe + 1)
+    filename_param = rendered[first_pipe:second_pipe]
+    # The filename param must NOT contain a raw `=` — only the {{=}} form.
+    assert "=" not in filename_param.replace("{{=}}", ""), (
+        f"raw `=` survived inside template-parameter position: {filename_param!r}"
+    )
+    assert "{{=}}" in filename_param, (
+        f"escape did not fire on title with `=`: {filename_param!r}"
+    )
+
+
+def test_tag_as_duplicate_escapes_equals_in_reason():
+    """The reason parameter is the second positional param of
+    ``{{Duplicate}}`` — same template-parser hazard. Today the
+    default reason has no `=`, but any future change that introduces
+    one (e.g. embedding a URL fragment) must not break the template."""
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(lambda self: "")
+    file_page.title.return_value = "Stranded.jpg"
+
+    tag_as_duplicate(
+        site,
+        file_page,
+        correct_filename="Correct.jpg",
+        reason="see https://example.org/?id=42 for context",
+    )
+
+    rendered = site.editpage.call_args.kwargs["prependtext"]
+    assert "?id{{=}}42" in rendered
+    assert "?id=42" not in rendered.replace("?id{{=}}42", "")
+
+
+def test_post_commonsdelinker_request_escapes_equals_in_filenames():
+    """Same `=` escape contract applies to the
+    ``{{universal replace|<old>|<new>|reason=...}}`` template that
+    ``post_commonsdelinker_request`` posts to the CommonsDelinker
+    page. Filenames with `=` would otherwise corrupt the positional
+    params and the delinker would silently no-op."""
+    site = MagicMock()
+    # ``pywikibot.Page(site, ...)`` rejects a MagicMock site, so stub
+    # the page constructor too. ``file_has_inbound_usage`` returns True
+    # so the post path is reached.
+    with (
+        patch("ingest_wikimedia.wikimedia.pywikibot.Page", return_value=MagicMock()),
+        patch("ingest_wikimedia.wikimedia.file_has_inbound_usage", return_value=True),
+    ):
+        post_commonsdelinker_request(
+            site,
+            old_filename="Foo = bar.jpg",
+            new_filename="Foo = bar - DPLA - abc.jpg",
+            check_usage=True,
+        )
+
+    assert site.editpage.call_count == 1
+    appended = site.editpage.call_args.kwargs.get("appendtext", "")
+    # Both positional params must use the {{=}} escape.
+    assert "|Foo {{=}} bar.jpg|" in appended
+    assert "|Foo {{=}} bar - DPLA - abc.jpg|" in appended
+    # And no raw `=` in the positional-param region (the `reason=` named
+    # param is fine; that's a legitimate named-param assignment).
+    template_body = appended[
+        appended.index("{{universal replace") : appended.index("|reason=")
+    ]
+    assert "=" not in template_body.replace("{{=}}", ""), (
+        f"raw `=` survived in positional region: {template_body!r}"
+    )
 
 
 def test_tag_as_duplicate_idempotency_does_not_match_unrelated_templates():
