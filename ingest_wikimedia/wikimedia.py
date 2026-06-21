@@ -870,7 +870,24 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     live under that header for proper categorisation, and an MOTD-archive
     scraper expecting that wrapper would miss a bare template.
 
-    Duplicates within each preserved group are collapsed.
+    Duplicates within each preserved group are collapsed. Items that
+    already appear in ``new_wikitext`` are also skipped — the new
+    wikitext sometimes already carries the same license tag or
+    category (the upload's bot-generated block can name common
+    categories that the community happened to also use), and
+    re-emitting them produces visible duplicates in the wikitext
+    source. MediaWiki dedupes them at render time, but the source
+    diff is unsightly and confuses Commons editors reviewing the
+    rescue edit.
+
+    Category-block formatting: a blank-line separator is emitted
+    before the rescued categories ONLY when ``new_wikitext`` does
+    not already end with a category line. When it does, the
+    preserved categories are appended directly so existing + rescued
+    categories flow as a single contiguous block. (Templates above
+    the category block — PD-USGov, Image extracted — always get a
+    blank-line separator, since they conventionally sit in their
+    own section between the description and the categories.)
 
     TODO (Goal 2 follow-up): the title-drift rescue currently
     overwrites the metadata template wholesale, discarding any
@@ -881,17 +898,35 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     then overwrite. Out of scope for the flat-shape uploader PR;
     flagged here so the integration point doesn't get lost.
     """
-    parts: list[str] = [new_wikitext.rstrip()]
-    assessment = list(dict.fromkeys(_ASSESSMENT_TEMPLATE_RE.findall(existing_text)))
+    new_stripped = new_wikitext.rstrip()
+    parts: list[str] = [new_stripped]
+
+    def _fresh(items: list[str]) -> list[str]:
+        """Items, deduped against each other AND against the new wikitext.
+        ``new_stripped`` already carries some of what the regexes find
+        in ``existing_text`` (especially common categories); re-emitting
+        those produces duplicates in the saved wikitext."""
+        return [i for i in dict.fromkeys(items) if i not in new_stripped]
+
+    assessment = _fresh(_ASSESSMENT_TEMPLATE_RE.findall(existing_text))
     if assessment:
         parts.append("")
         parts.append("=={{Assessment}}==")
         parts.extend(assessment)
-    for pattern in (_PD_USGOV_RE, _IMAGE_EXTRACTED_RE, _CATEGORY_RE):
-        group = list(dict.fromkeys(pattern.findall(existing_text)))
+    for pattern in (_PD_USGOV_RE, _IMAGE_EXTRACTED_RE):
+        group = _fresh(pattern.findall(existing_text))
         if group:
             parts.append("")
             parts.extend(group)
+    categories = _fresh(_CATEGORY_RE.findall(existing_text))
+    if categories:
+        # Append directly (no blank line) when the new wikitext already
+        # ends with a category line, so existing + rescued categories
+        # flow as a single block.
+        last_line = new_stripped.rsplit("\n", 1)[-1].strip()
+        if not _CATEGORY_RE.match(last_line):
+            parts.append("")
+        parts.extend(categories)
     return "\n".join(parts) + "\n"
 
 

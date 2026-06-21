@@ -404,6 +404,89 @@ def test_merge_preserved_wikitext_no_metadata_returns_new_wikitext_unchanged():
     assert result == NEW_WIKITEXT + "\n"
 
 
+def test_merge_preserved_wikitext_dedupes_against_new_wikitext():
+    """If the new wikitext already carries the same category /
+    license / image-extracted template that the existing page has,
+    the rescue must NOT re-emit it. MediaWiki silently dedupes
+    repeated category memberships at render time, but the saved
+    wikitext source would show two ``[[Category:X]]`` lines and
+    confuse Commons editors reviewing the rescue edit.
+
+    Regression: caught in production on rev 1235738403 (Heartland
+    "1813 Five Francs Coin" rescue) where the new file already had
+    ``[[Category:Gifts to Charles Lindbergh]]`` and the old file
+    contributed the same category — the merged result re-emitted it.
+    """
+    new_with_category = NEW_WIKITEXT + "\n\n[[Category:Already Present]]\n"
+    existing = (
+        "{{PD-USGov}}\n"
+        "{{Image extracted|1=Parent.jpg}}\n"
+        "[[Category:Already Present]]\n"
+        "[[Category:Brand New From Existing]]\n"
+    )
+    result = merge_preserved_wikitext(existing, new_with_category)
+    # The duplicate category must appear exactly once.
+    assert result.count("[[Category:Already Present]]") == 1
+    # The new category from the existing page must still be added.
+    assert "[[Category:Brand New From Existing]]" in result
+    # Non-category preserves that aren't in new_wikitext go through normally.
+    assert "{{PD-USGov}}" in result
+    assert "{{Image extracted|1=Parent.jpg}}" in result
+
+
+def test_merge_preserved_wikitext_dedupes_non_category_templates_too():
+    """Same dedup contract applies to PD-USGov, Image-extracted,
+    and Assessment templates — not just categories."""
+    new_with_pd = NEW_WIKITEXT + "\n{{PD-USGov}}\n"
+    existing = "{{PD-USGov}}\n[[Category:Foo]]\n"
+    result = merge_preserved_wikitext(existing, new_with_pd)
+    assert result.count("{{PD-USGov}}") == 1
+    assert "[[Category:Foo]]" in result
+
+
+def test_merge_preserved_wikitext_categories_flow_without_blank_line():
+    """When the new wikitext already ends with a category line,
+    the rescued categories must append directly — no blank-line
+    separator between the existing categories and the rescued ones.
+
+    Regression: same Heartland rescue rev 1235738403 had a blank
+    line between the new wikitext's last category and the rescued
+    block, making the source diff look like two separate category
+    groups rather than one contiguous block.
+    """
+    new_ending_in_category = (
+        "{{ Artwork | title = X }}\n\n[[Category:NewA]]\n[[Category:NewB]]\n"
+    )
+    existing = "[[Category:OldA]]\n[[Category:OldB]]\n"
+    result = merge_preserved_wikitext(existing, new_ending_in_category)
+    # All four categories should appear, contiguous, no blank line between.
+    lines = [ln for ln in result.splitlines() if ln.strip()]
+    cat_indices = [i for i, ln in enumerate(lines) if ln.startswith("[[Category:")]
+    # The four category lines must occupy four consecutive positions.
+    assert cat_indices == list(range(cat_indices[0], cat_indices[0] + 4))
+    # The rescued categories come after the existing ones (preserve order).
+    assert lines[cat_indices[0]] == "[[Category:NewA]]"
+    assert lines[cat_indices[0] + 1] == "[[Category:NewB]]"
+    assert lines[cat_indices[0] + 2] == "[[Category:OldA]]"
+    assert lines[cat_indices[0] + 3] == "[[Category:OldB]]"
+    # No blank line inside the category block.
+    cat_block_text = "\n".join(result.splitlines()[cat_indices[0] : cat_indices[0] + 4])
+    assert "\n\n" not in cat_block_text
+
+
+def test_merge_preserved_wikitext_blank_line_still_present_when_new_does_not_end_in_category():
+    """The blank-line separator is only suppressed when the new
+    wikitext already ends with a category line. When it ends with
+    a template (the common path — new wikitext is a freshly
+    generated ``{{DPLA metadata}}`` block with no categories), the
+    rescue still emits a blank line before the categories for
+    readability."""
+    existing = "[[Category:OldA]]\n[[Category:OldB]]\n"
+    # NEW_WIKITEXT ends with `{{DPLA metadata|title=Example}}` — not a category.
+    result = merge_preserved_wikitext(existing, NEW_WIKITEXT)
+    assert "{{DPLA metadata|title=Example}}\n\n[[Category:OldA]]" in result
+
+
 # ---------------------------------------------------------------------------
 # Assessment-template preservation (Media of the day, etc.)
 # ---------------------------------------------------------------------------

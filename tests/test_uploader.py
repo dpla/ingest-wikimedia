@@ -1532,11 +1532,14 @@ def _drift_uploader_with_pages(
     *,
     old_exists: bool = True,
     save_raises: Exception | None = None,
-    tag_raises: Exception | None = None,
 ):
     """Build ``(uploader, old_page, new_page)`` for direct invocation of
     ``_tag_drift_duplicate``. The new page is a write-only sink — we
-    just upload + save into it; nothing reads its state."""
+    just upload + save into it; nothing reads its state.
+
+    Tag-step failures are injected via ``patch("tools.uploader.tag_as_duplicate")``
+    at the call site, not here — the helper only needs to control the
+    rescue-side mocks."""
     from tools.uploader import Uploader
 
     uploader = Uploader.__new__(Uploader)
