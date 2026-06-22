@@ -429,3 +429,30 @@ def test_sort_key_dpla_id_tiebreaks_identical_titles():
     a = _key(_sr("Same Title"), "00000000000000000000000000000001")
     b = _key(_sr("Same Title"), "00000000000000000000000000000002")
     assert a < b
+
+
+def test_load_eligible_dp_names_maintain_includes_ineligible_with_qid():
+    """Maintain mode drops the upload-flag gate but keeps the QID gate, so a
+    formerly-participating institution (upload=False, has a QID) is included
+    while a never-onboarded one (no QID) still is not."""
+    from unittest.mock import patch
+
+    from tools import get_ids_es
+
+    insts = {
+        "Some Hub": {
+            "Wikidata": "Q100",
+            "institutions": {
+                "Active Inst": {"upload": True, "Wikidata": "Q1"},
+                "Former Inst": {"upload": False, "Wikidata": "Q2"},
+                "No QID Inst": {"upload": False, "Wikidata": ""},
+            },
+        }
+    }
+    with patch.object(get_ids_es, "PARTNER_HUBS", {"x": "Some Hub"}):
+        normal = get_ids_es.load_eligible_dp_names(insts, "x")
+        maintain = get_ids_es.load_eligible_dp_names(insts, "x", maintain=True)
+
+    assert normal == ["Active Inst"]
+    # Former Inst now included (upload=False but has a QID); No QID Inst never.
+    assert sorted(maintain) == ["Active Inst", "Former Inst"]

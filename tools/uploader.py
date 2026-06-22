@@ -183,6 +183,20 @@ class UploadTimeoutError(RuntimeError):
     """
 
 
+class NewFilePageBlocked(RuntimeError):
+    """Raised by the no-create fence when an upload would create a File page
+    that does not already exist on Commons.
+
+    This is the safety backbone of "maintain" mode (in-place upkeep of
+    already-uploaded files for institutions no longer authorized for new
+    uploads): every existing maintenance action is idempotent and repairable,
+    so the one invariant that must hold absolutely is that maintenance never
+    emits a *new* File page. The fence enforces that at the single upload
+    call site; this exception is caught per-ordinal in process_item() and
+    recorded as ``UPLOAD_SKIPPED_WOULD_CREATE`` — never fatal, never retried.
+    """
+
+
 class Uploader:
     def __init__(
         self,
@@ -192,6 +206,7 @@ class Uploader:
         dpla: DPLA,
         site: BaseSite,
         category_ensurer: CategoryEnsurer | None = None,
+        no_create: bool = False,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
@@ -199,6 +214,35 @@ class Uploader:
         self.site = site
         self.dpla = dpla
         self.category_ensurer = category_ensurer
+        # no_create: maintain-mode fence. When True, _safe_upload refuses to
+        # write to a File page that does not already exist, so no run can
+        # create a new Commons file. Defaults False (normal upload behaviour).
+        self.no_create = no_create
+
+    def _safe_upload(self, *, filepage, **kwargs):
+        """Sole sanctioned wrapper around ``site.upload`` — every upload in
+        this module MUST go through here so the no-create fence cannot be
+        bypassed by adding a new call site.
+
+        In no-create (maintain) mode, write only when the target is an existing
+        real File page (an overwrite / new version); otherwise raise
+        :class:`NewFilePageBlocked`. Two cases are blocked:
+
+          * the title doesn't exist — a net-new upload; and
+          * the title is a *redirect* — it holds no file of its own, so
+            uploading there would create file content at a title that had
+            none. ``FilePage.exists()`` returns True for a redirect (and
+            pywikibot transparently follows it when reading properties), so
+            the explicit ``isRedirectPage()`` guard is required — see the
+            "Pywikibot ... transparently follows redirects" lesson. A genuine
+            de-redirect belongs in the explicit move/redirect path, not here.
+
+        Moving and editing existing pages are unaffected — only *creating* a
+        new File page is fenced.
+        """
+        if self.no_create and (not filepage.exists() or filepage.isRedirectPage()):
+            raise NewFilePageBlocked(filepage.title())
+        return self.site.upload(filepage=filepage, **kwargs)
 
     def _refresh_pageid_with_retries(self, page_title: str) -> int | None:
         """Resolve the Commons pageid for ``page_title`` post-upload,
@@ -633,7 +677,7 @@ class Uploader:
                         future = None
                         try:
                             future = executor.submit(
-                                self.site.upload,
+                                self._safe_upload,
                                 filepage=wiki_file_page,
                                 source_filename=temp_file.name,
                                 comment=upload_comment,
@@ -1391,6 +1435,25 @@ class Uploader:
                     }
                     self.handle_upload_exception(ex)
                     break
+                except NewFilePageBlocked as ex:
+                    # Maintain-mode fence tripped: this ordinal would have
+                    # created a new File page. Record a would-create skip
+                    # (never fatal, never retried) and move on — other ordinals
+                    # of the same item may legitimately already exist. Status
+                    # INELIGIBLE keeps SDC sync from targeting a page that
+                    # isn't there.
+                    logging.info(
+                        f"maintain: blocked net-new upload for {dpla_id} "
+                        f"ordinal {ordinal} ({ex})"
+                    )
+                    self._track_ordinal_skip(Result.UPLOAD_SKIPPED_WOULD_CREATE)
+                    ordinal_results[str(ordinal)] = {
+                        "status": ORDINAL_INELIGIBLE,
+                        "title": None,
+                        "pageid": None,
+                        "error": "would create a new File page (blocked in maintain mode)",
+                    }
+                    continue
 
             # After the per-asset loop, look for "trailing-page orphan" Commons
             # files for this item — pages whose ordinal exceeds the current
@@ -1471,6 +1534,18 @@ class Uploader:
 @click.option("--dry-run", is_flag=True)
 @click.option("--verbose", is_flag=True)
 @click.option(
+    "--no-create",
+    is_flag=True,
+    help=(
+        "Maintain mode: never create a new Commons File page. Overwrites of "
+        "existing files (new versions) and moves/edits still proceed, but any "
+        "upload that would create a not-yet-existing File page is blocked and "
+        "recorded as UPLOAD_SKIPPED_WOULD_CREATE. Use when maintaining "
+        "already-uploaded files for institutions no longer authorized for new "
+        "uploads."
+    ),
+)
+@click.option(
     "--workers-budget",
     type=int,
     default=0,
@@ -1487,7 +1562,12 @@ class Uploader:
     ),
 )
 def main(
-    ids_file, partner: str, dry_run: bool, verbose: bool, workers_budget: int
+    ids_file,
+    partner: str,
+    dry_run: bool,
+    verbose: bool,
+    no_create: bool,
+    workers_budget: int,
 ) -> None:
     start_time = time.time()
     tools_context = ToolsContext.init(partner)
@@ -1502,6 +1582,7 @@ def main(
         tools_context.get_dpla(),
         commons_site,
         category_ensurer,
+        no_create=no_create,
     )
 
     dpla = tools_context.get_dpla()
@@ -1528,6 +1609,10 @@ def main(
         notify_phase_start(partner, "upload")
         if dry_run:
             logging.warning("---=== DRY RUN ===---")
+        if no_create:
+            logging.warning(
+                "---=== MAINTAIN MODE (no-create): no new File pages will be created ===---"
+            )
 
         providers_json = dpla.get_providers_data()
         logging.info(f"Starting upload for {partner}")
