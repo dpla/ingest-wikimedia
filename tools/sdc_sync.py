@@ -3881,6 +3881,11 @@ def _maintain_process_file(mediaid, embedded_id, file_page, title, tally=None):
             tally["ambiguous"] += 1
         return
 
+    # Emit the per-item marker the status poller (wikimedia_upload_status.py)
+    # counts for SDC-phase progress, so a maintain --cat run advances past
+    # "starting..." like a partner-mode run does.
+    logging.info(f"DPLA ID: {dpla_id}")
+
     if _s3_partner is not None:
         # Title-drift rename (#3): move to the canonical title for the re-linked
         # id before syncing, so SDC + wikitext cleanup land on the final page.
@@ -3925,6 +3930,26 @@ def _report_maintain_tally(tally, total):
     print(f"  {'ambiguous':>12}: {tally['ambiguous']} (multi-hit, not auto-applied)")
     resolved = total - tally["unresolved"]
     print(f"  {'-> resolved':>12}: {resolved}/{total}")
+
+
+def _emit_maintain_summary(label, elapsed_seconds):
+    """Maintain mode's terminal summary, mirroring _run_partner_mode's: log the
+    ``COUNTS:`` marker (which the status poller reads as the SDC-phase
+    completion signal) and post the Slack completion notice with the maintain
+    counters (renames included). Called only on normal loop completion — an
+    aborted run propagates the exception past this point, so (as in partner
+    mode) the shell-level ``notify_pipeline_fail`` handles the failure instead
+    and no spurious ``COUNTS:`` is written.
+    """
+    logging.info("\n" + str(tracker))
+    logging.info(f"{elapsed_seconds} seconds.")
+    notify_sdc_complete(
+        tracker=tracker,
+        partner_label=label,
+        elapsed_seconds=elapsed_seconds,
+        workers=1,
+        maintain=True,
+    )
 
 
 def process_one(mediaid, dpla_id):
@@ -5429,6 +5454,7 @@ def main() -> None:
     _initialize()
 
     count = 0
+    start_time = time.time()
 
     if method == "list":
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
@@ -5494,6 +5520,8 @@ def main() -> None:
                 _safe_process_one(mediaid, embedded_id, file_page=page)
         if tally is not None:
             _report_maintain_tally(tally, count)
+        elif args.maintain:
+            _emit_maintain_summary(_s3_partner or "maintain", time.time() - start_time)
 
     elif args.cat:
         category = pywikibot.Category(site, args.cat)
@@ -5524,6 +5552,8 @@ def main() -> None:
                 break
         if tally is not None:
             _report_maintain_tally(tally, count)
+        elif args.maintain:
+            _emit_maintain_summary(_s3_partner or args.cat, time.time() - start_time)
 
     elif args.partner:
         _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")

@@ -5603,3 +5603,45 @@ def test_maintain_process_file_renames_before_sync():
     mock_rename.assert_called_once_with(page, "liveid")
     # SDC sync lands on the renamed page, not the original.
     assert mock_sync.call_args.kwargs["file_page"] is renamed
+
+
+def test_emit_maintain_summary_calls_notify_with_maintain_flag():
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    with (
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "notify_sdc_complete") as mock_notify,
+    ):
+        sdc_sync._emit_maintain_summary("digitalnc", 12.5)
+    # Mirrors _run_partner_mode's terminal block: posts the SDC completion
+    # notice flagged as maintain (so rename counters surface) at workers=1.
+    mock_notify.assert_called_once()
+    kwargs = mock_notify.call_args.kwargs
+    assert kwargs["maintain"] is True
+    assert kwargs["workers"] == 1
+    assert kwargs["partner_label"] == "digitalnc"
+
+
+def test_maintain_process_file_logs_dpla_id_progress_marker(caplog):
+    import logging as _logging
+
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "embedded"),
+        ),
+        patch.object(sdc_sync, "_s3_partner", None),
+        patch.object(sdc_sync, "_safe_process_one"),
+        caplog.at_level(_logging.INFO),
+    ):
+        sdc_sync._maintain_process_file("M1", "liveid", page, "File:X.jpg", tally=None)
+    # The status poller (wikimedia_upload_status.py) counts "DPLA ID:" lines
+    # for SDC-phase progress; the maintain write path must emit one per file.
+    assert any("DPLA ID: liveid" in r.message for r in caplog.records)
