@@ -237,8 +237,9 @@ def get_phase_and_progress(
         f"/Uploaded to/ {{u++}} "
         f"/Skipping.*Already exists on commons/ {{s++}} "
         f"/COUNTS:/ {{c++}} "
-        f"END {{ print d+0; print u+0; print s+0; print c+0 }}"
-        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n'; "
+        f"/-- Ordinal [0-9]+:/ {{o++}} "
+        f"END {{ print d+0; print u+0; print s+0; print c+0; print o+0 }}"
+        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n0\\n'; "
         f"{csv_count_cmd}; "
         f"echo {sep}; "
         f"DOWNLOG=$(ls -t {log_dir}/*-{label}-download.log 2>/dev/null | head -1); "
@@ -260,13 +261,17 @@ def get_phase_and_progress(
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
 
     # Layout matches the awk-then-wc shell command above: the awk pass emits
-    # four counts (DPLA-ID, Uploaded, Skipping, COUNTS) and then `wc -l`
-    # emits the CSV total — five lines in total.
+    # five counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal) and then
+    # `wc -l` emits the CSV total — six lines in total. ``ordinal_count``
+    # is the count of ``-- Ordinal N:`` markers in the active log, which
+    # the SDC phase emits one of per file (numerator for SDC's file-level
+    # progress).
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
     counts_marker = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
-    total = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
+    ordinal_count = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
+    total = _safe_int(count_lines[5]) if len(count_lines) > 5 else 0
 
     # Sum of `Item <id>: N ordinals` lines from the download log — the true
     # file count once downloads have completed. 0 when no download log was
@@ -356,14 +361,17 @@ def get_phase_and_progress(
 
     if log_file.endswith("-sdc.log"):
         # sdc-sync's _run_partner_mode logs `DPLA ID: <id> (n/total)` per
-        # item — same `DPLA ID:` marker the awk pass already counts. Uses
-        # the COUNTS: terminal marker as the completion signal, matching
-        # the downloader/uploader convention. The reported figure is
-        # "items processed" (i.e. iterated by the loop) rather than
-        # "items synced" because some processed items may have been
-        # skipped for missing sidecars or mapping issues — the Slack
-        # summary surfaces the real synced count via the tracker's
-        # SDC_ITEMS_SYNCED line.
+        # item and `-- Ordinal N: <mediaid>` per ordinal. Uses the
+        # COUNTS: terminal marker as the completion signal, matching the
+        # downloader/uploader convention. The reported in-progress
+        # figure is file-level (`ordinal_count` numerator over
+        # `total_ordinals` denominator from the download log) when both
+        # are available — same rationale as the Upload branch, since
+        # multi-page items take proportionally more SDC-write work than
+        # 1-image items. Falls back to item-level when no download log
+        # has been found (legacy sessions). Terminal completion still
+        # reports items, since the tracker's SDC_ITEMS_SYNCED is per
+        # item.
         if dpla_id_count == 0:
             start_state = "queued" if waiting_on_slots else "starting..."
             return f"SDC syncing ({start_state}){slot_suffix}", log_mtime
@@ -372,8 +380,13 @@ def get_phase_and_progress(
                 f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)",
                 log_mtime,
             )
+        if total_ordinals > 0 and ordinal_count > 0:
+            files_pct = f"{ordinal_count / total_ordinals * 100:.1f}"
+            progress = f"{ordinal_count:,} / {total_ordinals:,} files, ~{files_pct}%"
+        else:
+            progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
         return (
-            f"SDC syncing ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){slot_suffix}{stale_suffix}",
+            f"SDC syncing ({progress}){slot_suffix}{stale_suffix}",
             log_mtime,
         )
 

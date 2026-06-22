@@ -136,7 +136,12 @@ def _fake_ssm_for_phase(
 
     Sequence (matches the real two-call flow):
       1. precheck — `session_created\nlog_filename`
-      2. main — `now\nmtime\nSEP\ntail\nSEP\n<5 lines of awk + wc>\nSEP\n<total_ordinals>`
+      2. main — `now\nmtime\nSEP\ntail\nSEP\n<6 lines of awk + wc>\nSEP\n<total_ordinals>`
+
+    ``awk_counts`` is the five-element awk-emitted prefix in order:
+    ``[dpla_id_count, uploaded_count, skipped_count, counts_marker,
+    ordinal_count]``. The trailing ``csv_total`` from ``wc -l`` is
+    appended automatically.
 
     ``mtime`` is parameterised so tests can verify the mtime tiebreak in
     ``main`` — an "aborted phase" fake with an earlier mtime must be
@@ -148,7 +153,7 @@ def _fake_ssm_for_phase(
     ``total_ordinals`` is the file-level denominator the helper now
     derives from the corresponding download log; default 0 mirrors the
     "no download log found" case (legacy sessions or pre-PR-272 logs),
-    where the Upload branch falls back to item-count.
+    where the Upload and SDC branches fall back to item-count.
     """
     call_count = [0]
     sep = "__WM_SEP__"
@@ -195,7 +200,7 @@ def test_get_phase_and_progress_retry_label_reads_retry_dir_csvs():
         # then csv total = 5 (sum of download+upload retry CSVs)
         return (
             "1700000000\n1700000000\n__WM_SEP__\nDownloading something\n"
-            "__WM_SEP__\n2\n0\n0\n0\n5\n"
+            "__WM_SEP__\n2\n0\n0\n0\n0\n5\n"
         )
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
@@ -242,7 +247,7 @@ def test_get_phase_and_progress_retry_label_uses_partner_dir_name():
         captured.append(command)
         if len(captured) == 1:
             return "1700000000\n20260601-120000-retry-si-download.log\n"
-        return "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n1\n0\n0\n0\n3\n"
+        return "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n1\n0\n0\n0\n0\n3\n"
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
         get_phase_and_progress(
@@ -270,7 +275,7 @@ def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
     # awk_counts layout: [dpla_id_count, uploaded, skipping, counts_marker]
     fake = _fake_ssm_for_phase(
         log_filename="20260525-200000-minnesota-sdc.log",
-        awk_counts=[3, 0, 0, 0],
+        awk_counts=[3, 0, 0, 0, 0],
         csv_total=10,
     )
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
@@ -298,7 +303,7 @@ def test_get_phase_and_progress_flags_waiting_on_slots():
 
     fake = _fake_ssm_for_phase(
         log_filename="20260616-000000-nara+x-sdc.log",
-        awk_counts=[100, 0, 0, 0],
+        awk_counts=[100, 0, 0, 0, 0],
         csv_total=200,
         mtime=1700000000,
         now=1700000000
@@ -324,7 +329,7 @@ def test_get_phase_and_progress_reports_sdc_complete():
 
     fake = _fake_ssm_for_phase(
         log_filename="20260525-200000-minnesota-sdc.log",
-        awk_counts=[10, 0, 0, 1],  # 10 items, COUNTS marker present
+        awk_counts=[10, 0, 0, 1, 0],  # 10 items, COUNTS marker present
         csv_total=10,
     )
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
@@ -347,7 +352,7 @@ def test_get_phase_and_progress_reports_sdc_starting_with_no_items():
 
     fake = _fake_ssm_for_phase(
         log_filename="20260525-200000-minnesota-sdc.log",
-        awk_counts=[0, 0, 0, 0],
+        awk_counts=[0, 0, 0, 0, 0],
         csv_total=10,
     )
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
@@ -369,7 +374,7 @@ def test_get_phase_and_progress_reports_sdc_queued_when_waiting():
 
     fake = _fake_ssm_for_phase(
         log_filename="20260525-200000-minnesota-sdc.log",
-        awk_counts=[0, 0, 0, 0],
+        awk_counts=[0, 0, 0, 0, 0],
         csv_total=10,
         tail=" -- All 16 worker slots busy; waiting for capacity.",
     )
@@ -414,7 +419,7 @@ def test_main_picks_latest_active_label_by_mtime_when_earlier_label_aborted():
 
     aborted = _fake_ssm_for_phase(
         log_filename="20260528-091047-nara+william-j-clinton-library-sdc.log",
-        awk_counts=[250, 0, 0, 0],  # no COUNTS marker → not complete
+        awk_counts=[250, 0, 0, 0, 0],  # no COUNTS marker → not complete
         csv_total=4879,
         mtime=ABORT_MTIME,
     )
@@ -428,7 +433,7 @@ def test_main_picks_latest_active_label_by_mtime_when_earlier_label_aborted():
 
     active = _fake_ssm_for_phase(
         log_filename="20260528-140954-nara+center-for-legislative-archives-sdc.log",
-        awk_counts=[3101, 0, 0, 0],
+        awk_counts=[3101, 0, 0, 0, 0],
         csv_total=6946,
         mtime=ACTIVE_MTIME,
     )
@@ -918,7 +923,7 @@ def test_upload_progress_reports_file_level_when_download_log_available():
     fake = _fake_ssm_for_phase(
         log_filename="20260528-091047-bpl+phillips-academy-upload.log",
         # [dpla_id_count, uploaded, skipping, counts]
-        awk_counts=[200, 1200, 300, 0],
+        awk_counts=[200, 1200, 300, 0, 0],
         csv_total=400,  # items — used as fallback only
         total_ordinals=6000,
     )
@@ -950,7 +955,7 @@ def test_upload_progress_falls_back_to_item_level_when_no_download_log():
 
     fake = _fake_ssm_for_phase(
         log_filename="20260528-091047-bpl+phillips-academy-upload.log",
-        awk_counts=[50, 30, 5, 0],
+        awk_counts=[50, 30, 5, 0, 0],
         csv_total=200,
         total_ordinals=0,  # no download log found
     )
@@ -965,6 +970,92 @@ def test_upload_progress_falls_back_to_item_level_when_no_download_log():
     # Item-level: 50 / 200 = 25.0%
     assert "50 / 200 items" in phase, phase
     assert "~25.0%" in phase, phase
+
+
+def test_sdc_progress_reports_file_level_when_download_log_available():
+    """Mirror of the Upload-phase file-level test for SDC. When the
+    SDC log carries per-ordinal ``-- Ordinal N:`` markers and the
+    download log gives a total file count, SDC progress is file-level.
+    Multi-page newspaper items would otherwise hide the actual SDC
+    work — the bot writes structured data on every ordinal, not just
+    once per item."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    # 400 items processed, 1,800 ordinals touched, 6,000 total = 30.0%
+    fake = _fake_ssm_for_phase(
+        log_filename="20260622-161651-texas+stephen-f-austin-sdc.log",
+        awk_counts=[400, 0, 0, 0, 1800],
+        csv_total=939,
+        total_ordinals=6000,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-texas+stephen-f-austin",
+            hub="texas",
+            label="texas+stephen-f-austin",
+        )
+    assert phase is not None
+    assert "1,800 / 6,000 files" in phase, phase
+    assert "~30.0%" in phase, phase
+    assert "items" not in phase, (
+        f"file-level reporting must replace item-level in SDC: got {phase!r}"
+    )
+
+
+def test_sdc_progress_falls_back_to_item_level_when_no_download_log():
+    """SDC's item-level fallback fires when no download log was found
+    (legacy sessions, or download phase lives elsewhere)."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260622-161651-texas+stephen-f-austin-sdc.log",
+        awk_counts=[400, 0, 0, 0, 1800],
+        csv_total=939,
+        total_ordinals=0,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-texas+stephen-f-austin",
+            hub="texas",
+            label="texas+stephen-f-austin",
+        )
+    assert phase is not None
+    assert "400 / 939 items" in phase, phase
+
+
+def test_sdc_progress_falls_back_to_item_level_when_no_ordinal_markers_yet():
+    """Defensive: a download log can be present (total_ordinals > 0)
+    while the SDC log is too new to have emitted any
+    ``-- Ordinal N:`` markers yet (just-started session — items are
+    starting but their first ordinals haven't been touched). Use the
+    item-level form rather than reporting 0.0%, which would look
+    visually identical to "not started" while the session is in fact
+    running its first item."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260622-161651-texas+stephen-f-austin-sdc.log",
+        awk_counts=[5, 0, 0, 0, 0],
+        csv_total=939,
+        total_ordinals=6000,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-texas+stephen-f-austin",
+            hub="texas",
+            label="texas+stephen-f-austin",
+        )
+    assert phase is not None
+    assert "5 / 939 items" in phase, phase
 
 
 def test_upload_progress_passes_label_glob_into_download_log_lookup():
@@ -984,7 +1075,7 @@ def test_upload_progress_passes_label_glob_into_download_log_lookup():
             return "1700000000\n20260528-091047-bpl+phillips-academy-upload.log\n"
         return (
             "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n"
-            "10\n5\n2\n0\n50\n__WM_SEP__\n200\n"
+            "10\n5\n2\n0\n0\n50\n__WM_SEP__\n200\n"
         )
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
@@ -1024,7 +1115,7 @@ def test_download_log_glob_is_not_single_quoted():
             return "1700000000\n20260528-091047-bpl+phillips-academy-upload.log\n"
         return (
             "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n"
-            "10\n5\n2\n0\n50\n__WM_SEP__\n200\n"
+            "10\n5\n2\n0\n0\n50\n__WM_SEP__\n200\n"
         )
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
