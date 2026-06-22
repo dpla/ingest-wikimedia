@@ -3790,8 +3790,14 @@ def _maintain_canonical_title(file_page, dpla_id):
         get_dict(metadata, SOURCE_RESOURCE_FIELD_NAME), DC_TITLE_FIELD_NAME
     )
     item_title = titles[0] if titles else ""
-    if not item_title:
-        # No source title to build a filename from — leave the name as-is.
+    # No usable source title to build a filename from — leave the name as-is.
+    # The isinstance guard matters because get_page_title slices/replaces the
+    # title (item_title[:181].replace(...)); a non-string staged value would
+    # raise there and abort the whole --cat batch. Don't strip/normalize beyond
+    # the type check: the uploader builds the stored title from the raw
+    # titles[0], so altering it here would break canonical-title parity and
+    # provoke spurious renames.
+    if not isinstance(item_title, str) or not item_title:
         return None
     current = file_page.title(with_ns=False)
     ext = os.path.splitext(current)[1]
@@ -3827,12 +3833,25 @@ def _maintain_rename(file_page, dpla_id):
         file_page.move(
             f"File:{canonical}", reason=reason, movetalk=False, noredirect=False
         )
-    except pywikibot.exceptions.Error as e:
+    except pywikibot.exceptions.ArticleExistsConflictError as e:
+        # The one outcome MAINTAIN_RENAME_BLOCKED is meant to count: MediaWiki
+        # raises this only when the canonical title is occupied by a page that
+        # isn't a redirect back to this file — a genuine collision needing DPLA
+        # follow-up. Leave the file non-canonical; its SDC still syncs in place.
         logging.error(
             f"maintain: could not move [[File:{current}]] ->"
             f" [[File:{canonical}]] ({e}); leaving non-canonical for review."
         )
         tracker.increment(Result.MAINTAIN_RENAME_BLOCKED)
+        return file_page
+    except pywikibot.exceptions.Error as e:
+        # Any other move failure (transient API, auth, invalid-name) is NOT an
+        # occupancy block — don't inflate the blocked counter with it. Log and
+        # continue; a later maintain run retries the rename.
+        logging.error(
+            f"maintain: move failed for [[File:{current}]] ->"
+            f" [[File:{canonical}]] ({e}); continuing without rename."
+        )
         return file_page
     logging.info(f"maintain: renamed [[File:{current}]] -> [[File:{canonical}]]")
     tracker.increment(Result.MAINTAIN_RENAMED)

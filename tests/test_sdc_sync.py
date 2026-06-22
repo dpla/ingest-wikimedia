@@ -5645,3 +5645,55 @@ def test_maintain_process_file_logs_dpla_id_progress_marker(caplog):
     # The status poller (wikimedia_upload_status.py) counts "DPLA ID:" lines
     # for SDC-phase progress; the maintain write path must emit one per file.
     assert any("DPLA ID: liveid" in r.message for r in caplog.records)
+
+
+def test_maintain_canonical_title_none_for_non_string_title():
+    # A non-string staged title (malformed dpla-map) must not reach
+    # get_page_title (which slices/replaces it) — return None instead of
+    # aborting the --cat batch with a TypeError.
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "X - DPLA - id.jpg"
+    fake_client = MagicMock()
+    fake_client.get_item_metadata.return_value = json.dumps(
+        {"sourceResource": {"title": [{"unexpected": "dict"}]}}
+    )
+    with (
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_s3_client", fake_client),
+    ):
+        assert sdc_sync._maintain_canonical_title(page, "id") is None
+
+
+def test_maintain_rename_transient_error_not_counted_as_blocked():
+    import pywikibot
+
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "Old - DPLA - deadid.jpg"
+    # A non-occupancy move failure (transient API/auth) — NOT ArticleExists.
+    page.move.side_effect = pywikibot.exceptions.Error("maxlag")
+    fake_tracker = MagicMock()
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_canonical_title",
+            return_value="Old - DPLA - liveid.jpg",
+        ),
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "site", MagicMock(), create=True),
+        patch.object(sdc_sync.wikimedia, "file_has_inbound_usage", return_value=False),
+        patch.object(
+            sdc_sync.wikimedia, "build_title_drift_move_reason", return_value="reason"
+        ),
+        patch.object(sdc_sync.wikimedia, "post_commonsdelinker_request"),
+    ):
+        out = sdc_sync._maintain_rename(page, "liveid")
+    # File left in place for retry; the blocked counter is NOT inflated by a
+    # transient failure (it means "canonical title occupied", not "move erred").
+    assert out is page
+    assert Result.MAINTAIN_RENAME_BLOCKED not in [
+        c.args[0] for c in fake_tracker.increment.call_args_list
+    ]
