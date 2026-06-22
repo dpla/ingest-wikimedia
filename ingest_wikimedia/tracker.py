@@ -14,6 +14,11 @@ class Result(Enum):
     # download-only formats staged for conversion).
     UPLOAD_SKIPPED_NOT_PRESENT = auto()
     UPLOAD_SKIPPED_INELIGIBLE = auto()
+    # Maintain (no-create) mode: an upload would have created a File page
+    # that does not already exist on Commons, so the fence blocked it. The
+    # core safety invariant of maintain mode — maintenance never emits a new
+    # File page — surfaces here so operators can audit that it held.
+    UPLOAD_SKIPPED_WOULD_CREATE = auto()
     UPLOADED = auto()
     BYTES = auto()
     ITEM_NOT_PRESENT = auto()

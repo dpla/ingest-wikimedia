@@ -128,7 +128,9 @@ def _title_sort_key(source: dict, dpla_id: str) -> str:
     return prefix.casefold().lstrip(_TITLE_SORT_STRIP) + "\x00" + dpla_id
 
 
-def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
+def load_eligible_dp_names(
+    institutions: dict, partner: str, maintain: bool = False
+) -> list[str]:
     """
     Return the list of dataProvider name strings eligible for upload for the
     given hub, given an already-loaded institutions_v2.json document.
@@ -141,6 +143,15 @@ def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
 
     Name strings are used rather than Wikidata URIs so that two provider name
     variants mapping to the same Wikidata ID can carry independent upload flags.
+
+    ``maintain`` (maintain mode) drops ONLY the ``upload`` requirement: every
+    QID-bearing institution under the hub is included regardless of its upload
+    flag. This is what lets the pipeline regenerate sdc.json / dpla-map.json for
+    institutions no longer authorized for *new* uploads, so their already-on-
+    Commons files can still be maintained in place. The Wikidata-ID requirement
+    is kept (it gates Commons categorisation and the P195 institution claim);
+    new-upload prevention is enforced downstream by the uploader's no-create
+    fence, never by this worklist.
     """
     hub_name = PARTNER_HUBS[partner]
 
@@ -155,7 +166,8 @@ def load_eligible_dp_names(institutions: dict, partner: str) -> list[str]:
     for inst_name, inst_info in hub.get("institutions", {}).items():
         wikidata_id = inst_info.get("Wikidata", "")
         inst_upload = inst_info.get("upload", False)
-        if hub_wikidata and wikidata_id and (hub_upload or inst_upload):
+        upload_ok = maintain or hub_upload or inst_upload
+        if hub_wikidata and wikidata_id and upload_ok:
             eligible.append(inst_name)
 
     return eligible
@@ -251,11 +263,23 @@ def build_query(
         " re-check — the operator's submission is treated as authoritative."
     ),
 )
+@click.option(
+    "--maintain",
+    is_flag=True,
+    help=(
+        "Maintain mode: include institutions regardless of their upload flag"
+        " (QID still required), so IDs + sdc.json are generated for already-"
+        "uploaded files of institutions no longer authorized for new uploads."
+        " New-upload prevention is enforced by the uploader's --no-create"
+        " fence, not by this worklist."
+    ),
+)
 def main(
     partner: str,
     institutions: tuple[str, ...],
     collection: str | None,
     single_id: str | None,
+    maintain: bool,
 ) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
@@ -303,7 +327,9 @@ def main(
     # Load institutions_v2.json once and reuse it for both eligibility
     # filtering and the SDC pre-compute pass.
     institutions_json = fetch_institutions_v2()
-    eligible_dp_names = load_eligible_dp_names(institutions_json, partner)
+    eligible_dp_names = load_eligible_dp_names(
+        institutions_json, partner, maintain=maintain
+    )
     if not eligible_dp_names:
         print(
             f"No eligible institutions found for {partner} in institutions_v2.json",
@@ -314,8 +340,10 @@ def main(
     if institutions:
         ineligible = [name for name in institutions if name not in eligible_dp_names]
         if ineligible:
+            # In maintain mode the gate is QID presence, not the upload flag.
+            reason = "lack a Wikidata ID" if maintain else "not upload-eligible"
             print(
-                f"Institution(s) not upload-eligible for {partner}: {ineligible}.",
+                f"Institution(s) {reason} for {partner}: {ineligible}.",
                 file=sys.stderr,
             )
             sys.exit(1)

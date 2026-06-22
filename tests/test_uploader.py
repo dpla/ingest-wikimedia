@@ -10,8 +10,12 @@ from unittest.mock import MagicMock, patch
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import WMC_UPLOAD_CHUNK_SIZE
 from ingest_wikimedia.worker_slots import WorkerSlotBudget
+import pytest
+
 from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
+    NewFilePageBlocked,
+    Uploader,
     _post_item_orphan_check,
     _post_upload_touch_new_institutions,
     is_dup_sha1_sibling_at_expected_title,
@@ -1708,3 +1712,83 @@ def test_tag_failure_does_not_swallow_successful_rescue(caplog):
     assert "[[Category:Community]]" in new_page.text
     # Tag failure is logged but didn't raise.
     assert any("Failed to tag" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Maintain-mode no-create fence: _safe_upload is the single sanctioned upload
+# path. In no_create mode it must refuse to write to a File page that does not
+# already exist (blocking new-page creation), while still allowing overwrites
+# of existing pages. This is the safety backbone of maintain mode.
+# ---------------------------------------------------------------------------
+
+
+def _uploader(no_create: bool) -> Uploader:
+    return Uploader(
+        tracker=MagicMock(),
+        local_fs=MagicMock(),
+        s3_client=MagicMock(),
+        dpla=MagicMock(),
+        site=MagicMock(),
+        category_ensurer=None,
+        no_create=no_create,
+    )
+
+
+def _filepage(exists: bool, is_redirect: bool = False) -> MagicMock:
+    page = MagicMock()
+    page.exists.return_value = exists
+    page.isRedirectPage.return_value = is_redirect
+    page.title.return_value = "File:Example - DPLA - deadbeef (page 1).jpg"
+    return page
+
+
+def test_safe_upload_blocks_new_filepage_in_no_create_mode():
+    uploader = _uploader(no_create=True)
+    page = _filepage(exists=False)
+    with pytest.raises(NewFilePageBlocked):
+        uploader._safe_upload(
+            filepage=page,
+            source_filename="/tmp/x.jpg",
+            comment="c",
+            text="t",
+            ignore_warnings=True,
+            asynchronous=True,
+            chunk_size=0,
+        )
+    # The fence must prevent the actual Commons write entirely.
+    uploader.site.upload.assert_not_called()
+
+
+def test_safe_upload_blocks_redirect_title_in_no_create_mode():
+    # A redirect page reports exists() == True but holds no file of its own;
+    # uploading there would create file content at a title that had none.
+    uploader = _uploader(no_create=True)
+    page = _filepage(exists=True, is_redirect=True)
+    with pytest.raises(NewFilePageBlocked):
+        uploader._safe_upload(filepage=page, source_filename="/tmp/x.jpg")
+    uploader.site.upload.assert_not_called()
+
+
+def test_safe_upload_allows_overwrite_of_existing_in_no_create_mode():
+    uploader = _uploader(no_create=True)
+    page = _filepage(exists=True)
+    uploader.site.upload.return_value = "ok"
+    result = uploader._safe_upload(
+        filepage=page, source_filename="/tmp/x.jpg", comment="c", text="t"
+    )
+    assert result == "ok"
+    uploader.site.upload.assert_called_once_with(
+        filepage=page, source_filename="/tmp/x.jpg", comment="c", text="t"
+    )
+
+
+def test_safe_upload_allows_new_filepage_when_not_in_no_create_mode():
+    # Default (normal upload) mode: creating a new page is allowed, so the
+    # fence is inert and the existence check is never even consulted.
+    uploader = _uploader(no_create=False)
+    page = _filepage(exists=False)
+    uploader.site.upload.return_value = "ok"
+    result = uploader._safe_upload(filepage=page, source_filename="/tmp/x.jpg")
+    assert result == "ok"
+    uploader.site.upload.assert_called_once()
+    page.exists.assert_not_called()

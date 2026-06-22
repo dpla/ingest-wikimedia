@@ -5189,3 +5189,62 @@ def test_find_existing_commons_files_skips_non_canonical_titles(monkeypatch):
 
     found = sdc_sync._find_existing_commons_files_by_dpla_id(dpla_id)
     assert list(found.keys()) == ["1"]
+
+
+# --- maintain mode: ID-drift re-link in --cat / --file ----------------------
+
+
+def test_extract_source_url_from_legacy_wikitext():
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = (
+        "== {{int:filedesc}} ==\n{{Artwork\n| source = {{DPLA | Q1 | hub=Q2 |"
+        " url=https://lib.digitalnc.org/record/100550 | dpla_id=abc }}\n}}"
+    )
+    assert (
+        sdc_sync._extract_source_url(page) == "https://lib.digitalnc.org/record/100550"
+    )
+
+
+def test_extract_source_url_absent_or_unreadable():
+    from tools import sdc_sync
+
+    no_url = MagicMock()
+    no_url.text = "{{DPLA metadata}}"
+    assert sdc_sync._extract_source_url(no_url) is None
+
+    raises = MagicMock()
+    type(raises).text = property(lambda self: (_ for _ in ()).throw(RuntimeError()))
+    assert sdc_sync._extract_source_url(raises) is None
+
+
+def test_maintain_relink_uses_current_id_when_drifted():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://lib.digitalnc.org/record/100550"
+    with patch.object(
+        sdc_sync,
+        "resolve_current_dpla_id",
+        return_value=ResolveResult("26f8310936c0321a8c611703751034ee", "isShownAt"),
+    ):
+        out = sdc_sync._maintain_relink("File:X (cropped).jpg", "deadbeef", page)
+    assert out == "26f8310936c0321a8c611703751034ee"
+
+
+def test_maintain_relink_keeps_embedded_when_unresolved():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = ""
+    with patch.object(
+        sdc_sync,
+        "resolve_current_dpla_id",
+        return_value=ResolveResult(None, "unresolved"),
+    ):
+        out = sdc_sync._maintain_relink("File:Y.jpg", "origid12345", page)
+    # Unresolved → keep the embedded id; process_one then skips a dead id as today.
+    assert out == "origid12345"
