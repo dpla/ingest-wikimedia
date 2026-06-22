@@ -145,6 +145,7 @@ def test_top_level_usage_mentions_sdc_subcommand(monkeypatch, handler_module):
     assert reply["statusCode"] == 200
     text = _decode_reply(reply)["text"]
     assert "/wikimedia-upload sdc" in text
+    assert "/wikimedia-upload maintain" in text
 
 
 def test_dispatch_helper_treats_raw_timeout_as_possibly_dispatched(

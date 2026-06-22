@@ -342,7 +342,9 @@ def handler(event, context):
                 "To stop a session: `/wikimedia-upload kill <label> [<label> ...]`\n"
                 "To retry transient failures: `/wikimedia-upload retry <days> [<partner>]`\n"
                 "To refresh S3 files: `/wikimedia-upload refresh <target> [<target> ...] <days>`\n"
-                "To re-run only the SDC sync phase: `/wikimedia-upload sdc <target> [<target> ...]`",
+                "To re-run only the SDC sync phase: `/wikimedia-upload sdc <target> [<target> ...]`\n"
+                "To maintain existing files in place (no uploads):"
+                " `/wikimedia-upload maintain <target> [<target> ...]`",
                 ephemeral=True,
             )
 

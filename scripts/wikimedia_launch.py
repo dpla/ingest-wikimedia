@@ -953,10 +953,17 @@ def main() -> None:
             # resolved to its exact Commons category via Wikidata (authoritative
             # — P8464 → commonswiki sitelink — never derived from the display
             # name), then walked with `sdc-sync --cat ... --maintain`.
-            if dpla_id is not None:
+            if dpla_id is not None or collection is not None:
+                # Maintain resolves to a hub/institution Commons category and
+                # walks the WHOLE category — there is no per-collection or
+                # per-item Commons category to scope to. Reject these targets
+                # loudly rather than silently widening the write scope to the
+                # entire category (a collection-scoped request must not quietly
+                # touch every file in the institution).
+                unit = "single DPLA-ID" if dpla_id is not None else "collection-scoped"
                 msg = (
-                    "maintain mode does not support single DPLA-ID targets;"
-                    " it operates on a hub/institution Commons category."
+                    f"maintain mode does not support {unit} targets; it operates"
+                    " on a whole hub/institution Commons category."
                 )
                 pipeline_steps = [f"cd {base}", f"echo {shlex.quote(msg)} >&2; exit 1"]
             else:
