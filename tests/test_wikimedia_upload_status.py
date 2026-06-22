@@ -129,13 +129,14 @@ def _fake_ssm_for_phase(
     mtime: int = 1700000000,
     now: int | None = None,
     tail: str = "last log line",
+    total_ordinals: int = 0,
 ):
     """Build a fake `ssm_run` that returns the precheck + counts payload
     `get_phase_and_progress` expects, with the named log file and counts.
 
     Sequence (matches the real two-call flow):
       1. precheck — `session_created\nlog_filename`
-      2. main — `now\nmtime\nSEP\ntail\nSEP\n<5 lines of awk + wc>`
+      2. main — `now\nmtime\nSEP\ntail\nSEP\n<5 lines of awk + wc>\nSEP\n<total_ordinals>`
 
     ``mtime`` is parameterised so tests can verify the mtime tiebreak in
     ``main`` — an "aborted phase" fake with an earlier mtime must be
@@ -143,6 +144,11 @@ def _fake_ssm_for_phase(
     though both produce a non-COUNTS-marker phase string.  ``now`` is
     kept at the same value so the staleness suffix doesn't fire (it
     would change the phase-string assertions in unrelated callers).
+
+    ``total_ordinals`` is the file-level denominator the helper now
+    derives from the corresponding download log; default 0 mirrors the
+    "no download log found" case (legacy sessions or pre-PR-272 logs),
+    where the Upload branch falls back to item-count.
     """
     call_count = [0]
     sep = "__WM_SEP__"
@@ -158,6 +164,7 @@ def _fake_ssm_for_phase(
         body = f"{now_val}\n{mtime}\n{sep}\n{tail}\n{sep}\n"
         body += "\n".join(str(n) for n in awk_counts) + "\n"
         body += f"{csv_total}\n"
+        body += f"{sep}\n{total_ordinals}\n"
         return body
 
     return fake_ssm_run
@@ -889,3 +896,194 @@ def test_main_rows_use_display_id_from_fetch_not_session_name():
     text = section_blocks[0]["text"]["text"]
     assert "bpl+phillips-academy" in text
     assert "Uploading" in text
+
+
+# ---------------------------------------------------------------------------
+# Upload-phase file-level progress (PR: file progress + position-in-chain)
+
+
+def test_upload_progress_reports_file_level_when_download_log_available():
+    """When the downloader has finished and the per-item `Item <id>: N
+    ordinals` summary lines are present in the download log, the Upload
+    phase status reports file-level progress (uploaded + skipped vs.
+    total ordinals) rather than item-level. A 100-page newspaper item
+    is no longer indistinguishable from a 1-image photo in the readout.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    # 1500 of 6000 ordinals processed (1200 uploaded + 300 skipped),
+    # ~25%. Item count is irrelevant when total_ordinals > 0.
+    fake = _fake_ssm_for_phase(
+        log_filename="20260528-091047-bpl+phillips-academy-upload.log",
+        # [dpla_id_count, uploaded, skipping, counts]
+        awk_counts=[200, 1200, 300, 0],
+        csv_total=400,  # items — used as fallback only
+        total_ordinals=6000,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+phillips-academy",
+            hub="bpl",
+            label="bpl+phillips-academy",
+        )
+    assert phase is not None
+    # File-level: (1200 + 300) / 6000 = 25.0%
+    assert "1,500 / 6,000 files" in phase, phase
+    assert "~25.0%" in phase, phase
+    # Item-level fallback string must NOT appear when file-level is in scope.
+    assert "items" not in phase, (
+        f"file-level reporting must replace item-level: got {phase!r}"
+    )
+
+
+def test_upload_progress_falls_back_to_item_level_when_no_download_log():
+    """Legacy sessions (pre-PR-272 logs) and sessions whose download
+    phase ran under a separate label have ``total_ordinals == 0``.
+    The Upload phase falls back to the item-level denominator so the
+    readout doesn't degrade to ``0 / 0 ?%``."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260528-091047-bpl+phillips-academy-upload.log",
+        awk_counts=[50, 30, 5, 0],
+        csv_total=200,
+        total_ordinals=0,  # no download log found
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+phillips-academy",
+            hub="bpl",
+            label="bpl+phillips-academy",
+        )
+    assert phase is not None
+    # Item-level: 50 / 200 = 25.0%
+    assert "50 / 200 items" in phase, phase
+    assert "~25.0%" in phase, phase
+
+
+def test_upload_progress_passes_label_glob_into_download_log_lookup():
+    """The download-log lookup must scope to THIS label, not the whole
+    log directory — otherwise multi-institution batches would sum
+    ordinal counts from sibling labels' download logs and over-count
+    the denominator."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if len(captured) == 1:
+            return "1700000000\n20260528-091047-bpl+phillips-academy-upload.log\n"
+        return (
+            "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n"
+            "10\n5\n2\n0\n50\n__WM_SEP__\n200\n"
+        )
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+phillips-academy",
+            hub="bpl",
+            label="bpl+phillips-academy",
+        )
+    main_cmd = captured[1]
+    # The download-log glob must include the specific label, not just
+    # `*-download.log`.
+    assert "bpl+phillips-academy-download.log" in main_cmd, main_cmd
+
+
+def test_fetch_position_annotation_for_multi_label_batch():
+    """Multi-label batch sessions get a `[<pos>/<total>]` suffix on the
+    active label, replacing the prior `(+N more)` form. Lets the
+    reader see at a glance how far along the chain a session is."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import main
+
+    sessions_out = "wikimedia-texas+a+texas+b+texas+c+texas+d: 1 windows\n"
+    captured, fake_post = _capture_slack_post()
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch("scripts.wikimedia_upload_status.ssm_run", return_value=sessions_out),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot", return_value=None
+        ),
+        patch("scripts.wikimedia_upload_status._format_slots_line", return_value=None),
+        # Active label is the 3rd of 4 (texas+c).
+        patch(
+            "scripts.wikimedia_upload_status.find_active_label",
+            return_value=("texas+c", 1700000000),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            return_value=("Uploading (10 / 100 files, ~10.0%)", 1700000000),
+        ),
+        patch("scripts.wikimedia_upload_status.requests.post", side_effect=fake_post),
+    ):
+        main()
+
+    section_text = next(
+        b["text"]["text"]
+        for b in captured["payload"]["blocks"]
+        if b.get("type") == "section"
+    )
+    # The position annotation must appear and be position-3-of-4, not "(+3 more)".
+    assert "texas+c [3/4]" in section_text, section_text
+    assert "(+" not in section_text, (
+        f"old ambiguous suffix must be gone: {section_text!r}"
+    )
+
+
+def test_fetch_no_position_annotation_for_single_label_session():
+    """Single-label sessions don't need the position annotation —
+    `[1/1]` would just be noise. Confirm it stays bare."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import main
+
+    sessions_out = "wikimedia-bpl+phillips-academy: 1 windows\n"
+    captured, fake_post = _capture_slack_post()
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch("scripts.wikimedia_upload_status.ssm_run", return_value=sessions_out),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot", return_value=None
+        ),
+        patch("scripts.wikimedia_upload_status._format_slots_line", return_value=None),
+        patch(
+            "scripts.wikimedia_upload_status.find_active_label",
+            return_value=("bpl+phillips-academy", 1700000000),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            return_value=("Uploading (10 / 100 files, ~10.0%)", 1700000000),
+        ),
+        patch("scripts.wikimedia_upload_status.requests.post", side_effect=fake_post),
+    ):
+        main()
+
+    section_text = next(
+        b["text"]["text"]
+        for b in captured["payload"]["blocks"]
+        if b.get("type") == "section"
+    )
+    assert "bpl+phillips-academy" in section_text
+    # No position bracket on a single-label session.
+    assert "[1/1]" not in section_text
+    assert "[/" not in section_text

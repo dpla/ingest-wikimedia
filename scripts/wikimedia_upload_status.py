@@ -189,14 +189,36 @@ def get_phase_and_progress(
         csv_count_cmd = f"wc -l < {csv_path} 2>/dev/null || echo 0"
 
     sep = "__WM_SEP__"
+    # Locate the corresponding -download.log for this label so we can sum
+    # total ordinals across all items — gives Upload-phase progress a
+    # file-level denominator instead of the item-level one that makes
+    # multi-page items vastly under-represent work done (a 100-page
+    # newspaper counts the same as a 1-image photo). Empty when no
+    # download log exists for this label yet (sessions still in
+    # get-ids-es or the legacy single-log layout); the Upload branch
+    # falls back to item-count in that case.
+    download_glob = shlex.quote(f"*-{label}-download.log")
+    # POSIX-awk ordinal summer: every `Item <id>: <N> ordinals (...)` line
+    # the downloader emits per-item gets its N picked out by walking fields
+    # until the "ordinals" token, then summing the preceding field. The
+    # gawk-only `match(..., array)` extraction would be cleaner but
+    # production awk on this host might be mawk/busybox; field walk works
+    # everywhere.
+    ordinals_awk = (
+        "BEGIN{s=0} "
+        "/Item [a-f0-9]+: [0-9]+ ordinals/ "
+        '{for(i=1;i<=NF;i++) if($i=="ordinals"){s+=$(i-1); break}} '
+        "END {print s+0}"
+    )
     # One awk pass counts all four marker lines in a single sequential read
-    # of the log; the previous code ran four separate `grep -c` invocations
-    # over the same file (plus the COUNTS: probe), which on multi-GB NARA
-    # logs translated to four full sequential reads and four SSM round-trips
-    # of pipeline setup overhead. Output is still four lines (dpla_id,
-    # uploaded, skipping, counts) in the same order as before, followed by
-    # the CSV total from `wc -l`. The `|| printf` fallback covers the
-    # missing-file case symmetrically with the old `|| true`.
+    # of the upload log; the previous code ran four separate `grep -c`
+    # invocations over the same file (plus the COUNTS: probe), which on
+    # multi-GB NARA logs translated to four full sequential reads and four
+    # SSM round-trips of pipeline setup overhead. Output is still four
+    # lines (dpla_id, uploaded, skipping, counts) in the same order as
+    # before, followed by the CSV total from `wc -l`. The download-log
+    # ordinal sum is emitted after a fresh separator so the output sections
+    # stay self-describing.
     out = ssm_run(
         client,
         f"date +%s; "
@@ -211,10 +233,15 @@ def get_phase_and_progress(
         f"/COUNTS:/ {{c++}} "
         f"END {{ print d+0; print u+0; print s+0; print c+0 }}"
         f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n'; "
-        f"{csv_count_cmd}",
+        f"{csv_count_cmd}; "
+        f"echo {sep}; "
+        f"DOWNLOG=$(ls -t {log_dir}/{download_glob} 2>/dev/null | head -1); "
+        f'if [ -n "$DOWNLOG" ]; then '
+        f"awk '{ordinals_awk}' \"$DOWNLOG\" 2>/dev/null || echo 0; "
+        f"else echo 0; fi",
     )
 
-    sections = out.split(f"{sep}\n", 2)
+    sections = out.split(f"{sep}\n", 3)
     pre_sep = sections[0].strip().splitlines() if sections else []
     now = _safe_int(pre_sep[0]) if pre_sep else 0
     log_mtime = _safe_int(pre_sep[1]) if len(pre_sep) > 1 else 0
@@ -234,6 +261,11 @@ def get_phase_and_progress(
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
     counts_marker = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
     total = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
+
+    # Sum of `Item <id>: N ordinals` lines from the download log — the true
+    # file count once downloads have completed. 0 when no download log was
+    # found (legacy sessions, or the session is still in get-ids-es).
+    total_ordinals = _safe_int(sections[3].strip()) if len(sections) > 3 else 0
 
     def pct(n: int) -> str:
         return f"{n / total * 100:.1f}" if total > 0 else "?"
@@ -300,8 +332,19 @@ def get_phase_and_progress(
                 f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)",
                 log_mtime,
             )
+        # File-level progress: the download log gives us the true total
+        # ordinal count, and the upload log tells us how many ordinals
+        # have terminated (uploaded or skipped). Falls back to the
+        # item-level item-count denominator when no download log was
+        # found, so legacy sessions still get a readout.
+        files_done = uploaded_count + skipped_count
+        if total_ordinals > 0:
+            files_pct = f"{files_done / total_ordinals * 100:.1f}"
+            progress = f"{files_done:,} / {total_ordinals:,} files, ~{files_pct}%"
+        else:
+            progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
         return (
-            f"Uploading ({dpla_id_count:,} / {total:,}, ~{pct(dpla_id_count)}%){slot_suffix}{stale_suffix}",
+            f"Uploading ({progress}){slot_suffix}{stale_suffix}",
             log_mtime,
         )
 
@@ -576,10 +619,22 @@ def main() -> None:
             logging.exception("Failed to find active label for %s", session)
             return labels[0], "Unknown (error)"
 
-        # For multi-label batches, suffix a "(+N more)" annotation so the
-        # reader can see this row is one slice of a larger session.
+        # For multi-label batches, suffix a `[<pos>/<total>]` position
+        # annotation so the reader can tell at a glance how far along
+        # the institution chain this row is. The earlier `(+N more)`
+        # form counted batch size − 1 and was ambiguous: a session
+        # showing `(+72 more)` could be on the FIRST institution or
+        # the LAST one (73 of 73). `[73/73]` makes it unambiguous.
         def _with_batch_suffix(label: str) -> str:
-            return f"{label} (+{len(labels) - 1} more)" if multi else label
+            if not multi:
+                return label
+            try:
+                pos = labels.index(label) + 1
+            except ValueError:
+                # Defensive: should never happen — every label we route
+                # through this helper came from `labels` itself.
+                return f"{label} [?/{len(labels)}]"
+            return f"{label} [{pos}/{len(labels)}]"
 
         if active is None:
             # No log file matches any label yet — pipeline is in
