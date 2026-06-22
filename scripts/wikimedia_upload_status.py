@@ -197,7 +197,13 @@ def get_phase_and_progress(
     # download log exists for this label yet (sessions still in
     # get-ids-es or the legacy single-log layout); the Upload branch
     # falls back to item-count in that case.
-    download_glob = shlex.quote(f"*-{label}-download.log")
+    #
+    # The label is interpolated directly into the glob pattern below
+    # (NOT shlex.quote'd) — single-quoting would disable shell glob
+    # expansion: `ls -t '*-foo.log'` looks for a literal file named
+    # `*-foo.log` rather than expanding the `*`. Labels are pure slug
+    # characters ([a-z0-9+\-]) with no shell metacharacters, so direct
+    # interpolation is safe.
     # POSIX-awk ordinal summer: every `Item <id>: <N> ordinals (...)` line
     # the downloader emits per-item gets its N picked out by walking fields
     # until the "ordinals" token, then summing the preceding field. The
@@ -235,7 +241,7 @@ def get_phase_and_progress(
         f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n'; "
         f"{csv_count_cmd}; "
         f"echo {sep}; "
-        f"DOWNLOG=$(ls -t {log_dir}/{download_glob} 2>/dev/null | head -1); "
+        f"DOWNLOG=$(ls -t {log_dir}/*-{label}-download.log 2>/dev/null | head -1); "
         f'if [ -n "$DOWNLOG" ]; then '
         f"awk '{ordinals_awk}' \"$DOWNLOG\" 2>/dev/null || echo 0; "
         f"else echo 0; fi",

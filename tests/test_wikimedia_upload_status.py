@@ -1000,6 +1000,53 @@ def test_upload_progress_passes_label_glob_into_download_log_lookup():
     assert "bpl+phillips-academy-download.log" in main_cmd, main_cmd
 
 
+def test_download_log_glob_is_not_single_quoted():
+    """Regression: the original implementation shlex.quote'd the glob
+    pattern, which wraps it in single quotes and disables shell glob
+    expansion. ``ls -t '*-foo-download.log'`` looks for a literal file
+    named ``*-foo-download.log`` rather than expanding the ``*``. The
+    bug silently fell back to item-level reporting in production
+    because total_ordinals was always 0.
+
+    Pin the contract: the glob's ``*`` must be unquoted in the rendered
+    SSM command so the shell expands it. Labels are pure slug
+    characters with no shell metacharacters, so direct interpolation
+    is safe."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if len(captured) == 1:
+            return "1700000000\n20260528-091047-bpl+phillips-academy-upload.log\n"
+        return (
+            "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n"
+            "10\n5\n2\n0\n50\n__WM_SEP__\n200\n"
+        )
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+phillips-academy",
+            hub="bpl",
+            label="bpl+phillips-academy",
+        )
+    main_cmd = captured[1]
+    # The bug shape was `ls -t <log_dir>/'*-bpl+phillips-academy-download.log'`
+    # — i.e. the literal `'*-` pattern. The fix renders it as
+    # `ls -t <log_dir>/*-bpl+phillips-academy-download.log` (no quotes
+    # around the asterisk), so shell glob expansion fires.
+    assert "/'*-" not in main_cmd, (
+        "download-log glob must not be wrapped in single quotes — "
+        f"shell glob expansion would be disabled. Rendered: {main_cmd!r}"
+    )
+    # Positive check: the unquoted glob is present.
+    assert "/*-bpl+phillips-academy-download.log" in main_cmd, main_cmd
+
+
 def test_fetch_position_annotation_for_multi_label_batch():
     """Multi-label batch sessions get a `[<pos>/<total>]` suffix on the
     active label, replacing the prior `(+N more)` form. Lets the
