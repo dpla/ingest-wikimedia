@@ -175,6 +175,52 @@ def test_anchor3_skipped_without_scope_filter():
     assert "wildcard" not in r.tried
 
 
+def test_lazy_scope_callable_invoked_only_at_wildcard_rung():
+    # An embedded hit resolves on rung 1 — the scope callable (a per-file P195
+    # read in production) must not run.
+    es = FakeES(live_ids={CURRENT_ID})
+    calls = []
+
+    def scope():
+        calls.append(1)
+        return {"term": {"dataProvider.name.not_analyzed": "X"}}
+
+    r = resolve_current_dpla_id(
+        embedded_id=CURRENT_ID, recorded_url=NC, scope_filter=scope, query_fn=es
+    )
+    assert r.anchor == "embedded"
+    assert calls == []
+
+
+def test_lazy_scope_callable_bounds_wildcard_when_reached():
+    ga = "http://dlg.galileo.usg.edu/id:arl_awc_awc337"
+    es = FakeES(wildcard={"arl_awc_awc337": ["0ff4842c996e3abab8cff9b3f8f8b297"]})
+    calls = []
+
+    def scope():
+        calls.append(1)
+        return {
+            "term": {"dataProvider.name.not_analyzed": "Athens-Clarke County Library"}
+        }
+
+    r = resolve_current_dpla_id(
+        embedded_id=DEAD_ID, recorded_url=ga, scope_filter=scope, query_fn=es
+    )
+    assert r.dpla_id == "0ff4842c996e3abab8cff9b3f8f8b297"
+    assert r.anchor == "wildcard"
+    assert calls == [1]  # invoked exactly once, at the wildcard rung
+
+
+def test_lazy_scope_callable_returning_none_skips_wildcard():
+    ga = "http://dlg.galileo.usg.edu/id:arl_awc_awc337"
+    es = FakeES(wildcard={"arl_awc_awc337": ["whatever"]})
+    r = resolve_current_dpla_id(
+        embedded_id=DEAD_ID, recorded_url=ga, scope_filter=lambda: None, query_fn=es
+    )
+    assert r.anchor == "unresolved"
+    assert "wildcard" not in r.tried
+
+
 def test_all_anchors_miss_is_unresolved():
     es = FakeES()
     r = resolve_current_dpla_id(

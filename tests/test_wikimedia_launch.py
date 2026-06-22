@@ -372,6 +372,82 @@ def test_target_label_hub_only():
     assert _label("bpl") == "`bpl`"
 
 
+def test_count_only_requires_maintain():
+    exit_info = _run_main(["--partner", "digitalnc", "--count-only", "true"])
+    assert exit_info is not None
+    assert exit_info.code == 1
+
+
+def _maintain_steps(
+    canonical, institutions, count_only, *, collection=None, dpla_id=None
+):
+    """Run _build_maintain_pipeline_steps with Wikidata resolution stubbed."""
+    import scripts.wikimedia_launch as launch_mod
+
+    with (
+        patch.object(launch_mod, "wikidata_qid_for_target", return_value="Q123"),
+        patch.object(
+            launch_mod,
+            "resolve_commons_category",
+            return_value="Category:Media contributed by X",
+        ),
+    ):
+        return launch_mod._build_maintain_pipeline_steps(
+            canonical,
+            institutions,
+            collection,
+            dpla_id,
+            "/srv/base",
+            "out.csv",
+            count_only,
+        )
+
+
+def test_maintain_real_run_stages_sidecars_then_syncs_from_s3():
+    steps = _maintain_steps("digitalnc", (), count_only=False)
+    # One ES scan stages sdc.json sidecars, then the category walk reads them.
+    assert steps[0] == "cd /srv/base"
+    assert steps[1] == "get-ids-es digitalnc --maintain > out.csv"
+    assert steps[2] == (
+        "sdc-sync --cat 'Category:Media contributed by X' --maintain"
+        " --from-s3 digitalnc"
+    )
+    assert "--count-only" not in steps[2]
+
+
+def test_maintain_per_institution_get_ids_repeats_institution_flags():
+    steps = _maintain_steps(
+        "georgia", ("Athens-Clarke County Library", "Atlanta History Center"), False
+    )
+    assert steps[1] == (
+        "get-ids-es georgia --institution 'Athens-Clarke County Library'"
+        " --institution 'Atlanta History Center' --maintain > out.csv"
+    )
+    # One --cat sync per institution category, all reading from S3.
+    syncs = [s for s in steps if s.startswith("sdc-sync")]
+    assert len(syncs) == 2
+    assert all("--from-s3 georgia" in s for s in syncs)
+
+
+def test_maintain_count_only_skips_staging_and_from_s3():
+    steps = _maintain_steps("digitalnc", (), count_only=True)
+    assert steps == [
+        "cd /srv/base",
+        "sdc-sync --cat 'Category:Media contributed by X' --maintain --count-only",
+    ]
+    # Pre-flight sizing never stages sidecars and never reads from S3.
+    assert not any("get-ids-es" in s for s in steps)
+    assert not any("--from-s3" in s for s in steps)
+
+
+def test_maintain_rejects_collection_and_single_id_targets():
+    coll = _maintain_steps("georgia", (), False, collection="Maps")
+    assert coll[-1].endswith("exit 1")
+    assert "does not support" in coll[-1]
+    single = _maintain_steps("georgia", (), False, dpla_id="abc123")
+    assert single[-1].endswith("exit 1")
+
+
 def test_maintain_mutually_exclusive_with_sdc_only():
     exit_info = _run_main(
         ["--partner", "georgia", "--maintain", "true", "--sdc-only", "true"]

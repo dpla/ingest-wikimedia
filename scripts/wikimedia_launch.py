@@ -158,6 +158,72 @@ def _build_get_ids_command(
     return cmd + f" > {csv_file}"
 
 
+def _build_maintain_pipeline_steps(
+    canonical: str,
+    institutions: tuple[str, ...],
+    collection: str | None,
+    dpla_id: str | None,
+    base: str,
+    csv_file: str,
+    count_only: bool,
+) -> list[str]:
+    """Pipeline steps for one maintain target (`cd` + the maintain commands).
+
+    Maintain re-links + SDC-syncs the EXISTING Commons files for this scope in
+    place: no download, no upload, no new File pages. Each hub/institution is
+    resolved to its exact Commons category via Wikidata (P8464 → commonswiki
+    sitelink — authoritative, never derived from the display name) and walked
+    with ``sdc-sync --cat … --maintain``.
+
+    The sync reads each (re-linked) item's claims from its precomputed
+    ``sdc.json`` sidecar (``--from-s3``) rather than calling ``api.dp.la`` per
+    file, so a real run first stages those sidecars with ONE ``get-ids-es
+    --maintain`` ES scan over the scope (drops only the upload gate, keeps the
+    QID requirement). ``count_only`` is a pre-flight that just resolves how each
+    file would re-link and writes nothing — it needs neither the staging step
+    nor ``--from-s3``.
+
+    A single-DPLA-id or collection-scoped target has no whole-category to walk,
+    so it's rejected loudly rather than silently widening the write scope.
+    """
+    if dpla_id is not None or collection is not None:
+        unit = "single DPLA-ID" if dpla_id is not None else "collection-scoped"
+        msg = (
+            f"maintain mode does not support {unit} targets; it operates"
+            " on a whole hub/institution Commons category."
+        )
+        return [f"cd {base}", f"echo {shlex.quote(msg)} >&2; exit 1"]
+
+    # count-only and --from-s3 are mutually exclusive: pre-flight sizing only
+    # resolves the re-link (no sidecar read, no write), so it skips both the
+    # staging scan and --from-s3.
+    sync_tail = " --count-only" if count_only else f" --from-s3 {canonical}"
+    steps = []
+    if not count_only:
+        stage_cmd = f"get-ids-es {canonical}"
+        for inst in institutions:
+            stage_cmd += f" --institution {shlex.quote(inst)}"
+        steps.append(stage_cmd + f" --maintain > {csv_file}")
+    for inst in institutions or (None,):
+        qid = wikidata_qid_for_target(canonical, inst)
+        category = resolve_commons_category(qid) if qid else None
+        if category:
+            # No --workers/--workers-budget: --cat mode is single-process (one
+            # Commons writer at a time), so it neither uses the pool nor needs
+            # the box-wide slot budget.
+            steps.append(
+                f"sdc-sync --cat {shlex.quote(category)} --maintain{sync_tail}"
+            )
+        else:
+            who = inst or canonical
+            msg = (
+                f"maintain: could not resolve a Commons category for {who}"
+                " (missing Wikidata QID or P8464 Commons-category link); skipping."
+            )
+            steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
+    return [f"cd {base}", *steps]
+
+
 def _target_label(
     canonical: str, institutions: tuple[str, ...], collection: str | None
 ) -> str:
@@ -190,6 +256,7 @@ def main() -> None:
     parser.add_argument("--refresh-only", default="false")
     parser.add_argument("--sdc-only", default="false")
     parser.add_argument("--maintain", default="false")
+    parser.add_argument("--count-only", default="false")
     # Keep in sync with .github/workflows/wikimedia-launch.yml inputs.workers
     # / inputs.workers_budget (currently 6 / 24), which the workflow always
     # passes explicitly. These defaults only apply to a bare manual launch —
@@ -203,6 +270,7 @@ def main() -> None:
     refresh_only = _parse_bool(args.refresh_only)
     sdc_only = _parse_bool(args.sdc_only)
     maintain = _parse_bool(args.maintain)
+    count_only = _parse_bool(args.count_only)
 
     # Normalize the response_url first so the mutual-exclusion check below
     # can use the validated value rather than re-implementing the same
@@ -222,6 +290,12 @@ def main() -> None:
             " mutually exclusive run modes (refresh skips upload + SDC; sdc-only"
             " skips download + upload; maintain re-links + SDC-syncs existing"
             " Commons files only, creating nothing).",
+        )
+    if count_only and not maintain:
+        _slack_fail(
+            response_url,
+            "--count-only is a maintain-mode pre-flight (it sizes the re-link"
+            " without writing); it has no meaning outside --maintain.",
         )
     max_age_days: int | None = None
     if args.max_age_days.strip():
@@ -946,47 +1020,15 @@ def main() -> None:
         # parallelism).
         upload_opts = f" --workers-budget {sdc_workers_budget}"
         if maintain:
-            # Maintain mode: re-link + SDC-sync the EXISTING Commons files for
-            # this scope in place. No get-ids / download / upload, and no new
-            # File pages — sdc-sync --maintain only edits SDC and migrates
-            # wikitext on files already on Commons. Each hub/institution is
-            # resolved to its exact Commons category via Wikidata (authoritative
-            # — P8464 → commonswiki sitelink — never derived from the display
-            # name), then walked with `sdc-sync --cat ... --maintain`.
-            if dpla_id is not None or collection is not None:
-                # Maintain resolves to a hub/institution Commons category and
-                # walks the WHOLE category — there is no per-collection or
-                # per-item Commons category to scope to. Reject these targets
-                # loudly rather than silently widening the write scope to the
-                # entire category (a collection-scoped request must not quietly
-                # touch every file in the institution).
-                unit = "single DPLA-ID" if dpla_id is not None else "collection-scoped"
-                msg = (
-                    f"maintain mode does not support {unit} targets; it operates"
-                    " on a whole hub/institution Commons category."
-                )
-                pipeline_steps = [f"cd {base}", f"echo {shlex.quote(msg)} >&2; exit 1"]
-            else:
-                cat_steps = []
-                for inst in institutions or (None,):
-                    qid = wikidata_qid_for_target(canonical, inst)
-                    category = resolve_commons_category(qid) if qid else None
-                    if category:
-                        # No --workers/--workers-budget: --cat mode is
-                        # single-process (one Commons writer at a time), so it
-                        # neither uses the pool nor needs the box-wide slot budget.
-                        cat_steps.append(
-                            f"sdc-sync --cat {shlex.quote(category)} --maintain"
-                        )
-                    else:
-                        who = inst or canonical
-                        msg = (
-                            f"maintain: could not resolve a Commons category for"
-                            f" {who} (missing Wikidata QID or P8464 Commons-category"
-                            f" link); skipping."
-                        )
-                        cat_steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
-                pipeline_steps = [f"cd {base}", *cat_steps]
+            pipeline_steps = _build_maintain_pipeline_steps(
+                canonical,
+                institutions,
+                collection,
+                dpla_id,
+                base,
+                csv_file,
+                count_only,
+            )
         elif sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which
             # also refreshes sdc.json sidecars from the latest ingestion3

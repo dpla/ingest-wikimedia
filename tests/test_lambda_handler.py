@@ -278,3 +278,41 @@ def test_maintain_subcommand_with_no_targets_returns_usage(monkeypatch, handler_
     text = _decode_reply(reply)["text"]
     assert "Usage:" in text
     assert "/wikimedia-upload maintain" in text
+
+
+def test_maintain_count_subcommand_dispatches_with_count_only_true(
+    monkeypatch, handler_module
+):
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain count digitalnc"), None)
+
+    assert reply["statusCode"] == 200
+    assert len(dispatched) == 1
+    inputs = dispatched[0]["inputs"]
+    assert inputs["maintain"] == "true"
+    assert inputs["count_only"] == "true"
+    assert inputs["partner"] == "digitalnc"
+    assert "sizing" in _decode_reply(reply)["text"].lower()
+
+
+def test_maintain_count_with_no_targets_returns_usage(monkeypatch, handler_module):
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain count"), None)
+
+    assert reply["statusCode"] == 200
+    assert dispatched == []
+    assert "Usage:" in _decode_reply(reply)["text"]
+
+
+def test_plain_maintain_does_not_set_count_only(monkeypatch, handler_module):
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain digitalnc"), None)
+
+    assert reply["statusCode"] == 200
+    assert "count_only" not in dispatched[0]["inputs"]
