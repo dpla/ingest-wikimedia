@@ -339,11 +339,7 @@ def get_phase_and_progress(
         # found, so legacy sessions still get a readout.
         files_done = uploaded_count + skipped_count
         if total_ordinals > 0:
-            files_pct = (
-                f"{files_done / total_ordinals * 100:.1f}"
-                if total_ordinals > 0
-                else "?"
-            )
+            files_pct = f"{files_done / total_ordinals * 100:.1f}"
             progress = f"{files_done:,} / {total_ordinals:,} files, ~{files_pct}%"
         else:
             progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
