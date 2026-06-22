@@ -6,6 +6,7 @@ GitHub Actions without installing the full ingest_wikimedia package dependencies
 
 import json
 import re
+import urllib.error
 import urllib.request
 
 # Module-level cache so warm Lambda invocations skip repeated network fetches.
@@ -204,6 +205,80 @@ def is_wikidata_id(s: str) -> bool:
 def is_dpla_id(s: str) -> bool:
     """Return True if s is a 32-hex-char DPLA item ID."""
     return bool(_DPLA_ID_RE.match(s))
+
+
+# Wikidata entity-data endpoint — the authoritative source for a hub/
+# institution's exact Commons category (see resolve_commons_category).
+_WIKIDATA_ENTITYDATA_URL = "https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+_WIKIDATA_UA = "dpla-ingest-wikimedia/1.0 (https://dp.la; tech@dp.la)"
+# P8464 = "Commons category": on a hub/institution item it points to a Wikidata
+# *category item* whose commonswiki sitelink is the actual Category: page DPLA
+# files are filed under.
+_COMMONS_CATEGORY_PROPERTY = "P8464"
+_commons_category_cache: dict[str, str | None] = {}
+
+
+def wikidata_qid_for_target(
+    canonical_slug: str, institution_name: str | None = None, timeout: int = 5
+) -> str | None:
+    """Return the Wikidata QID for a hub (``institution_name is None``) or for a
+    specific institution under it, read from institutions_v2.json. None if the
+    hub/institution isn't found or carries no Wikidata ID."""
+    hub_name = PARTNER_HUBS.get(canonical_slug)
+    if not hub_name:
+        return None
+    hub = _get_institutions(timeout).get(hub_name, {})
+    if institution_name is None:
+        return hub.get("Wikidata") or None
+    inst = hub.get("institutions", {}).get(institution_name, {})
+    return inst.get("Wikidata") or None
+
+
+def _fetch_wikidata_entity(qid: str, timeout: int) -> dict | None:
+    """Fetch one Wikidata entity's JSON, or None on any network/parse error."""
+    req = urllib.request.Request(
+        _WIKIDATA_ENTITYDATA_URL.format(qid=qid),
+        headers={"User-Agent": _WIKIDATA_UA},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())["entities"][qid]
+    except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
+        return None
+
+
+def resolve_commons_category(qid: str, timeout: int = 10) -> str | None:
+    """Resolve a hub/institution Wikidata QID to its exact Commons category page
+    title (e.g. ``'Category:Media contributed by the Digital Library of
+    Georgia'``), or None.
+
+    Follows the authoritative chain DPLA's own categorisation relies on — the
+    item's ``P8464`` ('Commons category', a Wikidata *category item*) → that
+    category item's ``commonswiki`` sitelink — so the exact title (including
+    wording such as a leading "the") comes straight from Wikidata and is never
+    derived from the DPLA display string. Cached per QID."""
+    if not is_wikidata_id(qid):
+        return None
+    if qid in _commons_category_cache:
+        return _commons_category_cache[qid]
+    result = None
+    entity = _fetch_wikidata_entity(qid, timeout)
+    if entity:
+        for claim in entity.get("claims", {}).get(_COMMONS_CATEGORY_PROPERTY, []):
+            value = (claim.get("mainsnak", {}).get("datavalue", {}) or {}).get("value")
+            cat_qid = value.get("id") if isinstance(value, dict) else None
+            if not cat_qid:
+                continue
+            cat_entity = _fetch_wikidata_entity(cat_qid, timeout)
+            if cat_entity:
+                title = (
+                    cat_entity.get("sitelinks", {}).get("commonswiki", {}).get("title")
+                )
+                if title:
+                    result = title
+                    break
+    _commons_category_cache[qid] = result
+    return result
 
 
 def parse_session_labels(suffix: str) -> list[str]:

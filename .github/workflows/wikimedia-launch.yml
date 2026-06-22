@@ -34,6 +34,10 @@ on:
         description: "SDC-only backfill — skip download + upload phases, just re-enumerate IDs and run sdc-sync"
         type: boolean
         default: false
+      maintain:
+        description: "Maintain mode — re-link + SDC-sync EXISTING Commons files of a (possibly no-longer-participating) hub/institution in place; no uploads, no new files"
+        type: boolean
+        default: false
       workers:
         description: "SDC-sync worker processes per session (parallelism). 1 = single-process."
         required: false
@@ -81,6 +85,7 @@ jobs:
           INPUT_MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days }}
           INPUT_REFRESH_ONLY: ${{ github.event.inputs.refresh_only }}
           INPUT_SDC_ONLY: ${{ github.event.inputs.sdc_only }}
+          INPUT_MAINTAIN: ${{ github.event.inputs.maintain }}
           INPUT_WORKERS: ${{ github.event.inputs.workers }}
           INPUT_WORKERS_BUDGET: ${{ github.event.inputs.workers_budget }}
         run: |
@@ -91,5 +96,6 @@ jobs:
             --max-age-days "$INPUT_MAX_AGE_DAYS" \
             --refresh-only "$INPUT_REFRESH_ONLY" \
             --sdc-only "$INPUT_SDC_ONLY" \
+            --maintain "$INPUT_MAINTAIN" \
             --workers "$INPUT_WORKERS" \
             --workers-budget "$INPUT_WORKERS_BUDGET"

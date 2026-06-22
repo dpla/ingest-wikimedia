@@ -145,6 +145,7 @@ def test_top_level_usage_mentions_sdc_subcommand(monkeypatch, handler_module):
     assert reply["statusCode"] == 200
     text = _decode_reply(reply)["text"]
     assert "/wikimedia-upload sdc" in text
+    assert "/wikimedia-upload maintain" in text
 
 
 def test_dispatch_helper_treats_raw_timeout_as_possibly_dispatched(
@@ -243,3 +244,37 @@ def test_dispatch_helper_non_timeout_urlerror_is_hard_failure(
     text = _decode_reply(reply)["text"]
     assert "may have been dispatched" not in text
     assert "internal error" in text.lower()
+
+
+def test_maintain_subcommand_dispatches_launch_with_maintain_true(
+    monkeypatch, handler_module
+):
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain digitalnc"), None)
+
+    assert reply["statusCode"] == 200
+    assert len(dispatched) == 1
+    call = dispatched[0]
+    assert call["workflow"] == "wikimedia-launch.yml"
+    assert call["inputs"]["maintain"] == "true"
+    # Maintain is its own run mode — must never set the others.
+    assert "sdc_only" not in call["inputs"]
+    assert "refresh_only" not in call["inputs"]
+    assert call["inputs"]["partner"] == "digitalnc"
+    assert len(call["inputs"]["concurrency_key"]) == 16
+    assert "maintain" in _decode_reply(reply)["text"].lower()
+
+
+def test_maintain_subcommand_with_no_targets_returns_usage(monkeypatch, handler_module):
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain"), None)
+
+    assert reply["statusCode"] == 200
+    assert dispatched == []
+    text = _decode_reply(reply)["text"]
+    assert "Usage:" in text
+    assert "/wikimedia-upload maintain" in text

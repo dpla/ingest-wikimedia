@@ -42,9 +42,11 @@ from ingest_wikimedia.partners import (
     is_upload_eligible,
     is_wikidata_id,
     parse_session_labels,
+    resolve_commons_category,
     resolve_slug,
     resolve_wikidata_id,
     slugify_session_label_component,
+    wikidata_qid_for_target,
 )
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
@@ -187,6 +189,7 @@ def main() -> None:
     parser.add_argument("--max-age-days", default="")
     parser.add_argument("--refresh-only", default="false")
     parser.add_argument("--sdc-only", default="false")
+    parser.add_argument("--maintain", default="false")
     # Keep in sync with .github/workflows/wikimedia-launch.yml inputs.workers
     # / inputs.workers_budget (currently 6 / 24), which the workflow always
     # passes explicitly. These defaults only apply to a bare manual launch —
@@ -199,6 +202,7 @@ def main() -> None:
     force = _parse_bool(args.force)
     refresh_only = _parse_bool(args.refresh_only)
     sdc_only = _parse_bool(args.sdc_only)
+    maintain = _parse_bool(args.maintain)
 
     # Normalize the response_url first so the mutual-exclusion check below
     # can use the validated value rather than re-implementing the same
@@ -211,12 +215,13 @@ def main() -> None:
     if raw_url and not response_url:
         print(f"Ignoring invalid response_url: {raw_url!r}", file=sys.stderr)
 
-    if refresh_only and sdc_only:
+    if sum([refresh_only, sdc_only, maintain]) > 1:
         _slack_fail(
             response_url,
-            "Cannot combine --refresh-only and --sdc-only — they're mutually"
-            " exclusive run modes (refresh skips upload + SDC; sdc-only skips"
-            " download + upload).",
+            "Cannot combine --refresh-only, --sdc-only, and --maintain — they're"
+            " mutually exclusive run modes (refresh skips upload + SDC; sdc-only"
+            " skips download + upload; maintain re-links + SDC-syncs existing"
+            " Commons files only, creating nothing).",
         )
     max_age_days: int | None = None
     if args.max_age_days.strip():
@@ -317,8 +322,16 @@ def main() -> None:
                 return
             stripped.append(name)
         institutions = tuple(stripped)
-        if dpla_id is None and canonical != "nara" and not institutions:
+        if (
+            not maintain
+            and dpla_id is None
+            and canonical != "nara"
+            and not institutions
+        ):
             # Hub-level target: check that any institution in the hub is eligible.
+            # Skipped in maintain mode — maintain operates ONLY on files already
+            # on Commons (no uploads), so an institution being upload-ineligible
+            # is exactly when it applies, not a reason to skip.
             # Skipped for DPLA item ID targets — item-level eligibility (rights
             # statement + media presence) was already verified by resolve-dpla-ids.
             # Institution-level and collection-level eligibility is not checked here —
@@ -932,7 +945,49 @@ def main() -> None:
         # overrun maxlag. Only the budget — no --workers (no upload
         # parallelism).
         upload_opts = f" --workers-budget {sdc_workers_budget}"
-        if sdc_only:
+        if maintain:
+            # Maintain mode: re-link + SDC-sync the EXISTING Commons files for
+            # this scope in place. No get-ids / download / upload, and no new
+            # File pages — sdc-sync --maintain only edits SDC and migrates
+            # wikitext on files already on Commons. Each hub/institution is
+            # resolved to its exact Commons category via Wikidata (authoritative
+            # — P8464 → commonswiki sitelink — never derived from the display
+            # name), then walked with `sdc-sync --cat ... --maintain`.
+            if dpla_id is not None or collection is not None:
+                # Maintain resolves to a hub/institution Commons category and
+                # walks the WHOLE category — there is no per-collection or
+                # per-item Commons category to scope to. Reject these targets
+                # loudly rather than silently widening the write scope to the
+                # entire category (a collection-scoped request must not quietly
+                # touch every file in the institution).
+                unit = "single DPLA-ID" if dpla_id is not None else "collection-scoped"
+                msg = (
+                    f"maintain mode does not support {unit} targets; it operates"
+                    " on a whole hub/institution Commons category."
+                )
+                pipeline_steps = [f"cd {base}", f"echo {shlex.quote(msg)} >&2; exit 1"]
+            else:
+                cat_steps = []
+                for inst in institutions or (None,):
+                    qid = wikidata_qid_for_target(canonical, inst)
+                    category = resolve_commons_category(qid) if qid else None
+                    if category:
+                        # No --workers/--workers-budget: --cat mode is
+                        # single-process (one Commons writer at a time), so it
+                        # neither uses the pool nor needs the box-wide slot budget.
+                        cat_steps.append(
+                            f"sdc-sync --cat {shlex.quote(category)} --maintain"
+                        )
+                    else:
+                        who = inst or canonical
+                        msg = (
+                            f"maintain: could not resolve a Commons category for"
+                            f" {who} (missing Wikidata QID or P8464 Commons-category"
+                            f" link); skipping."
+                        )
+                        cat_steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
+                pipeline_steps = [f"cd {base}", *cat_steps]
+        elif sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which
             # also refreshes sdc.json sidecars from the latest ingestion3
             # data) then run sdc-sync. No downloader, no uploader — the
@@ -1002,6 +1057,12 @@ def main() -> None:
             batch_labels = [_target_label(c, i, col) for c, i, _, col in batch_targets]
             if refresh_only:
                 msg = f"▶ Launching `{session_name}` refresh: {', '.join(batch_labels)}{refresh_suffix}."
+            elif maintain:
+                msg = (
+                    f"▶ Launching `{session_name}` maintain:"
+                    f" {', '.join(batch_labels)} — re-linking + SDC-syncing existing"
+                    " Commons files in place (no uploads, no new files)."
+                )
             elif sdc_only:
                 msg = (
                     f"▶ Launching `{session_name}` SDC backfill:"

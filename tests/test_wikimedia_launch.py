@@ -370,3 +370,41 @@ def test_target_label_single_and_multi_institution():
 
 def test_target_label_hub_only():
     assert _label("bpl") == "`bpl`"
+
+
+def test_maintain_mutually_exclusive_with_sdc_only():
+    exit_info = _run_main(
+        ["--partner", "georgia", "--maintain", "true", "--sdc-only", "true"]
+    )
+    assert exit_info is not None
+    assert exit_info.code == 1
+
+
+def test_maintain_mutually_exclusive_with_refresh_only():
+    exit_info = _run_main(
+        ["--partner", "georgia", "--maintain", "true", "--refresh-only", "true"]
+    )
+    assert exit_info is not None
+    assert exit_info.code == 1
+
+
+def test_maintain_bypasses_upload_eligibility_gate(monkeypatch, capsys):
+    """`--maintain true` for an upload-INELIGIBLE hub must parse and get PAST
+    the eligibility gate — maintain operates only on files already on Commons,
+    so ineligibility is exactly when it applies. Stub the EC2 path so the exit
+    comes from a deterministic post-parse point, then assert it is neither the
+    mutual-exclusion error nor a 'not upload-eligible' skip."""
+    monkeypatch.setattr(
+        "scripts.wikimedia_launch.boto3.client", lambda *a, **kw: object()
+    )
+    monkeypatch.setattr(
+        "scripts.wikimedia_launch.ssm_run",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("ssm stubbed")),
+    )
+    # "digitalnc" (North Carolina Digital Heritage Center) is upload=false in
+    # institutions_v2.json — the canonical maintain target.
+    exit_info = _run_main(["--partner", "digitalnc", "--maintain", "true"])
+    assert exit_info is not None
+    captured = capsys.readouterr()
+    assert "mutually exclusive" not in captured.err
+    assert "not upload-eligible" not in captured.err
