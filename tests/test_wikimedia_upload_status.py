@@ -1091,6 +1091,37 @@ def test_upload_progress_passes_label_glob_into_download_log_lookup():
     assert "bpl+phillips-academy-download.log" in main_cmd, main_cmd
 
 
+def test_get_phase_and_progress_rejects_non_slug_label():
+    """Defense-in-depth: the label is interpolated unquoted into the
+    download-log glob, so the function MUST refuse non-slug-shaped
+    labels rather than relying on caller discipline. A maliciously
+    crafted label like ``"bpl;rm -rf /tmp"`` would otherwise produce
+    a shell-command injection at the SSM round-trip.
+
+    The slug shape is ``[a-z0-9+\\-]+`` — what ``parse_session_labels``
+    and ``PARTNER_HUBS`` produce. Anything else raises ``ValueError``
+    at the function boundary."""
+    import pytest
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    for bad in (
+        "bpl; echo pwned",  # command separator
+        "bpl|echo pwned",  # pipe
+        "bpl$(id)",  # command substitution
+        "bpl`id`",  # backtick command substitution
+        "bpl 'a",  # quote + space
+        "bpl/../etc/passwd",  # path traversal
+        "bpl*",  # raw glob metachar
+        "BPL",  # uppercase (slug is lowercase only)
+        "",  # empty
+    ):
+        with pytest.raises(ValueError, match="slug-shaped"):
+            get_phase_and_progress(
+                client=None, session="wikimedia-x", hub="bpl", label=bad
+            )
+
+
 def test_download_log_glob_is_not_single_quoted():
     """Regression: the original implementation shlex.quote'd the glob
     pattern, which wraps it in single quotes and disables shell glob

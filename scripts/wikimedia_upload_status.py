@@ -51,6 +51,14 @@ _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 # Uploads normally complete items in seconds; downloads in seconds to low minutes.
 _STALE_SECONDS = 1800  # 30 minutes
 
+# Labels constructed by ``parse_session_labels`` and ``PARTNER_HUBS`` are
+# slug-form: hub-name-or-institution-name lowercase plus ``+`` and ``-``.
+# The download-log glob below interpolates ``label`` directly into a
+# shell command (unquoted, so the ``*`` expands), so we enforce the
+# slug shape at runtime to keep that interpolation safe regardless of
+# how callers obtain the label.
+_LABEL_SLUG_RE = re.compile(r"[a-z0-9+\-]+")
+
 
 def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
     """Return ``(label, log_mtime)`` for the most-recently-written log file
@@ -113,7 +121,18 @@ def get_phase_and_progress(
     didn't write a ``COUNTS:`` terminal marker (so it doesn't look
     "complete" via the count-marker test) must not eclipse a subsequent
     label that's actively progressing now.
+
+    ``label`` MUST be slug-shaped (``[a-z0-9+\\-]+``) — the download-log
+    glob below interpolates it unquoted into a shell command. A
+    non-slug label is rejected here so the shell-interpolation
+    contract is enforced at the boundary rather than relying on every
+    caller to feed only slug-form values.
     """
+    if not _LABEL_SLUG_RE.fullmatch(label):
+        raise ValueError(
+            f"label must be slug-shaped ([a-z0-9+-]+) for safe shell "
+            f"interpolation; got {label!r}"
+        )
 
     def _safe_int(s: str) -> int:
         try:
@@ -190,20 +209,18 @@ def get_phase_and_progress(
 
     sep = "__WM_SEP__"
     # Locate the corresponding -download.log for this label so we can sum
-    # total ordinals across all items — gives Upload-phase progress a
-    # file-level denominator instead of the item-level one that makes
-    # multi-page items vastly under-represent work done (a 100-page
-    # newspaper counts the same as a 1-image photo). Empty when no
-    # download log exists for this label yet (sessions still in
-    # get-ids-es or the legacy single-log layout); the Upload branch
-    # falls back to item-count in that case.
+    # total ordinals across all items — gives Upload- and SDC-phase
+    # progress a file-level denominator instead of the item-level one
+    # that makes multi-page items vastly under-represent work done (a
+    # 100-page newspaper counts the same as a 1-image photo). Empty
+    # when no download log exists for this label yet (sessions still
+    # in get-ids-es or the legacy single-log layout); the file-level
+    # branches fall back to item-count in that case.
     #
-    # The label is interpolated directly into the glob pattern below
-    # (NOT shlex.quote'd) — single-quoting would disable shell glob
-    # expansion: `ls -t '*-foo.log'` looks for a literal file named
-    # `*-foo.log` rather than expanding the `*`. Labels are pure slug
-    # characters ([a-z0-9+\-]) with no shell metacharacters, so direct
-    # interpolation is safe.
+    # The label is interpolated directly into the glob below (no
+    # shlex.quote) — single-quoting would disable shell glob expansion
+    # so the ``*`` would no longer expand. The slug-shape guard at the
+    # top of this function makes the unquoted interpolation safe.
     # POSIX-awk ordinal summer: every `Item <id>: <N> ordinals (...)` line
     # the downloader emits per-item gets its N picked out by walking fields
     # until the "ordinals" token, then summing the preceding field. The
