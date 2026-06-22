@@ -105,6 +105,15 @@ class Result(Enum):
     # Aggregate worker-seconds blocked on a box-wide slot (WorkerSlotBudget
     # contention). Summed across workers; the consumer divides by worker count.
     SDC_SLOT_WAIT_SECONDS = auto()
+    # Maintain-mode title-drift rename (PR B). A maintained file whose current
+    # Commons title differs from the canonical title for its re-linked DPLA id
+    # is moved to the canonical title. MAINTAIN_RENAMED counts successful
+    # moves; MAINTAIN_RENAME_BLOCKED counts files left at a non-canonical title
+    # because the canonical title was already occupied by a different page —
+    # logged as an error for DPLA to resolve later (maintain has no source
+    # bytes, so it neither inspects hashes nor picks a winner).
+    MAINTAIN_RENAMED = auto()
+    MAINTAIN_RENAME_BLOCKED = auto()
 
 
 class Tracker:

@@ -415,6 +415,7 @@ def notify_sdc_complete(
     elapsed_seconds: float,
     dry_run: bool = False,
     workers: int = 1,
+    maintain: bool = False,
 ) -> None:
     """Post the SDC phase's completion summary to #tech-alerts.
 
@@ -445,24 +446,41 @@ def notify_sdc_complete(
     avg_wait = tracker.count(Result.SDC_SLOT_WAIT_SECONDS) / max(1, workers)
     wait_pct = (avg_wait / elapsed_seconds * 100) if elapsed_seconds > 0 else 0
 
+    stats_lines = [
+        f"ITEMS SYNCED:         {tracker.count(Result.SDC_ITEMS_SYNCED):,}",
+        f"ITEMS PARTIAL:        {tracker.count(Result.SDC_ITEMS_PARTIALLY_SYNCED):,}",
+        f"PAGES EDITED:         {tracker.count(Result.SDC_PAGES_EDITED):,}",
+        f"CLAIMS ADDED:         {tracker.count(Result.SDC_CLAIMS_ADDED):,}",
+        f"REFS ADDED:           {tracker.count(Result.SDC_REFS_ADDED):,}",
+        f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",
+        f"SKIPPED (no sidecar): {tracker.count(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR):,}",
+        f"SKIPPED (mapping):    {tracker.count(Result.SDC_ITEMS_SKIPPED_MAPPING):,}",
+        f"SKIPPED (error):      {tracker.count(Result.SDC_ITEMS_SKIPPED_ERROR):,}",
+        f"ORDINAL MISSING:      {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY):,}",
+        f"ORDINAL NO PAGEID:    {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID):,}",
+        f"ORDINAL ERRORS:       {tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR):,}",
+    ]
+    # Maintain mode also renames title-drifted files to their canonical title;
+    # surface those outcomes (only on maintain runs, to keep the regular SDC
+    # summary uncluttered). RENAME BLOCKED counts files left non-canonical
+    # because the canonical title was occupied — flagged for DPLA follow-up.
+    if maintain:
+        stats_lines.extend(
+            [
+                f"RENAMED:              {tracker.count(Result.MAINTAIN_RENAMED):,}",
+                f"RENAME BLOCKED:       {tracker.count(Result.MAINTAIN_RENAME_BLOCKED):,}",
+            ]
+        )
+    stats_lines.extend(
+        [
+            f"SLOT WAIT (avg/wkr):  {_format_runtime(avg_wait)} ({wait_pct:.0f}% of runtime)",
+            f"Runtime:              {runtime}",
+        ]
+    )
+
     _post_completion_notice(
         token=token,
         header=f"*Wikimedia SDC Complete: {effective_label}*{dry_run_note}",
         plain_text=f"Wikimedia SDC complete: {effective_label}",
-        stats_lines=[
-            f"ITEMS SYNCED:         {tracker.count(Result.SDC_ITEMS_SYNCED):,}",
-            f"ITEMS PARTIAL:        {tracker.count(Result.SDC_ITEMS_PARTIALLY_SYNCED):,}",
-            f"PAGES EDITED:         {tracker.count(Result.SDC_PAGES_EDITED):,}",
-            f"CLAIMS ADDED:         {tracker.count(Result.SDC_CLAIMS_ADDED):,}",
-            f"REFS ADDED:           {tracker.count(Result.SDC_REFS_ADDED):,}",
-            f"REMOVALS:             {tracker.count(Result.SDC_REMOVALS):,}",
-            f"SKIPPED (no sidecar): {tracker.count(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR):,}",
-            f"SKIPPED (mapping):    {tracker.count(Result.SDC_ITEMS_SKIPPED_MAPPING):,}",
-            f"SKIPPED (error):      {tracker.count(Result.SDC_ITEMS_SKIPPED_ERROR):,}",
-            f"ORDINAL MISSING:      {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY):,}",
-            f"ORDINAL NO PAGEID:    {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID):,}",
-            f"ORDINAL ERRORS:       {tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR):,}",
-            f"SLOT WAIT (avg/wkr):  {_format_runtime(avg_wait)} ({wait_pct:.0f}% of runtime)",
-            f"Runtime:              {runtime}",
-        ],
+        stats_lines=stats_lines,
     )

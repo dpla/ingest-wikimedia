@@ -610,3 +610,50 @@ def test_notify_upload_complete_clean_retry_still_titled_retry_complete(tmp_path
     assert "Upload Complete" not in captured["header"]
     failed_lines = [s for s in captured["stats_lines"] if s.startswith("FAILED:")]
     assert failed_lines == ["FAILED:        0"]
+
+
+def _capture_sdc_completion(env: dict, tracker_counts: dict, maintain: bool) -> dict:
+    """Run notify_sdc_complete with a mocked Tracker + env, returning the
+    kwargs passed to _post_completion_notice so tests can assert on
+    stats_lines."""
+    tracker = MagicMock(spec=Tracker)
+    tracker.count.side_effect = lambda result: tracker_counts.get(result, 0)
+    captured: dict = {}
+    with (
+        patch.dict(os.environ, env, clear=True),
+        patch("ingest_wikimedia.slack._post_completion_notice") as mock_post,
+    ):
+        mock_post.side_effect = lambda **kwargs: captured.update(kwargs)
+        notify_sdc_complete(
+            tracker=tracker,
+            partner_label="digitalnc",
+            elapsed_seconds=10.0,
+            workers=1,
+            maintain=maintain,
+        )
+    return captured
+
+
+def test_notify_sdc_complete_maintain_reports_rename_counters():
+    captured = _capture_sdc_completion(
+        env={"DPLA_SLACK_BOT_TOKEN": "x"},
+        tracker_counts={
+            Result.MAINTAIN_RENAMED: 7,
+            Result.MAINTAIN_RENAME_BLOCKED: 2,
+        },
+        maintain=True,
+    )
+    lines = captured["stats_lines"]
+    assert any(s.startswith("RENAMED:") and s.endswith("7") for s in lines)
+    assert any(s.startswith("RENAME BLOCKED:") and s.endswith("2") for s in lines)
+
+
+def test_notify_sdc_complete_non_maintain_omits_rename_counters():
+    captured = _capture_sdc_completion(
+        env={"DPLA_SLACK_BOT_TOKEN": "x"},
+        tracker_counts={},
+        maintain=False,
+    )
+    lines = captured["stats_lines"]
+    assert not any(s.startswith("RENAMED:") for s in lines)
+    assert not any(s.startswith("RENAME BLOCKED:") for s in lines)

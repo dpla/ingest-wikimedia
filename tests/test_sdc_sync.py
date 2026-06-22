@@ -17,6 +17,7 @@ NOT safe — the wbeditentity round-trip would erase that data.
 """
 
 import contextlib
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -5380,6 +5381,9 @@ def test_maintain_process_file_syncs_from_sidecar_with_page_number():
             return_value=ResolveResult("liveid", "embedded"),
         ),
         patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        # Rename is exercised in its own tests; here keep it a no-op so this
+        # test isolates the sidecar sync dispatch.
+        patch.object(sdc_sync, "_maintain_rename", side_effect=lambda fp, did: fp),
         patch.object(sdc_sync, "_maintain_sidecar_payload", return_value=payload),
         patch.object(
             sdc_sync.wikimedia,
@@ -5410,6 +5414,7 @@ def test_maintain_process_file_skips_when_no_sidecar():
             return_value=ResolveResult("liveid", "embedded"),
         ),
         patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_maintain_rename", side_effect=lambda fp, did: fp),
         patch.object(sdc_sync, "_maintain_sidecar_payload", return_value=None),
         patch.object(sdc_sync, "tracker", fake_tracker),
         patch.object(sdc_sync, "_safe_process_one") as mock_sync,
@@ -5436,3 +5441,259 @@ def test_maintain_process_file_live_fallback_without_from_s3():
     ):
         sdc_sync._maintain_process_file("M1", "liveid", page, "File:X.jpg", tally=None)
     mock_sync.assert_called_once_with("M1", "liveid", file_page=page)
+
+
+def _dpla_map(title):
+    return json.dumps({"sourceResource": {"title": [title]}})
+
+
+def test_maintain_canonical_title_preserves_ordinal_and_ext():
+    from tools import sdc_sync
+
+    # Real DPLA ids are 32-char md5 hex; the page-ordinal parser requires that
+    # shape, so the test uses realistically-shaped ids.
+    dead = "0123456789abcdef0123456789abcdef"
+    live = "fedcba9876543210fedcba9876543210"
+    page = MagicMock()
+    page.title.return_value = f"Old Name - DPLA - {dead} (page 2).jpg"
+    fake_client = MagicMock()
+    fake_client.get_item_metadata.return_value = _dpla_map("New Name")
+    with (
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_s3_client", fake_client),
+    ):
+        out = sdc_sync._maintain_canonical_title(page, live)
+    # Same authority the uploader uses: new id + current title text, preserving
+    # the existing page ordinal and extension.
+    assert out == f"New Name - DPLA - {live} (page 2).jpg"
+
+
+def test_maintain_canonical_title_none_without_metadata_or_title():
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "X - DPLA - id.jpg"
+    fake_client = MagicMock()
+    with (
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_s3_client", fake_client),
+    ):
+        fake_client.get_item_metadata.return_value = None
+        assert sdc_sync._maintain_canonical_title(page, "id") is None
+        fake_client.get_item_metadata.return_value = _dpla_map("")
+        assert sdc_sync._maintain_canonical_title(page, "id") is None
+    # No --from-s3 → no canonical title (can't read the source title).
+    with patch.object(sdc_sync, "_s3_partner", None):
+        assert sdc_sync._maintain_canonical_title(page, "id") is None
+
+
+def test_maintain_rename_noop_when_already_canonical():
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "Canonical - DPLA - id.jpg"
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_canonical_title",
+            return_value="Canonical - DPLA - id.jpg",
+        ),
+    ):
+        out = sdc_sync._maintain_rename(page, "id")
+    assert out is page
+    page.move.assert_not_called()
+
+
+def test_maintain_rename_moves_and_posts_delinker_on_drift():
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "Old - DPLA - deadid.jpg"
+    moved = MagicMock(name="moved_page")
+    fake_tracker = MagicMock()
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_canonical_title",
+            return_value="Old - DPLA - liveid.jpg",
+        ),
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "site", MagicMock(), create=True),
+        patch.object(sdc_sync.wikimedia, "file_has_inbound_usage", return_value=True),
+        patch.object(
+            sdc_sync.wikimedia,
+            "build_title_drift_move_reason",
+            return_value="reason",
+        ),
+        patch.object(sdc_sync.wikimedia, "post_commonsdelinker_request") as mock_delink,
+        patch.object(
+            sdc_sync.wikimedia, "get_page", return_value=moved
+        ) as mock_getpage,
+    ):
+        out = sdc_sync._maintain_rename(page, "liveid")
+    page.move.assert_called_once()
+    assert page.move.call_args.args[0] == "File:Old - DPLA - liveid.jpg"
+    assert page.move.call_args.kwargs["noredirect"] is False
+    # Usage existed → CommonsDelinker posted with check_usage=False (gated pre-move).
+    mock_delink.assert_called_once()
+    assert mock_delink.call_args.kwargs["check_usage"] is False
+    fake_tracker.increment.assert_any_call(Result.MAINTAIN_RENAMED)
+    # Re-fetches the moved page (at the canonical title) to sync against.
+    assert mock_getpage.call_args.args[1] == "File:Old - DPLA - liveid.jpg"
+    assert out is moved
+
+
+def test_maintain_rename_blocked_when_target_occupied():
+    import pywikibot
+
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "Old - DPLA - deadid.jpg"
+    page.move.side_effect = pywikibot.exceptions.ArticleExistsConflictError(page)
+    fake_tracker = MagicMock()
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_canonical_title",
+            return_value="Old - DPLA - liveid.jpg",
+        ),
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "site", MagicMock(), create=True),
+        patch.object(sdc_sync.wikimedia, "file_has_inbound_usage", return_value=False),
+        patch.object(
+            sdc_sync.wikimedia, "build_title_drift_move_reason", return_value="reason"
+        ),
+        patch.object(sdc_sync.wikimedia, "post_commonsdelinker_request") as mock_delink,
+    ):
+        out = sdc_sync._maintain_rename(page, "liveid")
+    # Blocked → original page returned (SDC still syncs in place), error counted,
+    # no CommonsDelinker request.
+    assert out is page
+    fake_tracker.increment.assert_called_once_with(Result.MAINTAIN_RENAME_BLOCKED)
+    mock_delink.assert_not_called()
+
+
+def test_maintain_process_file_renames_before_sync():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    renamed = MagicMock(name="renamed_page")
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "embedded"),
+        ),
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_maintain_rename", return_value=renamed) as mock_rename,
+        patch.object(
+            sdc_sync, "_maintain_sidecar_payload", return_value={"claims": []}
+        ),
+        patch.object(
+            sdc_sync.wikimedia,
+            "extract_page_ordinal_from_commons_title",
+            return_value=None,
+        ),
+        patch.object(sdc_sync, "_safe_process_one") as mock_sync,
+    ):
+        sdc_sync._maintain_process_file("M1", "liveid", page, "File:X.jpg", tally=None)
+    mock_rename.assert_called_once_with(page, "liveid")
+    # SDC sync lands on the renamed page, not the original.
+    assert mock_sync.call_args.kwargs["file_page"] is renamed
+
+
+def test_emit_maintain_summary_calls_notify_with_maintain_flag():
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    with (
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "notify_sdc_complete") as mock_notify,
+    ):
+        sdc_sync._emit_maintain_summary("digitalnc", 12.5)
+    # Mirrors _run_partner_mode's terminal block: posts the SDC completion
+    # notice flagged as maintain (so rename counters surface) at workers=1.
+    mock_notify.assert_called_once()
+    kwargs = mock_notify.call_args.kwargs
+    assert kwargs["maintain"] is True
+    assert kwargs["workers"] == 1
+    assert kwargs["partner_label"] == "digitalnc"
+
+
+def test_maintain_process_file_logs_dpla_id_progress_marker(caplog):
+    import logging as _logging
+
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "embedded"),
+        ),
+        patch.object(sdc_sync, "_s3_partner", None),
+        patch.object(sdc_sync, "_safe_process_one"),
+        caplog.at_level(_logging.INFO),
+    ):
+        sdc_sync._maintain_process_file("M1", "liveid", page, "File:X.jpg", tally=None)
+    # The status poller (wikimedia_upload_status.py) counts "DPLA ID:" lines
+    # for SDC-phase progress; the maintain write path must emit one per file.
+    assert any("DPLA ID: liveid" in r.message for r in caplog.records)
+
+
+def test_maintain_canonical_title_none_for_non_string_title():
+    # A non-string staged title (malformed dpla-map) must not reach
+    # get_page_title (which slices/replaces it) — return None instead of
+    # aborting the --cat batch with a TypeError.
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "X - DPLA - id.jpg"
+    fake_client = MagicMock()
+    fake_client.get_item_metadata.return_value = json.dumps(
+        {"sourceResource": {"title": [{"unexpected": "dict"}]}}
+    )
+    with (
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_s3_client", fake_client),
+    ):
+        assert sdc_sync._maintain_canonical_title(page, "id") is None
+
+
+def test_maintain_rename_transient_error_not_counted_as_blocked():
+    import pywikibot
+
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.title.return_value = "Old - DPLA - deadid.jpg"
+    # A non-occupancy move failure (transient API/auth) — NOT ArticleExists.
+    page.move.side_effect = pywikibot.exceptions.Error("maxlag")
+    fake_tracker = MagicMock()
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_canonical_title",
+            return_value="Old - DPLA - liveid.jpg",
+        ),
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "site", MagicMock(), create=True),
+        patch.object(sdc_sync.wikimedia, "file_has_inbound_usage", return_value=False),
+        patch.object(
+            sdc_sync.wikimedia, "build_title_drift_move_reason", return_value="reason"
+        ),
+        patch.object(sdc_sync.wikimedia, "post_commonsdelinker_request"),
+    ):
+        out = sdc_sync._maintain_rename(page, "liveid")
+    # File left in place for retry; the blocked counter is NOT inflated by a
+    # transient failure (it means "canonical title occupied", not "move erred").
+    assert out is page
+    assert Result.MAINTAIN_RENAME_BLOCKED not in [
+        c.args[0] for c in fake_tracker.increment.call_args_list
+    ]

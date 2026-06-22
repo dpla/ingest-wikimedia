@@ -23,6 +23,8 @@ from ingest_wikimedia.sdc import (
     parse_other_date_template,
 )
 from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
+from ingest_wikimedia.common import get_dict, get_list
+from ingest_wikimedia.dpla import DC_TITLE_FIELD_NAME, SOURCE_RESOURCE_FIELD_NAME
 from ingest_wikimedia.maintain import resolve_current_dpla_id
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
@@ -3761,6 +3763,105 @@ def _maintain_sidecar_payload(dpla_id):
         return None
 
 
+def _maintain_canonical_title(file_page, dpla_id):
+    """The canonical Commons title for a maintained file under its (re-linked)
+    ``dpla_id``, or None when it can't be computed.
+
+    Built with the same :func:`get_page_title` authority the uploader uses, so
+    any difference from the file's current title reflects a real
+    current-vs-canonical difference (a drifted embedded id, or an upstream
+    title-text change) — never a fresh normalization rule. Maintain changes
+    neither the bytes nor the page structure, so the extension and page ordinal
+    are taken from the file's own existing title; only the descriptive prefix
+    and the embedded id can move. The descriptive title comes from the item's
+    staged ``dpla-map.json`` (``sourceResource.title``), so this requires
+    ``--from-s3``.
+    """
+    if _s3_partner is None:
+        return None
+    raw = _s3_client.get_item_metadata(_s3_partner, dpla_id)
+    if not raw:
+        return None
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    titles = get_list(
+        get_dict(metadata, SOURCE_RESOURCE_FIELD_NAME), DC_TITLE_FIELD_NAME
+    )
+    item_title = titles[0] if titles else ""
+    # No usable source title to build a filename from — leave the name as-is.
+    # The isinstance guard matters because get_page_title slices/replaces the
+    # title (item_title[:181].replace(...)); a non-string staged value would
+    # raise there and abort the whole --cat batch. Don't strip/normalize beyond
+    # the type check: the uploader builds the stored title from the raw
+    # titles[0], so altering it here would break canonical-title parity and
+    # provoke spurious renames.
+    if not isinstance(item_title, str) or not item_title:
+        return None
+    current = file_page.title(with_ns=False)
+    ext = os.path.splitext(current)[1]
+    page = wikimedia.extract_page_ordinal_from_commons_title(current)
+    return wikimedia.get_page_title(item_title, dpla_id, ext, page=page)
+
+
+def _maintain_rename(file_page, dpla_id):
+    """Maintain mode: move a file to its canonical title when its current title
+    has drifted from it (PR B). Returns the FilePage to SDC-sync against — the
+    moved page on success, or the original file on a no-op or blocked move.
+
+    The move runs only when the canonical title is free or a single-revision
+    redirect back to this same file; MediaWiki permits move-over-redirect only
+    in that case, so a blind move is safe — it cannot clobber another page. When
+    the canonical title is occupied by a different page the move raises, and we
+    log an error for DPLA to resolve and leave the file at its non-canonical
+    title (its SDC still syncs in place). Maintain has no source bytes, so it
+    never inspects hashes or picks a winner. A move never creates a page, so the
+    no-create fence is not at issue.
+    """
+    canonical = _maintain_canonical_title(file_page, dpla_id)
+    current = file_page.title(with_ns=False)
+    if not canonical or canonical == current:
+        return file_page
+    # Gate inbound-usage BEFORE the move, while ``current`` is still the live
+    # file — post-move it is a redirect and the usage query is unreliable.
+    needs_relink = wikimedia.file_has_inbound_usage(site, current)
+    reason = wikimedia.build_title_drift_move_reason(
+        current, canonical, dpla_id, site.user()
+    )
+    try:
+        file_page.move(
+            f"File:{canonical}", reason=reason, movetalk=False, noredirect=False
+        )
+    except pywikibot.exceptions.ArticleExistsConflictError as e:
+        # The one outcome MAINTAIN_RENAME_BLOCKED is meant to count: MediaWiki
+        # raises this only when the canonical title is occupied by a page that
+        # isn't a redirect back to this file — a genuine collision needing DPLA
+        # follow-up. Leave the file non-canonical; its SDC still syncs in place.
+        logging.error(
+            f"maintain: could not move [[File:{current}]] ->"
+            f" [[File:{canonical}]] ({e}); leaving non-canonical for review."
+        )
+        tracker.increment(Result.MAINTAIN_RENAME_BLOCKED)
+        return file_page
+    except pywikibot.exceptions.Error as e:
+        # Any other move failure (transient API, auth, invalid-name) is NOT an
+        # occupancy block — don't inflate the blocked counter with it. Log and
+        # continue; a later maintain run retries the rename.
+        logging.error(
+            f"maintain: move failed for [[File:{current}]] ->"
+            f" [[File:{canonical}]] ({e}); continuing without rename."
+        )
+        return file_page
+    logging.info(f"maintain: renamed [[File:{current}]] -> [[File:{canonical}]]")
+    tracker.increment(Result.MAINTAIN_RENAMED)
+    if needs_relink:
+        wikimedia.post_commonsdelinker_request(
+            site, current, canonical, check_usage=False
+        )
+    return wikimedia.get_page(site, f"File:{canonical}")
+
+
 # Pre-flight sizing (``--count-only``) tally: one bucket per resolver anchor
 # plus ``ambiguous`` (a multi-hit the resolver refused to auto-apply). Order is
 # the ladder order so the printed breakdown reads top-to-bottom.
@@ -3799,7 +3900,18 @@ def _maintain_process_file(mediaid, embedded_id, file_page, title, tally=None):
             tally["ambiguous"] += 1
         return
 
+    # Emit the per-item marker the status poller (wikimedia_upload_status.py)
+    # counts for SDC-phase progress, so a maintain --cat run advances past
+    # "starting..." like a partner-mode run does.
+    logging.info(f"DPLA ID: {dpla_id}")
+
     if _s3_partner is not None:
+        # Title-drift rename (#3): move to the canonical title for the re-linked
+        # id before syncing, so SDC + wikitext cleanup land on the final page.
+        # The MediaInfo entity is keyed by pageid, which a move preserves, so
+        # ``mediaid`` stays valid; the page ordinal is unchanged by the move, so
+        # ``title``'s ordinal still drives P304.
+        file_page = _maintain_rename(file_page, dpla_id)
         payload = _maintain_sidecar_payload(dpla_id)
         if payload is None:
             logging.info(
@@ -3837,6 +3949,26 @@ def _report_maintain_tally(tally, total):
     print(f"  {'ambiguous':>12}: {tally['ambiguous']} (multi-hit, not auto-applied)")
     resolved = total - tally["unresolved"]
     print(f"  {'-> resolved':>12}: {resolved}/{total}")
+
+
+def _emit_maintain_summary(label, elapsed_seconds):
+    """Maintain mode's terminal summary, mirroring _run_partner_mode's: log the
+    ``COUNTS:`` marker (which the status poller reads as the SDC-phase
+    completion signal) and post the Slack completion notice with the maintain
+    counters (renames included). Called only on normal loop completion — an
+    aborted run propagates the exception past this point, so (as in partner
+    mode) the shell-level ``notify_pipeline_fail`` handles the failure instead
+    and no spurious ``COUNTS:`` is written.
+    """
+    logging.info("\n" + str(tracker))
+    logging.info(f"{elapsed_seconds} seconds.")
+    notify_sdc_complete(
+        tracker=tracker,
+        partner_label=label,
+        elapsed_seconds=elapsed_seconds,
+        workers=1,
+        maintain=True,
+    )
 
 
 def process_one(mediaid, dpla_id):
@@ -5341,6 +5473,7 @@ def main() -> None:
     _initialize()
 
     count = 0
+    start_time = time.time()
 
     if method == "list":
         ltotal = [i for i in os.listdir(args.lists) if ".txt" in i]
@@ -5406,6 +5539,8 @@ def main() -> None:
                 _safe_process_one(mediaid, embedded_id, file_page=page)
         if tally is not None:
             _report_maintain_tally(tally, count)
+        elif args.maintain:
+            _emit_maintain_summary(_s3_partner or "maintain", time.time() - start_time)
 
     elif args.cat:
         category = pywikibot.Category(site, args.cat)
@@ -5436,6 +5571,8 @@ def main() -> None:
                 break
         if tally is not None:
             _report_maintain_tally(tally, count)
+        elif args.maintain:
+            _emit_maintain_summary(_s3_partner or args.cat, time.time() - start_time)
 
     elif args.partner:
         _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")
