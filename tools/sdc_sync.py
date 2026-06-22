@@ -49,6 +49,10 @@ rights: dict
 subject_ids: dict
 _s3_partner: str | None = None
 _s3_client = None
+# Maintain mode: {institution Wikidata QID -> dataProvider name}, built lazily
+# from ``hubs`` (institutions_v2.json) the first time the anchor-3 wildcard
+# needs to scope a re-link to the file's own institution. None until built.
+_maintain_qid_to_name: dict[str, str] | None = None
 # Legacy-mode (``--file`` / ``--cat`` / ``--list``) DPLA-doc cache.
 # ``parsed()`` populates it during ``process_one``; the post-SDC
 # cleanup helper pops on read so the same S3 / api.dp.la doc isn't
@@ -198,6 +202,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "record instead. SDC sync + template migration only; no uploads. "
             "Use to maintain already-uploaded files of institutions no longer "
             "authorized for new uploads."
+        ),
+    )
+    p.add_argument(
+        "--count-only",
+        dest="count_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Maintain-mode pre-flight sizing: walk the --cat/--file scope, "
+            "resolve how each file would re-link (embedded id still live / "
+            "isShownAt-recovered / institution-wildcard / unresolved), print a "
+            "per-anchor breakdown, and write nothing. Run this before a real "
+            "maintain pass to size the work and spot a scope that re-links "
+            "poorly. No effect without --maintain."
         ),
     )
     p.add_argument(
@@ -3644,36 +3662,181 @@ def _extract_source_url(file_page) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def _maintain_relink(title, embedded_id, file_page):
-    """Maintain mode: resolve the CURRENT DPLA id for a (possibly ID-drifted)
-    Commons file, so SDC sync targets the live record and the rendered
-    dp.la link resolves again. Returns the live id, or the original
-    ``embedded_id`` when re-linking finds nothing (``process_one`` then skips
-    a genuinely-dead id the same as today).
+def _maintain_qid_name_map() -> dict[str, str]:
+    """``{institution Wikidata QID -> dataProvider name}`` from institutions_v2.
 
-    Anchors 1 (embedded id still live) and 2 (exact ``isShownAt`` over
-    normalized URL variants) only — the institution-scoped wildcard (anchor 3)
-    needs a reliable scope filter, which ``--cat`` lacks (Commons category
-    names don't map 1:1 to DPLA dataProvider names); it's left for a later pass.
+    The dataProvider name is the institutions_v2.json institution key — the
+    exact string the DPLA index stores in ``dataProvider.name`` — so a QID read
+    off a file's existing P195 (collection) statement maps straight to the ES
+    scope term for the anchor-3 wildcard. Built once per run from ``hubs`` and
+    memoised. Only service-hub *institution* QIDs are mapped; a content hub's
+    own QID (NARA/Smithsonian, where P195 carries the hub) has no single
+    dataProvider name, so those files simply don't get an anchor-3 scope.
     """
-    result = resolve_current_dpla_id(
+    global _maintain_qid_to_name
+    if _maintain_qid_to_name is None:
+        mapping: dict[str, str] = {}
+        for hub_data in (hubs or {}).values():
+            for inst_name, inst_data in (hub_data.get("institutions") or {}).items():
+                qid = (inst_data or {}).get("Wikidata")
+                if qid:
+                    mapping[qid] = inst_name
+        _maintain_qid_to_name = mapping
+    return _maintain_qid_to_name
+
+
+def _existing_p195_qid(entity: dict) -> str | None:
+    """The institution QID from a Commons file's existing P195 (collection)
+    statement, or None. P195 is written by ``add_collection`` as the institution
+    (service hub) or the hub itself (content hub), and is stable under DPLA ID
+    drift — which is what makes it a reliable scope anchor when the id is dead.
+    """
+    statements = entity.get("statements") or entity.get("claims") or {}
+    for stmt in statements.get("P195", []) or []:
+        snak = stmt.get("mainsnak") if isinstance(stmt, dict) else None
+        val = ((snak or {}).get("datavalue") or {}).get("value")
+        if isinstance(val, dict) and val.get("id"):
+            return val["id"]
+    return None
+
+
+def _maintain_scope_filter(mediaid: str) -> dict | None:
+    """ES filter clause scoping the anchor-3 wildcard to ``mediaid``'s own
+    institution, or None when it can't be derived (no P195, or a QID that isn't
+    a known service-hub institution). Reads the file's *existing* P195 — so the
+    wildcard never runs an unbounded whole-index scan. Invoked lazily by
+    :func:`resolve_current_dpla_id`, only for files that fall through to the
+    wildcard rung.
+    """
+    try:
+        entity = get_entity(mediaid)
+    except Exception:
+        # A missing/deleted entity or transient API error here only costs the
+        # wildcard rung for this one file; the resolver falls back to unresolved.
+        return None
+    qid = _existing_p195_qid(entity)
+    if not qid:
+        return None
+    name = _maintain_qid_name_map().get(qid)
+    if not name:
+        return None
+    return {"term": {"dataProvider.name.not_analyzed": name}}
+
+
+def _maintain_resolve(title, embedded_id, file_page, mediaid):
+    """Resolve the CURRENT DPLA id for a (possibly ID-drifted) Commons file and
+    return the full :class:`ResolveResult` (id + which anchor resolved it).
+
+    Walks the full ladder: embedded id still live, exact ``isShownAt`` over
+    normalized URL variants, then the institution-scoped wildcard — the last
+    bounded by the file's own P195 institution, derived lazily so only
+    domain-drifted files pay for it.
+    """
+    return resolve_current_dpla_id(
         embedded_id=embedded_id,
         recorded_url=_extract_source_url(file_page),
-        scope_filter=None,
+        scope_filter=lambda: _maintain_scope_filter(mediaid),
     )
+
+
+def _maintain_sidecar_payload(dpla_id):
+    """Maintain mode: load the precomputed ``sdc.json`` for ``dpla_id`` from S3
+    (staged by ``get-ids-es --maintain``) so the sync runs through
+    :func:`process_one_from_sdc` — no ``api.dp.la`` call, no runtime claim
+    build. Requires ``--from-s3 <partner>`` (which sets ``_s3_partner`` /
+    ``_s3_client``); returns the parsed payload, or None when no sidecar is
+    staged for this id. A None result means the caller should SKIP the file
+    rather than fall back to a per-file live API call — at hub scale (100Ks of
+    files, possibly parallel) that fallback is exactly the api.dp.la load this
+    path exists to avoid.
+    """
+    if _s3_partner is None:
+        return None
+    raw = _s3_client.get_sdc_json(_s3_partner, dpla_id)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+# Pre-flight sizing (``--count-only``) tally: one bucket per resolver anchor
+# plus ``ambiguous`` (a multi-hit the resolver refused to auto-apply). Order is
+# the ladder order so the printed breakdown reads top-to-bottom.
+_MAINTAIN_TALLY_ANCHORS = ("embedded", "isShownAt", "wildcard", "unresolved")
+
+
+def _maintain_process_file(mediaid, embedded_id, file_page, title, tally=None):
+    """Maintain one Commons file: re-link to its current DPLA id, then either
+    tally the resolver outcome (``--count-only`` pre-flight sizing — ``tally``
+    given, nothing written) or SDC-sync it.
+
+    The sync runs through the staged ``sdc.json`` sidecar (``--from-s3``) so it
+    never calls ``api.dp.la`` and materialises P304 from the page ordinal in the
+    title. With no sidecar staged for the (re-linked) id the file is skipped
+    rather than falling back to a per-file live fetch — at hub scale that
+    fallback is the api.dp.la load this path exists to avoid. When ``--from-s3``
+    is not set at all (e.g. an ad-hoc ``--file`` run), it falls back to the live
+    ``process_one`` for that single file.
+    """
+    result = _maintain_resolve(title, embedded_id, file_page, mediaid)
+    dpla_id = result.dpla_id or embedded_id
     if result.dpla_id and result.dpla_id != embedded_id:
         logging.info(
             f"maintain: re-linked {title}: {embedded_id} ->"
             f" {result.dpla_id} (via {result.anchor})"
         )
-        return result.dpla_id
-    if result.dpla_id is None:
+    elif result.dpla_id is None:
         logging.info(
             f"maintain: could not re-link {title}"
             f" (embedded {embedded_id}); leaving as-is."
         )
-        return embedded_id
-    return result.dpla_id
+
+    if tally is not None:
+        tally[result.anchor] += 1
+        if result.ambiguous:
+            tally["ambiguous"] += 1
+        return
+
+    if _s3_partner is not None:
+        payload = _maintain_sidecar_payload(dpla_id)
+        if payload is None:
+            logging.info(
+                f"maintain: no staged sdc.json for {dpla_id} ({title}); skipping."
+            )
+            tracker.increment(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
+            return
+        page_number = wikimedia.extract_page_ordinal_from_commons_title(title)
+        _safe_process_one(
+            mediaid,
+            dpla_id,
+            file_page=file_page,
+            sdc_payload=payload,
+            page_number=page_number,
+        )
+    else:
+        _safe_process_one(mediaid, dpla_id, file_page=file_page)
+
+
+def _new_maintain_tally(enabled):
+    """A zero-initialised per-anchor tally for ``--count-only`` sizing, or None
+    when sizing is off. dict.fromkeys keeps a 0 for every bucket so
+    :func:`_report_maintain_tally` never KeyErrors on an unseen tier.
+    """
+    if not enabled:
+        return None
+    return dict.fromkeys((*_MAINTAIN_TALLY_ANCHORS, "ambiguous"), 0)
+
+
+def _report_maintain_tally(tally, total):
+    """Print the ``--count-only`` per-anchor sizing breakdown."""
+    print(f"\nmaintain pre-flight sizing ({total} files in scope):")
+    for anchor in _MAINTAIN_TALLY_ANCHORS:
+        print(f"  {anchor:>12}: {tally[anchor]}")
+    print(f"  {'ambiguous':>12}: {tally['ambiguous']} (multi-hit, not auto-applied)")
+    resolved = total - tally["unresolved"]
+    print(f"  {'-> resolved':>12}: {resolved}/{total}")
 
 
 def process_one(mediaid, dpla_id):
@@ -5089,9 +5252,23 @@ def _run_partner_mode(partner, ids_file):
 # We can use a PWB generator to programatically make the list of files we are working on based on a set of criteria. Here, we are generating the page titles from a Wikimedia Commons search and categories. For other types of available page generators, see <https://doc.wikimedia.org/pywikibot/master/api_ref/pywikibot.html#module-pywikibot.pagegenerators>. As an additional step, we take the pageid provided by the generator and prepend "M" for the mediaid needed for posting SDC statements.
 
 
-def _safe_process_one(mediaid: str, dpla_id: str, file_page=None) -> None:
+def _safe_process_one(
+    mediaid: str,
+    dpla_id: str,
+    file_page=None,
+    sdc_payload=None,
+    page_number=None,
+) -> None:
     """Run ``process_one`` with the per-file exception boundary the
     legacy ``--list`` / ``--files`` / ``--cat`` loops need.
+
+    When ``sdc_payload`` is supplied (maintain mode against staged S3
+    sidecars — see the ``--cat``/``--file`` loops), the precomputed
+    :func:`process_one_from_sdc` path is used instead of the live
+    :func:`process_one`: no ``api.dp.la`` call and no runtime claim build,
+    and ``page_number`` (parsed from the file title) materialises the P304
+    page qualifier. With no payload it runs the live ``process_one`` exactly
+    as before.
 
     Without this, a transient pywikibot APIError on any one file
     aborts the entire loop — and on ``--list``, leaves WORKING-*.txt
@@ -5119,7 +5296,12 @@ def _safe_process_one(mediaid: str, dpla_id: str, file_page=None) -> None:
     writes_before = _sdc_writes_total()
     try:
         try:
-            process_one(mediaid, dpla_id)
+            if sdc_payload is not None:
+                process_one_from_sdc(
+                    mediaid, dpla_id, sdc_payload, page_number=page_number
+                )
+            else:
+                process_one(mediaid, dpla_id)
         except _MissingEntityError:
             logging.info(
                 f" -- {mediaid} for {dpla_id}: Commons MediaInfo entity"
@@ -5205,6 +5387,9 @@ def main() -> None:
                 pass
 
     elif args.files:
+        # ``--count-only`` is a maintain-mode pre-flight: tally how each file
+        # would re-link without writing anything.
+        tally = _new_maintain_tally(args.maintain and args.count_only)
         for title in args.files:
             print("\n" + title)
             page = pywikibot.FilePage(site, title)
@@ -5212,25 +5397,27 @@ def main() -> None:
                 print(f" -- Page not found on Commons: {title}")
                 continue
             mediaid = "M" + str(page.pageid)
-            dpla_id = _resolve_dpla_id(title, dpla_api)
-            if args.maintain:
-                dpla_id = _maintain_relink(title, dpla_id, page)
+            embedded_id = _resolve_dpla_id(title, dpla_api)
             count += 1
             print(f"{count}: {mediaid}")
-            _safe_process_one(mediaid, dpla_id, file_page=page)
+            if args.maintain:
+                _maintain_process_file(mediaid, embedded_id, page, title, tally=tally)
+            else:
+                _safe_process_one(mediaid, embedded_id, file_page=page)
+        if tally is not None:
+            _report_maintain_tally(tally, count)
 
     elif args.cat:
         category = pywikibot.Category(site, args.cat)
         generator = pagegenerators.CategorizedPageGenerator(
             category, namespaces=[6], recurse=args.recurse
         )
+        tally = _new_maintain_tally(args.maintain and args.count_only)
         for page in generator:
             title = page.title()
             print("\n" + title)
             mediaid = "M" + str(page.pageid)
-            dpla_id = _resolve_dpla_id(title, dpla_api)
-            if args.maintain:
-                dpla_id = _maintain_relink(title, dpla_id, page)
+            embedded_id = _resolve_dpla_id(title, dpla_api)
             count += 1
             print(f"{count}: {mediaid}")
             # CategorizedPageGenerator yields generic Page objects;
@@ -5238,10 +5425,17 @@ def main() -> None:
             # right type (its normalize / migrate helpers expect a
             # FilePage handle).
             file_page = pywikibot.FilePage(site, title)
-            _safe_process_one(mediaid, dpla_id, file_page=file_page)
+            if args.maintain:
+                _maintain_process_file(
+                    mediaid, embedded_id, file_page, title, tally=tally
+                )
+            else:
+                _safe_process_one(mediaid, embedded_id, file_page=file_page)
             if args.limit and count >= args.limit:
                 print(f" -- Reached --limit {args.limit}, stopping.")
                 break
+        if tally is not None:
+            _report_maintain_tally(tally, count)
 
     elif args.partner:
         _ids_file = args.ids_file or os.path.join(args.partner, f"{args.partner}.csv")

@@ -455,27 +455,43 @@ def handler(event, context):
         # upload, no new File pages — so upload-ineligible targets are allowed.
         if tokens[0] == "maintain":
             maintain_tokens = tokens[1:]
+            # `maintain count <target> ...` is the pre-flight sizing variant:
+            # resolve how each file would re-link and report a per-anchor
+            # breakdown without writing anything.
+            count_only = bool(maintain_tokens) and maintain_tokens[0] == "count"
+            if count_only:
+                maintain_tokens = maintain_tokens[1:]
             if not maintain_tokens:
                 return _slack_reply(
-                    "Usage: `/wikimedia-upload maintain <target> [<target> ...]`\n"
+                    "Usage: `/wikimedia-upload maintain [count] <target> [<target> ...]`\n"
                     "Re-links + SDC-syncs files already on Commons for a hub or"
                     " institution, in place (no uploads, no new files). Works for"
                     " hubs no longer participating in uploads.\n"
+                    "Add `count` to size the re-link without writing anything.\n"
                     "Example: `/wikimedia-upload maintain digitalnc`\n"
+                    "Example: `/wikimedia-upload maintain count digitalnc`\n"
                     'Example: `/wikimedia-upload maintain "georgia|Atlanta History Center"`',
                     ephemeral=True,
                 )
             maintain_targets, err = _validate_launch_targets(maintain_tokens)
             if err is not None:
                 return err
+            inputs = {"maintain": "true"}
+            if count_only:
+                inputs["count_only"] = "true"
+            action = (
+                "maintain pre-flight sizing (count-only, writes nothing)"
+                if count_only
+                else "maintain (re-link + SDC sync, no uploads)"
+            )
             return _launch_with_targets(
                 gh_token,
                 repo,
                 response_url,
                 maintain_targets,
-                {"maintain": "true"},
+                inputs,
                 lambda targets_display: (
-                    f"Launching maintain (re-link + SDC sync, no uploads) for"
+                    f"Launching {action} for"
                     f" {targets_display} — confirmation will post to"
                     " #tech-alerts shortly."
                 ),

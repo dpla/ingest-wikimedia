@@ -174,7 +174,7 @@ def resolve_current_dpla_id(
     *,
     embedded_id: str | None,
     recorded_url: str | None,
-    scope_filter: dict | None,
+    scope_filter: dict | Callable[[], dict | None] | None,
     query_fn: Callable[[dict], object] = post_es,
 ) -> ResolveResult:
     """Resolve the *current* DPLA ID for one orphaned Commons file.
@@ -182,9 +182,14 @@ def resolve_current_dpla_id(
     Walks the validated ladder (embedded -> exact isShownAt -> scoped wildcard)
     and stops at the first unambiguous hit. ``query_fn`` runs an ES query and
     returns a ``requests``-style response exposing ``.json()`` — injected so the
-    ladder is testable without a cluster. ``scope_filter`` bounds the wildcard
-    rung to one institution; pass None to skip that rung (e.g. when the
-    institution is unknown).
+    ladder is testable without a cluster.
+
+    ``scope_filter`` bounds the wildcard rung to one institution. It may be a
+    ready ES filter clause, or a zero-arg callable that returns one (or None) —
+    the callable is invoked **only** if the ladder reaches the wildcard rung, so
+    the per-file work of deriving the scope (e.g. reading the file's existing
+    P195 institution) is skipped for the common embedded/isShownAt hits. Pass
+    None to skip the wildcard rung entirely.
     """
     tried: list[str] = []
 
@@ -208,13 +213,17 @@ def resolve_current_dpla_id(
 
     # Anchor 3: institution-scoped wildcard on the stable URL token.
     token = extract_stable_token(recorded_url or "")
-    if token and scope_filter:
-        tried.append("wildcard")
-        data = query_fn(_scoped_wildcard_query(token, scope_filter)).json()
-        total = _total(data)
-        if total == 1:
-            return ResolveResult(_hit_ids(data)[0], "wildcard", tried=tried)
-        if total > 1:
-            return ResolveResult(None, "unresolved", ambiguous=True, tried=tried)
+    if token:
+        # Resolve a lazy scope only now — deriving it (a P195 read on Commons)
+        # is wasted work on the embedded/isShownAt hits handled above.
+        scope = scope_filter() if callable(scope_filter) else scope_filter
+        if scope:
+            tried.append("wildcard")
+            data = query_fn(_scoped_wildcard_query(token, scope)).json()
+            total = _total(data)
+            if total == 1:
+                return ResolveResult(_hit_ids(data)[0], "wildcard", tried=tried)
+            if total > 1:
+                return ResolveResult(None, "unresolved", ambiguous=True, tried=tried)
 
     return ResolveResult(None, "unresolved", tried=tried)

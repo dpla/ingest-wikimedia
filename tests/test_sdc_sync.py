@@ -5219,7 +5219,7 @@ def test_extract_source_url_absent_or_unreadable():
     assert sdc_sync._extract_source_url(raises) is None
 
 
-def test_maintain_relink_uses_current_id_when_drifted():
+def test_maintain_resolve_uses_current_id_when_drifted():
     from ingest_wikimedia.maintain import ResolveResult
     from tools import sdc_sync
 
@@ -5230,11 +5230,13 @@ def test_maintain_relink_uses_current_id_when_drifted():
         "resolve_current_dpla_id",
         return_value=ResolveResult("26f8310936c0321a8c611703751034ee", "isShownAt"),
     ):
-        out = sdc_sync._maintain_relink("File:X (cropped).jpg", "deadbeef", page)
-    assert out == "26f8310936c0321a8c611703751034ee"
+        result = sdc_sync._maintain_resolve(
+            "File:X (cropped).jpg", "deadbeef", page, "M1"
+        )
+    assert result.dpla_id == "26f8310936c0321a8c611703751034ee"
 
 
-def test_maintain_relink_keeps_embedded_when_unresolved():
+def test_maintain_resolve_unresolved_so_caller_keeps_embedded():
     from ingest_wikimedia.maintain import ResolveResult
     from tools import sdc_sync
 
@@ -5245,6 +5247,192 @@ def test_maintain_relink_keeps_embedded_when_unresolved():
         "resolve_current_dpla_id",
         return_value=ResolveResult(None, "unresolved"),
     ):
-        out = sdc_sync._maintain_relink("File:Y.jpg", "origid12345", page)
-    # Unresolved → keep the embedded id; process_one then skips a dead id as today.
-    assert out == "origid12345"
+        result = sdc_sync._maintain_resolve("File:Y.jpg", "origid12345", page, "M2")
+    # Unresolved → dpla_id is None, so _maintain_process_file keeps the embedded
+    # id (process_one then skips a dead id as today).
+    assert result.dpla_id is None
+    assert (result.dpla_id or "origid12345") == "origid12345"
+
+
+def test_maintain_qid_name_map_reverses_institutions_v2():
+    from tools import sdc_sync
+
+    fake_hubs = {
+        "Digital Library of Georgia": {
+            "Wikidata": "Q5275908",
+            "institutions": {
+                "Athens-Clarke County Library": {"Wikidata": "Q100"},
+                "Atlanta History Center": {"Wikidata": "Q200"},
+            },
+        }
+    }
+    with patch.object(sdc_sync, "hubs", fake_hubs):
+        # Cache is module-level; clear it so this test's hubs are used.
+        sdc_sync._maintain_qid_to_name = None
+        mapping = sdc_sync._maintain_qid_name_map()
+        sdc_sync._maintain_qid_to_name = None
+    assert mapping["Q100"] == "Athens-Clarke County Library"
+    assert mapping["Q200"] == "Atlanta History Center"
+
+
+def test_existing_p195_qid_reads_collection_statement():
+    from tools import sdc_sync
+
+    entity = {
+        "statements": {
+            "P195": [
+                {
+                    "mainsnak": {
+                        "datavalue": {"value": {"id": "Q100", "entity-type": "item"}}
+                    }
+                }
+            ]
+        }
+    }
+    assert sdc_sync._existing_p195_qid(entity) == "Q100"
+    assert sdc_sync._existing_p195_qid({"statements": {}}) is None
+    assert sdc_sync._existing_p195_qid({}) is None
+
+
+def test_maintain_scope_filter_builds_term_from_p195():
+    from tools import sdc_sync
+
+    entity = {
+        "statements": {"P195": [{"mainsnak": {"datavalue": {"value": {"id": "Q100"}}}}]}
+    }
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(
+            sdc_sync,
+            "_maintain_qid_name_map",
+            return_value={"Q100": "Athens-Clarke County Library"},
+        ),
+    ):
+        scope = sdc_sync._maintain_scope_filter("M1")
+    assert scope == {
+        "term": {"dataProvider.name.not_analyzed": "Athens-Clarke County Library"}
+    }
+
+
+def test_maintain_scope_filter_none_when_qid_unknown():
+    from tools import sdc_sync
+
+    entity = {
+        "statements": {"P195": [{"mainsnak": {"datavalue": {"value": {"id": "Q999"}}}}]}
+    }
+    with (
+        patch.object(sdc_sync, "get_entity", return_value=entity),
+        patch.object(sdc_sync, "_maintain_qid_name_map", return_value={"Q100": "X"}),
+    ):
+        assert sdc_sync._maintain_scope_filter("M1") is None
+
+
+def test_maintain_sidecar_payload_parses_and_handles_missing():
+    from tools import sdc_sync
+
+    fake_client = MagicMock()
+    fake_client.get_sdc_json.return_value = '{"claims": [{"a": 1}]}'
+    with (
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_s3_client", fake_client),
+    ):
+        assert sdc_sync._maintain_sidecar_payload("abc") == {"claims": [{"a": 1}]}
+        fake_client.get_sdc_json.return_value = None
+        assert sdc_sync._maintain_sidecar_payload("missing") is None
+        fake_client.get_sdc_json.return_value = "not json{"
+        assert sdc_sync._maintain_sidecar_payload("bad") is None
+    # No --from-s3 → no client → None without touching S3.
+    with patch.object(sdc_sync, "_s3_partner", None):
+        assert sdc_sync._maintain_sidecar_payload("x") is None
+
+
+def test_maintain_process_file_count_only_tallies_and_writes_nothing():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    tally = dict.fromkeys((*sdc_sync._MAINTAIN_TALLY_ANCHORS, "ambiguous"), 0)
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "isShownAt"),
+        ),
+        patch.object(sdc_sync, "_safe_process_one") as mock_sync,
+    ):
+        sdc_sync._maintain_process_file("M1", "deadid", page, "File:X.jpg", tally=tally)
+    assert tally["isShownAt"] == 1
+    mock_sync.assert_not_called()
+
+
+def test_maintain_process_file_syncs_from_sidecar_with_page_number():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    payload = {"claims": [{"a": 1}]}
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "embedded"),
+        ),
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_maintain_sidecar_payload", return_value=payload),
+        patch.object(
+            sdc_sync.wikimedia,
+            "extract_page_ordinal_from_commons_title",
+            return_value=3,
+        ),
+        patch.object(sdc_sync, "_safe_process_one") as mock_sync,
+    ):
+        sdc_sync._maintain_process_file(
+            "M1", "liveid", page, "File:X (page 3).jpg", tally=None
+        )
+    mock_sync.assert_called_once_with(
+        "M1", "liveid", file_page=page, sdc_payload=payload, page_number=3
+    )
+
+
+def test_maintain_process_file_skips_when_no_sidecar():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    fake_tracker = MagicMock()
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "embedded"),
+        ),
+        patch.object(sdc_sync, "_s3_partner", "digitalnc"),
+        patch.object(sdc_sync, "_maintain_sidecar_payload", return_value=None),
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "_safe_process_one") as mock_sync,
+    ):
+        sdc_sync._maintain_process_file("M1", "liveid", page, "File:X.jpg", tally=None)
+    mock_sync.assert_not_called()
+    fake_tracker.increment.assert_called_once_with(Result.SDC_ITEMS_SKIPPED_NO_SIDECAR)
+
+
+def test_maintain_process_file_live_fallback_without_from_s3():
+    from ingest_wikimedia.maintain import ResolveResult
+    from tools import sdc_sync
+
+    page = MagicMock()
+    page.text = "url=https://x/1"
+    with (
+        patch.object(
+            sdc_sync,
+            "_maintain_resolve",
+            return_value=ResolveResult("liveid", "embedded"),
+        ),
+        patch.object(sdc_sync, "_s3_partner", None),
+        patch.object(sdc_sync, "_safe_process_one") as mock_sync,
+    ):
+        sdc_sync._maintain_process_file("M1", "liveid", page, "File:X.jpg", tally=None)
+    mock_sync.assert_called_once_with("M1", "liveid", file_page=page)
