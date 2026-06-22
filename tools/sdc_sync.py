@@ -23,6 +23,7 @@ from ingest_wikimedia.sdc import (
     parse_other_date_template,
 )
 from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
+from ingest_wikimedia.maintain import resolve_current_dpla_id
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
 from ingest_wikimedia.wikimedia import extract_dpla_id_from_commons_title
@@ -182,6 +183,21 @@ def _build_parser() -> argparse.ArgumentParser:
             "(upload → SDC → wikitext cleanup). Pass --no-normalize-wikitext "
             "to disable for diagnostic runs that need the pre-strip wikitext "
             "intact."
+        ),
+    )
+    p.add_argument(
+        "--maintain",
+        dest="maintain",
+        action="store_true",
+        default=False,
+        help=(
+            "Maintain mode (for --cat / --file). Before syncing each file, "
+            "re-link its DPLA id to the current record via the provider source "
+            "URL (ingest_wikimedia.maintain), so files whose embedded DPLA id "
+            "has gone dead (ID drift → 404 dp.la links) sync against the live "
+            "record instead. SDC sync + template migration only; no uploads. "
+            "Use to maintain already-uploaded files of institutions no longer "
+            "authorized for new uploads."
         ),
     )
     p.add_argument(
@@ -3614,6 +3630,52 @@ def _resolve_dpla_id(title, dpla_api):
     return title
 
 
+def _extract_source_url(file_page) -> str | None:
+    """Best-effort: the provider source URL from a file's wikitext — the
+    ``url=`` parameter of a legacy ``{{DPLA|...}}`` block or a flat
+    ``{{DPLA metadata}}`` param. Returns None when absent or unreadable.
+    Used by maintain mode to re-link an ID-drifted file to its current record.
+    """
+    try:
+        text = file_page.text
+    except Exception:
+        return None
+    m = re.search(r"\burl\s*=\s*(https?://[^|}\s\n]+)", text or "")
+    return m.group(1).strip() if m else None
+
+
+def _maintain_relink(title, embedded_id, file_page):
+    """Maintain mode: resolve the CURRENT DPLA id for a (possibly ID-drifted)
+    Commons file, so SDC sync targets the live record and the rendered
+    dp.la link resolves again. Returns the live id, or the original
+    ``embedded_id`` when re-linking finds nothing (``process_one`` then skips
+    a genuinely-dead id the same as today).
+
+    Anchors 1 (embedded id still live) and 2 (exact ``isShownAt`` over
+    normalized URL variants) only — the institution-scoped wildcard (anchor 3)
+    needs a reliable scope filter, which ``--cat`` lacks (Commons category
+    names don't map 1:1 to DPLA dataProvider names); it's left for a later pass.
+    """
+    result = resolve_current_dpla_id(
+        embedded_id=embedded_id,
+        recorded_url=_extract_source_url(file_page),
+        scope_filter=None,
+    )
+    if result.dpla_id and result.dpla_id != embedded_id:
+        logging.info(
+            f"maintain: re-linked {title}: {embedded_id} ->"
+            f" {result.dpla_id} (via {result.anchor})"
+        )
+        return result.dpla_id
+    if result.dpla_id is None:
+        logging.info(
+            f"maintain: could not re-link {title}"
+            f" (embedded {embedded_id}); leaving as-is."
+        )
+        return embedded_id
+    return result.dpla_id
+
+
 def process_one(mediaid, dpla_id):
     """Fetch DPLA metadata and sync SDC claims for a single Commons file."""
     # Drop every prior file's cached entity at the file boundary so the
@@ -5151,6 +5213,8 @@ def main() -> None:
                 continue
             mediaid = "M" + str(page.pageid)
             dpla_id = _resolve_dpla_id(title, dpla_api)
+            if args.maintain:
+                dpla_id = _maintain_relink(title, dpla_id, page)
             count += 1
             print(f"{count}: {mediaid}")
             _safe_process_one(mediaid, dpla_id, file_page=page)
@@ -5165,6 +5229,8 @@ def main() -> None:
             print("\n" + title)
             mediaid = "M" + str(page.pageid)
             dpla_id = _resolve_dpla_id(title, dpla_api)
+            if args.maintain:
+                dpla_id = _maintain_relink(title, dpla_id, page)
             count += 1
             print(f"{count}: {mediaid}")
             # CategorizedPageGenerator yields generic Page objects;
