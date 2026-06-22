@@ -447,6 +447,38 @@ def handler(event, context):
                 ),
             )
 
+        # Maintain subcommand: /wikimedia-upload maintain <target> [<target> ...]
+        # Re-links + SDC-syncs the EXISTING Commons files of a (possibly
+        # no-longer-participating) hub/institution in place. No download, no
+        # upload, no new File pages — so upload-ineligible targets are allowed.
+        if tokens[0] == "maintain":
+            maintain_tokens = tokens[1:]
+            if not maintain_tokens:
+                return _slack_reply(
+                    "Usage: `/wikimedia-upload maintain <target> [<target> ...]`\n"
+                    "Re-links + SDC-syncs files already on Commons for a hub or"
+                    " institution, in place (no uploads, no new files). Works for"
+                    " hubs no longer participating in uploads.\n"
+                    "Example: `/wikimedia-upload maintain digitalnc`\n"
+                    'Example: `/wikimedia-upload maintain "georgia|Atlanta History Center"`',
+                    ephemeral=True,
+                )
+            maintain_targets, err = _validate_launch_targets(maintain_tokens)
+            if err is not None:
+                return err
+            return _launch_with_targets(
+                gh_token,
+                repo,
+                response_url,
+                maintain_targets,
+                {"maintain": "true"},
+                lambda targets_display: (
+                    f"Launching maintain (re-link + SDC sync, no uploads) for"
+                    f" {targets_display} — confirmation will post to"
+                    " #tech-alerts shortly."
+                ),
+            )
+
         # Refresh subcommand: /wikimedia-upload refresh <target> [<target> ...] <days>
         # Re-downloads files older than DAYS days without running the uploader.
         if tokens[0] == "refresh":

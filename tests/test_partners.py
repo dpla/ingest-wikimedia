@@ -14,7 +14,12 @@ non-eligible matches never leak to the launcher.
 
 from unittest.mock import patch
 
-from ingest_wikimedia.partners import resolve_wikidata_id
+from ingest_wikimedia import partners
+from ingest_wikimedia.partners import (
+    resolve_commons_category,
+    resolve_wikidata_id,
+    wikidata_qid_for_target,
+)
 
 
 def _mock_institutions(data: dict):
@@ -175,3 +180,65 @@ def test_resolve_wikidata_id_same_hub_overlap_picks_up_eligible_institution():
     assert ("overlap-hub", None) not in results
     # Institution-level match preserved (institution.upload=true).
     assert results == [("overlap-hub", "Self-listed Institution")]
+
+
+# --- maintain mode: slug/target -> QID -> exact Commons category -------------
+
+
+def test_wikidata_qid_for_target_hub_and_institution():
+    # Keys are hub DISPLAY names (as in institutions_v2.json); the slug maps
+    # to the display name via PARTNER_HUBS ("georgia" -> "Digital Library of
+    # Georgia").
+    data = {
+        "Digital Library of Georgia": {
+            "Wikidata": "Q5275908",
+            "institutions": {"Some Library": {"Wikidata": "Q42"}},
+        }
+    }
+    with _mock_institutions(data):
+        assert wikidata_qid_for_target("georgia") == "Q5275908"
+        assert wikidata_qid_for_target("georgia", "Some Library") == "Q42"
+        assert wikidata_qid_for_target("georgia", "Unknown Inst") is None
+        assert wikidata_qid_for_target("not-a-slug") is None
+
+
+def test_resolve_commons_category_follows_p8464_to_sitelink():
+    # Hub item Q5275908 has P8464 -> category item Q999, whose commonswiki
+    # sitelink is the real Category page (authoritative; note the "the").
+    entities = {
+        "Q5275908": {
+            "claims": {
+                "P8464": [{"mainsnak": {"datavalue": {"value": {"id": "Q999"}}}}]
+            }
+        },
+        "Q999": {
+            "sitelinks": {
+                "commonswiki": {
+                    "title": "Category:Media contributed by the Digital Library of Georgia"
+                }
+            }
+        },
+    }
+    with (
+        patch.object(partners, "_commons_category_cache", {}),
+        patch.object(
+            partners, "_fetch_wikidata_entity", side_effect=lambda q, t: entities.get(q)
+        ),
+    ):
+        cat = resolve_commons_category("Q5275908")
+    assert cat == "Category:Media contributed by the Digital Library of Georgia"
+
+
+def test_resolve_commons_category_none_when_no_p8464():
+    with (
+        patch.object(partners, "_commons_category_cache", {}),
+        patch.object(partners, "_fetch_wikidata_entity", return_value={"claims": {}}),
+    ):
+        assert resolve_commons_category("Q123") is None
+
+
+def test_resolve_commons_category_rejects_non_qid():
+    # No network call for a non-QID input.
+    with patch.object(partners, "_fetch_wikidata_entity") as fetch:
+        assert resolve_commons_category("georgia") is None
+        fetch.assert_not_called()
