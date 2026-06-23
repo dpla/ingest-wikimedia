@@ -441,6 +441,7 @@ The Lambda function (`wikimedia-slack-dispatch`) sits behind a Lambda Function U
 ## EC2 infrastructure
 
 - **Instance**: `i-033eff6c8c168f999` (name: "wiki downloads") — always running
+- **Resources**: ~7.6 GiB RAM, **no swap** — see [Memory and concurrency planning](#memory-and-concurrency-planning) before launching several runs at once
 - **Access**: AWS SSM (`ssm:SendCommand` / `ssm:GetCommandInvocation`)
 - **Region**: `us-east-1`
 - **Repo root**: `/home/ec2-user/ingest-wikimedia/`
@@ -511,6 +512,29 @@ tail -200 /home/ec2-user/ingest-wikimedia/<partner>/logs/<latest>-sdc.log | grep
 ```
 
 A reboot that clears `/tmp` is safe — it also kills every slot holder, so there's nothing to preserve.
+
+### Memory and concurrency planning
+
+The box has **~7.6 GiB RAM and no swap**, so an over-budget allocation is killed by the OOM killer — abruptly and silently (no Slack notice; the session just dies mid-phase). The [worker-slot budget](#worker-slot-budget) does **not** protect against this: it caps concurrent Commons *writers* (maxlag protection), not memory. You can have most slots free and still be near the memory ceiling, so "slots available" is not a signal that it's safe to launch more.
+
+Two facts drive memory use:
+
+- **The uploader is the heavy phase, and its footprint scales with media file size.** It holds the file being uploaded in memory. Large-media hubs — **NARA** above all (large TIFFs, motion-picture video) — run **~1–2 GiB per uploader**. Image hubs (most ContentDM/IIIF library hubs, ~1–3 MB JPEGs) run a few hundred MiB, dominated by interpreter + batch overhead rather than the file. Downloaders (~100–150 MiB) and SDC workers (~80 MiB each) are comparatively cheap.
+
+- **Most downloaders are queued uploaders.** In a standard upload run — and in the maintain hash route — download is the cheap front end of a chain that auto-advances `download → upload → sdc-sync` in the same session. The run's memory *peak* arrives later, in the upload phase. Because downloads are fast and Commons uploads are throttled, runs **accumulate** in the upload phase, so memory climbs *after* phase changes, not at launch. Treat "a NARA download is running" as "a NARA upload is already booked." (The exception is [`refresh_only`](#alternate-run-modes), which runs `get-ids-es → downloader` alone — no upload follows, so it stays at downloader weight.)
+
+**Planning rule:** budget by the number of concurrent *runs*, each weighted by its hub's media size — not by current phase, and not by free slots. On this box, keep **at most one large-media (NARA-class) run** in flight at a time; image-hub runs can stack several deep safely. Stagger launches so two large upload phases don't converge. If large-media batches become routine, the fix is a bigger instance (or adding swap as a backstop), not throttling slots — the slot knob doesn't touch what actually fills RAM.
+
+Spot-check resident memory by category before launching (`free -h` for the headroom, `ps` for the breakdown):
+
+```bash
+# Top memory holders by category — run via SSM on the instance
+free -h
+ps -eo rss,args | grep -E "uploader|downloader|sdc-sync" | grep -v grep \
+  | awk '{mb=$1/1024; print int(mb) " MiB  " $0}' | sort -rn | head
+```
+
+RSS overcounts memory shared across a worker pool's forked children, so the per-process numbers run high for SDC pools — fine for a gut-check, but read `free -h` for the true figure. For an exact per-process number, sum `Pss` from `/proc/<pid>/smaps_rollup`.
 
 ### Log files
 

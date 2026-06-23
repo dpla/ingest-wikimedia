@@ -1169,6 +1169,50 @@ def test_download_log_glob_is_not_single_quoted():
     assert "/*-bpl+phillips-academy-download.log" in main_cmd, main_cmd
 
 
+def test_total_ordinals_awk_counts_universal_downloading_marker():
+    """The total-ordinals denominator must come from a marker that's
+    present in EVERY version of the downloader's log, not just
+    post-PR-272 logs. NARA-style large hubs run their download phase
+    once and iterate upload + SDC many times — the download log stays
+    in its original form forever, so the status script must work
+    against logs from before PR #272 added the per-item ``Item <id>:
+    N ordinals`` summary line.
+
+    The ``Downloading <partner> <id> <ordinal> from <url>`` line at
+    ``downloader.py:532`` has been emitted unconditionally since the
+    downloader was first written, so it's the right universal source.
+    Pin the contract: the rendered SSM command must use that pattern,
+    not the post-PR-272-only Item-summary one."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        if len(captured) == 1:
+            return "1700000000\n20260528-091047-bpl+phillips-academy-upload.log\n"
+        return (
+            "1700000000\n1700000000\n__WM_SEP__\n.\n__WM_SEP__\n"
+            "10\n5\n2\n0\n0\n50\n__WM_SEP__\n200\n"
+        )
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+phillips-academy",
+            hub="bpl",
+            label="bpl+phillips-academy",
+        )
+    main_cmd = captured[1]
+    # The new pattern that works on legacy AND current downloader logs.
+    assert "Downloading [a-z0-9-]+ [a-f0-9]+ [0-9]+ from" in main_cmd, main_cmd
+    # The old post-PR-272-only pattern must NOT be present — it would
+    # silently return 0 against any download log that predates PR #272.
+    assert "Item [a-f0-9]+: [0-9]+ ordinals" not in main_cmd, main_cmd
+
+
 def test_fetch_position_annotation_for_multi_label_batch():
     """Multi-label batch sessions get a `[<pos>/<total>]` suffix on the
     active label, replacing the prior `(+N more)` form. Lets the
