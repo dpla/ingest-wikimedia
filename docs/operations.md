@@ -316,7 +316,7 @@ get-ids-es … --maintain --skip-media-filter  →  downloader  →  uploader --
 
 Anchoring SDC on the category (not the get-ids id list) is deliberate: an institution whose current index docs no longer pass the rights/media filter still has files on Commons, and those must be reconciled. The content-drift repair is the lesser, best-effort benefit layered on top — matching is **exact SHA1 only** (no fuzzy/perceptual matching), so an item whose master was re-encoded upstream or has no fetchable media is simply not re-linked; the SDC `--cat` pass still reconciles its file in place.
 
-> **Single-DPLA-id / collection targets** have no whole category to walk, so they keep the **id-list-anchored** route — `get-ids-es --maintain` (media filter on) → downloader → `uploader --no-create` → `sdc-sync --partner --ids-file` — reconciling exactly the matched items. Use these for targeted drift repair of one item or collection.
+> **Single-DPLA-id / collection targets** have no whole category to walk, so they keep the **id-list-anchored** route — get-ids → downloader → `uploader --no-create` → `sdc-sync --partner --ids-file` — reconciling exactly the matched items. (A single-id re-stages that one item with `get-ids-es --single-id` — no `--maintain` flag; a collection uses `get-ids-es --collection … --maintain`.) Use these for targeted drift repair of one item or collection.
 
 ### Lite route
 

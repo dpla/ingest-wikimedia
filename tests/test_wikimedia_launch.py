@@ -560,9 +560,11 @@ def test_maintain_hash_pipeline_category_anchored_with_download_pass():
 
 def test_maintain_hash_single_id_and_collection_keep_id_list_anchored():
     """A single-DPLA-id or collection-scoped hash target has no whole category
-    to walk, so it keeps the id-list-anchored route: get-ids --maintain (media
-    filter ON — no --skip-media-filter), download, uploader --no-create, and
-    sdc-sync --partner --ids-file."""
+    to walk, so it keeps the id-list-anchored route — download, uploader
+    --no-create, sdc-sync --partner --ids-file — with the media filter on (no
+    --skip-media-filter). Note the get-ids asymmetry: single-id re-stages the
+    one item with --single-id (no --maintain); a collection uses --collection
+    --maintain."""
     import scripts.wikimedia_launch as launch_mod
 
     single = launch_mod._build_maintain_hash_pipeline_steps(
@@ -597,3 +599,22 @@ def test_maintain_hash_single_id_and_collection_keep_id_list_anchored():
     assert coll[1] == "get-ids-es georgia --collection Maps --maintain > out.csv"
     assert not any("--cat" in s for s in coll)
     assert coll[-1].startswith("sdc-sync --partner georgia --ids-file out.csv")
+
+
+def test_maintain_stage_cmd_routes_bare_nara_to_get_ids_nara():
+    """Bare-hub NARA stages via its bespoke catalog walk, mirroring
+    _build_get_ids_command — not `get-ids-es nara`, which can't do NARA's
+    catalog enumeration. A NARA *institution* target still uses get-ids-es."""
+    import scripts.wikimedia_launch as launch_mod
+
+    assert (
+        launch_mod._maintain_stage_cmd("nara", (), "out.csv")
+        == "get-ids-nara > out.csv"
+    )
+    # An institution-scoped NARA target keeps the broad get-ids-es staging.
+    assert launch_mod._maintain_stage_cmd(
+        "nara", ("National Archives at College Park",), "out.csv"
+    ) == (
+        "get-ids-es nara --institution 'National Archives at College Park'"
+        " --maintain --skip-media-filter > out.csv"
+    )

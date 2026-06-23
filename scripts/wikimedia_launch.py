@@ -182,6 +182,13 @@ def _maintain_stage_cmd(
     ``--cat`` sync falls back to a live ``api.dp.la`` read per file. Shared by
     the lite and hash maintain routes.
     """
+    # Bare-hub NARA stages via its bespoke catalog walk, not get-ids-es —
+    # mirror the routing in _build_get_ids_command so a hub-level NARA maintain
+    # target stages sidecars the same way the normal pipeline does. (Collection
+    # / single-id NARA targets never reach here — they take the id-list-anchored
+    # path in the hash builder.)
+    if canonical == "nara" and not institutions:
+        return f"get-ids-nara > {csv_file}"
     cmd = f"get-ids-es {canonical}"
     for inst in institutions:
         cmd += f" --institution {shlex.quote(inst)}"
@@ -308,9 +315,11 @@ def _build_maintain_hash_pipeline_steps(
     A single-DPLA-id or collection-scoped target has no whole category to walk,
     so it keeps the id-list-anchored route (``sdc-sync --partner --ids-file``):
     download + ``uploader --no-create`` + SDC over exactly the matched items,
-    for targeted drift repair of one item or collection. Those targets keep the
-    media/rights filter (``get-ids-es --maintain`` without ``--skip-media-
-    filter``) since there's no category to reconcile beyond what's fetched.
+    for targeted drift repair of one item or collection. These go through
+    :func:`_build_get_ids_command` — a single-id re-stages that one item with
+    ``--single-id`` (no ``--maintain``); a collection uses ``--collection …
+    --maintain`` — keeping the media/rights filter (no ``--skip-media-filter``),
+    since there's no category to reconcile beyond what's fetched.
     """
     dl_age_opt = f"--max-age-days {max_age_days} " if max_age_days is not None else ""
     if dpla_id is not None or collection is not None:
