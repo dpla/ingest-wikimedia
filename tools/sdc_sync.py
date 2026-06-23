@@ -5633,6 +5633,13 @@ def main() -> None:
     # run reports through the identical status surface as a partner-mode run.
     if args.maintain:
         setup_logging(_s3_partner or "maintain", "sdc", logging.INFO)
+        # Announce the SDC phase (as _run_partner_mode does) so a launched
+        # maintain run surfaces in Slack instead of going silent until the
+        # final summary. The lite --cat/--file path is the only one that
+        # reached SDC work without this. Count-only is a read-only sizing
+        # pre-flight, so it stays quiet.
+        if not args.count_only:
+            notify_phase_start(_s3_partner or "maintain", "sdc-sync")
 
     count = 0
     start_time = time.time()
