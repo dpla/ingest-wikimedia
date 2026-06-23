@@ -5615,12 +5615,26 @@ def test_emit_maintain_summary_calls_notify_with_maintain_flag():
     ):
         sdc_sync._emit_maintain_summary("digitalnc", 12.5)
     # Mirrors _run_partner_mode's terminal block: posts the SDC completion
-    # notice flagged as maintain (so rename counters surface) at workers=1.
+    # notice flagged as maintain (so rename counters surface). Serial callers
+    # default to workers=1.
     mock_notify.assert_called_once()
     kwargs = mock_notify.call_args.kwargs
     assert kwargs["maintain"] is True
     assert kwargs["workers"] == 1
     assert kwargs["partner_label"] == "digitalnc"
+
+
+def test_emit_maintain_summary_threads_real_worker_count():
+    from tools import sdc_sync
+
+    with (
+        patch.object(sdc_sync, "tracker", MagicMock()),
+        patch.object(sdc_sync, "notify_sdc_complete") as mock_notify,
+    ):
+        sdc_sync._emit_maintain_summary("digitalnc", 12.5, workers=6)
+    # Parallel path passes the real count so SLOT WAIT (avg/wkr) divides the
+    # aggregate worker-seconds by N, not 1.
+    assert mock_notify.call_args.kwargs["workers"] == 6
 
 
 def test_maintain_process_file_logs_dpla_id_progress_marker(caplog):
@@ -5697,3 +5711,120 @@ def test_maintain_rename_transient_error_not_counted_as_blocked():
     assert Result.MAINTAIN_RENAME_BLOCKED not in [
         c.args[0] for c in fake_tracker.increment.call_args_list
     ]
+
+
+def test_enumerate_maintain_groups_buckets_by_embedded_id():
+    from tools import sdc_sync
+
+    def _page(title, pageid):
+        p = MagicMock()
+        p.title.return_value = title
+        p.pageid = pageid
+        return p
+
+    # Two pages of item A (same id, different ordinals), one of item B.
+    pages = [
+        _page("A (page 1) - DPLA - id_a.jpg", 1),
+        _page("B - DPLA - id_b.jpg", 2),
+        _page("A (page 2) - DPLA - id_a.jpg", 3),
+    ]
+    with (
+        patch.object(sdc_sync, "dpla_api", None, create=True),
+        patch.object(
+            sdc_sync,
+            "_resolve_dpla_id",
+            side_effect=lambda title, api: "id_a" if title.startswith("A") else "id_b",
+        ),
+    ):
+        groups = sdc_sync._enumerate_maintain_groups(iter(pages), limit=0)
+    # One group per embedded id; item A's two pages stay together (so one worker
+    # serializes their renames — the whole point of grouping).
+    by_id = {g[0][2]: g for g in groups}
+    assert sorted(by_id) == ["id_a", "id_b"]
+    assert {t[1] for t in by_id["id_a"]} == {1, 3}
+    assert len(by_id["id_b"]) == 1
+
+
+def test_enumerate_maintain_groups_respects_limit():
+    from tools import sdc_sync
+
+    pages = []
+    for i in range(5):
+        p = MagicMock()
+        p.title.return_value = f"X{i} - DPLA - id{i}.jpg"
+        p.pageid = i
+        pages.append(p)
+    with (
+        patch.object(sdc_sync, "dpla_api", None, create=True),
+        patch.object(sdc_sync, "_resolve_dpla_id", side_effect=lambda t, a: t),
+    ):
+        groups = sdc_sync._enumerate_maintain_groups(iter(pages), limit=3)
+    assert sum(len(g) for g in groups) == 3
+
+
+def test_worker_maintain_group_task_processes_each_file_and_returns_delta():
+    from tools import sdc_sync
+
+    fake_tracker = MagicMock()
+    fake_tracker.diff.return_value = {"sentinel": 1}
+
+    class _NoopSlot:
+        total_wait_seconds = 0
+
+        def acquire(self):
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+    group = [
+        ("A (page 1) - DPLA - id_a.jpg", 1, "id_a"),
+        ("A (page 2) - DPLA - id_a.jpg", 3, "id_a"),
+    ]
+    with (
+        patch.object(sdc_sync, "tracker", fake_tracker),
+        patch.object(sdc_sync, "_worker_slot_budget", _NoopSlot()),
+        patch.object(sdc_sync, "site", MagicMock(), create=True),
+        patch.object(sdc_sync.pywikibot, "FilePage", return_value=MagicMock()),
+        patch.object(sdc_sync, "_maintain_process_file") as mock_proc,
+    ):
+        delta = sdc_sync._worker_maintain_group_task(group)
+    # Both files of the group processed in this one worker; mediaid derived
+    # from pageid; embedded_id carried through.
+    assert mock_proc.call_count == 2
+    assert mock_proc.call_args_list[0].args[0] == "M1"
+    assert mock_proc.call_args_list[1].args[0] == "M3"
+    assert delta == {"sentinel": 1}
+
+
+def test_run_maintain_parallel_delegates_to_run_pool():
+    from tools import sdc_sync
+
+    groups = [[("t", 1, "id")]]
+    with (
+        patch.object(sdc_sync, "_run_pool") as mock_pool,
+        patch.object(sdc_sync, "hubs", {"h": 1}, create=True),
+        patch.object(sdc_sync, "_s3_partner", "georgia"),
+    ):
+        sdc_sync._run_maintain_parallel(groups, 4)
+    mock_pool.assert_called_once()
+    kwargs = mock_pool.call_args.kwargs
+    assert kwargs["workers"] == 4
+    assert kwargs["initializer"] is sdc_sync._init_maintain_worker
+    assert kwargs["task_fn"] is sdc_sync._worker_maintain_group_task
+    # _s3_partner is threaded so workers read the right sidecar prefix.
+    assert "georgia" in kwargs["initargs"]
+
+
+def test_maintain_parallel_enabled_requires_from_s3_and_workers():
+    from tools import sdc_sync
+
+    f = sdc_sync._maintain_parallel_enabled
+    # Happy path: maintain + workers>1 + write + staged sidecars.
+    assert f(maintain=True, workers=6, count_only=False, from_s3_partner="georgia")
+    # No --from-s3 → must NOT fan out (live fallback would NameError in workers
+    # / hammer api.dp.la); caller drops to serial.
+    assert not f(maintain=True, workers=6, count_only=False, from_s3_partner=None)
+    # count-only sizing is serial; single worker is serial; non-maintain n/a.
+    assert not f(maintain=True, workers=6, count_only=True, from_s3_partner="georgia")
+    assert not f(maintain=True, workers=1, count_only=False, from_s3_partner="georgia")
+    assert not f(maintain=False, workers=6, count_only=False, from_s3_partner="georgia")
