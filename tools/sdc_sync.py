@@ -5472,6 +5472,15 @@ def main() -> None:
     """
     _initialize()
 
+    # Maintain runs through the legacy --cat/--file dispatch, which (unlike
+    # _run_partner_mode) never set up file logging — so a launched maintain
+    # session wrote no `-sdc.log`, leaving the status poller
+    # (wikimedia_upload_status.py) and the terminal COUNTS:/DPLA ID: markers
+    # with nothing to read. Set up the same "sdc"-phase log here so a maintain
+    # run reports through the identical status surface as a partner-mode run.
+    if args.maintain:
+        setup_logging(_s3_partner or "maintain", "sdc", logging.INFO)
+
     count = 0
     start_time = time.time()
 
