@@ -300,21 +300,23 @@ Targets use the normal `hub` / `hub|institution` formats. Because the default ro
 
 ### Default route (hash)
 
-`maintain <target>` runs the **full pipeline with the institution gate relaxed and the uploader fenced**:
+`maintain <target>` reconciles **SDC + legacy templates across every file in the live Commons category** (the primary goal) and additionally repairs **content drift** for the media-bearing subset. For a `hub` / `hub|institution` target it runs:
 
 ```text
-get-ids-es … --maintain  →  downloader  →  uploader --no-create  →  sdc-sync --partner
+get-ids-es … --maintain --skip-media-filter  →  downloader  →  uploader --no-create  →  sdc-sync --cat … --maintain --from-s3
 ```
 
-- `get-ids-es --maintain` enumerates the institution's current items (QID-only gate; the per-item rights + media-URL filters **still apply**, because we download).
-- The downloader pulls each current master into S3 (keyed by the item's *current* DPLA id, with its SHA1).
+- `get-ids-es --maintain --skip-media-filter` stages each item's `sdc.json` + `dpla-map.json` for the **whole** QID-bearing scope (QID-only gate, *and* the per-item rights/media-URL filters dropped) — the same broad scan as the lite route, so sidecars exist for the entire category.
+- The downloader pulls each fetchable current master into S3 (keyed by the item's *current* DPLA id, with its SHA1); items with no fetchable master are simply skipped.
 - `uploader --no-create` reuses the existing hash-drift machinery against that fresh S3 set:
   - **Re-link by content (exact SHA1):** an orphaned Commons file whose embedded id is dead but whose bytes match a current item is **moved** to that item's canonical title.
   - **Overwrite on content drift:** a Commons file whose bytes differ from the current master is re-uploaded as a new version at the canonical title.
   - **No-create fence:** an item not already on Commons is skipped (`UPLOAD_SKIPPED_WOULD_CREATE`) — never uploaded fresh.
-- `sdc-sync` then reconciles SDC as in a normal run.
+- `sdc-sync --cat … --maintain` then walks the **live Commons category** and reconciles SDC + legacy templates for *every* file there — not just the items get-ids matched — reading each (re-linked) file's claims from its staged `sdc.json` (`--from-s3`).
 
-Matching is **exact SHA1 only** — no fuzzy/perceptual matching. An item whose master was re-encoded upstream (new bytes) or that has no fetchable media URL is simply not matched, and its orphaned Commons file is left untouched (correctly — see "sidecar skipped" below).
+Anchoring SDC on the category (not the get-ids id list) is deliberate: an institution whose current index docs no longer pass the rights/media filter still has files on Commons, and those must be reconciled. The content-drift repair is the lesser, best-effort benefit layered on top — matching is **exact SHA1 only** (no fuzzy/perceptual matching), so an item whose master was re-encoded upstream or has no fetchable media is simply not re-linked; the SDC `--cat` pass still reconciles its file in place.
+
+> **Single-DPLA-id / collection targets** have no whole category to walk, so they keep the **id-list-anchored** route — `get-ids-es --maintain` (media filter on) → downloader → `uploader --no-create` → `sdc-sync --partner --ids-file` — reconciling exactly the matched items. Use these for targeted drift repair of one item or collection.
 
 ### Lite route
 

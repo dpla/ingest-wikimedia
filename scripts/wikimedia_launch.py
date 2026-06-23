@@ -148,10 +148,12 @@ def _build_get_ids_command(
       collection across every upload-eligible institution in the hub.
 
     ``maintain`` adds ``--maintain`` to the get-ids-es scan (relax the
-    institution upload gate to QID-only) — used by the default hash-maintain
-    pipeline so already-uploaded items of no-longer-opted-in institutions are
-    still enumerated. The per-item media/rights filters still apply (we
-    download), so it is NOT combined with ``--skip-media-filter`` here.
+    institution upload gate to QID-only) so already-uploaded items of
+    no-longer-opted-in institutions are still enumerated. The per-item
+    media/rights filters still apply (we download), so it is NOT combined with
+    ``--skip-media-filter`` here — this builds the id list for the *id-list-
+    anchored* maintain sub-path (single-DPLA-id / collection targets). The
+    category-anchored path stages via :func:`_maintain_stage_cmd` instead.
     """
     if dpla_id is not None:
         return f"get-ids-es {canonical} --single-id {shlex.quote(dpla_id)} > {csv_file}"
@@ -165,6 +167,58 @@ def _build_get_ids_command(
     if maintain:
         cmd += " --maintain"
     return cmd + f" > {csv_file}"
+
+
+def _maintain_stage_cmd(
+    canonical: str, institutions: tuple[str, ...], csv_file: str
+) -> str:
+    """``get-ids-es`` scan that stages each item's ``dpla-map.json`` +
+    ``sdc.json`` for the whole QID-bearing institution scope, with the
+    media/rights item filters dropped (``--skip-media-filter``).
+
+    Maintain reconciles whatever is already on Commons, so staging must not
+    exclude items whose current index doc has lost a fetchable media URL or
+    free-rights category — otherwise their sidecars are absent and the
+    ``--cat`` sync falls back to a live ``api.dp.la`` read per file. Shared by
+    the lite and hash maintain routes.
+    """
+    cmd = f"get-ids-es {canonical}"
+    for inst in institutions:
+        cmd += f" --institution {shlex.quote(inst)}"
+    return cmd + f" --maintain --skip-media-filter > {csv_file}"
+
+
+def _maintain_sdc_cat_steps(
+    canonical: str, institutions: tuple[str, ...], sync_tail: str
+) -> list[str]:
+    """One ``sdc-sync --cat <category> --maintain <sync_tail>`` per institution,
+    resolving each to its exact Commons category via Wikidata (P8464 →
+    commonswiki sitelink — never derived from the display name).
+
+    An institution whose category can't be resolved emits a failing
+    ``echo … >&2; exit 1`` rather than silently widening the write scope.
+    Shared by the lite and hash maintain routes — both anchor the SDC phase on
+    the *live category*, so reconciliation covers every file already on
+    Commons, not just a get-ids id list.
+    """
+    steps: list[str] = []
+    # A bare-hub target (no institutions) is one category-resolution pass with
+    # inst=None; wikidata_qid_for_target and the `who` fallback both accept it.
+    for inst in institutions or (None,):
+        qid = wikidata_qid_for_target(canonical, inst)
+        category = resolve_commons_category(qid) if qid else None
+        if category:
+            steps.append(
+                f"sdc-sync --cat {shlex.quote(category)} --maintain{sync_tail}"
+            )
+        else:
+            who = inst or canonical
+            msg = (
+                f"maintain: could not resolve a Commons category for {who}"
+                " (missing Wikidata QID or P8464 Commons-category link); skipping."
+            )
+            steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
+    return steps
 
 
 def _build_maintain_lite_pipeline_steps(
@@ -218,28 +272,8 @@ def _build_maintain_lite_pipeline_steps(
     )
     steps = []
     if not count_only:
-        stage_cmd = f"get-ids-es {canonical}"
-        for inst in institutions:
-            stage_cmd += f" --institution {shlex.quote(inst)}"
-        # Lite stages sidecars for the whole QID-bearing institution scope with
-        # the media/rights item filters dropped (--skip-media-filter): it syncs
-        # whatever is already on Commons, so it must not exclude items whose
-        # current index doc lost a fetchable media URL or free-rights category.
-        steps.append(stage_cmd + f" --maintain --skip-media-filter > {csv_file}")
-    for inst in institutions or (None,):
-        qid = wikidata_qid_for_target(canonical, inst)
-        category = resolve_commons_category(qid) if qid else None
-        if category:
-            steps.append(
-                f"sdc-sync --cat {shlex.quote(category)} --maintain{sync_tail}"
-            )
-        else:
-            who = inst or canonical
-            msg = (
-                f"maintain: could not resolve a Commons category for {who}"
-                " (missing Wikidata QID or P8464 Commons-category link); skipping."
-            )
-            steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
+        steps.append(_maintain_stage_cmd(canonical, institutions, csv_file))
+    steps += _maintain_sdc_cat_steps(canonical, institutions, sync_tail)
     return [f"cd {base}", *steps]
 
 
@@ -256,25 +290,48 @@ def _build_maintain_hash_pipeline_steps(
 ) -> list[str]:
     """Pipeline steps for one DEFAULT (hash) maintain target.
 
-    This is the full upload pipeline with two deltas: the institution upload
-    gate is relaxed (``get-ids-es --maintain`` → QID-only) and the uploader is
-    fenced (``--no-create``). The uploader's existing hash-drift machinery then
-    re-links orphaned files by content (move to the current canonical title)
-    and overwrites byte-drifted files, while the fence guarantees no NEW Commons
-    files are created for these (possibly no-longer-opted-in) institutions. SDC
-    syncs as usual. Item media/rights filters still apply (we download), so
-    items with no fetchable master are simply never pulled and stay untouched.
+    The SDC phase is anchored on the **live Commons category** (``sdc-sync
+    --cat … --maintain``, identical to the lite route), so it reconciles SDC +
+    legacy templates for *every* file already on Commons — the primary maintain
+    goal. Inserted before it, a ``downloader`` + ``uploader --no-create`` pass
+    repairs *content drift* for the media-bearing subset: the uploader's
+    hash-drift machinery re-links orphaned files by content and overwrites
+    byte-drifted ones, fenced (``--no-create``) so no NEW Commons file is ever
+    created for these (possibly no-longer-opted-in) institutions.
+
+    Staging uses the broad ``--skip-media-filter`` scan (same as lite) so the
+    ``--cat`` sync sees the whole category, not just currently-fetchable items;
+    the downloader simply skips items with no fetchable master. This is the
+    delta from lite: lite is stage + ``--cat`` sync only; hash inserts the
+    download + ``--no-create`` upload pass between them.
+
+    A single-DPLA-id or collection-scoped target has no whole category to walk,
+    so it keeps the id-list-anchored route (``sdc-sync --partner --ids-file``):
+    download + ``uploader --no-create`` + SDC over exactly the matched items,
+    for targeted drift repair of one item or collection. Those targets keep the
+    media/rights filter (``get-ids-es --maintain`` without ``--skip-media-
+    filter``) since there's no category to reconcile beyond what's fetched.
     """
-    maintain_get_ids = _build_get_ids_command(
-        canonical, institutions, collection, dpla_id, csv_file, maintain=True
-    )
     dl_age_opt = f"--max-age-days {max_age_days} " if max_age_days is not None else ""
+    if dpla_id is not None or collection is not None:
+        maintain_get_ids = _build_get_ids_command(
+            canonical, institutions, collection, dpla_id, csv_file, maintain=True
+        )
+        return [
+            f"cd {base}",
+            maintain_get_ids,
+            f"downloader {dl_age_opt}{csv_file} {canonical}",
+            f"uploader {csv_file} {canonical} --no-create{upload_opts}",
+            f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}",
+        ]
     return [
         f"cd {base}",
-        maintain_get_ids,
+        _maintain_stage_cmd(canonical, institutions, csv_file),
         f"downloader {dl_age_opt}{csv_file} {canonical}",
         f"uploader {csv_file} {canonical} --no-create{upload_opts}",
-        f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}",
+        *_maintain_sdc_cat_steps(
+            canonical, institutions, f" --from-s3 {canonical}{sdc_opts}"
+        ),
     ]
 
 

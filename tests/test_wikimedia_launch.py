@@ -514,16 +514,79 @@ def test_maintain_bypasses_upload_eligibility_gate(monkeypatch, capsys):
     assert "not upload-eligible" not in captured.err
 
 
-def test_maintain_hash_pipeline_is_full_download_fenced_no_create():
-    """Default (hash) maintain = full pipeline + relaxed institution gate
-    (get-ids-es --maintain) + uploader --no-create. No --skip-media-filter
-    (it downloads, so media/rights filters apply)."""
+def test_maintain_hash_pipeline_category_anchored_with_download_pass():
+    """Default (hash) maintain for a hub|institution target: broad staging
+    (--skip-media-filter, like lite) so the SDC pass covers the whole live
+    category, plus a download + ``uploader --no-create`` content-drift pass,
+    then ``sdc-sync --cat`` — NOT ``--partner --ids-file``. This is the fix for
+    the regression where an empty get-ids set left the category untouched."""
     import scripts.wikimedia_launch as launch_mod
 
-    steps = launch_mod._build_maintain_hash_pipeline_steps(
+    with (
+        patch.object(launch_mod, "wikidata_qid_for_target", return_value="Q123"),
+        patch.object(
+            launch_mod,
+            "resolve_commons_category",
+            return_value="Category:Media contributed by X",
+        ),
+    ):
+        steps = launch_mod._build_maintain_hash_pipeline_steps(
+            "georgia",
+            ("Southwest Georgia Regional Library",),
+            None,
+            None,
+            "/srv/base",
+            "out.csv",
+            None,
+            " --workers-budget 24",
+            " --workers 6 --workers-budget 24",
+        )
+    assert steps[0] == "cd /srv/base"
+    # Broad staging — same scan as lite, so sidecars exist for the whole category.
+    assert steps[1] == (
+        "get-ids-es georgia --institution 'Southwest Georgia Regional Library'"
+        " --maintain --skip-media-filter > out.csv"
+    )
+    # Content-drift pass: download (skips no-media items) + fenced overwrite.
+    assert any(s.startswith("downloader ") and "out.csv georgia" in s for s in steps)
+    assert "uploader out.csv georgia --no-create --workers-budget 24" in steps
+    # SDC anchored on the live category, NOT the get-ids id list.
+    assert steps[-1] == (
+        "sdc-sync --cat 'Category:Media contributed by X' --maintain"
+        " --from-s3 georgia --workers 6 --workers-budget 24"
+    )
+    assert not any("--partner" in s for s in steps)
+
+
+def test_maintain_hash_single_id_and_collection_keep_id_list_anchored():
+    """A single-DPLA-id or collection-scoped hash target has no whole category
+    to walk, so it keeps the id-list-anchored route: get-ids --maintain (media
+    filter ON — no --skip-media-filter), download, uploader --no-create, and
+    sdc-sync --partner --ids-file."""
+    import scripts.wikimedia_launch as launch_mod
+
+    single = launch_mod._build_maintain_hash_pipeline_steps(
         "georgia",
-        ("Southwest Georgia Regional Library",),
+        (),
         None,
+        "abc123def456",
+        "/srv/base",
+        "out.csv",
+        None,
+        " --workers-budget 24",
+        " --workers 6 --workers-budget 24",
+    )
+    assert single[1] == "get-ids-es georgia --single-id abc123def456 > out.csv"
+    assert not any("--skip-media-filter" in s for s in single)
+    assert not any("--cat" in s for s in single)
+    assert single[-1] == (
+        "sdc-sync --partner georgia --ids-file out.csv --workers 6 --workers-budget 24"
+    )
+
+    coll = launch_mod._build_maintain_hash_pipeline_steps(
+        "georgia",
+        (),
+        "Maps",
         None,
         "/srv/base",
         "out.csv",
@@ -531,14 +594,6 @@ def test_maintain_hash_pipeline_is_full_download_fenced_no_create():
         " --workers-budget 24",
         " --workers 6 --workers-budget 24",
     )
-    assert steps[0] == "cd /srv/base"
-    assert steps[1] == (
-        "get-ids-es georgia --institution 'Southwest Georgia Regional Library'"
-        " --maintain > out.csv"
-    )
-    assert "--skip-media-filter" not in steps[1]
-    assert any(s.startswith("downloader ") and "out.csv georgia" in s for s in steps)
-    assert "uploader out.csv georgia --no-create --workers-budget 24" in steps
-    assert steps[-1] == (
-        "sdc-sync --partner georgia --ids-file out.csv --workers 6 --workers-budget 24"
-    )
+    assert coll[1] == "get-ids-es georgia --collection Maps --maintain > out.csv"
+    assert not any("--cat" in s for s in coll)
+    assert coll[-1].startswith("sdc-sync --partner georgia --ids-file out.csv")
