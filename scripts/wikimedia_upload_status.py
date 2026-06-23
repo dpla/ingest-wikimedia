@@ -221,17 +221,24 @@ def get_phase_and_progress(
     # shlex.quote) — single-quoting would disable shell glob expansion
     # so the ``*`` would no longer expand. The slug-shape guard at the
     # top of this function makes the unquoted interpolation safe.
-    # POSIX-awk ordinal summer: every `Item <id>: <N> ordinals (...)` line
-    # the downloader emits per-item gets its N picked out by walking fields
-    # until the "ordinals" token, then summing the preceding field. The
-    # gawk-only `match(..., array)` extraction would be cleaner but
-    # production awk on this host might be mawk/busybox; field walk works
-    # everywhere.
+    # Total-ordinals denominator from the download log. Count the
+    # per-ordinal ``Downloading <partner> <id> <ordinal> from <url>`` line
+    # at `downloader.py:532` — emitted unconditionally for every ordinal
+    # attempted, regardless of whether the bytes ended up downloaded or
+    # skipped (key already in S3) — rather than the per-item summary
+    # ``Item <id>: N ordinals`` line, which PR #272 added but didn't
+    # backfill into older logs.
+    #
+    # This matters because for large multi-day hubs (NARA in particular)
+    # the download phase runs once and stays in its original form
+    # forever — the bot then iterates upload + SDC many times against the
+    # already-staged data without re-downloading. A status report run
+    # today against an SDC-only relaunch sees a fresh SDC log but an
+    # old download log whose Item-summary lines never existed; counting
+    # ``Downloading`` works on logs from every version of the downloader.
     ordinals_awk = (
-        "BEGIN{s=0} "
-        "/Item [a-f0-9]+: [0-9]+ ordinals/ "
-        '{for(i=1;i<=NF;i++) if($i=="ordinals"){s+=$(i-1); break}} '
-        "END {print s+0}"
+        "BEGIN{n=0} /Downloading [a-z0-9-]+ [a-f0-9]+ [0-9]+ from / {n++} "
+        "END {print n+0}"
     )
     # One awk pass counts all four marker lines in a single sequential read
     # of the upload log; the previous code ran four separate `grep -c`
