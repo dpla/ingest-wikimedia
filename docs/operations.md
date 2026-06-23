@@ -300,7 +300,7 @@ Targets use the normal `hub` / `hub|institution` formats. Because the default ro
 
 ### Default route (hash)
 
-`maintain <target>` reconciles **SDC + legacy templates across every file in the live Commons category** (the primary goal) and additionally repairs **content drift** for the media-bearing subset. For a `hub` / `hub|institution` target it runs:
+`maintain <target>` reconciles **SDC + legacy templates across every file in the live Commons category** (the primary goal) and additionally repairs **content drift** for the media-bearing subset. For a `hub` / `hub|institution` target it runs (bare-hub `nara` stages via `get-ids-nara` instead of `get-ids-es`, matching the normal pipeline):
 
 ```text
 get-ids-es … --maintain --skip-media-filter  →  downloader  →  uploader --no-create  →  sdc-sync --cat … --maintain --from-s3
