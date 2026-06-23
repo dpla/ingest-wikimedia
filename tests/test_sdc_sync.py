@@ -5615,12 +5615,26 @@ def test_emit_maintain_summary_calls_notify_with_maintain_flag():
     ):
         sdc_sync._emit_maintain_summary("digitalnc", 12.5)
     # Mirrors _run_partner_mode's terminal block: posts the SDC completion
-    # notice flagged as maintain (so rename counters surface) at workers=1.
+    # notice flagged as maintain (so rename counters surface). Serial callers
+    # default to workers=1.
     mock_notify.assert_called_once()
     kwargs = mock_notify.call_args.kwargs
     assert kwargs["maintain"] is True
     assert kwargs["workers"] == 1
     assert kwargs["partner_label"] == "digitalnc"
+
+
+def test_emit_maintain_summary_threads_real_worker_count():
+    from tools import sdc_sync
+
+    with (
+        patch.object(sdc_sync, "tracker", MagicMock()),
+        patch.object(sdc_sync, "notify_sdc_complete") as mock_notify,
+    ):
+        sdc_sync._emit_maintain_summary("digitalnc", 12.5, workers=6)
+    # Parallel path passes the real count so SLOT WAIT (avg/wkr) divides the
+    # aggregate worker-seconds by N, not 1.
+    assert mock_notify.call_args.kwargs["workers"] == 6
 
 
 def test_maintain_process_file_logs_dpla_id_progress_marker(caplog):

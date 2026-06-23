@@ -3951,7 +3951,7 @@ def _report_maintain_tally(tally, total):
     print(f"  {'-> resolved':>12}: {resolved}/{total}")
 
 
-def _emit_maintain_summary(label, elapsed_seconds):
+def _emit_maintain_summary(label, elapsed_seconds, workers=1):
     """Maintain mode's terminal summary, mirroring _run_partner_mode's: log the
     ``COUNTS:`` marker (which the status poller reads as the SDC-phase
     completion signal) and post the Slack completion notice with the maintain
@@ -3959,6 +3959,9 @@ def _emit_maintain_summary(label, elapsed_seconds):
     aborted run propagates the exception past this point, so (as in partner
     mode) the shell-level ``notify_pipeline_fail`` handles the failure instead
     and no spurious ``COUNTS:`` is written.
+
+    ``workers`` is the real worker count so the SLOT WAIT (avg/wkr) line divides
+    the aggregate worker-seconds correctly; the serial paths keep the default 1.
     """
     logging.info("\n" + str(tracker))
     logging.info(f"{elapsed_seconds} seconds.")
@@ -3966,7 +3969,7 @@ def _emit_maintain_summary(label, elapsed_seconds):
         tracker=tracker,
         partner_label=label,
         elapsed_seconds=elapsed_seconds,
-        workers=1,
+        workers=workers,
         maintain=True,
     )
 
@@ -5720,7 +5723,9 @@ def main() -> None:
                 f"{_workers} workers."
             )
             _run_maintain_parallel(groups, _workers)
-            _emit_maintain_summary(_s3_partner or args.cat, time.time() - start_time)
+            _emit_maintain_summary(
+                _s3_partner or args.cat, time.time() - start_time, workers=_workers
+            )
             return
 
         tally = _new_maintain_tally(args.maintain and args.count_only)
