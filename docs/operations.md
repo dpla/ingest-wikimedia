@@ -13,12 +13,13 @@ This guide covers running, monitoring, and troubleshooting the DPLA Wikimedia up
 4. [Partner hub registry](#partner-hub-registry)
 5. [Upload eligibility](#upload-eligibility)
 6. [Pipeline phases](#pipeline-phases)
-7. [Session naming and chaining](#session-naming-and-chaining)
-8. [GitHub Actions workflows](#github-actions-workflows)
-9. [Lambda dispatch mechanism](#lambda-dispatch-mechanism)
-10. [EC2 infrastructure](#ec2-infrastructure)
-11. [Monitoring](#monitoring)
-12. [Troubleshooting](#troubleshooting)
+7. [Maintain mode](#maintain-mode)
+8. [Session naming and chaining](#session-naming-and-chaining)
+9. [GitHub Actions workflows](#github-actions-workflows)
+10. [Lambda dispatch mechanism](#lambda-dispatch-mechanism)
+11. [EC2 infrastructure](#ec2-infrastructure)
+12. [Monitoring](#monitoring)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -85,6 +86,10 @@ Stops one or more running pipeline sessions. Use any `+`-delimited component of 
 ```
 
 Result posts to **#tech-alerts**.
+
+### `/wikimedia-upload maintain [lite|count] <target> [<target> ...]`
+
+Reconciles files already on Commons for a hub/institution (incl. no-longer-opted-in institutions); never creates new files. Default downloads + content-reconciles (re-link by hash + overwrite changed bytes + SDC); `lite` is the quick no-download SDC-in-place + rename route; `count` is a read-only pre-flight sizing pass. See [Maintain mode](#maintain-mode) for the full behavior.
 
 ### `/wikimedia-status`
 
@@ -276,6 +281,62 @@ The `wikimedia-launch.yml` workflow accepts two boolean inputs that swap the def
 - **`sdc_only=true`** — runs `get-ids-es → sdc-sync` only (no downloader, no uploader). For backfilling or refreshing SDC on items that were uploaded in a prior session, including picking up changes to ingestion3's `institutions_v2.json` / `subjects.json` mappings. The `get-ids-es` step re-stages each item's `sdc.json` from current ingestion3 data; `sdc-sync` then reconciles Commons against that.
   - **Targets without sdc.json re-staging**: single-item DPLA IDs (which use `resolve-dpla-ids` + `printf`) and NARA hub-level targets (which use `get-ids-nara`) do **not** re-stage `sdc.json`. For these, `sdc-sync` replays whatever sidecar the original upload run wrote. The launcher prints a stderr warning when this combination is detected. Useful for re-running fixed sdc-sync logic against a specific item; not useful for picking up upstream mapping changes.
   - `max_age_days` is ignored in `sdc_only` mode (no download phase runs).
+
+---
+
+## Maintain mode
+
+Maintain mode **reconciles files that are already on Commons** for a hub or institution — including institutions that are no longer authorized for *new* uploads (`upload=false` in `institutions_v2.json`). The only institution gate is a **Wikidata QID** (needed for the P195 institution claim and the Commons category); the `upload` flag is ignored. The safety guarantee is the uploader/sync **no-create fence**: maintain never creates a new Commons File page — it only edits, moves, or overwrites files that already exist.
+
+Trigger from Slack:
+
+```text
+/wikimedia-upload maintain <target> [<target> ...]          # default: hash route
+/wikimedia-upload maintain lite <target> [<target> ...]     # quick no-download route
+/wikimedia-upload maintain count <target> [<target> ...]    # pre-flight sizing, writes nothing
+```
+
+Targets use the normal `hub` / `hub|institution` formats. Because the default route downloads media, in practice you'll usually run at **`hub|institution`** granularity to bound how much is fetched (a whole service hub can be enormous).
+
+### Default route (hash)
+
+`maintain <target>` runs the **full pipeline with the institution gate relaxed and the uploader fenced**:
+
+```text
+get-ids-es … --maintain  →  downloader  →  uploader --no-create  →  sdc-sync --partner
+```
+
+- `get-ids-es --maintain` enumerates the institution's current items (QID-only gate; the per-item rights + media-URL filters **still apply**, because we download).
+- The downloader pulls each current master into S3 (keyed by the item's *current* DPLA id, with its SHA1).
+- `uploader --no-create` reuses the existing hash-drift machinery against that fresh S3 set:
+  - **Re-link by content (exact SHA1):** an orphaned Commons file whose embedded id is dead but whose bytes match a current item is **moved** to that item's canonical title.
+  - **Overwrite on content drift:** a Commons file whose bytes differ from the current master is re-uploaded as a new version at the canonical title.
+  - **No-create fence:** an item not already on Commons is skipped (`UPLOAD_SKIPPED_WOULD_CREATE`) — never uploaded fresh.
+- `sdc-sync` then reconciles SDC as in a normal run.
+
+Matching is **exact SHA1 only** — no fuzzy/perceptual matching. An item whose master was re-encoded upstream (new bytes) or that has no fetchable media URL is simply not matched, and its orphaned Commons file is left untouched (correctly — see "sidecar skipped" below).
+
+### Lite route
+
+`maintain lite <target>` is the quick, **no-download** sidecar route. It walks the institution's Commons category and, per file:
+
+- re-links the DPLA id via the URL ladder (embedded id still live → exact `isShownAt` → institution-scoped wildcard);
+- **renames** a title-drifted file to its canonical title when that title is free or a redirect back to the file (else logs `MAINTAIN_RENAME_BLOCKED`);
+- syncs SDC in place from the precomputed `sdc.json` sidecar (`--from-s3`).
+
+`get-ids-es` here adds `--skip-media-filter` (drops the rights + media-URL item filters): lite touches whatever is already on Commons, so it must not exclude items whose current index doc lost a media URL or free-rights category. Lite runs under the same `--workers` / `--workers-budget` pool as a partner-mode SDC sync (files are grouped by DPLA id so an item's pages stay on one worker). It cannot re-link or overwrite by content (no download) — use it for routine SDC refresh + cheap name-drift fixes.
+
+### Count route (pre-flight sizing)
+
+`maintain count <target>` is a read-only lite pre-flight: it walks the category and resolves how each file *would* re-link (embedded / isShownAt / wildcard / unresolved), prints a per-anchor breakdown, and writes nothing. Run it first to size a maintain job and spot a scope that re-links poorly.
+
+### Reading the result
+
+Maintain reports through the same surfaces as a normal SDC run — the per-target `…-sdc.log` and the `/wikimedia-status` poller (`Generating IDs → SDC syncing (n/total) → SDC complete`), plus a `#tech-alerts` completion summary. In the COUNTS summary:
+
+- **`SDC_ITEMS_SKIPPED_NO_SIDECAR`** (lite) / a file left untouched (hash): the re-link found no current match — the item left the index, or (hash route) its bytes/media URL changed so no exact match exists. This is expected and safe, not an error; flagged for human review.
+- **`MAINTAIN_RENAMED` / `MAINTAIN_RENAME_BLOCKED`** (lite): title-drift renames applied / left for follow-up.
+- **`UPLOAD_SKIPPED_WOULD_CREATE`** (hash): items not already on Commons — correctly not created.
 
 ---
 

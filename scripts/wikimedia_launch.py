@@ -131,6 +131,7 @@ def _build_get_ids_command(
     collection: str | None,
     dpla_id: str | None,
     csv_file: str,
+    maintain: bool = False,
 ) -> str:
     """Build the get-ids command that stages the ID CSV for one target.
 
@@ -145,6 +146,12 @@ def _build_get_ids_command(
       resolved name (ORed in the ES dataProvider filter) and adding
       ``--collection`` when set. Omitting ``--institution`` matches the
       collection across every upload-eligible institution in the hub.
+
+    ``maintain`` adds ``--maintain`` to the get-ids-es scan (relax the
+    institution upload gate to QID-only) — used by the default hash-maintain
+    pipeline so already-uploaded items of no-longer-opted-in institutions are
+    still enumerated. The per-item media/rights filters still apply (we
+    download), so it is NOT combined with ``--skip-media-filter`` here.
     """
     if dpla_id is not None:
         return f"get-ids-es {canonical} --single-id {shlex.quote(dpla_id)} > {csv_file}"
@@ -155,10 +162,12 @@ def _build_get_ids_command(
         cmd += f" --institution {shlex.quote(inst)}"
     if collection is not None:
         cmd += f" --collection {shlex.quote(collection)}"
+    if maintain:
+        cmd += " --maintain"
     return cmd + f" > {csv_file}"
 
 
-def _build_maintain_pipeline_steps(
+def _build_maintain_lite_pipeline_steps(
     canonical: str,
     institutions: tuple[str, ...],
     collection: str | None,
@@ -168,9 +177,11 @@ def _build_maintain_pipeline_steps(
     count_only: bool,
     worker_opts: str = "",
 ) -> list[str]:
-    """Pipeline steps for one maintain target (`cd` + the maintain commands).
+    """Pipeline steps for one LITE maintain target (`cd` + the maintain
+    commands). Lite = the quick, no-download sidecar route (the default
+    hash-maintain path runs the full download+uploader pipeline instead).
 
-    Maintain re-links + SDC-syncs the EXISTING Commons files for this scope in
+    Lite re-links + SDC-syncs the EXISTING Commons files for this scope in
     place: no download, no upload, no new File pages. Each hub/institution is
     resolved to its exact Commons category via Wikidata (P8464 → commonswiki
     sitelink — authoritative, never derived from the display name) and walked
@@ -210,7 +221,11 @@ def _build_maintain_pipeline_steps(
         stage_cmd = f"get-ids-es {canonical}"
         for inst in institutions:
             stage_cmd += f" --institution {shlex.quote(inst)}"
-        steps.append(stage_cmd + f" --maintain > {csv_file}")
+        # Lite stages sidecars for the whole QID-bearing institution scope with
+        # the media/rights item filters dropped (--skip-media-filter): it syncs
+        # whatever is already on Commons, so it must not exclude items whose
+        # current index doc lost a fetchable media URL or free-rights category.
+        steps.append(stage_cmd + f" --maintain --skip-media-filter > {csv_file}")
     for inst in institutions or (None,):
         qid = wikidata_qid_for_target(canonical, inst)
         category = resolve_commons_category(qid) if qid else None
@@ -226,6 +241,41 @@ def _build_maintain_pipeline_steps(
             )
             steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
     return [f"cd {base}", *steps]
+
+
+def _build_maintain_hash_pipeline_steps(
+    canonical: str,
+    institutions: tuple[str, ...],
+    collection: str | None,
+    dpla_id: str | None,
+    base: str,
+    csv_file: str,
+    max_age_days: int | None,
+    upload_opts: str,
+    sdc_opts: str,
+) -> list[str]:
+    """Pipeline steps for one DEFAULT (hash) maintain target.
+
+    This is the full upload pipeline with two deltas: the institution upload
+    gate is relaxed (``get-ids-es --maintain`` → QID-only) and the uploader is
+    fenced (``--no-create``). The uploader's existing hash-drift machinery then
+    re-links orphaned files by content (move to the current canonical title)
+    and overwrites byte-drifted files, while the fence guarantees no NEW Commons
+    files are created for these (possibly no-longer-opted-in) institutions. SDC
+    syncs as usual. Item media/rights filters still apply (we download), so
+    items with no fetchable master are simply never pulled and stay untouched.
+    """
+    maintain_get_ids = _build_get_ids_command(
+        canonical, institutions, collection, dpla_id, csv_file, maintain=True
+    )
+    dl_age_opt = f"--max-age-days {max_age_days} " if max_age_days is not None else ""
+    return [
+        f"cd {base}",
+        maintain_get_ids,
+        f"downloader {dl_age_opt}{csv_file} {canonical}",
+        f"uploader {csv_file} {canonical} --no-create{upload_opts}",
+        f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}",
+    ]
 
 
 def _target_label(
@@ -260,6 +310,7 @@ def main() -> None:
     parser.add_argument("--refresh-only", default="false")
     parser.add_argument("--sdc-only", default="false")
     parser.add_argument("--maintain", default="false")
+    parser.add_argument("--lite", default="false")
     parser.add_argument("--count-only", default="false")
     # Keep in sync with .github/workflows/wikimedia-launch.yml inputs.workers
     # / inputs.workers_budget (currently 6 / 24), which the workflow always
@@ -275,6 +326,10 @@ def main() -> None:
     sdc_only = _parse_bool(args.sdc_only)
     maintain = _parse_bool(args.maintain)
     count_only = _parse_bool(args.count_only)
+    # Lite = the quick no-download sidecar route. count-only is a lite-only
+    # pre-flight (re-link sizing), so it forces lite. Default maintain (lite
+    # False) is the hash route: full download + uploader --no-create.
+    lite = _parse_bool(args.lite) or count_only
 
     # Normalize the response_url first so the mutual-exclusion check below
     # can use the validated value rather than re-implementing the same
@@ -300,6 +355,15 @@ def main() -> None:
             response_url,
             "--count-only is a maintain-mode pre-flight (it sizes the re-link"
             " without writing); it has no meaning outside --maintain.",
+        )
+    # Guard on the RAW --lite flag, not the derived ``lite`` above: ``lite`` is
+    # also True under --count-only, so using it here would wrongly reject a bare
+    # ``--count-only`` (which is validated separately just above).
+    if _parse_bool(args.lite) and not maintain:
+        _slack_fail(
+            response_url,
+            "--lite selects the quick no-download maintain route; it has no"
+            " meaning outside --maintain.",
         )
     max_age_days: int | None = None
     if args.max_age_days.strip():
@@ -1023,8 +1087,8 @@ def main() -> None:
         # overrun maxlag. Only the budget — no --workers (no upload
         # parallelism).
         upload_opts = f" --workers-budget {sdc_workers_budget}"
-        if maintain:
-            pipeline_steps = _build_maintain_pipeline_steps(
+        if maintain and lite:
+            pipeline_steps = _build_maintain_lite_pipeline_steps(
                 canonical,
                 institutions,
                 collection,
@@ -1033,6 +1097,18 @@ def main() -> None:
                 csv_file,
                 count_only,
                 worker_opts=sdc_opts,
+            )
+        elif maintain:
+            pipeline_steps = _build_maintain_hash_pipeline_steps(
+                canonical,
+                institutions,
+                collection,
+                dpla_id,
+                base,
+                csv_file,
+                max_age_days,
+                upload_opts,
+                sdc_opts,
             )
         elif sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which
@@ -1105,10 +1181,19 @@ def main() -> None:
             if refresh_only:
                 msg = f"▶ Launching `{session_name}` refresh: {', '.join(batch_labels)}{refresh_suffix}."
             elif maintain:
+                if lite:
+                    detail = (
+                        "re-linking + SDC-syncing existing Commons files in place"
+                        " (lite: no download)"
+                    )
+                else:
+                    detail = (
+                        "download + content-reconcile (hash re-link + overwrite) +"
+                        " SDC on existing Commons files (no new files)"
+                    )
                 msg = (
                     f"▶ Launching `{session_name}` maintain:"
-                    f" {', '.join(batch_labels)} — re-linking + SDC-syncing existing"
-                    " Commons files in place (no uploads, no new files)."
+                    f" {', '.join(batch_labels)} — {detail}."
                 )
             elif sdc_only:
                 msg = (

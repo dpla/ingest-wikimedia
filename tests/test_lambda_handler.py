@@ -259,12 +259,33 @@ def test_maintain_subcommand_dispatches_launch_with_maintain_true(
     call = dispatched[0]
     assert call["workflow"] == "wikimedia-launch.yml"
     assert call["inputs"]["maintain"] == "true"
+    # Bare `maintain` is the DEFAULT hash route — not lite, not count-only.
+    assert "lite" not in call["inputs"]
+    assert "count_only" not in call["inputs"]
     # Maintain is its own run mode — must never set the others.
     assert "sdc_only" not in call["inputs"]
     assert "refresh_only" not in call["inputs"]
     assert call["inputs"]["partner"] == "digitalnc"
     assert len(call["inputs"]["concurrency_key"]) == 16
     assert "maintain" in _decode_reply(reply)["text"].lower()
+
+
+def test_maintain_lite_subcommand_dispatches_with_lite_true(
+    monkeypatch, handler_module
+):
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain lite digitalnc"), None)
+
+    assert reply["statusCode"] == 200
+    assert len(dispatched) == 1
+    inputs = dispatched[0]["inputs"]
+    assert inputs["maintain"] == "true"
+    assert inputs["lite"] == "true"
+    assert "count_only" not in inputs
+    assert inputs["partner"] == "digitalnc"
+    assert "lite" in _decode_reply(reply)["text"].lower()
 
 
 def test_maintain_subcommand_with_no_targets_returns_usage(monkeypatch, handler_module):

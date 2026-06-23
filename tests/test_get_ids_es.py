@@ -480,12 +480,12 @@ def test_build_query_default_applies_upload_readiness_filters():
     assert any("should" in f.get("bool", {}) for f in filters), "asset filter missing"
 
 
-def test_build_query_maintain_drops_rights_and_asset_filters():
+def test_build_query_skip_media_filter_drops_rights_and_asset_filters():
     from tools import get_ids_es
 
     filters = _filter_terms(
         get_ids_es.build_query(
-            "Digital Library of Georgia", ["Some Institution"], maintain=True
+            "Digital Library of Georgia", ["Some Institution"], skip_media_filter=True
         )
     )
     # Scoping (hub + QID-bearing institution) still gates the scan.
@@ -501,7 +501,7 @@ def test_build_query_maintain_drops_rights_and_asset_filters():
     assert not any("should" in f.get("bool", {}) for f in filters)
 
 
-def test_build_query_maintain_still_supports_collection_scope():
+def test_build_query_skip_media_filter_still_supports_collection_scope():
     from tools import get_ids_es
 
     filters = _filter_terms(
@@ -509,7 +509,7 @@ def test_build_query_maintain_still_supports_collection_scope():
             "Digital Library of Georgia",
             ["Some Institution"],
             collection="Maps",
-            maintain=True,
+            skip_media_filter=True,
         )
     )
     assert {"term": {"sourceResource.collection.title.not_analyzed": "Maps"}} in filters
