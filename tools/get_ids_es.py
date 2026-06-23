@@ -178,28 +178,42 @@ def build_query(
     eligible_dp_names: list[str],
     collection: str | None = None,
     search_after: list | None = None,
+    maintain: bool = False,
 ) -> dict:
-    """Build the Elasticsearch boolean query for a single page."""
-    asset_should = [
-        {"exists": {"field": "mediaMaster"}},
-        {"exists": {"field": "iiifManifest"}},
-        *[
-            {"wildcard": {"isShownAt": pattern}}
-            for pattern in IIIF_DERIVABLE_ISSHOWNAT_PATTERNS
-        ],
-    ]
+    """Build the Elasticsearch boolean query for a single page.
 
+    The ``provider`` + ``dataProvider`` filters always apply: they scope the
+    scan to this hub and to institutions that resolve to a Wikidata QID
+    (``eligible_dp_names`` comes from :func:`load_eligible_dp_names`, which
+    requires a QID). A dataProvider without a QID is correctly excluded — it
+    can't get a P195 institution claim or a Commons category.
+
+    ``maintain`` drops the two *upload-readiness* filters — ``rightsCategory ==
+    "Unlimited Re-Use"`` and the asset-presence check (``mediaMaster`` /
+    ``iiifManifest`` / IIIF-derivable ``isShownAt``). Those gate whether an
+    item's media can be FETCHED for a fresh upload; in maintain the files are
+    already on Commons and the Commons category — not ES — defines the
+    work-set, so applying them would wrongly skip already-uploaded items whose
+    current index doc no longer carries fetchable media or a free rights
+    category (exactly the drift maintain exists to repair: e.g. DLG items that
+    no longer populate ``mediaMaster`` in the current index).
+    """
     filters: list[dict] = [
         {"term": {"provider.name.not_analyzed": provider_name}},
-        {"term": {"rightsCategory": "Unlimited Re-Use"}},
         {"terms": {"dataProvider.name.not_analyzed": eligible_dp_names}},
-        {
-            "bool": {
-                "should": asset_should,
-                "minimum_should_match": 1,
-            }
-        },
     ]
+
+    if not maintain:
+        asset_should = [
+            {"exists": {"field": "mediaMaster"}},
+            {"exists": {"field": "iiifManifest"}},
+            *[
+                {"wildcard": {"isShownAt": pattern}}
+                for pattern in IIIF_DERIVABLE_ISSHOWNAT_PATTERNS
+            ],
+        ]
+        filters.append({"term": {"rightsCategory": "Unlimited Re-Use"}})
+        filters.append({"bool": {"should": asset_should, "minimum_should_match": 1}})
 
     if collection is not None:
         filters.append(
@@ -408,7 +422,11 @@ def main(
                 query = {"query": {"term": {"id": single_id}}, "size": 2}
             else:
                 query = build_query(
-                    provider_name, eligible_dp_names, collection, search_after
+                    provider_name,
+                    eligible_dp_names,
+                    collection,
+                    search_after,
+                    maintain=maintain,
                 )
             response = post_es(query)
             response.raise_for_status()

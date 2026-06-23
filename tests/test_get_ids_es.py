@@ -456,3 +456,60 @@ def test_load_eligible_dp_names_maintain_includes_ineligible_with_qid():
     assert normal == ["Active Inst"]
     # Former Inst now included (upload=False but has a QID); No QID Inst never.
     assert sorted(maintain) == ["Active Inst", "Former Inst"]
+
+
+def _filter_terms(query: dict) -> list[dict]:
+    return query["query"]["bool"]["filter"]
+
+
+def test_build_query_default_applies_upload_readiness_filters():
+    from tools import get_ids_es
+
+    filters = _filter_terms(
+        get_ids_es.build_query("Digital Library of Georgia", ["Some Institution"])
+    )
+    # Scoping filters always present.
+    assert {
+        "term": {"provider.name.not_analyzed": "Digital Library of Georgia"}
+    } in filters
+    assert {
+        "terms": {"dataProvider.name.not_analyzed": ["Some Institution"]}
+    } in filters
+    # Upload-readiness gates present in the normal (non-maintain) path.
+    assert {"term": {"rightsCategory": "Unlimited Re-Use"}} in filters
+    assert any("should" in f.get("bool", {}) for f in filters), "asset filter missing"
+
+
+def test_build_query_maintain_drops_rights_and_asset_filters():
+    from tools import get_ids_es
+
+    filters = _filter_terms(
+        get_ids_es.build_query(
+            "Digital Library of Georgia", ["Some Institution"], maintain=True
+        )
+    )
+    # Scoping (hub + QID-bearing institution) still gates the scan.
+    assert {
+        "term": {"provider.name.not_analyzed": "Digital Library of Georgia"}
+    } in filters
+    assert {
+        "terms": {"dataProvider.name.not_analyzed": ["Some Institution"]}
+    } in filters
+    # Upload-readiness gates dropped: maintain syncs files already on Commons,
+    # so items lacking current fetchable media / free rights must not be skipped.
+    assert {"term": {"rightsCategory": "Unlimited Re-Use"}} not in filters
+    assert not any("should" in f.get("bool", {}) for f in filters)
+
+
+def test_build_query_maintain_still_supports_collection_scope():
+    from tools import get_ids_es
+
+    filters = _filter_terms(
+        get_ids_es.build_query(
+            "Digital Library of Georgia",
+            ["Some Institution"],
+            collection="Maps",
+            maintain=True,
+        )
+    )
+    assert {"term": {"sourceResource.collection.title.not_analyzed": "Maps"}} in filters
