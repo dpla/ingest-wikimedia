@@ -5799,3 +5799,18 @@ def test_run_maintain_parallel_delegates_to_run_pool():
     assert kwargs["task_fn"] is sdc_sync._worker_maintain_group_task
     # _s3_partner is threaded so workers read the right sidecar prefix.
     assert "georgia" in kwargs["initargs"]
+
+
+def test_maintain_parallel_enabled_requires_from_s3_and_workers():
+    from tools import sdc_sync
+
+    f = sdc_sync._maintain_parallel_enabled
+    # Happy path: maintain + workers>1 + write + staged sidecars.
+    assert f(maintain=True, workers=6, count_only=False, from_s3_partner="georgia")
+    # No --from-s3 → must NOT fan out (live fallback would NameError in workers
+    # / hammer api.dp.la); caller drops to serial.
+    assert not f(maintain=True, workers=6, count_only=False, from_s3_partner=None)
+    # count-only sizing is serial; single worker is serial; non-maintain n/a.
+    assert not f(maintain=True, workers=6, count_only=True, from_s3_partner="georgia")
+    assert not f(maintain=True, workers=1, count_only=False, from_s3_partner="georgia")
+    assert not f(maintain=False, workers=6, count_only=False, from_s3_partner="georgia")

@@ -5369,6 +5369,24 @@ def _worker_maintain_group_task(group):
     return tracker.diff(prior)
 
 
+def _maintain_parallel_enabled(maintain, workers, count_only, from_s3_partner):
+    """Whether the ``--cat`` maintain run should fan out to the worker pool.
+
+    Requires --maintain, --workers > 1, NOT --count-only (read-only pre-flight
+    sizing stays serial), and --from-s3 (``from_s3_partner``). The --from-s3
+    requirement is load-critical: without staged sidecars,
+    :func:`_maintain_process_file` falls back to the live :func:`process_one`,
+    which needs ``dpla_api`` / ``rights`` / ``subject_ids`` (not injected into
+    workers) and would hit ``api.dp.la`` once per file — at N-way concurrency
+    that is exactly the load the precomputed-sidecar path exists to avoid. With
+    no sidecars the caller drops to the serial path, where that single-file
+    fallback runs once, in the parent, with the globals bound.
+    """
+    return bool(
+        maintain and workers > 1 and not count_only and from_s3_partner is not None
+    )
+
+
 def _run_maintain_parallel(groups, workers):
     """Dispatch parallel maintain across ``workers`` processes, one id-group per
     task via :func:`_run_pool`.
@@ -5688,12 +5706,13 @@ def main() -> None:
         generator = pagegenerators.CategorizedPageGenerator(
             category, namespaces=[6], recurse=args.recurse
         )
-        if args.maintain and _workers > 1 and not args.count_only:
+        if _maintain_parallel_enabled(
+            args.maintain, _workers, args.count_only, _s3_partner
+        ):
             # Parallel maintain: enumerate the category into id-groups and
             # dispatch one group per worker. Grouping keeps an item's files
             # together so title-drift renames (which only collide within one
             # id — the id is in the canonical title) can't race across workers.
-            # --count-only stays on the serial path below (read-only sizing).
             groups = _enumerate_maintain_groups(generator, args.limit)
             total_files = sum(len(g) for g in groups)
             print(
