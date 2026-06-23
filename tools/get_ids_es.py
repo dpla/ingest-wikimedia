@@ -178,7 +178,7 @@ def build_query(
     eligible_dp_names: list[str],
     collection: str | None = None,
     search_after: list | None = None,
-    maintain: bool = False,
+    skip_media_filter: bool = False,
 ) -> dict:
     """Build the Elasticsearch boolean query for a single page.
 
@@ -188,22 +188,26 @@ def build_query(
     requires a QID). A dataProvider without a QID is correctly excluded — it
     can't get a P195 institution claim or a Commons category.
 
-    ``maintain`` drops the two *upload-readiness* filters — ``rightsCategory ==
-    "Unlimited Re-Use"`` and the asset-presence check (``mediaMaster`` /
-    ``iiifManifest`` / IIIF-derivable ``isShownAt``). Those gate whether an
-    item's media can be FETCHED for a fresh upload; in maintain the files are
-    already on Commons and the Commons category — not ES — defines the
-    work-set, so applying them would wrongly skip already-uploaded items whose
-    current index doc no longer carries fetchable media or a free rights
-    category (exactly the drift maintain exists to repair: e.g. DLG items that
-    no longer populate ``mediaMaster`` in the current index).
+    ``skip_media_filter`` drops the two *upload-readiness* item filters —
+    ``rightsCategory == "Unlimited Re-Use"`` and the asset-presence check
+    (``mediaMaster`` / ``iiifManifest`` / IIIF-derivable ``isShownAt``). Those
+    gate whether an item's media can be FETCHED. It is set only by **lite
+    maintain** (``sdc-sync --cat``), which downloads nothing and operates on the
+    files already on Commons — so applying them would wrongly skip
+    already-uploaded items whose current index doc no longer carries fetchable
+    media or a free rights category (e.g. DLG items that no longer populate
+    ``mediaMaster``). The DEFAULT (hash) maintain path DOWNLOADS media, so it
+    keeps these filters (``skip_media_filter=False``) — only downloadable,
+    free-rights items can be hash-reconciled. Distinct from ``--maintain``,
+    which relaxes the *institution* upload gate (see ``load_eligible_dp_names``)
+    and applies to BOTH maintain routes.
     """
     filters: list[dict] = [
         {"term": {"provider.name.not_analyzed": provider_name}},
         {"terms": {"dataProvider.name.not_analyzed": eligible_dp_names}},
     ]
 
-    if not maintain:
+    if not skip_media_filter:
         asset_should = [
             {"exists": {"field": "mediaMaster"}},
             {"exists": {"field": "iiifManifest"}},
@@ -285,7 +289,20 @@ def build_query(
         " (QID still required), so IDs + sdc.json are generated for already-"
         "uploaded files of institutions no longer authorized for new uploads."
         " New-upload prevention is enforced by the uploader's --no-create"
-        " fence, not by this worklist."
+        " fence, not by this worklist. Relaxes only the INSTITUTION gate; item"
+        " media/rights filters still apply unless --skip-media-filter is given."
+    ),
+)
+@click.option(
+    "--skip-media-filter",
+    is_flag=True,
+    help=(
+        "Drop the per-item upload-readiness filters (rightsCategory +"
+        " mediaMaster/iiifManifest/IIIF-derivable isShownAt). Used only by LITE"
+        " maintain (sdc-sync --cat), which downloads nothing and maintains the"
+        " files already on Commons regardless of current media/rights. The"
+        " default (hash) maintain path downloads media, so it keeps these"
+        " filters (omit this flag)."
     ),
 )
 def main(
@@ -294,6 +311,7 @@ def main(
     collection: str | None,
     single_id: str | None,
     maintain: bool,
+    skip_media_filter: bool,
 ) -> None:
     """Print wiki-eligible DPLA IDs for PARTNER to stdout, one per line.
 
@@ -426,7 +444,7 @@ def main(
                     eligible_dp_names,
                     collection,
                     search_after,
-                    maintain=maintain,
+                    skip_media_filter=skip_media_filter,
                 )
             response = post_es(query)
             response.raise_for_status()

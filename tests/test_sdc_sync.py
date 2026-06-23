@@ -5637,6 +5637,63 @@ def test_emit_maintain_summary_threads_real_worker_count():
     assert mock_notify.call_args.kwargs["workers"] == 6
 
 
+def _drive_main_cat_maintain(monkeypatch, *, count_only):
+    """Drive ``sdc_sync.main()`` down the ``--cat`` maintain branch on an EMPTY
+    category, returning the patched ``notify_phase_start`` mock.
+
+    ``main()`` is gated behind module-level argparse globals normally set by
+    ``_initialize()``; we stub those so the dispatch reaches the maintain block
+    without a live Commons login or category walk. The empty generator means
+    the per-file loop body never runs — we exercise only the dispatch and the
+    phase-start announcement.
+    """
+    import argparse
+
+    from tools import sdc_sync
+
+    args = argparse.Namespace(
+        maintain=True,
+        count_only=count_only,
+        cat="Category:Test",
+        files=None,
+        lists=None,
+        recurse=False,
+        limit=0,
+    )
+    monkeypatch.setattr(sdc_sync, "_initialize", lambda: None)
+    monkeypatch.setattr(sdc_sync, "args", args, raising=False)
+    monkeypatch.setattr(sdc_sync, "method", "cat", raising=False)
+    monkeypatch.setattr(sdc_sync, "_s3_partner", None, raising=False)
+    monkeypatch.setattr(sdc_sync, "site", MagicMock(name="site"), raising=False)
+    monkeypatch.setattr(sdc_sync, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(sdc_sync, "_emit_maintain_summary", lambda *a, **k: None)
+    monkeypatch.setattr(sdc_sync, "_report_maintain_tally", lambda *a, **k: None)
+    monkeypatch.setattr(sdc_sync.pywikibot, "Category", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        sdc_sync.pagegenerators, "CategorizedPageGenerator", lambda *a, **k: iter(())
+    )
+    mock_phase = MagicMock()
+    monkeypatch.setattr(sdc_sync, "notify_phase_start", mock_phase)
+
+    sdc_sync.main()
+    return mock_phase
+
+
+def test_main_cat_maintain_announces_sdc_phase_start(monkeypatch):
+    # A launched maintain --cat run must announce the SDC phase (like
+    # _run_partner_mode does at its start) so Slack isn't silent between the
+    # launcher's ack and the final summary — which on a long run is hours away.
+    mock_phase = _drive_main_cat_maintain(monkeypatch, count_only=False)
+    mock_phase.assert_called_once_with("maintain", "sdc-sync")
+
+
+def test_main_cat_maintain_count_only_stays_silent(monkeypatch):
+    # Count-only is a read-only sizing pre-flight — no SDC writes happen, so it
+    # must NOT post a phase-start (that would falsely signal sync had begun).
+    mock_phase = _drive_main_cat_maintain(monkeypatch, count_only=True)
+    mock_phase.assert_not_called()
+
+
 def test_maintain_process_file_logs_dpla_id_progress_marker(caplog):
     import logging as _logging
 

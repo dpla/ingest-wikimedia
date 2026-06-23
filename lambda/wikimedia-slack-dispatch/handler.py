@@ -455,22 +455,33 @@ def handler(event, context):
         # upload, no new File pages — so upload-ineligible targets are allowed.
         if tokens[0] == "maintain":
             maintain_tokens = tokens[1:]
-            # `maintain count <target> ...` is the pre-flight sizing variant:
-            # resolve how each file would re-link and report a per-anchor
-            # breakdown without writing anything.
-            count_only = bool(maintain_tokens) and maintain_tokens[0] == "count"
-            if count_only:
+            # An optional mode modifier follows `maintain`:
+            #   count — pre-flight sizing (lite re-link, writes nothing)
+            #   lite  — quick no-download sidecar route (SDC-in-place + rename)
+            #   (none) — DEFAULT hash route: download + content reconcile + SDC
+            mode = (
+                maintain_tokens[0]
+                if maintain_tokens and maintain_tokens[0] in ("count", "lite")
+                else None
+            )
+            if mode:
                 maintain_tokens = maintain_tokens[1:]
+            count_only = mode == "count"
+            lite = mode == "lite"
             if not maintain_tokens:
                 return _slack_reply(
-                    "Usage: `/wikimedia-upload maintain [count] <target> [<target> ...]`\n"
-                    "Re-links + SDC-syncs files already on Commons for a hub or"
-                    " institution, in place (no uploads, no new files). Works for"
-                    " hubs no longer participating in uploads.\n"
-                    "Add `count` to size the re-link without writing anything.\n"
-                    "Example: `/wikimedia-upload maintain digitalnc`\n"
-                    "Example: `/wikimedia-upload maintain count digitalnc`\n"
-                    'Example: `/wikimedia-upload maintain "georgia|Atlanta History Center"`',
+                    "Usage: `/wikimedia-upload maintain [lite|count] <target> [<target> ...]`\n"
+                    "Reconciles files already on Commons for a hub or institution"
+                    " (never creates new files); works for hubs no longer"
+                    " participating in uploads.\n"
+                    "Default (hash): downloads media and content-reconciles —"
+                    " re-links drifted files + overwrites changed bytes + SDC.\n"
+                    "`lite`: quick no-download route — SDC-in-place + name-drift"
+                    " rename only.\n"
+                    "`count`: size the re-link without writing anything.\n"
+                    'Example: `/wikimedia-upload maintain "georgia|Atlanta History Center"`\n'
+                    "Example: `/wikimedia-upload maintain lite digitalnc`\n"
+                    "Example: `/wikimedia-upload maintain count digitalnc`",
                     ephemeral=True,
                 )
             maintain_targets, err = _validate_launch_targets(maintain_tokens)
@@ -479,11 +490,14 @@ def handler(event, context):
             inputs = {"maintain": "true"}
             if count_only:
                 inputs["count_only"] = "true"
-            action = (
-                "maintain pre-flight sizing (count-only, writes nothing)"
-                if count_only
-                else "maintain (re-link + SDC sync, no uploads)"
-            )
+            if lite:
+                inputs["lite"] = "true"
+            if count_only:
+                action = "maintain pre-flight sizing (count-only, writes nothing)"
+            elif lite:
+                action = "lite maintain (SDC-in-place + rename, no download)"
+            else:
+                action = "maintain (download + content reconcile + SDC)"
             return _launch_with_targets(
                 gh_token,
                 repo,

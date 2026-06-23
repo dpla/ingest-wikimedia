@@ -398,7 +398,7 @@ def _maintain_steps(
             return_value="Category:Media contributed by X",
         ),
     ):
-        return launch_mod._build_maintain_pipeline_steps(
+        return launch_mod._build_maintain_lite_pipeline_steps(
             canonical,
             institutions,
             collection,
@@ -414,7 +414,7 @@ def test_maintain_real_run_stages_sidecars_then_syncs_from_s3():
     steps = _maintain_steps("digitalnc", (), count_only=False)
     # One ES scan stages sdc.json sidecars, then the category walk reads them.
     assert steps[0] == "cd /srv/base"
-    assert steps[1] == "get-ids-es digitalnc --maintain > out.csv"
+    assert steps[1] == "get-ids-es digitalnc --maintain --skip-media-filter > out.csv"
     assert steps[2] == (
         "sdc-sync --cat 'Category:Media contributed by X' --maintain"
         " --from-s3 digitalnc"
@@ -428,7 +428,8 @@ def test_maintain_per_institution_get_ids_repeats_institution_flags():
     )
     assert steps[1] == (
         "get-ids-es georgia --institution 'Athens-Clarke County Library'"
-        " --institution 'Atlanta History Center' --maintain > out.csv"
+        " --institution 'Atlanta History Center' --maintain --skip-media-filter"
+        " > out.csv"
     )
     # One --cat sync per institution category, all reading from S3.
     syncs = [s for s in steps if s.startswith("sdc-sync")]
@@ -511,3 +512,33 @@ def test_maintain_bypasses_upload_eligibility_gate(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "mutually exclusive" not in captured.err
     assert "not upload-eligible" not in captured.err
+
+
+def test_maintain_hash_pipeline_is_full_download_fenced_no_create():
+    """Default (hash) maintain = full pipeline + relaxed institution gate
+    (get-ids-es --maintain) + uploader --no-create. No --skip-media-filter
+    (it downloads, so media/rights filters apply)."""
+    import scripts.wikimedia_launch as launch_mod
+
+    steps = launch_mod._build_maintain_hash_pipeline_steps(
+        "georgia",
+        ("Southwest Georgia Regional Library",),
+        None,
+        None,
+        "/srv/base",
+        "out.csv",
+        None,
+        " --workers-budget 24",
+        " --workers 6 --workers-budget 24",
+    )
+    assert steps[0] == "cd /srv/base"
+    assert steps[1] == (
+        "get-ids-es georgia --institution 'Southwest Georgia Regional Library'"
+        " --maintain > out.csv"
+    )
+    assert "--skip-media-filter" not in steps[1]
+    assert any(s.startswith("downloader ") and "out.csv georgia" in s for s in steps)
+    assert "uploader out.csv georgia --no-create --workers-budget 24" in steps
+    assert steps[-1] == (
+        "sdc-sync --partner georgia --ids-file out.csv --workers 6 --workers-budget 24"
+    )
