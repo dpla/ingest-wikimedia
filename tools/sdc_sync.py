@@ -4687,71 +4687,76 @@ def _migrate_one_dpla_item(s3, partner: str, dpla_id: str) -> None:
             )
 
 
-def _run_partner_mode_parallel(partner, dpla_ids, workers):
-    """Dispatch partner-mode SDC sync across ``workers`` processes.
+def _run_pool(tasks, *, workers, initializer, initargs, task_fn):
+    """Shared spawn-Pool scaffolding for the parallel sync paths.
 
-    Each worker process runs :func:`_process_one_partner_item` against
-    one DPLA item at a time via ``Pool.imap_unordered``; the parent
-    aggregates per-task counter deltas into the module-level tracker.
+    Routes worker log records to the parent's handlers (the open ``-sdc.log``)
+    through a ``multiprocessing.Queue`` + ``QueueListener``, runs ``task_fn``
+    over ``tasks`` with ``imap_unordered``, and merges each task's returned
+    tracker delta into the parent ``tracker``. ``initargs`` are forwarded to
+    ``initializer`` AFTER the log queue — every worker initializer takes
+    ``log_queue`` as its first parameter.
 
-    Item-level safety: every ordinal of every item has a unique
-    MediaInfo M-id, so two workers handling different items never
-    write to the same Commons entity. The pywikibot ``Site`` is
-    re-initialized per worker (see :func:`_init_partner_worker`),
-    isolating HTTP sessions and CSRF tokens.
-
-    Logging: workers route records through a ``multiprocessing.Queue``
-    to a ``QueueListener`` thread in the parent, which dispatches them
-    to the per-partner SDC log file the parent already opened.
-
-    Uses ``spawn`` start_method explicitly so workers don't inherit
-    the parent's pywikibot session sockets — fork-then-use of a live
-    session has been a source of half-broken connections in similar
-    bot setups.
+    Uses ``spawn`` start_method explicitly so workers don't inherit the
+    parent's pywikibot session sockets — fork-then-use of a live session has
+    been a source of half-broken connections in similar bot setups.
     """
     import logging.handlers
     import multiprocessing
 
     ctx = multiprocessing.get_context("spawn")
     log_queue = ctx.Manager().Queue(-1)
-
-    # Reuse the file handler(s) the parent's setup_logging already
-    # attached to the root logger — the QueueListener drains worker
-    # records into the same destinations the parent writes to.
-    listener_targets = list(logging.getLogger().handlers)
     listener = logging.handlers.QueueListener(
-        log_queue, *listener_targets, respect_handler_level=True
+        log_queue, *logging.getLogger().handlers, respect_handler_level=True
     )
     listener.start()
-
-    tasks = [
-        (partner, dpla_id, idx, len(dpla_ids))
-        for idx, dpla_id in enumerate(dpla_ids, start=1)
-    ]
     try:
         with ctx.Pool(
             processes=workers,
-            initializer=_init_partner_worker,
-            # Pickle the parent's already-fetched mapping tables across
-            # to each worker so the cleanup path (which calls
-            # ``DPLA.get_provider_and_data_provider`` with ``hubs``)
-            # doesn't NameError under spawn start_method. Sharing one
-            # snapshot also means workers and parent agree on the data
-            # even if ingestion3 updates mid-run.
-            initargs=(
-                log_queue,
-                hubs,
-                rights,
-                subject_ids,
-                _normalize_wikitext_enabled,
-                _workers_budget,
-            ),
+            initializer=initializer,
+            initargs=(log_queue, *initargs),
         ) as pool:
-            for delta in pool.imap_unordered(_worker_partner_task, tasks):
+            for delta in pool.imap_unordered(task_fn, tasks):
                 if delta:
                     tracker.merge(delta)
     finally:
         listener.stop()
+
+
+def _run_partner_mode_parallel(partner, dpla_ids, workers):
+    """Dispatch partner-mode SDC sync across ``workers`` processes.
+
+    Each worker process runs :func:`_process_one_partner_item` against one DPLA
+    item at a time via :func:`_run_pool`; the parent aggregates per-task counter
+    deltas into the module-level tracker.
+
+    Item-level safety: every ordinal of every item has a unique MediaInfo M-id,
+    so two workers handling different items never write to the same Commons
+    entity. The pywikibot ``Site`` is re-initialized per worker (see
+    :func:`_init_partner_worker`), isolating HTTP sessions and CSRF tokens.
+
+    ``initargs`` pickles the parent's already-fetched mapping tables (``hubs`` /
+    ``rights`` / ``subject_ids``) across to each worker so the cleanup path
+    (``DPLA.get_provider_and_data_provider`` with ``hubs``) doesn't NameError
+    under spawn, and all workers + parent agree on one snapshot.
+    """
+    tasks = [
+        (partner, dpla_id, idx, len(dpla_ids))
+        for idx, dpla_id in enumerate(dpla_ids, start=1)
+    ]
+    _run_pool(
+        tasks,
+        workers=workers,
+        initializer=_init_partner_worker,
+        initargs=(
+            hubs,
+            rights,
+            subject_ids,
+            _normalize_wikitext_enabled,
+            _workers_budget,
+        ),
+        task_fn=_worker_partner_task,
+    )
 
 
 def _init_partner_worker(
@@ -5264,6 +5269,133 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         tracker.increment(Result.SDC_PAGES_EDITED, len(pages_edited))
 
 
+def _enumerate_maintain_groups(generator, limit):
+    """Walk the ``--cat`` page generator once and bucket files by embedded DPLA
+    id for parallel maintain.
+
+    Returns a list of groups, each a list of ``(title, pageid, embedded_id)``
+    for files sharing one embedded id. Grouping keeps an item's multi-page set
+    on a single worker (see :func:`_run_maintain_parallel`). ``limit`` caps the
+    total files enumerated (``--limit``). Embedded ids are resolved here in the
+    single-threaded parent (``_resolve_dpla_id`` — title-pattern only for
+    service hubs, so effectively no api.dp.la calls).
+    """
+    groups: dict[str, list] = {}
+    count = 0
+    for page in generator:
+        title = page.title()
+        embedded_id = _resolve_dpla_id(title, dpla_api)
+        groups.setdefault(embedded_id, []).append((title, page.pageid, embedded_id))
+        count += 1
+        if limit and count >= limit:
+            print(f" -- Reached --limit {limit}, stopping enumeration.")
+            break
+    return list(groups.values())
+
+
+def _init_maintain_worker(
+    log_queue,
+    hubs_data,
+    s3_partner,
+    normalize_wikitext_enabled,
+    workers_budget,
+):
+    """Per-worker setup for parallel maintain — mirrors
+    :func:`_init_partner_worker`: a fresh pywikibot session, the parent's
+    ``hubs`` snapshot (anchor-3 QID scope map + post-SDC cleanup provider
+    lookup), the ``--from-s3`` partner key and an S3 client for sidecar reads,
+    the normalize flag, the box-wide slot budget, and log routing to the parent.
+
+    No ``dpla_api`` is injected: embedded ids are precomputed by the parent and
+    carried in each group tuple, and the sync reads claims from the staged
+    sidecar — neither path calls ``api.dp.la``.
+    """
+    import logging.handlers
+
+    import pywikibot
+
+    pywikibot.config.max_retries = _PYWIKIBOT_MAX_RETRIES
+    pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
+    pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
+
+    global site, hubs, _s3_partner, _s3_client
+    global _normalize_wikitext_enabled, _worker_slot_budget
+    site = pywikibot.Site("commons", "commons")
+    site.login()
+    hubs = hubs_data
+    _s3_partner = s3_partner
+    _normalize_wikitext_enabled = bool(normalize_wikitext_enabled)
+    _worker_slot_budget = WorkerSlotBudget(workers_budget)
+    if s3_partner is not None:
+        from ingest_wikimedia.s3 import S3Client
+
+        _s3_client = S3Client()
+
+    qh = logging.handlers.QueueHandler(log_queue)
+    root = logging.getLogger()
+    root.handlers = [qh]
+    root.setLevel(logging.INFO)
+
+
+def _worker_maintain_group_task(group):
+    """Pool worker entrypoint for parallel maintain: process one id-group (all
+    files sharing an embedded DPLA id) serially in this worker, returning the
+    per-group tracker delta.
+
+    Snapshot/diff gives the parent only what this group contributed (workers
+    are reused across groups). One box-wide slot is held for the whole group —
+    matching partner mode's per-item slot — and a per-file try/except keeps one
+    bad page from dropping the rest of the group.
+    """
+    prior = tracker.snapshot()
+    wait_before = _worker_slot_budget.total_wait_seconds
+    try:
+        with _worker_slot_budget.acquire():
+            for title, pageid, embedded_id in group:
+                try:
+                    file_page = pywikibot.FilePage(site, title)
+                    _maintain_process_file(
+                        "M" + str(pageid), embedded_id, file_page, title
+                    )
+                except Exception:
+                    logging.exception("maintain: worker failed on %s", title)
+                    tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
+    except Exception:
+        logging.exception("maintain: worker group setup failed (%d files)", len(group))
+        tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR)
+    wait_delta = int(_worker_slot_budget.total_wait_seconds) - int(wait_before)
+    if wait_delta:
+        tracker.increment(Result.SDC_SLOT_WAIT_SECONDS, wait_delta)
+    return tracker.diff(prior)
+
+
+def _run_maintain_parallel(groups, workers):
+    """Dispatch parallel maintain across ``workers`` processes, one id-group per
+    task via :func:`_run_pool`.
+
+    Concurrency safety: the canonical title embeds the DPLA id, so two files can
+    only collide on a destination title if they share an id — and grouping puts
+    every such file on the same worker, serializing those renames. The only
+    residual (two different embedded ids that re-link to the SAME current id — a
+    drifted duplicate) degrades safely: the second move hits
+    ``ArticleExistsConflictError`` → ``MAINTAIN_RENAME_BLOCKED``, the
+    dedup-deferral behavior we want anyway. CommonsDelinker posts are append-only
+    and already race-safe.
+    """
+    _run_pool(
+        groups,
+        workers=workers,
+        initializer=_init_maintain_worker,
+        initargs=(
+            hubs,
+            _s3_partner,
+            _normalize_wikitext_enabled,
+            _workers_budget,
+        ),
+        task_fn=_worker_maintain_group_task,
+    )
+
+
 def _run_partner_mode(partner, ids_file):
     """Drive the SDC phase from precomputed S3 sidecars for a whole partner.
 
@@ -5556,6 +5688,22 @@ def main() -> None:
         generator = pagegenerators.CategorizedPageGenerator(
             category, namespaces=[6], recurse=args.recurse
         )
+        if args.maintain and _workers > 1 and not args.count_only:
+            # Parallel maintain: enumerate the category into id-groups and
+            # dispatch one group per worker. Grouping keeps an item's files
+            # together so title-drift renames (which only collide within one
+            # id — the id is in the canonical title) can't race across workers.
+            # --count-only stays on the serial path below (read-only sizing).
+            groups = _enumerate_maintain_groups(generator, args.limit)
+            total_files = sum(len(g) for g in groups)
+            print(
+                f"maintain: {total_files} files in {len(groups)} id-group(s); "
+                f"{_workers} workers."
+            )
+            _run_maintain_parallel(groups, _workers)
+            _emit_maintain_summary(_s3_partner or args.cat, time.time() - start_time)
+            return
+
         tally = _new_maintain_tally(args.maintain and args.count_only)
         for page in generator:
             title = page.title()

@@ -166,6 +166,7 @@ def _build_maintain_pipeline_steps(
     base: str,
     csv_file: str,
     count_only: bool,
+    worker_opts: str = "",
 ) -> list[str]:
     """Pipeline steps for one maintain target (`cd` + the maintain commands).
 
@@ -197,7 +198,13 @@ def _build_maintain_pipeline_steps(
     # count-only and --from-s3 are mutually exclusive: pre-flight sizing only
     # resolves the re-link (no sidecar read, no write), so it skips both the
     # staging scan and --from-s3.
-    sync_tail = " --count-only" if count_only else f" --from-s3 {canonical}"
+    # The write path runs the parallel pool (one worker per group of files
+    # sharing a DPLA id) under the box-wide slot budget — same --workers /
+    # --workers-budget as partner mode. count-only is read-only pre-flight
+    # sizing: serial, no sidecar read, no write, no workers.
+    sync_tail = (
+        " --count-only" if count_only else f" --from-s3 {canonical}{worker_opts}"
+    )
     steps = []
     if not count_only:
         stage_cmd = f"get-ids-es {canonical}"
@@ -208,9 +215,6 @@ def _build_maintain_pipeline_steps(
         qid = wikidata_qid_for_target(canonical, inst)
         category = resolve_commons_category(qid) if qid else None
         if category:
-            # No --workers/--workers-budget: --cat mode is single-process (one
-            # Commons writer at a time), so it neither uses the pool nor needs
-            # the box-wide slot budget.
             steps.append(
                 f"sdc-sync --cat {shlex.quote(category)} --maintain{sync_tail}"
             )
@@ -1028,6 +1032,7 @@ def main() -> None:
                 base,
                 csv_file,
                 count_only,
+                worker_opts=sdc_opts,
             )
         elif sdc_only:
             # SDC-only backfill: re-enumerate the partner's items (which

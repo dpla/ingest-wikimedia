@@ -379,7 +379,13 @@ def test_count_only_requires_maintain():
 
 
 def _maintain_steps(
-    canonical, institutions, count_only, *, collection=None, dpla_id=None
+    canonical,
+    institutions,
+    count_only,
+    *,
+    collection=None,
+    dpla_id=None,
+    worker_opts="",
 ):
     """Run _build_maintain_pipeline_steps with Wikidata resolution stubbed."""
     import scripts.wikimedia_launch as launch_mod
@@ -400,6 +406,7 @@ def _maintain_steps(
             "/srv/base",
             "out.csv",
             count_only,
+            worker_opts=worker_opts,
         )
 
 
@@ -438,6 +445,26 @@ def test_maintain_count_only_skips_staging_and_from_s3():
     # Pre-flight sizing never stages sidecars and never reads from S3.
     assert not any("get-ids-es" in s for s in steps)
     assert not any("--from-s3" in s for s in steps)
+
+
+def test_maintain_write_run_passes_worker_opts_to_cat_sync():
+    steps = _maintain_steps(
+        "digitalnc", (), False, worker_opts=" --workers 6 --workers-budget 24"
+    )
+    sync = next(s for s in steps if s.startswith("sdc-sync"))
+    # Parallel maintain runs the pool under the box-wide slot budget, same flags
+    # as partner mode, appended after --from-s3.
+    assert sync.endswith("--from-s3 digitalnc --workers 6 --workers-budget 24")
+
+
+def test_maintain_count_only_ignores_worker_opts():
+    steps = _maintain_steps(
+        "digitalnc", (), True, worker_opts=" --workers 6 --workers-budget 24"
+    )
+    sync = next(s for s in steps if s.startswith("sdc-sync"))
+    # count-only is serial read-only sizing — never parallelized.
+    assert "--workers" not in sync
+    assert sync.endswith("--maintain --count-only")
 
 
 def test_maintain_rejects_collection_and_single_id_targets():
