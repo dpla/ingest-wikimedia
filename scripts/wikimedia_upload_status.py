@@ -338,7 +338,11 @@ def get_phase_and_progress(
                 f"{_DOWNLOAD_COMPLETE_PREFIX} ({dpla_id_count:,} / {total:,} items)",
                 log_mtime,
             )
-        if "Downloading" in tail or "Key already in S3" in tail:
+        if (
+            "Downloading" in tail
+            or "Key already in S3" in tail
+            or "No media; skipping." in tail
+        ):
             return (
                 f"Downloading ({dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%){stale_suffix}",
                 log_mtime,

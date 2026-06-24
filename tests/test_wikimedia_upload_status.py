@@ -1213,6 +1213,39 @@ def test_total_ordinals_awk_counts_universal_downloading_marker():
     assert "Item [a-f0-9]+: [0-9]+ ordinals" not in main_cmd, main_cmd
 
 
+def test_download_phase_classifies_no_media_skip_marker_as_active():
+    """All-no-media partners — e.g. a maintain-mode pass over a hub whose
+    items have no eligible media — emit the per-item ``No media;
+    skipping.`` marker added at ``tools/downloader.py:484``. The status
+    script must treat that marker as evidence the downloader is
+    actively iterating, not classify the run as ``Stalled``. Without
+    this branch in the tail-check, the prior tests asserting ``Stalled``
+    only on truly missing markers would mask the calhoun-style
+    misclassification."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260623-200436-georgia+calhoun-gordon-county-library-download.log",
+        awk_counts=[42311, 0, 0, 0, 0],  # 42,311 items iterated, no COUNTS yet
+        csv_total=50120,
+        tail="[INFO] 16:50:00: No media; skipping.",
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-georgia+calhoun-gordon-county-library",
+            hub="georgia",
+            label="georgia+calhoun-gordon-county-library",
+        )
+    assert phase is not None
+    assert phase.startswith("Downloading"), phase
+    assert "Stalled" not in phase, phase
+    assert "42,311 / 50,120 items" in phase, phase
+    assert "~84.4%" in phase, phase
+
+
 def test_fetch_position_annotation_for_multi_label_batch():
     """Multi-label batch sessions get a `[<pos>/<total>]` suffix on the
     active label, replacing the prior `(+N more)` form. Lets the
