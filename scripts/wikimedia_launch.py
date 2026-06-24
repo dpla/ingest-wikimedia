@@ -627,7 +627,7 @@ def main() -> None:
 
     for token in target_tokens:
         if is_wikidata_id(token):
-            resolved = resolve_wikidata_id(token)
+            resolved = resolve_wikidata_id(token, maintain=maintain)
             if not resolved:
                 skipped_warnings.append(
                     f"Wikidata ID {token!r}: not found in institutions_v2.json."

@@ -337,3 +337,35 @@ def test_plain_maintain_does_not_set_count_only(monkeypatch, handler_module):
 
     assert reply["statusCode"] == 200
     assert "count_only" not in dispatched[0]["inputs"]
+
+
+def test_duplicate_targets_are_deduped_not_rejected(monkeypatch, handler_module):
+    """A target repeated in one command is silently de-duped and still
+    launches — the operator's intent is unambiguous and running it once is
+    risk-free. Pins the fix for the loud 'appears more than once' rejection."""
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("maintain Q77062489 Q77062489"), None)
+
+    assert reply["statusCode"] == 200
+    assert len(dispatched) == 1, "a duplicate target must not abort the launch"
+    text = _decode_reply(reply)["text"]
+    assert "appears more than once" not in text
+    # The QID survives exactly once in the dispatched partner string.
+    assert dispatched[0]["inputs"]["partner"].count("Q77062489") == 1
+
+
+def test_duplicate_hub_slug_deduped_across_mixed_targets(monkeypatch, handler_module):
+    """De-dupe is by resolved target, preserving first-seen order and keeping
+    distinct targets. `bpl pa bpl` → `bpl pa` (one each)."""
+    dispatched: list[dict] = []
+    _setup_env_and_stubs(monkeypatch, handler_module, dispatched)
+
+    reply = handler_module.handler(_make_event("bpl pa bpl"), None)
+
+    assert reply["statusCode"] == 200
+    assert len(dispatched) == 1
+    partner = dispatched[0]["inputs"]["partner"]
+    assert partner.count("bpl") == 1
+    assert "pa" in partner

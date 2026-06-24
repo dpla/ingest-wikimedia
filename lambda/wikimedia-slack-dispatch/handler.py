@@ -216,25 +216,26 @@ def _validate_launch_targets(
     Validate a list of target tokens (hub slugs, DPLA IDs, QIDs, pipe-separated).
     Returns (launch_targets, None) on success, or ([], error_reply) on the first
     invalid token.
+
+    A target repeated in the same command is silently de-duplicated (kept once,
+    in first-seen order) rather than rejected: the operator's intent is
+    unambiguous, and running it once is risk-free. Only genuinely invalid tokens
+    (unknown hub, bad syntax) abort the launch.
     """
     seen_tokens: set[str] = set()
     launch_targets: list[str] = []
+
+    def _add(target: str) -> None:
+        # De-dupe a repeated target: keep the first occurrence, preserve order.
+        if target not in seen_tokens:
+            seen_tokens.add(target)
+            launch_targets.append(target)
+
     for token in tokens:
         if is_wikidata_id(token):
-            if token in seen_tokens:
-                return [], _slack_reply(
-                    f"Target `{token}` appears more than once.", ephemeral=True
-                )
-            seen_tokens.add(token)
-            launch_targets.append(token)
+            _add(token)
         elif is_dpla_id(token):
-            normalised = token.lower()
-            if normalised in seen_tokens:
-                return [], _slack_reply(
-                    f"Target `{normalised}` appears more than once.", ephemeral=True
-                )
-            seen_tokens.add(normalised)
-            launch_targets.append(normalised)
+            _add(token.lower())
         else:
             pipe_count = token.count("|")
             if pipe_count > 2:
@@ -264,12 +265,7 @@ def _validate_launch_targets(
                 target_str = f"{canonical}|{institution}"
             else:
                 target_str = canonical
-            if target_str in seen_tokens:
-                return [], _slack_reply(
-                    f"Target `{target_str}` appears more than once.", ephemeral=True
-                )
-            seen_tokens.add(target_str)
-            launch_targets.append(target_str)
+            _add(target_str)
     return launch_targets, None
 
 

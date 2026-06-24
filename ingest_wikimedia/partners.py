@@ -339,7 +339,9 @@ def canonical_matches_session_component(
     )
 
 
-def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | None]]:
+def resolve_wikidata_id(
+    qid: str, timeout: int = 5, *, maintain: bool = False
+) -> list[tuple[str, str | None]]:
     """Return (canonical_slug, institution_or_None) pairs matching a Wikidata QID.
 
     Searches hub-level and institution-level Wikidata fields in
@@ -363,6 +365,15 @@ def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | Non
     misleading ``Skipped targets: 'lc'`` error. Filtering here keeps
     eligibility on the QID resolution side, where the data shape is
     available, instead of leaking that knowledge into every caller.
+
+    ``maintain`` drops that filter (QID-only gate): a maintain run
+    reconciles files ALREADY on Commons, so a de-opted (``upload:
+    False``) institution is exactly when it applies — the whole point
+    of maintain. Any hub-/institution-level QID match is returned
+    regardless of the upload flag. A QID present under multiple hubs
+    then resolves to one match per hub, which the launcher groups into
+    one session each (as it does for any cross-hub QID); the same
+    QID-derived Commons category is therefore walked once per hub.
     """
     institutions = _get_institutions(timeout)
     results: list[tuple[str, str | None]] = []
@@ -371,7 +382,7 @@ def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | Non
         if canonical is None:
             continue
         hub_upload = bool(hub_data.get("upload"))
-        if hub_data.get("Wikidata") == qid and hub_upload:
+        if hub_data.get("Wikidata") == qid and (maintain or hub_upload):
             results.append((canonical, None))
         # Don't ``continue`` on a hub-level QID match — if the same
         # QID is also used by an institution within this hub, that
@@ -381,6 +392,6 @@ def resolve_wikidata_id(qid: str, timeout: int = 5) -> list[tuple[str, str | Non
         for inst_name, inst_data in hub_data.get("institutions", {}).items():
             if inst_data.get("Wikidata") != qid:
                 continue
-            if hub_upload or bool(inst_data.get("upload")):
+            if maintain or hub_upload or bool(inst_data.get("upload")):
                 results.append((canonical, inst_name))
     return results
