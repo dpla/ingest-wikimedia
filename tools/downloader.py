@@ -482,6 +482,17 @@ class Downloader:
 
             else:
                 # item metadata has neither media_master nor IIIF manifest field
+                # — emit a per-item marker so the silent-skip path leaves an
+                # activity trail in the log. Without this, an all-no-media
+                # partner (e.g. maintain-mode passes over a hub whose items
+                # have no eligible media) produces only ``DPLA ID:`` lines per
+                # item and no other downloader markers, which makes
+                # ``wikimedia_upload_status`` misclassify the active phase
+                # as ``Stalled``. This branch didn't matter before maintain
+                # mode existed — most pre-maintain partners had at least
+                # ``mediaMaster`` or an IIIF manifest, so the silent path
+                # was rarely hit at scale.
+                logging.info("No media; skipping.")
                 self.tracker.increment(Result.SKIPPED)
                 return
 
