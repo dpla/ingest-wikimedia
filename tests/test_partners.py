@@ -182,6 +182,49 @@ def test_resolve_wikidata_id_same_hub_overlap_picks_up_eligible_institution():
     assert results == [("overlap-hub", "Self-listed Institution")]
 
 
+def test_resolve_wikidata_id_maintain_keeps_de_opted_matches_across_hubs():
+    """In maintain mode the upload-eligibility filter is dropped (QID-only
+    gate): a de-opted (upload=false) institution still resolves, because
+    maintain reconciles files ALREADY on Commons — exactly when it applies. A
+    QID present under multiple hubs resolves to one match per hub. Mirrors the
+    reported Duke (Q5312898) case, which the default filter wrongly returned
+    empty for (→ misleading "not found in institutions_v2.json")."""
+    data = {
+        "Digital Library of Georgia": {
+            "Wikidata": "Qhub-ga",
+            "upload": False,
+            "institutions": {
+                "Duke University. Library": {"Wikidata": "Q5312898", "upload": False},
+            },
+        },
+        "Internet Archive": {
+            "Wikidata": "Qhub-ia",
+            "upload": False,
+            "institutions": {
+                "Duke University Libraries": {"Wikidata": "Q5312898", "upload": False},
+            },
+        },
+        "North Carolina Digital Heritage Center": {
+            "Wikidata": "Qhub-nc",
+            "upload": False,
+            "institutions": {
+                "Duke University Libraries": {"Wikidata": "Q5312898", "upload": False},
+            },
+        },
+    }
+    with _mock_institutions(data):
+        default = resolve_wikidata_id("Q5312898")
+        maintained = resolve_wikidata_id("Q5312898", maintain=True)
+    # The default (upload-gated) path drops all three — the reported bug.
+    assert default == []
+    # Maintain keeps every match, one per hub (launcher groups → one session each).
+    assert set(maintained) == {
+        ("georgia", "Duke University. Library"),
+        ("ia", "Duke University Libraries"),
+        ("digitalnc", "Duke University Libraries"),
+    }
+
+
 # --- maintain mode: slug/target -> QID -> exact Commons category -------------
 
 
