@@ -212,7 +212,19 @@ def test_resolve_wikidata_id_maintain_keeps_de_opted_matches_across_hubs():
             },
         },
     }
-    with _mock_institutions(data):
+    # Pin the slug map locally so the test exercises only the maintain-mode
+    # filter, not the real registry (a slug rename shouldn't break it).
+    with (
+        _mock_institutions(data),
+        patch.dict(
+            "ingest_wikimedia.partners._SLUG_BY_HUB_NAME",
+            {
+                "digital library of georgia": "georgia",
+                "internet archive": "ia",
+                "north carolina digital heritage center": "digitalnc",
+            },
+        ),
+    ):
         default = resolve_wikidata_id("Q5312898")
         maintained = resolve_wikidata_id("Q5312898", maintain=True)
     # The default (upload-gated) path drops all three — the reported bug.
