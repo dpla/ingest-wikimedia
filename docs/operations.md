@@ -137,7 +137,7 @@ A Wikidata entity identifier (e.g. `Q72380652`). The launch script resolves the 
 
 For a **regular** run, QID resolution drops matches that aren't upload-eligible (hub *and* institution both `upload=false`), so an ineligible QID resolves to nothing. In **maintain** mode that filter is lifted (QID-only gate) — a de-opted (`upload=false`) institution resolves and runs, which is the whole point of maintain. A QID present under multiple hubs then yields one session per hub.
 
-The Lambda handler validates QID format (`^Q\d+$`) and passes QIDs through unchanged; resolution happens in the launch script where `institutions_v2.json` is already cached. A target repeated in the same command (or a QID and its `hub|institution` equivalent) is silently de-duplicated rather than rejected.
+The Lambda handler validates QID format (`^Q\d+$`) and passes QIDs through unchanged; resolution happens in the launch script where `institutions_v2.json` is already cached. A target **repeated verbatim** in the same command is silently de-duplicated (kept once) rather than rejected. A QID and its equivalent `hub|institution` form are *different* raw tokens, so they aren't collapsed there — but they resolve to the same session label, and the launcher skips the duplicate with a warning. Either way the target runs once.
 
 ---
 
