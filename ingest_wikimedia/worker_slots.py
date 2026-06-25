@@ -13,15 +13,30 @@ a fixed directory of N slot files, each acquired with a non-blocking
 work and releases it on return. When more would-be writers than slots
 exist across all sessions, the excess block until a slot frees.
 
-Both Commons-writing phases draw from the same pool:
+Both Commons-writing phases draw from the slot pool, but with a tier:
 
-  * **SDC sync** — each pool worker (``--workers N``) holds one slot per
-    item it processes.
-  * **Uploader** — single-process (no parallelism), but holds one slot
-    per item too, so it counts as one writer against the shared cap
-    alongside SDC-sync workers. (The downloader is deliberately NOT in
-    the pool: it writes to source sites, not Commons, so it contends for
-    a different resource.)
+  * **Shared pool** (``DEFAULT_SLOT_DIR``) — the box-wide budget every
+    SDC-sync worker contends over. Each pool worker (``--workers N``)
+    holds one slot per item it processes.
+  * **Uploader priority pool** (``UPLOADER_PRIORITY_SLOT_DIR``) — a
+    smaller dedicated pool (``UPLOADER_PRIORITY_SLOTS``) that ONLY
+    uploaders use. The uploader's :class:`WorkerSlotBudget` is wired
+    with the priority pool as primary and the shared pool as
+    ``fallback``, so it acquires from priority first and spills into
+    shared only when all priority slots are held by other simultaneous
+    uploaders. SDC sync constructs no fallback, so it can never lock
+    a priority slot.
+
+    Net effect: an uploader is never blocked by SDC-sync workers as
+    long as fewer than ``UPLOADER_PRIORITY_SLOTS`` uploader items are
+    box-wide in flight. The priority pool is additive (not carved out
+    of the shared budget), trading ~4 more concurrent Commons writers
+    under saturation for guaranteed uploader headroom — a deliberate
+    choice given uploaders are slow-moving and SDC sessions are
+    memory-cheap.
+
+  * **Downloader** is deliberately not in either pool: it writes to
+    source sites, not Commons, so it contends for a different resource.
 
 So the cap bounds the number of DPLA *items* being actively written to
 Commons at once across the whole box — summed over every upload and
@@ -94,6 +109,32 @@ _FLOCK_CONTENDED_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 # clears /tmp also kills every holder, so there's nothing to preserve.
 DEFAULT_SLOT_DIR = "/tmp/sdc-sync-worker-slots"
 
+# Dedicated priority-pool directory for uploader sessions. Smaller pool
+# (UPLOADER_PRIORITY_SLOTS) that ONLY uploaders contend over, kept on a
+# separate path so SDC-sync workers — which never use this directory —
+# can't lock its slots. Uploaders try this pool first per acquisition
+# pass and fall back to ``DEFAULT_SLOT_DIR`` only when all priority
+# slots are held by other uploaders. Net effect: an uploader is never
+# blocked by SDC-sync workers as long as fewer than
+# ``UPLOADER_PRIORITY_SLOTS`` uploader items are simultaneously in
+# flight box-wide.
+UPLOADER_PRIORITY_SLOT_DIR = "/tmp/dpla-uploader-priority-slots"
+
+# Default size of the dedicated uploader priority pool. Sized for
+# typical box concurrency (1–4 uploader sessions, each holding ≤1 slot
+# at any moment): four priority slots fully absorbs the common case
+# without ever queueing behind SDC-sync workers.
+#
+# This pool is ADDITIVE to the shared pool — total writers on the box
+# = shared budget + UPLOADER_PRIORITY_SLOTS — because uploaders are
+# slow-moving (one item per session at a time, big multi-page items
+# hold a slot for many minutes) and SDC sessions are memory-cheap, so
+# carving out of the existing shared budget would shrink SDC concurrency
+# without buying much for uploads. Adding fresh capacity costs ~4 more
+# concurrent Commons writers under saturation, which Commons' parser
+# pool tolerates comfortably.
+UPLOADER_PRIORITY_SLOTS = 4
+
 # Poll interval when every slot is currently held. Slots turn over on
 # the order of seconds (one per-item SDC sync), so a sub-second poll
 # keeps latency low without busy-spinning.
@@ -112,11 +153,27 @@ class WorkerSlotBudget:
     ``budget <= 0`` disables the semaphore entirely: :meth:`acquire`
     becomes a no-op context manager. This is the single-process /
     unlimited path — callers don't special-case it.
+
+    Optional ``fallback``: when set, :meth:`acquire` tries this budget
+    first (single non-blocking pass per iteration) and only consults
+    ``fallback`` once the primary pool is fully held. Used for the
+    uploader's two-tier setup: a small dedicated pool (this budget)
+    that the uploader tries first, with the box-wide shared pool
+    (``fallback``) as overflow. The fallback's slots come from a
+    DIFFERENT directory and a DIFFERENT lock-file set, so they're
+    accounted for separately and SDC workers using only the fallback
+    can never lock priority slots.
     """
 
-    def __init__(self, budget: int, slot_dir: str = DEFAULT_SLOT_DIR):
+    def __init__(
+        self,
+        budget: int,
+        slot_dir: str = DEFAULT_SLOT_DIR,
+        fallback: "WorkerSlotBudget | None" = None,
+    ):
         self.budget = budget
         self.slot_dir = slot_dir
+        self.fallback = fallback
         # Cumulative seconds this process spent blocked in acquire() waiting
         # for a free slot. ~0 when the budget isn't contended; grows under
         # saturation. Callers read it to report slot contention.
@@ -170,10 +227,13 @@ class WorkerSlotBudget:
         (also released automatically if this process dies while
         holding it).
 
-        When ``budget <= 0`` the budget is disabled and this yields
-        immediately without touching the filesystem.
+        When ``budget <= 0`` the budget is disabled, AND no fallback is
+        set, this yields immediately without touching the filesystem.
+        When ``budget <= 0`` but a fallback exists, defers to the
+        fallback's normal acquisition — preserving the "primary disabled,
+        still capped by fallback" semantics callers may rely on.
         """
-        if self.budget <= 0:
+        if self.budget <= 0 and self.fallback is None:
             yield
             return
 
@@ -189,36 +249,67 @@ class WorkerSlotBudget:
                 # LOCK_UN needed — close is the documented release.
                 os.close(fd)
 
-    def _acquire_slot_fd(self) -> int:
-        """Block until a slot is free; return the held fd.
+    def _try_acquire_one_pass(self) -> int | None:
+        """One non-blocking scan over this budget's slot files. Returns
+        the held fd on success, ``None`` if every slot is currently held.
 
-        Returns the open file descriptor whose flock this call now
-        holds. Caller owns closing it.
+        Doesn't sleep, doesn't log, doesn't recurse into ``fallback`` —
+        that policy lives in ``_acquire_slot_fd``. A disabled budget
+        (``budget <= 0``) returns ``None`` immediately so callers
+        composing tiers can move on to the next pool.
+        """
+        if self.budget <= 0:
+            return None
+        for i in range(self.budget):
+            path = os.path.join(self.slot_dir, f"slot-{i}")
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, _SLOT_FILE_MODE)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as e:
+                os.close(fd)
+                if e.errno in _FLOCK_CONTENDED_ERRNOS:
+                    # Slot held by another worker/session — try the
+                    # next one. Any other errno (permission, ENOLCK,
+                    # I/O) is a real fault: re-raise rather than spin
+                    # forever masking it.
+                    continue
+                raise
+        return None
+
+    def _acquire_slot_fd(self) -> int:
+        """Block until a slot is free in this budget or its fallback;
+        return the held fd.
+
+        Tries the primary pool first (single non-blocking pass), then —
+        only if all primary slots are held — the fallback pool. Sleeps
+        and retries when both are saturated. Caller owns closing the
+        returned fd; closing releases the flock regardless of which
+        pool's directory it came from.
+
+        The priority order (primary > fallback) is what makes the
+        uploader's dedicated pool actually a priority pool: the uploader
+        consistently gets a dedicated slot first if any are free, and
+        only spills into the shared pool when its own four slots are
+        exhausted by other simultaneously-running uploaders.
         """
         waited_logged = False
         while True:
-            for i in range(self.budget):
-                path = os.path.join(self.slot_dir, f"slot-{i}")
-                fd = os.open(path, os.O_RDWR | os.O_CREAT, _SLOT_FILE_MODE)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = self._try_acquire_one_pass()
+            if fd is not None:
+                return fd
+            if self.fallback is not None:
+                fd = self.fallback._try_acquire_one_pass()
+                if fd is not None:
                     return fd
-                except OSError as e:
-                    os.close(fd)
-                    if e.errno in _FLOCK_CONTENDED_ERRNOS:
-                        # Slot held by another worker/session — try the
-                        # next one. Any other errno (permission, ENOLCK,
-                        # I/O) is a real fault: re-raise rather than spin
-                        # forever masking it.
-                        continue
-                    raise
-            # Every slot busy. Log once so an operator watching the log
-            # can see the budget is saturated (expected under heavy
-            # concurrency), then poll.
+            # Every slot busy across primary AND fallback. Log once so an
+            # operator watching the log can see the budget is saturated
+            # (expected under heavy concurrency), then poll.
             if not waited_logged:
+                total = self.budget + (self.fallback.budget if self.fallback else 0)
                 logging.info(
                     " -- All %d %s; waiting for capacity.",
-                    self.budget,
+                    total,
                     SLOTS_BUSY_LOG_MARKER,
                 )
                 waited_logged = True

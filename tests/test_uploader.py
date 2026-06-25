@@ -1446,25 +1446,32 @@ def test_pageid_refresh_returns_immediately_on_first_success(monkeypatch):
 def test_main_acquires_one_budget_slot_per_item():
     """main() must construct a WorkerSlotBudget from --workers-budget and
     enter its acquire() context exactly once per DPLA item, around the
-    process_item call. A spy budget records the constructed budget value
-    and counts context entries."""
+    process_item call. A spy budget records every constructed instance
+    (the uploader now builds two: a priority pool with the shared pool
+    wired as its fallback) and counts context entries on the outer
+    instance the per-item loop actually uses."""
     from click.testing import CliRunner
 
     import tools.uploader as up
 
     acquire_calls = []
-    constructed_budget = {}
+    instances: list = []
 
     class _SpyBudget:
-        def __init__(self, budget):
-            constructed_budget["value"] = budget
+        def __init__(self, budget, slot_dir=None, fallback=None):
+            self.budget = budget
+            self.slot_dir = slot_dir
+            self.fallback = fallback
+            instances.append(self)
 
         def acquire(self):
             from contextlib import contextmanager
 
+            outer = self
+
             @contextmanager
             def _cm():
-                acquire_calls.append(True)
+                acquire_calls.append(outer)
                 yield
 
             return _cm()
@@ -1508,10 +1515,30 @@ def test_main_acquires_one_budget_slot_per_item():
             )
 
     assert result.exit_code == 0, result.output
-    assert constructed_budget["value"] == 16, "budget not built from --workers-budget"
     assert processed == ["id_a", "id_b", "id_c"], "all items must be processed"
+    # The uploader builds two budgets when --workers-budget > 0:
+    #   * a shared-pool instance sized at --workers-budget (16), no fallback
+    #   * a priority-pool instance sized at UPLOADER_PRIORITY_SLOTS, with
+    #     the shared instance wired as its fallback
+    # The per-item loop must acquire on the OUTER (priority) instance so
+    # the priority>fallback acquisition order kicks in.
+    from ingest_wikimedia.worker_slots import (
+        UPLOADER_PRIORITY_SLOT_DIR,
+        UPLOADER_PRIORITY_SLOTS,
+    )
+
+    assert len(instances) == 2, f"expected priority + shared budgets; got {instances}"
+    shared = next(b for b in instances if b.fallback is None)
+    priority = next(b for b in instances if b.fallback is not None)
+    assert shared.budget == 16, "shared pool not sized from --workers-budget"
+    assert priority.budget == UPLOADER_PRIORITY_SLOTS
+    assert priority.slot_dir == UPLOADER_PRIORITY_SLOT_DIR
+    assert priority.fallback is shared, "priority pool must point at shared as fallback"
     assert len(acquire_calls) == 3, (
         f"expected one slot acquire per item; got {len(acquire_calls)}"
+    )
+    assert all(b is priority for b in acquire_calls), (
+        "per-item loop must acquire on the priority (outer) budget, not the shared one"
     )
 
 

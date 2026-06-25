@@ -232,3 +232,133 @@ def test_total_wait_seconds_accumulates_when_blocked(tmp_path):
     t.join(timeout=1)
     assert not t.is_alive(), "worker thread should exit after slot release"
     assert budget.total_wait_seconds > 0.3
+
+
+# ---- Two-tier (uploader priority + shared fallback) behaviour ----
+
+
+def test_two_tier_prefers_priority_pool_over_fallback(tmp_path):
+    """Uploader budget with a priority pool AND a shared fallback must
+    consume a priority slot first whenever one is free, leaving the
+    shared pool entirely untouched. This is the whole point of the
+    dedicated pool — SDC workers using the shared pool must never see
+    an uploader holding one of their slots when there's priority
+    capacity to spare."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=3, slot_dir=str(shared_dir))
+    uploader = WorkerSlotBudget(budget=2, slot_dir=str(priority_dir), fallback=shared)
+    with uploader.acquire():
+        # Priority pool: slot-0 must be held; shared pool: nothing held.
+        assert _slot_is_held(str(priority_dir), 0), (
+            "uploader should consume a priority slot first"
+        )
+        assert not any(_slot_is_held(str(shared_dir), i) for i in range(3)), (
+            "shared pool must remain untouched while priority capacity is free"
+        )
+
+
+def test_two_tier_falls_back_to_shared_when_priority_saturated(tmp_path):
+    """When every priority slot is held (simulating the uploader's
+    priority pool being fully consumed by other simultaneous uploader
+    sessions), the next uploader acquire MUST fall back to a shared
+    slot rather than block — overflow is the point of the fallback."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=3, slot_dir=str(shared_dir))
+    uploader = WorkerSlotBudget(budget=2, slot_dir=str(priority_dir), fallback=shared)
+    with (
+        _foreign_flock(str(priority_dir), 0),
+        _foreign_flock(str(priority_dir), 1),
+    ):
+        acquired = []
+
+        def worker():
+            with uploader.acquire():
+                # Priority pool is fully held by foreigners; the
+                # uploader must be in the shared pool now.
+                acquired.append(
+                    any(_slot_is_held(str(shared_dir), i) for i in range(3))
+                )
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=2)
+        assert not t.is_alive(), "uploader must not block when fallback has room"
+        assert acquired == [True], "uploader fallback should have taken a shared slot"
+
+
+def test_two_tier_blocks_only_when_both_pools_saturated(tmp_path):
+    """If both the priority pool AND the shared pool are fully held,
+    the uploader must poll-wait — the two-tier composition shouldn't
+    accidentally bypass the cap. Once any slot in either pool frees,
+    acquisition proceeds."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=1, slot_dir=str(shared_dir))
+    uploader = WorkerSlotBudget(budget=1, slot_dir=str(priority_dir), fallback=shared)
+    proceeded = threading.Event()
+
+    def worker():
+        with uploader.acquire():
+            proceeded.set()
+
+    stack = contextlib.ExitStack()
+    stack.enter_context(_foreign_flock(str(priority_dir), 0))
+    stack.enter_context(_foreign_flock(str(shared_dir), 0))
+    t = threading.Thread(target=worker)
+    t.start()
+    try:
+        # Both pools fully held → worker must block.
+        assert not proceeded.wait(timeout=0.8)
+    finally:
+        stack.close()  # release both, worker should proceed
+    assert proceeded.wait(timeout=3), "should proceed once any pool frees"
+    t.join(timeout=1)
+    assert not t.is_alive()
+
+
+def test_two_tier_sdc_path_never_touches_priority_pool(tmp_path):
+    """SDC sync constructs its budget with NO fallback, so it can only
+    ever consume shared slots — the priority pool is uploader-only by
+    construction. Pin this so a future refactor doesn't accidentally
+    wire SDC into the priority pool and undo the whole guarantee."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    # SDC's budget is plain — no fallback, single pool.
+    sdc = WorkerSlotBudget(budget=2, slot_dir=str(shared_dir))
+    assert sdc.fallback is None
+    with sdc.acquire():
+        assert not any(_slot_is_held(str(priority_dir), i) for i in range(2)), (
+            "SDC sync must not lock priority slots even by accident"
+        )
+
+
+def test_priority_pool_release_does_not_leak_shared_slot(tmp_path):
+    """Closing the acquired fd releases the flock regardless of which
+    pool's directory the slot lives in. Spec-pin so a stray bookkeeping
+    bug can't leak a shared slot when the uploader had been in the
+    priority pool, or vice versa."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=2, slot_dir=str(shared_dir))
+    uploader = WorkerSlotBudget(budget=2, slot_dir=str(priority_dir), fallback=shared)
+    # Force the fallback path by holding all priority slots.
+    with _foreign_flock(str(priority_dir), 0), _foreign_flock(str(priority_dir), 1):
+        with uploader.acquire():
+            held = [_slot_is_held(str(shared_dir), i) for i in range(2)]
+            assert sum(held) == 1, "exactly one shared slot held during the block"
+    # After the block both shared slots must be free again.
+    assert all(not _slot_is_held(str(shared_dir), i) for i in range(2)), (
+        "shared slot must release when the uploader's with-block exits"
+    )
