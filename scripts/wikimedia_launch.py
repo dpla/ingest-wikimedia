@@ -203,7 +203,7 @@ def _maintain_sdc_cat_steps(
     commonswiki sitelink — never derived from the display name).
 
     An institution whose category can't be resolved emits a failing
-    ``echo … >&2; exit 1`` rather than silently widening the write scope.
+    ``echo … >&2; false`` rather than silently widening the write scope.
     Shared by the lite and hash maintain routes — both anchor the SDC phase on
     the *live category*, so reconciliation covers every file already on
     Commons, not just a get-ids id list.
@@ -224,7 +224,18 @@ def _maintain_sdc_cat_steps(
                 f"maintain: could not resolve a Commons category for {who}"
                 " (missing Wikidata QID or P8464 Commons-category link); skipping."
             )
-            steps.append(f"echo {shlex.quote(msg)} >&2; exit 1")
+            # ``false`` (not ``exit 1``): the launcher composes per-target
+            # blocks with a trailing ``|| { notify_fail; }``, expecting
+            # individual targets to fail loudly without taking the rest of
+            # the batch down with them. ``exit 1`` here would terminate the
+            # whole shell — bypassing both the per-target ``||`` notify and
+            # every subsequent target's block — so the first un-resolvable
+            # institution kills the entire batch (observed on a 15-QID
+            # maintain run where target #3 had no P8464 sitelink, leaving
+            # targets #4-15 unrun and Slack silent). ``false`` fails the
+            # ``&&`` chain with exit 1 but stays in the same shell, so the
+            # outer ``||`` runs and the chain proceeds to the next target.
+            steps.append(f"echo {shlex.quote(msg)} >&2; false")
     return steps
 
 
@@ -265,7 +276,9 @@ def _build_maintain_lite_pipeline_steps(
             f"maintain mode does not support {unit} targets; it operates"
             " on a whole hub/institution Commons category."
         )
-        return [f"cd {base}", f"echo {shlex.quote(msg)} >&2; exit 1"]
+        # ``false`` not ``exit 1`` — see the note on the
+        # missing-category branch below; same reasoning applies here.
+        return [f"cd {base}", f"echo {shlex.quote(msg)} >&2; false"]
 
     # count-only and --from-s3 are mutually exclusive: pre-flight sizing only
     # resolves the re-link (no sidecar read, no write), so it skips both the
