@@ -470,10 +470,62 @@ def test_maintain_count_only_ignores_worker_opts():
 
 def test_maintain_rejects_collection_and_single_id_targets():
     coll = _maintain_steps("georgia", (), False, collection="Maps")
-    assert coll[-1].endswith("exit 1")
+    # ``false``, not ``exit 1`` — see test below: ``exit 1`` from inside the
+    # outer ``{ … }`` group kills the whole batch script, not just the target.
+    assert coll[-1].endswith("false")
     assert "does not support" in coll[-1]
     single = _maintain_steps("georgia", (), False, dpla_id="abc123")
-    assert single[-1].endswith("exit 1")
+    assert single[-1].endswith("false")
+
+
+def test_maintain_unresolvable_category_fails_target_not_whole_batch():
+    """If a target can't be resolved to a Commons category, the launcher
+    must fail JUST that target (so the outer ``|| { notify_fail; }`` runs
+    and the next target proceeds), NOT terminate the whole shell.
+
+    The launcher composes per-target blocks as
+    ``{ cd … && step1 && … && <error-step> ; } || { notify_fail; }`` and
+    chains many such blocks with ``;``. ``exit 1`` inside the outer ``{ … }``
+    group kills the whole shell — bypassing both the per-target ``||`` notify
+    AND every subsequent target's block. Observed on a 15-QID maintain run
+    where target #3 (Azalea Regional Library System, Q29094224) had no P8464
+    sitelink: its target block ran through download + uploader, then hit
+    ``exit 1``, leaving targets #4-15 unrun and no Slack failure post
+    (because ``exit`` bypasses ``||``).
+
+    ``false`` is the right primitive here: it fails the ``&&`` chain with
+    exit 1 but stays in the same shell, so the outer ``||`` fires and the
+    chain proceeds to the next target.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    # Force "no category resolvable" path: wikidata_qid_for_target returns
+    # None (no QID on the institution at all).
+    with (
+        patch.object(launch_mod, "wikidata_qid_for_target", return_value=None),
+        patch.object(launch_mod, "resolve_commons_category", return_value=None),
+    ):
+        steps = launch_mod._build_maintain_lite_pipeline_steps(
+            "georgia",
+            ("Azalea Regional Library System",),
+            None,
+            None,
+            "/srv/base",
+            "out.csv",
+            count_only=False,
+            worker_opts="",
+        )
+
+    error_step = next(s for s in steps if "could not resolve" in s)
+    # Must NOT use ``exit 1`` — that would kill the whole batch shell.
+    assert "exit 1" not in error_step, (
+        f"error step uses ``exit 1`` which terminates the whole batch shell; "
+        f"must use ``false`` to fail only this target. Got: {error_step!r}"
+    )
+    # Must use ``false`` so the ``&&`` chain fails but the shell survives.
+    assert error_step.endswith("false"), error_step
+    # The diagnostic to stderr must still be present.
+    assert "could not resolve a Commons category" in error_step
 
 
 def test_maintain_mutually_exclusive_with_sdc_only():
