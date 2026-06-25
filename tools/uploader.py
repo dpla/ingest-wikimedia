@@ -30,7 +30,11 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
-from ingest_wikimedia.worker_slots import WorkerSlotBudget
+from ingest_wikimedia.worker_slots import (
+    UPLOADER_PRIORITY_SLOT_DIR,
+    UPLOADER_PRIORITY_SLOTS,
+    WorkerSlotBudget,
+)
 from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
@@ -1591,17 +1595,36 @@ def main(
 
     dpla.check_partner(partner)
 
-    # Box-wide Commons-write budget, shared with the SDC-sync phase
-    # (same flock slot dir). The uploader is single-process, so it holds
-    # exactly one slot while working an item — counting as one writer
-    # against the shared cap so concurrent upload + SDC-sync sessions
+    # Box-wide Commons-write budget. The uploader is single-process, so
+    # it holds exactly one slot while working an item — counting as one
+    # writer against the cap so concurrent upload + SDC-sync sessions
     # across the host don't collectively overrun Commons' maxlag
     # threshold. Per-item acquire (not whole-run) so the uploader doesn't
     # stall at startup holding a slot through its S3 reads when the pool
     # is momentarily full, and briefly frees the slot between items.
-    # budget <= 0 disables it (no-op). Built before the try so the
-    # post-upload touch in the finally can reuse it.
-    slot_budget = WorkerSlotBudget(workers_budget)
+    #
+    # Two-tier: primary = dedicated uploader priority pool, fallback =
+    # the box-wide shared pool the SDC workers contend over. The
+    # uploader's per-item ``slot_budget.acquire()`` tries the priority
+    # pool first and only spills into the shared pool when fewer than
+    # ``UPLOADER_PRIORITY_SLOTS`` uploader items would otherwise be
+    # serviced — which means an uploader is never blocked by SDC
+    # workers as long as box-wide uploader concurrency stays within the
+    # priority pool's size. See ``ingest_wikimedia.worker_slots`` for
+    # the rationale (additive, not carved out of the shared budget).
+    #
+    # ``workers_budget <= 0`` disables both pools (standalone run).
+    # Built before the try so the post-upload touch in the finally can
+    # reuse it.
+    if workers_budget > 0:
+        shared_budget = WorkerSlotBudget(workers_budget)
+        slot_budget = WorkerSlotBudget(
+            UPLOADER_PRIORITY_SLOTS,
+            slot_dir=UPLOADER_PRIORITY_SLOT_DIR,
+            fallback=shared_budget,
+        )
+    else:
+        slot_budget = WorkerSlotBudget(0)
 
     try:
         local_fs.setup_temp_dir()
