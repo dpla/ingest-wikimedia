@@ -12,10 +12,12 @@ The fix is to filter results by ``upload`` at resolution time so
 non-eligible matches never leak to the launcher.
 """
 
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
 from ingest_wikimedia import partners
 from ingest_wikimedia.partners import (
+    commons_has_files_for_qid,
     resolve_commons_category,
     resolve_wikidata_id,
     wikidata_qid_for_target,
@@ -297,3 +299,64 @@ def test_resolve_commons_category_rejects_non_qid():
     with patch.object(partners, "_fetch_wikidata_entity") as fetch:
         assert resolve_commons_category("georgia") is None
         fetch.assert_not_called()
+
+
+def _fake_commons_search_response(totalhits: int) -> bytes:
+    """Shape a Cirrus list=search response so urlopen().read() can hand it
+    straight to ``commons_has_files_for_qid``."""
+    return json.dumps(
+        {"query": {"searchinfo": {"totalhits": totalhits}, "search": []}}
+    ).encode()
+
+
+def test_commons_has_files_for_qid_true_when_p195_hits():
+    """One or more files carry P195=<qid> in SDC: maintain has work to do."""
+    fake_resp = MagicMock()
+    fake_resp.__enter__.return_value.read.return_value = _fake_commons_search_response(
+        42
+    )
+    with (
+        patch.object(partners, "_commons_files_for_qid_cache", {}),
+        patch.object(partners.urllib.request, "urlopen", return_value=fake_resp),
+    ):
+        assert commons_has_files_for_qid("Q12345") is True
+
+
+def test_commons_has_files_for_qid_false_when_no_hits():
+    """Zero P195=<qid> hits: case-2 — the launcher should skip the
+    target's SDC step gracefully (see
+    ``test_maintain_no_category_no_files_skips_target_gracefully``)."""
+    fake_resp = MagicMock()
+    fake_resp.__enter__.return_value.read.return_value = _fake_commons_search_response(
+        0
+    )
+    with (
+        patch.object(partners, "_commons_files_for_qid_cache", {}),
+        patch.object(partners.urllib.request, "urlopen", return_value=fake_resp),
+    ):
+        assert commons_has_files_for_qid("Q12345") is False
+
+
+def test_commons_has_files_for_qid_fails_open_on_network_error():
+    """A transient Commons API outage must NOT silently downgrade a real
+    case-1 (files exist) target to case-2 (skipped). Return True on any
+    network/parse error so the launcher errs on the side of running the
+    SDC step rather than dropping a target."""
+    import urllib.error as _ue
+
+    with (
+        patch.object(partners, "_commons_files_for_qid_cache", {}),
+        patch.object(
+            partners.urllib.request,
+            "urlopen",
+            side_effect=_ue.URLError("boom"),
+        ),
+    ):
+        assert commons_has_files_for_qid("Q12345") is True
+
+
+def test_commons_has_files_for_qid_rejects_non_qid_without_network():
+    """No QID → no network call; just return False."""
+    with patch.object(partners.urllib.request, "urlopen") as urlopen:
+        assert commons_has_files_for_qid("not-a-qid") is False
+        urlopen.assert_not_called()

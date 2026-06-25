@@ -499,11 +499,13 @@ def test_maintain_unresolvable_category_fails_target_not_whole_batch():
     """
     import scripts.wikimedia_launch as launch_mod
 
-    # Force "no category resolvable" path: wikidata_qid_for_target returns
-    # None (no QID on the institution at all).
+    # Force the no-QID, no-category path (case-1 / QID-less). The case-2
+    # branch (which would emit ``true``) needs a real QID; with qid=None
+    # the launcher falls straight through to the loud-failure step.
     with (
         patch.object(launch_mod, "wikidata_qid_for_target", return_value=None),
         patch.object(launch_mod, "resolve_commons_category", return_value=None),
+        patch.object(launch_mod, "commons_has_files_for_qid", return_value=True),
     ):
         steps = launch_mod._build_maintain_lite_pipeline_steps(
             "georgia",
@@ -526,6 +528,85 @@ def test_maintain_unresolvable_category_fails_target_not_whole_batch():
     assert error_step.endswith("false"), error_step
     # The diagnostic to stderr must still be present.
     assert "could not resolve a Commons category" in error_step
+
+
+def test_maintain_no_category_no_files_skips_target_gracefully():
+    """Case-2: institution has a QID but no Commons category yet AND no
+    existing files on Commons reference the QID. There's nothing to
+    maintain; the launcher must succeed the target (``true``) with an
+    info-log line, not fail it.
+
+    Observed live on Azalea Regional Library System (Q29094224),
+    Columbia County Library (Q78362427), and Live Oak Public Libraries
+    (Q30268035) — all three have institutions_v2.json entries with
+    Wikidata QIDs but no P8464 sitelink and zero Commons files carrying
+    P195=<qid>. PR #343 stopped these from killing the batch; this
+    completes the fix by making the per-target outcome a graceful skip
+    instead of a failure notification.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    with (
+        patch.object(launch_mod, "wikidata_qid_for_target", return_value="Q29094224"),
+        patch.object(launch_mod, "resolve_commons_category", return_value=None),
+        patch.object(launch_mod, "commons_has_files_for_qid", return_value=False),
+    ):
+        steps = launch_mod._build_maintain_lite_pipeline_steps(
+            "georgia",
+            ("Azalea Regional Library System",),
+            None,
+            None,
+            "/srv/base",
+            "out.csv",
+            count_only=False,
+            worker_opts="",
+        )
+
+    skip_step = next(s for s in steps if "nothing to maintain" in s)
+    # Must succeed the target (``true``) so the outer ``;`` proceeds to the
+    # next target's block; must NOT use ``false`` (would trigger
+    # notify_pipeline_fail for a non-failure) or ``exit 1`` (would kill the
+    # whole batch).
+    assert skip_step.endswith("true"), skip_step
+    assert "false" not in skip_step.split(";")[-1], skip_step
+    assert "exit 1" not in skip_step, skip_step
+    # The diagnostic should name the institution and the QID so the operator
+    # can identify the skipped target in the tmux log.
+    assert "Azalea Regional Library System" in skip_step
+    assert "Q29094224" in skip_step
+
+
+def test_maintain_no_category_but_files_exist_still_fails_target():
+    """Case-1: no Commons category yet, BUT files exist on Commons
+    referencing the QID. The eventual fix is to call
+    ``CategoryEnsurer.ensure(qid)`` before the SDC step so the category
+    materialises and the sync can walk it — but that path needs a live
+    test case and isn't merged yet. For now we must fail the target
+    LOUDLY (``false`` → notify_pipeline_fail) so the operator sees there's
+    real work being skipped, instead of silently downgrading to the
+    case-2 ``true`` path.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    with (
+        patch.object(launch_mod, "wikidata_qid_for_target", return_value="Q12345"),
+        patch.object(launch_mod, "resolve_commons_category", return_value=None),
+        patch.object(launch_mod, "commons_has_files_for_qid", return_value=True),
+    ):
+        steps = launch_mod._build_maintain_lite_pipeline_steps(
+            "georgia",
+            ("Some Existing-Files Institution",),
+            None,
+            None,
+            "/srv/base",
+            "out.csv",
+            count_only=False,
+            worker_opts="",
+        )
+
+    step = next(s for s in steps if "could not resolve" in s)
+    assert step.endswith("false"), step
+    assert "true" not in step.split(";")[-1], step
 
 
 def test_maintain_mutually_exclusive_with_sdc_only():

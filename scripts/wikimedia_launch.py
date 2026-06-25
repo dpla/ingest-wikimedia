@@ -38,6 +38,7 @@ import requests
 
 from ingest_wikimedia.partners import (
     PARTNER_DIR,
+    commons_has_files_for_qid,
     is_dpla_id,
     is_upload_eligible,
     is_wikidata_id,
@@ -202,8 +203,23 @@ def _maintain_sdc_cat_steps(
     resolving each to its exact Commons category via Wikidata (P8464 →
     commonswiki sitelink — never derived from the display name).
 
-    An institution whose category can't be resolved emits a failing
-    ``echo … >&2; false`` rather than silently widening the write scope.
+    When a category can't be resolved (no P8464 sitelink on the institution's
+    Wikidata item), branch on whether any DPLA-bot uploads exist for the QID:
+
+    * **No files exist on Commons** (case-2): nothing to maintain. Emit an
+      info-log step that exits 0 (``echo … ; true``) so the target succeeds
+      and the batch proceeds — we don't materialise empty category
+      infrastructure pre-emptively, matching the file-driven contract the
+      uploader's ``CategoryEnsurer`` and ``tools/fix_unknown_categories``
+      already follow (don't create a category until there's a file for it).
+    * **Files exist** (case-1, e.g. institution-name drift since the upload):
+      fall through to a per-target failure (``echo … >&2; false``).  The
+      eventual fix is for the launcher to ``CategoryEnsurer.ensure(qid)``
+      before the SDC step in this case, but that path needs a live case to
+      test and isn't merged yet — for now we fail loudly per-target (notify
+      runs, batch continues) instead of silently skipping a target that
+      actually has work.
+
     Shared by the lite and hash maintain routes — both anchor the SDC phase on
     the *live category*, so reconciliation covers every file already on
     Commons, not just a get-ids id list.
@@ -218,24 +234,27 @@ def _maintain_sdc_cat_steps(
             steps.append(
                 f"sdc-sync --cat {shlex.quote(category)} --maintain{sync_tail}"
             )
-        else:
-            who = inst or canonical
+            continue
+        who = inst or canonical
+        if qid and not commons_has_files_for_qid(qid):
+            # Case 2: live institution, brand-new — no Commons category and
+            # no files referencing the QID. Maintain pass is a no-op for this
+            # target; succeed it and continue.
             msg = (
-                f"maintain: could not resolve a Commons category for {who}"
-                " (missing Wikidata QID or P8464 Commons-category link); skipping."
+                f"maintain: no Commons category and no existing files for {who}"
+                f" ({qid}); nothing to maintain — skipping."
             )
-            # ``false`` (not ``exit 1``): the launcher composes per-target
-            # blocks with a trailing ``|| { notify_fail; }``, expecting
-            # individual targets to fail loudly without taking the rest of
-            # the batch down with them. ``exit 1`` here would terminate the
-            # whole shell — bypassing both the per-target ``||`` notify and
-            # every subsequent target's block — so the first un-resolvable
-            # institution kills the entire batch (observed on a 15-QID
-            # maintain run where target #3 had no P8464 sitelink, leaving
-            # targets #4-15 unrun and Slack silent). ``false`` fails the
-            # ``&&`` chain with exit 1 but stays in the same shell, so the
-            # outer ``||`` runs and the chain proceeds to the next target.
-            steps.append(f"echo {shlex.quote(msg)} >&2; false")
+            steps.append(f"echo {shlex.quote(msg)} >&2; true")
+            continue
+        # Case 1 (files exist, no category yet) OR QID-less target — fall
+        # through to per-target failure. ``false`` (not ``exit 1``) so only
+        # this target fails; the outer ``|| { notify_fail; }`` runs and the
+        # batch proceeds. ``exit 1`` would terminate the whole shell (PR #343).
+        msg = (
+            f"maintain: could not resolve a Commons category for {who}"
+            " (missing Wikidata QID or P8464 Commons-category link); skipping."
+        )
+        steps.append(f"echo {shlex.quote(msg)} >&2; false")
     return steps
 
 
