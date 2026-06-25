@@ -7,6 +7,7 @@ GitHub Actions without installing the full ingest_wikimedia package dependencies
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Module-level cache so warm Lambda invocations skip repeated network fetches.
@@ -278,6 +279,64 @@ def resolve_commons_category(qid: str, timeout: int = 10) -> str | None:
                     result = title
                     break
     _commons_category_cache[qid] = result
+    return result
+
+
+# Commons API endpoint for the launcher's case-2 pre-flight (see
+# commons_has_files_for_qid). Same host as commons_site uses, but we go via
+# urllib so this module stays stdlib-only.
+_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
+_commons_files_for_qid_cache: dict[str, bool] = {}
+
+
+def commons_has_files_for_qid(qid: str, timeout: int = 10) -> bool:
+    """True if any Commons File: page carries a P195 (collection) SDC claim
+    pointing at ``qid``.
+
+    Used as the case-2 pre-flight in maintain mode: when an institution has no
+    resolvable Commons category (no P8464 + commonswiki sitelink) AND no file
+    on Commons references its QID, the maintain ``sdc-sync --cat`` step has
+    nothing to walk — the launcher should skip the target gracefully rather
+    than fail it (or eagerly create empty category infrastructure).
+
+    Why P195: every DPLA-bot upload runs through the SDC sync, which posts a
+    P195 ('collection') statement with the institution's QID. So the set of
+    Commons files contributed by an institution is exactly the set with
+    ``haswbstatement:P195=<qid>`` — irrespective of which {{Institution}} /
+    {{DPLA metadata}} template variant the file's wikitext uses. Cirrus's
+    structured-data index makes this a single fast query.
+
+    Fails OPEN (returns True) on any network/parse error so a transient blip
+    doesn't downgrade a real case-1 (files exist) target into a case-2 skip.
+
+    Cached per QID for the life of the process."""
+    if not is_wikidata_id(qid):
+        return False
+    if qid in _commons_files_for_qid_cache:
+        return _commons_files_for_qid_cache[qid]
+    params = {
+        "action": "query",
+        "format": "json",
+        "list": "search",
+        "srsearch": f"haswbstatement:P195={qid}",
+        "srnamespace": "6",
+        "srlimit": "1",
+        "srinfo": "totalhits",
+        "srprop": "",
+    }
+    query = urllib.parse.urlencode(params)
+    url = f"{_COMMONS_API_URL}?{query}"
+    req = urllib.request.Request(url, headers={"User-Agent": _WIKIDATA_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        total = data.get("query", {}).get("searchinfo", {}).get("totalhits", 0)
+        result = bool(total and total > 0)
+    except (urllib.error.URLError, TimeoutError, ValueError, KeyError):
+        # Fail open: assume files exist so the launcher doesn't silently skip a
+        # target on a transient outage.
+        result = True
+    _commons_files_for_qid_cache[qid] = result
     return result
 
 
