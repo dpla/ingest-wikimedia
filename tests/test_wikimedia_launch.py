@@ -410,6 +410,115 @@ def _maintain_steps(
         )
 
 
+# ---------------------------------------------------------------------------
+# Step-marker wrapping: each pipeline step gets an ``export WIKIMEDIA_STEP``
+# prefix so the per-target failure handler can name the failing phase in
+# Slack. Tests pin the per-tool step-name mapping and the special
+# id-generation stderr-tee behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_step_with_marker_tags_each_tool_with_its_phase():
+    """The first token of the command determines the step name. Every
+    Commons-writing tool that the per-target ``&&`` chain runs must
+    produce a recognisable step name so the failure handler can
+    identify the failing phase. ``cd`` / ``echo`` / unknown tokens
+    pass through unchanged."""
+    from scripts.wikimedia_launch import _wrap_step_with_marker
+
+    assert _wrap_step_with_marker("downloader x.csv georgia").startswith(
+        "export WIKIMEDIA_STEP=download && downloader "
+    )
+    assert _wrap_step_with_marker("uploader x.csv ohio --no-create").startswith(
+        "export WIKIMEDIA_STEP=upload && uploader "
+    )
+    assert _wrap_step_with_marker(
+        "sdc-sync --partner texas --ids-file x.csv --workers 6"
+    ).startswith("export WIKIMEDIA_STEP=sdc-sync && sdc-sync ")
+    # Non-step commands (``cd``, the case-2 graceful-skip ``echo … ; true``,
+    # and the ``sdc-sync --cat`` flavour the maintain builder emits — wait,
+    # that one IS sdc-sync. Use a true non-step instead.):
+    assert _wrap_step_with_marker("cd /srv/base") == "cd /srv/base"
+    assert (
+        _wrap_step_with_marker("echo 'maintain: skipping' >&2; true")
+        == "echo 'maintain: skipping' >&2; true"
+    )
+
+
+def test_wrap_step_with_marker_tees_id_generation_stderr():
+    """The id-generation step is the one tool that doesn't call
+    ``setup_logging``, so it produces no log file. To let the
+    failure handler include its stderr in Slack, the launcher tees
+    stderr to a known path while keeping the live stream visible in
+    the tmux pane (``>&2``). Pin the tee shape so a refactor can't
+    silently drop it — the digitalnc-class case (``click.BadParameter``
+    from ``DPLA.check_partner``) only reaches Slack via this tee."""
+    from scripts.wikimedia_launch import _wrap_step_with_marker
+
+    wrapped = _wrap_step_with_marker(
+        "get-ids-es digitalnc --institution 'Duke University Libraries'"
+        " --maintain --skip-media-filter > out.csv"
+    )
+    assert wrapped.startswith("export WIKIMEDIA_STEP=id-generation && ")
+    # The redirect must keep stdout on the CSV (the existing >),
+    # tee stderr to a per-session path interpolated from
+    # ``${WIKIMEDIA_SESSION_LABEL}`` at runtime (so concurrent tmux
+    # sessions can't clobber each other's stderr file), AND pass stderr
+    # through to the pane (``>&2`` inside the substitution).
+    assert "> out.csv" in wrapped
+    assert "${WIKIMEDIA_SESSION_LABEL" in wrapped, (
+        "id-generation stderr path must be per-session, not a shared /tmp file"
+    )
+    assert "tee" in wrapped and ">&2" in wrapped
+
+
+def test_wrap_step_with_marker_id_generation_for_nara_uses_same_phase():
+    """``get-ids-nara`` is the bespoke NARA catalog walker — it
+    replaces ``get-ids-es`` for a bare-hub NARA target but is still
+    the id-generation phase. Same step name + same stderr-tee
+    treatment as ``get-ids-es``, so the failure handler doesn't
+    care which tool ran."""
+    from scripts.wikimedia_launch import _wrap_step_with_marker
+
+    wrapped = _wrap_step_with_marker("get-ids-nara > nara.csv")
+    assert "WIKIMEDIA_STEP=id-generation" in wrapped
+    assert "tee" in wrapped
+
+
+def test_per_target_preamble_unsets_wikimedia_step():
+    """Each target's preamble must reset ``WIKIMEDIA_STEP`` so a
+    failure in the un-wrapped ``cd $base`` step (or any other step
+    not in ``_STEP_BY_FIRST_TOKEN``) doesn't carry over the previous
+    target's last-step name into the Slack failure message.
+
+    Concrete scenario: target 1's sdc-sync runs successfully (exports
+    ``WIKIMEDIA_STEP=sdc-sync``), target 2's ``cd /home/.../wrong-dir``
+    fails. Without this reset, Slack would post "`sdc-sync` step
+    failed" for target 2 — misleading. With the reset, the message
+    falls back to the generic "pipeline step failed" wording, which
+    is accurate.
+
+    Pinned via source inspection rather than running ``main()`` because
+    the label_export composition is inline in the per-target loop and
+    spinning up the full launcher (AWS clients, Slack, partner-dir
+    bootstrapping) for one preamble assertion is more setup than the
+    pin is worth. If the line moves, the source grep still catches it.
+    """
+    import inspect
+
+    import scripts.wikimedia_launch as launch_mod
+
+    source = inspect.getsource(launch_mod)
+    # The per-target preamble (label_export) is the only place this
+    # literal should appear; if it shows up elsewhere, the test still
+    # passes — overzealous-unset is harmless. We only fail when the
+    # reset is MISSING entirely.
+    assert "unset WIKIMEDIA_STEP" in source, (
+        "per-target preamble must clear WIKIMEDIA_STEP so an unwrapped-cd "
+        "failure doesn't inherit the prior target's step name"
+    )
+
+
 def test_maintain_real_run_stages_sidecars_then_syncs_from_s3():
     steps = _maintain_steps("digitalnc", (), count_only=False)
     # One ES scan stages sdc.json sidecars, then the category walk reads them.

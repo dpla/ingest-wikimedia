@@ -39,16 +39,27 @@ def post_message(token: str, text: str) -> None:
         raise RuntimeError(f"Slack API error: {data.get('error')}")
 
 
-# exit code → short hint shown in the Slack failure message.  Anything >128 is
-# a bash-encoded signal (128 + signal number).  137 in particular is SIGKILL,
+# exit code → short hint shown in the Slack failure message. Anything >128 is
+# a bash-encoded signal (128 + signal number). 137 in particular is SIGKILL,
 # which the OOM killer uses — so seeing it in the message is a strong "this was
 # probably an OOM" hint without having to SSM in and check dmesg.
+#
+# Common interpreter-level exits also have universally-recognised meanings:
+#   * 1 — Python uncaught exception (CRITICAL traceback printed to stderr)
+#   * 2 — Click misuse: bad CLI arguments / failed Click-side validation
+#         (e.g. ``click.BadParameter`` from a precheck like
+#         ``DPLA.check_partner``). Always points at config / args, never code.
+#   * 124 — GNU ``timeout`` (1) wrapper killed the child for exceeding its
+#         deadline. Not used in the pipeline today but cheap to include.
 _EXIT_CODE_HINTS: dict[int, str] = {
-    137: "SIGKILL — likely OOM",
-    143: "SIGTERM",
-    139: "SIGSEGV",
-    134: "SIGABRT",
+    1: "uncaught exception — see traceback",
+    2: "rejected its arguments",
+    124: "timed out",
     130: "SIGINT (Ctrl-C)",
+    134: "SIGABRT",
+    137: "SIGKILL — likely OOM",
+    139: "SIGSEGV",
+    143: "SIGTERM",
 }
 
 
@@ -137,12 +148,97 @@ def _summarize_log(log_path: str, tail_lines: int = 8) -> str | None:
     return "\n".join(parts)
 
 
+# Map WIKIMEDIA_STEP (set by the launcher per pipeline step) → the phase
+# suffix the corresponding tool uses for ``setup_logging(...)``. Used by
+# :func:`notify_pipeline_fail` to scope log lookup to the failing step.
+#
+# ``id-generation`` deliberately has no entry: ``tools/get_ids_es.py`` does
+# NOT call ``setup_logging``, so there's no log file to tail. The launcher
+# instead tees its stderr to the per-session path returned by
+# :func:`id_generation_stderr_tail_file` and the failure handler reads
+# that file directly.
+_PHASE_LOG_SUFFIX: dict[str, str] = {
+    "download": "download",
+    "upload": "upload",
+    "sdc-sync": "sdc",
+}
+
+# Per-session-label path the launcher tees ``get-ids-es`` stderr to.
+# Per-label, not a single shared path, because the EC2 box runs many
+# concurrent tmux sessions and a shared ``/tmp/wm-id-generation-stderr.log``
+# would race: two id-generation steps starting near-simultaneously would
+# clobber each other's stderr, and a later failure handler would pick up
+# whichever ran second. The launcher's bash side composes the same path
+# via ``${WIKIMEDIA_SESSION_LABEL}`` interpolation in the tee redirect,
+# so write-side and read-side agree without any extra env var.
+#
+# A label is the per-target slug (e.g. ``georgia+duke-university-library``);
+# it's already passed through ``slugify_session_label_component`` so it's
+# filesystem-safe (lowercase + digits + ``+`` + ``-`` only — no shell
+# metacharacters and no path separators).
+_ID_GENERATION_STDERR_TAIL_BASENAME_PREFIX = "wm-id-generation-stderr"
+# Matches the bash ``${WIKIMEDIA_SESSION_LABEL:-unknown}`` fallback in
+# ``scripts/wikimedia_launch.py``'s tee redirect, so when the env var
+# isn't set on either side both write/read paths produce the same file
+# name. Without this agreement, a partial-env failure handler would
+# look for ``…-stderr.log`` while the launcher wrote
+# ``…-stderr-unknown.log`` and the operator would see no stderr body.
+_ID_GENERATION_STDERR_NO_LABEL_FALLBACK = "unknown"
+
+
+def id_generation_stderr_tail_file(session_label: str | None) -> str:
+    """Return the per-session path the launcher tees ``get-ids-es`` /
+    ``get-ids-nara`` stderr to. The launcher's bash side interpolates
+    the same shape via ``${WIKIMEDIA_SESSION_LABEL:-unknown}``; this
+    helper is the Python read-side counterpart used by
+    :func:`notify_pipeline_fail` and must produce the SAME path for
+    the SAME env state.
+
+    Callers must pass the *raw* ``WIKIMEDIA_SESSION_LABEL`` value (or
+    ``None``/empty when unset), not a display-fallback like ``"unknown"``
+    — otherwise the no-label branch here is dead and the helper agrees
+    with bash only by accident.
+    """
+    label = session_label or _ID_GENERATION_STDERR_NO_LABEL_FALLBACK
+    return f"/tmp/{_ID_GENERATION_STDERR_TAIL_BASENAME_PREFIX}-{label}.log"
+
+
+def _tail_text_file(
+    path: str, tail_lines: int = 8, max_bytes: int = 64 * 1024
+) -> str | None:
+    """Read up to ``max_bytes`` from the end of ``path`` and return the last
+    ``tail_lines`` non-empty lines, or None if the file is missing/unreadable.
+
+    Used by the failure handler for steps without a dedicated log file
+    (currently just id-generation, which has no ``setup_logging`` call).
+    """
+    try:
+        size = os.path.getsize(path)
+        read_size = min(size, max_bytes)
+        with open(path, "rb") as f:
+            f.seek(size - read_size)
+            data = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line for line in data.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return "\n".join(lines[-tail_lines:])
+
+
 def notify_pipeline_fail() -> None:
     """Post a pipeline-step failure notification to Slack.
 
     Reads from the environment:
       DPLA_SLACK_BOT_TOKEN     — required to post
       WIKIMEDIA_SESSION_LABEL  — identifies the target in the message
+      WIKIMEDIA_STEP           — name of the pipeline step that was running
+                                 when the chain broke (``id-generation``,
+                                 ``download``, ``upload``, ``sdc-sync``).
+                                 Empty / unset → "pipeline step" generic
+                                 wording. Set by the launcher's per-step
+                                 ``export`` so the latest assignment before
+                                 the failure sticks in the shell.
       WIKIMEDIA_LAST_EXIT      — exit code of the failed step (best-effort)
       WIKIMEDIA_PARTNER_DIR    — absolute path to the partner dir, used to
                                  locate the most recent log for tailing
@@ -162,20 +258,60 @@ def notify_pipeline_fail() -> None:
             "DPLA_SLACK_BOT_TOKEN not set — skipping pipeline failure notification"
         )
         return
-    label = os.environ.get("WIKIMEDIA_SESSION_LABEL") or "unknown"
+    # Two views of the same env var:
+    #   * ``raw_label`` — the actual value (or ``None`` / empty when
+    #     unset). Passed to :func:`id_generation_stderr_tail_file` so
+    #     the helper's own fallback decides the path. Mixing in a
+    #     display-text fallback here would skip that branch and only
+    #     agree with the bash side by coincidence.
+    #   * ``label`` — display-only, used in Slack header text where an
+    #     empty session label would render ugly backticks.
+    raw_label = os.environ.get("WIKIMEDIA_SESSION_LABEL")
+    label = raw_label or "unknown"
     rc_suffix = _decode_exit_code(os.environ.get("WIKIMEDIA_LAST_EXIT"))
+    step = (os.environ.get("WIKIMEDIA_STEP") or "").strip()
 
     is_last = os.environ.get("WIKIMEDIA_TARGET_IS_LAST") == "1"
     tail_phrase = (
         "no further targets in batch" if is_last else "skipping to next target"
     )
-    msg = f"❌ `wikimedia-{label}`: pipeline step failed{rc_suffix} — {tail_phrase}"
+    # Step-aware header: tells the operator WHICH phase failed
+    # (id-generation / download / upload / sdc-sync), not just "the
+    # pipeline". Pre-step-tracking this said only "pipeline step
+    # failed" — leaving the operator to SSM in and grep four log
+    # files to find the actual phase. WIKIMEDIA_STEP is exported by
+    # the launcher right before each step, and the bash ``&&`` chain
+    # halts on the failing step, so its value survives into this
+    # handler.
+    step_phrase = f"`{step}` step failed" if step else "pipeline step failed"
+    msg = f"❌ `wikimedia-{label}`: {step_phrase}{rc_suffix} — {tail_phrase}"
 
-    log_path = _find_latest_log(os.environ.get("WIKIMEDIA_PARTNER_DIR", ""), label)
-    if log_path is not None:
-        summary = _summarize_log(log_path)
-        if summary:
-            msg += "\n" + summary
+    # Scope log lookup to the failing step's log file when possible.
+    # id-generation has no dedicated log file (get_ids_es.py never
+    # calls setup_logging), so for that step we fall back to reading
+    # the tee'd stderr file the launcher writes — without this, a
+    # failure inside get-ids-es would only ever surface as a bare
+    # "exit N" in Slack.
+    partner_dir = os.environ.get("WIKIMEDIA_PARTNER_DIR", "")
+    summary: str | None = None
+    log_suffix = _PHASE_LOG_SUFFIX.get(step)
+    if log_suffix is not None:
+        log_path = _find_latest_log(partner_dir, label, phase=log_suffix)
+        if log_path is not None:
+            summary = _summarize_log(log_path)
+    elif step == "id-generation":
+        stderr_tail = _tail_text_file(id_generation_stderr_tail_file(raw_label))
+        if stderr_tail:
+            summary = "Last stderr lines:\n```\n" + stderr_tail + "\n```"
+    else:
+        # Unknown step (or step unset on a stale launcher): fall back to
+        # the legacy any-phase log lookup so we don't regress on the
+        # info-density of the pre-step-tracking message.
+        log_path = _find_latest_log(partner_dir, label)
+        if log_path is not None:
+            summary = _summarize_log(log_path)
+    if summary:
+        msg += "\n" + summary
 
     try:
         post_message(token, msg)

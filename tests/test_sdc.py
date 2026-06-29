@@ -556,6 +556,55 @@ def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
         assert p7482["qualifiers"]["P6108"][0]["datavalue"]["value"] == valid.strip()
 
 
+def test_build_claims_for_doc_tolerates_missing_rights_field():
+    """In maintain mode + ``--skip-media-filter``, the ES query no longer
+    enforces ``rightsCategory == "Unlimited Re-Use"``, so docs with no
+    ``rights`` field reach SDC pre-compute. Pre-fix, ``parse_dpla_doc``
+    did ``doc["rights"]`` unguarded and raised ``KeyError`` on the first
+    such doc — aborting the entire id-generation pass for one maintain
+    target (concretely: Duke maintain via Internet Archive / Digital
+    Library of Georgia hubs, both of which have de-opted institutions
+    whose records still flow through the maintain scope).
+
+    The fix defaults missing ``rights`` to an empty string;
+    ``normalize_rights_uri("")`` is a no-op and the
+    ``rights.get("")`` lookup in ``_build_rights_claims`` returns
+    None, so no rights claim is emitted (instead of crashing).
+    """
+    from ingest_wikimedia.sdc import build_claims_for_doc
+
+    doc = {
+        "id": "abc1234567890",
+        "provider": {"name": "Internet Archive"},
+        "dataProvider": {"name": "Duke University Libraries"},
+        "sourceResource": {
+            "title": ["A book"],
+            "date": [{"displayDate": "1945"}],
+        },
+        "isShownAt": "https://example.org/item/abc",
+        # No "rights" key.
+    }
+    hubs = {
+        "Internet Archive": {
+            "Wikidata": "Q461",
+            "institutions": {"Duke University Libraries": {"Wikidata": "Q5312898"}},
+        }
+    }
+    import datetime as _dt
+
+    out = build_claims_for_doc(
+        doc, "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 29)
+    )
+    # No crash. No P275/P6426 rights claims since the input had no rights.
+    rights_props = {"P275", "P6426", "P6216"}
+    rights_claims = [
+        c for c in out["claims"] if c["mainsnak"]["property"] in rights_props
+    ]
+    assert rights_claims == [], (
+        f"missing rights must produce no rights claims; got {rights_claims}"
+    )
+
+
 def test_build_source_claim_never_stamps_p2699():
     """``P2699`` is per-ordinal — different ordinals of the same DPLA
     item have different download URLs, so the qualifier can't be baked

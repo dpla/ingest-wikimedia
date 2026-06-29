@@ -64,8 +64,9 @@ def test_notify_phase_start_supports_sdc_sync_phase():
         ("", ""),
         (None, ""),
         ("not-a-number", ""),
-        ("1", " (exit 1)"),
-        ("2", " (exit 2)"),
+        ("1", " (exit 1 — uncaught exception — see traceback)"),
+        ("2", " (exit 2 — rejected its arguments)"),
+        ("124", " (exit 124 — timed out)"),
         ("137", " (exit 137 — SIGKILL — likely OOM)"),
         ("143", " (exit 143 — SIGTERM)"),
         ("139", " (exit 139 — SIGSEGV)"),
@@ -200,6 +201,175 @@ def test_notify_pipeline_fail_treats_any_value_other_than_1_as_not_last():
         assert "skipping to next target" in msg, (
             f"value {value!r} should be treated as not-last"
         )
+
+
+# ---------------------------------------------------------------------------
+# Step-aware failure messages: include WIKIMEDIA_STEP in the header so the
+# operator sees WHICH phase failed instead of a bare "pipeline step failed".
+# Also pin the new exit-code hints for 1 ("uncaught exception") and 2
+# ("rejected its arguments"), since those are the two codes the user's
+# Duke maintain run hit and the bare-number message was opaque.
+# ---------------------------------------------------------------------------
+
+
+def test_decode_exit_code_interprets_python_exit_1():
+    """Exit 1 ≈ Python uncaught exception. Including the hint makes the
+    Slack message actionable — "look for a CRITICAL traceback in the log"
+    instead of "the pipeline failed somehow with exit 1"."""
+    assert _decode_exit_code("1") == " (exit 1 — uncaught exception — see traceback)"
+
+
+def test_decode_exit_code_interprets_click_exit_2():
+    """Exit 2 ≈ Click usage error (e.g. ``click.BadParameter`` from a
+    failed precheck like ``DPLA.check_partner``). Points the operator
+    at config/CLI args, never at a code bug."""
+    assert _decode_exit_code("2") == " (exit 2 — rejected its arguments)"
+
+
+def test_notify_pipeline_fail_names_the_failing_step():
+    """The failure message header should include the step name when
+    ``WIKIMEDIA_STEP`` is set. Pre-change the message just said
+    "pipeline step failed" and left the operator to grep four log
+    files to find which one."""
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "georgia+duke-university-library",
+            "WIKIMEDIA_LAST_EXIT": "1",
+            "WIKIMEDIA_STEP": "id-generation",
+        }
+    )
+    assert "`id-generation` step failed" in msg, msg
+    assert "uncaught exception" in msg, msg
+    assert "pipeline step failed" not in msg, (
+        "step-aware header must replace the generic phrasing"
+    )
+
+
+def test_notify_pipeline_fail_falls_back_to_generic_when_step_unset():
+    """A stale launcher (no WIKIMEDIA_STEP export) must not crash — the
+    handler should fall back to the legacy "pipeline step failed"
+    wording. Pre-step-tracking deployments will still produce this
+    while the new launcher rolls out."""
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": "georgia+x",
+            "WIKIMEDIA_LAST_EXIT": "1",
+        }
+    )
+    assert "pipeline step failed" in msg, msg
+
+
+def test_notify_pipeline_fail_id_generation_step_includes_stderr_tail(
+    tmp_path, monkeypatch
+):
+    """For the id-generation step there's no per-phase log file (the
+    ``get-ids-es`` CLI doesn't call ``setup_logging``), so the failure
+    handler reads stderr-tail directly from the file the launcher
+    tees to. This is exactly the digitalnc case from the user's Duke
+    run: ``click.BadParameter`` printed to stderr, no log produced,
+    Slack would otherwise show only a bare "exit 2"."""
+    # Per-session-label path: the file lives under /tmp/ in production
+    # but tests redirect it to a tmp_path via monkeypatching the helper
+    # itself — so we control the read path without writing to /tmp.
+    label = "digitalnc+duke-university-libraries"
+    stderr_path = tmp_path / f"wm-id-generation-stderr-{label}.log"
+    stderr_path.write_text(
+        "Usage: get-ids-es [OPTIONS] PARTNER\n"
+        "Try 'get-ids-es --help' for help.\n"
+        "\n"
+        "Error: Invalid value: Hub 'digitalnc' has no upload-eligible institutions in"
+        " institutions_v2.json — edit that file to opt in\n"
+    )
+    monkeypatch.setattr(
+        "ingest_wikimedia.slack.id_generation_stderr_tail_file",
+        lambda label_arg: str(tmp_path / f"wm-id-generation-stderr-{label_arg}.log"),
+    )
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": label,
+            "WIKIMEDIA_LAST_EXIT": "2",
+            "WIKIMEDIA_STEP": "id-generation",
+        }
+    )
+    # The header names the failing step + interprets exit 2.
+    assert "`id-generation` step failed" in msg
+    assert "rejected its arguments" in msg
+    # The actual stderr message must be in the body so the operator
+    # doesn't have to SSM in to find out WHY the precheck rejected.
+    assert "Hub 'digitalnc' has no upload-eligible institutions" in msg
+
+
+def test_id_generation_stderr_tail_file_is_per_session():
+    """The stderr tail path must be per-session-label, not a single
+    shared ``/tmp`` file. The EC2 box runs many concurrent tmux
+    sessions; a shared path would let two id-generation steps clobber
+    each other's stderr and serve the wrong failure body to Slack."""
+    from ingest_wikimedia.slack import id_generation_stderr_tail_file
+
+    a = id_generation_stderr_tail_file("georgia+duke-university-library")
+    b = id_generation_stderr_tail_file("ia+duke-university-libraries")
+    assert a != b, "different labels must produce different paths"
+    assert "georgia+duke-university-library" in a
+    assert "ia+duke-university-libraries" in b
+
+
+def test_id_generation_stderr_tail_file_no_label_fallback_matches_bash():
+    """The Python read-side and bash write-side must agree on the path
+    when ``WIKIMEDIA_SESSION_LABEL`` is unset. The launcher's tee
+    redirect uses ``${WIKIMEDIA_SESSION_LABEL:-unknown}``, so the
+    helper's empty-label fallback MUST produce the same
+    ``…-unknown.log`` suffix — otherwise a partial-env failure would
+    have Python looking for a file at a path bash never wrote to.
+
+    Both ``None`` and empty string represent "unset" and must collapse
+    to the same fallback path. This is the dead-branch regression CR
+    caught on the first pass: previously the helper's empty-string
+    branch returned a no-suffix path, agreeing with bash only by
+    accident because the caller never actually fed it an empty value.
+    """
+    from ingest_wikimedia.slack import id_generation_stderr_tail_file
+
+    expected_fallback = "/tmp/wm-id-generation-stderr-unknown.log"
+    assert id_generation_stderr_tail_file("") == expected_fallback
+    assert id_generation_stderr_tail_file(None) == expected_fallback
+
+
+def test_notify_pipeline_fail_phase_log_scopes_to_failing_step(tmp_path):
+    """When ``WIKIMEDIA_STEP`` is ``upload`` (or ``download`` / ``sdc``),
+    the handler must tail the *matching* phase log — not the most
+    recent log of any phase. Pre-step-tracking the lookup matched any
+    phase (``*``), so a failure during the upload step that came
+    after a longer-running download could end up tailing the older
+    download log instead. Pin the scope so the failing step's tail
+    actually goes to Slack."""
+    base = tmp_path
+    logs = base / "logs"
+    logs.mkdir()
+    label = "georgia+x"
+    older_upload = logs / f"20260101-100000-{label}-upload.log"
+    newer_download = logs / f"20260101-110000-{label}-download.log"
+    older_upload.write_text("[INFO] start\n[ERROR] Failed: boom in uploader\n")
+    newer_download.write_text("[INFO] downloader ran fine, nothing to flag\n")
+    # Force ``older_upload`` to be older than ``newer_download`` so the
+    # legacy any-phase lookup would have picked the newer download.
+    os.utime(str(older_upload), (time.time() - 7200, time.time() - 7200))
+
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": label,
+            "WIKIMEDIA_PARTNER_DIR": str(base),
+            "WIKIMEDIA_LAST_EXIT": "1",
+            "WIKIMEDIA_STEP": "upload",
+        }
+    )
+    # The upload-phase log content should be reflected; the unrelated
+    # download log should NOT be the tailed file.
+    assert "boom in uploader" in msg
+    assert "downloader ran fine" not in msg
 
 
 # ---------------------------------------------------------------------------
