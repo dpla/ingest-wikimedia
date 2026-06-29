@@ -623,17 +623,16 @@ def notify_sdc_complete(
 
 
 def notify_dup_drain_incomplete(partner_label: str, remaining: int) -> None:
-    """Warn #tech-alerts that the dup-category drain pass gave up with files
+    """Warn #tech-alerts that the dup-category drain pass exited with files
     still deferred.
 
     The uploader defers ``{{duplicate}}``-tagging uploads while
-    Category:Duplicate is at capacity, then returns to them in a drain pass
-    that waits for the category to drain. If that wait times out (the category
-    stays full longer than the drain budget), the remaining files are left
-    un-uploaded and un-tagged — a human needs to clear the category before a
-    re-run will finish them. This is the only path that leaves intended work
-    undone, so it warrants an explicit operator ping rather than a buried log
-    line.
+    Category:Duplicate is at capacity, then returns to them in a drain pass.
+    If that pass times out (the category stays full past the drain budget) or
+    makes no progress after capacity returns, the remaining files are left
+    un-uploaded and un-tagged — they need operator attention before a re-run
+    will finish them. This is the only path that leaves intended work undone,
+    so it warrants an explicit operator ping rather than a buried log line.
     """
     token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
     if not token:
@@ -644,9 +643,9 @@ def notify_dup_drain_incomplete(partner_label: str, remaining: int) -> None:
     )
     msg = (
         f"⚠️ `{effective_label}`: {remaining:,} file(s) left deferred — "
-        "Category:Duplicate stayed at capacity past the drain window, so their "
-        "uploads + `{{duplicate}}` tags were skipped. Clear the category, then "
-        "re-run the partner to finish them."
+        "the duplicate-category drain pass exited before they could be retried, "
+        "so their uploads + `{{duplicate}}` tags were skipped. Clear "
+        "Category:Duplicate if needed, then re-run the partner to finish them."
     )
     try:
         post_message(token, msg)

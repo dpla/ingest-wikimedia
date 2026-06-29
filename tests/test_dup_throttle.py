@@ -86,7 +86,8 @@ def test_wait_for_capacity_returns_when_drained():
     )
     slept: list[float] = []
     clock = iter([0, 0, 120, 240]).__next__
-    assert t.wait_for_capacity(10_000, sleep=lambda s: slept.append(s), clock=clock)
+    drained = t.wait_for_capacity(10_000, sleep=lambda s: slept.append(s), clock=clock)
+    assert drained is True
     assert slept == [120, 120]
     # Headroom was refilled, so the next tag rides the cache (no new query).
     before = sizes.calls
@@ -101,9 +102,8 @@ def test_wait_for_capacity_times_out():
     )
     slept: list[float] = []
     clock = iter([0, 300]).__next__  # second check is past the 100s deadline
-    assert (
-        t.wait_for_capacity(100, sleep=lambda s: slept.append(s), clock=clock) is False
-    )
+    timed_out = t.wait_for_capacity(100, sleep=lambda s: slept.append(s), clock=clock)
+    assert timed_out is False
     assert slept == []  # deadline hit before any sleep
 
 

@@ -1525,10 +1525,12 @@ class Uploader:
             # the current truth.
             self._persist_upload_result(partner, dpla_id, ordinal_results, dry_run)
 
-            # Tell main() whether any ordinal was deferred by the dup-category
-            # throttle, so it can re-run this item in the drain pass once
-            # Category:Duplicate has room. (Other exits return None = falsy.)
-            return any(
+            # Return how many ordinals the dup-category throttle deferred, so
+            # main() knows to re-run this item in the drain pass and the drain
+            # loop can measure progress per ordinal (a multi-page item can clear
+            # some deferred ordinals while others remain). 0 = nothing deferred;
+            # other exits return None, also falsy.
+            return sum(
                 r.get("status") == ORDINAL_DEFERRED for r in ordinal_results.values()
             )
 
@@ -1697,22 +1699,24 @@ def main(
 
         dpla_ids = load_ids(ids_file)
 
-        deferred_ids: list[str] = []
+        # Map of dpla_id -> count of ordinals the dup-category throttle deferred.
+        deferred: dict[str, int] = {}
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
             with slot_budget.acquire():
-                if uploader.process_item(
+                deferred_count = uploader.process_item(
                     dpla_id, providers_json, partner, verbose, dry_run
-                ):
-                    deferred_ids.append(dpla_id)
+                )
+                if deferred_count:
+                    deferred[dpla_id] = deferred_count
 
         # Any item whose {{duplicate}}-tagging upload was deferred because
         # Category:Duplicate was full: wait for the category to drain, then
         # re-run those items in this same session (not an operator re-run).
-        if deferred_ids:
+        if deferred:
             _drain_deferred_dups(
                 uploader,
                 dup_throttle,
-                deferred_ids,
+                deferred,
                 providers_json,
                 partner,
                 verbose,
@@ -1761,7 +1765,7 @@ _DRAIN_MAX_WAIT_SECS = 4 * 60 * 60  # 4 hours
 def _drain_deferred_dups(
     uploader: "Uploader",
     throttle: DuplicateCategoryThrottle,
-    deferred_ids: list[str],
+    deferred: dict[str, int],
     providers_json,
     partner: str,
     verbose: bool,
@@ -1769,57 +1773,67 @@ def _drain_deferred_dups(
     slot_budget: WorkerSlotBudget,
     *,
     max_wait_secs: float = _DRAIN_MAX_WAIT_SECS,
-) -> list[str]:
+) -> dict[str, int]:
     """Re-run items whose {{duplicate}}-tagging upload was deferred, once
     Category:Duplicate has drained.
 
+    ``deferred`` maps each item's dpla_id to its count of deferred ordinals.
     Each round waits (via the throttle) for the category to fall below its
     resume threshold, then re-processes the still-deferred items. Re-processing
     may itself defer again if the category refills mid-drain, so it loops until
     nothing remains, no progress is made, or the wait budget is exhausted.
-    Returns the ids still deferred at exit (empty on full success).
+    Returns the {id: count} still deferred at exit (empty on full success).
+
+    Progress is measured by total deferred *ordinals*, not items: a single
+    multi-page item can clear some ordinals while others remain, which is real
+    progress and must not read as a stall.
     """
-    remaining = list(deferred_ids)
+    remaining = dict(deferred)
     deadline = time.monotonic() + max_wait_secs
     logging.info(
-        "Drain pass: %d item(s) deferred while Category:Duplicate was at "
-        "capacity; waiting for it to drain, then retrying their uploads.",
+        "Drain pass: %d file(s) across %d item(s) deferred while "
+        "Category:Duplicate was at capacity; waiting for it to drain, then "
+        "retrying their uploads.",
+        sum(remaining.values()),
         len(remaining),
     )
     while remaining:
         budget = deadline - time.monotonic()
         if budget <= 0 or not throttle.wait_for_capacity(budget):
+            still = sum(remaining.values())
             logging.error(
-                "Drain pass timed out with %d item(s) still deferred; their "
+                "Drain pass timed out with %d file(s) still deferred; their "
                 "uploads + {{duplicate}} tags were NOT emitted. Clear "
                 "Category:Duplicate, then re-run the partner to finish them.",
-                len(remaining),
+                still,
             )
-            notify_dup_drain_incomplete(partner, len(remaining))
+            notify_dup_drain_incomplete(partner, still)
             return remaining
 
-        still_deferred: list[str] = []
+        still_deferred: dict[str, int] = {}
         for dpla_id in remaining:
             with slot_budget.acquire():
-                if uploader.process_item(
+                count = uploader.process_item(
                     dpla_id, providers_json, partner, verbose, dry_run
-                ):
-                    still_deferred.append(dpla_id)
+                )
+                if count:
+                    still_deferred[dpla_id] = count
 
         # A batch larger than the throttle's headroom (recheck_cap) legitimately
         # takes several rounds — each round re-queries and clears up to a cap's
         # worth, so partial progress is normal, not a stall. But if a round that
-        # began with confirmed capacity clears NOTHING, the category is refilling
-        # as fast as we drain (or another mechanism keeps deferring) — bail
-        # rather than spin a hot loop re-querying the category every iteration.
-        if len(still_deferred) >= len(remaining):
+        # began with confirmed capacity cleared NO ordinals, the category is
+        # refilling as fast as we drain (or another mechanism keeps deferring) —
+        # bail rather than spin a hot loop re-querying the category every round.
+        if sum(still_deferred.values()) >= sum(remaining.values()):
+            still = sum(still_deferred.values())
             logging.error(
                 "Drain pass made no progress despite available capacity (%d "
-                "still deferred); aborting drain. Clear Category:Duplicate, "
-                "then re-run the partner to finish them.",
-                len(still_deferred),
+                "file(s) still deferred); aborting drain. Clear "
+                "Category:Duplicate, then re-run the partner to finish them.",
+                still,
             )
-            notify_dup_drain_incomplete(partner, len(still_deferred))
+            notify_dup_drain_incomplete(partner, still)
             return still_deferred
         remaining = still_deferred
 
