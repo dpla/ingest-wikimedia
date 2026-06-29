@@ -349,7 +349,13 @@ def main(
         # the hub. Some DPLA collections span multiple institutions.
 
     try:
-        DPLA.check_partner(partner)
+        # Maintain mode operates on hubs whose upload flag is off
+        # (the whole point — reconcile already-on-Commons files for
+        # de-opted institutions), so the eligibility precheck must
+        # honor ``--maintain``. Mirrors the same flag honoring
+        # ``load_eligible_dp_names`` already does for the
+        # institution-level gate below.
+        DPLA.check_partner(partner, maintain=maintain)
     except ValueError as e:
         raise click.BadParameter(str(e)) from e
 

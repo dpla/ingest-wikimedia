@@ -422,6 +422,14 @@ def _build_maintain_hash_pipeline_steps(
     since there's no category to reconcile beyond what's fetched.
     """
     dl_age_opt = f"--max-age-days {max_age_days} " if max_age_days is not None else ""
+    # ``--maintain`` on the downloader bypasses its
+    # ``DPLA.check_partner`` upload-eligibility precheck, so a hub like
+    # ``digitalnc`` (no opted-in institutions but real prior uploads)
+    # can still run the hash-drift download pass. Behaviour is otherwise
+    # unchanged — items the CSV passes through are downloaded the same.
+    # The uploader gets the same effect via its existing ``--no-create``
+    # flag (the launcher's maintain pipelines already pass it), so no
+    # extra flag there.
     if dpla_id is not None or collection is not None:
         maintain_get_ids = _build_get_ids_command(
             canonical, institutions, collection, dpla_id, csv_file, maintain=True
@@ -429,14 +437,14 @@ def _build_maintain_hash_pipeline_steps(
         return [
             f"cd {base}",
             maintain_get_ids,
-            f"downloader {dl_age_opt}{csv_file} {canonical}",
+            f"downloader --maintain {dl_age_opt}{csv_file} {canonical}",
             f"uploader {csv_file} {canonical} --no-create{upload_opts}",
             f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}",
         ]
     return [
         f"cd {base}",
         _maintain_stage_cmd(canonical, institutions, csv_file),
-        f"downloader {dl_age_opt}{csv_file} {canonical}",
+        f"downloader --maintain {dl_age_opt}{csv_file} {canonical}",
         f"uploader {csv_file} {canonical} --no-create{upload_opts}",
         *_maintain_sdc_cat_steps(
             canonical, institutions, f" --from-s3 {canonical}{sdc_opts}"

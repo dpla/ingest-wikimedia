@@ -843,6 +843,64 @@ def test_maintain_hash_single_id_and_collection_keep_id_list_anchored():
     assert coll[-1].startswith("sdc-sync --partner georgia --ids-file out.csv")
 
 
+def test_maintain_hash_pipeline_passes_maintain_flag_to_downloader():
+    """The downloader's ``--maintain`` flag bypasses its
+    ``DPLA.check_partner`` upload-eligibility precheck. Without it, a
+    maintain run on a hub with no opted-in institutions (e.g.
+    ``digitalnc`` in the Q5312898 Duke Libraries case) would die at
+    the downloader step with ``click.BadParameter`` → exit 2, even
+    after PR #346 made the failure message readable.
+
+    Pin both the institution-scoped (hub|institution) AND the
+    single-id / collection branches: both call paths build the
+    ``downloader`` step from the same template, so a regression would
+    drop the flag from both. The uploader uses its existing
+    ``--no-create`` as the maintain signal (no extra flag here).
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    with (
+        patch.object(launch_mod, "wikidata_qid_for_target", return_value="Q123"),
+        patch.object(
+            launch_mod,
+            "resolve_commons_category",
+            return_value="Category:Media contributed by X",
+        ),
+    ):
+        inst_steps = launch_mod._build_maintain_hash_pipeline_steps(
+            "digitalnc",
+            ("Duke University Libraries",),
+            None,
+            None,
+            "/srv/base",
+            "out.csv",
+            None,
+            " --workers-budget 24",
+            " --workers 6 --workers-budget 24",
+        )
+    dl_step = next(s for s in inst_steps if s.startswith("downloader "))
+    assert "--maintain" in dl_step, (
+        "maintain pipeline must pass --maintain to the downloader so its"
+        " check_partner precheck doesn't reject a de-opted hub"
+    )
+    assert "out.csv digitalnc" in dl_step
+
+    # Same for the single-id route.
+    single = launch_mod._build_maintain_hash_pipeline_steps(
+        "digitalnc",
+        (),
+        None,
+        "abc123def456",
+        "/srv/base",
+        "out.csv",
+        None,
+        " --workers-budget 24",
+        " --workers 6 --workers-budget 24",
+    )
+    dl_step = next(s for s in single if s.startswith("downloader "))
+    assert "--maintain" in dl_step
+
+
 def test_maintain_stage_cmd_routes_bare_nara_to_get_ids_nara():
     """Bare-hub NARA stages via its bespoke catalog walk, mirroring
     _build_get_ids_command — not `get-ids-es nara`, which can't do NARA's

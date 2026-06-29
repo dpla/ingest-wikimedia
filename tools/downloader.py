@@ -592,6 +592,18 @@ class Downloader:
     is_flag=True,
     help="Post a download-complete summary to Slack when finished (used for refresh runs).",
 )
+@click.option(
+    "--maintain",
+    is_flag=True,
+    help=(
+        "Bypass the partner upload-eligibility precheck so a maintain run"
+        " can process a hub whose institutions are all de-opted (``upload:"
+        " false``). Matches the same ``--maintain`` semantics in get-ids-es"
+        " and the uploader's ``--no-create`` fence. Has no other behavioural"
+        " effect on the downloader itself — items the CSV passes through"
+        " are downloaded the same way."
+    ),
+)
 def main(
     ids_file: IO,
     partner: str,
@@ -601,6 +613,7 @@ def main(
     sleep: float,
     max_age_days: int | None,
     notify_complete: bool,
+    maintain: bool,
 ):
     setup_logging(partner, "download", logging.INFO)
     start_time = time.time()
@@ -622,7 +635,7 @@ def main(
     dpla = tools_context.get_dpla()
     tracker = tools_context.get_tracker()
 
-    dpla.check_partner(partner)
+    dpla.check_partner(partner, maintain=maintain)
     notify_phase_start(partner, "download")
     logging.info(f"Starting download for {partner}")
 

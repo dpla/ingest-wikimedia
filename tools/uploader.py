@@ -1593,7 +1593,12 @@ def main(
     local_fs = tools_context.get_local_fs()
     tracker = tools_context.get_tracker()
 
-    dpla.check_partner(partner)
+    # ``--no-create`` is the uploader's maintain signal — it gates the
+    # no-create fence inside the per-item loop and is exactly what the
+    # launcher passes in maintain mode. Reusing it as the maintain
+    # flag for ``check_partner`` keeps the CLI surface unchanged (no
+    # new ``--maintain`` flag here, unlike the downloader).
+    dpla.check_partner(partner, maintain=no_create)
 
     # Box-wide Commons-write budget. The uploader is single-process, so
     # it holds exactly one slot while working an item — counting as one
