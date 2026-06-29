@@ -19,6 +19,12 @@ class Result(Enum):
     # core safety invariant of maintain mode — maintenance never emits a new
     # File page — surfaces here so operators can audit that it held.
     UPLOAD_SKIPPED_WOULD_CREATE = auto()
+    # Dup-category throttle: a {{duplicate}}-tagging upload (Case 2 hash-drift)
+    # was deferred because Category:Duplicate was at capacity. Counts each
+    # defer event (a deferred ordinal may be re-attempted — and counted again —
+    # in the drain pass); the number of items still deferred at run end is
+    # logged separately. Not a skip: the work is retried, not abandoned.
+    UPLOAD_DEFERRED_DUP_CATEGORY = auto()
     UPLOADED = auto()
     BYTES = auto()
     ITEM_NOT_PRESENT = auto()

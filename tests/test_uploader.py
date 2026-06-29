@@ -16,6 +16,7 @@ from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     NewFilePageBlocked,
     Uploader,
+    _drain_deferred_dups,
     _post_item_orphan_check,
     _post_upload_touch_new_institutions,
     is_dup_sha1_sibling_at_expected_title,
@@ -965,6 +966,77 @@ def test_chunk_size_file_exists_small_returns_direct():
         force_ignore_warnings=False,
         file_size_bytes=10 * 1024 * 1024,
     ) == (0, True)
+
+
+# --------------------------------------------------------------------------
+# _drain_deferred_dups — the post-upload pass that re-runs items whose
+# {{duplicate}}-tagging upload was deferred while Category:Duplicate was full.
+# --------------------------------------------------------------------------
+
+
+def _drain_args(process_item_side_effect):
+    """Build the (uploader, throttle, slot_budget) mocks _drain_deferred_dups
+    needs. ``process_item`` returns the count of ordinals still deferred for
+    that item (0 = item fully cleared)."""
+    uploader = MagicMock()
+    uploader.process_item.side_effect = process_item_side_effect
+    throttle = MagicMock()
+    # A no-op slot context manager — slot accounting isn't under test here.
+    return uploader, throttle, _DISABLED_BUDGET
+
+
+def test_drain_retries_until_all_emitted():
+    # "a" clears on round 1; "b" stays deferred through round 1 and clears on
+    # round 2. Call order: a→0 cleared, b→1 deferred, (round 2) b→0 cleared.
+    uploader, throttle, budget = _drain_args([0, 1, 0])
+    throttle.wait_for_capacity.return_value = True
+    remaining = _drain_deferred_dups(
+        uploader, throttle, {"a": 1, "b": 1}, {}, "partner", False, False, budget
+    )
+    assert remaining == {}
+    assert throttle.wait_for_capacity.call_count == 2
+    assert uploader.process_item.call_count == 3
+
+
+def test_drain_counts_partial_ordinal_progress_as_progress():
+    # A single multi-page item with 3 deferred ordinals clears 2 on round 1
+    # (3→1) and the last on round 2. Per-item counting would see "still 1 item
+    # deferred" and falsely abort; per-ordinal counting sees real progress.
+    uploader, throttle, budget = _drain_args([1, 0])
+    throttle.wait_for_capacity.return_value = True
+    with patch("tools.uploader.notify_dup_drain_incomplete") as notify:
+        remaining = _drain_deferred_dups(
+            uploader, throttle, {"a": 3}, {}, "partner", False, False, budget
+        )
+    assert remaining == {}
+    assert uploader.process_item.call_count == 2
+    notify.assert_not_called()
+
+
+def test_drain_times_out_and_notifies():
+    uploader, throttle, budget = _drain_args([])  # never reached
+    throttle.wait_for_capacity.return_value = False  # category never drains
+    with patch("tools.uploader.notify_dup_drain_incomplete") as notify:
+        remaining = _drain_deferred_dups(
+            uploader, throttle, {"a": 1, "b": 2}, {}, "partner", False, False, budget
+        )
+    assert remaining == {"a": 1, "b": 2}
+    uploader.process_item.assert_not_called()
+    notify.assert_called_once_with("partner", 3)  # total deferred ordinals
+
+
+def test_drain_bails_when_no_progress():
+    # Capacity is available but the re-run clears no ordinals (category refilling
+    # as fast as we drain): bail rather than spin a hot loop.
+    uploader, throttle, budget = _drain_args([1, 1])
+    throttle.wait_for_capacity.return_value = True
+    with patch("tools.uploader.notify_dup_drain_incomplete") as notify:
+        remaining = _drain_deferred_dups(
+            uploader, throttle, {"a": 1, "b": 1}, {}, "partner", False, False, budget
+        )
+    assert remaining == {"a": 1, "b": 1}
+    assert throttle.wait_for_capacity.call_count == 1
+    notify.assert_called_once_with("partner", 2)
 
 
 def test_chunk_size_force_ignore_warnings_small_returns_direct():

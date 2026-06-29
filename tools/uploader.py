@@ -14,6 +14,7 @@ from pywikibot.site import BaseSite
 
 from tqdm import tqdm
 
+from ingest_wikimedia.dup_throttle import DuplicateCategoryThrottle
 from ingest_wikimedia.common import (
     get_list,
     get_dict,
@@ -44,7 +45,7 @@ from ingest_wikimedia.dpla import (
     WIKIDATA_FIELD_NAME,
     DPLA,
 )
-from ingest_wikimedia.slack import notify_upload_complete
+from ingest_wikimedia.slack import notify_dup_drain_incomplete, notify_upload_complete
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
@@ -176,6 +177,9 @@ ORDINAL_NOT_PRESENT = "NOT_PRESENT"  # no S3 asset to upload (downloader gap)
 ORDINAL_INELIGIBLE = "INELIGIBLE"  # S3 asset present but uploader chose not
 # to upload (bad MIME, download-only, unguessable extension, etc.)
 ORDINAL_FAILED = "FAILED"  # upload attempted, raised, did not land
+ORDINAL_DEFERRED = (
+    "DEFERRED"  # {{duplicate}}-tagging upload deferred: Category:Duplicate at capacity
+)
 
 
 class UploadTimeoutError(RuntimeError):
@@ -211,6 +215,7 @@ class Uploader:
         site: BaseSite,
         category_ensurer: CategoryEnsurer | None = None,
         no_create: bool = False,
+        dup_throttle: DuplicateCategoryThrottle | None = None,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
@@ -222,6 +227,10 @@ class Uploader:
         # write to a File page that does not already exist, so no run can
         # create a new Commons file. Defaults False (normal upload behaviour).
         self.no_create = no_create
+        # dup_throttle: gate on the Case-2 hash-drift tag-emitting path so a
+        # run can't flood the human-maintained Category:Duplicate. None disables
+        # the gate (standalone / unit-test construction); main() injects one.
+        self.dup_throttle = dup_throttle
 
     def _safe_upload(self, *, filepage, **kwargs):
         """Sole sanctioned wrapper around ``site.upload`` — every upload in
@@ -522,6 +531,32 @@ class Uploader:
                                 "pageid": existing_file.pageid,
                             }
                         elif drift_action == "upload_and_tag":
+                            # This ordinal would upload its bytes to the
+                            # canonical title AND tag the stranded sha1-sibling
+                            # {{duplicate}}. If Category:Duplicate is at
+                            # capacity, defer the WHOLE op — not just the tag —
+                            # so we never upload the duplicating bytes and leave
+                            # an untagged duplicate behind. The drain pass
+                            # re-runs this item once the category drains. The
+                            # gate is consulted only here (the rare tag path),
+                            # so ordinary uploads are unaffected.
+                            if (
+                                self.dup_throttle is not None
+                                and not self.dup_throttle.try_acquire()
+                            ):
+                                logging.info(
+                                    f"Deferring {dpla_id} {ordinal}: "
+                                    f"Category:Duplicate at capacity; will retry "
+                                    f"upload + duplicate-tag in the drain pass."
+                                )
+                                self.tracker.increment(
+                                    Result.UPLOAD_DEFERRED_DUP_CATEGORY
+                                )
+                                return {
+                                    "status": ORDINAL_DEFERRED,
+                                    "title": page_title,
+                                    "pageid": None,
+                                }
                             drift_old_filename = existing_file.title(with_ns=False)
                             force_ignore_warnings = True
                         else:  # "upload_only"
@@ -1490,6 +1525,15 @@ class Uploader:
             # the current truth.
             self._persist_upload_result(partner, dpla_id, ordinal_results, dry_run)
 
+            # Return how many ordinals the dup-category throttle deferred, so
+            # main() knows to re-run this item in the drain pass and the drain
+            # loop can measure progress per ordinal (a multi-page item can clear
+            # some deferred ordinals while others remain). 0 = nothing deferred;
+            # other exits return None, also falsy.
+            return sum(
+                r.get("status") == ORDINAL_DEFERRED for r in ordinal_results.values()
+            )
+
         except Exception as ex:
             # Intentionally NOT writing upload-result.json on the catch-all
             # exception path. The failure may be transient (S3 hiccup,
@@ -1579,6 +1623,13 @@ def main(
     commons_site = get_site()
     category_ensurer = CategoryEnsurer(commons_site, dry_run=dry_run)
 
+    # Caps how many files this run may add to the human-maintained
+    # Category:Duplicate (via {{duplicate}} tags on Case-2 hash-drift uploads).
+    # Consulted only on that rare tag-emitting path; ordinary uploads never
+    # touch it and it queries the category size at most once per ~100 tags.
+    # A dry run never tags, so the throttle is simply never consulted.
+    dup_throttle = DuplicateCategoryThrottle(commons_site)
+
     uploader = Uploader(
         tools_context.get_tracker(),
         tools_context.get_local_fs(),
@@ -1587,6 +1638,7 @@ def main(
         commons_site,
         category_ensurer,
         no_create=no_create,
+        dup_throttle=dup_throttle,
     )
 
     dpla = tools_context.get_dpla()
@@ -1647,11 +1699,30 @@ def main(
 
         dpla_ids = load_ids(ids_file)
 
+        # Map of dpla_id -> count of ordinals the dup-category throttle deferred.
+        deferred: dict[str, int] = {}
         for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
             with slot_budget.acquire():
-                uploader.process_item(
+                deferred_count = uploader.process_item(
                     dpla_id, providers_json, partner, verbose, dry_run
                 )
+                if deferred_count:
+                    deferred[dpla_id] = deferred_count
+
+        # Any item whose {{duplicate}}-tagging upload was deferred because
+        # Category:Duplicate was full: wait for the category to drain, then
+        # re-run those items in this same session (not an operator re-run).
+        if deferred:
+            _drain_deferred_dups(
+                uploader,
+                dup_throttle,
+                deferred,
+                providers_json,
+                partner,
+                verbose,
+                dry_run,
+                slot_budget,
+            )
 
     finally:
         elapsed = time.time() - start_time
@@ -1681,6 +1752,93 @@ def main(
             elapsed_seconds=elapsed,
             dry_run=dry_run,
         )
+
+
+# Upper bound on how long the drain pass will wait for Category:Duplicate to
+# fall back below the throttle's resume threshold. Volunteers clear the
+# category on human timescales, so give it real headroom — but cap it so a
+# session never hangs indefinitely. On timeout the remaining files are left
+# un-uploaded and the operator is pinged to re-run after the category drains.
+_DRAIN_MAX_WAIT_SECS = 4 * 60 * 60  # 4 hours
+
+
+def _drain_deferred_dups(
+    uploader: "Uploader",
+    throttle: DuplicateCategoryThrottle,
+    deferred: dict[str, int],
+    providers_json,
+    partner: str,
+    verbose: bool,
+    dry_run: bool,
+    slot_budget: WorkerSlotBudget,
+    *,
+    max_wait_secs: float = _DRAIN_MAX_WAIT_SECS,
+) -> dict[str, int]:
+    """Re-run items whose {{duplicate}}-tagging upload was deferred, once
+    Category:Duplicate has drained.
+
+    ``deferred`` maps each item's dpla_id to its count of deferred ordinals.
+    Each round waits (via the throttle) for the category to fall below its
+    resume threshold, then re-processes the still-deferred items. Re-processing
+    may itself defer again if the category refills mid-drain, so it loops until
+    nothing remains, no progress is made, or the wait budget is exhausted.
+    Returns the {id: count} still deferred at exit (empty on full success).
+
+    Progress is measured by total deferred *ordinals*, not items: a single
+    multi-page item can clear some ordinals while others remain, which is real
+    progress and must not read as a stall.
+    """
+    remaining = dict(deferred)
+    deadline = time.monotonic() + max_wait_secs
+    logging.info(
+        "Drain pass: %d file(s) across %d item(s) deferred while "
+        "Category:Duplicate was at capacity; waiting for it to drain, then "
+        "retrying their uploads.",
+        sum(remaining.values()),
+        len(remaining),
+    )
+    while remaining:
+        budget = deadline - time.monotonic()
+        if budget <= 0 or not throttle.wait_for_capacity(budget):
+            still = sum(remaining.values())
+            logging.error(
+                "Drain pass timed out with %d file(s) still deferred; their "
+                "uploads + {{duplicate}} tags were NOT emitted. Clear "
+                "Category:Duplicate, then re-run the partner to finish them.",
+                still,
+            )
+            notify_dup_drain_incomplete(partner, still)
+            return remaining
+
+        still_deferred: dict[str, int] = {}
+        for dpla_id in remaining:
+            with slot_budget.acquire():
+                count = uploader.process_item(
+                    dpla_id, providers_json, partner, verbose, dry_run
+                )
+                if count:
+                    still_deferred[dpla_id] = count
+
+        # A batch larger than the throttle's headroom (recheck_cap) legitimately
+        # takes several rounds — each round re-queries and clears up to a cap's
+        # worth, so partial progress is normal, not a stall. But if a round that
+        # began with confirmed capacity cleared NO ordinals, the category is
+        # refilling as fast as we drain (or another mechanism keeps deferring) —
+        # bail rather than spin a hot loop re-querying the category every round.
+        if sum(still_deferred.values()) >= sum(remaining.values()):
+            still = sum(still_deferred.values())
+            logging.error(
+                "Drain pass made no progress despite available capacity (%d "
+                "file(s) still deferred); aborting drain. Clear "
+                "Category:Duplicate, then re-run the partner to finish them.",
+                still,
+            )
+            notify_dup_drain_incomplete(partner, still)
+            return still_deferred
+        remaining = still_deferred
+
+    logging.info("Drain pass complete: all deferred uploads + duplicate-tags emitted.")
+    return remaining
 
 
 # Wait between the last ensure() and the first touch.  Wikidata→Commons

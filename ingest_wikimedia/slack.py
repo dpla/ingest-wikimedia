@@ -620,3 +620,36 @@ def notify_sdc_complete(
         plain_text=f"Wikimedia SDC complete: {effective_label}",
         stats_lines=stats_lines,
     )
+
+
+def notify_dup_drain_incomplete(partner_label: str, remaining: int) -> None:
+    """Warn #tech-alerts that the dup-category drain pass exited with files
+    still deferred.
+
+    The uploader defers ``{{duplicate}}``-tagging uploads while
+    Category:Duplicate is at capacity, then returns to them in a drain pass.
+    If that pass times out (the category stays full past the drain budget) or
+    makes no progress after capacity returns, the remaining files are left
+    un-uploaded and un-tagged — they need operator attention before a re-run
+    will finish them. This is the only path that leaves intended work undone,
+    so it warrants an explicit operator ping rather than a buried log line.
+    """
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+    effective_label = (
+        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
+    )
+    msg = (
+        f"⚠️ `{effective_label}`: {remaining:,} file(s) left deferred — "
+        "the duplicate-category drain pass exited before they could be retried, "
+        "so their uploads + `{{duplicate}}` tags were skipped. Clear "
+        "Category:Duplicate if needed, then re-run the partner to finish them."
+    )
+    try:
+        post_message(token, msg)
+    except Exception:
+        logging.warning(
+            "Failed to post dup-drain-incomplete notification to Slack", exc_info=True
+        )
