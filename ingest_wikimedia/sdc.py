@@ -557,7 +557,16 @@ def parse_dpla_doc(
     titles = doc["sourceResource"]["title"]
     if isinstance(titles, str):
         titles = [titles]
-    rs = doc["rights"]
+    # ``rights`` is always present on regular runs (``rightsCategory ==
+    # "Unlimited Re-Use"`` is in the ES filter), but maintain mode runs
+    # with ``--skip-media-filter``, which drops that filter so docs
+    # without a ``rights`` field reach SDC pre-compute. Default to empty
+    # string — ``normalize_rights_uri("")`` is a no-op and the
+    # ``rights.get("")`` lookup in ``_build_rights_claims`` returns
+    # None, so no rights claim is appended. Without this, the first
+    # de-opted item in a maintain run raises ``KeyError`` and aborts
+    # the whole id-generation pass.
+    rs = doc.get("rights", "")
     url = doc["isShownAt"]
 
     # The shape-tolerant blocks below treat missing or mis-typed fields as

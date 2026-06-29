@@ -126,6 +126,74 @@ def _slack_fail(response_url: str, msg: str, *, operational: bool = False) -> No
     sys.exit(1)
 
 
+# Maps the first token of a pipeline command to the step name reported to
+# Slack on failure via ``WIKIMEDIA_STEP``. ``id-generation`` covers both
+# ``get-ids-es`` and the bespoke NARA catalog walker (``get-ids-nara``);
+# Slack's failure handler reads the env var directly so a stale launcher
+# without this map still produces a generic "pipeline step failed" message
+# (the legacy wording) rather than crashing.
+_STEP_BY_FIRST_TOKEN: dict[str, str] = {
+    "get-ids-es": "id-generation",
+    "get-ids-nara": "id-generation",
+    "downloader": "download",
+    "uploader": "upload",
+    "sdc-sync": "sdc-sync",
+}
+
+
+def _wrap_step_with_marker(cmd: str) -> str:
+    """Prefix ``cmd`` with ``export WIKIMEDIA_STEP=<name> &&`` so the bash
+    shell's WIKIMEDIA_STEP reflects which step was running when the
+    ``&&``-chain breaks. The export goes BEFORE the step's command in the
+    same chain, so the failed-step's name is the most recent assignment
+    when ``notify_pipeline_fail`` reads it.
+
+    For ``get-ids-es`` / ``get-ids-nara`` (the id-generation step), also
+    tees stderr to the per-session path returned by
+    :func:`id_generation_stderr_tail_file` (interpolated by bash from
+    ``WIKIMEDIA_SESSION_LABEL`` at runtime, so concurrent tmux sessions
+    don't clobber each other's stderr file). That's the one step in the
+    pipeline whose tool doesn't call ``setup_logging``, so without this
+    its stderr (e.g. ``click.BadParameter`` from a failed
+    ``DPLA.check_partner`` precheck) would be visible only in the tmux
+    pane and never reach the Slack failure message. Process substitution
+    keeps the live stream going to the pane too.
+
+    Commands not in :data:`_STEP_BY_FIRST_TOKEN` (``cd``, ``echo``, the
+    case-2 skip step) are returned unchanged.
+    """
+    if not cmd:
+        return cmd
+    first = cmd.split(None, 1)[0]
+    step = _STEP_BY_FIRST_TOKEN.get(first)
+    if step is None:
+        return cmd
+    wrapped = cmd
+    if step == "id-generation":
+        # The existing build emits ``... > csv_file`` for stdout; appending
+        # ``2> >(tee FILE >&2)`` here keeps stdout on the CSV and tees
+        # stderr both to the tmux pane (via the trailing ``>&2``) and to
+        # the failure-tail file. Bash parses the redirects in order:
+        # stdout to the CSV, stderr through the substitution.
+        #
+        # Path is interpolated at runtime from
+        # ``${WIKIMEDIA_SESSION_LABEL}`` so concurrent tmux sessions
+        # running id-generation don't clobber each other's stderr file
+        # in ``/tmp``. The launcher's per-target preamble exports
+        # ``WIKIMEDIA_SESSION_LABEL`` BEFORE this tee runs, so the
+        # interpolation always resolves. The ``:-unknown`` fallback is
+        # belt-and-braces against a future caller that doesn't set the
+        # var; in that case the read-side
+        # (:func:`ingest_wikimedia.slack.id_generation_stderr_tail_file`)
+        # would not match — accepting that as a fail-soft. Mirrors the
+        # Python helper's filename shape.
+        per_session_path = (
+            '"/tmp/wm-id-generation-stderr-${WIKIMEDIA_SESSION_LABEL:-unknown}.log"'
+        )
+        wrapped = f"{cmd} 2> >(tee {per_session_path} >&2)"
+    return f"export WIKIMEDIA_STEP={step} && {wrapped}"
+
+
 def _build_get_ids_command(
     canonical: str,
     institutions: tuple[str, ...],
@@ -1169,11 +1237,21 @@ def main() -> None:
             if idx == last_idx
             else "unset WIKIMEDIA_TARGET_IS_LAST"
         )
+        # ``unset WIKIMEDIA_STEP`` first so a failure in this target's
+        # un-wrapped preamble (``cd $base``, currently the only step that
+        # ``_wrap_step_with_marker`` leaves alone) doesn't inherit the
+        # previous target's last-step name in the Slack failure message.
+        # Each subsequent step's ``export WIKIMEDIA_STEP=<name>`` then
+        # sets it freshly. Without this, a target whose ``cd`` fails on a
+        # missing partner directory would be reported as e.g. "`sdc-sync`
+        # step failed" — naming the prior target's tail step instead of
+        # the actual failure point.
         label_export = (
             f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(session_label)}; "
             f"export WIKIMEDIA_PARTNER_DIR={shlex.quote(base)}; "
             f"{is_last_env}; "
-            f"{single_item_env}"
+            f"{single_item_env}; "
+            f"unset WIKIMEDIA_STEP"
         )
         # SDC-sync parallelism options. --workers > 1 enables the
         # multiprocessing pool; --workers-budget caps concurrent worker
@@ -1240,7 +1318,12 @@ def main() -> None:
                 pipeline_steps.append(
                     f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}"
                 )
-        target_steps = " && ".join(pipeline_steps)
+        # Wrap each step with an ``export WIKIMEDIA_STEP=<name>`` prefix so
+        # the per-target failure handler (``notify_pipeline_fail``) can name
+        # the failing phase in Slack instead of just reporting an exit code.
+        # See :func:`_wrap_step_with_marker` for the per-step details
+        # (including the id-generation stderr tee).
+        target_steps = " && ".join(_wrap_step_with_marker(s) for s in pipeline_steps)
         target_blocks.append(
             f"{label_export}; {{ {target_steps}; }}"
             f" || {{ {notify_fail_cmd} >/dev/null 2>&1 || true; }}"
