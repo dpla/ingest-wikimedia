@@ -89,6 +89,40 @@ def test_check_partner_rejects_hub_with_no_upload_eligible_institutions(
             dpla.check_partner("bpl")
 
 
+def test_check_partner_maintain_mode_accepts_de_opted_hub(dpla: DPLA):
+    """Maintain mode reconciles files ALREADY on Commons for de-opted
+    institutions, so a hub with zero ``upload: True`` institutions must
+    still pass the precheck when ``maintain=True``. This is the
+    digitalnc-class case from the user's Q5312898 Duke Libraries run:
+    the launcher correctly resolved the QID to three hubs (one of which,
+    NCDH, has no opted-in institutions), and the maintain pipeline
+    needs to process each — but pre-fix, ``DPLA.check_partner`` raised
+    ``ValueError`` → ``click.BadParameter`` (exit 2) at every CLI
+    entry point before maintain mode could rescue.
+
+    The partner-level twin of the bug PR #342 fixed for
+    :func:`resolve_wikidata_id`.
+    """
+    with patch("ingest_wikimedia.dpla.is_upload_eligible", return_value=False):
+        # No exception when maintain=True, even though the hub fails
+        # the eligibility check.
+        dpla.check_partner("bpl", maintain=True)
+    # And the eligibility check is still skipped — not even called.
+    with patch("ingest_wikimedia.dpla.is_upload_eligible") as mock_eligible:
+        dpla.check_partner("bpl", maintain=True)
+        mock_eligible.assert_not_called()
+
+
+def test_check_partner_maintain_mode_still_rejects_unknown_slug(dpla: DPLA):
+    """Maintain mode drops ONLY the upload-eligibility check. A slug
+    not in ``PARTNER_HUBS`` is still a real bug (typo / unsupported
+    hub) and must fail loudly even in maintain mode — otherwise the
+    downstream tools would dereference ``PARTNER_HUBS[partner]`` and
+    KeyError obscurely."""
+    with pytest.raises(ValueError, match="Unrecognized partner"):
+        dpla.check_partner("nope-not-a-real-slug", maintain=True)
+
+
 def test_check_record_partner_valid(dpla: DPLA):
     partner = "bpl"
     item_metadata = {"provider": {"name": "Digital Commonwealth"}}

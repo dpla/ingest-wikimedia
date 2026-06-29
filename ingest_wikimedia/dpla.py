@@ -34,7 +34,7 @@ class DPLA:
         self.iiif = iiif
 
     @staticmethod
-    def check_partner(partner: str) -> None:
+    def check_partner(partner: str, *, maintain: bool = False) -> None:
         """Raise ValueError if `partner` is not an upload-eligible DPLA hub.
 
         Eligibility is driven entirely by institutions_v2.json — the file
@@ -43,10 +43,21 @@ class DPLA:
         institutions_v2.json marks it (or any of its institutions) as
         `upload: True` is accepted here. No code change is required to
         add a new partner.
+
+        ``maintain`` drops the upload-eligibility check (keeps the
+        slug-recognition check). Maintain mode reconciles files ALREADY
+        on Commons, which is exactly when an un-opted-in hub is in
+        scope: a hub with zero opted-in institutions but real prior
+        uploads (e.g. ``digitalnc`` in the user's Q5312898 Duke
+        Libraries case) needs its existing files maintained even
+        though no new uploads should land. Pre-fix this raised
+        ``ValueError`` → ``click.BadParameter`` (exit 2) at every CLI
+        entry point — the partner-level twin of the bug PR #342 fixed
+        for :func:`resolve_wikidata_id`.
         """
         if partner not in PARTNER_HUBS:
             raise ValueError(f"Unrecognized partner: {partner}")
-        if not is_upload_eligible(partner):
+        if not maintain and not is_upload_eligible(partner):
             raise ValueError(
                 f"Hub {partner!r} has no upload-eligible institutions in "
                 f"institutions_v2.json — edit that file to opt in"
