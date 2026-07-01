@@ -622,6 +622,45 @@ def notify_sdc_complete(
     )
 
 
+def notify_upload_aborted(
+    tracker: Tracker,
+    partner_label: str,
+    elapsed_seconds: float,
+    reason: str,
+) -> None:
+    """Warn #tech-alerts that the upload phase aborted mid-run.
+
+    Emitted on unrecoverable session-level failures (e.g. pywikibot CSRF
+    token invalidated and recovery ceiling exhausted). The caller
+    suppresses the normal ``notify_upload_complete`` so this message
+    stands on its own.
+    """
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+    effective_label = (
+        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
+    )
+    runtime = _format_runtime(elapsed_seconds)
+    _post_completion_notice(
+        token=token,
+        header=f"🛑 *Wikimedia upload ABORTED: {effective_label}*",
+        plain_text=f"Wikimedia upload aborted: {effective_label}",
+        stats_lines=[
+            f"UPLOADED:      {tracker.count(Result.UPLOADED):,}",
+            f"SKIPPED:       {tracker.count(Result.SKIPPED):,}",
+            f"  not present: {tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT):,}",
+            f"  ineligible:  {tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE):,}",
+            f"FAILED:        {tracker.count(Result.FAILED):,}",
+            f"BYTES:         {_format_bytes(tracker.count(Result.BYTES))}",
+            f"Runtime:       {runtime}",
+            "",
+            f"Reason: {reason}",
+        ],
+    )
+
+
 def notify_dup_drain_incomplete(partner_label: str, remaining: int) -> None:
     """Warn #tech-alerts that the dup-category drain pass exited with files
     still deferred.
