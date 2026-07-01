@@ -45,7 +45,11 @@ from ingest_wikimedia.dpla import (
     WIKIDATA_FIELD_NAME,
     DPLA,
 )
-from ingest_wikimedia.slack import notify_dup_drain_incomplete, notify_upload_complete
+from ingest_wikimedia.slack import (
+    notify_dup_drain_incomplete,
+    notify_upload_aborted,
+    notify_upload_complete,
+)
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
     IGNORE_WIKIMEDIA_WARNINGS,
@@ -205,6 +209,45 @@ class NewFilePageBlocked(RuntimeError):
     """
 
 
+class CsrfRecoveryFailed(RuntimeError):
+    """Raised when the pywikibot session's CSRF token cannot be recovered.
+
+    Routed AROUND the per-ordinal generic FAILED-counter catch so a
+    session-level fatal aborts the run instead of looping the same
+    error against every remaining item.
+    """
+
+
+# Session-scoped ceiling on CSRF recoveries per run; exceeding it raises
+# ``CsrfRecoveryFailed``. This is the hard guardrail against unbounded
+# looping on a persistently invalid session.
+MAX_CSRF_RECOVERIES = 3
+
+_CSRF_TOKEN_ERROR_MARKER = "Invalid token 'csrf'"
+
+
+def _is_csrf_token_error(ex: BaseException) -> bool:
+    """True if ``ex`` is the pywikibot ``KeyError`` from ``TokenWallet``
+    whose message signals an invalidated CSRF token — narrowed on the
+    marker so unrelated ``KeyError``s don't trigger session recovery."""
+    return isinstance(ex, KeyError) and _CSRF_TOKEN_ERROR_MARKER in str(ex)
+
+
+def _recover_commons_session(site) -> None:
+    """Drop the current pywikibot session, re-authenticate, and clear
+    the cached TokenWallet so the next ``site.tokens['csrf']`` refetches.
+
+    ``site.logout()`` is required first: ``site.login()`` on an
+    already-"logged-in" site is a no-op in pywikibot's default flow, so
+    clearing tokens alone would just re-fetch against the same bad
+    session.
+    """
+    logging.info("Recovering Commons session: logout + login + token-wallet clear")
+    site.logout()
+    site.login()
+    site.tokens.clear()
+
+
 class Uploader:
     def __init__(
         self,
@@ -231,6 +274,9 @@ class Uploader:
         # run can't flood the human-maintained Category:Duplicate. None disables
         # the gate (standalone / unit-test construction); main() injects one.
         self.dup_throttle = dup_throttle
+        # Capped at :data:`MAX_CSRF_RECOVERIES`; once exhausted the next
+        # CSRF error raises :class:`CsrfRecoveryFailed` and aborts the run.
+        self._csrf_recoveries_used = 0
 
     def _safe_upload(self, *, filepage, **kwargs):
         """Sole sanctioned wrapper around ``site.upload`` — every upload in
@@ -712,7 +758,15 @@ class Uploader:
                 # Use try/finally to guarantee shutdown(wait=False) on all paths.
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
-                    for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                    # ``attempt`` is managed manually rather than via
+                    # ``for attempt in range(...)`` so a CSRF-recovery
+                    # continue can re-loop WITHOUT consuming an attempt
+                    # slot — the recovered session deserves a fresh try
+                    # of the same call. Only real per-ordinal errors
+                    # (backend-fail retries, unrecoverable exceptions)
+                    # advance ``attempt``.
+                    attempt = 1
+                    while attempt <= MAX_UPLOAD_RETRIES:
                         future = None
                         try:
                             future = executor.submit(
@@ -741,6 +795,48 @@ class Uploader:
                             break
                         except Exception as ex:
                             is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
+                            is_csrf_error = _is_csrf_token_error(ex)
+                            if is_csrf_error:
+                                # Session was invalidated — every subsequent
+                                # upload will hit the same KeyError until
+                                # we re-authenticate. Retrying the same call
+                                # can't help; refresh the session instead.
+                                # Session cap or recovery failure → fatal.
+                                if self._csrf_recoveries_used >= MAX_CSRF_RECOVERIES:
+                                    raise CsrfRecoveryFailed(
+                                        f"Commons session invalidated: CSRF"
+                                        f" token still invalid after"
+                                        f" {self._csrf_recoveries_used}"
+                                        f" recovery attempts; aborting run."
+                                    ) from ex
+                                logging.warning(
+                                    "CSRF token invalidated (attempt"
+                                    " %d/%d for %s ordinal %d); refreshing"
+                                    " Commons session (recovery %d/%d)",
+                                    attempt,
+                                    MAX_UPLOAD_RETRIES,
+                                    dpla_id,
+                                    ordinal,
+                                    self._csrf_recoveries_used + 1,
+                                    MAX_CSRF_RECOVERIES,
+                                )
+                                try:
+                                    _recover_commons_session(self.site)
+                                except Exception as recover_ex:
+                                    raise CsrfRecoveryFailed(
+                                        f"Commons session recovery threw"
+                                        f" ({recover_ex!r}); aborting rather"
+                                        f" than looping unrecoverable auth"
+                                        f" errors."
+                                    ) from recover_ex
+                                self._csrf_recoveries_used += 1
+                                del future
+                                gc.collect()
+                                # Do NOT advance ``attempt``: the previous call
+                                # failed on session state, not on anything
+                                # ordinal-specific — the recovered session
+                                # gets a fresh attempt slot.
+                                continue
                             if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
                                 delay = min(
                                     UPLOAD_RETRY_BASE_DELAY_SECS * (2 ** (attempt - 1)),
@@ -761,6 +857,8 @@ class Uploader:
                                 del future
                                 gc.collect()
                                 time.sleep(delay)
+                                attempt += 1
+                                continue
                             else:
                                 # Don't increment FAILED here — the ``raise``
                                 # propagates to the generic ``except Exception``
@@ -856,12 +954,19 @@ class Uploader:
             # ordinals aren't attempted — a stuck Commons job queue won't
             # magically un-stick mid-item.
             raise
+        except CsrfRecoveryFailed:
+            # Session-level fatal — propagates to main() so the whole run
+            # aborts. Not a per-ordinal FAILED (the auth state is broken
+            # for every subsequent write, not just this ordinal).
+            raise
         except Exception as ex:
             # Single source of truth for the per-ordinal FAILED counter on
-            # every non-timeout exception path — includes pywikibot API
-            # errors like the CSRF ``KeyError`` from an invalidated session,
-            # backend-fail retries exhausted, "file linked to another
-            # page" ID drift, and anything else that reaches this catch.
+            # every non-timeout, non-session-fatal exception path — includes
+            # pywikibot API errors like a *recoverable* CSRF ``KeyError``
+            # that we couldn't recover from within this attempt (post the
+            # session-recovery branch in the retry loop above), backend-fail
+            # retries exhausted, "file linked to another page" ID drift, and
+            # anything else that reaches this catch.
             # Pre-fix, ``handle_upload_exception`` logged the ``Failed:
             # <reason>`` line but never bumped the counter, so a whole
             # class of upload failures were silently absent from
@@ -1557,6 +1662,12 @@ class Uploader:
                 r.get("status") == ORDINAL_DEFERRED for r in ordinal_results.values()
             )
 
+        except CsrfRecoveryFailed:
+            # Session-level fatal — propagates to main() so the run
+            # aborts. Explicit re-raise ordering: the generic catch
+            # below is for per-item transient errors and would swallow
+            # this into a FAILED bump.
+            raise
         except Exception as ex:
             # Intentionally NOT writing upload-result.json on the catch-all
             # exception path. The failure may be transient (S3 hiccup,
@@ -1706,6 +1817,11 @@ def main(
     else:
         slot_budget = WorkerSlotBudget(0)
 
+    # Suppresses the "Upload Complete" Slack notification in the finally
+    # when the run aborted mid-loop. Defined *before* the outer try so
+    # it's in scope for the finally even if an early setup step raises.
+    session_aborted = False
+
     try:
         local_fs.setup_temp_dir()
         setup_logging(partner, "upload", logging.INFO)
@@ -1724,57 +1840,82 @@ def main(
 
         # Map of dpla_id -> count of ordinals the dup-category throttle deferred.
         deferred: dict[str, int] = {}
-        for dpla_id in tqdm(dpla_ids, desc="Uploading Items", unit="Item", ncols=100):
-            with slot_budget.acquire():
-                deferred_count = uploader.process_item(
-                    dpla_id, providers_json, partner, verbose, dry_run
-                )
-                if deferred_count:
-                    deferred[dpla_id] = deferred_count
+        try:
+            for dpla_id in tqdm(
+                dpla_ids, desc="Uploading Items", unit="Item", ncols=100
+            ):
+                with slot_budget.acquire():
+                    deferred_count = uploader.process_item(
+                        dpla_id, providers_json, partner, verbose, dry_run
+                    )
+                    if deferred_count:
+                        deferred[dpla_id] = deferred_count
 
-        # Any item whose {{duplicate}}-tagging upload was deferred because
-        # Category:Duplicate was full: wait for the category to drain, then
-        # re-run those items in this same session (not an operator re-run).
-        if deferred:
-            _drain_deferred_dups(
-                uploader,
-                dup_throttle,
-                deferred,
-                providers_json,
-                partner,
-                verbose,
-                dry_run,
-                slot_budget,
+            # Any item whose {{duplicate}}-tagging upload was deferred because
+            # Category:Duplicate was full: wait for the category to drain, then
+            # re-run those items in this same session (not an operator re-run).
+            # Inside the same try so a CSRF-fatal from the drain pass also
+            # routes to the notify_upload_aborted + re-raise path below.
+            if deferred:
+                _drain_deferred_dups(
+                    uploader,
+                    dup_throttle,
+                    deferred,
+                    providers_json,
+                    partner,
+                    verbose,
+                    dry_run,
+                    slot_budget,
+                )
+        except CsrfRecoveryFailed as ex:
+            # Session's auth is broken and unrecoverable. Abort — do NOT
+            # continue to remaining items (every one would hit the same
+            # error). Re-raise after notifying so the process exits
+            # non-zero and the tmux `&&` chain doesn't proceed to sdc-sync.
+            session_aborted = True
+            logging.error("Aborting upload: %s", ex)
+            notify_upload_aborted(
+                tracker=tracker,
+                partner_label=partner,
+                elapsed_seconds=time.time() - start_time,
+                reason=str(ex),
             )
+            raise
 
     finally:
         elapsed = time.time() - start_time
         logging.info("\n" + str(tracker))
         logging.info(f"{elapsed} seconds.")
         local_fs.cleanup_temp_dir()
-        # Touch files for any institutions we set up this session.  Closes the
-        # Wikidata-replication-lag race that lands first-batch files in the
-        # "unknown institution" category; without this we rely on a periodic
-        # run of fix-unknown-categories to clean up after the fact.  The 10s
-        # pause is a cheap belt-and-suspenders against very-late ensure()
-        # calls — for typical runs replication has settled long before this.
-        #
-        # Passes the slot budget through: these touches are Commons writes,
-        # so the helper holds a slot around them (see its docstring).
-        _post_upload_touch_new_institutions(
-            commons_site, category_ensurer, dry_run, slot_budget
-        )
-        notify_upload_complete(
-            # Bare partner slug, not "wikimedia-<partner>" — notify_upload_complete
-            # always prepends "wikimedia-" itself (matching the bare-label
-            # convention notify_phase_start and notify_download_complete use).
-            # Passing the pre-prefixed form yielded "wikimedia-wikimedia-<partner>"
-            # in standalone runs after PR #199 refactored these helpers.
-            tracker=tracker,
-            partner_label=partner,
-            elapsed_seconds=elapsed,
-            dry_run=dry_run,
-        )
+        # On a session-aborted run ``notify_upload_aborted`` already
+        # posted the failure message; skip the "Upload Complete" summary
+        # AND the Commons-writing touch helper, since the auth state is
+        # broken and further writes would fail noisily (potentially
+        # masking the original CSRF-fatal in logs).
+        if not session_aborted:
+            # Touch files for any institutions we set up this session.  Closes the
+            # Wikidata-replication-lag race that lands first-batch files in the
+            # "unknown institution" category; without this we rely on a periodic
+            # run of fix-unknown-categories to clean up after the fact.  The 10s
+            # pause is a cheap belt-and-suspenders against very-late ensure()
+            # calls — for typical runs replication has settled long before this.
+            #
+            # Passes the slot budget through: these touches are Commons writes,
+            # so the helper holds a slot around them (see its docstring).
+            _post_upload_touch_new_institutions(
+                commons_site, category_ensurer, dry_run, slot_budget
+            )
+            notify_upload_complete(
+                # Bare partner slug, not "wikimedia-<partner>" — notify_upload_complete
+                # always prepends "wikimedia-" itself (matching the bare-label
+                # convention notify_phase_start and notify_download_complete use).
+                # Passing the pre-prefixed form yielded "wikimedia-wikimedia-<partner>"
+                # in standalone runs after PR #199 refactored these helpers.
+                tracker=tracker,
+                partner_label=partner,
+                elapsed_seconds=elapsed,
+                dry_run=dry_run,
+            )
 
 
 # Upper bound on how long the drain pass will wait for Category:Duplicate to

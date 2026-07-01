@@ -14,9 +14,13 @@ import pytest
 
 from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
+    MAX_CSRF_RECOVERIES,
+    CsrfRecoveryFailed,
     NewFilePageBlocked,
     Uploader,
+    _CSRF_TOKEN_ERROR_MARKER,
     _drain_deferred_dups,
+    _is_csrf_token_error,
     _post_item_orphan_check,
     _post_upload_touch_new_institutions,
     is_dup_sha1_sibling_at_expected_title,
@@ -2086,4 +2090,219 @@ def test_process_file_backend_fail_retry_exhaustion_counts_once():
         f"{uploader._safe_upload.call_count} of "
         f"{MAX_UPLOAD_RETRIES} tries. Test isn't exercising the "
         f"removed-increment site."
+    )
+
+
+# ---------------------------------------------------------------------------
+# CSRF token recovery in the retry loop.
+#
+# Pins the contract: (a) recover the session on the first CSRF error,
+# (b) cap total recoveries per run so an unrecoverable state can't loop,
+# (c) escalate to ``CsrfRecoveryFailed`` that propagates past
+# process_file's and process_item's generic ``except Exception`` catches
+# — otherwise the fatal would be swallowed as "one FAILED ordinal" and
+# the main loop would keep going.
+# ---------------------------------------------------------------------------
+
+
+def _csrf_keyerror() -> KeyError:
+    """Build a KeyError whose ``str()`` matches pywikibot's CSRF-invalid
+    TokenWallet message. Uses the production marker constant so the
+    detector and the test data can never drift apart."""
+    return KeyError(
+        f"{_CSRF_TOKEN_ERROR_MARKER} for user 'DPLA bot' on commons:commons wiki."
+    )
+
+
+def test_is_csrf_token_error_matches_pywikibot_shape():
+    """Substring match on ``str(KeyError(...))`` — Python wraps KeyError
+    args in quotes on stringify, so the marker must appear inside those
+    wrapping quotes."""
+    assert _is_csrf_token_error(_csrf_keyerror())
+
+
+def test_is_csrf_token_error_rejects_unrelated_keyerror():
+    """A KeyError from any other code path (e.g. dict miss on 'title')
+    must not be treated as a CSRF error — otherwise a bug elsewhere
+    could accidentally trip the whole session-abort escalation."""
+    assert not _is_csrf_token_error(KeyError("title"))
+    assert not _is_csrf_token_error(KeyError("csrf"))  # bare, no "Invalid token"
+
+
+def test_is_csrf_token_error_rejects_non_keyerror():
+    """A RuntimeError whose message happens to contain the CSRF marker
+    isn't a real CSRF token error — pywikibot only raises this as
+    KeyError. Guard against a false positive from log-string
+    contamination."""
+    assert not _is_csrf_token_error(RuntimeError(_CSRF_TOKEN_ERROR_MARKER))
+
+
+def _csrf_retry_loop_uploader(tracker: Tracker) -> Uploader:
+    """Mirrors ``_process_file_uploader`` but wires up the extra mocks
+    needed to reach the retry loop (the CSRF handling site) rather than
+    landing in the pre-loop outer catch."""
+    uploader = Uploader(
+        tracker=tracker,
+        local_fs=MagicMock(),
+        s3_client=MagicMock(),
+        dpla=MagicMock(),
+        site=MagicMock(),
+        category_ensurer=None,
+    )
+    uploader.s3_client.get_media_s3_path.return_value = "p/a/t/h/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+    return uploader
+
+
+def _csrf_process_file(uploader: Uploader):
+    """Drive execution into the retry loop with all pre-retry mocks
+    patched in. Returns the tuple ``(fake_page, result_or_exc)`` where
+    the latter is the process_file return value or ``None`` if an
+    exception was raised (caught outside this helper)."""
+    fake_page = MagicMock()
+    fake_page.exists.return_value = False
+    fake_page.isRedirectPage.return_value = False
+    fake_page.title.return_value = (
+        "File:X - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    )
+    fake_page.pageid = 0
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=None),
+        patch(
+            "tools.uploader.get_page_title",
+            return_value=(
+                "File:X - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+            ),
+        ),
+        patch("tools.uploader.get_page", return_value=fake_page),
+        patch("tools.uploader.time.sleep"),
+    ):
+        return uploader.process_file(
+            dpla_id="abc",
+            title="X",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+
+def test_csrf_error_triggers_session_recovery_and_retry():
+    """First CSRF error → ``_recover_commons_session`` fires and the
+    retry loop advances to the next attempt. Verifies the recovery +
+    re-attempt contract only — the second attempt is arranged to fail
+    with a non-CSRF error so the test doesn't have to fake the
+    post-upload FilePage refresh."""
+    tracker = Tracker()
+    uploader = _csrf_retry_loop_uploader(tracker)
+    # First upload attempt raises CSRF KeyError; second raises a
+    # non-CSRF error so the retry loop exits without exercising the
+    # post-upload machinery. The point of this test is the RE-ATTEMPT
+    # after recovery, not what happens on the second attempt.
+    uploader._safe_upload = MagicMock(
+        side_effect=[_csrf_keyerror(), RuntimeError("second attempt marker")]
+    )
+    with patch("tools.uploader._recover_commons_session") as recover_mock:
+        _csrf_process_file(uploader)
+    recover_mock.assert_called_once_with(uploader.site)
+    assert uploader._safe_upload.call_count == 2, (
+        f"retry loop did not re-attempt after CSRF recovery — "
+        f"_safe_upload called {uploader._safe_upload.call_count} time(s), "
+        f"expected 2. If this is 1, the recovery path returned instead "
+        f"of continuing the loop."
+    )
+    assert uploader._csrf_recoveries_used == 1
+
+
+def test_csrf_errors_beyond_cap_raise_csrf_recovery_failed():
+    """Once ``MAX_CSRF_RECOVERIES`` is reached, the next CSRF error
+    raises ``CsrfRecoveryFailed`` — the exception must not be silently
+    counted as FAILED. Bounded abort under a persistently invalid
+    session."""
+    tracker = Tracker()
+    uploader = _csrf_retry_loop_uploader(tracker)
+    # Pre-consume the cap so the very next CSRF error escalates. This is
+    # a cleaner test than driving through many attempts (each of which
+    # would exhaust MAX_UPLOAD_RETRIES per ordinal) and pins the cap
+    # behavior specifically.
+    uploader._csrf_recoveries_used = MAX_CSRF_RECOVERIES
+    uploader._safe_upload = MagicMock(side_effect=_csrf_keyerror())
+    with patch("tools.uploader._recover_commons_session") as recover_mock:
+        with pytest.raises(CsrfRecoveryFailed):
+            _csrf_process_file(uploader)
+    # Recovery must NOT have been attempted — the cap was already at the
+    # ceiling, so trying again would just loop the same failure.
+    recover_mock.assert_not_called()
+    # And nothing was silently counted as FAILED — the exception
+    # propagates past process_file's outer catch (the whole point).
+    assert tracker.count(Result.FAILED) == 0, (
+        "CsrfRecoveryFailed must propagate past process_file's outer "
+        "``except Exception`` — if this is nonzero, the generic catch "
+        "swallowed the session-fatal escalation and the run would keep "
+        "going, defeating the abort."
+    )
+
+
+def test_csrf_recovery_that_throws_escalates_to_csrf_recovery_failed():
+    """If ``_recover_commons_session`` itself throws (network down,
+    credentials rotated, etc.), escalate to ``CsrfRecoveryFailed``
+    immediately rather than looping recovery attempts against an
+    unreachable auth endpoint."""
+    tracker = Tracker()
+    uploader = _csrf_retry_loop_uploader(tracker)
+    uploader._safe_upload = MagicMock(side_effect=_csrf_keyerror())
+    with patch(
+        "tools.uploader._recover_commons_session",
+        side_effect=RuntimeError("network unreachable"),
+    ):
+        with pytest.raises(CsrfRecoveryFailed):
+            _csrf_process_file(uploader)
+    assert tracker.count(Result.FAILED) == 0
+
+
+def test_csrf_recovery_failed_propagates_past_process_item_outer_catch():
+    """process_item wraps its body in an outer ``except Exception`` that
+    increments FAILED. Without an explicit ``except CsrfRecoveryFailed:
+    raise`` before it, the fatal would be swallowed as a per-ordinal
+    FAILED and the main() loop would move on to the next item — every
+    one of which would hit the same broken session. This test pins that
+    CsrfRecoveryFailed propagates all the way out of process_item, so
+    main() sees it and aborts the run.
+
+    Raises CsrfRecoveryFailed from the very first call inside the try
+    (``get_item_metadata``) — the propagation contract is about outer
+    handler ordering (specific-before-generic), which is testable at
+    the boundary without driving through the full ordinal pipeline.
+    """
+    tracker = Tracker()
+    uploader = _csrf_retry_loop_uploader(tracker)
+    uploader.s3_client.get_item_metadata.side_effect = CsrfRecoveryFailed(
+        "session unrecoverable"
+    )
+    with pytest.raises(CsrfRecoveryFailed):
+        uploader.process_item(
+            dpla_id="abc",
+            providers_json={},
+            partner="nara",
+            verbose=False,
+            dry_run=False,
+        )
+    # The fatal must not have been counted as a plain FAILED — that
+    # counter is reserved for per-ordinal failures the generic outer
+    # catch legitimately owns after PR #349.
+    assert tracker.count(Result.FAILED) == 0, (
+        "CsrfRecoveryFailed was caught by process_item's generic "
+        "``except Exception`` and counted as FAILED. Add an explicit "
+        "``except CsrfRecoveryFailed: raise`` before the generic "
+        "handler so the run aborts instead of looping the next item."
     )
