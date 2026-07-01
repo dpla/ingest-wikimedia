@@ -1578,3 +1578,79 @@ def test_migrate_legacy_file_strips_params_matching_sdc_in_one_edit():
     assert "{{DPLA metadata}}" in saved
     # And only one save was issued.
     assert page.save.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# plan_migration — community-vs-canonical equivalence widening (this PR).
+# A community edit that reformatted DPLA's own value (case, punctuation,
+# or date format) is NOT a community contribution and must not be
+# imported as an inferred-from-Wikitext SDC claim. The equivalence
+# function :func:`_value_equivalent_to_canonical` widens the previous
+# byte-equality check to cover these editor-reformat cases.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_migration_skips_semantically_equal_date():
+    """Editor reformatted DPLA's `1900` as `January 1, 1900` (or
+    similar). Same year+month+day at same precision — no import."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|date=1900-06-15}}"),
+        (2, "Editor1", "{{Artwork|date=15 June 1900}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="1900-06-15"))
+    assert plan is not None
+    assert plan.community_imports == {}, (
+        f"expected `15 June 1900` == `1900-06-15` semantically; "
+        f"got community_imports={plan.community_imports}"
+    )
+    assert plan.dpla_originated_params.get("date") == "15 June 1900"
+
+
+def test_plan_migration_skips_case_only_title_change():
+    """Editor retyped title in uppercase — no factual change, no
+    import. Casefold widening applies to display-string keys."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title}}"),
+        (2, "Editor1", "{{Artwork|title=A TITLE}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports == {}
+
+
+def test_plan_migration_skips_trailing_period_description_change():
+    """Editor stripped a trailing period from DPLA's description —
+    still the same fact, no import."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|description=A description.}}"),
+        (2, "Editor1", "{{Artwork|description=A description}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(description="A description.")
+    )
+    assert plan is not None
+    assert plan.community_imports == {}
+
+
+def test_plan_migration_still_imports_substantively_different_date():
+    """Widening must not lose real differences — an editor supplied a
+    different date, we import."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|date=1900}}"),
+        (2, "Editor1", "{{Artwork|date=1950}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="1900"))
+    assert plan is not None
+    assert plan.community_imports == {"date": "1950"}
+
+
+def test_plan_migration_still_imports_substantively_different_title():
+    """Guard against overshoot — a title that differs by more than
+    case/punctuation still imports."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title}}"),
+        (2, "Editor1", "{{Artwork|title=A Completely Different Title}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports == {"title": "A Completely Different Title"}

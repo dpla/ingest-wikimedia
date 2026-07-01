@@ -347,9 +347,9 @@ def test_parse_falls_back_when_residue_has_unrecognised_text():
         "before 1945",
         "after 1945",
         "between 1945 and 1950",
-        # Month-name prefixes / season markers — not stripped.
-        "January 1945",
-        "Jan 1945",
+        # Season markers — not stripped. Month names ARE now handled
+        # separately (see test_parse_month_name_forms) so they are
+        # correctly excluded from the fall-back list.
         "Spring 1945",
         "summer 1945",
         # Parenthesised forms — parens not in the decorator list.
@@ -453,6 +453,217 @@ def test_build_date_claim_returns_none_for_empty_input():
 
     assert _build_date_claim("", "abc123", _dt.date(2026, 6, 7)) is None
     assert _build_date_claim("   ", "abc123", _dt.date(2026, 6, 7)) is None
+
+
+# ---------------------------------------------------------------------------
+# parse_dpla_date — natural-language month/year and slash-form
+# extensions. Motivating example: M174777532 (indiana partner) has a
+# DPLA-attributed P571 stored as ``somevalue + P1932="June 1959"``, whose
+# comparable key would not match the inferred-from-Wikitext value-typed
+# time claim for the same date until parse_dpla_date learned month
+# names.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_month_name_year_forms():
+    """``Month YYYY`` variants → month precision (10)."""
+    for src in (
+        "June 1959",
+        "june 1959",
+        "Jun 1959",
+        "JUN 1959",
+        "Sept 1912",
+        "sept. 1912",
+        "September 1912",
+        "May 1900",
+    ):
+        r = parse_dpla_date(src)
+        assert r is not None, f"{src!r} should now parse to a structured month"
+        v = r["value"]
+        assert v["precision"] == 10, f"{src!r} → wrong precision {v['precision']}"
+        assert not r["approximate"]
+        # Time string always +YYYY-MM-01T00:00:00Z
+        assert v["time"].endswith("-01T00:00:00Z"), f"{src!r} time={v['time']}"
+
+
+def test_parse_month_day_year_forms():
+    """``Month D, YYYY`` and ``Month D YYYY`` → day precision (11)."""
+    for src in (
+        "November 19, 1902",
+        "November 19 1902",
+        "Nov 19, 1902",
+        "nov. 19 1902",
+        "March 3, 1900",
+    ):
+        r = parse_dpla_date(src)
+        assert r is not None, f"{src!r} should now parse to a structured day"
+        v = r["value"]
+        assert v["precision"] == 11, f"{src!r} → wrong precision"
+        assert not r["approximate"]
+
+
+def test_parse_day_month_year_forms():
+    """``D Month YYYY`` (British / scholarly) → day precision (11).
+    Motivating example: M105419621's ``| date = 19 November 1902``
+    override must parse to the same time as DPLA's ``1902-11-19``."""
+    r = parse_dpla_date("19 November 1902")
+    assert r is not None
+    assert r["value"]["precision"] == 11
+    assert r["value"]["time"] == "+1902-11-19T00:00:00Z"
+
+
+def test_parse_us_slash_date_form():
+    """``MM/DD/YYYY`` → day precision. Common in US-hub-supplied dates."""
+    r = parse_dpla_date("11/19/1902")
+    assert r is not None
+    assert r["value"]["precision"] == 11
+    assert r["value"]["time"] == "+1902-11-19T00:00:00Z"
+
+
+def test_parse_month_name_forms_reject_invalid_calendar_dates():
+    """``February 30, 1902`` etc. must NOT silently parse — the
+    calendar check runs on every day-precision path so a phantom
+    date can't sneak through."""
+    for src in ("February 30, 1902", "13/40/1900", "November 31 1902"):
+        assert parse_dpla_date(src) is None, f"{src!r} should not parse"
+
+
+def test_parse_month_name_forms_reject_year_zero():
+    """Year zero is invalid in the proleptic Gregorian calendar; the
+    month-name paths honour the same guard as the existing regexes."""
+    for src in ("June 0", "November 19, 0", "19 November 0"):
+        assert parse_dpla_date(src) is None
+
+
+def test_parse_month_name_forms_reject_adjacent_text():
+    """A recognised month + year must not silently absorb trailing
+    prose. Regex is fully anchored so the parser refuses anything
+    outside the exact shape."""
+    for src in (
+        "January 1945 or 1946",
+        "Jan 1945 AD",
+        "circa Jan 1945 (uncertain)",
+        "November 19, 1902 (approximately)",
+    ):
+        assert parse_dpla_date(src) is None, f"{src!r} should NOT parse"
+
+
+def test_parse_month_name_forms_carry_approximate_flag():
+    """Circa / bracket / question-mark decorators around a
+    month-name date correctly propagate the approximate flag."""
+    r = parse_dpla_date("circa June 1959")
+    assert r is not None and r["approximate"] is True
+    r = parse_dpla_date("[19 November 1902]")
+    assert r is not None and r["approximate"] is True
+
+
+# ---------------------------------------------------------------------------
+# casefold_for_compare — comparator-only text normaliser. Motivating
+# examples: M114630785 (trailing "." on DPLA-side description) and
+# M100761231 (wrapping "[…]" brackets on DPLA-side title).
+# ---------------------------------------------------------------------------
+
+
+def test_casefold_for_compare_trims_leading_and_trailing_punctuation():
+    """Wrapping brackets / parens / quotes on either side collapse."""
+    from ingest_wikimedia.sdc import casefold_for_compare
+
+    # Trailing period (M114630785 case).
+    assert casefold_for_compare(
+        "A.D. Abbott, Hancock N.H. L.M. Stearns Collection."
+    ) == casefold_for_compare("A.D. Abbott, Hancock N.H. L.M. Stearns Collection")
+    # Wrapping brackets (M100761231 case).
+    assert casefold_for_compare(
+        "[Promissory note for Thomas Love]"
+    ) == casefold_for_compare("Promissory note for Thomas Love")
+    # Curly-quote wrappers and paren wrappers.
+    assert casefold_for_compare("“A title”") == casefold_for_compare("A title")
+    assert casefold_for_compare("(1902)") == casefold_for_compare("1902")
+
+
+def test_casefold_for_compare_folds_case_but_not_internal_punctuation():
+    """Case-fold turns ``ABC`` == ``abc``, but internal punctuation is
+    preserved — so ``"A.D. Abbott"`` and ``"A D Abbott"`` do NOT
+    collapse. Rationale: the reconciler is one-way (removes inferred
+    claims only), but conservative internal-punctuation handling still
+    protects the rare case where internal punctuation is meaningful
+    (e.g. a stringy inventory number)."""
+    from ingest_wikimedia.sdc import casefold_for_compare
+
+    assert casefold_for_compare("ABC def") == casefold_for_compare("abc DEF")
+    # Internal punctuation NOT collapsed.
+    assert casefold_for_compare("A.D. Abbott") != casefold_for_compare("A D Abbott")
+
+
+def test_casefold_for_compare_collapses_internal_whitespace():
+    """Runs of whitespace fold to a single space — an editor's
+    accidental double-space or newline in a wikitext value doesn't
+    survive as a mismatch."""
+    from ingest_wikimedia.sdc import casefold_for_compare
+
+    assert casefold_for_compare("A  B  C") == casefold_for_compare("A B C")
+    assert casefold_for_compare("A\tB\nC") == casefold_for_compare("A B C")
+
+
+def test_casefold_for_compare_handles_falsy_input():
+    """Non-string / empty input returns an empty string — callers that
+    compare two folded keys treat that as unequal-to-any-real-value
+    (an empty key from a malformed claim should never accidentally
+    dedup against another empty)."""
+    from ingest_wikimedia.sdc import casefold_for_compare
+
+    assert casefold_for_compare("") == ""
+    assert casefold_for_compare(None) == ""  # type: ignore[arg-type]
+    assert casefold_for_compare("   .,  ") == ""
+
+
+# ---------------------------------------------------------------------------
+# dates_semantically_equal — semantic date equivalence for
+# ``{{DPLA metadata}}`` ``date =`` overrides that reformat DPLA's own
+# supplied date. Motivating example: M105419621 with
+# ``| date = 19 November 1902`` alongside canonical ``1902-11-19``.
+# ---------------------------------------------------------------------------
+
+
+def test_dates_semantically_equal_matches_across_formats():
+    """Cross-format equivalence: month-name day form, US slash form,
+    and canonical ISO all fold to the same time+precision."""
+    from ingest_wikimedia.sdc import dates_semantically_equal
+
+    assert dates_semantically_equal("19 November 1902", "1902-11-19")
+    assert dates_semantically_equal("November 19, 1902", "1902-11-19")
+    assert dates_semantically_equal("11/19/1902", "1902-11-19")
+    assert dates_semantically_equal("June 1959", "1959-06")
+
+
+def test_dates_semantically_equal_rejects_different_precisions():
+    """Same year but different precisions must NOT match — a P571
+    claim at year precision and one at day precision are different
+    facts even when the day one falls inside the year."""
+    from ingest_wikimedia.sdc import dates_semantically_equal
+
+    assert not dates_semantically_equal("1902", "1902-11-19")
+    assert not dates_semantically_equal("1902-11", "1902-11-19")
+
+
+def test_dates_semantically_equal_respects_circa_flag():
+    """A circa-decorated date and a plain date at the same time are
+    NOT semantically equal — the circa flag drives the P1480
+    qualifier and represents a distinct uncertainty semantic."""
+    from ingest_wikimedia.sdc import dates_semantically_equal
+
+    assert not dates_semantically_equal("circa 1902-11-19", "1902-11-19")
+    assert dates_semantically_equal("circa 1902-11-19", "circa November 19, 1902")
+
+
+def test_dates_semantically_equal_returns_false_on_unparseable():
+    """Anything the parser can't structure returns False — never a
+    false positive from two None-returns colliding."""
+    from ingest_wikimedia.sdc import dates_semantically_equal
+
+    assert not dates_semantically_equal("some date", "another date")
+    assert not dates_semantically_equal("", "1902-11-19")
+    assert not dates_semantically_equal("1902-11-19", "")
 
 
 # ---------------------------------------------------------------------------

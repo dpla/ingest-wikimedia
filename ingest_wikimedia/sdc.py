@@ -1064,6 +1064,124 @@ _YEAR_MONTH = re.compile(r"^(\d{1,4})-(\d{1,2})$")
 _DECADE = re.compile(r"^(\d{1,4})s$")
 _YEAR_ONLY = re.compile(r"^(\d{1,4})$")
 
+# English month-name lookup for the natural-language forms the DPLA API
+# occasionally emits (and that community editors routinely type into
+# ``{{DPLA metadata}}`` ``date`` overrides). Recognised spellings include
+# every 3-letter abbreviation plus the two common 4-letter one
+# (``Sept``). The lookup key is casefold-stripped-of-trailing-period so
+# ``September``, ``sept``, ``Sept.``, ``SEPT`` all collapse to the same
+# integer.
+_MONTH_NAMES = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_MONTH_NAME_RE = (
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?"
+    r"|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+# ``November 1902`` / ``Nov 1902`` / ``Sept. 1902`` → month + year precision.
+_MONTH_YEAR = re.compile(rf"^{_MONTH_NAME_RE}\.?\s+(\d{{3,4}})$", re.IGNORECASE)
+# ``November 19, 1902`` / ``Nov 19 1902`` / ``November 19 1902`` → day precision.
+# Comma between day and year is optional; whitespace is required.
+_MONTH_DAY_YEAR = re.compile(
+    rf"^{_MONTH_NAME_RE}\.?\s+(\d{{1,2}}),?\s+(\d{{3,4}})$", re.IGNORECASE
+)
+# ``19 November 1902`` / ``19 Nov. 1902`` → day precision (British / scholarly form).
+_DAY_MONTH_YEAR = re.compile(
+    rf"^(\d{{1,2}})\s+{_MONTH_NAME_RE}\.?\s+(\d{{3,4}})$", re.IGNORECASE
+)
+# ``11/19/1902`` — US slash-form with day precision. Deliberately requires
+# the trailing 3-4-digit year to avoid gluing to unrelated slash-shaped
+# strings; ambiguous with DD/MM/YYYY is left unrecognised (both forms
+# would need a heuristic we don't want in a value-preserving parser).
+_US_SLASH_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{3,4})$")
+
+# Unicode punctuation categories used by ``casefold_for_compare``'s
+# leading/trailing strip. ``\W`` in Python's re without ``re.ASCII`` covers
+# most Unicode punctuation; the explicit character class here spells out
+# the ASCII/Unicode punctuation that matters in practice so the intent is
+# reviewable and the behaviour is predictable regardless of locale.
+_TRIM_PUNCT_CHARS = (
+    r" \t\r\n"
+    r".,;:!?"
+    r"\"'`‘’“”"  # curly quotes
+    r"()\[\]{}<>"
+    r"\-‐‑‒–—"  # hyphens/en-dash/em-dash
+    r"…"  # ellipsis
+    r"/\\|"
+)
+_LEADING_TRIM_RE = re.compile(rf"^[{_TRIM_PUNCT_CHARS}]+")
+_TRAILING_TRIM_RE = re.compile(rf"[{_TRIM_PUNCT_CHARS}]+$")
+_INTERNAL_WS_RE = re.compile(r"\s+")
+
+
+def casefold_for_compare(s: str) -> str:
+    """Fold ``s`` to a comparable form for equivalence checks against
+    another display string. Strips leading/trailing whitespace and
+    punctuation, collapses internal whitespace runs, and casefolds.
+
+    Used ONLY as a comparator key — never to rewrite stored or rendered
+    values. DPLA-authored SDC and rendered wikitext must continue to
+    match byte-for-byte (case and punctuation intact); this helper only
+    widens the tolerance of "is this DPLA claim + this community claim
+    the same fact?" checks.
+
+    Non-string / falsy input returns an empty string, so a caller
+    comparing two folded keys treats both as equal only when both are
+    empty-like — deliberate: two None-shaped claims should not
+    accidentally dedup against each other.
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+    s = _LEADING_TRIM_RE.sub("", s)
+    s = _TRAILING_TRIM_RE.sub("", s)
+    s = _INTERNAL_WS_RE.sub(" ", s)
+    return s.casefold()
+
+
+def dates_semantically_equal(a: str, b: str) -> bool:
+    """True iff ``a`` and ``b`` are date display strings that parse
+    (via :func:`parse_dpla_date`) to the same Wikibase time value,
+    precision, and circa-flag.
+
+    Returns False when either side fails to parse or the parses
+    disagree — never widens a match beyond structured equivalence. Used
+    by the wikitext-normalize equivalence check (for ``date =``
+    overrides in ``{{DPLA metadata}}``) and by the legacy-Artwork
+    migration planner's community-vs-canonical comparator.
+    """
+    if not a or not b:
+        return False
+    pa = parse_dpla_date(a)
+    pb = parse_dpla_date(b)
+    if pa is None or pb is None:
+        return False
+    if bool(pa.get("approximate")) != bool(pb.get("approximate")):
+        return False
+    return pa.get("value") == pb.get("value")
+
 
 def _wikibase_time(time_str: str, precision: int) -> dict:
     """Construct the canonical ``value`` payload for a Wikibase time
@@ -1127,21 +1245,30 @@ def parse_dpla_date(date_string: str) -> dict | None:
 
     Recognised single-date shapes (after decorator stripping):
 
-      * ``YYYY-MM-DD``   → precision 11 (day)
-      * ``YYYY-MM``      → precision 10 (month)
-      * ``YYYYs``        → precision 8 (decade), accepted only when the
-                            year is decade-aligned (e.g. ``1940s``, not
-                            ``1945s``)
-      * ``YYYY``         → precision 9 (year)
+      * ``YYYY-MM-DD``            → precision 11 (day)
+      * ``MM/DD/YYYY``            → precision 11 (US slash-form)
+      * ``Month D, YYYY`` /
+        ``Month D YYYY``          → precision 11
+      * ``D Month YYYY``          → precision 11 (British / scholarly)
+      * ``YYYY-MM``               → precision 10 (month)
+      * ``Month YYYY``            → precision 10 (English month name)
+      * ``YYYYs``                 → precision 8 (decade), accepted only
+                                    when the year is decade-aligned
+                                    (e.g. ``1940s``, not ``1945s``)
+      * ``YYYY``                  → precision 9 (year)
+
+    Month names accept every 3-letter abbreviation plus the common
+    4-letter ``Sept``; case is folded and an optional trailing period is
+    tolerated (``Nov``, ``Nov.``, ``November``, ``NOV``). Comma between
+    day and year is optional in the ``Month D YYYY`` shapes.
 
     Returns None for ranges (``1945-1950``), BC dates (``500 BC``), free
     prose (``During the Gilded Age``), era markers (``1945 AD``),
-    parenthesised forms (``(1945)``), month names (``January 1945``),
-    "before"/"after"/"between" prefixes, or any other shape that
-    leaves unrecognised text in the residue after decorator stripping
-    — the builder falls back to ``somevalue + P1932 stated-as`` for
-    those, so the original DPLA string is preserved verbatim
-    regardless of parse outcome.
+    parenthesised forms (``(1945)``), "before"/"after"/"between"
+    prefixes, or any other shape that leaves unrecognised text in the
+    residue after decorator stripping — the builder falls back to
+    ``somevalue + P1932 stated-as`` for those, so the original DPLA
+    string is preserved verbatim regardless of parse outcome.
 
     Conservative-fallback contract: every regex above is anchored
     (``^…$``), so ANY non-date text adjacent to a recognised pattern
@@ -1183,10 +1310,67 @@ def parse_dpla_date(date_string: str) -> dict | None:
                 _wikibase_time(f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY)
             )
 
+    m = _US_SLASH_DATE.match(s)
+    if m:
+        mo, d, y = int(m[1]), int(m[2]), int(m[3])
+        if y != 0:
+            try:
+                datetime.date(y, mo, d)
+            except ValueError:
+                pass
+            else:
+                return _ok(
+                    _wikibase_time(
+                        f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
+                    )
+                )
+
+    m = _MONTH_DAY_YEAR.match(s)
+    if m:
+        mo = _MONTH_NAMES[m[1].casefold()]
+        d, y = int(m[2]), int(m[3])
+        if y != 0:
+            try:
+                datetime.date(y, mo, d)
+            except ValueError:
+                pass
+            else:
+                return _ok(
+                    _wikibase_time(
+                        f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
+                    )
+                )
+
+    m = _DAY_MONTH_YEAR.match(s)
+    if m:
+        d = int(m[1])
+        mo = _MONTH_NAMES[m[2].casefold()]
+        y = int(m[3])
+        if y != 0:
+            try:
+                datetime.date(y, mo, d)
+            except ValueError:
+                pass
+            else:
+                return _ok(
+                    _wikibase_time(
+                        f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
+                    )
+                )
+
     m = _YEAR_MONTH.match(s)
     if m:
         y, mo = int(m[1]), int(m[2])
         if y != 0 and 1 <= mo <= 12:
+            return _ok(
+                _wikibase_time(f"+{y:04d}-{mo:02d}-01T00:00:00Z", _PRECISION_MONTH)
+            )
+
+    m = _MONTH_YEAR.match(s)
+    if m:
+        mo = _MONTH_NAMES[m[1].casefold()]
+        y = int(m[2])
+        if y != 0:
             return _ok(
                 _wikibase_time(f"+{y:04d}-{mo:02d}-01T00:00:00Z", _PRECISION_MONTH)
             )

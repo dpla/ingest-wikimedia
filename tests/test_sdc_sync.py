@@ -5885,3 +5885,248 @@ def test_maintain_parallel_enabled_requires_from_s3_and_workers():
     assert not f(maintain=True, workers=6, count_only=True, from_s3_partner="georgia")
     assert not f(maintain=True, workers=1, count_only=False, from_s3_partner="georgia")
     assert not f(maintain=False, workers=6, count_only=False, from_s3_partner="georgia")
+
+
+# ---------------------------------------------------------------------------
+# Wikitext ↔ SDC match tolerance (this PR). Covers the four in-the-wild
+# mismatch shapes surfaced during PR authoring — all now dedup after
+# extending parse_dpla_date + adding casefold_for_compare to the
+# comparator's text-shape branches.
+#
+# Each test builds a minimal DPLA-attributed + inferred-from-Wikitext
+# pair and asserts the inferred side is queued for removal.
+# ---------------------------------------------------------------------------
+
+
+def _p571_value_typed_time(stmt_id, time_str, precision, references=None):
+    """Build a value-typed P571 statement at the given time/precision.
+    Uses the pinned before/after/timezone/calendarmodel that
+    ``_wikibase_time`` produces so the fixture matches what real
+    upload paths write.
+
+    Not routed through ``_stmt`` because that helper's value-typed
+    branch is written for wikibase-entityid / string props, and a
+    time datavalue has neither shape."""
+    return {
+        "id": stmt_id,
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P571",
+            "datavalue": {
+                "type": "time",
+                "value": {
+                    "time": time_str,
+                    "precision": precision,
+                    "before": 0,
+                    "after": 0,
+                    "timezone": 0,
+                    "calendarmodel": "http://www.wikidata.org/entity/Q1985727",
+                },
+            },
+        },
+        "references": references or [],
+    }
+
+
+def _monolingual_claim(stmt_id, prop, text, language, references=None, p459=False):
+    """Build a monolingualtext-mainsnak statement, optionally with the
+    P459 = Q61848113 (heuristic-determination) DPLA marker qualifier."""
+    quals = {"P459": _dpla_p459()} if p459 else None
+    return {
+        "id": stmt_id,
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": prop,
+            "datavalue": {
+                "type": "monolingualtext",
+                "value": {"text": text, "language": language},
+            },
+        },
+        **({"qualifiers": quals} if quals is not None else {}),
+        "references": references or [],
+    }
+
+
+def test_inferred_dupe_cleanup_removes_month_name_year_when_dpla_is_somevalue():
+    """M174777532 (indiana) repro: DPLA P571 = somevalue+P1932="June 1959"
+    and an inferred-from-Wikitext P571 value-typed +1959-06-01|P10.
+    Before this PR the DPLA-side comparable was ('p1932-string', 'June
+    1959') because parse_dpla_date returned None for the month-name
+    form — the two comparables disagreed on shape_tag and the dedup
+    never fired. Extending the parser closes the shape mismatch."""
+    from tools import sdc_sync
+
+    dpla_claim = _p571_somevalue_with_p1932(
+        "M174$DPLA", "June 1959", references=[_dpla_reference()]
+    )
+    inferred_claim = _p571_value_typed_time(
+        "M174$INFERRED",
+        "+1959-06-01T00:00:00Z",
+        10,
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 174, "statements": {"P571": [dpla_claim, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M174")
+    assert sdc_sync.removals == ["M174$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_removes_monolingual_text_with_trailing_period():
+    """M114630785 (bpl) repro: DPLA P10358 description carries a
+    trailing '.'; the inferred-from-Wikitext copy has no trailing
+    period. Byte comparison of the monolingualtext text failed;
+    casefold_for_compare's trailing-punctuation trim collapses them."""
+    from tools import sdc_sync
+
+    dpla_claim = _monolingual_claim(
+        "M114$DPLA",
+        "P10358",
+        "A.D. Abbott, Hancock N.H. L.M. Stearns Collection.",
+        "en",
+        references=[_dpla_reference()],
+        p459=True,
+    )
+    inferred_claim = _monolingual_claim(
+        "M114$INFERRED",
+        "P10358",
+        "A.D. Abbott, Hancock N.H. L.M. Stearns Collection",
+        "en",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 114, "statements": {"P10358": [dpla_claim, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M114")
+    assert sdc_sync.removals == ["M114$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_removes_monolingual_text_wrapped_in_brackets():
+    """M100761231 (bpl) repro: DPLA P1476 title wraps a supplied title
+    in ``[…]`` per archival convention; the inferred copy strips the
+    brackets. Both fold to the same normaliser key, dedup fires,
+    inferred claim removed. DPLA's bracketed form survives on the
+    file — archival convention preserved."""
+    from tools import sdc_sync
+
+    dpla_claim = _monolingual_claim(
+        "M100$DPLA",
+        "P1476",
+        "[Promissory note for Thomas Love]",
+        "en",
+        references=[_dpla_reference()],
+        p459=True,
+    )
+    inferred_claim = _monolingual_claim(
+        "M100$INFERRED",
+        "P1476",
+        "Promissory note for Thomas Love",
+        "en",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 100, "statements": {"P1476": [dpla_claim, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M100")
+    assert sdc_sync.removals == ["M100$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_removes_monolingual_text_case_only_difference():
+    """Casefold protection: an editor who retyped a DPLA title in
+    different case (``AN OLD MAP`` vs canonical ``An Old Map``) still
+    dedups — the case difference carries no factual distinction."""
+    from tools import sdc_sync
+
+    dpla_claim = _monolingual_claim(
+        "M001$DPLA",
+        "P1476",
+        "An Old Map",
+        "en",
+        references=[_dpla_reference()],
+        p459=True,
+    )
+    inferred_claim = _monolingual_claim(
+        "M001$INFERRED",
+        "P1476",
+        "an old map",
+        "en",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 1, "statements": {"P1476": [dpla_claim, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M001")
+    assert sdc_sync.removals == ["M001$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_preserves_language_mismatch():
+    """Two monolingualtext claims with the SAME text but different
+    languages must NOT dedup — the language field is a separate
+    identity axis. The comparator preserves it distinct from the
+    folded text."""
+    from tools import sdc_sync
+
+    dpla_claim = _monolingual_claim(
+        "M002$DPLA",
+        "P1476",
+        "An Old Map",
+        "en",
+        references=[_dpla_reference()],
+        p459=True,
+    )
+    inferred_claim = _monolingual_claim(
+        "M002$INFERRED",
+        "P1476",
+        "An Old Map",
+        "es",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 2, "statements": {"P1476": [dpla_claim, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M002")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_preserves_substantively_different_text():
+    """Punctuation-only tolerance must NOT widen to substantively
+    different text. Two inventory-number claims that differ by more
+    than punctuation stay separate."""
+    from tools import sdc_sync
+
+    dpla_claim = _monolingual_claim(
+        "M003$DPLA",
+        "P1476",
+        "A Title About Cats",
+        "en",
+        references=[_dpla_reference()],
+        p459=True,
+    )
+    inferred_claim = _monolingual_claim(
+        "M003$INFERRED",
+        "P1476",
+        "A Title About Dogs",
+        "en",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 3, "statements": {"P1476": [dpla_claim, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M003")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()

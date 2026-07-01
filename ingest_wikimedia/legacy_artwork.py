@@ -34,7 +34,12 @@ from urllib.parse import urlencode
 
 import mwparserfromhell
 
-from ingest_wikimedia.sdc import parse_date_range, parse_dpla_date
+from ingest_wikimedia.sdc import (
+    casefold_for_compare,
+    dates_semantically_equal,
+    parse_date_range,
+    parse_dpla_date,
+)
 
 # DPLA's Commons-bot account names. Revisions authored by these accounts
 # are treated as DPLA-originated for the purpose of provenance
@@ -325,11 +330,18 @@ def plan_migration(
 
     for key, value in wikitext_params.items():
         canonical_value = _canonical_value_for_key(canonical_params, key)
-        if classified.get(key) == "community" and value != canonical_value:
+        if classified.get(key) == "community" and not _value_equivalent_to_canonical(
+            key, value, canonical_value
+        ):
             # Only import community values that *differ* from canonical
             # — a community editor restating DPLA's title verbatim is
             # not an import we want to record (it's redundant). Same
             # invariant as Goal 1: if it matches, it's strip-eligible.
+            # Equivalence is checked semantically for the ``date`` key
+            # (via :func:`dates_semantically_equal`) and via casefold +
+            # punctuation-trim for the display-string keys — so a
+            # community edit that reformatted DPLA's own value is not
+            # imported as a spurious community contribution.
             community_imports[key] = value
         else:
             dpla_originated[key] = value
@@ -341,6 +353,46 @@ def plan_migration(
         dpla_originated_params=dpla_originated,
         artwork_template_name=_template_name(legacy_template),
     )
+
+
+_CASEFOLD_COMPARE_KEYS = frozenset(
+    {
+        "title",
+        "description",
+        "date",
+        "permission",
+        "creator",
+    }
+)
+
+
+def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
+    """Return True when ``value`` (from wikitext) and ``canonical`` (from
+    DPLA) are the same fact for the purpose of migration-planning.
+
+    Exact string equality is the primary check. For the display-string
+    keys (``title``/``description``/``date``/``permission``/``creator``)
+    a casefold + leading/trailing-punctuation-trim comparator widens
+    the tolerance so a community edit whose only difference from
+    canonical is punctuation or case is not imported as a spurious
+    community contribution. For the ``date`` key specifically the
+    semantic date-equivalence check runs first — an override like
+    ``19 November 1902`` collapses cleanly against ``1902-11-19``.
+
+    Keys outside the display-string set (opaque identifiers,
+    sub-template shapes) fall back to strict equality: a case change in
+    an identifier is a genuinely different value.
+    """
+    if value == canonical:
+        return True
+    if key == "date" and dates_semantically_equal(value, canonical):
+        return True
+    if key in _CASEFOLD_COMPARE_KEYS:
+        folded_value = casefold_for_compare(value)
+        folded_canonical = casefold_for_compare(canonical)
+        if folded_value and folded_value == folded_canonical:
+            return True
+    return False
 
 
 def _canonical_value_for_key(canonical_params: dict, key: str) -> str:
