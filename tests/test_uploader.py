@@ -1891,3 +1891,199 @@ def test_safe_upload_allows_new_filepage_when_not_in_no_create_mode():
     assert result == "ok"
     uploader.site.upload.assert_called_once()
     page.exists.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# process_file per-ordinal exception counting.
+#
+# Regression pin for the silent-failure bug: any uncaught exception in
+# process_file that reaches the outer ``except Exception`` handler must
+# increment ``Result.FAILED``. Pre-fix, ``handle_upload_exception`` logged
+# a ``Failed: <reason>`` line but did NOT bump the counter, so entire
+# classes of upload failures were absent from ``COUNTS: FAILED`` and the
+# Slack summary.
+#
+# Concrete observed impact: the NARA Washington DC general-records run had
+# 22,712 ``Failed: Unknown`` tracebacks in the upload log (all from CSRF
+# ``KeyError`` after the pywikibot session invalidated) but ``COUNTS:
+# FAILED: 13``. Downloader saw 43,439 ordinals; uploader accounted for
+# 20,629 in its counters. The 22,810 gap = silent failures.
+# ---------------------------------------------------------------------------
+
+
+def _process_file_uploader(tracker: Tracker) -> Uploader:
+    """Build an ``Uploader`` with a real ``Tracker`` (so counters are
+    inspectable) and mocks for the S3 / site / dpla dependencies. Tests
+    then arrange one of those mocks to raise the exception under test."""
+    return Uploader(
+        tracker=tracker,
+        local_fs=MagicMock(),
+        s3_client=MagicMock(),
+        dpla=MagicMock(),
+        site=MagicMock(),
+        category_ensurer=None,
+    )
+
+
+def test_process_file_csrf_style_keyerror_counts_as_failed():
+    """A ``KeyError`` raised deep inside process_file (mimicking the
+    CSRF-token invalidation pywikibot emits when the session lapses)
+    must land as ``Result.FAILED += 1`` — not as a silent log-only
+    ``Failed: Unknown`` line. This is the whole point of the fix; if
+    this test ever regresses, the operator's Slack summary starts
+    lying about failure counts again."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    # get_media_s3_path is the first S3 call after the try: — arranging it
+    # to raise gets us into the outer ``except Exception`` catch without
+    # having to mock the full upload pipeline. The specific exception type
+    # doesn't matter here (the catch is bare); a KeyError models the
+    # CSRF-invalid-session shape.
+    uploader.s3_client.get_media_s3_path.side_effect = KeyError(
+        "Invalid token 'csrf' for user 'DPLA bot' on commons:commons wiki."
+    )
+    with patch("tools.uploader.get_wiki_text", return_value="wt"):
+        result = uploader.process_file(
+            dpla_id="abc123",
+            title="Some Title",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+    assert result["status"] == "FAILED"
+    assert tracker.count(Result.FAILED) == 1, (
+        f"expected FAILED == 1 after CSRF-style KeyError; got "
+        f"{tracker.count(Result.FAILED)}. This is the silent-failure "
+        f"regression — the generic catch must increment FAILED."
+    )
+
+
+def test_process_file_generic_exception_counts_as_failed():
+    """Same as the CSRF test but for a generic ``RuntimeError`` — any
+    exception falling into the outer catch must be counted, not just
+    the specific pywikibot-session shape. Guards against a future
+    fix that special-cases KeyError alone."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.s3_client.get_media_s3_path.side_effect = RuntimeError(
+        "some transient network error"
+    )
+    with patch("tools.uploader.get_wiki_text", return_value="wt"):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="T",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+    assert result["status"] == "FAILED"
+    assert tracker.count(Result.FAILED) == 1
+
+
+def test_process_file_backend_fail_retry_exhaustion_counts_once():
+    """The removed line-766 increment fired when the retry loop
+    exhausted attempts on a backend-fail error. Its re-raised exception
+    propagates to the outer catch at end-of-process_file (which now
+    owns the counter increment), so leaving line 766 in would
+    double-count. This test drives execution through the retry loop
+    itself — mocks are wired to reach ``_safe_upload``, which raises a
+    backend-fail-marker exception on every attempt so the loop
+    exhausts and takes the else branch (the removed-increment site).
+    Post-fix: FAILED == 1 exactly. Pre-fix: would have been 2.
+    """
+    from ingest_wikimedia.wikimedia import ERROR_BACKEND_FAIL
+
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+
+    # Make every retry attempt fail with a message containing the
+    # backend-fail marker (triggers the ``is_backend_fail`` branch in
+    # the retry loop).
+    uploader._safe_upload = MagicMock(
+        side_effect=RuntimeError(
+            f"stashfailed: {ERROR_BACKEND_FAIL} simulated for test"
+        )
+    )
+
+    # Pre-retry pipeline: mock just enough to reach the retry loop.
+    #   * S3: ``get_media_s3_path`` → path, ``s3_file_exists`` → True,
+    #     ``get_s3().Object(...)`` → 100 bytes of image/jpeg with a
+    #     sha1 in metadata.
+    #   * Hash-drift lookup: ``find_file_by_hash`` returns None so we
+    #     skip the drift-correction branch and land in the plain-upload
+    #     path. That path calls ``get_page(...)`` on a title from
+    #     ``get_page_title(...)`` — mocked to a FilePage that isn't a
+    #     redirect.
+    #   * ``time.sleep`` is mocked so the retry backoff doesn't stall
+    #     the test suite for 15+ seconds per test.
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    fake_page = MagicMock()
+    fake_page.exists.return_value = False
+    fake_page.isRedirectPage.return_value = False
+    fake_page.title.return_value = (
+        "File:Something - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    )
+    fake_page.pageid = 0
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=None),
+        patch(
+            "tools.uploader.get_page_title",
+            return_value="File:Something - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg",
+        ),
+        patch("tools.uploader.get_page", return_value=fake_page),
+        patch("tools.uploader.time.sleep"),  # skip retry backoff
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Something",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "FAILED"
+    # The retry loop exhausted MAX_UPLOAD_RETRIES attempts, then
+    # re-raised into the outer ``except Exception`` catch. Exactly
+    # one FAILED increment — pre-fix line 766 would have added a
+    # second when ``is_backend_fail`` was true.
+    assert tracker.count(Result.FAILED) == 1, (
+        f"expected FAILED == 1 after backend-fail retry exhaustion; got "
+        f"{tracker.count(Result.FAILED)}. If this is 2, the removed "
+        f"line-766 increment came back and is double-counting with the "
+        f"outer catch's increment."
+    )
+    # Sanity check: retry loop actually ran multiple attempts, not just
+    # one. ``_safe_upload`` should have been submitted to the executor
+    # ``MAX_UPLOAD_RETRIES`` times.
+    from tools.uploader import MAX_UPLOAD_RETRIES
+
+    assert uploader._safe_upload.call_count == MAX_UPLOAD_RETRIES, (
+        f"retry loop didn't exhaust attempts — only "
+        f"{uploader._safe_upload.call_count} of "
+        f"{MAX_UPLOAD_RETRIES} tries. Test isn't exercising the "
+        f"removed-increment site."
+    )
