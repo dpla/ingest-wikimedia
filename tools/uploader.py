@@ -758,7 +758,15 @@ class Uploader:
                 # Use try/finally to guarantee shutdown(wait=False) on all paths.
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 try:
-                    for attempt in range(1, MAX_UPLOAD_RETRIES + 1):
+                    # ``attempt`` is managed manually rather than via
+                    # ``for attempt in range(...)`` so a CSRF-recovery
+                    # continue can re-loop WITHOUT consuming an attempt
+                    # slot — the recovered session deserves a fresh try
+                    # of the same call. Only real per-ordinal errors
+                    # (backend-fail retries, unrecoverable exceptions)
+                    # advance ``attempt``.
+                    attempt = 1
+                    while attempt <= MAX_UPLOAD_RETRIES:
                         future = None
                         try:
                             future = executor.submit(
@@ -824,6 +832,10 @@ class Uploader:
                                 self._csrf_recoveries_used += 1
                                 del future
                                 gc.collect()
+                                # Do NOT advance ``attempt``: the previous call
+                                # failed on session state, not on anything
+                                # ordinal-specific — the recovered session
+                                # gets a fresh attempt slot.
                                 continue
                             if is_backend_fail and attempt < MAX_UPLOAD_RETRIES:
                                 delay = min(
@@ -845,6 +857,8 @@ class Uploader:
                                 del future
                                 gc.collect()
                                 time.sleep(delay)
+                                attempt += 1
+                                continue
                             else:
                                 # Don't increment FAILED here — the ``raise``
                                 # propagates to the generic ``except Exception``
@@ -1836,10 +1850,28 @@ def main(
                     )
                     if deferred_count:
                         deferred[dpla_id] = deferred_count
+
+            # Any item whose {{duplicate}}-tagging upload was deferred because
+            # Category:Duplicate was full: wait for the category to drain, then
+            # re-run those items in this same session (not an operator re-run).
+            # Inside the same try so a CSRF-fatal from the drain pass also
+            # routes to the notify_upload_aborted + re-raise path below.
+            if deferred:
+                _drain_deferred_dups(
+                    uploader,
+                    dup_throttle,
+                    deferred,
+                    providers_json,
+                    partner,
+                    verbose,
+                    dry_run,
+                    slot_budget,
+                )
         except CsrfRecoveryFailed as ex:
             # Session's auth is broken and unrecoverable. Abort — do NOT
             # continue to remaining items (every one would hit the same
-            # error). The drain pass below is skipped for the same reason.
+            # error). Re-raise after notifying so the process exits
+            # non-zero and the tmux `&&` chain doesn't proceed to sdc-sync.
             session_aborted = True
             logging.error("Aborting upload: %s", ex)
             notify_upload_aborted(
@@ -1848,42 +1880,31 @@ def main(
                 elapsed_seconds=time.time() - start_time,
                 reason=str(ex),
             )
-
-        # Any item whose {{duplicate}}-tagging upload was deferred because
-        # Category:Duplicate was full: wait for the category to drain, then
-        # re-run those items in this same session (not an operator re-run).
-        if deferred and not session_aborted:
-            _drain_deferred_dups(
-                uploader,
-                dup_throttle,
-                deferred,
-                providers_json,
-                partner,
-                verbose,
-                dry_run,
-                slot_budget,
-            )
+            raise
 
     finally:
         elapsed = time.time() - start_time
         logging.info("\n" + str(tracker))
         logging.info(f"{elapsed} seconds.")
         local_fs.cleanup_temp_dir()
-        # Touch files for any institutions we set up this session.  Closes the
-        # Wikidata-replication-lag race that lands first-batch files in the
-        # "unknown institution" category; without this we rely on a periodic
-        # run of fix-unknown-categories to clean up after the fact.  The 10s
-        # pause is a cheap belt-and-suspenders against very-late ensure()
-        # calls — for typical runs replication has settled long before this.
-        #
-        # Passes the slot budget through: these touches are Commons writes,
-        # so the helper holds a slot around them (see its docstring).
-        _post_upload_touch_new_institutions(
-            commons_site, category_ensurer, dry_run, slot_budget
-        )
         # On a session-aborted run ``notify_upload_aborted`` already
-        # posted the failure message; skip the "Upload Complete" summary.
+        # posted the failure message; skip the "Upload Complete" summary
+        # AND the Commons-writing touch helper, since the auth state is
+        # broken and further writes would fail noisily (potentially
+        # masking the original CSRF-fatal in logs).
         if not session_aborted:
+            # Touch files for any institutions we set up this session.  Closes the
+            # Wikidata-replication-lag race that lands first-batch files in the
+            # "unknown institution" category; without this we rely on a periodic
+            # run of fix-unknown-categories to clean up after the fact.  The 10s
+            # pause is a cheap belt-and-suspenders against very-late ensure()
+            # calls — for typical runs replication has settled long before this.
+            #
+            # Passes the slot budget through: these touches are Commons writes,
+            # so the helper holds a slot around them (see its docstring).
+            _post_upload_touch_new_institutions(
+                commons_site, category_ensurer, dry_run, slot_budget
+            )
             notify_upload_complete(
                 # Bare partner slug, not "wikimedia-<partner>" — notify_upload_complete
                 # always prepends "wikimedia-" itself (matching the bare-label
