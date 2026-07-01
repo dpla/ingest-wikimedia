@@ -762,8 +762,12 @@ class Uploader:
                                 gc.collect()
                                 time.sleep(delay)
                             else:
-                                if is_backend_fail:
-                                    self.tracker.increment(Result.FAILED)
+                                # Don't increment FAILED here — the ``raise``
+                                # propagates to the generic ``except Exception``
+                                # at the end of process_file (line ~848), which
+                                # owns the single counter increment for every
+                                # non-timeout exception path. Incrementing here
+                                # too would double-count the same ordinal.
                                 raise
                 finally:
                     executor.shutdown(wait=False)
@@ -774,8 +778,10 @@ class Uploader:
 
                 if not result:
                     # upload() returned None — file exists under a different page
-                    # title, likely due to DPLA ID drift between runs.
-                    self.tracker.increment(Result.FAILED)
+                    # title, likely due to DPLA ID drift between runs. The
+                    # ``raise`` below propagates to the generic
+                    # ``except Exception`` at the end of process_file, which
+                    # increments FAILED — no counter bump needed here.
                     raise RuntimeError(
                         "File linked to another page (possible ID drift)"
                     )
@@ -844,8 +850,25 @@ class Uploader:
             return {"status": ORDINAL_INELIGIBLE}
 
         except UploadTimeoutError:
+            # TimeoutError already counted at the future.result() timeout site
+            # (the only path that reports FAILED before falling through to
+            # here). Re-raise so the item-level loop breaks and remaining
+            # ordinals aren't attempted — a stuck Commons job queue won't
+            # magically un-stick mid-item.
             raise
         except Exception as ex:
+            # Single source of truth for the per-ordinal FAILED counter on
+            # every non-timeout exception path — includes pywikibot API
+            # errors like the CSRF ``KeyError`` from an invalidated session,
+            # backend-fail retries exhausted, "file linked to another
+            # page" ID drift, and anything else that reaches this catch.
+            # Pre-fix, ``handle_upload_exception`` logged the ``Failed:
+            # <reason>`` line but never bumped the counter, so a whole
+            # class of upload failures were silently absent from
+            # ``COUNTS: FAILED`` and the Slack summary (concretely: 22,700+
+            # CSRF failures counted as 13 on the NARA Washington DC
+            # general-records run).
+            self.tracker.increment(Result.FAILED)
             self.handle_upload_exception(ex)
             return {"status": ORDINAL_FAILED, "error": str(ex)}
 
