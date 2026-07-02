@@ -107,6 +107,28 @@ def test_wait_for_capacity_times_out():
     assert slept == []  # deadline hit before any sleep
 
 
+def test_wait_for_capacity_unbounded_never_times_out():
+    """``max_wait_secs=None`` disables the deadline — appropriate for
+    the drain-deferred loop, which waits patiently on human-admin
+    category clearing. Category stays full for many polls, then drains;
+    the wait returns True whenever the category actually falls."""
+    sizes = _Sizes(1000, 1000, 1000, 1000, 880)
+    t = DuplicateCategoryThrottle(
+        threshold=1000, resume_below=900, poll_secs=60, size_fn=sizes
+    )
+    slept: list[float] = []
+    # Clock never advances past any deadline because there is no
+    # deadline; the loop is size-driven, not time-driven.
+    drained = t.wait_for_capacity(
+        max_wait_secs=None,
+        sleep=lambda s: slept.append(s),
+        clock=lambda: 0,
+    )
+    assert drained is True
+    # 4 polls at 1000, 1 poll at 880: 4 sleeps of the full poll interval.
+    assert slept == [60, 60, 60, 60]
+
+
 def test_resume_below_must_not_exceed_threshold():
     try:
         DuplicateCategoryThrottle(threshold=1000, resume_below=1001)

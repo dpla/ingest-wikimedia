@@ -138,6 +138,7 @@ _STEP_BY_FIRST_TOKEN: dict[str, str] = {
     "downloader": "download",
     "uploader": "upload",
     "sdc-sync": "sdc-sync",
+    "drain-deferred": "drain-deferred",
 }
 
 
@@ -1326,6 +1327,11 @@ def main() -> None:
                 pipeline_steps.append(
                     f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}"
                 )
+                # Drain any Case-2 hash-drift uploads the uploader deferred
+                # because Category:Duplicate was at capacity. No-op when
+                # nothing deferred (the common case); patient loop when
+                # non-empty. See tools/drain_deferred.py for the design.
+                pipeline_steps.append(f"drain-deferred {canonical}")
         # Wrap each step with an ``export WIKIMEDIA_STEP=<name>`` prefix so
         # the per-target failure handler (``notify_pipeline_fail``) can name
         # the failing phase in Slack instead of just reporting an exit code.
