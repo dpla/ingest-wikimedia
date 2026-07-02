@@ -2306,3 +2306,131 @@ def test_csrf_recovery_failed_propagates_past_process_item_outer_catch():
         "``except CsrfRecoveryFailed: raise`` before the generic "
         "handler so the run aborts instead of looping the next item."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phantom-drift defense-in-depth (this PR).
+#
+# ``get_page_title``'s ``item_title[:181]`` truncation used to leak a
+# trailing space when the 181st character landed on whitespace, producing
+# a raw Python title with a double-space run around the ``- DPLA -``
+# separator. ``process_file``'s line-468 identity check
+# (``existing_file.title(with_ns=False) == page_title``) then failed on
+# the raw-string comparison, and ``_resolve_hash_drift`` fell through to
+# Case 2 tagging the file as a duplicate of itself. Commons's
+# ``fileexists-no-change`` server-side check happened to reject the
+# upload, so ``_tag_drift_duplicate`` was never called — but the guard
+# path is defense-in-depth for any future normalisation drift.
+# ---------------------------------------------------------------------------
+
+
+def test_canonicalize_commons_title_collapses_whitespace_runs():
+    """The guard helper mirrors MediaWiki's ``.trim()`` +
+    whitespace-run collapse on file titles."""
+    from tools.uploader import _canonicalize_commons_title
+
+    assert _canonicalize_commons_title("Foo  Bar") == "Foo Bar"
+    assert _canonicalize_commons_title("  Foo Bar  ") == "Foo Bar"
+    assert _canonicalize_commons_title("Foo\tBar") == "Foo Bar"
+    assert _canonicalize_commons_title("Foo Bar") == "Foo Bar"
+
+
+def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_match():
+    """Regression: when the SHA1-lookup returns the file already at the
+    intended title (after whitespace normalisation), ``_resolve_hash_drift``
+    must NOT fall through to Case 2 (which would try to upload same-hash
+    bytes and tag the file as duplicate of itself). Return the new
+    ``already_correct`` sentinel so the caller records SKIPPED.
+
+    Uses a raw ``page_title`` with a double-space run (the exact shape
+    the pre-fix ``get_page_title`` truncation-lands-on-whitespace bug
+    used to produce) against a pywikibot-normalized ``existing_file``
+    title with the single-space form. Byte equality is false; the
+    canonicalized-equality guard is what catches this case. If the
+    guard regresses to raw equality (which would coincide with the
+    line-468 identity check ``process_file`` already runs before
+    calling here), this test fails.
+    """
+    uploader = _build_uploader_with_dpla()
+    commons_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.gif"
+    raw_page_title = "Item  - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.gif"  # 2 spaces
+    assert commons_title != raw_page_title, (
+        "test premise: titles must differ byte-wise so byte-equality won't fire"
+    )
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = commons_title
+    with patch("tools.uploader.get_page", return_value=intended_page):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(commons_title),
+            page_title=raw_page_title,
+            dpla_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ordinal=1,
+            wiki_markup="",
+        )
+    assert action == "already_correct"
+
+
+def test_tag_drift_duplicate_refuses_self_tag_byte_equal():
+    """Belt: even if some caller passes the same title as both
+    ``old_filename`` and ``new_filename``, ``_tag_drift_duplicate``
+    refuses to call ``tag_as_duplicate`` — that would flag the file
+    for admin deletion of itself."""
+    uploader = _build_uploader_with_dpla()
+    same = "Foo - DPLA - cccccccccccccccccccccccccccccccc.jpg"
+    with (
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+        patch("tools.uploader.get_page") as get_page_mock,
+    ):
+        uploader._tag_drift_duplicate(
+            old_filename=same,
+            new_filename=same,
+            wiki_markup="wt",
+            dpla_id="cccccccccccccccccccccccccccccccc",
+        )
+    tag_mock.assert_not_called()
+    get_page_mock.assert_not_called()
+
+
+def test_tag_drift_duplicate_refuses_self_tag_whitespace_run_equal():
+    """Suspenders: two titles that differ only in whitespace runs
+    (the exact shape ``get_page_title``'s truncation bug used to
+    produce) resolve to the same Commons page under MediaWiki
+    normalisation. Must not tag."""
+    uploader = _build_uploader_with_dpla()
+    single_space = "Foo Bar - DPLA - dddddddddddddddddddddddddddddddd.jpg"
+    double_space = "Foo Bar  - DPLA - dddddddddddddddddddddddddddddddd.jpg"
+    with (
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+        patch("tools.uploader.get_page") as get_page_mock,
+    ):
+        uploader._tag_drift_duplicate(
+            old_filename=single_space,
+            new_filename=double_space,
+            wiki_markup="wt",
+            dpla_id="dddddddddddddddddddddddddddddddd",
+        )
+    tag_mock.assert_not_called()
+    get_page_mock.assert_not_called()
+
+
+def test_tag_drift_duplicate_still_tags_when_names_genuinely_differ():
+    """Positive: a genuine hash-drift case (different filenames) still
+    reaches ``tag_as_duplicate`` — the self-tag guard doesn't over-fire."""
+    uploader = _build_uploader_with_dpla()
+    old_page = MagicMock()
+    old_page.exists.return_value = True
+    old_page.text = ""
+    with (
+        patch("tools.uploader.tag_as_duplicate") as tag_mock,
+        patch("tools.uploader.get_page", return_value=old_page),
+        patch("tools.uploader.merge_preserved_wikitext", return_value="wt"),
+    ):
+        uploader._tag_drift_duplicate(
+            old_filename="Old title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
+            new_filename="New title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
+            wiki_markup="wt",
+            dpla_id="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+    tag_mock.assert_called_once()
