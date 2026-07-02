@@ -176,7 +176,11 @@ class CategoryEnsurer:
     def _create_commons_category(self, category_name: str) -> None:
         page = pywikibot.Page(self.commons_site, category_name)
         page.text = "{{dpla cat}}"
-        page.save(summary="Create institutional category")
+        with_csrf_recovery(
+            self.commons_site,
+            f"save {category_name} (create category)",
+            lambda: page.save(summary="Create institutional category"),
+        )
 
     def _get_or_create_wikidata_category_item(
         self,
@@ -197,6 +201,11 @@ class CategoryEnsurer:
             return self._create_wikidata_category_item(
                 institution_name, institution_qid, hub_category_qid, category_name
             )
+        except CsrfRecoveryFailed:
+            # Session-level fatal — the concurrent-create fallback below
+            # would silently paper over an auth failure and return a
+            # bogus success. Propagate so the run aborts.
+            raise
         except Exception as create_exc:
             # Another process may have created the item concurrently. Re-read before failing.
             try:

@@ -2044,14 +2044,14 @@ def _csrf_keyerror() -> KeyError:
     )
 
 
-def testis_csrf_token_error_matches_pywikibot_shape():
+def test_is_csrf_token_error_matches_pywikibot_shape():
     """Substring match on ``str(KeyError(...))`` — Python wraps KeyError
     args in quotes on stringify, so the marker must appear inside those
     wrapping quotes."""
     assert is_csrf_token_error(_csrf_keyerror())
 
 
-def testis_csrf_token_error_rejects_unrelated_keyerror():
+def test_is_csrf_token_error_rejects_unrelated_keyerror():
     """A KeyError from any other code path (e.g. dict miss on 'title')
     must not be treated as a CSRF error — otherwise a bug elsewhere
     could accidentally trip the whole session-abort escalation."""
@@ -2059,7 +2059,7 @@ def testis_csrf_token_error_rejects_unrelated_keyerror():
     assert not is_csrf_token_error(KeyError("csrf"))  # bare, no "Invalid token"
 
 
-def testis_csrf_token_error_rejects_non_keyerror():
+def test_is_csrf_token_error_rejects_non_keyerror():
     """A RuntimeError whose message happens to contain the CSRF marker
     isn't a real CSRF token error — pywikibot only raises this as
     KeyError. Guard against a false positive from log-string

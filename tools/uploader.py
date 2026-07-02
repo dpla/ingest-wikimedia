@@ -76,6 +76,7 @@ from ingest_wikimedia.csrf import (
     MAX_CSRF_RECOVERIES,
     is_csrf_token_error,
     recover_commons_session,
+    with_csrf_recovery,
 )
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
@@ -1225,12 +1226,16 @@ class Uploader:
         else:
             new_text = wiki_markup
         wiki_file_page.text = new_text
-        wiki_file_page.save(
-            summary=(
-                f"Replacing redirect with DPLA metadata for title drift "
-                f"correction (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+        with_csrf_recovery(
+            self.site,
+            f"save {wiki_file_page.title()} (redirect-overwrite)",
+            lambda: wiki_file_page.save(
+                summary=(
+                    f"Replacing redirect with DPLA metadata for title drift "
+                    f"correction (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                ),
+                minor=False,
             ),
-            minor=False,
         )
         wiki_file_page.clear_cache()
         return wiki_file_page, old_filename
@@ -1306,12 +1311,16 @@ class Uploader:
                 moved_page.text = merge_preserved_wikitext(
                     moved_page.text or "", wiki_markup
                 )
-                moved_page.save(
-                    summary=(
-                        f"Update description after title drift correction "
-                        f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                with_csrf_recovery(
+                    self.site,
+                    f"save {moved_page.title()} (post-drift description)",
+                    lambda: moved_page.save(
+                        summary=(
+                            f"Update description after title drift correction "
+                            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                        ),
+                        minor=False,
                     ),
-                    minor=False,
                 )
 
     def _resolve_hash_drift(
@@ -1666,19 +1675,29 @@ class Uploader:
                     # round-trips and write directly.
                     new_page = get_page(self.site, f"File:{new_filename}")
                     new_page.text = merged
-                    new_page.save(
-                        summary=(
-                            f"Rescue community-contributed metadata from "
-                            f"[[File:{old_filename}]] (DPLA ID "
-                            f"[[dpla:{dpla_id}|{dpla_id}]])"
+                    with_csrf_recovery(
+                        self.site,
+                        f"save {new_page.title()} (rescue community metadata)",
+                        lambda: new_page.save(
+                            summary=(
+                                f"Rescue community-contributed metadata from "
+                                f"[[File:{old_filename}]] (DPLA ID "
+                                f"[[dpla:{dpla_id}|{dpla_id}]])"
+                            ),
+                            minor=False,
                         ),
-                        minor=False,
                     )
                     logging.info(
                         f"Rescued community-contributed metadata from "
                         f"[[File:{old_filename}]] into "
                         f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
                     )
+        except CsrfRecoveryFailed:
+            # Session-level fatal — the community-metadata rescue is a
+            # best-effort side-effect, but a stuck CSRF token affects
+            # every subsequent write. Propagate so the run aborts
+            # instead of continuing to log rescue-failed warnings.
+            raise
         except Exception as ex:
             logging.warning(
                 f"Failed to rescue community contributions from "

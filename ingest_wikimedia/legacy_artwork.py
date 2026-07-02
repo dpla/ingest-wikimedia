@@ -1270,7 +1270,11 @@ def migrate_legacy_file(
     wikitext_changed = rewritten != file_page.text
     if wikitext_changed:
         file_page.text = rewritten
-        file_page.save(summary=summary, minor=False, bot=True)
+        with_csrf_recovery(
+            file_page.site,
+            f"save {file_page.title()} (legacy-artwork migrate)",
+            lambda: file_page.save(summary=summary, minor=False, bot=True),
+        )
 
     return MigrationResult(
         imports_posted=len(claims),

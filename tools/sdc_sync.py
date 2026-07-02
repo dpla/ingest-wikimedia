@@ -4445,6 +4445,11 @@ def _post_sdc_cleanup_for_page(
                 file_page, expected_params, _NORMALIZE_EDIT_SUMMARY
             )
         )
+    except CsrfRecoveryFailed:
+        # Session-level fatal from the wrapped .save() — propagate so
+        # the run aborts rather than silently turning a stuck session
+        # into a per-file skip that would recur on every ordinal.
+        raise
     except Exception:
         logging.exception(
             f" -- cleanup: normalize_page on '{file_page.title()}' for"

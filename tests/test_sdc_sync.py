@@ -1012,7 +1012,23 @@ def test_submit_sdc_write_runtime_error_message_names_the_action(monkeypatch):
     assert "permissiondenied" in msg
 
 
-def test_submit_sdc_write_recovers_from_csrf_error_and_retries(monkeypatch):
+@pytest.fixture
+def _fresh_csrf_counter():
+    """Zero the shared ``csrf._session_recoveries_used`` before AND after
+    each CSRF-related sdc_sync test so an intermediate assertion failure
+    can't leak process-wide state into another test."""
+    from ingest_wikimedia import csrf
+
+    csrf._session_recoveries_used = 0
+    try:
+        yield
+    finally:
+        csrf._session_recoveries_used = 0
+
+
+def test_submit_sdc_write_recovers_from_csrf_error_and_retries(
+    monkeypatch, _fresh_csrf_counter
+):
     """The Toledo 2026-06-25 failure mode: pywikibot's ``TokenWallet``
     raises ``KeyError("Invalid token 'csrf'")`` when the session goes
     stale. Before this fix, every subsequent SDC write in the run
@@ -1024,10 +1040,6 @@ def test_submit_sdc_write_recovers_from_csrf_error_and_retries(monkeypatch):
     """
     from ingest_wikimedia import csrf
     from tools import sdc_sync
-
-    # Reset shared counter so this test doesn't pick up recoveries from
-    # earlier tests.
-    csrf._session_recoveries_used = 0
 
     fake_site = _install_module_globals(monkeypatch, sdc_sync)
     # The realistic failure point is the ``site.tokens["csrf"]`` lookup
@@ -1059,10 +1071,11 @@ def test_submit_sdc_write_recovers_from_csrf_error_and_retries(monkeypatch):
     fake_site.login.assert_called_once()
     fake_site.tokens.clear.assert_called_once()
     assert csrf.session_recoveries_used() == 1
-    csrf._session_recoveries_used = 0
 
 
-def test_submit_sdc_write_aborts_when_csrf_cap_exhausted(monkeypatch):
+def test_submit_sdc_write_aborts_when_csrf_cap_exhausted(
+    monkeypatch, _fresh_csrf_counter
+):
     """After :data:`MAX_CSRF_RECOVERIES` refreshes fail to unstick the
     token, the helper raises :class:`CsrfRecoveryFailed` — a
     non-``KeyError`` type — so the caller's ``except CsrfRecoveryFailed``
@@ -1086,7 +1099,6 @@ def test_submit_sdc_write_aborts_when_csrf_cap_exhausted(monkeypatch):
             "wbeditentity", "M12345", "abcdef01abcdef01abcdef01abcdef01", data="{}"
         )
     fake_site.logout.assert_not_called()
-    csrf._session_recoveries_used = 0
 
 
 def test_missing_entity_error_is_not_a_runtime_error():
