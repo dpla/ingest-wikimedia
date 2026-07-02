@@ -661,17 +661,19 @@ def notify_upload_aborted(
     )
 
 
-def notify_dup_drain_incomplete(partner_label: str, remaining: int) -> None:
-    """Warn #tech-alerts that the dup-category drain pass exited with files
-    still deferred.
+def notify_drain_phase_start(
+    partner_label: str, deferred_count: int, category_size: int
+) -> None:
+    """Ping #tech-alerts that a session has entered the deferred-drain
+    phase — the uploader has finished processing every non-deferred
+    item, sdc-sync has (or is about to) run on those, and the session
+    is now patiently waiting for Category:Duplicate to fall below the
+    resume threshold so it can finish the deferred items.
 
-    The uploader defers ``{{duplicate}}``-tagging uploads while
-    Category:Duplicate is at capacity, then returns to them in a drain pass.
-    If that pass times out (the category stays full past the drain budget) or
-    makes no progress after capacity returns, the remaining files are left
-    un-uploaded and un-tagged — they need operator attention before a re-run
-    will finish them. This is the only path that leaves intended work undone,
-    so it warrants an explicit operator ping rather than a buried log line.
+    Emitted at drain-phase start so the operator knows the session is
+    in this state (rather than hung or making per-item progress). The
+    tmux session stays alive during the wait; kill via the existing
+    Slack kill-session command if you need to abandon.
     """
     token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
     if not token:
@@ -681,14 +683,43 @@ def notify_dup_drain_incomplete(partner_label: str, remaining: int) -> None:
         f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
     )
     msg = (
-        f"⚠️ `{effective_label}`: {remaining:,} file(s) left deferred — "
-        "the duplicate-category drain pass exited before they could be retried, "
-        "so their uploads + `{{duplicate}}` tags were skipped. Clear "
-        "Category:Duplicate if needed, then re-run the partner to finish them."
+        f"⏳ `{effective_label}`: entering deferred-drain phase — "
+        f"{deferred_count:,} item(s) waiting for Category:Duplicate to "
+        f"drain (currently at {category_size:,}). No worker slots held; "
+        f"other partner sessions unaffected."
     )
     try:
         post_message(token, msg)
     except Exception:
         logging.warning(
-            "Failed to post dup-drain-incomplete notification to Slack", exc_info=True
+            "Failed to post drain-phase-start notification to Slack", exc_info=True
+        )
+
+
+def notify_drain_phase_complete(
+    partner_label: str, elapsed_seconds: float, emitted_count: int
+) -> None:
+    """Ping #tech-alerts that the deferred-drain phase drained cleanly —
+    every deferred upload + ``{{duplicate}}`` tag has landed. Emitted at
+    the drain phase's normal exit; a killed / aborted drain leaves the
+    sidecar in place for a future session to resume from.
+    """
+    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    if not token:
+        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
+        return
+    effective_label = (
+        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
+    )
+    runtime = _format_runtime(elapsed_seconds)
+    msg = (
+        f"✅ `{effective_label}`: deferred-drain phase complete — "
+        f"{emitted_count:,} item(s) emitted their upload + "
+        f"`{{{{duplicate}}}}` tag over {runtime}."
+    )
+    try:
+        post_message(token, msg)
+    except Exception:
+        logging.warning(
+            "Failed to post drain-phase-complete notification to Slack", exc_info=True
         )

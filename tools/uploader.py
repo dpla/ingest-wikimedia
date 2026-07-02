@@ -46,8 +46,8 @@ from ingest_wikimedia.dpla import (
     WIKIDATA_FIELD_NAME,
     DPLA,
 )
+from ingest_wikimedia import drain_sidecar
 from ingest_wikimedia.slack import (
-    notify_dup_drain_incomplete,
     notify_upload_aborted,
     notify_upload_complete,
 )
@@ -1964,20 +1964,25 @@ def main(
                         deferred[dpla_id] = deferred_count
 
             # Any item whose {{duplicate}}-tagging upload was deferred because
-            # Category:Duplicate was full: wait for the category to drain, then
-            # re-run those items in this same session (not an operator re-run).
-            # Inside the same try so a CSRF-fatal from the drain pass also
-            # routes to the notify_upload_aborted + re-raise path below.
+            # Category:Duplicate was full: persist the deferred DPLA IDs to
+            # the per-partner sidecar and exit normally. The pipeline's
+            # next step (``sdc-sync``) will process every item that DID
+            # upload; the ``drain-deferred`` step at the end of the
+            # pipeline reads the sidecar and patiently loops on
+            # Category:Duplicate until the deferred items can complete.
+            #
+            # This replaces the previous in-line ``_drain_deferred_dups``
+            # loop that held the whole session (and blocked sdc-sync) for
+            # up to 4 hours. See ``ingest_wikimedia.drain_sidecar``.
             if deferred:
-                _drain_deferred_dups(
-                    uploader,
-                    dup_throttle,
-                    deferred,
-                    providers_json,
+                combined = drain_sidecar.merge_sidecar(partner, list(deferred))
+                logging.info(
+                    "Deferred %d item(s) to the drain-phase sidecar "
+                    "(%d total now queued for partner %s): %s",
+                    len(deferred),
+                    len(combined),
                     partner,
-                    verbose,
-                    dry_run,
-                    slot_budget,
+                    drain_sidecar.sidecar_path(partner),
                 )
         except CsrfRecoveryFailed as ex:
             # Session's auth is broken and unrecoverable. Abort — do NOT
@@ -2028,93 +2033,6 @@ def main(
                 elapsed_seconds=elapsed,
                 dry_run=dry_run,
             )
-
-
-# Upper bound on how long the drain pass will wait for Category:Duplicate to
-# fall back below the throttle's resume threshold. Volunteers clear the
-# category on human timescales, so give it real headroom — but cap it so a
-# session never hangs indefinitely. On timeout the remaining files are left
-# un-uploaded and the operator is pinged to re-run after the category drains.
-_DRAIN_MAX_WAIT_SECS = 4 * 60 * 60  # 4 hours
-
-
-def _drain_deferred_dups(
-    uploader: "Uploader",
-    throttle: DuplicateCategoryThrottle,
-    deferred: dict[str, int],
-    providers_json,
-    partner: str,
-    verbose: bool,
-    dry_run: bool,
-    slot_budget: WorkerSlotBudget,
-    *,
-    max_wait_secs: float = _DRAIN_MAX_WAIT_SECS,
-) -> dict[str, int]:
-    """Re-run items whose {{duplicate}}-tagging upload was deferred, once
-    Category:Duplicate has drained.
-
-    ``deferred`` maps each item's dpla_id to its count of deferred ordinals.
-    Each round waits (via the throttle) for the category to fall below its
-    resume threshold, then re-processes the still-deferred items. Re-processing
-    may itself defer again if the category refills mid-drain, so it loops until
-    nothing remains, no progress is made, or the wait budget is exhausted.
-    Returns the {id: count} still deferred at exit (empty on full success).
-
-    Progress is measured by total deferred *ordinals*, not items: a single
-    multi-page item can clear some ordinals while others remain, which is real
-    progress and must not read as a stall.
-    """
-    remaining = dict(deferred)
-    deadline = time.monotonic() + max_wait_secs
-    logging.info(
-        "Drain pass: %d file(s) across %d item(s) deferred while "
-        "Category:Duplicate was at capacity; waiting for it to drain, then "
-        "retrying their uploads.",
-        sum(remaining.values()),
-        len(remaining),
-    )
-    while remaining:
-        budget = deadline - time.monotonic()
-        if budget <= 0 or not throttle.wait_for_capacity(budget):
-            still = sum(remaining.values())
-            logging.error(
-                "Drain pass timed out with %d file(s) still deferred; their "
-                "uploads + {{duplicate}} tags were NOT emitted. Clear "
-                "Category:Duplicate, then re-run the partner to finish them.",
-                still,
-            )
-            notify_dup_drain_incomplete(partner, still)
-            return remaining
-
-        still_deferred: dict[str, int] = {}
-        for dpla_id in remaining:
-            with slot_budget.acquire():
-                count = uploader.process_item(
-                    dpla_id, providers_json, partner, verbose, dry_run
-                )
-                if count:
-                    still_deferred[dpla_id] = count
-
-        # A batch larger than the throttle's headroom (recheck_cap) legitimately
-        # takes several rounds — each round re-queries and clears up to a cap's
-        # worth, so partial progress is normal, not a stall. But if a round that
-        # began with confirmed capacity cleared NO ordinals, the category is
-        # refilling as fast as we drain (or another mechanism keeps deferring) —
-        # bail rather than spin a hot loop re-querying the category every round.
-        if sum(still_deferred.values()) >= sum(remaining.values()):
-            still = sum(still_deferred.values())
-            logging.error(
-                "Drain pass made no progress despite available capacity (%d "
-                "file(s) still deferred); aborting drain. Clear "
-                "Category:Duplicate, then re-run the partner to finish them.",
-                still,
-            )
-            notify_dup_drain_incomplete(partner, still)
-            return still_deferred
-        remaining = still_deferred
-
-    logging.info("Drain pass complete: all deferred uploads + duplicate-tags emitted.")
-    return remaining
 
 
 # Wait between the last ensure() and the first touch.  Wikidata→Commons

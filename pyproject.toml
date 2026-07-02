@@ -55,4 +55,5 @@ resolve-dpla-ids = "tools.resolve_dpla_ids:main"
 fix-unknown-categories = "tools.fix_unknown_categories:main"
 get-ids-retry = "tools.get_ids_retry:main"
 sdc-sync = "tools.sdc_sync:main"
+drain-deferred = "tools.drain_deferred:main"
 

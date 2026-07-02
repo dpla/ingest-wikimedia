@@ -34,7 +34,13 @@ import pywikibot
 DEFAULT_THRESHOLD = 1000
 DEFAULT_RESUME_BELOW = 900
 DEFAULT_RECHECK_CAP = 100
-DEFAULT_POLL_SECS = 120
+# Category:Duplicate drains on human-admin timescales — days, not
+# minutes — so polling every 5 minutes is fast enough that we won't sit
+# idle after a batch clears while still being a good API citizen. The
+# category has no user-visible latency requirement here; a session that
+# notices a drop 5 minutes late is indistinguishable from one that
+# notices instantly.
+DEFAULT_POLL_SECS = 300
 DUPLICATE_CATEGORY = "Category:Duplicate"
 
 
@@ -111,27 +117,39 @@ class DuplicateCategoryThrottle:
 
     def wait_for_capacity(
         self,
-        max_wait_secs: float,
+        max_wait_secs: float | None = None,
         *,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> bool:
         """Block (polling every ``poll_secs``) until the category is below
-        ``resume_below``, then refill headroom and return ``True``. Return
-        ``False`` if ``max_wait_secs`` elapses first. Used by the drain pass.
+        ``resume_below``, then refill headroom and return ``True``.
+
+        ``max_wait_secs`` bounds the wait; ``None`` disables the timeout so
+        the caller waits indefinitely — appropriate for the drain-deferred
+        loop, which patiently waits out human-admin category-clearing.
+        Returns ``False`` iff a finite ``max_wait_secs`` elapses first.
+
+        The first poll fires immediately (no initial sleep). This matters
+        when a caller re-enters the wait after a subprocess pass: the
+        category may already have room, and sleeping first would waste
+        ``poll_secs`` of latency for no observation.
         """
-        deadline = clock() + max_wait_secs
+        deadline = clock() + max_wait_secs if max_wait_secs is not None else None
         while True:
             size = self._category_size()
             if size < self.resume_below:
                 self._headroom = self._headroom_for(size)
                 return True
-            now = clock()
-            if now >= deadline:
-                return False
-            # Don't oversleep the deadline: a sub-``poll_secs`` budget remaining
-            # should wake for its final check on time, not ~poll_secs late.
-            nap = min(self.poll_secs, deadline - now)
+            if deadline is not None:
+                now = clock()
+                if now >= deadline:
+                    return False
+                # Don't oversleep the deadline: a sub-``poll_secs`` budget remaining
+                # should wake for its final check on time, not ~poll_secs late.
+                nap = min(self.poll_secs, deadline - now)
+            else:
+                nap = self.poll_secs
             logging.info(
                 "Category:Duplicate at %d (>= resume threshold %d); waiting %ds "
                 "before retrying deferred duplicate-tags.",
