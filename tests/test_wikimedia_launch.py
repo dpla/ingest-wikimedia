@@ -435,6 +435,9 @@ def test_wrap_step_with_marker_tags_each_tool_with_its_phase():
     assert _wrap_step_with_marker(
         "sdc-sync --partner texas --ids-file x.csv --workers 6"
     ).startswith("export WIKIMEDIA_STEP=sdc-sync && sdc-sync ")
+    assert _wrap_step_with_marker("drain-deferred nara").startswith(
+        "export WIKIMEDIA_STEP=drain-deferred && drain-deferred "
+    )
     # Non-step commands (``cd``, the case-2 graceful-skip ``echo … ; true``,
     # and the ``sdc-sync --cat`` flavour the maintain builder emits — wait,
     # that one IS sdc-sync. Use a true non-step instead.):

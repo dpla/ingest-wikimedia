@@ -27,11 +27,13 @@ If the sidecar is non-empty, the command:
      wait days or weeks. Volunteers clear the category on human-admin
      timescales and this command is designed to be as patient as they
      are.
-  3. When capacity is available, re-invokes ``uploader`` and
-     ``sdc-sync`` (as subprocesses) on the deferred IDs. The uploader's
-     re-run either completes the deferred items (moving them out of
-     the sidecar) or re-defers them (leaving them in the sidecar for
-     the next loop iteration).
+  3. When capacity is available, removes the round's IDs from the
+     sidecar and re-invokes ``uploader`` and ``sdc-sync`` (as
+     subprocesses) on them. The uploader only ever *merges* deferred
+     IDs into the sidecar (it never removes completed ones), so the
+     drain clears the round up front and the uploader's re-run merges
+     back whichever items re-deferred — those stay queued for the next
+     loop iteration; completed items stay out.
   4. Loops until the sidecar is empty.
 
 Cancellation is operator-driven — ``tmux kill-session`` at any time.
@@ -113,16 +115,24 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
             len(dpla_ids),
             csv_path,
         )
-        subprocess.run(
+        result = subprocess.run(
             ["uploader", os.path.basename(csv_path), partner],
             cwd=partner,
             check=False,
         )
+        if result.returncode != 0:
+            logging.warning(
+                "Drain round: uploader exited %d for partner %s (ids file %s); "
+                "any still-deferred items remain in the sidecar for the next round.",
+                result.returncode,
+                partner,
+                csv_path,
+            )
         logging.info(
             "Drain round: invoking sdc-sync on the same %d item(s)",
             len(dpla_ids),
         )
-        subprocess.run(
+        result = subprocess.run(
             [
                 "sdc-sync",
                 "--partner",
@@ -133,11 +143,22 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
             cwd=partner,
             check=False,
         )
+        if result.returncode != 0:
+            logging.warning(
+                "Drain round: sdc-sync exited %d for partner %s (ids file %s).",
+                result.returncode,
+                partner,
+                csv_path,
+            )
     finally:
         try:
             os.unlink(csv_path)
-        except OSError:
-            pass
+        except OSError as exc:
+            # Non-fatal — a stray temp ids file in the partner dir is only
+            # cosmetic — but record it rather than failing silently.
+            logging.warning(
+                "Drain round: could not remove temp ids file %s: %s", csv_path, exc
+            )
 
 
 @click.command()
@@ -164,58 +185,71 @@ def main(partner: str) -> None:
     )
 
     # Advisory host-level lock. Held for the entire drain (potentially
-    # days). Released on process exit — kill via ``tmux kill-session``.
-    lock_fd = _acquire_host_lock()  # noqa: F841 — kept alive by scope
+    # days). The ``finally`` below closes the fd (releasing the flock)
+    # on normal exit or exception; a kill releases it on process exit.
+    lock_fd = _acquire_host_lock()
+    try:
+        started_at = time.monotonic()
+        throttle = DuplicateCategoryThrottle()
+        initial_category_size = throttle.category_size()
+        notify_drain_phase_start(partner, len(initial_ids), initial_category_size)
 
-    started_at = time.monotonic()
-    throttle = DuplicateCategoryThrottle()
-    initial_category_size = throttle._category_size()
-    notify_drain_phase_start(partner, len(initial_ids), initial_category_size)
-
-    total_emitted = 0
-    while True:
-        pending = drain_sidecar.read_sidecar(partner)
-        if not pending:
-            break
-        logging.info(
-            "Drain-deferred: %d item(s) still pending; waiting for "
-            "Category:Duplicate to drop below %d (currently polled every %ds).",
-            len(pending),
-            throttle.resume_below,
-            throttle.poll_secs,
-        )
-        # Unlimited wait — patient by design. See module docstring.
-        throttle.wait_for_capacity(max_wait_secs=None)
-        pre_round_count = len(pending)
-        _run_deferred_items(partner, pending)
-        post_round = drain_sidecar.read_sidecar(partner)
-        emitted_this_round = pre_round_count - len(post_round)
-        if emitted_this_round > 0:
-            total_emitted += emitted_this_round
+        total_emitted = 0
+        while True:
+            pending = drain_sidecar.read_sidecar(partner)
+            if not pending:
+                break
             logging.info(
-                "Drain-deferred: round emitted %d item(s); %d still pending.",
-                emitted_this_round,
-                len(post_round),
+                "Drain-deferred: %d item(s) still pending; waiting for "
+                "Category:Duplicate to drop below %d (currently polled every %ds).",
+                len(pending),
+                throttle.resume_below,
+                throttle.poll_secs,
             )
-        else:
-            # A round that made no progress despite reported capacity is
-            # not fatal here (unlike the old bounded drain that would
-            # abort). Category:Duplicate may have refilled while we were
-            # processing, or the round hit unrelated per-item failures.
-            # Loop back to wait_for_capacity; next round will re-observe.
-            logging.warning(
-                "Drain-deferred: round made no progress (%d item(s) still "
-                "pending). Continuing to wait; category may have refilled.",
-                len(post_round),
-            )
+            # Unlimited wait — patient by design. See module docstring.
+            throttle.wait_for_capacity(max_wait_secs=None)
+            pre_round_count = len(pending)
+            # Take this round's IDs out of the sidecar BEFORE the
+            # subprocess pass. The uploader only ever merges deferred IDs
+            # back in — it never removes completed ones — so leaving the
+            # round's IDs in place would make the queue permanent:
+            # completed items would replay every round and the loop would
+            # never terminate. Items the uploader re-defers reappear via
+            # its ``merge_sidecar``; completed (or hard-failed) items stay
+            # out. IDs a concurrent session appends mid-round are
+            # untouched and picked up on the next loop iteration.
+            drain_sidecar.remove_from_sidecar(partner, pending)
+            _run_deferred_items(partner, pending)
+            post_round = drain_sidecar.read_sidecar(partner)
+            emitted_this_round = pre_round_count - len(post_round)
+            if emitted_this_round > 0:
+                total_emitted += emitted_this_round
+                logging.info(
+                    "Drain-deferred: round emitted %d item(s); %d still pending.",
+                    emitted_this_round,
+                    len(post_round),
+                )
+            else:
+                # A round that made no progress despite reported capacity is
+                # not fatal here (unlike the old bounded drain that would
+                # abort). Category:Duplicate may have refilled while we were
+                # processing, or the round hit unrelated per-item failures.
+                # Loop back to wait_for_capacity; next round will re-observe.
+                logging.warning(
+                    "Drain-deferred: round made no progress (%d item(s) still "
+                    "pending). Continuing to wait; category may have refilled.",
+                    len(post_round),
+                )
 
-    elapsed = time.monotonic() - started_at
-    logging.info(
-        "Drain-deferred: complete. Emitted %d item(s) over %.0f seconds.",
-        total_emitted,
-        elapsed,
-    )
-    notify_drain_phase_complete(partner, elapsed, total_emitted)
+        elapsed = time.monotonic() - started_at
+        logging.info(
+            "Drain-deferred: complete. Emitted %d item(s) over %.0f seconds.",
+            total_emitted,
+            elapsed,
+        )
+        notify_drain_phase_complete(partner, elapsed, total_emitted)
+    finally:
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":

@@ -110,6 +110,24 @@ def write_sidecar(partner: str, dpla_ids: list[str]) -> None:
     os.replace(tempname, path)
 
 
+def remove_from_sidecar(partner: str, dpla_ids: list[str]) -> list[str]:
+    """Remove ``dpla_ids`` from the sidecar and return the remaining
+    list. IDs not present are ignored; an empty remainder removes the
+    file (via :func:`write_sidecar`'s empty-list handling).
+
+    Used by the drain phase to take a round's worth of IDs out of the
+    queue before re-invoking the uploader on them: the uploader only
+    ever *merges* deferred IDs back in (it never removes completed
+    ones), so the drain must clear the round's IDs itself and let the
+    uploader's ``merge_sidecar`` re-add whichever ones re-deferred.
+    IDs a concurrent session appended mid-round are untouched.
+    """
+    to_remove = set(dpla_ids)
+    remaining = [x for x in read_sidecar(partner) if x not in to_remove]
+    write_sidecar(partner, remaining)
+    return remaining
+
+
 def merge_sidecar(partner: str, new_dpla_ids: list[str]) -> list[str]:
     """Union ``new_dpla_ids`` into the sidecar and return the resulting
     combined list. If the sidecar didn't exist, this is a plain create.

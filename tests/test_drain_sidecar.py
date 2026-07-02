@@ -70,6 +70,33 @@ def test_merge_sidecar_creates_when_missing():
     assert drain_sidecar.read_sidecar("nara") == ["a", "b"]
 
 
+def test_remove_from_sidecar_drops_only_the_given_ids():
+    drain_sidecar.write_sidecar("nara", ["a", "b", "c", "d"])
+    remaining = drain_sidecar.remove_from_sidecar("nara", ["b", "d"])
+    assert remaining == ["a", "c"]
+    assert drain_sidecar.read_sidecar("nara") == ["a", "c"]
+
+
+def test_remove_from_sidecar_ignores_absent_ids():
+    drain_sidecar.write_sidecar("nara", ["a"])
+    remaining = drain_sidecar.remove_from_sidecar("nara", ["never-queued", "a"])
+    assert remaining == []
+
+
+def test_remove_from_sidecar_empty_remainder_deletes_the_file():
+    """Removing the last IDs leaves the unambiguous empty state
+    (missing file), same as ``write_sidecar([])``."""
+    drain_sidecar.write_sidecar("nara", ["a", "b"])
+    remaining = drain_sidecar.remove_from_sidecar("nara", ["a", "b"])
+    assert remaining == []
+    assert not drain_sidecar.sidecar_path("nara").exists()
+
+
+def test_remove_from_sidecar_on_missing_file_is_a_noop():
+    assert drain_sidecar.remove_from_sidecar("nara", ["a"]) == []
+    assert not drain_sidecar.sidecar_path("nara").exists()
+
+
 def test_read_tolerates_unparseable_file():
     """A file present but corrupted (mid-write crash, hand-edit,
     disk error) is treated the same as missing — the drain loop

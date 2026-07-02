@@ -80,7 +80,12 @@ class DuplicateCategoryThrottle:
         # size query) when it hits zero. Starts at 0 so the first grant queries.
         self._headroom = 0
 
-    def _category_size(self) -> int:
+    def category_size(self) -> int:
+        """Current live size of the tracked category — one ``categoryinfo``
+        API query per call (or the injected ``size_fn``). Public so
+        callers outside the throttle (e.g. the drain-deferred phase's
+        start-of-drain notification) can observe the category without
+        reaching into throttle internals."""
         if self._size_fn is not None:
             return self._size_fn()
         info = pywikibot.Category(self._site, self.category).categoryinfo
@@ -108,7 +113,7 @@ class DuplicateCategoryThrottle:
             self._headroom -= 1
             return True
         # Headroom is exhausted (0), so query the live size to decide.
-        size = self._category_size()
+        size = self.category_size()
         if size >= self.threshold:
             return False  # defer; banks no headroom, so the next attempt re-queries
         # Refill headroom, consuming one grant for this tag.
@@ -137,7 +142,7 @@ class DuplicateCategoryThrottle:
         """
         deadline = clock() + max_wait_secs if max_wait_secs is not None else None
         while True:
-            size = self._category_size()
+            size = self.category_size()
             if size < self.resume_below:
                 self._headroom = self._headroom_for(size)
                 return True

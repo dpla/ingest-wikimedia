@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -57,12 +58,16 @@ def test_empty_sidecar_early_exits_without_starting_the_loop(monkeypatch):
 def test_populated_sidecar_runs_drain_loop_until_empty(monkeypatch):
     """Non-empty sidecar: acquire host lock, poll category, run
     uploader + sdc-sync subprocesses, and loop until the sidecar is
-    empty. The subprocess side-effect removes the ID from the sidecar
-    (as the real uploader would after a successful re-run).
+    empty. The drain itself removes the round's IDs from the sidecar
+    before invoking the subprocesses; a successful re-run (nothing
+    re-deferred) leaves it empty, so the fake uploader is a no-op —
+    as the real uploader would be when every item completes.
     """
     drain_sidecar.write_sidecar("nara", ["id-1"])
 
-    lock_fd = MagicMock()
+    # main() closes the lock fd in its ``finally`` via os.close(), so
+    # the stub must be a real (closable) file descriptor.
+    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     def fake_wait(*a, **kw):
         return True  # capacity immediately available
@@ -71,14 +76,11 @@ def test_populated_sidecar_runs_drain_loop_until_empty(monkeypatch):
     throttle.wait_for_capacity.side_effect = fake_wait
     throttle.resume_below = 900
     throttle.poll_secs = 300
-    throttle._category_size.return_value = 850
+    throttle.category_size.return_value = 850
 
     def fake_subprocess_run(argv, **kwargs):
-        # After the first (uploader) subprocess, the deferred item is
-        # "processed". Empty the sidecar so the loop exits after this
-        # round.
-        if argv[0] == "uploader":
-            drain_sidecar.write_sidecar("nara", [])
+        # Every item completes: the real uploader would touch the
+        # sidecar only to merge re-deferrals back in, so do nothing.
         return MagicMock(returncode=0)
 
     with (
@@ -115,13 +117,15 @@ def test_drain_loop_re_reads_sidecar_between_rounds():
     exiting on the pre-round snapshot.
     """
     drain_sidecar.write_sidecar("nara", ["id-1"])
-    lock_fd = MagicMock()
+    # main() closes the lock fd in its ``finally`` via os.close(), so
+    # the stub must be a real (closable) file descriptor.
+    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     throttle = MagicMock()
     throttle.wait_for_capacity.return_value = True
     throttle.resume_below = 900
     throttle.poll_secs = 300
-    throttle._category_size.return_value = 850
+    throttle.category_size.return_value = 850
 
     call_state = {"round": 0}
 
@@ -129,10 +133,11 @@ def test_drain_loop_re_reads_sidecar_between_rounds():
         if argv[0] == "uploader":
             call_state["round"] += 1
             if call_state["round"] == 1:
-                # First round clears id-1 but appends id-2 (concurrent).
-                drain_sidecar.write_sidecar("nara", ["id-2"])
-            else:
-                drain_sidecar.write_sidecar("nara", [])
+                # Round 1: id-1 completes (the drain already removed it
+                # from the sidecar); a concurrent uploader session
+                # appends id-2 while we're mid-round.
+                drain_sidecar.merge_sidecar("nara", ["id-2"])
+            # Round 2: id-2 completes — nothing merged back.
         return MagicMock(returncode=0)
 
     with (
@@ -159,13 +164,15 @@ def test_drain_loop_continues_on_no_progress_round():
     loop continues waiting rather than aborting.
     """
     drain_sidecar.write_sidecar("nara", ["id-1"])
-    lock_fd = MagicMock()
+    # main() closes the lock fd in its ``finally`` via os.close(), so
+    # the stub must be a real (closable) file descriptor.
+    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     throttle = MagicMock()
     throttle.wait_for_capacity.return_value = True
     throttle.resume_below = 900
     throttle.poll_secs = 300
-    throttle._category_size.return_value = 850
+    throttle.category_size.return_value = 850
 
     call_state = {"round": 0}
 
@@ -173,10 +180,10 @@ def test_drain_loop_continues_on_no_progress_round():
         if argv[0] == "uploader":
             call_state["round"] += 1
             if call_state["round"] < 2:
-                # Round 1: no progress (id-1 still in sidecar).
-                return MagicMock(returncode=0)
-            # Round 2: cleared.
-            drain_sidecar.write_sidecar("nara", [])
+                # Round 1: no progress — the uploader re-defers id-1,
+                # merging it back into the sidecar the drain cleared.
+                drain_sidecar.merge_sidecar("nara", ["id-1"])
+            # Round 2: id-1 completes — nothing merged back.
         return MagicMock(returncode=0)
 
     with (
@@ -194,3 +201,47 @@ def test_drain_loop_continues_on_no_progress_round():
     done_ping.assert_called_once()
     # Two rounds ran (no-progress round did NOT abort).
     assert call_state["round"] == 2
+
+
+def test_drain_removes_round_ids_from_sidecar_before_invoking_uploader():
+    """The drain — not the uploader — must clear the round's IDs from
+    the sidecar before the subprocess pass. The uploader only ever
+    *merges* deferred IDs back in (it never removes completed ones), so
+    if the drain left the round's IDs in place, completed items would
+    replay every round and the loop would never terminate. Pin the
+    ordering by observing the sidecar from inside the uploader
+    subprocess: the round's IDs must already be gone."""
+    drain_sidecar.write_sidecar("nara", ["id-1", "id-2"])
+    # main() closes the lock fd in its ``finally`` via os.close(), so
+    # the stub must be a real (closable) file descriptor.
+    lock_fd = os.open(os.devnull, os.O_RDONLY)
+
+    throttle = MagicMock()
+    throttle.wait_for_capacity.return_value = True
+    throttle.resume_below = 900
+    throttle.poll_secs = 300
+    throttle.category_size.return_value = 850
+
+    seen_by_uploader: list[list[str]] = []
+
+    def fake_subprocess_run(argv, **kwargs):
+        if argv[0] == "uploader":
+            seen_by_uploader.append(drain_sidecar.read_sidecar("nara"))
+        return MagicMock(returncode=0)
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred.subprocess.run", side_effect=fake_subprocess_run),
+        patch(
+            "tools.drain_deferred.DuplicateCategoryThrottle",
+            return_value=throttle,
+        ),
+        patch("tools.drain_deferred.notify_drain_phase_start"),
+        patch("tools.drain_deferred.notify_drain_phase_complete"),
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    assert result.exit_code == 0, result.output
+    # Exactly one round ran, and the uploader saw an already-cleared
+    # sidecar — with a merge-only uploader this is what lets completed
+    # items leave the queue.
+    assert seen_by_uploader == [[]]

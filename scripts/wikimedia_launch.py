@@ -138,6 +138,7 @@ _STEP_BY_FIRST_TOKEN: dict[str, str] = {
     "downloader": "download",
     "uploader": "upload",
     "sdc-sync": "sdc-sync",
+    "drain-deferred": "drain-deferred",
 }
 
 

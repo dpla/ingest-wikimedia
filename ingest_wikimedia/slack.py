@@ -161,6 +161,7 @@ _PHASE_LOG_SUFFIX: dict[str, str] = {
     "download": "download",
     "upload": "upload",
     "sdc-sync": "sdc",
+    "drain-deferred": "drain-deferred",
 }
 
 # Per-session-label path the launcher tees ``get-ids-es`` stderr to.
@@ -234,7 +235,8 @@ def notify_pipeline_fail() -> None:
       WIKIMEDIA_SESSION_LABEL  — identifies the target in the message
       WIKIMEDIA_STEP           — name of the pipeline step that was running
                                  when the chain broke (``id-generation``,
-                                 ``download``, ``upload``, ``sdc-sync``).
+                                 ``download``, ``upload``, ``sdc-sync``,
+                                 ``drain-deferred``).
                                  Empty / unset → "pipeline step" generic
                                  wording. Set by the launcher's per-step
                                  ``export`` so the latest assignment before
@@ -675,7 +677,7 @@ def notify_drain_phase_start(
     tmux session stays alive during the wait; kill via the existing
     Slack kill-session command if you need to abandon.
     """
-    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     if not token:
         logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
         return
@@ -704,7 +706,7 @@ def notify_drain_phase_complete(
     the drain phase's normal exit; a killed / aborted drain leaves the
     sidecar in place for a future session to resume from.
     """
-    token = os.environ.get("DPLA_SLACK_BOT_TOKEN")
+    token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
     if not token:
         logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
         return
