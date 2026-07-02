@@ -39,8 +39,33 @@ Module structure:
 
   Top-level builder
     build_claims_for_doc(doc, dpla_id, hubs, rights, subject_ids,
-                        subjects_lookup, retrieval_date)
-        Returns `{"claims": [...]}` ready to POST to wbsetclaims.
+                        subjects_lookup)
+        Returns `{"claims": [...], "ingest_date": "YYYY-MM-DD"}` ready to
+        POST to wbsetclaims. The ingest date is derived internally from
+        ``doc["ingestDate"]`` (see the "P813" section below).
+
+## P813 (retrieved on) reference date — pinned to the DPLA ingest date
+
+Every DPLA-authored claim carries a ``P813`` (retrieved on) snak in
+its reference block, indicating when the DPLA data was fetched. This
+codebase pins that date to the **DPLA item's ``ingestDate``** — the
+timestamp DPLA's ingestion pipeline recorded when it harvested this
+item's metadata from the source hub — rather than to the sync run's
+``datetime.date.today()``.
+
+Rationale: ``ingestDate`` changes only when DPLA re-ingests the item
+(a genuine new fact about the DPLA-side data), whereas ``today()``
+changes with every sync run. Anchoring P813 to ``today()`` produced
+noisy Commons edit diffs — every re-sync of a file rewrote every
+P813 date across every one of the file's claims, drowning out the
+substantive changes in the diff. Anchoring to ``ingestDate`` means a
+sync that finds no factual delta produces no diff at all; a diff
+that DOES appear reflects a real DPLA-side change.
+
+See ``ingest_date_from_doc`` for extraction. Callers that build
+claims (``get-ids-es``, ``get-ids-nara``, ``sdc-sync``'s reference
+refresh) should derive ``retrieval_date`` per-item from the doc, not
+from ``today()``.
 """
 
 from __future__ import annotations
@@ -286,31 +311,61 @@ def _qualifier_string_snak(prop: str, value: str, datatype: str | None = None) -
     return snak
 
 
+def ingest_date_from_doc(doc: dict) -> datetime.date:
+    """Return the DPLA ingestion date from an item document (either a
+    live API response or a staged ``dpla-map.json`` sidecar) as a
+    ``datetime.date``.
+
+    The DPLA API emits ``ingestDate`` as an ISO 8601 timestamp string
+    (e.g. ``"2026-06-23T15:50:29.874Z"``); this helper strips the time
+    portion and returns the date part.
+
+    Raises ``ValueError`` if the field is missing, non-string, or not
+    parseable — every record that survives DPLA ingestion carries an
+    ``ingestDate``, so its absence signals a corrupted record / ES bug
+    / upstream data-integrity problem. Callers should catch per-item
+    (same convention as the existing ``ET.ParseError`` skip in
+    ``get-ids-es`` / ``get-ids-nara``), log the DPLA ID, and skip that
+    item's ``sdc.json`` rather than fall back to a synthetic date that
+    would mask the real issue.
+
+    Used as the anchor for the P813 (retrieved on) reference date; see
+    the module docstring for the rationale.
+    """
+    raw = doc.get("ingestDate") if isinstance(doc, dict) else None
+    if not isinstance(raw, str) or len(raw) < 10:
+        raise ValueError(
+            f"DPLA item document missing or has invalid ingestDate: {raw!r} "
+            "(every record ingested via DPLA carries a valid ingestDate; "
+            "an item without one signals a corrupted record — do not "
+            "silently synthesize a date)"
+        )
+    return datetime.date.fromisoformat(raw[:10])
+
+
 def formattedclaim(
     prop: str,
     value: Any,
     value_type: str,
     dpla_id: str,
-    retrieval_date: datetime.date | None = None,
+    retrieval_date: datetime.date,
 ) -> dict:
     """Build the canonical Wikibase claim envelope.
 
     Every DPLA-published claim carries:
       * a P459 (determination method) qualifier set to Q61848113 (heuristic)
       * a reference triple — P854 (DPLA item URL), P123 (publisher = DPLA),
-        P813 (retrieved on `retrieval_date`).
+        P813 (retrieved on ``retrieval_date``).
+
+    ``retrieval_date`` is required; callers derive it per-item from the
+    doc's ``ingestDate`` via :func:`ingest_date_from_doc`. See the
+    module docstring for why P813 is pinned to the ingest date rather
+    than the sync run's today().
 
     When called with `value == "somevalue"` the mainsnak is emitted as a
     snaktype=somevalue node instead of a value node — the caller adds the
     type-specific qualifier (P2093 for creators, P1932 for dates).
-
-    `retrieval_date` defaults to today's date when omitted; callers that
-    want a deterministic, persisted-to-S3 claim list (get-ids-es) should
-    pass the run date explicitly so the same `sdc.json` content is
-    reproducible from the same input doc.
     """
-    if retrieval_date is None:
-        retrieval_date = datetime.date.today()
 
     claim = {
         "mainsnak": {
@@ -1611,22 +1666,27 @@ def build_claims_for_doc(
     rights: dict,
     subject_ids: dict,
     subjects_lookup: dict[tuple[str, str], str] | None,
-    retrieval_date: datetime.date,
-) -> dict[str, list[dict]] | None:
+) -> dict[str, Any] | None:
     """Build the complete ready-to-POST SDC claim list for a DPLA item.
 
-    Returns `{"claims": [...]}` matching the wbsetclaims POST shape. Returns
-    `None` when the doc can't be parsed (e.g. provider/dataProvider not in
-    the hubs map) — callers should skip the item and not stage an sdc.json
-    for it.
+    Returns ``{"claims": [...], "ingest_date": "YYYY-MM-DD"}`` matching
+    the wbsetclaims POST shape (the extra ``ingest_date`` envelope field
+    is read back by ``sdc-sync`` to pin its per-file P813 refresh — see
+    the module docstring). Returns ``None`` when the doc can't be
+    parsed (e.g. provider / dataProvider not in the hubs map) — callers
+    should skip the item and not stage an sdc.json for it.
 
-    `subjects_lookup` is the pre-resolved reconciliation table; pass `None`
-    for inline-only behavior (the parallel P921 statements for NARA
-    `exactMatch` subjects are simply omitted in that case).
+    ``subjects_lookup`` is the pre-resolved reconciliation table; pass
+    ``None`` for inline-only behavior (the parallel P921 statements for
+    NARA ``exactMatch`` subjects are simply omitted in that case).
 
-    `retrieval_date` is stamped into every claim's P813 reference. For
-    deterministic, persisted-to-S3 output (get-ids-es), pass the run date.
+    The P813 (retrieved on) reference date is derived internally from
+    the doc's ``ingestDate`` via :func:`ingest_date_from_doc`. Raises
+    ``ValueError`` if the doc lacks a valid ``ingestDate`` — callers
+    catch per-item (same convention as ``ET.ParseError`` in
+    ``get-ids-es`` / ``get-ids-nara``), log, and skip that item.
     """
+    retrieval_date = ingest_date_from_doc(doc)
     parsed = parse_dpla_doc(doc, dpla_id, hubs, subject_ids, subjects_lookup)
     if parsed is None:
         return None
@@ -1802,4 +1862,4 @@ def build_claims_for_doc(
             )
         )
 
-    return {"claims": claims}
+    return {"claims": claims, "ingest_date": retrieval_date.isoformat()}

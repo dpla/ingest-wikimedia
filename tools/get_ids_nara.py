@@ -27,7 +27,6 @@ Output: one DPLA ID per line to stdout. Redirect to produce the IDs CSV:
     get-ids-nara > nara/nara.csv
 """
 
-import datetime
 import json
 import logging
 import sys
@@ -328,7 +327,6 @@ def main() -> None:
     institutions_json = fetch_institutions_v2()
     rights = load_rights_json()
     subject_ids = fetch_subjects_json()
-    retrieval_date = datetime.date.today()
 
     dpla_ids: list[str] = []
     subject_queries: set[tuple[str, str]] = set()
@@ -415,16 +413,19 @@ def main() -> None:
                     rights,
                     subject_ids,
                     subjects_lookup,
-                    retrieval_date,
                 )
-            except ET.ParseError as e:
-                # Malformed NARA originalRecord XML (parse_nara_access_level
-                # surfaces this). Skip the sdc.json for this item rather than
-                # abort the whole run — same boundary get-ids-es uses.
+            except (ET.ParseError, ValueError) as e:
+                # ET.ParseError: parse_nara_access_level on malformed
+                # NARA originalRecord XML. ValueError:
+                # ingest_date_from_doc on missing / unparseable
+                # ingestDate. Both are per-item data-integrity signals;
+                # skip the sdc.json for this item rather than abort the
+                # whole run.
                 logging.warning(
-                    "build_claims_for_doc for %s raised ET.ParseError (%s);"
+                    "build_claims_for_doc for %s raised %s (%s);"
                     " skipping sdc.json for this item",
                     dpla_id,
+                    type(e).__name__,
                     e,
                 )
                 sdc_skipped += 1

@@ -18,6 +18,7 @@ from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
     casefold_for_compare,
+    ingest_date_from_doc,
     parse_date_range,
     parse_dpla_date,
     parse_nara_access_level,
@@ -667,10 +668,12 @@ def formattedclaim(prop, value, value_type, dpla_id):
     ref_url.setTarget(_dpla_item_url(dpla_id))
     ref_publisher = pywikibot.Claim(site, "P123", is_reference=True)
     ref_publisher.setTarget(pywikibot.ItemPage(repo, "Q2944483"))
-    today = datetime.date.today()
+    ingest_date = _require_ingest_date()
     ref_retrieved = pywikibot.Claim(site, "P813", is_reference=True)
     ref_retrieved.setTarget(
-        pywikibot.WbTime(year=today.year, month=today.month, day=today.day)
+        pywikibot.WbTime(
+            year=ingest_date.year, month=ingest_date.month, day=ingest_date.day
+        )
     )
     claim.addSources([ref_url, ref_publisher, ref_retrieved])
 
@@ -734,17 +737,41 @@ qualifier_amends = []  # list of (claimid, prop, snak_to_add)
 qualifier_removals = []  # list of (claimid, snak_hash_to_remove)
 removals = []  # list of statement IDs to remove from Commons
 
+# Per-file DPLA ingest date. Set at the top of each ``process_one`` /
+# ``process_one_from_sdc`` call from the item's ``ingestDate`` and used by
+# ``formattedclaim`` (P813 stamp) and ``_flush_per_file_edits`` (reference
+# refresh). ``None`` outside a process_one* call — reading it in that state
+# is a programming error and raises so a rogue caller can't silently fall
+# back to today. See ``ingest_wikimedia.sdc.ingest_date_from_doc`` for the
+# rationale on pinning to the ingest date rather than today.
+_current_ingest_date: datetime.date | None = None
+
 
 def _reset_per_file_accumulators():
     """Drop every per-file accumulator at the start of a new file's
     processing. Used by both ``process_one`` and ``process_one_from_sdc``
     so the dispatcher only ever sees the current file's fragments."""
     global claims, refclaims, qualifier_amends, qualifier_removals, removals
+    global _current_ingest_date
     claims = {"claims": []}
     refclaims = {"claims": []}
     qualifier_amends = []
     qualifier_removals = []
     removals = []
+    _current_ingest_date = None
+
+
+def _require_ingest_date() -> datetime.date:
+    """Return the per-file ingest date set by the current ``process_one*``
+    call. Raises ``RuntimeError`` when called outside a process_one* run —
+    fallback to today would defeat the whole point of ingest-date pinning."""
+    if _current_ingest_date is None:
+        raise RuntimeError(
+            "sdc_sync: no ingest_date set — a P813-producing helper was called "
+            "outside process_one / process_one_from_sdc, or the entry point "
+            "didn't set _current_ingest_date before the call."
+        )
+    return _current_ingest_date
 
 
 def _url_snak(prop, url):
@@ -2677,29 +2704,33 @@ def _entity_snak(prop, qid):
     }
 
 
-def _build_dpla_reference(dpla_id, retrieved=None):
+def _build_dpla_reference(dpla_id, ingest_date):
     """The canonical DPLA reference as a wbeditentity reference dict: the
     3-snak group ``P854`` (this item's dp.la URL) + ``P123`` (publisher =
-    DPLA, Q2944483) + ``P813`` (retrieved date, default today). Same shape
-    ``formattedclaim`` stamps on new claims (P813 via the shared
-    ``_build_p813_snak``), so a rebuilt reference is indistinguishable from
-    a freshly authored one."""
+    DPLA, Q2944483) + ``P813`` (retrieved date, pinned to the item's DPLA
+    ``ingestDate``). Same shape ``formattedclaim`` stamps on new claims
+    (P813 via the shared ``_build_p813_snak``), so a rebuilt reference is
+    indistinguishable from a freshly authored one.
+
+    See ``ingest_wikimedia.sdc.ingest_date_from_doc`` for why P813 is
+    pinned to the ingest date rather than today."""
     return {
         "snaks": {
             "P854": [_string_snak("P854", _dpla_item_url(dpla_id))],
             "P123": [_entity_snak("P123", "Q2944483")],
-            "P813": [_build_p813_snak(retrieved or datetime.date.today())],
+            "P813": [_build_p813_snak(ingest_date)],
         }
     }
 
 
-def _dpla_reference_is_canonical(reference, dpla_id):
+def _dpla_reference_is_canonical(reference, dpla_id, ingest_date):
     """True iff ``reference`` is already the complete, current DPLA reference
-    — publisher = DPLA (P123), this item's dp.la URL (P854), and today's
-    retrieved date (P813). A DPLA reference missing or wrong on any of these
-    is treated as needing a rebuild, so the refresh repairs a partial
-    reference (e.g. a foreign-bot rights claim that only ever carried P123)
-    in the same write that refreshes the date — no separate reconcile pass.
+    — publisher = DPLA (P123), this item's dp.la URL (P854), and the P813
+    retrieved date matching this item's DPLA ``ingestDate``. A DPLA
+    reference missing or wrong on any of these is treated as needing a
+    rebuild, so the refresh repairs a partial reference (e.g. a foreign-bot
+    rights claim that only ever carried P123) in the same write — no
+    separate reconcile pass.
 
     Identity keys on the P123 publisher marker (via ``_is_dpla_reference``);
     a reference that lost P123 entirely reads as foreign and is left
@@ -2713,31 +2744,34 @@ def _dpla_reference_is_canonical(reference, dpla_id):
         (snak.get("datavalue") or {}).get("value") == expected_url
         for snak in snaks.get("P854") or []
     )
-    return p854_ok and _p813_already_today(reference)
+    return p854_ok and _p813_matches(reference, ingest_date)
 
 
-def _build_reference_refresh_fragments(mediaid, dpla_id, already_touched_ids):
+def _build_reference_refresh_fragments(
+    mediaid, dpla_id, already_touched_ids, ingest_date
+):
     """Build reference-update fragments that make each DPLA-authored claim's
-    DPLA reference *canonical and current* — the full P854+P123+P813-today
-    triple — rewriting it wholesale rather than only swapping the P813 date.
+    DPLA reference *canonical and up-to-date* — the full P854+P123+P813
+    triple with P813 pinned to the item's DPLA ``ingestDate`` — rewriting
+    it wholesale rather than only swapping the P813 date.
 
-    This both refreshes the "as-of" retrieved date AND repairs a partial or
-    stale DPLA reference (e.g. one a foreign bot wrote with P123 but no P854)
-    in a single write — relying on the fact that re-asserting an identical
-    reference is a Wikibase no-op, so the only claims that actually change are
-    those whose DPLA reference isn't already canonical. User-added (non-DPLA)
-    references are preserved verbatim; a duplicate second DPLA reference (rare
-    legacy state) is collapsed to the single canonical one.
+    This both refreshes the retrieved date to match the current
+    ``ingestDate`` AND repairs a partial or stale DPLA reference (e.g. one
+    a foreign bot wrote with P123 but no P854) in a single write —
+    relying on the fact that re-asserting an identical reference is a
+    Wikibase no-op, so the only claims that actually change are those
+    whose DPLA reference isn't already canonical. User-added (non-DPLA)
+    references are preserved verbatim; a duplicate second DPLA reference
+    (rare legacy state) is collapsed to the single canonical one.
 
     Only fires for claims NOT already covered by another fragment in this
     file's edit (``already_touched_ids``), and only when the dispatcher is
     already making some other edit on the file (the call site builds these
     only when the bundle is otherwise non-empty) — so a file where every DPLA
-    reference is already canonical gets no spurious edit.
+    reference is already canonical gets no spurious edit. Pinning P813 to
+    ``ingestDate`` (rather than today) means back-to-back sync runs against
+    unchanged partner data produce no reference-refresh churn at all.
     """
-    # One date for the whole file's rebuilds, so fragments built either side
-    # of a UTC midnight boundary still agree on the retrieved date.
-    today = datetime.date.today()
     entity = get_entity(mediaid)
     fragments = []
     for prop_stmts in (entity.get("statements") or {}).values():
@@ -2762,10 +2796,10 @@ def _build_reference_refresh_fragments(mediaid, dpla_id, already_touched_ids):
                     changed = True  # duplicate DPLA reference — drop it
                     continue
                 seen_dpla = True
-                if _dpla_reference_is_canonical(ref, dpla_id):
+                if _dpla_reference_is_canonical(ref, dpla_id, ingest_date):
                     new_refs.append(ref)
                 else:
-                    new_refs.append(_build_dpla_reference(dpla_id, today))
+                    new_refs.append(_build_dpla_reference(dpla_id, ingest_date))
                     changed = True
             if changed:
                 # Same wholesale-replace contract as
@@ -2805,16 +2839,17 @@ def _build_p813_snak(retrieval_date):
     }
 
 
-def _p813_already_today(reference):
+def _p813_matches(reference, target_date):
     """Return True iff the reference's P813 (retrieved on) snak already
-    carries today's date in its time value. Avoids emitting spurious
-    edits on references that were already refreshed today (e.g. an
-    item processed twice in the same UTC day).
+    carries ``target_date`` in its time value. Used by the reference-refresh
+    path to skip references that are already up-to-date with the item's
+    DPLA ``ingestDate`` — the whole point of pinning P813 to the ingest
+    date is that a re-sync of unchanged partner data produces no diff.
     """
-    today_iso = "+" + datetime.date.today().isoformat() + "T00:00:00Z"
+    target_iso = "+" + target_date.isoformat() + "T00:00:00Z"
     for snak in (reference.get("snaks") or {}).get("P813") or []:
         try:
-            if snak["datavalue"]["value"]["time"] == today_iso:
+            if snak["datavalue"]["value"]["time"] == target_iso:
                 return True
         except (KeyError, TypeError):
             continue
@@ -2829,15 +2864,19 @@ def _flush_per_file_edits(mediaid, dpla_id):
     separate API calls.
 
     When any other edit fragments are present, opportunistically make
-    every other DPLA-authored claim's DPLA reference canonical and current
-    — the full P854+P123+P813-today triple — via
+    every other DPLA-authored claim's DPLA reference canonical and
+    up-to-date — the full P854+P123+P813 triple with P813 pinned to
+    the item's DPLA ``ingestDate`` — via
     ``_build_reference_refresh_fragments``. This both refreshes the
-    "retrieved on" date (the bot has just re-verified the file against
-    DPLA's source metadata, so every assertion is effectively "as-of
-    today") AND repairs a partial or stale DPLA reference left by an older
-    sync or a foreign bot. Re-asserting an already-canonical reference is a
-    Wikibase no-op, so there are no spurious edits when the file has
-    nothing else to change.
+    "retrieved on" date (against the current ingest date, not today)
+    AND repairs a partial or stale DPLA reference left by an older
+    sync or a foreign bot. Re-asserting an already-canonical reference
+    is a Wikibase no-op, so there are no spurious edits when the file
+    has nothing else to change.
+
+    The ingest date is read from ``_current_ingest_date``, which the
+    entry point set from the item's ``ingestDate``. See
+    ``ingest_wikimedia.sdc.ingest_date_from_doc`` for rationale.
 
     After a successful write, invalidate the cached entity once so any
     follow-up code reading from cache picks up the new revision.
@@ -2853,13 +2892,20 @@ def _flush_per_file_edits(mediaid, dpla_id):
         or removal_fragments
     )
     if has_any_other_edit:
+        # Only need the ingest date when we're actually building a
+        # reference-refresh fragment. This keeps the "nothing to do"
+        # path callable without a set ingest date (used by tests and by
+        # process_one entry points that short-circuit before setting it).
+        ingest_date = _require_ingest_date()
         touched_ids = set()
         for frag in qualifier_fragments + removal_fragments + reference_updates:
             fid = frag.get("id")
             if fid:
                 touched_ids.add(fid)
         reference_updates.extend(
-            _build_reference_refresh_fragments(mediaid, dpla_id, touched_ids)
+            _build_reference_refresh_fragments(
+                mediaid, dpla_id, touched_ids, ingest_date
+            )
         )
 
     _submit_per_item_edit(
@@ -4018,6 +4064,12 @@ def process_one(mediaid, dpla_id):
             missing.write(dpla_id + "\n")
             print(" -- Missing ID recorded.")
         return
+
+    # Pin P813 to the item's DPLA ingestDate for the whole file's writes.
+    # ``parsed()`` stashed the raw doc in ``_legacy_mode_doc_cache``; the
+    # legacy-mode cleanup helper pops it after we're done.
+    global _current_ingest_date
+    _current_ingest_date = ingest_date_from_doc(_legacy_mode_doc_cache[dpla_id])
     (
         url,
         descs,
@@ -4146,6 +4198,19 @@ def process_one_from_sdc(
     _entity_cache.clear()
     _reset_per_file_accumulators()
     get_entity(mediaid)
+
+    # Pin P813 to the ingest date the sdc.json envelope records — same date
+    # baked into every P813 snak in the payload's claims, kept as a
+    # top-level field so the reference-refresh path doesn't have to peel it
+    # out of a claim.
+    global _current_ingest_date
+    raw_ingest_date = sdc_payload.get("ingest_date")
+    if not isinstance(raw_ingest_date, str):
+        raise ValueError(
+            f"sdc.json for {dpla_id} is missing 'ingest_date' — regenerate "
+            "the sidecar with a post-P813-pinning get-ids-* run."
+        )
+    _current_ingest_date = datetime.date.fromisoformat(raw_ingest_date)
 
     sdc_claims = sdc_payload.get("claims", [])
     first_check = True

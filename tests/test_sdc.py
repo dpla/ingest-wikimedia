@@ -721,6 +721,7 @@ def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
     def _doc(iiif_value):
         return {
             "id": "abc1234567890",
+            "ingestDate": "2026-06-07T00:00:00Z",
             "provider": {"name": "Digital Commonwealth"},
             "dataProvider": {"name": "Boston Public Library"},
             "sourceResource": {
@@ -738,11 +739,10 @@ def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
             "institutions": {"Boston Public Library": {"Wikidata": "Q2"}},
         }
     }
-    import datetime as _dt
 
     for junk in (None, "", "   ", "null", "ftp://example.org/x", "not a url"):
         out = build_claims_for_doc(
-            _doc(junk), "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 7)
+            _doc(junk), "abc1234567890", hubs, {}, {}, {}
         )
         p7482 = next(c for c in out["claims"] if c["mainsnak"]["property"] == "P7482")
         assert "P6108" not in p7482["qualifiers"], (
@@ -757,7 +757,7 @@ def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
         "http://example.org/iiif/manifest.json",
     ):
         out = build_claims_for_doc(
-            _doc(valid), "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 7)
+            _doc(valid), "abc1234567890", hubs, {}, {}, {}
         )
         p7482 = next(c for c in out["claims"] if c["mainsnak"]["property"] == "P7482")
         assert "P6108" in p7482["qualifiers"], (
@@ -786,6 +786,7 @@ def test_build_claims_for_doc_tolerates_missing_rights_field():
 
     doc = {
         "id": "abc1234567890",
+        "ingestDate": "2026-06-29T00:00:00Z",
         "provider": {"name": "Internet Archive"},
         "dataProvider": {"name": "Duke University Libraries"},
         "sourceResource": {
@@ -801,10 +802,9 @@ def test_build_claims_for_doc_tolerates_missing_rights_field():
             "institutions": {"Duke University Libraries": {"Wikidata": "Q5312898"}},
         }
     }
-    import datetime as _dt
 
     out = build_claims_for_doc(
-        doc, "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 29)
+        doc, "abc1234567890", hubs, {}, {}, {}
     )
     # No crash. No P275/P6426 rights claims since the input had no rights.
     rights_props = {"P275", "P6426", "P6216"}
@@ -1411,3 +1411,89 @@ def test_build_contributed_claims_service_hub_shape():
         ("Q12345", Q_ROLE_AGGREGATOR),
         ("Q67890", Q_ROLE_REPOSITORY),
     ]
+
+
+def test_ingest_date_from_doc_parses_iso_timestamp():
+    """The DPLA API emits ``ingestDate`` as ISO 8601. Strip the time part
+    and return a ``datetime.date``."""
+    import datetime
+
+    from ingest_wikimedia.sdc import ingest_date_from_doc
+
+    doc = {"ingestDate": "2026-06-23T15:50:29.874Z"}
+    assert ingest_date_from_doc(doc) == datetime.date(2026, 6, 23)
+
+
+def test_ingest_date_from_doc_raises_when_missing():
+    """A DPLA record without ingestDate is corrupted / an ES bug. Raise
+    loudly so the caller can skip the item — do NOT synthesize a date."""
+    from ingest_wikimedia.sdc import ingest_date_from_doc
+
+    for bad in (None, {}, {"ingestDate": None}, {"ingestDate": ""}, {"ingestDate": 12345}):
+        try:
+            ingest_date_from_doc(bad)
+        except ValueError:
+            continue
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_ingest_date_from_doc_raises_on_malformed_timestamp():
+    """A non-ISO ``ingestDate`` value is a data-integrity signal, not a
+    condition to paper over."""
+    from ingest_wikimedia.sdc import ingest_date_from_doc
+
+    try:
+        ingest_date_from_doc({"ingestDate": "not-a-date-value"})
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for malformed ingestDate")
+
+
+def test_build_claims_for_doc_pins_p813_to_ingest_date():
+    """Every P813 (retrieved on) reference across the returned claims is
+    pinned to the doc's ``ingestDate``, not the current date. Two calls
+    against the same doc must produce identical P813 values regardless of
+    when they run — this is the whole point of ingest-date pinning."""
+    from ingest_wikimedia.sdc import build_claims_for_doc
+
+    doc = {
+        "id": "abc1234567890",
+        "ingestDate": "2026-06-23T15:50:29.874Z",
+        "provider": {"name": "Digital Commonwealth"},
+        "dataProvider": {"name": "Boston Public Library"},
+        "sourceResource": {
+            "title": ["A title"],
+            "date": [{"displayDate": "1945"}],
+        },
+        "isShownAt": "https://example.org/item/abc",
+        "rights": "http://rightsstatements.org/vocab/InC/1.0/",
+    }
+    hubs = {
+        "Digital Commonwealth": {
+            "Wikidata": "Q1",
+            "institutions": {"Boston Public Library": {"Wikidata": "Q2"}},
+        }
+    }
+    out_a = build_claims_for_doc(doc, "abc1234567890", hubs, {}, {}, {})
+    out_b = build_claims_for_doc(doc, "abc1234567890", hubs, {}, {}, {})
+
+    assert out_a["ingest_date"] == "2026-06-23"
+    assert out_b["ingest_date"] == "2026-06-23"
+
+    def _p813_times(payload):
+        times = []
+        for claim in payload["claims"]:
+            for ref in claim.get("references") or []:
+                for snak in (ref.get("snaks") or {}).get("P813") or []:
+                    times.append(snak["datavalue"]["value"]["time"])
+        return times
+
+    times = _p813_times(out_a)
+    assert times, "every claim carries a P813 reference"
+    assert set(times) == {"+2026-06-23T00:00:00Z"}, (
+        f"P813 must be pinned to ingestDate; got {set(times)}"
+    )
+    assert _p813_times(out_a) == _p813_times(out_b), (
+        "identical doc must produce byte-identical P813 stamps"
+    )
