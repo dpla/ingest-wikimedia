@@ -1112,10 +1112,16 @@ _MONTH_DAY_YEAR = re.compile(
 _DAY_MONTH_YEAR = re.compile(
     rf"^(\d{{1,2}})\s+{_MONTH_NAME_RE}\.?\s+(\d{{3,4}})$", re.IGNORECASE
 )
-# ``11/19/1902`` — US slash-form with day precision. Deliberately requires
-# the trailing 3-4-digit year to avoid gluing to unrelated slash-shaped
-# strings; ambiguous with DD/MM/YYYY is left unrecognised (both forms
-# would need a heuristic we don't want in a value-preserving parser).
+# ``11/19/1902`` — US slash-form with day precision. Always interpreted
+# as MM/DD/YYYY; when the day component is <= 12 this is genuinely
+# ambiguous with DD/MM/YYYY and a non-US-formatted date will be silently
+# mis-parsed rather than rejected. Acceptable trade-off in this
+# codebase: ``parse_dpla_date``'s callers are (a) the reconciler's
+# comparator — where a mis-parse is self-correcting, since both sides
+# just fail to match and the override survives unstripped — and (b)
+# ``_build_date_claim`` on unambiguously US-formatted DPLA sources.
+# Requires a 3-4-digit trailing year so unrelated slash-shaped strings
+# can't glue.
 _US_SLASH_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{3,4})$")
 
 # Unicode punctuation categories used by ``casefold_for_compare``'s

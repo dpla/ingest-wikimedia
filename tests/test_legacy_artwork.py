@@ -1654,3 +1654,70 @@ def test_plan_migration_still_imports_substantively_different_title():
     plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
     assert plan is not None
     assert plan.community_imports == {"title": "A Completely Different Title"}
+
+
+# ---------------------------------------------------------------------------
+# plan_migration — institution Q-ID equivalence (this commit).
+# For NARA files in particular, the legacy `{{Artwork}}` template wrote
+# the data-provider as a nested `{{Institution|wikidata=Q...}}` sub-
+# template, while `dpla_metadata_params` now emits it as a bare Q-ID.
+# A byte-wise inequality shouldn't lead to a spurious inferred-from-
+# Wikitext import when both sides carry the same Q-ID.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_migration_skips_institution_subtemplate_matching_canonical_qid():
+    """Legacy `{{Institution|wikidata=Q59661041}}` sub-template value in
+    a community-authored revision must NOT import as inferred-from-
+    Wikitext when the canonical DPLA `institution` param is the same
+    Q-ID. Motivating example: NARA custodial-unit files whose legacy
+    `Institution =` field held the same custodial-unit Q-ID that DPLA
+    now writes as canonical."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|institution=Q59661041}}"),
+        (2, "Editor1", "{{Artwork|institution={{Institution|wikidata=Q59661041}}}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(institution="Q59661041")
+    )
+    assert plan is not None
+    assert plan.community_imports == {}, (
+        f"expected `{{Institution|wikidata=Q59661041}}` to be recognised "
+        f"as equivalent to canonical `Q59661041`; got "
+        f"community_imports={plan.community_imports}"
+    )
+
+
+def test_plan_migration_still_imports_institution_that_differs():
+    """Q-ID mismatch is real — the community pointed the file at a
+    different institution and that override must be preserved."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|institution=Q59661041}}"),
+        (2, "Editor1", "{{Artwork|institution={{Institution|wikidata=Q77777777}}}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(institution="Q59661041")
+    )
+    assert plan is not None
+    assert "institution" in plan.community_imports
+
+
+def test_plan_migration_extract_institution_qid_handles_flat_bare_qid():
+    """The flat `{{DPLA metadata|institution=Q123}}` shape stores the
+    Q-ID bare — the extractor recognises both shapes so migration off
+    an already-partially-modernised page still equates cleanly."""
+    from ingest_wikimedia.legacy_artwork import _extract_institution_qid
+
+    assert _extract_institution_qid("Q59661041") == "Q59661041"
+    assert _extract_institution_qid("{{Institution|wikidata=Q59661041}}") == "Q59661041"
+    # Case-insensitive on the template name + key.
+    assert _extract_institution_qid("{{institution|Wikidata=Q123}}") == "Q123"
+    # Whitespace-tolerant.
+    assert _extract_institution_qid("  {{ Institution | wikidata = Q123 }} ") == "Q123"
+    # Non-matching shapes return None (so the caller can fall through
+    # to the byte-equality / casefold branches without wrongly claiming
+    # a Q-ID equivalence).
+    assert _extract_institution_qid("") is None
+    assert _extract_institution_qid("Not a Q-ID") is None
+    assert _extract_institution_qid("Q") is None  # no digits
+    assert _extract_institution_qid("Q59661041x") is None  # trailing junk

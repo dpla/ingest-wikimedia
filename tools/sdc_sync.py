@@ -3285,16 +3285,21 @@ def _statement_comparable_value(stmt):
             except (KeyError, TypeError):
                 return None
         if dtype == "string":
-            return (
-                ("string", casefold_for_compare(v), None)
-                if isinstance(v, str)
-                else None
-            )
+            if not isinstance(v, str):
+                return None
+            folded = casefold_for_compare(v)
+            # A punctuation-only string folds to the empty key; treating
+            # two such claims as equal would silently dedup distinct
+            # malformed values (e.g. ``"..."`` and ``"---"``). Skip.
+            return ("string", folded, None) if folded else None
         if dtype == "monolingualtext" and isinstance(v, dict):
             text = v.get("text")
             if not isinstance(text, str):
                 return None
-            return ("monolingual", casefold_for_compare(text), v.get("language"))
+            folded = casefold_for_compare(text)
+            if not folded:
+                return None
+            return ("monolingual", folded, v.get("language"))
         if dtype == "wikibase-entityid" and isinstance(v, dict):
             return ("item", v.get("id"), None)
         return None
@@ -3332,8 +3337,10 @@ def _statement_comparable_value(stmt):
             # Literal-string fallback — only matches another P1932
             # qualifier whose stated-as text folds to the same
             # comparator key (casefold + trim leading/trailing
-            # punctuation + collapse whitespace).
-            return ("p1932-string", casefold_for_compare(s), None)
+            # punctuation + collapse whitespace). Empty-folded values
+            # skip so two punctuation-only strings can't dedup.
+            folded = casefold_for_compare(s)
+            return ("p1932-string", folded, None) if folded else None
         return None
 
     return None

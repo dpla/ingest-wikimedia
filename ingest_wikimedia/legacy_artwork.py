@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Iterable
 from urllib.parse import urlencode
@@ -366,6 +367,39 @@ _CASEFOLD_COMPARE_KEYS = frozenset(
 )
 
 
+# Matches a bare ``{{Institution|wikidata=Q...}}`` sub-template value.
+# Case-insensitive on the template name and param key so hand-typed
+# variants (``institution`` / ``Institution``, ``Wikidata`` / ``wikidata``)
+# both parse cleanly to the inner Q-ID.
+_INSTITUTION_SUBTEMPLATE_RE = re.compile(
+    r"^\s*\{\{\s*Institution\s*\|\s*wikidata\s*=\s*(Q\d+)\s*\}\}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_institution_qid(value: str) -> str | None:
+    """Return the inner Q-ID from a wikitext ``institution`` param
+    value, or ``None`` if the value isn't a bare Q-ID or an
+    ``{{Institution|wikidata=Q...}}`` sub-template.
+
+    The legacy ``{{Artwork}}`` shape wraps the Q-ID in a sub-template
+    (``| Institution = {{Institution|wikidata=Q59661041}}``); the flat
+    ``{{DPLA metadata}}`` shape stores it as a bare Q-ID (``| institution
+    = Q59661041``). This helper normalises both so the migration
+    planner's equivalence check works regardless of which shape the
+    legacy wikitext carried.
+    """
+    if not value:
+        return None
+    stripped = value.strip()
+    m = _INSTITUTION_SUBTEMPLATE_RE.match(stripped)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"Q\d+", stripped):
+        return stripped
+    return None
+
+
 def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
     """Return True when ``value`` (from wikitext) and ``canonical`` (from
     DPLA) are the same fact for the purpose of migration-planning.
@@ -379,14 +413,27 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
     semantic date-equivalence check runs first — an override like
     ``19 November 1902`` collapses cleanly against ``1902-11-19``.
 
-    Keys outside the display-string set (opaque identifiers,
-    sub-template shapes) fall back to strict equality: a case change in
-    an identifier is a genuinely different value.
+    For ``institution`` the wikitext value may be a bare Q-ID (flat
+    ``{{DPLA metadata}}`` shape) or the legacy sub-template
+    ``{{Institution|wikidata=Q...}}`` shape; both extract to a plain
+    Q-ID that is byte-compared to the canonical DPLA institution Q-ID.
+    This closes the case where a legacy NARA file's ``Institution``
+    sub-template holds the (custodial-unit) Q-ID that DPLA now emits as
+    ``institution`` in canonical params, but where a wrap difference
+    prevents plain equality from firing.
+
+    Keys outside those sets (other sub-template shapes) fall back to
+    strict equality.
     """
     if value == canonical:
         return True
     if key == "date" and dates_semantically_equal(value, canonical):
         return True
+    if key == "institution":
+        wiki_qid = _extract_institution_qid(value)
+        canon_qid = _extract_institution_qid(canonical) or canonical.strip()
+        if wiki_qid and wiki_qid == canon_qid:
+            return True
     if key in _CASEFOLD_COMPARE_KEYS:
         folded_value = casefold_for_compare(value)
         folded_canonical = casefold_for_compare(canonical)
@@ -398,15 +445,16 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
 def _canonical_value_for_key(canonical_params: dict, key: str) -> str:
     """Pull the comparable canonical value for a key.
 
-    title/description/date/permission/creator are all scalar strings in
-    ``dpla_metadata_params``'s output — creator included (it comes from
-    ``extract_strings``, not an ``{{InFi|Creator|...}}`` sub-template dict).
-    Source, institution, etc. are sub-template valued and not handled in
-    Phase 3a's scalar mapping — return empty so the equality check
-    classifies them as "different" and they fall through to community-import
-    or dpla-originated based on provenance only.
+    title/description/date/permission/creator/institution are all scalar
+    strings in ``dpla_metadata_params``'s output — institution is a bare
+    Q-ID (``data_provider_wiki_q``), the rest come from
+    ``extract_strings``.  Other sub-template-valued keys (``source``,
+    etc.) are not handled in Phase 3a's scalar mapping — return empty
+    so the equality check classifies them as "different" and they fall
+    through to community-import or dpla-originated based on provenance
+    only.
     """
-    if key in ("title", "description", "date", "permission", "creator"):
+    if key in ("title", "description", "date", "permission", "creator", "institution"):
         return str(canonical_params.get(key, ""))
     return ""
 
