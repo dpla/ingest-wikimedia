@@ -745,3 +745,41 @@ def test_normalize_strips_description_with_case_and_trailing_punctuation():
     wikitext = "{{DPLA metadata\n| description = SOME DESCRIPTION TEXT\n}}\n"
     _, stripped = normalize(wikitext, expected)
     assert "description" in stripped
+
+
+def test_normalize_preserves_non_language_template_override():
+    """Regression guard (CR flagged on PR #351): a non-language template
+    like ``{{Cite|A description}}`` folds to ``cite|a description`` under
+    ``casefold_for_compare`` (leading/trailing braces are punctuation
+    the trim removes). Without a template-shape guard in the casefold
+    fallback, that folded key can accidentally match a bare canonical
+    scalar and strip the editor's citation template as if redundant.
+
+    The strip must NOT fire — an editor's citation is deliberate
+    structure, distinct from the plain-text value DPLA would supply."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["description"] = ["A description"]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| description = {{Cite|A description}}\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "description" not in stripped, (
+        f"expected non-language template {{Cite|...}} to be preserved; "
+        f"stripped={stripped}. Regression: the casefold fallback is "
+        f"accepting template-wrapped values whose stripped inner text "
+        f"folds to the canonical scalar."
+    )
+
+
+def test_normalize_preserves_multi_template_override():
+    """Related: a wikitext value carrying multiple templates (e.g.
+    ``{{en|foo}}{{ja|bar}}``) is complex editor structure. Only the
+    single-language-wrapper unwrap path is allowed; anything else
+    returns False before the casefold fallback runs."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["title"] = ["Two languages"]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "{{DPLA metadata\n| title = {{en|Two languages}}{{ja|Some other text}}\n}}\n"
+    )
+    _, stripped = normalize(wikitext, expected)
+    assert "title" not in stripped

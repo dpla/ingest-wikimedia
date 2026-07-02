@@ -163,14 +163,29 @@ def _value_matches(
         if _template_name(tpl) == _LANGSWITCH_NAME:
             return False
         lang = _language_wrapper_code(tpl)
-        if lang is not None and lang in languages:
-            inner = str(tpl.get(1).value)
-            if _canonical_value(inner) == _canonical_value(expected):
-                return True
-            # Fall through to the tolerance-widening checks below on the
-            # unwrapped inner value — a bracketed / trailing-period /
-            # cased variant inside ``{{en|…}}`` still deserves to dedup.
-            wikitext_value = inner
+        if lang is None or lang not in languages:
+            # Any non-language-wrapper template ({{Cite|…}},
+            # {{Institution|…}}, {{PD-USGov}}, {{Cc-zero}}, an arbitrary
+            # citation) is deliberate editor structure. Falling through
+            # to the casefold widening would let ``casefold_for_compare``
+            # strip the leading/trailing braces and compare the residue
+            # against a bare canonical scalar — a false-match risk on
+            # display-string keys and a semantic-loss risk on structural
+            # keys. Exit here so template-wrapped values only ever match
+            # via exact string equality above.
+            return False
+        inner = str(tpl.get(1).value)
+        if _canonical_value(inner) == _canonical_value(expected):
+            return True
+        # Fall through to the tolerance-widening checks below on the
+        # unwrapped inner value — a bracketed / trailing-period / cased
+        # variant inside ``{{en|…}}`` still deserves to dedup.
+        wikitext_value = inner
+    elif templates:
+        # Multiple templates (or nested-template soup) is by definition
+        # editor-added structure. Same reasoning as the single non-lang
+        # case above; skip the tolerance widening.
+        return False
 
     if param_name == "date" and dates_semantically_equal(
         _canonical_value(wikitext_value), _canonical_value(expected)
