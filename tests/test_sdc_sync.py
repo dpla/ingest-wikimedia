@@ -1012,6 +1012,83 @@ def test_submit_sdc_write_runtime_error_message_names_the_action(monkeypatch):
     assert "permissiondenied" in msg
 
 
+def test_submit_sdc_write_recovers_from_csrf_error_and_retries(monkeypatch):
+    """The Toledo 2026-06-25 failure mode: pywikibot's ``TokenWallet``
+    raises ``KeyError("Invalid token 'csrf'")`` when the session goes
+    stale. Before this fix, every subsequent SDC write in the run
+    silently bucketed as "SDC sync failed; skipping ordinal" — 68,411
+    times over 5.5 days. Now the first CSRF error triggers a session
+    refresh (logout + login + tokens.clear) and the write is retried
+    against the fresh session; only the failure of that recovery, or
+    exhaustion of the run-scoped cap, aborts the run.
+    """
+    from ingest_wikimedia import csrf
+    from tools import sdc_sync
+
+    # Reset shared counter so this test doesn't pick up recoveries from
+    # earlier tests.
+    csrf._session_recoveries_used = 0
+
+    fake_site = _install_module_globals(monkeypatch, sdc_sync)
+    # The realistic failure point is the ``site.tokens["csrf"]`` lookup
+    # itself (pywikibot's ``TokenWallet.__getitem__`` raises the
+    # KeyError, not the API round-trip). Model that: on first read
+    # raise, on the retry (after ``.clear()`` + implicit refetch)
+    # succeed. ``fake_site.tokens`` from the helper is a plain dict —
+    # replace it with a MagicMock so we can drive the side_effect
+    # AND leave ``.clear()`` a no-op the recovery helper can still
+    # call without erasing the dict for the retry.
+    fake_site.tokens = MagicMock()
+    fake_site.tokens.__getitem__.side_effect = [
+        KeyError("Invalid token 'csrf' for user 'DPLA bot' on commons:commons wiki."),
+        "stub-csrf-token",
+    ]
+    request_mock = fake_site.simple_request.return_value
+
+    sdc_sync._submit_sdc_write(
+        "wbeditentity", "M12345", "abcdef01abcdef01abcdef01abcdef01", data="{}"
+    )
+
+    assert request_mock.submit.call_count == 1, (
+        "second try succeeds — first attempt failed before .submit() ran"
+    )
+    assert fake_site.tokens.__getitem__.call_count == 2, (
+        "helper must re-fetch site.tokens['csrf'] after refresh"
+    )
+    fake_site.logout.assert_called_once()
+    fake_site.login.assert_called_once()
+    fake_site.tokens.clear.assert_called_once()
+    assert csrf.session_recoveries_used() == 1
+    csrf._session_recoveries_used = 0
+
+
+def test_submit_sdc_write_aborts_when_csrf_cap_exhausted(monkeypatch):
+    """After :data:`MAX_CSRF_RECOVERIES` refreshes fail to unstick the
+    token, the helper raises :class:`CsrfRecoveryFailed` — a
+    non-``KeyError`` type — so the caller's ``except CsrfRecoveryFailed``
+    arm can propagate the abort past the per-item ``except Exception``
+    catch, killing the whole run rather than looping the same
+    unrecoverable auth error against every remaining ordinal.
+    """
+    from ingest_wikimedia import csrf
+    from tools import sdc_sync
+
+    # Prime the counter to the cap so the next CSRF error is fatal.
+    csrf._session_recoveries_used = csrf.MAX_CSRF_RECOVERIES
+
+    fake_site = _install_module_globals(monkeypatch, sdc_sync)
+    fake_site.simple_request.return_value.submit.side_effect = KeyError(
+        "Invalid token 'csrf' for user 'DPLA bot' on commons:commons wiki."
+    )
+
+    with pytest.raises(csrf.CsrfRecoveryFailed):
+        sdc_sync._submit_sdc_write(
+            "wbeditentity", "M12345", "abcdef01abcdef01abcdef01abcdef01", data="{}"
+        )
+    fake_site.logout.assert_not_called()
+    csrf._session_recoveries_used = 0
+
+
 def test_missing_entity_error_is_not_a_runtime_error():
     """The per-ordinal handler distinguishes ``_MissingEntityError`` from
     generic ``RuntimeError`` / ``Exception``. Keep the class hierarchy
@@ -2282,7 +2359,9 @@ def test_reconciler_removes_value_typed_claim_when_dpla_dropped_the_date(monkeyp
     from tools import sdc_sync
 
     # New sdc.json has NO P571 claim at all.
-    expected = sdc_sync._build_expected_from_sdc({"claims": [], "ingest_date": "2026-06-23"})
+    expected = sdc_sync._build_expected_from_sdc(
+        {"claims": [], "ingest_date": "2026-06-23"}
+    )
     assert expected == {}
 
     stale_live = _value_typed_p571_claim(
@@ -2968,7 +3047,10 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing
         ),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=None
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_number=None,
         )
     assert submit_calls == []
     # No writes happened → no terminal invalidate.
@@ -3010,7 +3092,10 @@ def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none()
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=None
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_number=None,
         )
 
     assert sdc_sync.qualifier_removals == [("M999$p760id", "obsolete-hash")]
@@ -3564,7 +3649,9 @@ def test_process_one_from_sdc_clears_entity_cache_at_file_boundary(monkeypatch):
 
     _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, "M999")
 
-    sdc_sync.process_one_from_sdc("M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"})
+    sdc_sync.process_one_from_sdc(
+        "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}
+    )
 
     # Prior files' entities are gone. The current mediaid may or may not
     # be in the cache afterward (post-write cleanup invalidates it), but
@@ -3588,7 +3675,9 @@ def test_entity_cache_does_not_grow_across_many_files(monkeypatch):
     for i in range(100):
         mediaid = f"M{1000 + i}"
         _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, mediaid)
-        sdc_sync.process_one_from_sdc(mediaid, f"dpla{i:06d}", {"claims": [], "ingest_date": "2026-06-23"})
+        sdc_sync.process_one_from_sdc(
+            mediaid, f"dpla{i:06d}", {"claims": [], "ingest_date": "2026-06-23"}
+        )
         sizes.append(len(sdc_sync._entity_cache))
 
     # Pre-fix, sizes would be [1, 2, 3, ..., 100] (linear growth).
@@ -5604,7 +5693,9 @@ def test_maintain_process_file_renames_before_sync():
         patch.object(sdc_sync, "_s3_partner", "digitalnc"),
         patch.object(sdc_sync, "_maintain_rename", return_value=renamed) as mock_rename,
         patch.object(
-            sdc_sync, "_maintain_sidecar_payload", return_value={"claims": [], "ingest_date": "2026-06-23"}
+            sdc_sync,
+            "_maintain_sidecar_payload",
+            return_value={"claims": [], "ingest_date": "2026-06-23"},
         ),
         patch.object(
             sdc_sync.wikimedia,

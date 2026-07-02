@@ -3,6 +3,7 @@ import logging
 import pywikibot
 from pywikibot.site import BaseSite
 
+from ingest_wikimedia.csrf import CsrfRecoveryFailed, with_csrf_recovery
 from ingest_wikimedia.wikimedia import get_wikidata_site
 
 # Stable Wikimedia ontology constants — these items will not change
@@ -247,7 +248,13 @@ class CategoryEnsurer:
             ],
         }
 
-        new_item.editEntity(data, summary="Create new Wikimedia Commons category item.")
+        with_csrf_recovery(
+            self._repo,
+            f"editEntity new-category ({institution_name})",
+            lambda: new_item.editEntity(
+                data, summary="Create new Wikimedia Commons category item."
+            ),
+        )
         return new_item.getID()
 
     def _add_p8464_to_institution(
@@ -277,9 +284,13 @@ class CategoryEnsurer:
                 f"none match expected {category_qid}"
             )
 
-        institution_item.addClaim(
-            self._item_claim("P8464", category_qid),
-            summary="Add Commons content partnership category.",
+        with_csrf_recovery(
+            self._repo,
+            f"addClaim P8464 to {institution_qid}",
+            lambda: institution_item.addClaim(
+                self._item_claim("P8464", category_qid),
+                summary="Add Commons content partnership category.",
+            ),
         )
 
 
@@ -315,8 +326,13 @@ def touch_institution_files(
         if log_each:
             logging.info(f"  Touching: {page.title()}")
         try:
-            page.touch()
+            with_csrf_recovery(commons_site, f"touch {page.title()}", page.touch)
             count += 1
+        except CsrfRecoveryFailed:
+            # Session-level fatal — propagate past the per-page catch
+            # so the caller can abort the run rather than logging one
+            # warning per remaining file.
+            raise
         except Exception as e:
             logging.warning(f"Failed to touch '{page.title()}'", exc_info=e)
     return count

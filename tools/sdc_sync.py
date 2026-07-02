@@ -26,6 +26,7 @@ from ingest_wikimedia.sdc import (
 )
 from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
 from ingest_wikimedia.common import get_dict, get_list
+from ingest_wikimedia.csrf import CsrfRecoveryFailed, with_csrf_recovery
 from ingest_wikimedia.dpla import DC_TITLE_FIELD_NAME, SOURCE_RESOURCE_FIELD_NAME
 from ingest_wikimedia.maintain import resolve_current_dpla_id
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
@@ -2330,11 +2331,24 @@ def _submit_sdc_write(action, mediaid, dpla_id, **params):
     - structured ``APIError(code=..., info=...)`` instead of JSON
       response inspection.
 
+    Wraps the call in :func:`with_csrf_recovery` so a stale
+    ``TokenWallet`` (``KeyError: Invalid token 'csrf'``) triggers a
+    session refresh (``logout`` + ``login`` + ``tokens.clear``) and
+    a retry rather than bubbling up as "SDC sync failed; skipping
+    ordinal" for every subsequent write in the run. See PR #350 for
+    the analogous uploader fix and the Toledo Lucas 2026-06-25
+    incident that surfaced the same weakness here (68,411 identical
+    CSRF errors bucketed as per-ordinal skips over ~5.5 days).
+
     Raises :class:`_MissingEntityError` when Commons returns
     ``no-such-entity`` (the entity doesn't exist; not the SDC phase's
     problem — see PR #267). Other ``APIError`` codes propagate as a
     ``RuntimeError`` carrying the code + info, which the per-ordinal
     handler catches and treats as an ``SDC_ORDINALS_SKIPPED_ERROR``.
+    Unrecoverable CSRF failures propagate as
+    :class:`CsrfRecoveryFailed` — routed AROUND the per-ordinal
+    generic catch so the whole run aborts (mirrors uploader
+    behaviour).
 
     ``params`` is the per-action payload — for wbeditentity, the
     serialized ``data``; for wbremoveclaims, the pipe-joined ``claim``
@@ -2342,20 +2356,24 @@ def _submit_sdc_write(action, mediaid, dpla_id, **params):
     injected here so call sites stay focused on the action-specific
     differences.
     """
-    try:
-        site.simple_request(
-            action=action,
-            id=mediaid,
-            bot=True,
-            token=site.tokens["csrf"],
-            **params,
-        ).submit()
-    except pywikibot.exceptions.APIError as e:
-        _raise_if_missing_entity(e, mediaid)
-        raise RuntimeError(
-            f"{action} failed for {mediaid} ({dpla_id}):"
-            f" {e.code} — {_truncate(getattr(e, 'info', ''))}"
-        ) from e
+
+    def _do_write():
+        try:
+            site.simple_request(
+                action=action,
+                id=mediaid,
+                bot=True,
+                token=site.tokens["csrf"],
+                **params,
+            ).submit()
+        except pywikibot.exceptions.APIError as e:
+            _raise_if_missing_entity(e, mediaid)
+            raise RuntimeError(
+                f"{action} failed for {mediaid} ({dpla_id}):"
+                f" {e.code} — {_truncate(getattr(e, 'info', ''))}"
+            ) from e
+
+    with_csrf_recovery(site, f"{action} {mediaid} ({dpla_id})", _do_write)
 
 
 def _snak_content_key(snak):
@@ -4966,6 +4984,12 @@ def _worker_partner_task(args):
         # real per-write safety net.
         with _worker_slot_budget.acquire():
             _process_one_partner_item(s3, partner, dpla_id, idx, total)
+    except CsrfRecoveryFailed:
+        # Session-level fatal — propagate to _run_partner_mode_parallel's
+        # future-collection loop so main() ends the run rather than
+        # every worker looping the same auth failure. Mirrors uploader's
+        # CSRF abort contract (PR #350).
+        raise
     except Exception:
         logging.exception(
             "Worker task crashed processing %s (idx %s/%s) in partner %s",
@@ -5307,6 +5331,13 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
             )
             tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
             continue
+        except CsrfRecoveryFailed:
+            # Session-level fatal — propagate past the per-ordinal
+            # catch so the whole run aborts rather than looping the
+            # same unrecoverable auth error against every remaining
+            # ordinal. Mirrors the uploader's CSRF abort contract
+            # (PR #350) and the Toledo 2026-06-25 lesson.
+            raise
         except Exception:
             logging.exception(
                 f" -- Ordinal {ord_str} ({mediaid}) for {dpla_id}:"
@@ -5331,8 +5362,18 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
             pages_edited.add(ord_str)
             if title and title != "?":
                 try:
-                    pywikibot.FilePage(site, title).touch()
+                    with_csrf_recovery(
+                        site,
+                        f"touch File:{title}",
+                        pywikibot.FilePage(site, title).touch,
+                    )
                     logging.info(f" -- Touched '{title}' (category refresh).")
+                except CsrfRecoveryFailed:
+                    # Session refresh exhausted — same abort contract as
+                    # the uploader: propagate past every per-item catch so
+                    # main() ends the run rather than looping the same
+                    # unrecoverable error against every remaining ordinal.
+                    raise
                 except Exception as e:
                     logging.warning(
                         f" -- Failed to touch '{title}' for category refresh: {e!r}"
@@ -5683,6 +5724,11 @@ def _safe_process_one(
             )
             tracker.increment(Result.SDC_ORDINALS_SKIPPED_MISSING_ENTITY)
             return
+        except CsrfRecoveryFailed:
+            # Session-level fatal — abort the whole run rather than
+            # looping the same unrecoverable auth error against every
+            # remaining file. Mirrors uploader's CSRF abort (PR #350).
+            raise
         except Exception:
             logging.exception(
                 f" -- {mediaid} for {dpla_id}: SDC sync failed; skipping."

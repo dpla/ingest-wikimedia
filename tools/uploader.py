@@ -71,6 +71,12 @@ from ingest_wikimedia.worker_slots import (
     WorkerSlotBudget,
 )
 from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
+from ingest_wikimedia.csrf import (
+    CsrfRecoveryFailed,
+    MAX_CSRF_RECOVERIES,
+    is_csrf_token_error,
+    recover_commons_session,
+)
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
@@ -264,30 +270,6 @@ class NewFilePageBlocked(RuntimeError):
     """
 
 
-class CsrfRecoveryFailed(RuntimeError):
-    """Raised when the pywikibot session's CSRF token cannot be recovered.
-
-    Routed AROUND the per-ordinal generic FAILED-counter catch so a
-    session-level fatal aborts the run instead of looping the same
-    error against every remaining item.
-    """
-
-
-# Session-scoped ceiling on CSRF recoveries per run; exceeding it raises
-# ``CsrfRecoveryFailed``. This is the hard guardrail against unbounded
-# looping on a persistently invalid session.
-MAX_CSRF_RECOVERIES = 3
-
-_CSRF_TOKEN_ERROR_MARKER = "Invalid token 'csrf'"
-
-
-def _is_csrf_token_error(ex: BaseException) -> bool:
-    """True if ``ex`` is the pywikibot ``KeyError`` from ``TokenWallet``
-    whose message signals an invalidated CSRF token — narrowed on the
-    marker so unrelated ``KeyError``s don't trigger session recovery."""
-    return isinstance(ex, KeyError) and _CSRF_TOKEN_ERROR_MARKER in str(ex)
-
-
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 
@@ -308,21 +290,6 @@ def _canonicalize_commons_title(title: str) -> str:
     need every one of them to be a safety net.
     """
     return _WHITESPACE_RUN_RE.sub(" ", title).strip()
-
-
-def _recover_commons_session(site) -> None:
-    """Drop the current pywikibot session, re-authenticate, and clear
-    the cached TokenWallet so the next ``site.tokens['csrf']`` refetches.
-
-    ``site.logout()`` is required first: ``site.login()`` on an
-    already-"logged-in" site is a no-op in pywikibot's default flow, so
-    clearing tokens alone would just re-fetch against the same bad
-    session.
-    """
-    logging.info("Recovering Commons session: logout + login + token-wallet clear")
-    site.logout()
-    site.login()
-    site.tokens.clear()
 
 
 class Uploader:
@@ -972,7 +939,7 @@ class Uploader:
                             break
                         except Exception as ex:
                             is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
-                            is_csrf_error = _is_csrf_token_error(ex)
+                            is_csrf_error = is_csrf_token_error(ex)
                             if is_csrf_error:
                                 # Session was invalidated — every subsequent
                                 # upload will hit the same KeyError until
@@ -998,7 +965,7 @@ class Uploader:
                                     MAX_CSRF_RECOVERIES,
                                 )
                                 try:
-                                    _recover_commons_session(self.site)
+                                    recover_commons_session(self.site)
                                 except Exception as recover_ex:
                                     raise CsrfRecoveryFailed(
                                         f"Commons session recovery threw"
