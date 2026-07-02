@@ -46,6 +46,76 @@ def test_is_csrf_token_error_rejects_unrelated_keyerror():
     assert not csrf.is_csrf_token_error(KeyError("some_dict_key"))
 
 
+def test_is_csrf_token_error_matches_apierror_badtoken():
+    """The wire-level twin of the wallet KeyError: pywikibot's
+    ``APIError`` with ``code='badtoken'`` reaches us when the server
+    rejected our submitted token AND pywikibot's own internal relogin
+    couldn't recover it. Duck-typed on ``.code`` so the detector
+    doesn't need to import pywikibot."""
+
+    class FakeAPIError(Exception):
+        def __init__(self, code, info=""):
+            super().__init__(f"{code}: {info}")
+            self.code = code
+            self.info = info
+
+    assert csrf.is_csrf_token_error(FakeAPIError("badtoken", "Invalid CSRF token."))
+    # Not a badtoken error — any other pywikibot APIError code follows
+    # the caller's existing per-item skip path.
+    assert not csrf.is_csrf_token_error(FakeAPIError("ratelimited", "Slow down."))
+    assert not csrf.is_csrf_token_error(FakeAPIError("no-such-entity", "Missing."))
+
+
+def test_is_csrf_token_error_walks_cause_chain():
+    """``_submit_sdc_write`` wraps a pywikibot ``APIError(badtoken)``
+    in a ``RuntimeError(...) from e`` — without walking ``__cause__``
+    the detector would miss it and the CSRF write would fall through
+    to the caller's generic skip path, defeating the recovery
+    contract."""
+
+    class FakeAPIError(Exception):
+        def __init__(self, code):
+            super().__init__(code)
+            self.code = code
+
+    try:
+        try:
+            raise FakeAPIError("badtoken")
+        except Exception as inner:
+            raise RuntimeError("wbeditentity failed for M123: badtoken") from inner
+    except RuntimeError as outer:
+        assert csrf.is_csrf_token_error(outer)
+
+
+def test_is_csrf_token_error_walks_cause_chain_for_wallet_keyerror():
+    """Same chain-walking contract for the wallet-side ``KeyError``:
+    any caller that wraps the underlying token failure in another
+    exception must still route through recovery."""
+
+    try:
+        try:
+            raise KeyError(
+                "Invalid token 'csrf' for user 'DPLA bot' on commons:commons wiki."
+            )
+        except Exception as inner:
+            raise RuntimeError("outer wrapper") from inner
+    except RuntimeError as outer:
+        assert csrf.is_csrf_token_error(outer)
+
+
+def test_is_csrf_token_error_terminates_on_circular_cause_chain():
+    """Cycle-guard: a maliciously (or accidentally) circular
+    ``__cause__`` chain must not spin forever. Realistically
+    ``__cause__`` chains built via ``raise ... from ex`` never cycle,
+    but defense-in-depth keeps the detector total."""
+    a = RuntimeError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    # Doesn't hang; returns False because neither exception matches.
+    assert not csrf.is_csrf_token_error(a)
+
+
 def test_is_csrf_token_error_rejects_non_keyerror_with_matching_message():
     """A RuntimeError whose message happens to contain the marker must
     NOT trigger recovery — pywikibot only ever raises this as a

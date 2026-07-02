@@ -60,11 +60,41 @@ CSRF_TOKEN_ERROR_MARKER = "Invalid token 'csrf'"
 
 
 def is_csrf_token_error(ex: BaseException) -> bool:
-    """True iff ``ex`` is the pywikibot ``KeyError`` from ``TokenWallet``
-    whose message signals an invalidated CSRF token — narrowed on the
-    marker so unrelated ``KeyError``\\s don't trigger session recovery.
+    """True iff ``ex`` (or any exception in its ``__cause__`` chain)
+    signals an invalidated CSRF token. Recognises two shapes:
+
+    1. Pywikibot's ``TokenWallet.__getitem__`` raises ``KeyError`` with
+       the :data:`CSRF_TOKEN_ERROR_MARKER` message — the wallet
+       couldn't produce a valid csrf token BEFORE we ever hit the wire
+       (session invalidated / wallet miss). This is the Toledo
+       2026-06-25 fingerprint.
+    2. Pywikibot's ``simple_request(...).submit()`` propagates an
+       ``APIError`` with ``code='badtoken'`` when the server rejected
+       our submitted token AND pywikibot's own internal relogin
+       didn't recover it — the wire-level twin of #1.
+
+    Walks ``__cause__`` because callers commonly wrap the underlying
+    pywikibot exception in a domain-specific ``RuntimeError`` (see
+    :func:`tools.sdc_sync._submit_sdc_write`), which would otherwise
+    hide the CSRF signal from :func:`with_csrf_recovery`.
     """
-    return isinstance(ex, KeyError) and CSRF_TOKEN_ERROR_MARKER in str(ex)
+    seen: set[int] = set()
+    cur: BaseException | None = ex
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, KeyError) and CSRF_TOKEN_ERROR_MARKER in str(cur):
+            return True
+        # Duck-typed on ``.code`` to avoid pulling pywikibot into this
+        # module's imports (test paths import this without pywikibot
+        # installed). ``APIError`` is the only exception in the write
+        # path that exposes ``.code``, so a false positive here
+        # requires a foreign exception class deliberately shadowing
+        # both ``.code`` and the string value ``'badtoken'`` — not a
+        # realistic collision.
+        if getattr(cur, "code", None) == "badtoken":
+            return True
+        cur = getattr(cur, "__cause__", None)
+    return False
 
 
 def recover_commons_session(site) -> None:
