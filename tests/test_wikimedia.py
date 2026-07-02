@@ -59,6 +59,79 @@ def test_get_page_title():
     assert title == expected_title
 
 
+def test_get_page_title_trims_trailing_whitespace_after_truncation():
+    """Regression: a DPLA-supplied title longer than 181 chars whose 181st
+    character lands on whitespace must NOT leave that whitespace in the
+    constructed Commons title. Commons normalises whitespace runs at
+    store time, so the raw Python-side title (with trailing space) and
+    the actual Commons-stored title (without) will not compare equal
+    under the process_file identity check — that check drives every
+    downstream skip-if-already-there / hash-drift / duplicate-tag
+    branch, so a mismatch produces phantom Case-2 drift.
+
+    Concrete repro: DPLA ID 95bd6bee5aed3c5311a67d5f6cee490b
+    (NARA / FDR Library) has a 264-char source title. Truncated to 181
+    chars, the last character is a space right after "...value of farm ".
+    Pre-fix that space survived into the constructed page title,
+    breaking equality with the Commons file at "...value of farm - DPLA
+    - <id>.gif" and hanging the entire upload session in the phantom
+    duplicate-tag drain.
+    """
+    # NB: single-string literal — Python's implicit-concat would elide
+    # the spaces at the line breaks and change ``[181]``'s character.
+    source_title = "Planning for an adequate home grown food supply brought to this New York woman, as to hundred thousands like her throughout the country, a realization of the economic value of farm produced food and fuel, and a keener appreciation of the advantages of farm living."
+    # Sanity check the repro: ``[:181]``'s last character must be
+    # whitespace so the fix's trailing-strip is what causes this test's
+    # assertion to hold. Python slicing is end-exclusive — ``s[:181]``
+    # covers indices 0..180, so we probe ``s[180]``.
+    assert len(source_title) > 181
+    assert source_title[:181].endswith(" "), (
+        f"Test premise broken: source_title[:181] ends with "
+        f"{source_title[:181][-3:]!r} — needs to end in whitespace for "
+        f"this to be a truncation-lands-on-space repro."
+    )
+    title = get_page_title(source_title, "95bd6bee5aed3c5311a67d5f6cee490b", ".gif")
+    assert " - DPLA -" in title
+    assert "  - DPLA -" not in title, (
+        f"expected no double-space before ` - DPLA -`; got {title!r}. "
+        f"If this asserts, the `item_title[:181]` truncation left a "
+        f"trailing space that leaks into the assembled title."
+    )
+    # Also pin the exact expected shape so a future refactor can't
+    # silently drop the fix.
+    assert title == (
+        "Planning for an adequate home grown food supply brought to this "
+        "New York woman, as to hundred thousands like her throughout the "
+        "country, a realization of the economic value of farm - DPLA - "
+        "95bd6bee5aed3c5311a67d5f6cee490b.gif"
+    )
+
+
+def test_get_page_title_preserves_short_title_trailing_whitespace_absent():
+    """Trailing-whitespace strip only applies at the truncation boundary
+    — a short title with no trailing whitespace must be identical to
+    pre-fix output. Sanity check that the rstrip doesn't inadvertently
+    alter titles that don't hit the 181-char cap."""
+    title = get_page_title("Sample Title", "abcd1234", ".jpg")
+    assert title == "Sample Title - DPLA - abcd1234.jpg"
+
+
+def test_get_page_title_trims_multiple_trailing_whitespace_chars():
+    """If DPLA's source title happens to have multiple whitespace chars
+    at the 181-char boundary (e.g. a tab plus a space), the rstrip
+    removes all of them, not just one — matching MediaWiki's ``.trim()``
+    of leading/trailing whitespace on stored titles."""
+    # Construct a 200-char title whose chars 180-183 are various
+    # whitespace, so ``[:181]`` yields a chunk ending in `[<chars>\t `.
+    prefix = "A" * 180
+    source_title = prefix + "\t   more text after"
+    title = get_page_title(source_title, "deadbeef" * 4, ".jpg")
+    # No whitespace immediately before the ` - DPLA -` separator.
+    assert title.startswith(prefix + " - DPLA -"), (
+        f"expected trailing whitespace runs to be stripped; got {title!r}"
+    )
+
+
 def test_get_page_title_preserves_ampersand_when_no_equals():
     """Regression: titles containing `&` alone (no `=`) must NOT be rewritten.
 

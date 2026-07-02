@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import os
 import random
+import re
 import time
 
 import click
@@ -231,6 +232,28 @@ def _is_csrf_token_error(ex: BaseException) -> bool:
     whose message signals an invalidated CSRF token — narrowed on the
     marker so unrelated ``KeyError``s don't trigger session recovery."""
     return isinstance(ex, KeyError) and _CSRF_TOKEN_ERROR_MARKER in str(ex)
+
+
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+
+def _canonicalize_commons_title(title: str) -> str:
+    """Return ``title`` under a light MediaWiki-title normalisation:
+    strip leading/trailing whitespace and collapse internal whitespace
+    runs to a single space.
+
+    Used by ``_tag_drift_duplicate``'s self-tag defense — a raw Python
+    string comparison of "the old title" vs "the new title" can miss
+    a match when the two names disagree only in whitespace-run form
+    (the exact shape ``get_page_title``'s ``[:181]`` truncation-lands-
+    on-whitespace bug used to produce). This helper mirrors just enough
+    of MediaWiki's title normalisation to catch that class of case
+    without pulling in the broader normalisation surface (Unicode NFC,
+    underscore ↔ space, namespace-first-letter capitalisation, etc.);
+    those live on the API side and the defense-in-depth guard doesn't
+    need every one of them to be a safety net.
+    """
+    return _WHITESPACE_RUN_RE.sub(" ", title).strip()
 
 
 def _recover_commons_session(site) -> None:
@@ -573,6 +596,25 @@ class Uploader:
                             # by MediaWiki across moves so we can stamp it here.
                             return {
                                 "status": ORDINAL_UPLOADED,
+                                "title": page_title,
+                                "pageid": existing_file.pageid,
+                            }
+                        elif drift_action == "already_correct":
+                            # ``_resolve_hash_drift`` caught a phantom drift —
+                            # the file the SHA1-lookup returned IS the file
+                            # at the intended title, once pywikibot's title
+                            # normalisation collapsed the raw
+                            # ``page_title`` difference. Treat the same as
+                            # the line-468 identity check that ``process_file``
+                            # attempted before we called ``_resolve_hash_drift``.
+                            logging.info(
+                                f"Skipping {dpla_id} {ordinal}: "
+                                f"Already exists on commons (normalized "
+                                f"identity)."
+                            )
+                            self.tracker.increment(Result.SKIPPED)
+                            return {
+                                "status": ORDINAL_SKIPPED,
                                 "title": page_title,
                                 "pageid": existing_file.pageid,
                             }
@@ -1171,15 +1213,50 @@ class Uploader:
         already lives on Commons at a different title than intended.
 
         Returns one of:
-          "moved"          — Case 1/3: file moved to correct title; caller should
-                             increment UPLOADED and return (no upload needed).
-          "upload_and_tag" — Case 2: correct title has a different file; caller
-                             should upload (ignore_warnings=True) then tag the
-                             orphaned old title as a duplicate.
-          "upload_only"    — Cross-item hash collision with a still-valid DPLA ID;
-                             upload to the correct title but leave the other file alone.
+          "moved"           — Case 1/3: file moved to correct title; caller should
+                              increment UPLOADED and return (no upload needed).
+          "upload_and_tag"  — Case 2: correct title has a different file; caller
+                              should upload (ignore_warnings=True) then tag the
+                              orphaned old title as a duplicate.
+          "upload_only"     — Cross-item hash collision with a still-valid DPLA ID;
+                              upload to the correct title but leave the other file alone.
+          "already_correct" — No drift after normalisation: the file the SHA1
+                              lookup returned IS the file at the intended title.
+                              Caller should record SKIPPED and return.
         """
         actual_filename = existing_file.title(with_ns=False)
+
+        # Defense-in-depth: if pywikibot's normalized title for the file
+        # that carries this SHA1 equals the intended title we're about
+        # to upload to, there is no drift to resolve — MediaWiki
+        # collapsed whatever difference our raw ``page_title`` had
+        # (typically a whitespace-run artefact from title truncation,
+        # see ``get_page_title``) and the file we found IS the file at
+        # the canonical title. Return early rather than fall through to
+        # Case 1/2/3, all of which are destructive in this state:
+        # Case 3 would attempt a move-to-self; Case 1/2 would attempt an
+        # upload + tag-as-duplicate against the same page (in practice
+        # Commons rejects the upload with ``fileexists-no-change``, so
+        # the tag path was never reached — but the ordinal was recorded
+        # as FAILED instead of SKIPPED, inflating counters across 7,550
+        # DPLA items in past runs).
+        #
+        # The upstream ``process_file`` identity check
+        # (``existing_file.title(with_ns=False) == page_title``) SHOULD
+        # catch this earlier, but that comparison is a raw Python
+        # equality on the constructed vs. pywikibot-normalized strings —
+        # any character MediaWiki normalises that our constructor
+        # doesn't (or vice versa) leaks through. This guard closes the
+        # remaining gap without depending on the constructor's
+        # correctness for every future normalisation change on either
+        # side.
+        if actual_filename == page_title:
+            logging.info(
+                f"Hash drift for {dpla_id} {ordinal}: "
+                f"[[File:{actual_filename}]] IS the intended title after "
+                f"pywikibot normalisation; nothing to resolve."
+            )
+            return "already_correct"
 
         # --- Hash collision safety check ---
         # Cross-item collision: the file at the wrong title was uploaded for a
@@ -1363,7 +1440,32 @@ class Uploader:
         file's revision history still contains the community
         contributions even if the rescue's save fails, so manual
         recovery from page history is always possible.
+
+        Defense-in-depth self-tag guard: if ``old_filename`` and
+        ``new_filename`` resolve to the same Commons page (after
+        whitespace-run normalisation), refuse to tag. Tagging a file as
+        a duplicate of itself would flag it for admin deletion — the
+        destructive outcome the caller's Case 2 detection can slip
+        into if the two names disagree only in whitespace-run form.
+        Commons's ``fileexists-no-change`` check has historically
+        rejected the preceding upload attempt (so ``_tag_drift_duplicate``
+        wasn't reached in practice — see PR authoring for the log
+        audit), but the audit cannot cover future changes to Commons's
+        server-side behaviour, so we belt-and-suspender here.
         """
+        if _canonicalize_commons_title(old_filename) == _canonicalize_commons_title(
+            new_filename
+        ):
+            logging.warning(
+                f"Refusing to tag [[File:{old_filename}]] as duplicate of "
+                f"[[File:{new_filename}]] — the two names resolve to the "
+                f"same Commons page under whitespace normalisation. This "
+                f"is a phantom-drift signal upstream (see "
+                f"``_resolve_hash_drift``'s ``already_correct`` return); "
+                f"no destructive action taken."
+            )
+            return
+
         old_page = get_page(self.site, f"File:{old_filename}")
 
         # Rescue community contributions, if any.

@@ -111,6 +111,19 @@ def get_page_title(
     bypass those checks (see PR #261's audit).
     """
     escaped_title = (
+        # ``rstrip`` after the 181-char truncation: MediaWiki collapses
+        # whitespace runs (and effectively trims whitespace adjacent to
+        # the ``... - DPLA - <id>...`` separator we append below) when
+        # storing file titles, so if the truncation cutoff lands on
+        # whitespace, the constructed title picks up a trailing space
+        # that Commons removes at store time. The Python-side raw-string
+        # identity check in ``process_file`` then thinks the file has
+        # drifted (constructed vs. stored differ by one space), triggers
+        # phantom Case-2 duplicate-tagging, and the item hangs in the
+        # dup-throttle drain. Concrete repro: DPLA ID
+        # 95bd6bee5aed3c5311a67d5f6cee490b (NARA / FDR Library), whose
+        # 264-char source title lands ``:181`` on the space after
+        # ``"...value of farm "``.
         # MediaWiki's `stripIllegalFilenameChars` strips `:` from File-
         # namespace titles unconditionally (filesystem path-separator
         # concern), replacing with `-`.  Apply the same rule here.  An
@@ -124,7 +137,7 @@ def get_page_title(
         # up as orphan duplicates because the uploader treated the
         # colon-form title as the canonical one while Commons stored
         # the dash form.
-        _break_query_string_pattern(item_title[:181])
+        _break_query_string_pattern(item_title[:181].rstrip())
         .replace(":", "-")
         # `/` must also be substituted.  An earlier reading of MediaWiki's
         # rules (PR #223) removed this substitution because
