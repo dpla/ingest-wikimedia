@@ -26,7 +26,11 @@ import re
 
 import mwparserfromhell
 
-from ingest_wikimedia.sdc import casefold_for_compare, dates_semantically_equal
+from ingest_wikimedia.sdc import (
+    CASEFOLD_COMPARE_KEYS,
+    casefold_for_compare,
+    dates_semantically_equal,
+)
 
 # Pattern that identifies the family of Commons single-language wrapper
 # templates ({{en|...}}, {{es|...}}, {{de|...}}, {{pt-br|...}}, …).
@@ -173,7 +177,7 @@ def _value_matches(
     ):
         return True
 
-    if param_name in _CASEFOLD_COMPARE_KEYS:
+    if param_name in CASEFOLD_COMPARE_KEYS:
         folded_wiki = casefold_for_compare(_canonical_value(wikitext_value))
         folded_expected = casefold_for_compare(_canonical_value(expected))
         if folded_wiki and folded_wiki == folded_expected:
@@ -198,20 +202,6 @@ _SCALAR_PARAMS = (
     "url",
     "dpla_id",
     "local_id",
-)
-
-# Scalar keys where a casefold + leading/trailing-punctuation strip
-# fallback is safe (see :func:`_value_matches`). Excludes opaque
-# identifier / URL keys: a case change in a Q-ID, DPLA ID, or URL is a
-# genuinely different value, not a display variant.
-_CASEFOLD_COMPARE_KEYS = frozenset(
-    {
-        "title",
-        "description",
-        "date",
-        "permission",
-        "creator",
-    }
 )
 
 # Legacy param shapes that an older upload (pre-flat-shape) may carry.

@@ -1143,6 +1143,24 @@ _TRAILING_TRIM_RE = re.compile(rf"[{_TRIM_PUNCT_CHARS}]+$")
 _INTERNAL_WS_RE = re.compile(r"\s+")
 
 
+# Canonical-params keys where a casefold + leading/trailing-punctuation
+# strip is a safe equivalence-widening fallback. Excludes opaque
+# identifier / URL / hub keys: a case change in a Q-ID, DPLA ID, URL, or
+# hub identifier is a genuinely different value, not a display variant.
+# Imported by both :mod:`ingest_wikimedia.legacy_artwork` (pre-write
+# migration equivalence) and :mod:`ingest_wikimedia.wikitext_normalize`
+# (post-write template-arg strip) so the allowlist can't drift.
+CASEFOLD_COMPARE_KEYS: frozenset[str] = frozenset(
+    {
+        "title",
+        "description",
+        "date",
+        "permission",
+        "creator",
+    }
+)
+
+
 def casefold_for_compare(s: str) -> str:
     """Fold ``s`` to a comparable form for equivalence checks against
     another display string. Strips leading/trailing whitespace and

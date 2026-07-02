@@ -36,6 +36,7 @@ from urllib.parse import urlencode
 import mwparserfromhell
 
 from ingest_wikimedia.sdc import (
+    CASEFOLD_COMPARE_KEYS,
     casefold_for_compare,
     dates_semantically_equal,
     parse_date_range,
@@ -356,17 +357,6 @@ def plan_migration(
     )
 
 
-_CASEFOLD_COMPARE_KEYS = frozenset(
-    {
-        "title",
-        "description",
-        "date",
-        "permission",
-        "creator",
-    }
-)
-
-
 # Matches a bare ``{{Institution|wikidata=Q...}}`` sub-template value.
 # Case-insensitive on the template name and param key so hand-typed
 # variants (``institution`` / ``Institution``, ``Wikidata`` / ``wikidata``)
@@ -434,7 +424,7 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
         canon_qid = _extract_institution_qid(canonical) or canonical.strip()
         if wiki_qid and wiki_qid == canon_qid:
             return True
-    if key in _CASEFOLD_COMPARE_KEYS:
+    if key in CASEFOLD_COMPARE_KEYS:
         folded_value = casefold_for_compare(value)
         folded_canonical = casefold_for_compare(canonical)
         if folded_value and folded_value == folded_canonical:
