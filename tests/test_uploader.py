@@ -2335,23 +2335,36 @@ def test_canonicalize_commons_title_collapses_whitespace_runs():
     assert _canonicalize_commons_title("Foo Bar") == "Foo Bar"
 
 
-def test_resolve_hash_drift_returns_already_correct_on_exact_title_match():
+def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_match():
     """Regression: when the SHA1-lookup returns the file already at the
-    intended title, ``_resolve_hash_drift`` must NOT fall through to
-    Case 2 (which would try to upload same-hash bytes and tag the file
-    as duplicate of itself). Return the new ``already_correct`` sentinel
-    so the caller records SKIPPED.
+    intended title (after whitespace normalisation), ``_resolve_hash_drift``
+    must NOT fall through to Case 2 (which would try to upload same-hash
+    bytes and tag the file as duplicate of itself). Return the new
+    ``already_correct`` sentinel so the caller records SKIPPED.
+
+    Uses a raw ``page_title`` with a double-space run (the exact shape
+    the pre-fix ``get_page_title`` truncation-lands-on-whitespace bug
+    used to produce) against a pywikibot-normalized ``existing_file``
+    title with the single-space form. Byte equality is false; the
+    canonicalized-equality guard is what catches this case. If the
+    guard regresses to raw equality (which would coincide with the
+    line-468 identity check ``process_file`` already runs before
+    calling here), this test fails.
     """
     uploader = _build_uploader_with_dpla()
-    same_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.gif"
+    commons_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.gif"
+    raw_page_title = "Item  - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.gif"  # 2 spaces
+    assert commons_title != raw_page_title, (
+        "test premise: titles must differ byte-wise so byte-equality won't fire"
+    )
     intended_page = MagicMock()
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
-    intended_page.title.return_value = same_title
+    intended_page.title.return_value = commons_title
     with patch("tools.uploader.get_page", return_value=intended_page):
         action = uploader._resolve_hash_drift(
-            existing_file=_drift_existing_file(same_title),
-            page_title=same_title,
+            existing_file=_drift_existing_file(commons_title),
+            page_title=raw_page_title,
             dpla_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             ordinal=1,
             wiki_markup="",

@@ -117,14 +117,20 @@ def test_get_page_title_preserves_short_title_trailing_whitespace_absent():
 
 
 def test_get_page_title_trims_multiple_trailing_whitespace_chars():
-    """If DPLA's source title happens to have multiple whitespace chars
-    at the 181-char boundary (e.g. a tab plus a space), the rstrip
-    removes all of them, not just one — matching MediaWiki's ``.trim()``
-    of leading/trailing whitespace on stored titles."""
-    # Construct a 200-char title whose chars 180-183 are various
-    # whitespace, so ``[:181]`` yields a chunk ending in `[<chars>\t `.
-    prefix = "A" * 180
-    source_title = prefix + "\t   more text after"
+    """If the 181-char truncation lands inside a run of multiple
+    whitespace characters, ``rstrip`` removes all of them, not just
+    one — matching MediaWiki's ``.trim()`` on stored titles.
+
+    Sizing: ``[:181]`` covers indices 0..180. Prefix is 178 A's, then
+    ``\\t  `` at indices 178, 179, 180 — so the truncated chunk ends
+    with three whitespace chars (tab + two spaces) that all need to
+    strip cleanly.
+    """
+    prefix = "A" * 178
+    source_title = prefix + "\t  more text after"
+    assert source_title[:181] == prefix + "\t  ", (
+        "test premise: truncation covers tab + 2 spaces"
+    )
     title = get_page_title(source_title, "deadbeef" * 4, ".jpg")
     # No whitespace immediately before the ` - DPLA -` separator.
     assert title.startswith(prefix + " - DPLA -"), (

@@ -607,6 +607,14 @@ class Uploader:
                             # ``page_title`` difference. Treat the same as
                             # the line-468 identity check that ``process_file``
                             # attempted before we called ``_resolve_hash_drift``.
+                            # Persist the pywikibot-normalized title, not the
+                            # raw constructed ``page_title`` — downstream
+                            # sidecars / SDC-sync key on the Commons-stored
+                            # form, so returning the raw double-space form
+                            # here would break the very equality checks
+                            # elsewhere in the pipeline this branch exists
+                            # to accommodate.
+                            canonical_title = existing_file.title(with_ns=False)
                             logging.info(
                                 f"Skipping {dpla_id} {ordinal}: "
                                 f"Already exists on commons (normalized "
@@ -615,7 +623,7 @@ class Uploader:
                             self.tracker.increment(Result.SKIPPED)
                             return {
                                 "status": ORDINAL_SKIPPED,
-                                "title": page_title,
+                                "title": canonical_title,
                                 "pageid": existing_file.pageid,
                             }
                         elif drift_action == "upload_and_tag":
@@ -1250,7 +1258,9 @@ class Uploader:
         # remaining gap without depending on the constructor's
         # correctness for every future normalisation change on either
         # side.
-        if actual_filename == page_title:
+        if _canonicalize_commons_title(actual_filename) == _canonicalize_commons_title(
+            page_title
+        ):
             logging.info(
                 f"Hash drift for {dpla_id} {ordinal}: "
                 f"[[File:{actual_filename}]] IS the intended title after "
