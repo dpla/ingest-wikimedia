@@ -26,6 +26,12 @@ import re
 
 import mwparserfromhell
 
+from ingest_wikimedia.sdc import (
+    CASEFOLD_COMPARE_KEYS,
+    casefold_for_compare,
+    dates_semantically_equal,
+)
+
 # Pattern that identifies the family of Commons single-language wrapper
 # templates ({{en|...}}, {{es|...}}, {{de|...}}, {{pt-br|...}}, …).
 # Used solely to *recognise* a wrapper so we can decide whether stripping
@@ -95,7 +101,11 @@ def _canonical_value(value: str) -> str:
 
 
 def _value_matches(
-    wikitext_value: str, expected: str, languages: frozenset[str] | set[str]
+    wikitext_value: str,
+    expected: str,
+    languages: frozenset[str] | set[str],
+    *,
+    param_name: str | None = None,
 ) -> bool:
     """Compare a wikitext value to its canonical-DPLA expectation.
 
@@ -117,6 +127,23 @@ def _value_matches(
     text byte-matches the canonical English (the ``es`` tag is editor-
     contributed translation metadata, not a redundant wrapper).
 
+    Two tolerance widenings run AFTER the byte-exact and language-
+    wrapper paths fail:
+
+      * For ``param_name == "date"`` the two values are compared via
+        :func:`ingest_wikimedia.sdc.dates_semantically_equal` — so an
+        override like ``| date = 19 November 1902`` collapses cleanly
+        against a canonical ``1902-11-19``.
+      * For every scalar key, a casefold-and-trim comparator
+        (:func:`ingest_wikimedia.sdc.casefold_for_compare`) folds both
+        sides through the same normaliser used by the SDC dedup
+        comparator, so a description differing only by a trailing
+        period, wrapping brackets, or an editor's case change strips
+        cleanly. Codepoint identifiers (``hub``, ``institution``,
+        ``dpla_id``, ``url``, ``local_id``) are excluded from the
+        casefold path — those are opaque tokens where a case change
+        genuinely represents a different value.
+
     Other template-wrapped values (``{{LangSwitch|...}}``, an Information
     sub-template, a citation) are conservatively a mismatch — they
     represent deliberate editor structure that the strip must preserve.
@@ -136,9 +163,40 @@ def _value_matches(
         if _template_name(tpl) == _LANGSWITCH_NAME:
             return False
         lang = _language_wrapper_code(tpl)
-        if lang is not None and lang in languages:
-            inner = str(tpl.get(1).value)
-            return _canonical_value(inner) == _canonical_value(expected)
+        if lang is None or lang not in languages:
+            # Any non-language-wrapper template ({{Cite|…}},
+            # {{Institution|…}}, {{PD-USGov}}, {{Cc-zero}}, an arbitrary
+            # citation) is deliberate editor structure. Falling through
+            # to the casefold widening would let ``casefold_for_compare``
+            # strip the leading/trailing braces and compare the residue
+            # against a bare canonical scalar — a false-match risk on
+            # display-string keys and a semantic-loss risk on structural
+            # keys. Exit here so template-wrapped values only ever match
+            # via exact string equality above.
+            return False
+        inner = str(tpl.get(1).value)
+        if _canonical_value(inner) == _canonical_value(expected):
+            return True
+        # Fall through to the tolerance-widening checks below on the
+        # unwrapped inner value — a bracketed / trailing-period / cased
+        # variant inside ``{{en|…}}`` still deserves to dedup.
+        wikitext_value = inner
+    elif templates:
+        # Multiple templates (or nested-template soup) is by definition
+        # editor-added structure. Same reasoning as the single non-lang
+        # case above; skip the tolerance widening.
+        return False
+
+    if param_name == "date" and dates_semantically_equal(
+        _canonical_value(wikitext_value), _canonical_value(expected)
+    ):
+        return True
+
+    if param_name in CASEFOLD_COMPARE_KEYS:
+        folded_wiki = casefold_for_compare(_canonical_value(wikitext_value))
+        folded_expected = casefold_for_compare(_canonical_value(expected))
+        if folded_wiki and folded_wiki == folded_expected:
+            return True
 
     return False
 
@@ -260,7 +318,9 @@ def normalize(wikitext: str, expected_params: dict) -> tuple[str, list[str]]:
         param = _find_param(template, param_name)
         if param is None:
             continue
-        if _value_matches(str(param.value), expected_value, languages):
+        if _value_matches(
+            str(param.value), expected_value, languages, param_name=param_name
+        ):
             template.remove(param, keep_field=False)
             stripped.append(param_name)
 

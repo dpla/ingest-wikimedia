@@ -613,3 +613,209 @@ def test_canonicalize_returns_input_unchanged_when_no_dpla_metadata_template():
     job upstream."""
     untouched = "Just some prose.\n{{Artwork|title=Foo}}\n[[Category:Foo]]"
     assert canonicalize(untouched) == untouched
+
+
+# ---------------------------------------------------------------------------
+# Tolerance widenings on `_value_matches` (this PR).
+# * `date` key gets semantic-equivalence via parse_dpla_date.
+# * display-string keys get casefold + leading/trailing-punctuation
+#   trim as a byte-equality fallback.
+# Identifier keys (hub, dpla_id, url, local_id, institution) do NOT
+# get the casefold path — a case change there is a distinct value.
+# ---------------------------------------------------------------------------
+
+
+def _item_with_date(display_date: str, dpla_id: str = "abc") -> dict:
+    return {
+        "rights": "http://creativecommons.org/publicdomain/zero/1.0/",
+        "isShownAt": "https://example.org/item/123",
+        "sourceResource": {
+            "creator": ["A Creator"],
+            "title": ["A Title"],
+            "description": ["A description"],
+            "date": [{"displayDate": display_date}],
+            "identifier": [dpla_id],
+        },
+    }
+
+
+def test_normalize_strips_semantically_equal_date_override():
+    """M105419621 repro: canonical ``1902-11-19`` DPLA-supplied date;
+    editor added ``| date = 19 November 1902`` inside ``{{DPLA
+    metadata}}``. The two parse to the same time+precision, so the
+    override strips cleanly. Extends the existing byte-equality strip
+    contract."""
+    item = _item_with_date("1902-11-19")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "== {{int:filedesc}} ==\n\n"
+        "{{DPLA metadata\n| hub = Q72380652\n| date = 19 November 1902\n}}\n"
+    )
+    normalized, stripped = normalize(wikitext, expected)
+    assert "date" in stripped, (
+        f"expected `date` override to strip; stripped={stripped}. "
+        f"If missing, either parse_dpla_date doesn't recognise "
+        f"`19 November 1902` or _value_matches skipped the semantic-"
+        f"equivalence path."
+    )
+    assert "19 November 1902" not in normalized
+
+
+def test_normalize_preserves_date_override_that_disagrees_semantically():
+    """A community edit that changes the date to a different year is
+    real information — must NOT strip even under the widened
+    tolerance. Semantic equivalence is strict about precision+time."""
+    item = _item_with_date("1902-11-19")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| hub = Q72380652\n| date = 15 November 1903\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "date" not in stripped
+
+
+def test_normalize_strips_description_with_trailing_period():
+    """M114630785 shape: canonical description ends with a period;
+    editor's copy in wikitext drops the trailing period. Casefold-
+    with-punctuation-trim strips the override cleanly."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["description"] = [
+        "A.D. Abbott, Hancock N.H. L.M. Stearns Collection."
+    ]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "{{DPLA metadata\n"
+        "| description = A.D. Abbott, Hancock N.H. L.M. Stearns Collection\n"
+        "}}\n"
+    )
+    _, stripped = normalize(wikitext, expected)
+    assert "description" in stripped
+
+
+def test_normalize_strips_title_with_wrapping_brackets():
+    """M100761231 shape: canonical title is bracketed (supplied-title
+    convention); editor's copy drops the brackets. Casefold-with-
+    punctuation-trim on both sides folds to the same key and the
+    override strips."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["title"] = ["[Promissory note for Thomas Love]"]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| title = Promissory note for Thomas Love\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "title" in stripped
+
+
+def test_normalize_strips_title_that_only_differs_in_case():
+    """Casefold widening: an editor who retyped the title in
+    all-uppercase still gets stripped."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["title"] = ["An Old Map"]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| title = AN OLD MAP\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "title" in stripped
+
+
+def test_normalize_preserves_url_with_case_change():
+    """Identifier keys (url / dpla_id / hub / institution / local_id)
+    are opaque tokens — case differences are real. The tolerance
+    widening deliberately excludes them so an editor's URL variant
+    survives instead of being silently overwritten."""
+    item = _item_with_date("1902", dpla_id="abcdef1234567890")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    original_url = expected.get("url", "https://example.org/item/123")
+    variant = original_url.upper()  # case flip
+    if variant == original_url:
+        # Some URL forms are already all-lower; guarantee a case delta.
+        variant = original_url + "/EXTRA"
+    wikitext = f"{{{{DPLA metadata\n| url = {variant}\n}}}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "url" not in stripped, (
+        f"URL is an identifier — case change must NOT strip; got "
+        f"stripped={stripped}. If this asserts, the casefold widening "
+        f"was accidentally applied to opaque tokens."
+    )
+
+
+def test_normalize_strips_description_with_case_and_trailing_punctuation():
+    """Combined tolerance: an editor's copy of the description in
+    different case AND missing the trailing period folds to the same
+    normaliser key and strips."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["description"] = ["Some Description Text."]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| description = SOME DESCRIPTION TEXT\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "description" in stripped
+
+
+def test_normalize_preserves_non_language_template_override():
+    """Regression guard (CR flagged on PR #351): a non-language template
+    like ``{{Cite|A description}}`` folds to ``cite|a description`` under
+    ``casefold_for_compare`` (leading/trailing braces are punctuation
+    the trim removes). Without a template-shape guard in the casefold
+    fallback, that folded key can accidentally match a bare canonical
+    scalar and strip the editor's citation template as if redundant.
+
+    The strip must NOT fire — an editor's citation is deliberate
+    structure, distinct from the plain-text value DPLA would supply."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["description"] = ["A description"]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| description = {{Cite|A description}}\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "description" not in stripped, (
+        f"expected non-language template {{Cite|...}} to be preserved; "
+        f"stripped={stripped}. Regression: the casefold fallback is "
+        f"accepting template-wrapped values whose stripped inner text "
+        f"folds to the canonical scalar."
+    )
+
+
+def test_normalize_preserves_multi_template_override():
+    """Related: a wikitext value carrying multiple templates (e.g.
+    ``{{en|foo}}{{ja|bar}}``) is complex editor structure. Only the
+    single-language-wrapper unwrap path is allowed; anything else
+    returns False before the casefold fallback runs."""
+    item = _item_with_date("1902")
+    item["sourceResource"]["title"] = ["Two languages"]
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = (
+        "{{DPLA metadata\n| title = {{en|Two languages}}{{ja|Some other text}}\n}}\n"
+    )
+    _, stripped = normalize(wikitext, expected)
+    assert "title" not in stripped
+
+
+def test_normalize_preserves_bracketed_date_override():
+    """Regression guard (CR flagged on PR #351): a wikitext
+    ``| date = [1902]`` override carries archival "supplied/uncertain
+    date" semantics that ``_strip_date_decorators`` maps to the
+    approximate flag. ``dates_semantically_equal([1902], 1902)`` is
+    False on that flag difference. The strip MUST NOT fire.
+
+    Pre-fix: ``casefold_for_compare("[1902]")`` == ``"1902"`` because
+    the trim strips the wrapping brackets, and ``date`` was in
+    ``CASEFOLD_COMPARE_KEYS``, so the strip fired even though the
+    dates aren't semantically equal.
+    """
+    item = _item_with_date("1902")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| date = [1902]\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "date" not in stripped, (
+        f"expected `[1902]` (archival supplied-date convention) to "
+        f"survive the strip; stripped={stripped}. If this asserts, the "
+        f"casefold path is bypassing the approximate-flag check."
+    )
+
+
+def test_normalize_preserves_question_marked_date_override():
+    """Same as the bracket case for ``1902?`` — ``?`` is one of the
+    approximate/uncertain decorators ``_strip_date_decorators``
+    strips. Casefold ALSO strips it (trailing punctuation), so a
+    ``| date = 1902?`` override folds to ``1902`` and would spuriously
+    match canonical ``1902`` under a naive casefold pass."""
+    item = _item_with_date("1902")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| date = 1902?\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "date" not in stripped
