@@ -622,8 +622,9 @@ def main(
 
     if sdc_skipped:
         print(
-            f"Skipped sdc.json for {sdc_skipped} items "
-            "(unparseable provider/institution).",
+            f"Skipped sdc.json for {sdc_skipped} items"
+            " (missing/malformed dpla-map.json, unmappable source, or"
+            " missing/invalid ingestDate).",
             file=sys.stderr,
         )
     if sdc_failed[0]:

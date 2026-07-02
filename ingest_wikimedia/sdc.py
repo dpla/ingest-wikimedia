@@ -1666,13 +1666,15 @@ def build_claims_for_doc(
     rights: dict,
     subject_ids: dict,
     subjects_lookup: dict[tuple[str, str], str] | None,
-) -> dict[str, list[dict]] | None:
+) -> dict[str, Any] | None:
     """Build the complete ready-to-POST SDC claim list for a DPLA item.
 
-    Returns ``{"claims": [...]}`` matching the wbsetclaims POST shape.
-    Returns ``None`` when the doc can't be parsed (e.g. provider /
-    dataProvider not in the hubs map) — callers should skip the item
-    and not stage an sdc.json for it.
+    Returns ``{"claims": [...], "ingest_date": "YYYY-MM-DD"}`` matching
+    the wbsetclaims POST shape (the extra ``ingest_date`` envelope field
+    is read back by ``sdc-sync`` to pin its per-file P813 refresh — see
+    the module docstring). Returns ``None`` when the doc can't be
+    parsed (e.g. provider / dataProvider not in the hubs map) — callers
+    should skip the item and not stage an sdc.json for it.
 
     ``subjects_lookup`` is the pre-resolved reconciliation table; pass
     ``None`` for inline-only behavior (the parallel P921 statements for
