@@ -1721,3 +1721,33 @@ def test_plan_migration_extract_institution_qid_handles_flat_bare_qid():
     assert _extract_institution_qid("Not a Q-ID") is None
     assert _extract_institution_qid("Q") is None  # no digits
     assert _extract_institution_qid("Q59661041x") is None  # trailing junk
+
+
+def test_plan_migration_preserves_bracketed_date_override():
+    """Regression guard (CR flagged on PR #351): a community editor's
+    ``date = [1902]`` (archival supplied-date convention) carries an
+    approximate-flag semantic distinct from the bare canonical ``1902``.
+    Must be preserved as a community import, not classified as
+    dpla-originated on a casefold false-match.
+    """
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|date=1902}}"),
+        (2, "Editor1", "{{Artwork|date=[1902]}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="1902"))
+    assert plan is not None
+    assert plan.community_imports == {"date": "[1902]"}, (
+        f"expected `[1902]` to be preserved as a community import; "
+        f"got community_imports={plan.community_imports}"
+    )
+
+
+def test_plan_migration_preserves_question_marked_date_override():
+    """Same shape as above but with the ``1902?`` uncertain-marker."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|date=1902}}"),
+        (2, "Editor1", "{{Artwork|date=1902?}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="1902"))
+    assert plan is not None
+    assert plan.community_imports == {"date": "1902?"}

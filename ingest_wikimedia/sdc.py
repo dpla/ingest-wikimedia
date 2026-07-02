@@ -1147,6 +1147,17 @@ _INTERNAL_WS_RE = re.compile(r"\s+")
 # strip is a safe equivalence-widening fallback. Excludes opaque
 # identifier / URL / hub keys: a case change in a Q-ID, DPLA ID, URL, or
 # hub identifier is a genuinely different value, not a display variant.
+#
+# ``date`` is deliberately EXCLUDED. ``casefold_for_compare`` trims ``[``,
+# ``]``, ``(``, ``)``, ``?`` — the same characters ``_strip_date_decorators``
+# treats as approximate/uncertain markers — so ``[1902]``, ``(1902)``, and
+# ``1902?`` would all fold to ``1902`` and spuriously match a bare
+# canonical ``1902``. That would silently strip an archival "supplied/
+# uncertain date" override, losing the uncertainty annotation.
+# :func:`dates_semantically_equal` is the ONLY comparator dates need —
+# it already handles month-name/slash-form format variance AND respects
+# the approximate-flag distinction the decorator markers encode.
+#
 # Imported by both :mod:`ingest_wikimedia.legacy_artwork` (pre-write
 # migration equivalence) and :mod:`ingest_wikimedia.wikitext_normalize`
 # (post-write template-arg strip) so the allowlist can't drift.
@@ -1154,7 +1165,6 @@ CASEFOLD_COMPARE_KEYS: frozenset[str] = frozenset(
     {
         "title",
         "description",
-        "date",
         "permission",
         "creator",
     }
@@ -1246,6 +1256,22 @@ def _strip_date_decorators(s: str) -> tuple[str, bool]:
     return s.strip(), stripped
 
 
+def _day_precision_value(y: int, mo: int, d: int) -> dict | None:
+    """Return a day-precision Wikibase time-datavalue value dict for
+    ``(y, mo, d)``, or ``None`` if the tuple isn't a real Gregorian
+    date. Encapsulates the year-zero guard + ``datetime.date`` calendar
+    check + ``_wikibase_time`` construction shared by every day-
+    precision branch of :func:`parse_dpla_date`.
+    """
+    if y == 0:
+        return None
+    try:
+        datetime.date(y, mo, d)
+    except ValueError:
+        return None
+    return _wikibase_time(f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY)
+
+
 def parse_dpla_date(date_string: str) -> dict | None:
     """Parse a DPLA display-date string into a structured representation,
     or ``None`` when the input is too messy to commit to a Wikibase
@@ -1322,65 +1348,27 @@ def parse_dpla_date(date_string: str) -> dict | None:
 
     m = _ISO_DATE.match(s)
     if m:
-        y, mo, d = int(m[1]), int(m[2]), int(m[3])
-        if y == 0:
-            return None
-        try:
-            datetime.date(y, mo, d)
-        except ValueError:
-            pass
-        else:
-            return _ok(
-                _wikibase_time(f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY)
-            )
+        v = _day_precision_value(int(m[1]), int(m[2]), int(m[3]))
+        if v is not None:
+            return _ok(v)
 
     m = _US_SLASH_DATE.match(s)
     if m:
-        mo, d, y = int(m[1]), int(m[2]), int(m[3])
-        if y != 0:
-            try:
-                datetime.date(y, mo, d)
-            except ValueError:
-                pass
-            else:
-                return _ok(
-                    _wikibase_time(
-                        f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
-                    )
-                )
+        v = _day_precision_value(int(m[3]), int(m[1]), int(m[2]))
+        if v is not None:
+            return _ok(v)
 
     m = _MONTH_DAY_YEAR.match(s)
     if m:
-        mo = _MONTH_NAMES[m[1].casefold()]
-        d, y = int(m[2]), int(m[3])
-        if y != 0:
-            try:
-                datetime.date(y, mo, d)
-            except ValueError:
-                pass
-            else:
-                return _ok(
-                    _wikibase_time(
-                        f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
-                    )
-                )
+        v = _day_precision_value(int(m[3]), _MONTH_NAMES[m[1].casefold()], int(m[2]))
+        if v is not None:
+            return _ok(v)
 
     m = _DAY_MONTH_YEAR.match(s)
     if m:
-        d = int(m[1])
-        mo = _MONTH_NAMES[m[2].casefold()]
-        y = int(m[3])
-        if y != 0:
-            try:
-                datetime.date(y, mo, d)
-            except ValueError:
-                pass
-            else:
-                return _ok(
-                    _wikibase_time(
-                        f"+{y:04d}-{mo:02d}-{d:02d}T00:00:00Z", _PRECISION_DAY
-                    )
-                )
+        v = _day_precision_value(int(m[3]), _MONTH_NAMES[m[2].casefold()], int(m[1]))
+        if v is not None:
+            return _ok(v)
 
     m = _YEAR_MONTH.match(s)
     if m:

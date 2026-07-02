@@ -783,3 +783,39 @@ def test_normalize_preserves_multi_template_override():
     )
     _, stripped = normalize(wikitext, expected)
     assert "title" not in stripped
+
+
+def test_normalize_preserves_bracketed_date_override():
+    """Regression guard (CR flagged on PR #351): a wikitext
+    ``| date = [1902]`` override carries archival "supplied/uncertain
+    date" semantics that ``_strip_date_decorators`` maps to the
+    approximate flag. ``dates_semantically_equal([1902], 1902)`` is
+    False on that flag difference. The strip MUST NOT fire.
+
+    Pre-fix: ``casefold_for_compare("[1902]")`` == ``"1902"`` because
+    the trim strips the wrapping brackets, and ``date`` was in
+    ``CASEFOLD_COMPARE_KEYS``, so the strip fired even though the
+    dates aren't semantically equal.
+    """
+    item = _item_with_date("1902")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| date = [1902]\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "date" not in stripped, (
+        f"expected `[1902]` (archival supplied-date convention) to "
+        f"survive the strip; stripped={stripped}. If this asserts, the "
+        f"casefold path is bypassing the approximate-flag check."
+    )
+
+
+def test_normalize_preserves_question_marked_date_override():
+    """Same as the bracket case for ``1902?`` — ``?`` is one of the
+    approximate/uncertain decorators ``_strip_date_decorators``
+    strips. Casefold ALSO strips it (trailing punctuation), so a
+    ``| date = 1902?`` override folds to ``1902`` and would spuriously
+    match canonical ``1902`` under a naive casefold pass."""
+    item = _item_with_date("1902")
+    expected = dpla_metadata_params("abc", item, _PROVIDER, _DATA_PROVIDER)
+    wikitext = "{{DPLA metadata\n| date = 1902?\n}}\n"
+    _, stripped = normalize(wikitext, expected)
+    assert "date" not in stripped
