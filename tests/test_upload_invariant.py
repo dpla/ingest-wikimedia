@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from tools.uploader import Uploader
+from tools.uploader import DriftResolution, Uploader
 
 
 # --------------------------------------------------------------------------
@@ -93,8 +93,8 @@ def test_invariant_corollary_1_cross_item_collision_uploads_to_our_intended_titl
             wiki_markup="",
         )
 
-    assert action == "leave_others_alone", (
-        f"expected leave_others_alone (invariant corollary 1: our S3 SHA1 "
+    assert action is DriftResolution.LEAVE_OTHERS_ALONE, (
+        f"expected LEAVE_OTHERS_ALONE (invariant corollary 1: our S3 SHA1 "
         f"must land at our intended title, other DPLA ID keeps its file); "
         f"got {action!r}. If this asserts, someone likely added a 'skip "
         f"our upload because SHA1 already exists elsewhere on Commons' "
@@ -159,13 +159,13 @@ def test_invariant_corollary_2_redirect_at_intended_title_defers_to_overwrite_ha
             ordinal=1,
             wiki_markup="",
         )
-    assert action == "leave_others_alone", (
-        f"expected leave_others_alone (cross-item collision detected "
+    assert action is DriftResolution.LEAVE_OTHERS_ALONE, (
+        f"expected LEAVE_OTHERS_ALONE (cross-item collision detected "
         f"before the redirect branch — the other DPLA ID is live, so "
         f"we must not move its file to our title; the caller's "
         f"redirect handler in process_file will overwrite the redirect "
         f"and upload our bytes to our intended title separately); got "
-        f"{action!r}. If ``moved``, the resolver is about to move "
+        f"{action!r}. If ``MOVED``, the resolver is about to move "
         f"another live DPLA item's file to our title — that violates "
         f"the invariant at the OTHER title. See docs/upload-invariant.md "
         f"corollary 1 + the 2026-07-02 Palo Pinto incident."
@@ -205,8 +205,8 @@ def test_invariant_already_satisfied_via_normalized_identity_returns_already_cor
             wiki_markup="",
         )
 
-    assert action == "already_correct", (
-        f"expected already_correct (invariant already satisfied: our "
+    assert action is DriftResolution.ALREADY_CORRECT, (
+        f"expected ALREADY_CORRECT (invariant already satisfied: our "
         f"SHA1 lives at the intended title under whitespace-run "
         f"normalisation); got {action!r}."
     )
@@ -231,8 +231,6 @@ def test_drift_resolution_sentinel_contract_pin():
         string), so a well-typed caller can use enum member
         comparisons without ``==`` falling back to string-equality.
     """
-    from tools.uploader import DriftResolution
-
     uploader = _build_uploader(dpla_get_item_metadata={"id": "other"})
     other_title = "Other - DPLA - dddddddddddddddddddddddddddddddd (page 1).jpg"
     with patch("tools.uploader.get_page"):
