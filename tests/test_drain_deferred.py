@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,22 @@ def stub_setup_logging(monkeypatch):
     monkeypatch.setattr(drain_deferred, "setup_logging", lambda *a, **kw: None)
 
 
+@pytest.fixture
+def lock_fd():
+    """A real (closable) file descriptor for stubbing
+    ``_acquire_host_lock`` — ``main()`` closes the lock fd in its
+    ``finally`` via ``os.close()``, so a MagicMock won't do. The
+    fixture guarantees cleanup itself in case a test bails before
+    ``main()`` gets to close it (suppressing the EBADF from the
+    already-closed happy path)."""
+    fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        yield fd
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def test_empty_sidecar_early_exits_without_starting_the_loop(monkeypatch):
     """The common case: no items deferred. Command must exit without
     acquiring the host lock, without polling the category, and
@@ -55,7 +72,7 @@ def test_empty_sidecar_early_exits_without_starting_the_loop(monkeypatch):
     done_ping.assert_not_called()
 
 
-def test_populated_sidecar_runs_drain_loop_until_empty(monkeypatch):
+def test_populated_sidecar_runs_drain_loop_until_empty(monkeypatch, lock_fd):
     """Non-empty sidecar: acquire host lock, poll category, run
     uploader + sdc-sync subprocesses, and loop until the sidecar is
     empty. The drain itself removes the round's IDs from the sidecar
@@ -64,10 +81,6 @@ def test_populated_sidecar_runs_drain_loop_until_empty(monkeypatch):
     as the real uploader would be when every item completes.
     """
     drain_sidecar.write_sidecar("nara", ["id-1"])
-
-    # main() closes the lock fd in its ``finally`` via os.close(), so
-    # the stub must be a real (closable) file descriptor.
-    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     def fake_wait(*a, **kw):
         return True  # capacity immediately available
@@ -110,16 +123,13 @@ def test_populated_sidecar_runs_drain_loop_until_empty(monkeypatch):
     done_ping.assert_called_once()
 
 
-def test_drain_loop_re_reads_sidecar_between_rounds():
+def test_drain_loop_re_reads_sidecar_between_rounds(lock_fd):
     """If a round processes N items but a later round finds new items
     in the sidecar (e.g., a concurrent uploader session appended
     while we were mid-round), the loop picks them up rather than
     exiting on the pre-round snapshot.
     """
     drain_sidecar.write_sidecar("nara", ["id-1"])
-    # main() closes the lock fd in its ``finally`` via os.close(), so
-    # the stub must be a real (closable) file descriptor.
-    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     throttle = MagicMock()
     throttle.wait_for_capacity.return_value = True
@@ -158,15 +168,12 @@ def test_drain_loop_re_reads_sidecar_between_rounds():
     assert sp.call_count == 4
 
 
-def test_drain_loop_continues_on_no_progress_round():
+def test_drain_loop_continues_on_no_progress_round(lock_fd):
     """A round that made no progress despite reported capacity (e.g.
     category refilled while we were mid-round) is not fatal — the
     loop continues waiting rather than aborting.
     """
     drain_sidecar.write_sidecar("nara", ["id-1"])
-    # main() closes the lock fd in its ``finally`` via os.close(), so
-    # the stub must be a real (closable) file descriptor.
-    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     throttle = MagicMock()
     throttle.wait_for_capacity.return_value = True
@@ -203,7 +210,7 @@ def test_drain_loop_continues_on_no_progress_round():
     assert call_state["round"] == 2
 
 
-def test_drain_removes_round_ids_from_sidecar_before_invoking_uploader():
+def test_drain_removes_round_ids_from_sidecar_before_invoking_uploader(lock_fd):
     """The drain — not the uploader — must clear the round's IDs from
     the sidecar before the subprocess pass. The uploader only ever
     *merges* deferred IDs back in (it never removes completed ones), so
@@ -212,9 +219,6 @@ def test_drain_removes_round_ids_from_sidecar_before_invoking_uploader():
     ordering by observing the sidecar from inside the uploader
     subprocess: the round's IDs must already be gone."""
     drain_sidecar.write_sidecar("nara", ["id-1", "id-2"])
-    # main() closes the lock fd in its ``finally`` via os.close(), so
-    # the stub must be a real (closable) file descriptor.
-    lock_fd = os.open(os.devnull, os.O_RDONLY)
 
     throttle = MagicMock()
     throttle.wait_for_capacity.return_value = True
