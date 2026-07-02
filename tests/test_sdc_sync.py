@@ -1070,7 +1070,8 @@ def test_submit_sdc_write_recovers_from_csrf_error_and_retries(
     fake_site.logout.assert_called_once()
     fake_site.login.assert_called_once()
     fake_site.tokens.clear.assert_called_once()
-    assert csrf.session_recoveries_used() == 1
+    # Consecutive-cap semantics: successful retry resets the counter.
+    assert csrf.session_recoveries_used() == 0
 
 
 def test_submit_sdc_write_aborts_when_csrf_cap_exhausted(

@@ -2151,7 +2151,9 @@ def test_csrf_error_triggers_session_recovery_and_retry():
         f"expected 2. If this is 1, the recovery path returned instead "
         f"of continuing the loop."
     )
-    assert uploader._csrf_recoveries_used == 1
+    from ingest_wikimedia import csrf
+
+    assert csrf.session_recoveries_used() == 1
 
 
 def test_csrf_errors_beyond_cap_raise_csrf_recovery_failed():
@@ -2165,7 +2167,9 @@ def test_csrf_errors_beyond_cap_raise_csrf_recovery_failed():
     # a cleaner test than driving through many attempts (each of which
     # would exhaust MAX_UPLOAD_RETRIES per ordinal) and pins the cap
     # behavior specifically.
-    uploader._csrf_recoveries_used = MAX_CSRF_RECOVERIES
+    from ingest_wikimedia import csrf
+
+    csrf._session_recoveries_used = MAX_CSRF_RECOVERIES
     uploader._safe_upload = MagicMock(side_effect=_csrf_keyerror())
     with patch("tools.uploader.recover_commons_session") as recover_mock:
         with pytest.raises(CsrfRecoveryFailed):

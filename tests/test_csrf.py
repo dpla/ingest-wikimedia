@@ -201,7 +201,10 @@ def test_with_csrf_recovery_refreshes_and_retries_on_csrf_error():
     site.logout.assert_called_once()
     site.login.assert_called_once()
     site.tokens.clear.assert_called_once()
-    assert csrf.session_recoveries_used() == 1
+    # Counter resets to 0 after the successful retry — consecutive-cap
+    # semantics. The recovery HAPPENED (site.logout/login/clear all
+    # asserted above), but a successful thunk zeroes the streak.
+    assert csrf.session_recoveries_used() == 0
 
 
 def test_with_csrf_recovery_raises_when_cap_exhausted():
@@ -253,7 +256,9 @@ def test_with_csrf_recovery_raises_if_recovery_itself_fails():
 def test_with_csrf_recovery_recovers_multiple_times_up_to_cap():
     """Successive CSRF errors, each recoverable on retry, walk the
     counter up to (but not past) the cap. Only the (cap+1)th error
-    raises."""
+    raises. Because the final ``thunk()`` DOES succeed, the counter
+    resets to 0 — consecutive-cap semantics reward the eventual
+    recovery."""
     site = MagicMock()
     seen = {"n": 0}
 
@@ -269,8 +274,72 @@ def test_with_csrf_recovery_recovers_multiple_times_up_to_cap():
 
     out = csrf.with_csrf_recovery(site, "test-action", _thunk)
     assert out == "eventually-ok"
-    assert csrf.session_recoveries_used() == csrf.MAX_CSRF_RECOVERIES
+    # Counter reset after the eventual success — even though we walked
+    # right to the cap, the successful thunk cleared the streak.
+    assert csrf.session_recoveries_used() == 0
+    # ...but recovery WAS invoked ``MAX_CSRF_RECOVERIES`` times to get
+    # us to the successful attempt.
     assert site.logout.call_count == csrf.MAX_CSRF_RECOVERIES
+
+
+def test_with_csrf_recovery_resets_counter_on_successful_thunk():
+    """Consecutive-cap semantics, not lifetime-cap: a successful
+    ``thunk()`` return zeros the counter, so a long-running run that
+    legitimately hits N stale-then-refresh events across its lifetime
+    doesn't trip the cap. Only :data:`MAX_CSRF_RECOVERIES`
+    *consecutive* failed recoveries abort the run."""
+    site = MagicMock()
+    call = {"n": 0}
+
+    def _flaky_thunk():
+        call["n"] += 1
+        if call["n"] == 1:
+            raise KeyError(
+                "Invalid token 'csrf' for user 'DPLA bot' on commons:commons wiki."
+            )
+        return f"ok-{call['n']}"
+
+    # First cycle: 1 recovery, then success. Counter reset.
+    assert csrf.with_csrf_recovery(site, "test-action", _flaky_thunk) == "ok-2"
+    assert csrf.session_recoveries_used() == 0, (
+        "counter must reset after successful thunk — otherwise long-running "
+        "processes exhaust the lifetime budget on legitimate stale sessions"
+    )
+
+    # A subsequent independent failure starts fresh at 1, not 2.
+    call["n"] = 0
+    assert csrf.with_csrf_recovery(site, "test-action", _flaky_thunk) == "ok-2"
+    assert csrf.session_recoveries_used() == 0
+
+
+def test_with_csrf_recovery_counter_persists_across_consecutive_failures():
+    """The reset happens only on SUCCESS. A run of consecutive CSRF
+    failures (no intervening success) walks the counter up to the cap,
+    exactly as before — the persistently-invalid-session guard still
+    works."""
+    site = MagicMock()
+
+    def _always_csrf():
+        raise KeyError(
+            "Invalid token 'csrf' for user 'DPLA bot' on commons:commons wiki."
+        )
+
+    with pytest.raises(csrf.CsrfRecoveryFailed):
+        csrf.with_csrf_recovery(site, "test-action", _always_csrf)
+    # All MAX_CSRF_RECOVERIES slots consumed by the consecutive failures.
+    assert csrf.session_recoveries_used() == csrf.MAX_CSRF_RECOVERIES
+
+
+def test_reset_session_recoveries_zeros_the_counter():
+    """The explicit reset function exists for callers that own their
+    own retry loop (the uploader) — they need to signal a successful
+    write to keep the consecutive-cap semantics consistent across the
+    shared counter."""
+    csrf.bump_session_recovery()
+    csrf.bump_session_recovery()
+    assert csrf.session_recoveries_used() == 2
+    csrf.reset_session_recoveries()
+    assert csrf.session_recoveries_used() == 0
 
 
 def test_csrf_recovery_failed_is_a_runtime_error_subclass():

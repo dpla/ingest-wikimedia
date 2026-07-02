@@ -15,6 +15,7 @@ from pywikibot.tools.chars import replace_invisible
 
 
 from .common import CHECKSUM, get_list, get_str, get_dict
+from .csrf import with_csrf_recovery
 from .s3 import S3_BUCKET, S3Client
 from .dpla import (
     WIKIDATA_FIELD_NAME,
@@ -770,7 +771,13 @@ def post_commonsdelinker_request(
     summary = f"universal replace: [[File:{old_filename}]] → [[File:{new_filename}]]"
     # Leading newline so the new request lands on its own line regardless
     # of whether the existing page ends with one.
-    site.editpage(page, summary=summary, minor=False, appendtext="\n" + template)
+    with_csrf_recovery(
+        site,
+        f"editpage CommonsDelinker request ({old_filename} → {new_filename})",
+        lambda: site.editpage(
+            page, summary=summary, minor=False, appendtext="\n" + template
+        ),
+    )
 
 
 def wiki_file_exists(site: BaseSite, sha1: str) -> bool:
@@ -1035,7 +1042,13 @@ def tag_as_duplicate(
     summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
     # Trailing newline so the tag sits on its own line above whatever
     # wikitext currently starts the page.
-    site.editpage(file_page, summary=summary, minor=False, prependtext=tag + "\n")
+    with_csrf_recovery(
+        site,
+        f"editpage tag-as-duplicate ({file_page.title(with_ns=False)})",
+        lambda: site.editpage(
+            file_page, summary=summary, minor=False, prependtext=tag + "\n"
+        ),
+    )
 
 
 INVALID_CONTENT_TYPES = frozenset(

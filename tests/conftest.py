@@ -91,3 +91,32 @@ def _no_slack_in_tests(monkeypatch: pytest.MonkeyPatch):
             # by a test that manually managed its lifetime).  Swallow so
             # subsequent ``p.stop()`` calls in this loop still run.
             pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_csrf_recovery_counter():
+    """Zero the shared ``ingest_wikimedia.csrf._session_recoveries_used``
+    module counter around every test.
+
+    The counter is process-scoped in production (each pywikibot process
+    is its own run), but the whole test suite runs in ONE process. Any
+    test that mutates it — the direct CSRF tests plus the sdc_sync /
+    uploader tests that prime it to exercise cap behavior — would leak
+    the value into subsequent tests without this reset. Autouse rather
+    than opt-in so a future CSRF test added without the fixture can't
+    silently poison the run's ordering.
+
+    Imports the module lazily so tests that don't touch pywikibot
+    surfaces (e.g. pure-data tests) don't pay the import cost per test.
+    """
+    try:
+        from ingest_wikimedia import csrf as _csrf
+    except ImportError:
+        # csrf module unavailable in this environment — nothing to reset.
+        yield
+        return
+    _csrf._session_recoveries_used = 0
+    try:
+        yield
+    finally:
+        _csrf._session_recoveries_used = 0

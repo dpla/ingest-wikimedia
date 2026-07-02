@@ -139,14 +139,39 @@ def bump_session_recovery() -> int:
 T = TypeVar("T")
 
 
+def reset_session_recoveries() -> None:
+    """Zero the recovery counter — used to signal that a write against
+    the current session succeeded, so the cap should be interpreted as
+    "consecutive failed recoveries" rather than a lifetime budget.
+
+    A 5.5-day partner-mode run can legitimately have the session go
+    stale more than :data:`MAX_CSRF_RECOVERIES` times over its lifetime
+    (Wikimedia session policy + long idle windows). Under a lifetime
+    cap, run N+1 stale-then-refresh events would abort the whole run
+    even though every recovery worked. Consecutive-cap semantics only
+    abort when the session is genuinely un-refreshable — which is what
+    :class:`CsrfRecoveryFailed` is meant to signal."""
+    global _session_recoveries_used
+    _session_recoveries_used = 0
+
+
 def with_csrf_recovery(site, action_label: str, thunk: Callable[[], T]) -> T:
-    """Call ``thunk()``; on CSRF error, refresh the session and retry
-    once. Repeat up to :data:`MAX_CSRF_RECOVERIES` times **across
-    the whole process** (session-scoped cap). Non-CSRF exceptions
-    propagate immediately.
+    """Call ``thunk()``; on CSRF error, refresh the session and retry.
+    Repeat until either ``thunk()`` succeeds or
+    :data:`MAX_CSRF_RECOVERIES` consecutive refreshes still can't
+    unstick the token — at which point :class:`CsrfRecoveryFailed` is
+    raised. Non-CSRF exceptions propagate immediately.
 
     ``action_label`` is a short human-readable tag used only in the
     warning log line (e.g. ``"wbeditentity M12345"``, ``"touch File:X"``).
+
+    **Cap semantics: consecutive, not lifetime.** After every
+    successful ``thunk()`` return the counter is reset to zero, so a
+    long-running process that legitimately experiences a stale session
+    N times over its lifetime — each recovered — never trips the cap.
+    The cap only fires when :data:`MAX_CSRF_RECOVERIES` refreshes in a
+    row fail to produce a working session, which is the genuine
+    "session is un-refreshable, abort the run" signal.
 
     Raises :class:`CsrfRecoveryFailed` when the cap is exhausted or
     when :func:`recover_commons_session` itself throws — callers
@@ -156,13 +181,14 @@ def with_csrf_recovery(site, action_label: str, thunk: Callable[[], T]) -> T:
 
     This helper is for write sites that don't already own a retry loop
     (e.g. ``touch()``, ``editEntity()``, ``save()``). Sites that own
-    their own attempt-counted loop (:mod:`tools.uploader`) should
-    integrate the CSRF branch directly so they can coordinate the
-    per-item retry budget with session-level recovery.
+    their own attempt-counted loop (:mod:`tools.uploader`) integrate
+    the CSRF branch directly and MUST also call
+    :func:`reset_session_recoveries` on successful writes to keep the
+    consecutive-cap semantics consistent across the shared counter.
     """
     while True:
         try:
-            return thunk()
+            result = thunk()
         except Exception as ex:
             if not is_csrf_token_error(ex):
                 raise
@@ -170,7 +196,7 @@ def with_csrf_recovery(site, action_label: str, thunk: Callable[[], T]) -> T:
                 raise CsrfRecoveryFailed(
                     f"Commons session invalidated on {action_label}: CSRF"
                     f" token still invalid after {session_recoveries_used()}"
-                    f" recovery attempts; aborting run."
+                    f" consecutive recovery attempts; aborting run."
                 ) from ex
             logging.warning(
                 "CSRF token invalidated on %s; refreshing Commons session"
@@ -189,3 +215,8 @@ def with_csrf_recovery(site, action_label: str, thunk: Callable[[], T]) -> T:
                 ) from recover_ex
             bump_session_recovery()
             # Loop and retry the thunk against the recovered session.
+            continue
+        # Successful write against the current session — reset the
+        # consecutive-recovery counter. See docstring above.
+        reset_session_recoveries()
+        return result
