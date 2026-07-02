@@ -18,6 +18,7 @@ sidecar is sufficient and unambiguous. Location:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -97,17 +98,28 @@ def write_sidecar(partner: str, dpla_ids: list[str]) -> None:
             seen.add(dpla_id)
             ordered.append(dpla_id)
     payload = {"partner": partner, "deferred_dpla_ids": ordered}
-    with tempfile.NamedTemporaryFile(
-        "w",
-        dir=str(path.parent),
-        prefix=".deferred-drain-",
-        suffix=".tmp",
-        delete=False,
-    ) as tf:
-        json.dump(payload, tf, indent=2)
-        tf.write("\n")
-        tempname = tf.name
-    os.replace(tempname, path)
+    # ``delete=False`` so the file survives the ``with`` for the rename —
+    # which means a failure before ``os.replace`` (e.g. disk full mid-dump)
+    # must clean the orphan up itself, or partner dirs would accumulate
+    # ``.deferred-drain-*.tmp`` litter.
+    tempname: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=str(path.parent),
+            prefix=".deferred-drain-",
+            suffix=".tmp",
+            delete=False,
+        ) as tf:
+            tempname = tf.name
+            json.dump(payload, tf, indent=2)
+            tf.write("\n")
+        os.replace(tempname, path)
+    except Exception:
+        if tempname is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tempname)
+        raise
 
 
 def remove_from_sidecar(partner: str, dpla_ids: list[str]) -> list[str]:

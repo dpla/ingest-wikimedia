@@ -137,6 +137,25 @@ def test_no_stray_tempfiles_after_successful_writes(tmp_path):
     assert drain_sidecar.sidecar_path("nara").exists()
 
 
+def test_failed_write_cleans_up_its_tempfile(tmp_path, monkeypatch):
+    """A write that dies before the atomic rename (e.g. disk full
+    mid-``json.dump``) must remove its own ``.deferred-drain-*.tmp``
+    orphan and leave the previous sidecar contents untouched."""
+    drain_sidecar.write_sidecar("nara", ["keep-me"])
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as m:
+        m.setattr(drain_sidecar.json, "dump", boom)
+        with pytest.raises(OSError, match="disk full"):
+            drain_sidecar.write_sidecar("nara", ["new-id"])
+
+    tempfiles = list((tmp_path / "nara").glob(".deferred-drain-*"))
+    assert tempfiles == [], f"orphaned tempfiles: {tempfiles}"
+    assert drain_sidecar.read_sidecar("nara") == ["keep-me"]
+
+
 def test_read_ignores_non_string_entries():
     """A hand-edited sidecar with garbage in the list still reads
     cleanly — the drain loop should ignore junk rather than crash."""
