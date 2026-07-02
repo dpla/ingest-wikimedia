@@ -927,7 +927,7 @@ def test_resolve_hash_drift_5xx_response_stays_on_leave_others_alone():
     assert action == "leave_others_alone"
 
 
-def test_resolve_hash_drift_valid_cross_item_collision_uploads_only():
+def test_resolve_hash_drift_valid_cross_item_collision_leaves_others_alone():
     """Existing positive case (no regression): when the colliding DPLA
     item IS still valid, the cross-item-collision branch returns
     ``leave_others_alone`` — our hash gets its own title and we leave the

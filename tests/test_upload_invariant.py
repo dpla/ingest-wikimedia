@@ -108,54 +108,67 @@ def test_invariant_corollary_1_cross_item_collision_uploads_to_our_intended_titl
 # --------------------------------------------------------------------------
 
 
-def test_invariant_corollary_2_cross_item_redirect_at_intended_title_gets_overwritten():
+def test_invariant_corollary_2_redirect_at_intended_title_defers_to_overwrite_handler():
     """CORRECTNESS CRITERION being pinned: when our intended title is a
-    ``#REDIRECT`` to another live DPLA ID's file (an editor's stale
-    curatorial judgment about a partner-decided fact), the caller
-    overwrites the redirect and uploads our S3 bytes to our intended
-    title. Corollary 2: the redirect does not bind our invariant
-    obligation. See ``docs/upload-invariant.md``.
+    ``#REDIRECT`` whose target holds our S3 SHA1 but under a
+    DIFFERENT DPLA ID's canonical title (an editor's 2021-era "duplicate
+    of" declaration), ``_resolve_hash_drift`` must NOT return ``moved``
+    (Case 1 title-drift) — that would move the OTHER DPLA ID's file to
+    OUR title, violating the invariant at the other title. Instead the
+    resolver returns ``leave_others_alone``, deferring to
+    ``process_file``'s redirect handler, which overwrites the redirect
+    (corollary 2 of the invariant — the redirect does not bind our
+    obligation) and uploads our bytes to OUR intended title.
 
-    Pinned via ``_resolve_hash_drift``'s deferral to the redirect
-    handler: when the SHA1 lives at a DIFFERENT title than the
-    redirect target (or when the redirect target is a
-    different-DPLA-ID valid file), the resolver returns
-    ``leave_others_alone`` so the caller's redirect handler can
-    overwrite. Contrast: if the redirect target IS the SHA1's home for
-    THIS DPLA ID (Case 1 title-drift), the resolver moves over the
-    redirect instead.
+    This is the exact 2026-07-02 Palo Pinto shape: SHA1 lives at the
+    OTHER DPLA ID's title AND our intended title happens to be a
+    redirect to that same target. The resolver must recognise the
+    cross-item collision FIRST (both are live DPLA IDs, corollary 1)
+    and stop; the redirect handling then runs on the outside in
+    ``process_file``.
 
-    If a future change adds an "if the redirect target has our SHA1,
-    honor the redirect and skip the upload" check, this test fails."""
+    If a future change makes ``_resolve_hash_drift`` return ``moved``
+    when the intended title is a redirect to the SHA1's location
+    (regardless of whether the target's DPLA ID matches ours), this
+    test fails — that change would move another live DPLA item's file
+    to our title, violating that item's invariant."""
     uploader = _build_uploader(dpla_get_item_metadata={"id": "other-item-live"})
     our_intended = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 1).jpg"
     other_dpla_id_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 1).jpg"
 
-    # Our SHA1 lives at the OTHER DPLA ID's title. Our intended title
-    # is a redirect to that same title.
+    # Our SHA1 lives at the OTHER DPLA ID's title.
     existing_file = _make_existing_file(other_dpla_id_title)
+    # Our intended title is a redirect to that same target — the exact
+    # Palo Pinto configuration. Mock the ``get_page(page_title)`` result
+    # (which _resolve_hash_drift calls after the cross-item check) so
+    # if the cross-item early return is ever removed, the redirect
+    # branch's behaviour is at least well-defined during the test.
+    redirect_target = MagicMock()
+    redirect_target.title.return_value = other_dpla_id_title
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = True
+    intended_page.getRedirectTarget.return_value = redirect_target
+    intended_page.title.return_value = our_intended
 
-    action = uploader._resolve_hash_drift(
-        existing_file=existing_file,
-        page_title=our_intended,
-        dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ordinal=1,
-        wiki_markup="",
-    )
-    # The cross-item collision check returns early — the redirect at
-    # our intended title never enters the picture in _resolve_hash_drift.
-    # The caller's own redirect handler (in process_file, tested
-    # separately) is what overwrites the redirect. What we pin here:
-    # the resolver does NOT block the upload by returning some "skip"
-    # value.
+    with patch("tools.uploader.get_page", return_value=intended_page):
+        action = uploader._resolve_hash_drift(
+            existing_file=existing_file,
+            page_title=our_intended,
+            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ordinal=1,
+            wiki_markup="",
+        )
     assert action == "leave_others_alone", (
-        f"expected leave_others_alone (invariant corollary 1+2: our S3 "
-        f"SHA1 must land at our intended title regardless of whether a "
-        f"redirect currently sits there); got {action!r}. If this "
-        f"asserts, someone added a 'honor the pre-existing redirect' "
-        f"check. That is an invariant violation. See "
-        f"docs/upload-invariant.md corollary 2 + the 2026-07-02 Palo "
-        f"Pinto incident."
+        f"expected leave_others_alone (cross-item collision detected "
+        f"before the redirect branch — the other DPLA ID is live, so "
+        f"we must not move its file to our title; the caller's "
+        f"redirect handler in process_file will overwrite the redirect "
+        f"and upload our bytes to our intended title separately); got "
+        f"{action!r}. If ``moved``, the resolver is about to move "
+        f"another live DPLA item's file to our title — that violates "
+        f"the invariant at the OTHER title. See docs/upload-invariant.md "
+        f"corollary 1 + the 2026-07-02 Palo Pinto incident."
     )
 
 
@@ -204,12 +217,22 @@ def test_invariant_already_satisfied_via_normalized_identity_returns_already_cor
 # --------------------------------------------------------------------------
 
 
-def test_leave_others_alone_sentinel_is_the_expected_string_value():
-    """The sentinel string value ``leave_others_alone`` is the contract
-    between ``_resolve_hash_drift`` and its caller. A rename here
-    would silently break the caller's dispatch (which is a plain
-    string comparison). Pin the exact value so a future refactor
-    can't rename it without a test failure."""
+def test_drift_resolution_sentinel_contract_pin():
+    """The four ``DriftResolution`` enum members define the contract
+    between ``_resolve_hash_drift`` and its caller. This test pins:
+
+      * The specific enum member returned for a known input scenario
+        (``LEAVE_OTHERS_ALONE`` for cross-item collision).
+      * That the enum member's ``str`` value has not silently drifted
+        from ``"leave_others_alone"`` — old-style callers or log
+        readers may still assume the plain string form via
+        ``str, Enum`` subclassing.
+      * That the enum member IS a ``DriftResolution`` (not a bare
+        string), so a well-typed caller can use enum member
+        comparisons without ``==`` falling back to string-equality.
+    """
+    from tools.uploader import DriftResolution
+
     uploader = _build_uploader(dpla_get_item_metadata={"id": "other"})
     other_title = "Other - DPLA - dddddddddddddddddddddddddddddddd (page 1).jpg"
     with patch("tools.uploader.get_page"):
@@ -220,7 +243,6 @@ def test_leave_others_alone_sentinel_is_the_expected_string_value():
             ordinal=1,
             wiki_markup="",
         )
-    # If someone renames the sentinel without updating every caller,
-    # they'll get a mismatch here.
-    assert action == "leave_others_alone"
-    assert isinstance(action, str)
+    assert action is DriftResolution.LEAVE_OTHERS_ALONE
+    assert action.value == "leave_others_alone"
+    assert isinstance(action, str)  # ``str, Enum`` subclass preserves string-ness

@@ -40,6 +40,7 @@ import os
 import random
 import re
 import time
+from enum import Enum
 
 import click
 import pywikibot
@@ -150,9 +151,9 @@ def is_dup_sha1_sibling_at_expected_title(
     """Return True iff the existing Commons file is a true sibling at one of
     this item's own expected current titles.
 
-    ``True`` means it's safe to take the upload-only branch — the per-ordinal
-    iteration is preserving that title intentionally and we can upload our
-    own ordinal alongside it.
+    ``True`` means it's safe to take the ``leave_others_alone`` branch —
+    the per-ordinal iteration is preserving that title intentionally and
+    we can upload our own ordinal alongside it.
 
     ``False`` means the existing file is at a *different* title than any of
     this item's current asset positions (typically a legacy upload from a
@@ -217,6 +218,27 @@ ORDINAL_FAILED = "FAILED"  # upload attempted, raised, did not land
 ORDINAL_DEFERRED = (
     "DEFERRED"  # {{duplicate}}-tagging upload deferred: Category:Duplicate at capacity
 )
+
+
+class DriftResolution(str, Enum):
+    """The four outcomes ``_resolve_hash_drift`` produces, one per
+    invariant-restoring next step the caller takes.
+
+    Values are the caller-visible string sentinels; ``str, Enum``
+    subclassing means ``DriftResolution.MOVED == "moved"`` still
+    holds, so any legacy comparison against the raw string keeps
+    working. New comparisons should reference the enum member so a
+    typo or rename is a hard error at import time rather than a
+    silent no-match at runtime.
+
+    See ``_resolve_hash_drift``'s docstring for the per-outcome
+    invariant story.
+    """
+
+    MOVED = "moved"
+    UPLOAD_AND_TAG = "upload_and_tag"
+    LEAVE_OTHERS_ALONE = "leave_others_alone"
+    ALREADY_CORRECT = "already_correct"
 
 
 class UploadTimeoutError(RuntimeError):
@@ -654,7 +676,12 @@ class Uploader:
                             f"is a legitimate sibling, not drift. Uploading "
                             f"to [[File:{page_title}]] without disturbing it."
                         )
-                        drift_action = "leave_others_alone"
+                        # This branch's caller-visible action equals
+                        # ``DriftResolution.LEAVE_OTHERS_ALONE``; no assignment
+                        # to ``drift_action`` is needed because the else branch
+                        # is the only path that dispatches on it, and this
+                        # branch already sets the sole side-effect
+                        # (``force_ignore_warnings = True``) itself.
                         force_ignore_warnings = True
                     else:
                         drift_action = self._resolve_hash_drift(
@@ -665,7 +692,7 @@ class Uploader:
                             wiki_markup=wiki_markup,
                             expected_item_titles=expected_item_titles,
                         )
-                        if drift_action == "moved":
+                        if drift_action == DriftResolution.MOVED:
                             self.tracker.increment(Result.UPLOADED)
                             # After a successful move the same file page lives
                             # at page_title; existing_file.pageid is preserved
@@ -675,7 +702,7 @@ class Uploader:
                                 "title": page_title,
                                 "pageid": existing_file.pageid,
                             }
-                        elif drift_action == "already_correct":
+                        elif drift_action == DriftResolution.ALREADY_CORRECT:
                             # ``_resolve_hash_drift`` caught a phantom drift —
                             # the file the SHA1-lookup returned IS the file
                             # at the intended title, once pywikibot's title
@@ -702,7 +729,7 @@ class Uploader:
                                 "title": canonical_title,
                                 "pageid": existing_file.pageid,
                             }
-                        elif drift_action == "upload_and_tag":
+                        elif drift_action == DriftResolution.UPLOAD_AND_TAG:
                             # This ordinal would upload its bytes to the
                             # canonical title AND tag the stranded sha1-sibling
                             # {{duplicate}}. If Category:Duplicate is at
@@ -1140,6 +1167,10 @@ class Uploader:
         to the same item's file under a slightly different title. Move the
         target file to the intended title and post a CommonsDelinker request.
 
+        **Invariant maintained**: on return, the S3 SHA1 for this
+        ``dpla_id`` lives at ``get_page_title(dpla_id, …)``'s output.
+        See ``docs/upload-invariant.md``.
+
         Caller must verify the redirect target carries the same DPLA ID and
         same logical page (i.e. not a same-item different-page relic, where
         moving would oscillate); see is_same_item_redirect_relic.
@@ -1191,6 +1222,15 @@ class Uploader:
         """
         Replace a redirect at our intended title with wikitext so the
         subsequent upload can land the new S3 file there.
+
+        **Invariant maintained**: after the caller's subsequent upload
+        completes, the S3 SHA1 for this ``dpla_id`` lives at
+        ``get_page_title(dpla_id, …)``'s output. Corollary 2 of the
+        upload invariant: pre-existing Commons redirects do not bind
+        us — they are stale curatorial judgments about partner-decided
+        facts and are safely overwritten so the invariant lands the
+        S3 bytes at the DPLA-ID's canonical title. See
+        ``docs/upload-invariant.md``.
 
         Works for *any* redirect target — same-item different-page relic,
         cross-item dedup (e.g. a 2022 human "redirecting to duplicate file"
@@ -1315,7 +1355,7 @@ class Uploader:
         ordinal: int,
         wiki_markup: str | None = None,
         expected_item_titles: set[str] | None = None,
-    ) -> str:
+    ) -> DriftResolution:
         """Resolve the case where our S3 source's SHA1 already lives on
         Commons at a different title than we intend to write.
 
@@ -1404,7 +1444,7 @@ class Uploader:
                 f"[[File:{actual_filename}]] IS the intended title after "
                 f"pywikibot normalisation; nothing to resolve."
             )
-            return "already_correct"
+            return DriftResolution.ALREADY_CORRECT
 
         # --- Hash collision safety check ---
         # Cross-item collision: the file at the wrong title was uploaded for a
@@ -1462,7 +1502,7 @@ class Uploader:
                         f"colliding DPLA item {existing_dpla_id}: {ex}; "
                         f"falling back to leave_others_alone."
                     )
-                    return "leave_others_alone"
+                    return DriftResolution.LEAVE_OTHERS_ALONE
             if other_item:
                 # cross_item_or_stranded_orphan: our SHA1 lives at
                 # another LIVE DPLA ID's canonical title. This is
@@ -1487,7 +1527,7 @@ class Uploader:
                     f"(invariant corollary 1: two live DPLA IDs → two "
                     f"files at two DPLA-ID titles is correct)."
                 )
-                return "leave_others_alone"
+                return DriftResolution.LEAVE_OTHERS_ALONE
 
         intended_page = get_page(self.site, page_title)
 
@@ -1519,7 +1559,7 @@ class Uploader:
                 wiki_markup,
                 post_commonsdelinker=not sibling_slot,
             )
-            return "moved"
+            return DriftResolution.MOVED
 
         if intended_page.isRedirectPage():
             # Case: title_text_drift_redirect_at_intended (Case 1).
@@ -1537,7 +1577,7 @@ class Uploader:
                     wiki_markup,
                     post_commonsdelinker=not sibling_slot,
                 )
-                return "moved"
+                return DriftResolution.MOVED
             # Intended title is a redirect, but its target is somewhere
             # other than where our SHA1 currently lives. We can't apply
             # the title-drift move here; instead let the caller's
@@ -1553,7 +1593,7 @@ class Uploader:
                 f"the location of our SHA1 ([[File:{actual_filename}]]); "
                 f"deferring to the redirect-handler in process_file."
             )
-            return "leave_others_alone"
+            return DriftResolution.LEAVE_OTHERS_ALONE
 
         # Case: orphan_at_wrong_title / cross_item_or_stranded_orphan (Case 2).
         # Intended title has real content with a different hash, and the
@@ -1581,14 +1621,14 @@ class Uploader:
                 f"its own ordinal's iteration. Uploading to "
                 f"[[File:{page_title}]] without tagging."
             )
-            return "leave_others_alone"
+            return DriftResolution.LEAVE_OTHERS_ALONE
 
         logging.info(
             f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
             f"has a different hash; will upload correct hash and tag "
             f"[[File:{actual_filename}]] as duplicate."
         )
-        return "upload_and_tag"
+        return DriftResolution.UPLOAD_AND_TAG
 
     def _tag_drift_duplicate(
         self,
