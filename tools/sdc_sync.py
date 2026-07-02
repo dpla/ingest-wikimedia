@@ -4376,6 +4376,13 @@ def _post_sdc_cleanup_for_page(
                 dpla_id=dpla_id,
                 site=site,
             )
+        except CsrfRecoveryFailed:
+            # Session-level fatal from the wrapped writes inside
+            # migrate_legacy_file (post_legacy_import_claims and the
+            # post-migration .save). Propagate so the run aborts rather
+            # than silently turning a stuck session into per-file
+            # migrate skips that would recur on every remaining item.
+            raise
         except Exception:
             logging.exception(
                 f" -- cleanup: legacy migration of '{file_page.title()}'"
@@ -4779,6 +4786,11 @@ def _migrate_one_dpla_item(s3, partner: str, dpla_id: str) -> None:
             )
             tracker.increment(Result.LEGACY_SKIPPED_NOT_LEGACY)
             continue
+        except CsrfRecoveryFailed:
+            # Session-level fatal from wrapped writes in migrate_legacy_file
+            # — abort the run rather than counting it as a routine skip
+            # against every remaining item in the legacy loop.
+            raise
         except Exception:
             logging.exception(
                 f" -- '{title}' for {dpla_id}: legacy migration failed; skipping."

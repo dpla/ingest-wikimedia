@@ -2467,6 +2467,12 @@ def _post_upload_touch_new_institutions(
         for inst_qid in sorted(newly_created):
             try:
                 n = touch_institution_files(commons_site, inst_qid)
+            except CsrfRecoveryFailed:
+                # Session-level fatal from a wrapped .touch() inside
+                # touch_institution_files — propagate so main() ends
+                # the run rather than logging a warning per remaining
+                # institution while writes stay broken.
+                raise
             except Exception as e:
                 logging.warning(f"Search/touch for {inst_qid} failed: {e}")
                 continue
