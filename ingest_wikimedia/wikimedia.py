@@ -101,6 +101,13 @@ def get_page_title(
 ) -> str:
     """Build a Commons file title from a DPLA item title + identifier.
 
+    **This function defines "the intended title" side of the upload
+    invariant** (see ``docs/upload-invariant.md``). The full invariant:
+    for every DPLA item, the SHA1 of its S3 source bytes must live at
+    ``get_page_title(dpla_id, …)``'s output. Every drift-resolution
+    branch in ``tools/uploader.py`` exists to enforce or restore that
+    equality.
+
     Applies the same character normalisations Commons enforces at upload
     time so that the title returned here matches what Commons stores once
     the upload completes.  Equality of constructed vs. stored title is

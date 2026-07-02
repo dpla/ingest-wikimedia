@@ -1,3 +1,35 @@
+"""DPLA → Wikimedia Commons per-ordinal uploader.
+
+## The upload invariant (correctness criterion for this file)
+
+**For every DPLA item, the SHA1 of the S3-staged source bytes for that
+item must live at the Commons title ``get_page_title(dpla_id, …)``
+produces.**
+
+That is the entire correctness criterion this file is responsible
+for. Every branch of :meth:`Uploader.process_file`,
+:meth:`Uploader._resolve_hash_drift`, and the redirect handling below
+is chosen because it either enforces this invariant directly or
+delegates to a step that will.
+
+The full statement of the invariant — including corollaries,
+anti-patterns, and past incidents that illustrate the invariant's
+scope — lives in ``docs/upload-invariant.md``. **Read that document
+before making any change to this file that could affect what SHA1
+lands at what Commons title.** In particular:
+
+- Two Commons files with matching SHA1s from two live DPLA IDs is
+  the invariant satisfied (corollary 1), not a bug to fix.
+- Human-authored ``#REDIRECT`` on a Commons title does NOT bind us:
+  the intended title is where the bytes belong for our DPLA ID.
+
+Proposals to "skip the upload when target has our SHA1", "honor the
+existing redirect", or "tag the file as a Commons-side duplicate" for
+the corollary-1 / corollary-2 shapes ARE invariant violations dressed
+up as safety improvements. See the anti-patterns section of the
+invariant document.
+"""
+
 import concurrent.futures
 import datetime
 import gc
@@ -272,6 +304,17 @@ def _recover_commons_session(site) -> None:
 
 
 class Uploader:
+    """Per-ordinal uploader — the object that satisfies the upload
+    invariant one Commons title at a time.
+
+    Invariant contract (same as the module docstring): on any
+    :meth:`process_file` success path, the Commons title
+    ``get_page_title(dpla_id, …)`` produces holds the SHA1 of the
+    item's S3 source bytes. Every code path below is chosen because
+    it maintains that invariant. See ``docs/upload-invariant.md`` for
+    the full statement, corollaries, anti-patterns, and past incidents.
+    """
+
     def __init__(
         self,
         tracker: Tracker,
@@ -423,15 +466,48 @@ class Uploader:
     ) -> dict:
         """Process one ordinal's source asset and return a per-ordinal result dict.
 
+        **Invariant contract**: on ``UPLOADED`` or ``SKIPPED`` return, the
+        Commons title ``get_page_title(dpla_id, …, page=page_label)``
+        produces holds the SHA1 of ``s3_object.metadata['sha1']`` — the
+        S3-staged source bytes for this DPLA item + ordinal. Every
+        branch below is chosen because it maintains that invariant.
+        See ``docs/upload-invariant.md``.
+
+        Roadmap of the branches (each explains its invariant story
+        at the branch site):
+
+        1. **already-at-intended-title fast path**: SHA1 lookup finds
+           the file at exactly the intended title. Invariant already
+           satisfied. Return ``SKIPPED``.
+        2. **hash-drift resolution** via :meth:`_resolve_hash_drift`:
+           SHA1 lookup finds the file at some OTHER title. Dispatch to
+           one of ``moved`` (Case 1/3 — move restores invariant),
+           ``upload_and_tag`` (Case 2 orphan — upload restores it here,
+           tag cleans up the wrong-title relic), ``leave_others_alone``
+           (cross-item collision with a live sibling DPLA ID — upload
+           restores it here, other title correctly holds ITS DPLA ID's
+           SHA1 by corollary 1), or ``already_correct``
+           (defense-in-depth normalization match — invariant already
+           satisfied).
+        3. **redirect handling** if the intended title is a redirect:
+           move over the redirect (if target IS our SHA1's home for
+           the same DPLA ID + logical page), or overwrite the redirect
+           in place (cross-item / relic / no-DPLA-ID redirect — the
+           redirect is a stale curatorial judgment per corollary 2
+           and doesn't bind our invariant obligation). Upload proceeds
+           and lands the S3 bytes at the intended title.
+        4. **fresh upload** with the retry-and-drift-tag path when
+           there's no existing state to reconcile.
+
         Return shape (consumed by process_item to assemble upload-result.json):
           {"status": <ORDINAL_*>, "title": str | None,
            "pageid": int | None, "error": str | None}
 
-        The status drives the SDC sync phase (PR 4): UPLOADED and SKIPPED
-        ordinals are eligible for wbsetclaims; NOT_PRESENT, INELIGIBLE, and
-        FAILED ordinals are not. `title` and `pageid` are populated only for
-        UPLOADED and SKIPPED; everything else has no canonical Commons page
-        to attach structured data to.
+        The status drives the SDC sync phase: UPLOADED and SKIPPED
+        ordinals are eligible for wbsetclaims; NOT_PRESENT, INELIGIBLE,
+        DEFERRED, and FAILED ordinals are not. ``title`` and ``pageid``
+        are populated only for UPLOADED and SKIPPED; everything else
+        has no canonical Commons page to attach structured data to.
         """
         temp_file = self.local_fs.get_temp_file()
 
@@ -578,7 +654,7 @@ class Uploader:
                             f"is a legitimate sibling, not drift. Uploading "
                             f"to [[File:{page_title}]] without disturbing it."
                         )
-                        drift_action = "upload_only"
+                        drift_action = "leave_others_alone"
                         force_ignore_warnings = True
                     else:
                         drift_action = self._resolve_hash_drift(
@@ -655,7 +731,7 @@ class Uploader:
                                 }
                             drift_old_filename = existing_file.title(with_ns=False)
                             force_ignore_warnings = True
-                        else:  # "upload_only"
+                        else:  # "leave_others_alone"
                             force_ignore_warnings = True
 
                 with tqdm(
@@ -685,8 +761,8 @@ class Uploader:
                 # preservation) based on the redirect target, and always sets
                 # `force_ignore_warnings=True` for the subsequent upload.
                 #
-                # Earlier this branch was gated on `drift_action != "upload_only"`,
-                # but `_resolve_hash_drift` can legitimately return "upload_only"
+                # Earlier this branch was gated on `drift_action != "leave_others_alone"`,
+                # but `_resolve_hash_drift` can legitimately return "leave_others_alone"
                 # while the intended title is still a redirect — specifically
                 # when the redirect's target is a sibling page rather than the
                 # SHA1's current location. The misleading warning at line ~880
@@ -745,11 +821,35 @@ class Uploader:
                                 f"moving sibling page."
                             )
                         else:
+                            # Cross-item OR no-DPLA-ID redirect. The
+                            # intended title is a redirect either to
+                            # another DPLA ID's canonical file, or to
+                            # some unrelated Commons file. Either way,
+                            # the redirect is a stale curatorial
+                            # judgment about a partner-decided fact
+                            # (corollary 2 of the upload invariant —
+                            # see ``docs/upload-invariant.md``) and
+                            # does NOT override our obligation to
+                            # place OUR S3 SHA1 at OUR canonical title.
+                            # Overwrite it in place, upload our bytes,
+                            # invariant satisfied at our title.
+                            #
+                            # ANTI-PATTERN: do NOT add a "if the
+                            # redirect target has our SHA1, skip our
+                            # upload and honor the redirect" check
+                            # here. That would leave our intended
+                            # title as a redirect (i.e., without our
+                            # required bytes) — direct invariant
+                            # violation. The two-files-same-SHA1
+                            # outcome is corollary 1 and is CORRECT.
+                            # See the 2026-07-02 Palo Pinto incident.
                             logging.info(
                                 f"Cross-item or no-DPLA redirect for {dpla_id}: "
                                 f"[[File:{wiki_file_page.title(with_ns=False)}]] → "
                                 f"[[File:{target_title}]]; overwriting redirect "
-                                f"with fresh wikitext (no metadata preservation)."
+                                f"with fresh wikitext (invariant corollary 2: "
+                                f"stale curatorial redirect does not bind our "
+                                f"obligation to place S3 SHA1 at DPLA-ID title)."
                             )
                         wiki_file_page, _ = self._resolve_redirect_overwrite(
                             wiki_file_page,
@@ -1216,21 +1316,59 @@ class Uploader:
         wiki_markup: str | None = None,
         expected_item_titles: set[str] | None = None,
     ) -> str:
-        """
-        Determine and where possible resolve the case where our file's SHA1
-        already lives on Commons at a different title than intended.
+        """Resolve the case where our S3 source's SHA1 already lives on
+        Commons at a different title than we intend to write.
 
-        Returns one of:
-          "moved"           — Case 1/3: file moved to correct title; caller should
-                              increment UPLOADED and return (no upload needed).
-          "upload_and_tag"  — Case 2: correct title has a different file; caller
-                              should upload (ignore_warnings=True) then tag the
-                              orphaned old title as a duplicate.
-          "upload_only"     — Cross-item hash collision with a still-valid DPLA ID;
-                              upload to the correct title but leave the other file alone.
-          "already_correct" — No drift after normalisation: the file the SHA1
-                              lookup returned IS the file at the intended title.
-                              Caller should record SKIPPED and return.
+        **Invariant contract**: on any return, the caller has a
+        well-defined next step that, when completed, leaves the S3
+        source's SHA1 at ``get_page_title(dpla_id, …)``'s output — the
+        canonical Commons title for this DPLA item. See
+        ``docs/upload-invariant.md``.
+
+        Return values name the case + the caller's next step:
+
+        - ``"moved"`` — **title_text_drift**: same DPLA ID's SHA1 lived
+          at a different title (e.g., pre-normalization title, a
+          brackets-vs-parens variant). The file has been moved to the
+          intended title. Caller records UPLOADED and returns. Invariant
+          satisfied by the move.
+
+        - ``"upload_and_tag"`` — **orphan_at_wrong_title**: a file with
+          our SHA1 lives at a title that (a) is NOT one of this item's
+          expected ordinal titles, and (b) either has no recognizable
+          DPLA ID or belongs to a DPLA ID that is no longer live. The
+          caller uploads our bytes to the intended title (restoring
+          the invariant) AND tags the stranded old title as a
+          ``{{Duplicate}}`` so Commons admins can clean up.
+
+        - ``"leave_others_alone"`` — **cross_item_or_stranded_orphan**:
+          our SHA1 lives at another live DPLA ID's canonical title
+          (the partner emitted two DPLA IDs for byte-identical
+          content, corollary 1 of the invariant). The caller uploads
+          our bytes to OUR intended title without touching theirs. The
+          resulting two-files-same-SHA1 state on Commons is the
+          invariant satisfied at both DPLA IDs — a faithful projection
+          of partner data, not a bug.
+
+          The same return value is used when the SHA1 lives at a
+          sibling ordinal's expected title within THIS item — a rare
+          shape where deferring to the redirect-handler is the safer
+          resolution. Both sub-cases share the caller's next step
+          (upload to intended title, don't touch the sibling), which
+          is why they share a return value.
+
+        - ``"already_correct"`` — **normalized_identity**: the file
+          the SHA1 lookup returned IS the file at the intended title
+          under whitespace-run normalization (typically a
+          post-title-truncation artefact of ``get_page_title``). No
+          drift to resolve. Caller records SKIPPED and returns.
+
+        Defense-in-depth: for callers that MUST NOT accidentally
+        propose a fix that violates the invariant, see the anti-pattern
+        section of ``docs/upload-invariant.md``. In particular, the
+        ``leave_others_alone`` case's second-file outcome is the
+        invariant satisfied at each DPLA ID and MUST NOT be
+        "fixed" by skipping our upload.
         """
         actual_filename = existing_file.title(with_ns=False)
 
@@ -1280,7 +1418,7 @@ class Uploader:
         # longer matches the new naming scheme — always falls through to the
         # Case 1/2/3 migration logic below.  A previous version of this code
         # special-cased "same DPLA ID, different parsed ordinal" by returning
-        # "upload_only" to avoid disturbing a hypothetical hash-coincidence
+        # "leave_others_alone" to avoid disturbing a hypothetical hash-coincidence
         # between two pages of the same item, but that branch fired routinely
         # whenever PR #173's per-extension page-label scheme produced a
         # different (or no) (page N) suffix from the existing Commons file —
@@ -1306,7 +1444,7 @@ class Uploader:
                 # the catch-all path is reached by network timeouts, 5xx
                 # responses, JSON parse errors, etc. — none of which carry
                 # the same definitive "the old ID is gone" meaning. Those
-                # stay on the conservative ``upload_only`` fallback so a
+                # stay on the conservative ``leave_others_alone`` fallback so a
                 # transient API blip doesn't trigger a destructive move on
                 # a file that still has a valid sibling item.
                 status = getattr(getattr(ex, "response", None), "status_code", None)
@@ -1322,16 +1460,34 @@ class Uploader:
                     logging.warning(
                         f"Hash drift for {dpla_id} {ordinal}: failed to verify "
                         f"colliding DPLA item {existing_dpla_id}: {ex}; "
-                        f"falling back to upload_only."
+                        f"falling back to leave_others_alone."
                     )
-                    return "upload_only"
+                    return "leave_others_alone"
             if other_item:
+                # cross_item_or_stranded_orphan: our SHA1 lives at
+                # another LIVE DPLA ID's canonical title. This is
+                # corollary 1 of the upload invariant — partner data
+                # emitted two DPLA IDs pointing to the same source
+                # content; the correct Commons projection is two files
+                # at two DPLA-ID-suffixed titles holding the same bytes.
+                # We upload to OUR intended title. The other DPLA ID's
+                # file remains at its title (its own S3 SHA1 matches
+                # ITS canonical title — invariant satisfied there too).
+                #
+                # ANTI-PATTERN: do NOT add a "skip our upload because
+                # the SHA1 already exists elsewhere on Commons" check
+                # here. Doing so would leave OUR intended title without
+                # its required S3 bytes — direct invariant violation.
+                # See ``docs/upload-invariant.md`` corollary 1 + the
+                # 2026-07-02 Palo Pinto incident.
                 logging.info(
                     f"Hash drift for {dpla_id} {ordinal}: "
                     f"[[File:{actual_filename}]] belongs to valid DPLA item "
-                    f"{existing_dpla_id}; uploading to correct title only."
+                    f"{existing_dpla_id}; uploading to correct title only "
+                    f"(invariant corollary 1: two live DPLA IDs → two "
+                    f"files at two DPLA-ID titles is correct)."
                 )
-                return "upload_only"
+                return "leave_others_alone"
 
         intended_page = get_page(self.site, page_title)
 
@@ -1352,38 +1508,44 @@ class Uploader:
         )
 
         if not intended_page.exists():
-            # Case 3: nothing at the intended title — simple move.
+            # Case: title_text_drift_empty_intended (Case 3).
+            # Nothing at the intended title — simple move restores the
+            # invariant (our SHA1 now lives at get_page_title(dpla_id)).
             self._move_to_correct_title(
                 existing_file,
                 intended_page,
                 dpla_id,
-                "Case 3",
+                "title_text_drift_empty_intended (Case 3)",
                 wiki_markup,
                 post_commonsdelinker=not sibling_slot,
             )
             return "moved"
 
         if intended_page.isRedirectPage():
-            # Case 1 (via hash lookup): intended title is a redirect. If it
-            # redirects to exactly our existing file (same filename), move over it.
+            # Case: title_text_drift_redirect_at_intended (Case 1).
+            # Intended title is a redirect. If it redirects to exactly
+            # our existing file (same filename), move over it — the
+            # redirect was a stale artifact from the same file living
+            # at both names; move restores the invariant.
             redirect_target = intended_page.getRedirectTarget()
             if redirect_target.title(with_ns=False) == actual_filename:
                 self._move_to_correct_title(
                     existing_file,
                     intended_page,
                     dpla_id,
-                    "Case 1",
+                    "title_text_drift_redirect_at_intended (Case 1)",
                     wiki_markup,
                     post_commonsdelinker=not sibling_slot,
                 )
                 return "moved"
             # Intended title is a redirect, but its target is somewhere
             # other than where our SHA1 currently lives. We can't apply
-            # the Case 1 move; instead let the caller's redirect-handler
-            # decide (overwrite as same-item relic, overwrite as
-            # cross-item, etc). "upload_only" here just means
-            # "drift-resolution didn't move or tag anything"; the
-            # redirect-handler still runs unconditionally now.
+            # the title-drift move here; instead let the caller's
+            # redirect-handler decide (overwrite as same-item relic,
+            # overwrite as cross-item, etc). ``leave_others_alone``
+            # here just means "drift-resolution didn't move or tag
+            # anything"; the redirect-handler still runs
+            # unconditionally now.
             logging.info(
                 f"Hash drift for {dpla_id} {ordinal}: intended title "
                 f"[[File:{intended_page.title(with_ns=False)}]] is a redirect to "
@@ -1391,13 +1553,14 @@ class Uploader:
                 f"the location of our SHA1 ([[File:{actual_filename}]]); "
                 f"deferring to the redirect-handler in process_file."
             )
-            return "upload_only"
+            return "leave_others_alone"
 
-        # Case 2: intended title has real content with a different hash, and
-        # the file found at the wrong title belongs to a different item (or
-        # has no recognisable DPLA ID). Normally we upload the correct hash
-        # to the intended title AND tag the orphaned old title as a duplicate
-        # so it can be cleaned up.
+        # Case: orphan_at_wrong_title / cross_item_or_stranded_orphan (Case 2).
+        # Intended title has real content with a different hash, and the
+        # file found at the wrong title either has no recognisable DPLA
+        # ID or belongs to a DPLA item that is no longer live. Normally
+        # we upload the correct hash to the intended title AND tag the
+        # orphaned old title as a duplicate so it can be cleaned up.
         #
         # BUT: if the "old title" is itself an expected title for one of THIS
         # item's other current asset positions, it is not an orphan — it's a
@@ -1410,7 +1573,7 @@ class Uploader:
         # and just upload our content to the intended title.
         if expected_item_titles and actual_filename in expected_item_titles:
             logging.info(
-                f"Title drift (Case 2 → upload_only): "
+                f"Title drift (Case 2 → leave_others_alone): "
                 f"[[File:{intended_page.title(with_ns=False)}]] has a different "
                 f"hash and our SHA1 currently lives at "
                 f"[[File:{actual_filename}]], but that title is one of this "
@@ -1418,7 +1581,7 @@ class Uploader:
                 f"its own ordinal's iteration. Uploading to "
                 f"[[File:{page_title}]] without tagging."
             )
-            return "upload_only"
+            return "leave_others_alone"
 
         logging.info(
             f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
