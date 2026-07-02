@@ -71,6 +71,16 @@ from ingest_wikimedia.worker_slots import (
     WorkerSlotBudget,
 )
 from ingest_wikimedia.categories import CategoryEnsurer, touch_institution_files
+from ingest_wikimedia.csrf import (
+    CsrfRecoveryFailed,
+    MAX_CSRF_RECOVERIES,
+    bump_session_recovery,
+    is_csrf_token_error,
+    recover_commons_session,
+    reset_session_recoveries,
+    session_recoveries_used,
+    with_csrf_recovery,
+)
 from ingest_wikimedia.dpla import (
     SOURCE_RESOURCE_FIELD_NAME,
     DC_TITLE_FIELD_NAME,
@@ -264,30 +274,6 @@ class NewFilePageBlocked(RuntimeError):
     """
 
 
-class CsrfRecoveryFailed(RuntimeError):
-    """Raised when the pywikibot session's CSRF token cannot be recovered.
-
-    Routed AROUND the per-ordinal generic FAILED-counter catch so a
-    session-level fatal aborts the run instead of looping the same
-    error against every remaining item.
-    """
-
-
-# Session-scoped ceiling on CSRF recoveries per run; exceeding it raises
-# ``CsrfRecoveryFailed``. This is the hard guardrail against unbounded
-# looping on a persistently invalid session.
-MAX_CSRF_RECOVERIES = 3
-
-_CSRF_TOKEN_ERROR_MARKER = "Invalid token 'csrf'"
-
-
-def _is_csrf_token_error(ex: BaseException) -> bool:
-    """True if ``ex`` is the pywikibot ``KeyError`` from ``TokenWallet``
-    whose message signals an invalidated CSRF token — narrowed on the
-    marker so unrelated ``KeyError``s don't trigger session recovery."""
-    return isinstance(ex, KeyError) and _CSRF_TOKEN_ERROR_MARKER in str(ex)
-
-
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
 
 
@@ -308,21 +294,6 @@ def _canonicalize_commons_title(title: str) -> str:
     need every one of them to be a safety net.
     """
     return _WHITESPACE_RUN_RE.sub(" ", title).strip()
-
-
-def _recover_commons_session(site) -> None:
-    """Drop the current pywikibot session, re-authenticate, and clear
-    the cached TokenWallet so the next ``site.tokens['csrf']`` refetches.
-
-    ``site.logout()`` is required first: ``site.login()`` on an
-    already-"logged-in" site is a no-op in pywikibot's default flow, so
-    clearing tokens alone would just re-fetch against the same bad
-    session.
-    """
-    logging.info("Recovering Commons session: logout + login + token-wallet clear")
-    site.logout()
-    site.login()
-    site.tokens.clear()
 
 
 class Uploader:
@@ -362,9 +333,6 @@ class Uploader:
         # run can't flood the human-maintained Category:Duplicate. None disables
         # the gate (standalone / unit-test construction); main() injects one.
         self.dup_throttle = dup_throttle
-        # Capped at :data:`MAX_CSRF_RECOVERIES`; once exhausted the next
-        # CSRF error raises :class:`CsrfRecoveryFailed` and aborts the run.
-        self._csrf_recoveries_used = 0
 
     def _safe_upload(self, *, filepage, **kwargs):
         """Sole sanctioned wrapper around ``site.upload`` — every upload in
@@ -969,21 +937,32 @@ class Uploader:
                                     f"Upload timed out after {UPLOAD_TIMEOUT_SECS // 3600}h "
                                     f"— Commons job queue likely stuck"
                                 )
+                            # Successful upload against the current session
+                            # — reset the shared consecutive-recovery
+                            # counter so long-running processes that
+                            # legitimately hit N stale-then-refresh events
+                            # over their lifetime don't trip the cap. Same
+                            # semantics as ``with_csrf_recovery``.
+                            reset_session_recoveries()
                             break
                         except Exception as ex:
                             is_backend_fail = ERROR_BACKEND_FAIL in str(ex)
-                            is_csrf_error = _is_csrf_token_error(ex)
+                            is_csrf_error = is_csrf_token_error(ex)
                             if is_csrf_error:
                                 # Session was invalidated — every subsequent
                                 # upload will hit the same KeyError until
                                 # we re-authenticate. Retrying the same call
                                 # can't help; refresh the session instead.
-                                # Session cap or recovery failure → fatal.
-                                if self._csrf_recoveries_used >= MAX_CSRF_RECOVERIES:
+                                # Coordinates with the shared csrf.py budget
+                                # so a run that ALSO invokes non-uploader
+                                # write paths (touch_institution_files, etc.)
+                                # can't independently spend the cap — one
+                                # process, one counter.
+                                if session_recoveries_used() >= MAX_CSRF_RECOVERIES:
                                     raise CsrfRecoveryFailed(
                                         f"Commons session invalidated: CSRF"
                                         f" token still invalid after"
-                                        f" {self._csrf_recoveries_used}"
+                                        f" {session_recoveries_used()}"
                                         f" recovery attempts; aborting run."
                                     ) from ex
                                 logging.warning(
@@ -994,11 +973,11 @@ class Uploader:
                                     MAX_UPLOAD_RETRIES,
                                     dpla_id,
                                     ordinal,
-                                    self._csrf_recoveries_used + 1,
+                                    session_recoveries_used() + 1,
                                     MAX_CSRF_RECOVERIES,
                                 )
                                 try:
-                                    _recover_commons_session(self.site)
+                                    recover_commons_session(self.site)
                                 except Exception as recover_ex:
                                     raise CsrfRecoveryFailed(
                                         f"Commons session recovery threw"
@@ -1006,7 +985,7 @@ class Uploader:
                                         f" than looping unrecoverable auth"
                                         f" errors."
                                     ) from recover_ex
-                                self._csrf_recoveries_used += 1
+                                bump_session_recovery()
                                 del future
                                 gc.collect()
                                 # Do NOT advance ``attempt``: the previous call
@@ -1192,11 +1171,15 @@ class Uploader:
             f"Title drift redirect detected — moving "
             f"[[File:{old_filename}]] → [[File:{new_filename}]]"
         )
-        redirect_target.move(
-            wiki_file_page.title(),
-            reason=reason,
-            movetalk=False,
-            noredirect=False,  # leave a redirect at the old title
+        with_csrf_recovery(
+            self.site,
+            f"move {redirect_target.title()} → {wiki_file_page.title()}",
+            lambda: redirect_target.move(
+                wiki_file_page.title(),
+                reason=reason,
+                movetalk=False,
+                noredirect=False,  # leave a redirect at the old title
+            ),
         )
         if needs_relink:
             post_commonsdelinker_request(
@@ -1258,12 +1241,16 @@ class Uploader:
         else:
             new_text = wiki_markup
         wiki_file_page.text = new_text
-        wiki_file_page.save(
-            summary=(
-                f"Replacing redirect with DPLA metadata for title drift "
-                f"correction (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+        with_csrf_recovery(
+            self.site,
+            f"save {wiki_file_page.title()} (redirect-overwrite)",
+            lambda: wiki_file_page.save(
+                summary=(
+                    f"Replacing redirect with DPLA metadata for title drift "
+                    f"correction (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                ),
+                minor=False,
             ),
-            minor=False,
         )
         wiki_file_page.clear_cache()
         return wiki_file_page, old_filename
@@ -1305,11 +1292,15 @@ class Uploader:
             f"Title drift ({case_label}): moving "
             f"[[File:{actual_filename}]] → [[File:{intended_filename}]]"
         )
-        existing_file.move(
-            intended_page.title(),
-            reason=reason,
-            movetalk=False,
-            noredirect=False,
+        with_csrf_recovery(
+            self.site,
+            f"move {existing_file.title()} → {intended_page.title()}",
+            lambda: existing_file.move(
+                intended_page.title(),
+                reason=reason,
+                movetalk=False,
+                noredirect=False,
+            ),
         )
         if needs_relink:
             post_commonsdelinker_request(
@@ -1339,12 +1330,16 @@ class Uploader:
                 moved_page.text = merge_preserved_wikitext(
                     moved_page.text or "", wiki_markup
                 )
-                moved_page.save(
-                    summary=(
-                        f"Update description after title drift correction "
-                        f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                with_csrf_recovery(
+                    self.site,
+                    f"save {moved_page.title()} (post-drift description)",
+                    lambda: moved_page.save(
+                        summary=(
+                            f"Update description after title drift correction "
+                            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                        ),
+                        minor=False,
                     ),
-                    minor=False,
                 )
 
     def _resolve_hash_drift(
@@ -1699,19 +1694,29 @@ class Uploader:
                     # round-trips and write directly.
                     new_page = get_page(self.site, f"File:{new_filename}")
                     new_page.text = merged
-                    new_page.save(
-                        summary=(
-                            f"Rescue community-contributed metadata from "
-                            f"[[File:{old_filename}]] (DPLA ID "
-                            f"[[dpla:{dpla_id}|{dpla_id}]])"
+                    with_csrf_recovery(
+                        self.site,
+                        f"save {new_page.title()} (rescue community metadata)",
+                        lambda: new_page.save(
+                            summary=(
+                                f"Rescue community-contributed metadata from "
+                                f"[[File:{old_filename}]] (DPLA ID "
+                                f"[[dpla:{dpla_id}|{dpla_id}]])"
+                            ),
+                            minor=False,
                         ),
-                        minor=False,
                     )
                     logging.info(
                         f"Rescued community-contributed metadata from "
                         f"[[File:{old_filename}]] into "
                         f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
                     )
+        except CsrfRecoveryFailed:
+            # Session-level fatal — the community-metadata rescue is a
+            # best-effort side-effect, but a stuck CSRF token affects
+            # every subsequent write. Propagate so the run aborts
+            # instead of continuing to log rescue-failed warnings.
+            raise
         except Exception as ex:
             logging.warning(
                 f"Failed to rescue community contributions from "
@@ -1732,6 +1737,8 @@ class Uploader:
                 f"Tagged [[File:{old_filename}]] as duplicate of "
                 f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
             )
+        except CsrfRecoveryFailed:
+            raise
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
 
@@ -1958,6 +1965,8 @@ class Uploader:
                     page_labels,
                     dry_run,
                 )
+            except CsrfRecoveryFailed:
+                raise
             except Exception as ex:
                 logging.warning(f"Orphan check failed for {dpla_id}: {ex}; continuing")
 
@@ -2436,6 +2445,8 @@ def _post_item_orphan_check(
                         f"as duplicate of [[File:{keep_title}]] (DPLA ID {dpla_id})"
                     )
                     tracker.increment(Result.ORPHANS_TAGGED)
+                except CsrfRecoveryFailed:
+                    raise
                 except Exception as e:
                     # The orphan remains unresolved; record as FLAGGED so the
                     # run summary accurately reflects follow-up work needed.
@@ -2481,6 +2492,12 @@ def _post_upload_touch_new_institutions(
         for inst_qid in sorted(newly_created):
             try:
                 n = touch_institution_files(commons_site, inst_qid)
+            except CsrfRecoveryFailed:
+                # Session-level fatal from a wrapped .touch() inside
+                # touch_institution_files — propagate so main() ends
+                # the run rather than logging a warning per remaining
+                # institution while writes stay broken.
+                raise
             except Exception as e:
                 logging.warning(f"Search/touch for {inst_qid} failed: {e}")
                 continue

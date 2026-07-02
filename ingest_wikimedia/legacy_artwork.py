@@ -35,6 +35,7 @@ from urllib.parse import urlencode
 
 import mwparserfromhell
 
+from ingest_wikimedia.csrf import with_csrf_recovery
 from ingest_wikimedia.sdc import (
     CASEFOLD_COMPARE_KEYS,
     casefold_for_compare,
@@ -1155,16 +1156,24 @@ def post_legacy_import_claims(
 
     Raises :class:`pywikibot.exceptions.APIError` on Wikibase rejection
     — the caller catches it per-file so a single failure doesn't kill
-    the partner batch.
+    the partner batch. Wrapped in :func:`with_csrf_recovery` so an
+    invalidated session (``KeyError: Invalid token 'csrf'``) triggers
+    a refresh + retry rather than bubbling up as a per-file failure
+    for every remaining item — session-level fatals raise
+    :class:`CsrfRecoveryFailed` to abort the run instead.
     """
-    site.simple_request(
-        action="wbeditentity",
-        id=mediaid,
-        bot=True,
-        token=site.tokens["csrf"],
-        data=json.dumps({"claims": claims}),
-        summary=summary,
-    ).submit()
+    with_csrf_recovery(
+        site,
+        f"wbeditentity {mediaid} (legacy-artwork import)",
+        lambda: site.simple_request(
+            action="wbeditentity",
+            id=mediaid,
+            bot=True,
+            token=site.tokens["csrf"],
+            data=json.dumps({"claims": claims}),
+            summary=summary,
+        ).submit(),
+    )
 
 
 def migrate_legacy_file(
@@ -1261,7 +1270,11 @@ def migrate_legacy_file(
     wikitext_changed = rewritten != file_page.text
     if wikitext_changed:
         file_page.text = rewritten
-        file_page.save(summary=summary, minor=False, bot=True)
+        with_csrf_recovery(
+            file_page.site,
+            f"save {file_page.title()} (legacy-artwork migrate)",
+            lambda: file_page.save(summary=summary, minor=False, bot=True),
+        )
 
     return MigrationResult(
         imports_posted=len(claims),

@@ -12,14 +12,16 @@ from ingest_wikimedia.wikimedia import WMC_UPLOAD_CHUNK_SIZE
 from ingest_wikimedia.worker_slots import WorkerSlotBudget
 import pytest
 
+from ingest_wikimedia.csrf import (
+    CSRF_TOKEN_ERROR_MARKER,
+    CsrfRecoveryFailed,
+    MAX_CSRF_RECOVERIES,
+    is_csrf_token_error,
+)
 from tools.uploader import (
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
-    MAX_CSRF_RECOVERIES,
-    CsrfRecoveryFailed,
     NewFilePageBlocked,
     Uploader,
-    _CSRF_TOKEN_ERROR_MARKER,
-    _is_csrf_token_error,
     _post_item_orphan_check,
     _post_upload_touch_new_institutions,
     is_dup_sha1_sibling_at_expected_title,
@@ -2038,7 +2040,7 @@ def _csrf_keyerror() -> KeyError:
     TokenWallet message. Uses the production marker constant so the
     detector and the test data can never drift apart."""
     return KeyError(
-        f"{_CSRF_TOKEN_ERROR_MARKER} for user 'DPLA bot' on commons:commons wiki."
+        f"{CSRF_TOKEN_ERROR_MARKER} for user 'DPLA bot' on commons:commons wiki."
     )
 
 
@@ -2046,15 +2048,15 @@ def test_is_csrf_token_error_matches_pywikibot_shape():
     """Substring match on ``str(KeyError(...))`` — Python wraps KeyError
     args in quotes on stringify, so the marker must appear inside those
     wrapping quotes."""
-    assert _is_csrf_token_error(_csrf_keyerror())
+    assert is_csrf_token_error(_csrf_keyerror())
 
 
 def test_is_csrf_token_error_rejects_unrelated_keyerror():
     """A KeyError from any other code path (e.g. dict miss on 'title')
     must not be treated as a CSRF error — otherwise a bug elsewhere
     could accidentally trip the whole session-abort escalation."""
-    assert not _is_csrf_token_error(KeyError("title"))
-    assert not _is_csrf_token_error(KeyError("csrf"))  # bare, no "Invalid token"
+    assert not is_csrf_token_error(KeyError("title"))
+    assert not is_csrf_token_error(KeyError("csrf"))  # bare, no "Invalid token"
 
 
 def test_is_csrf_token_error_rejects_non_keyerror():
@@ -2062,7 +2064,7 @@ def test_is_csrf_token_error_rejects_non_keyerror():
     isn't a real CSRF token error — pywikibot only raises this as
     KeyError. Guard against a false positive from log-string
     contamination."""
-    assert not _is_csrf_token_error(RuntimeError(_CSRF_TOKEN_ERROR_MARKER))
+    assert not is_csrf_token_error(RuntimeError(CSRF_TOKEN_ERROR_MARKER))
 
 
 def _csrf_retry_loop_uploader(tracker: Tracker) -> Uploader:
@@ -2126,7 +2128,7 @@ def _csrf_process_file(uploader: Uploader):
 
 
 def test_csrf_error_triggers_session_recovery_and_retry():
-    """First CSRF error → ``_recover_commons_session`` fires and the
+    """First CSRF error → ``recover_commons_session`` fires and the
     retry loop advances to the next attempt. Verifies the recovery +
     re-attempt contract only — the second attempt is arranged to fail
     with a non-CSRF error so the test doesn't have to fake the
@@ -2140,7 +2142,7 @@ def test_csrf_error_triggers_session_recovery_and_retry():
     uploader._safe_upload = MagicMock(
         side_effect=[_csrf_keyerror(), RuntimeError("second attempt marker")]
     )
-    with patch("tools.uploader._recover_commons_session") as recover_mock:
+    with patch("tools.uploader.recover_commons_session") as recover_mock:
         _csrf_process_file(uploader)
     recover_mock.assert_called_once_with(uploader.site)
     assert uploader._safe_upload.call_count == 2, (
@@ -2149,7 +2151,9 @@ def test_csrf_error_triggers_session_recovery_and_retry():
         f"expected 2. If this is 1, the recovery path returned instead "
         f"of continuing the loop."
     )
-    assert uploader._csrf_recoveries_used == 1
+    from ingest_wikimedia import csrf
+
+    assert csrf.session_recoveries_used() == 1
 
 
 def test_csrf_errors_beyond_cap_raise_csrf_recovery_failed():
@@ -2163,9 +2167,11 @@ def test_csrf_errors_beyond_cap_raise_csrf_recovery_failed():
     # a cleaner test than driving through many attempts (each of which
     # would exhaust MAX_UPLOAD_RETRIES per ordinal) and pins the cap
     # behavior specifically.
-    uploader._csrf_recoveries_used = MAX_CSRF_RECOVERIES
+    from ingest_wikimedia import csrf
+
+    csrf._session_recoveries_used = MAX_CSRF_RECOVERIES
     uploader._safe_upload = MagicMock(side_effect=_csrf_keyerror())
-    with patch("tools.uploader._recover_commons_session") as recover_mock:
+    with patch("tools.uploader.recover_commons_session") as recover_mock:
         with pytest.raises(CsrfRecoveryFailed):
             _csrf_process_file(uploader)
     # Recovery must NOT have been attempted — the cap was already at the
@@ -2182,7 +2188,7 @@ def test_csrf_errors_beyond_cap_raise_csrf_recovery_failed():
 
 
 def test_csrf_recovery_that_throws_escalates_to_csrf_recovery_failed():
-    """If ``_recover_commons_session`` itself throws (network down,
+    """If ``recover_commons_session`` itself throws (network down,
     credentials rotated, etc.), escalate to ``CsrfRecoveryFailed``
     immediately rather than looping recovery attempts against an
     unreachable auth endpoint."""
@@ -2190,7 +2196,7 @@ def test_csrf_recovery_that_throws_escalates_to_csrf_recovery_failed():
     uploader = _csrf_retry_loop_uploader(tracker)
     uploader._safe_upload = MagicMock(side_effect=_csrf_keyerror())
     with patch(
-        "tools.uploader._recover_commons_session",
+        "tools.uploader.recover_commons_session",
         side_effect=RuntimeError("network unreachable"),
     ):
         with pytest.raises(CsrfRecoveryFailed):

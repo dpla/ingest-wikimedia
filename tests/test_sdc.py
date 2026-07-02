@@ -741,9 +741,7 @@ def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
     }
 
     for junk in (None, "", "   ", "null", "ftp://example.org/x", "not a url"):
-        out = build_claims_for_doc(
-            _doc(junk), "abc1234567890", hubs, {}, {}, {}
-        )
+        out = build_claims_for_doc(_doc(junk), "abc1234567890", hubs, {}, {}, {})
         p7482 = next(c for c in out["claims"] if c["mainsnak"]["property"] == "P7482")
         assert "P6108" not in p7482["qualifiers"], (
             f"{junk!r} should not produce a P6108 qualifier"
@@ -756,9 +754,7 @@ def test_build_claims_for_doc_rejects_junky_iiif_manifest_values():
         "  https://example.org/iiif/manifest.json  ",
         "http://example.org/iiif/manifest.json",
     ):
-        out = build_claims_for_doc(
-            _doc(valid), "abc1234567890", hubs, {}, {}, {}
-        )
+        out = build_claims_for_doc(_doc(valid), "abc1234567890", hubs, {}, {}, {})
         p7482 = next(c for c in out["claims"] if c["mainsnak"]["property"] == "P7482")
         assert "P6108" in p7482["qualifiers"], (
             f"{valid!r} should produce a P6108 qualifier"
@@ -803,9 +799,7 @@ def test_build_claims_for_doc_tolerates_missing_rights_field():
         }
     }
 
-    out = build_claims_for_doc(
-        doc, "abc1234567890", hubs, {}, {}, {}
-    )
+    out = build_claims_for_doc(doc, "abc1234567890", hubs, {}, {}, {})
     # No crash. No P275/P6426 rights claims since the input had no rights.
     rights_props = {"P275", "P6426", "P6216"}
     rights_claims = [
@@ -1429,7 +1423,13 @@ def test_ingest_date_from_doc_raises_when_missing():
     loudly so the caller can skip the item — do NOT synthesize a date."""
     from ingest_wikimedia.sdc import ingest_date_from_doc
 
-    for bad in (None, {}, {"ingestDate": None}, {"ingestDate": ""}, {"ingestDate": 12345}):
+    for bad in (
+        None,
+        {},
+        {"ingestDate": None},
+        {"ingestDate": ""},
+        {"ingestDate": 12345},
+    ):
         try:
             ingest_date_from_doc(bad)
         except ValueError:

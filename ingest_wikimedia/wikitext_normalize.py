@@ -26,6 +26,7 @@ import re
 
 import mwparserfromhell
 
+from ingest_wikimedia.csrf import with_csrf_recovery
 from ingest_wikimedia.sdc import (
     CASEFOLD_COMPARE_KEYS,
     casefold_for_compare,
@@ -544,5 +545,9 @@ def normalize_page(file_page, expected_params: dict, edit_summary: str) -> bool:
             f" -- {file_page.title()}: canonicalising DPLA-metadata template"
             " whitespace (no redundant params to strip)."
         )
-    file_page.save(summary=edit_summary, minor=True, bot=True)
+    with_csrf_recovery(
+        file_page.site,
+        f"save {file_page.title()} (wikitext normalize)",
+        lambda: file_page.save(summary=edit_summary, minor=True, bot=True),
+    )
     return True
