@@ -37,7 +37,6 @@ consumed by the downloader and uploader:
     get-ids-es pa > pa/pa.csv
 """
 
-import datetime
 import json
 import logging
 import sys
@@ -390,7 +389,6 @@ def main(
     # SDC pre-compute inputs.
     rights = load_rights_json()
     subject_ids = fetch_subjects_json()
-    retrieval_date = datetime.date.today()
 
     banlist = Banlist()
     s3_client = S3Client()
@@ -596,17 +594,19 @@ def main(
                     rights,
                     subject_ids,
                     subjects_lookup,
-                    retrieval_date,
                 )
-            except ET.ParseError as e:
-                # parse_nara_access_level surfaces malformed NARA
-                # originalRecord XML here instead of silently writing a
-                # partial sdc.json missing P7228/P6224. One bad item
-                # must not abort staging for the whole NARA hub.
+            except (ET.ParseError, ValueError) as e:
+                # ET.ParseError: parse_nara_access_level on malformed
+                # NARA originalRecord XML. ValueError:
+                # ingest_date_from_doc on missing / unparseable
+                # ingestDate. Both are per-item data-integrity signals,
+                # not conditions to abort the whole hub for — skip the
+                # sdc.json for this item and keep going.
                 logging.warning(
-                    "build_claims_for_doc for %s raised ET.ParseError (%s); "
+                    "build_claims_for_doc for %s raised %s (%s); "
                     "skipping sdc.json for this item",
                     dpla_id,
+                    type(e).__name__,
                     e,
                 )
                 sdc_skipped += 1

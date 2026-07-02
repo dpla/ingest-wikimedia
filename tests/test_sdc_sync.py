@@ -1062,6 +1062,12 @@ def test_legacy_process_one_treats_missing_entity_as_clean_skip(monkeypatch):
     monkeypatch.setattr(sdc_sync, "dpla_api", "stub-api-key", raising=False)
     monkeypatch.setattr(sdc_sync, "invalidate_entity", lambda *_a, **_k: None)
     monkeypatch.setattr(sdc_sync, "get_entity", lambda *_a, **_k: {})
+    # process_one reads the doc from _legacy_mode_doc_cache (populated
+    # by the real parsed()) to derive the ingest date. The stubbed parsed
+    # skips that step, so pre-seed the cache with a valid ingestDate.
+    sdc_sync._legacy_mode_doc_cache["abcdef01abcdef01abcdef01abcdef01"] = {
+        "ingestDate": "2026-06-23T00:00:00Z"
+    }
     # Skip every add_* helper — they call check() which hits the real
     # Commons API for entity reads. Replace them with no-ops.
     for name in [
@@ -2276,7 +2282,7 @@ def test_reconciler_removes_value_typed_claim_when_dpla_dropped_the_date(monkeyp
     from tools import sdc_sync
 
     # New sdc.json has NO P571 claim at all.
-    expected = sdc_sync._build_expected_from_sdc({"claims": []})
+    expected = sdc_sync._build_expected_from_sdc({"claims": [], "ingest_date": "2026-06-23"})
     assert expected == {}
 
     stale_live = _value_typed_p571_claim(
@@ -2962,7 +2968,7 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing
         ),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=None
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=None
         )
     assert submit_calls == []
     # No writes happened → no terminal invalidate.
@@ -3004,7 +3010,7 @@ def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none()
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=None
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=None
         )
 
     assert sdc_sync.qualifier_removals == [("M999$p760id", "obsolete-hash")]
@@ -3033,7 +3039,7 @@ def test_amend_p760_page_qualifier_stamps_missing_p304_via_accumulator():
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=2
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
         )
 
     assert len(sdc_sync.qualifier_amends) == 1
@@ -3070,7 +3076,7 @@ def test_amend_p760_page_qualifier_idempotent_when_p304_already_matches():
         patch.object(sdc_sync, "invalidate_entity"),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=2
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
         )
 
 
@@ -3096,7 +3102,7 @@ def test_amend_p760_page_qualifier_skips_when_no_dpla_authored_p760():
         patch.object(sdc_sync, "invalidate_entity"),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=1
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=1
         )
 
 
@@ -3135,7 +3141,7 @@ def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=2
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
         )
 
     assert sdc_sync.qualifier_removals == [("M999$p760id", "stale-snak-hash-3")]
@@ -3185,7 +3191,7 @@ def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=2
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
         )
 
     # Only the stale snak got queued for removal; the expected value
@@ -3406,14 +3412,13 @@ def test_chunked_claim_roundtrip_extract_comparable_value_preserves_chunk_identi
     the P1545 series ordinal must follow A1/A2/A3 in order. Without
     this end-to-end coverage, the sdc.py and sdc_sync.py halves could
     drift on the chunk-key contract."""
-    import datetime as _dt
-
     from ingest_wikimedia.sdc import build_claims_for_doc
     from tools import sdc_sync
 
     long_desc = "a" * 1500 + " " + "b" * 1500 + " " + "c" * 800
     doc = {
         "id": "abc1234567890",
+        "ingestDate": "2026-06-01T00:00:00Z",
         "provider": {"name": "Digital Commonwealth"},
         "dataProvider": {"name": "Boston Public Library"},
         "sourceResource": {
@@ -3429,9 +3434,7 @@ def test_chunked_claim_roundtrip_extract_comparable_value_preserves_chunk_identi
             "institutions": {"Boston Public Library": {"Wikidata": "Q2"}},
         }
     }
-    out = build_claims_for_doc(
-        doc, "abc1234567890", hubs, {}, {}, {}, _dt.date(2026, 6, 1)
-    )
+    out = build_claims_for_doc(doc, "abc1234567890", hubs, {}, {}, {})
     assert out is not None, "doc should be parseable; check fixture shape"
     desc_claims = [c for c in out["claims"] if c["mainsnak"]["property"] == "P10358"]
     assert len(desc_claims) == 3, (
@@ -3477,7 +3480,7 @@ def test_amend_p760_page_qualifier_does_not_re_invalidate_when_p304_matches():
         ),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": []}, page_number=2
+            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
         )
 
     assert invalidate_calls == []
@@ -3561,7 +3564,7 @@ def test_process_one_from_sdc_clears_entity_cache_at_file_boundary(monkeypatch):
 
     _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, "M999")
 
-    sdc_sync.process_one_from_sdc("M999", "abcdef", {"claims": []})
+    sdc_sync.process_one_from_sdc("M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"})
 
     # Prior files' entities are gone. The current mediaid may or may not
     # be in the cache afterward (post-write cleanup invalidates it), but
@@ -3585,7 +3588,7 @@ def test_entity_cache_does_not_grow_across_many_files(monkeypatch):
     for i in range(100):
         mediaid = f"M{1000 + i}"
         _patch_process_one_from_sdc_dependencies(monkeypatch, sdc_sync, mediaid)
-        sdc_sync.process_one_from_sdc(mediaid, f"dpla{i:06d}", {"claims": []})
+        sdc_sync.process_one_from_sdc(mediaid, f"dpla{i:06d}", {"claims": [], "ingest_date": "2026-06-23"})
         sizes.append(len(sdc_sync._entity_cache))
 
     # Pre-fix, sizes would be [1, 2, 3, ..., 100] (linear growth).
@@ -3985,8 +3988,8 @@ def _stale_p813_ref(dpla_id):
 
 def test_p813_refresh_added_when_other_edits_exist():
     """When any other edit is being made on the file, the dispatcher
-    refreshes P813 on all DPLA-authored claims whose P813 isn't already
-    today's date."""
+    refreshes P813 on all DPLA-authored claims whose P813 doesn't match
+    the item's DPLA ingestDate."""
     import datetime as _dt
     import json
 
@@ -4005,6 +4008,7 @@ def test_p813_refresh_added_when_other_edits_exist():
     entity = {"pageid": 999, "statements": {"P760": [old_claim]}}
 
     sdc_sync._reset_per_file_accumulators()
+    sdc_sync._current_ingest_date = _dt.date(2026, 6, 23)
     # Queue ONE unrelated removal so the dispatcher decides to edit.
     sdc_sync.removals.append("M999$some-other-claim")
 
@@ -4021,7 +4025,7 @@ def test_p813_refresh_added_when_other_edits_exist():
         sdc_sync._flush_per_file_edits("M999", "abcdef")
 
     payload = json.loads(submit_calls[0][1]["data"])
-    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    expected_iso = "+2026-06-23T00:00:00Z"
     refresh = [
         c for c in payload["claims"] if c.get("id") == "M999$old" and "references" in c
     ]
@@ -4029,18 +4033,19 @@ def test_p813_refresh_added_when_other_edits_exist():
     refreshed_p813 = refresh[0]["references"][0]["snaks"]["P813"][0]["datavalue"][
         "value"
     ]["time"]
-    assert refreshed_p813 == today_iso
+    assert refreshed_p813 == expected_iso
     sdc_sync._reset_per_file_accumulators()
 
 
 def test_p813_refresh_skips_claims_already_dated_today():
-    """A DPLA reference whose P813 is already today is not re-emitted."""
+    """A DPLA reference whose P813 already matches the ingestDate is not
+    re-emitted."""
     import datetime as _dt
     import json
 
     from tools import sdc_sync
 
-    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    expected_iso = "+2026-06-23T00:00:00Z"
     fresh_ref = {
         "snaks": {
             "P854": [
@@ -4061,7 +4066,7 @@ def test_p813_refresh_skips_claims_already_dated_today():
                     "datavalue": {
                         "type": "time",
                         "value": {
-                            "time": today_iso,
+                            "time": expected_iso,
                             "timezone": 0,
                             "before": 0,
                             "after": 0,
@@ -4086,6 +4091,7 @@ def test_p813_refresh_skips_claims_already_dated_today():
     entity = {"pageid": 999, "statements": {"P760": [fresh_claim]}}
 
     sdc_sync._reset_per_file_accumulators()
+    sdc_sync._current_ingest_date = _dt.date(2026, 6, 23)
     sdc_sync.removals.append("M999$some-other-claim")
 
     submit_calls = []
@@ -4142,6 +4148,7 @@ def test_p813_refresh_preserves_user_added_references():
     entity = {"pageid": 999, "statements": {"P760": [claim]}}
 
     sdc_sync._reset_per_file_accumulators()
+    sdc_sync._current_ingest_date = _dt.date(2026, 6, 23)
     sdc_sync.removals.append("M999$some-other-claim")
 
     submit_calls = []
@@ -4164,8 +4171,8 @@ def test_p813_refresh_preserves_user_added_references():
     )
     refs = refresh["references"]
     assert refs[0] == user_ref
-    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
-    assert refs[1]["snaks"]["P813"][0]["datavalue"]["value"]["time"] == today_iso
+    expected_iso = "+2026-06-23T00:00:00Z"
+    assert refs[1]["snaks"]["P813"][0]["datavalue"]["value"]["time"] == expected_iso
     sdc_sync._reset_per_file_accumulators()
 
 
@@ -4173,15 +4180,15 @@ def test_reference_refresh_repairs_partial_dpla_reference():
     """A DPLA reference that is the publisher marker (P123) but is MISSING
     P854 — e.g. one a foreign bot wrote, or an older sdc-sync left partial —
     is rebuilt to the full canonical P854+P123+P813 triple, EVEN when its
-    P813 is already today (the old date-only refresh would have skipped it).
-    This is the shape repair that lets us always re-assert the expected
-    reference without a separate reconcile pass."""
+    P813 already matches the ingestDate (the old date-only refresh would
+    have skipped it). This is the shape repair that lets us always
+    re-assert the expected reference without a separate reconcile pass."""
     import datetime as _dt
     import json
 
     from tools import sdc_sync
 
-    today_iso = "+" + _dt.date.today().isoformat() + "T00:00:00Z"
+    expected_iso = "+2026-06-23T00:00:00Z"
     partial_ref = {
         "snaks": {
             # No P854 — the partial/broken shape.
@@ -4193,7 +4200,7 @@ def test_reference_refresh_repairs_partial_dpla_reference():
                     "datavalue": {
                         "type": "time",
                         "value": {
-                            "time": today_iso,
+                            "time": expected_iso,
                             "timezone": 0,
                             "before": 0,
                             "after": 0,
@@ -4221,6 +4228,7 @@ def test_reference_refresh_repairs_partial_dpla_reference():
     entity = {"pageid": 999, "statements": {"P275": [claim]}}
 
     sdc_sync._reset_per_file_accumulators()
+    sdc_sync._current_ingest_date = _dt.date(2026, 6, 23)
     sdc_sync.removals.append("M999$some-other-claim")
 
     submit_calls = []
@@ -4240,18 +4248,20 @@ def test_reference_refresh_repairs_partial_dpla_reference():
     ref_snaks = repaired["references"][0]["snaks"]
     assert ref_snaks["P854"][0]["datavalue"]["value"] == "https://dp.la/item/abcdef"
     assert ref_snaks["P123"][0]["datavalue"]["value"]["id"] == "Q2944483"
-    assert ref_snaks["P813"][0]["datavalue"]["value"]["time"] == today_iso
+    assert ref_snaks["P813"][0]["datavalue"]["value"]["time"] == expected_iso
     sdc_sync._reset_per_file_accumulators()
 
 
 def test_reference_refresh_skips_fully_canonical_reference():
     """A DPLA reference already at the full canonical shape (P854 for this
-    item + P123 + P813 today) produces no fragment — no spurious edit."""
+    item + P123 + P813 matching the ingestDate) produces no fragment — no
+    spurious edit."""
+    import datetime as _dt
     import json
 
     from tools import sdc_sync
 
-    canonical = sdc_sync._build_dpla_reference("abcdef")
+    canonical = sdc_sync._build_dpla_reference("abcdef", _dt.date(2026, 6, 23))
     claim = {
         "id": "M999$canon",
         "mainsnak": {
@@ -4268,6 +4278,7 @@ def test_reference_refresh_skips_fully_canonical_reference():
     entity = {"pageid": 999, "statements": {"P275": [claim]}}
 
     sdc_sync._reset_per_file_accumulators()
+    sdc_sync._current_ingest_date = _dt.date(2026, 6, 23)
     sdc_sync.removals.append("M999$some-other-claim")
 
     submit_calls = []
@@ -4337,7 +4348,10 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
         },
     }
 
+    import datetime as _dt
+
     sdc_sync._reset_per_file_accumulators()
+    sdc_sync._current_ingest_date = _dt.date(2026, 6, 23)
     sdc_sync.qualifier_amends.append(
         ("M999$amend", "P2699", sdc_sync._url_snak("P2699", "https://example.com/foo"))
     )
@@ -5590,7 +5604,7 @@ def test_maintain_process_file_renames_before_sync():
         patch.object(sdc_sync, "_s3_partner", "digitalnc"),
         patch.object(sdc_sync, "_maintain_rename", return_value=renamed) as mock_rename,
         patch.object(
-            sdc_sync, "_maintain_sidecar_payload", return_value={"claims": []}
+            sdc_sync, "_maintain_sidecar_payload", return_value={"claims": [], "ingest_date": "2026-06-23"}
         ),
         patch.object(
             sdc_sync.wikimedia,
