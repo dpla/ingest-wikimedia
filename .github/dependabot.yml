@@ -1,0 +1,46 @@
+version: 2
+
+# Dependabot config for dpla/ingest-wikimedia.
+#
+# Structurally mirrors dpla/dashboard-analytics's config, with three
+# repo-specific adjustments:
+#
+#   1. ``package-ecosystem: "uv"`` — this repo is Python + uv.lock (not
+#      Ruby/bundler like dashboard-analytics). Dependabot's ``uv``
+#      ecosystem reads ``pyproject.toml`` + ``uv.lock`` and produces PRs
+#      that update both together.
+#   2. No ``ignore:`` block on the primary language runtime. The
+#      analogous dashboard-analytics rule ignores rails major-version
+#      bumps because they're rare and disruptive. For us, major bumps
+#      on pywikibot are the OPPOSITE — they're how we get upstream
+#      CSRF-handling fixes (e.g. T428817 landed in pywikibot 11.4.0),
+#      so we deliberately keep the majors flowing.
+#   3. Weekly cadence with grouped PRs — one Python-deps PR and one
+#      github-actions PR per week, not N per package. Matches
+#      dashboard-analytics's approach to keeping the PR volume tolerable.
+
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    versioning-strategy: auto
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "python"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "github-actions"
