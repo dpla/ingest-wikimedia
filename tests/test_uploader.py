@@ -2269,6 +2269,37 @@ def test_canonicalize_commons_title_collapses_whitespace_runs():
     assert _canonicalize_commons_title("Foo Bar") == "Foo Bar"
 
 
+def test_canonicalize_commons_title_treats_underscores_as_space_equivalent():
+    """MediaWiki treats ``_`` and space as equivalent in page titles
+    (``File:X_Y`` and ``File:X Y`` are the same page). The guard MUST
+    fold both forms — otherwise an uploader-constructed underscore
+    title vs a previously-uploaded space title (same DPLA ID, same
+    SHA1) reads as drift, falls through to Case 2 UPLOAD_AND_TAG, and
+    inflates the Category:Duplicate deferral sidecar with false
+    positives.
+    """
+    from tools.uploader import _canonicalize_commons_title
+
+    # Direct underscore ↔ space equivalence.
+    assert _canonicalize_commons_title("Foo_Bar") == _canonicalize_commons_title(
+        "Foo Bar"
+    )
+    # Mixed underscore + space runs collapse to a single space.
+    assert _canonicalize_commons_title("Foo _ Bar") == "Foo Bar"
+    assert _canonicalize_commons_title("Foo__Bar") == "Foo Bar"
+    assert _canonicalize_commons_title("Foo_ _Bar") == "Foo Bar"
+    # Leading/trailing underscores are stripped alongside whitespace.
+    assert _canonicalize_commons_title("_Foo Bar_") == "Foo Bar"
+    # Realistic file-title shape with an underscore/space mismatch
+    # between the uploader-constructed form and the already-uploaded
+    # Commons form — must canonicalize to the same string.
+    space_form = "COLL FRAZIER AUGUSTUS PH119 BX4 IMG100 - DPLA - aef63c89.jpg"
+    underscore_form = "COLL_FRAZIER_AUGUSTUS_PH119_BX4_IMG100 - DPLA - aef63c89.jpg"
+    assert _canonicalize_commons_title(space_form) == _canonicalize_commons_title(
+        underscore_form
+    )
+
+
 def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_match():
     """Regression: when the SHA1-lookup returns the file already at the
     intended title (after whitespace normalisation), ``_resolve_hash_drift``

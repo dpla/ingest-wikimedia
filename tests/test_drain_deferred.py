@@ -255,3 +255,111 @@ def test_drain_removes_round_ids_from_sidecar_before_invoking_uploader(lock_fd):
     # sidecar — with a merge-only uploader this is what lets completed
     # items leave the queue.
     assert seen_by_uploader == [[]]
+
+
+# ---------------------------------------------------------------------------
+# ``--no-wait`` opportunistic mode: single best-effort round per invocation.
+# Runs inside each target's chain (per-target opportunistic phase) so a
+# partner whose Category:Duplicate cleared mid-batch gets its deferrals
+# actioned before subsequent targets start. The batch-terminal patient
+# drain (invoked WITHOUT ``--no-wait``, per unique partner, after every
+# target's chain) still handles anything the opportunistic pass left.
+# ---------------------------------------------------------------------------
+
+
+def test_no_wait_exits_immediately_when_category_at_capacity(lock_fd):
+    """When Category:Duplicate is at capacity, the opportunistic pass
+    must exit WITHOUT running any uploader/sdc-sync subprocess and
+    WITHOUT emitting the patient-mode Slack notifications — that
+    milestone is the terminal drain's, not this bonus pass."""
+    drain_sidecar.write_sidecar("nara", ["id-1"])
+
+    throttle = MagicMock()
+    # ``wait_for_capacity(0)`` returns False when the category is at
+    # or above threshold — mirrors ``DuplicateCategoryThrottle`` real
+    # behavior when the deadline is already past on first check.
+    throttle.wait_for_capacity.return_value = False
+    throttle.resume_below = 900
+    throttle.poll_secs = 300
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred.subprocess.run") as sp,
+        patch(
+            "tools.drain_deferred.DuplicateCategoryThrottle",
+            return_value=throttle,
+        ),
+        patch("tools.drain_deferred.notify_drain_phase_start") as start_ping,
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
+
+    assert result.exit_code == 0, result.output
+    sp.assert_not_called()
+    # Slack pings are patient-mode milestones; opportunistic passes
+    # are silent so a run with no capacity doesn't spam #tech-alerts.
+    start_ping.assert_not_called()
+    done_ping.assert_not_called()
+    # Sidecar left intact for the terminal drain.
+    assert drain_sidecar.read_sidecar("nara") == ["id-1"]
+
+
+def test_no_wait_drains_single_round_when_under_capacity(lock_fd):
+    """When Category:Duplicate is under capacity, the opportunistic
+    pass DOES run one round — same clear-then-invoke pattern as the
+    patient loop — then exits without waiting for another round.
+    Contrast with patient mode, which loops until the sidecar is
+    empty (potentially many rounds)."""
+    drain_sidecar.write_sidecar("nara", ["id-1", "id-2"])
+
+    throttle = MagicMock()
+    throttle.wait_for_capacity.return_value = True  # capacity available now
+    throttle.resume_below = 900
+    throttle.poll_secs = 300
+
+    def fake_subprocess_run(argv, **kwargs):
+        return MagicMock(returncode=0)
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch(
+            "tools.drain_deferred.subprocess.run", side_effect=fake_subprocess_run
+        ) as sp,
+        patch(
+            "tools.drain_deferred.DuplicateCategoryThrottle",
+            return_value=throttle,
+        ),
+        patch("tools.drain_deferred.notify_drain_phase_start") as start_ping,
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
+
+    assert result.exit_code == 0, result.output
+    # Exactly two subprocess calls: one uploader + one sdc-sync for
+    # the single round. Contrast with patient mode which could loop.
+    assert sp.call_count == 2
+    assert sp.call_args_list[0].args[0][0] == "uploader"
+    assert sp.call_args_list[1].args[0][0] == "sdc-sync"
+    # No patient-mode milestones — opportunistic passes are silent.
+    start_ping.assert_not_called()
+    done_ping.assert_not_called()
+
+
+def test_no_wait_empty_sidecar_early_exits(lock_fd):
+    """``--no-wait`` on an empty sidecar is the same no-op as patient
+    mode — no lock, no throttle, no subprocess."""
+    lock_mock = MagicMock()
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", lock_mock),
+        patch("tools.drain_deferred.subprocess.run") as sp,
+        patch(
+            "tools.drain_deferred.DuplicateCategoryThrottle",
+        ) as throttle_ctor,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
+
+    assert result.exit_code == 0, result.output
+    lock_mock.assert_not_called()
+    sp.assert_not_called()
+    throttle_ctor.assert_not_called()
