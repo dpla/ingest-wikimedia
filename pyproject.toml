@@ -12,27 +12,27 @@ classifiers = ["Private :: Do Not Upload"]
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "boto3-stubs[essential]>=1.35.49",
-    "boto3>=1.35.49",
-    "certifi>=2024.8.30",
-    "click>=8.1.7",
-    "mwparserfromhell>=0.6.6",
-    "pip-system-certs>=4.0",
+    "boto3-stubs[essential]>=1.43.40",
+    "boto3>=1.43.40",
+    "certifi>=2026.6.17",
+    "click>=8.4.2",
+    "mwparserfromhell>=0.7.2",
+    "pip-system-certs>=5.3",
     "python-magic>=0.4.27",
-    "pywikibot>=9.4.1",
-    "requests>=2.32.3",
-    "tqdm>=4.67.0",
-    "validators>=0.34.0",
-    "types-boto3-s3>=1.35.93",
+    "pywikibot>=11.4.2",
+    "requests>=2.34.2",
+    "tqdm>=4.68.3",
+    "validators>=0.35.0",
+    "types-boto3-s3>=1.43.31",
 ]
 
 [dependency-groups]
 dev = [
-    "coverage>=7.6.9",
-    "mypy>=1.13.0",
-    "pytest>=8.3.3",
-    "ruff>=0.9.0",
-    "types-requests>=2.32.0.20241016",
+    "coverage>=7.15.0",
+    "mypy>=2.1.0",
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+    "types-requests>=2.33.0.20260518",
 ]
 
 [build-system]
