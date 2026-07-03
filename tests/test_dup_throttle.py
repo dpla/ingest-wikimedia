@@ -143,3 +143,38 @@ def test_recheck_cap_must_be_positive():
     except ValueError:
         return
     raise AssertionError("expected ValueError for recheck_cap < 1")
+
+
+def test_construction_without_site_or_size_fn_raises():
+    """The MWDL 2026-07-02 drain-deferred crash: ``drain_deferred.py``
+    called ``DuplicateCategoryThrottle()`` with no arguments, so the
+    site defaulted to ``None`` and the first ``category_size`` call
+    exploded on ``pywikibot.Category(None, ...)``. Fail fast at
+    construction so a similarly broken future caller can't silently
+    sit dormant until the first API call."""
+    try:
+        DuplicateCategoryThrottle()
+    except ValueError as e:
+        assert "site" in str(e).lower() or "size_fn" in str(e).lower(), (
+            "error message should mention site or size_fn to point the "
+            f"caller at the fix; got: {e!r}"
+        )
+        return
+    raise AssertionError(
+        "expected ValueError when neither site nor size_fn is provided"
+    )
+
+
+def test_construction_with_size_fn_only_is_accepted():
+    """Tests inject ``size_fn`` to avoid the real pywikibot path;
+    that use case must remain valid (no ``site`` required)."""
+    t = DuplicateCategoryThrottle(size_fn=lambda: 0)
+    assert t.category_size() == 0
+
+
+def test_construction_with_site_only_is_accepted():
+    """Production callers pass a real pywikibot Site; that use case
+    must remain valid (no ``size_fn`` required). The site is not used
+    at construction, only when ``category_size`` runs, so any non-None
+    sentinel proves the guard passes."""
+    DuplicateCategoryThrottle(site=object())  # no exception → guard passes

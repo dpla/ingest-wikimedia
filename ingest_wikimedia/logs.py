@@ -1,8 +1,42 @@
-import os
 import logging
+import os
+import sys
 from datetime import datetime
 
 from tqdm import tqdm
+
+
+def _install_logging_excepthook() -> None:
+    """Replace ``sys.excepthook`` with a wrapper that logs the
+    exception via ``logging.critical(exc_info=...)`` before delegating
+    to whatever hook was previously installed.
+
+    Uncaught exceptions otherwise write only to ``sys.stderr``. Tools
+    running under tmux lose stderr when the session ends, leaving the
+    file logger (populated by :func:`setup_logging`) as the only
+    surviving artifact — but the default hook never routes through
+    that logger, so the file log stops at whatever logged just before
+    the crash.
+
+    The previous hook is captured (not ``sys.__excepthook__``) so an
+    outer wrapper — pywikibot, click, pytest, a debugger — stays in
+    the chain rather than being silently discarded.
+
+    ``KeyboardInterrupt`` and ``SystemExit`` skip the logging branch:
+    they're operator-driven / clean-exit signals, not crashes, and
+    logging them at CRITICAL would fill the log with false alarms on
+    every ``Ctrl-C`` or ``sys.exit(0)``.
+    """
+    prev_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            prev_hook(exc_type, exc_value, exc_tb)
+            return
+        logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+        prev_hook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -27,7 +61,9 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
     """
     Creates a logfile for this process with a unique timestamp and with the partner's
     name. Passes local logging through tqdm so the progress bars don't get mangled.
-    Suppresses pywikibot logging below ERROR.
+    Suppresses pywikibot logging below ERROR. Installs a
+    logging-aware ``sys.excepthook`` so uncaught tracebacks reach the
+    log file — see :func:`_install_logging_excepthook`.
     """
     os.makedirs(LOGS_DIR_BASE, exist_ok=True)
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -47,6 +83,7 @@ def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> N
     for d in logging.Logger.manager.loggerDict:
         if d.startswith("pywiki"):
             logging.getLogger(d).setLevel(level)
+    _install_logging_excepthook()
 
 
 LOGS_DIR_BASE = "./logs"
