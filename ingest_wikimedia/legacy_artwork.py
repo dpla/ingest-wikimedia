@@ -684,8 +684,6 @@ def _expand_wikitext_for_date_parse(raw_date: str, site) -> str:
     # noise the date templates inject for downstream tooling should
     # disappear. Generic tag-strip on the second pass removes the
     # remaining bare tags but preserves their inner text.
-    import re
-
     expanded = re.sub(
         r"<(span|div)[^>]*"
         r"(?:style\s*=\s*[\"'][^\"']*display\s*:\s*none[^\"']*[\"']"

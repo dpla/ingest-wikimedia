@@ -31,6 +31,7 @@ import json
 import logging
 import sys
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import click
@@ -39,6 +40,7 @@ from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.es import ES_HARD_TIMEOUT, check_es_response, post_es
 from ingest_wikimedia.s3 import S3Client
 from ingest_wikimedia.sdc import (
+    NARA_PROVIDER_NAME,
     build_claims_for_doc,
     collect_subject_queries,
     fetch_institutions_v2,
@@ -56,7 +58,6 @@ from ingest_wikimedia.staging import (
 PAGE_SIZE = 500
 S3_WRITE_WORKERS = 4
 PARTNER = "nara"
-NARA_PROVIDER = "National Archives and Records Administration"
 
 # --- Tunable priority thresholds ---
 # Collections or formats exceeding these counts are deferred to future runs,
@@ -127,7 +128,7 @@ def _fetch_buckets(field: str, extra_filters: list[dict] | None = None) -> list[
             "query": {
                 "bool": {
                     "filter": [
-                        {"term": {"provider.name.not_analyzed": NARA_PROVIDER}},
+                        {"term": {"provider.name.not_analyzed": NARA_PROVIDER_NAME}},
                         {"term": {"rightsCategory": "Unlimited Re-Use"}},
                         *(extra_filters or []),
                     ]
@@ -153,7 +154,7 @@ def _fetch_buckets(field: str, extra_filters: list[dict] | None = None) -> list[
     return buckets
 
 
-def _paginate(extra_filter: dict):
+def _paginate(extra_filter: dict) -> Iterator[dict]:
     """Yield all ES hits for NARA items with Unlimited Re-Use and mediaMaster, filtered by extra_filter."""
     search_after = None
     while True:
@@ -163,7 +164,7 @@ def _paginate(extra_filter: dict):
             "query": {
                 "bool": {
                     "filter": [
-                        {"term": {"provider.name.not_analyzed": NARA_PROVIDER}},
+                        {"term": {"provider.name.not_analyzed": NARA_PROVIDER_NAME}},
                         {"term": {"rightsCategory": "Unlimited Re-Use"}},
                         {"exists": {"field": "mediaMaster"}},
                         extra_filter,

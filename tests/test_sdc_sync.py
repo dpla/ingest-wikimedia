@@ -1867,7 +1867,6 @@ def test_post_sdc_cleanup_for_item_isolates_per_page_failures(monkeypatch, caplo
     """A per-page cleanup failure is isolated: the failing page is skipped and
     its siblings still count. (See _post_sdc_cleanup_for_item for why this must
     not propagate.)"""
-    import json
     import logging as _logging
 
     from ingest_wikimedia import wikimedia
@@ -3798,8 +3797,6 @@ def test_submit_per_item_edit_bundles_all_fragments_into_one_post():
     """Every fragment kind — new claims, reference updates, qualifier
     updates, removals — gets bundled into a single ``wbeditentity``
     POST with the combined claims list in ``data.claims``."""
-    import json
-
     from tools import sdc_sync
 
     new_claim = {
@@ -4093,7 +4090,6 @@ def test_p813_refresh_added_when_other_edits_exist():
     refreshes P813 on all DPLA-authored claims whose P813 doesn't match
     the item's DPLA ingestDate."""
     import datetime as _dt
-    import json
 
     from tools import sdc_sync
 
@@ -4143,7 +4139,6 @@ def test_p813_refresh_skips_claims_already_dated_today():
     """A DPLA reference whose P813 already matches the ingestDate is not
     re-emitted."""
     import datetime as _dt
-    import json
 
     from tools import sdc_sync
 
@@ -4219,7 +4214,6 @@ def test_p813_refresh_preserves_user_added_references():
     ONLY the DPLA reference refreshed; user references are preserved
     verbatim in the rewritten references list."""
     import datetime as _dt
-    import json
 
     from tools import sdc_sync
 
@@ -4286,7 +4280,6 @@ def test_reference_refresh_repairs_partial_dpla_reference():
     have skipped it). This is the shape repair that lets us always
     re-assert the expected reference without a separate reconcile pass."""
     import datetime as _dt
-    import json
 
     from tools import sdc_sync
 
@@ -4359,7 +4352,6 @@ def test_reference_refresh_skips_fully_canonical_reference():
     item + P123 + P813 matching the ingestDate) produces no fragment — no
     spurious edit."""
     import datetime as _dt
-    import json
 
     from tools import sdc_sync
 
@@ -4414,8 +4406,6 @@ def test_flush_emits_type_statement_on_every_non_removal_fragment():
     (drives a P813 refresh fragment). Assert every non-removal claim
     in the POSTed payload carries ``type: "statement"``.
     """
-    import json
-
     from tools import sdc_sync
 
     stale_claim = {
