@@ -19,6 +19,7 @@ def test_setup_logging_installs_uncaught_exception_hook(tmp_path, monkeypatch):
     monkeypatch.setattr(logs_mod, "LOGS_DIR_BASE", str(tmp_path))
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
+    saved_level = root.level
     for h in saved_handlers:
         root.removeHandler(h)
     original_hook = sys.excepthook
@@ -31,10 +32,15 @@ def test_setup_logging_installs_uncaught_exception_hook(tmp_path, monkeypatch):
         )
     finally:
         sys.excepthook = original_hook
+        # setup_logging installs a FileHandler that opens a file
+        # descriptor — close it explicitly before dropping the handler
+        # so the fd doesn't outlive the test.
         for h in list(root.handlers):
             root.removeHandler(h)
+            h.close()
         for h in saved_handlers:
             root.addHandler(h)
+        root.setLevel(saved_level)
 
 
 def test_installed_excepthook_routes_traceback_to_root_logger():
