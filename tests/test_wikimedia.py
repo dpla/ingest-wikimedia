@@ -59,6 +59,60 @@ def test_get_page_title():
     assert title == expected_title
 
 
+def test_get_page_title_replaces_underscore_with_space():
+    """Regression: MediaWiki's ``Title`` normalisation converts ``_`` in
+    titles to spaces at store time, so a DPLA source title like
+    ``doris_ulmann_0001`` must be rewritten to ``Doris ulmann 0001``
+    at construction time — otherwise every downstream title-equality
+    check (skip-if-already-there, hash-drift, expected_item_titles
+    sibling protection, orphan probes, ``{{duplicate}}``-tag targets)
+    treats the constructed vs. stored pair as drift and triggers a
+    phantom Case-2 tag-upload that Commons itself rejects with
+    ``fileexists-no-change``.
+
+    Concrete pre-fix repro (2026-07-03 MWDL run): DPLA IDs
+    ``fbfa741802e31f0b3b9ba69a79ed675b``,
+    ``df20cb360e0f5fb5d8e1e9ddf7ac557c``,
+    ``e34fac17587acd584cd038ced095fd01`` — three Doris Ulmann
+    photographs whose ``sourceResource.title`` is a literal
+    underscore-separated slug that Commons stored as
+    ``File:Doris ulmann 000N - DPLA - <id>.jpg``.
+    """
+    title = get_page_title(
+        "doris_ulmann_0001", "fbfa741802e31f0b3b9ba69a79ed675b", ".jpg"
+    )
+    assert title == "Doris ulmann 0001 - DPLA - fbfa741802e31f0b3b9ba69a79ed675b.jpg", (
+        title
+    )
+    # ``_`` must NOT appear anywhere in the item-title portion.
+    assert "_" not in title.split(" - DPLA -")[0]
+
+
+def test_get_page_title_capitalizes_first_character_only():
+    """MediaWiki's ``Title::capitalize`` uppercases the FIRST character
+    of any title in a capitalized namespace (which ``File:`` is), but
+    does NOT lowercase the rest — internal case is preserved
+    verbatim. So a source title like ``eBookLibrary_1998`` becomes
+    ``EBookLibrary 1998`` on Commons (E capitalized, B/L/... preserved),
+    not ``Ebooklibrary 1998`` (which ``str.capitalize()`` would produce).
+    """
+    title = get_page_title("eBookLibrary_1998", "cafef00d" * 4, ".jpg")
+    assert title.startswith("EBookLibrary 1998"), title
+    # Rest of the casing is preserved — no forced lowercase.
+    assert "EBook" in title
+    assert "Ebook" not in title
+
+
+def test_get_page_title_leaves_already_capitalized_titles_alone():
+    """The uppercase-first-char step must be a no-op when the source
+    title already starts with an uppercase letter — regression guard
+    against a refactor that swaps in ``.capitalize()`` and silently
+    lowercases everything after the first character."""
+    title = get_page_title("Sample Title", "abcd1234", ".jpg")
+    # Byte-identical to pre-fix output for the common case.
+    assert title == "Sample Title - DPLA - abcd1234.jpg"
+
+
 def test_get_page_title_trims_trailing_whitespace_after_truncation():
     """Regression: a DPLA-supplied title longer than 181 chars whose 181st
     character lands on whitespace must NOT leave that whitespace in the
@@ -178,7 +232,9 @@ def test_get_page_title_breaks_query_string_when_both_present():
     # Both characters get rewritten so the title no longer matches `&...=`.
     assert "&" not in title
     assert "=" not in title
-    assert "filter-value+other-thing" in title
+    # Leading letter capitalized (MediaWiki ``Title::capitalize`` — see
+    # get_page_title docstring); rest of casing preserved.
+    assert "Filter-value+other-thing" in title
 
 
 def test_get_page_title_replaces_slash_with_dash():
