@@ -46,6 +46,7 @@ def test_installed_excepthook_routes_traceback_to_root_logger():
     LogRecord's ``exc_info`` field pins the behavior instead."""
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
+    saved_level = root.level
     for h in saved_handlers:
         root.removeHandler(h)
     original_hook = sys.excepthook
@@ -69,6 +70,7 @@ def test_installed_excepthook_routes_traceback_to_root_logger():
             root.removeHandler(h)
         for h in saved_handlers:
             root.addHandler(h)
+        root.setLevel(saved_level)
 
     assert len(captured) == 1
     rec = captured[0]
@@ -79,6 +81,26 @@ def test_installed_excepthook_routes_traceback_to_root_logger():
     )
     assert rec.exc_info[0] is RuntimeError
     assert "crash-payload" in str(rec.exc_info[1])
+
+
+def test_installed_excepthook_is_idempotent():
+    """A repeat install must be a no-op. Without the guard, a caller
+    that invoked ``setup_logging`` twice (e.g. a future partner-mode
+    worker re-initializing per file) would wrap the hook around
+    itself, so a single uncaught exception would log at CRITICAL N
+    times where N is the install count."""
+    original_hook = sys.excepthook
+    try:
+        logs_mod._install_logging_excepthook()
+        first = sys.excepthook
+        logs_mod._install_logging_excepthook()
+        assert sys.excepthook is first, (
+            "second _install_logging_excepthook call must be a no-op; "
+            "wrapping the hook again would produce duplicate CRITICAL "
+            "logs per uncaught exception"
+        )
+    finally:
+        sys.excepthook = original_hook
 
 
 def test_installed_excepthook_delegates_to_previous_hook_in_chain():

@@ -26,7 +26,16 @@ def _install_logging_excepthook() -> None:
     they're operator-driven / clean-exit signals, not crashes, and
     logging them at CRITICAL would fill the log with false alarms on
     every ``Ctrl-C`` or ``sys.exit(0)``.
+
+    Idempotent: a repeat install is a no-op. Without this a caller that
+    invoked ``setup_logging`` twice would wrap the hook around itself,
+    logging every uncaught exception N times where N is the install
+    count. No production caller does this today, but the guard keeps
+    the behavior safe against future reuse (e.g. a partner-mode worker
+    re-initializing per file).
     """
+    if getattr(sys.excepthook, "_is_logging_excepthook", False):
+        return
     prev_hook = sys.excepthook
 
     def _hook(exc_type, exc_value, exc_tb):
@@ -36,6 +45,7 @@ def _install_logging_excepthook() -> None:
         logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
         prev_hook(exc_type, exc_value, exc_tb)
 
+    _hook._is_logging_excepthook = True
     sys.excepthook = _hook
 
 

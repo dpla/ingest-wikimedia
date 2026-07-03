@@ -12,6 +12,8 @@ key behaviours pinned here:
     ``resume_below`` (hysteresis), refills headroom, and times out cleanly.
 """
 
+import pytest
+
 from ingest_wikimedia.dup_throttle import DuplicateCategoryThrottle
 
 
@@ -152,16 +154,12 @@ def test_construction_without_site_or_size_fn_raises():
     exploded on ``pywikibot.Category(None, ...)``. Fail fast at
     construction so a similarly broken future caller can't silently
     sit dormant until the first API call."""
-    try:
+    with pytest.raises(ValueError) as exc_info:
         DuplicateCategoryThrottle()
-    except ValueError as e:
-        assert "site" in str(e).lower() or "size_fn" in str(e).lower(), (
-            "error message should mention site or size_fn to point the "
-            f"caller at the fix; got: {e!r}"
-        )
-        return
-    raise AssertionError(
-        "expected ValueError when neither site nor size_fn is provided"
+    message = str(exc_info.value).lower()
+    assert "site" in message or "size_fn" in message, (
+        "error message should mention site or size_fn to point the "
+        f"caller at the fix; got: {exc_info.value!r}"
     )
 
 

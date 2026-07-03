@@ -38,7 +38,7 @@ def stub_setup_logging_and_get_site(monkeypatch):
     ``DuplicateCategoryThrottle``, so the return value is only used
     as an opaque argument to the patched throttle constructor."""
     monkeypatch.setattr(drain_deferred, "setup_logging", lambda *a, **kw: None)
-    monkeypatch.setattr(drain_deferred, "get_site", lambda: MagicMock())
+    monkeypatch.setattr(drain_deferred, "get_site", MagicMock)
 
 
 @pytest.fixture
