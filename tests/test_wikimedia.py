@@ -128,7 +128,7 @@ def test_get_page_title_capitalizes_first_character_only():
     not ``Ebooklibrary 1998`` (which ``str.capitalize()`` would produce).
     """
     title = get_page_title("eBookLibrary_1998", "cafef00d" * 4, ".jpg")
-    assert title.startswith("EBookLibrary 1998"), title
+    assert title == f"EBookLibrary 1998 - DPLA - {'cafef00d' * 4}.jpg", title
     # Rest of the casing is preserved — no forced lowercase.
     assert "EBook" in title
     assert "Ebook" not in title
