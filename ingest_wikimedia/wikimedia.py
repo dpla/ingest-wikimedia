@@ -185,9 +185,52 @@ def get_page_title(
         .replace(
             "\ufffd", "\u2019"
         )  # Unicode replacement char → right single quote (corrupted metadata)
+        # MediaWiki's ``Title`` normalisation converts ``_`` to space in
+        # stored titles. Without this replacement, a DPLA source title
+        # like ``doris_ulmann_0001`` produces the constructed title
+        # ``doris_ulmann_0001 - DPLA - <id>.jpg`` while Commons stores
+        # it as ``Doris ulmann 0001 - DPLA - <id>.jpg`` (and returns
+        # that form on any query). Every downstream title-equality
+        # check then treats the pair as a Case-2 hash-drift, triggering
+        # a bogus ``{{duplicate}}``-tag attempt that Commons itself
+        # rejects with ``fileexists-no-change``. Concrete repro: MWDL
+        # DPLA IDs fbfa741802e31f0b3b9ba69a79ed675b,
+        # df20cb360e0f5fb5d8e1e9ddf7ac557c,
+        # e34fac17587acd584cd038ced095fd01 — Doris Ulmann photographs
+        # whose ``sourceResource.title`` is a literal underscore-
+        # separated slug.
+        .replace("_", " ")
     )
 
     escaped_visible_title = replace_invisible(escaped_title)
+
+    # MediaWiki collapses any run of whitespace in a stored title down to
+    # a single space and trims leading/trailing whitespace. Applied AFTER
+    # the ``_`` → space replacement above so mixed inputs like
+    # ``foo__bar`` (2 underscores → 2 spaces) or ``foo_ bar`` (underscore
+    # + space → 2 spaces) also collapse to the single-space form Commons
+    # actually stores. Without this collapse,
+    # :func:`find_file_by_hash` — which compares
+    # ``img.title(with_ns=False)`` to the raw ``preferred_title`` we
+    # construct here — would miss the match on any DPLA title with
+    # adjacent whitespace/underscore, sending the item down the wrong
+    # drift path. ``" ".join(s.split())`` collapses any Unicode
+    # whitespace run and strips edges, matching MediaWiki's behavior.
+    escaped_visible_title = " ".join(escaped_visible_title.split())
+
+    # MediaWiki's ``Title::capitalize`` uppercases the first character
+    # of every title in a capitalized namespace, which ``File:`` is.
+    # A constructed title of ``doris ulmann 0001 - DPLA - <id>.jpg`` is
+    # stored on Commons as ``Doris ulmann 0001 - DPLA - <id>.jpg`` —
+    # so raw-string equality between our constructed title and the
+    # Commons-stored title only holds if we apply the same uppercase.
+    # Slice-and-upper rather than ``.capitalize()``: the latter ALSO
+    # lowercases the rest of the string, which Commons does NOT — it
+    # preserves internal case.
+    if escaped_visible_title:
+        escaped_visible_title = (
+            escaped_visible_title[:1].upper() + escaped_visible_title[1:]
+        )
 
     # Add pagination to page title if needed
     if page:
