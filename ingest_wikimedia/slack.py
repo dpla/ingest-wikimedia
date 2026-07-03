@@ -45,14 +45,17 @@ def post_message(token: str, text: str) -> None:
 # probably an OOM" hint without having to SSM in and check dmesg.
 #
 # Common interpreter-level exits also have universally-recognised meanings:
-#   * 1 — Python uncaught exception (CRITICAL traceback printed to stderr)
 #   * 2 — Click misuse: bad CLI arguments / failed Click-side validation
 #         (e.g. ``click.BadParameter`` from a precheck like
 #         ``DPLA.check_partner``). Always points at config / args, never code.
 #   * 124 — GNU ``timeout`` (1) wrapper killed the child for exceeding its
 #         deadline. Not used in the pipeline today but cheap to include.
+#
+# Exit 1 is deliberately absent: it's Python's catch-all "something raised"
+# and any hint (previously "uncaught exception — see traceback") over-promised
+# a traceback the message often can't deliver, since the raise may have happened
+# in a ``finally`` block or before ``setup_logging`` ran.
 _EXIT_CODE_HINTS: dict[int, str] = {
-    1: "uncaught exception — see traceback",
     2: "rejected its arguments",
     124: "timed out",
     130: "SIGINT (Ctrl-C)",
@@ -79,12 +82,26 @@ def _decode_exit_code(rc_str: str | None) -> str:
     return f" (exit {rc}" + (f" — {hint})" if hint else ")")
 
 
-def _find_latest_log(partner_dir: str, label: str, phase: str = "*") -> str | None:
+def _find_latest_log(
+    partner_dir: str,
+    label: str,
+    phase: str = "*",
+    min_mtime: float | None = None,
+) -> str | None:
     """Return the most recently modified log file matching this label, or None.
 
     Logs are named `{timestamp}-{label}-{phase}.log` under `<partner_dir>/logs/`.
     Pass `phase` (e.g. "download", "upload") to restrict the match to a single
     phase; the default matches any phase.
+
+    ``min_mtime`` (Unix epoch seconds) filters out files older than the given
+    threshold. The launcher stamps ``WIKIMEDIA_STEP_START`` right before each
+    step so that a step which dies before ``setup_logging`` runs (i.e., writes
+    no log of its own) does NOT get a stale log from a previous run attached
+    to its Slack failure message — instead the caller sees ``None`` and can
+    say "no log written yet." Without this, a step that fails during
+    pre-``setup_logging`` init would post a log from an unrelated prior run,
+    which is worse than posting no log at all.
 
     Tolerates the rare race where a candidate disappears between glob and stat —
     raising OSError here would suppress the Slack failure notification entirely.
@@ -98,9 +115,29 @@ def _find_latest_log(partner_dir: str, label: str, phase: str = "*") -> str | No
             mtime = os.path.getmtime(path)
         except OSError:
             continue
+        if min_mtime is not None and mtime < min_mtime:
+            continue
         if newest is None or mtime > newest[0]:
             newest = (mtime, path)
     return newest[1] if newest is not None else None
+
+
+def _step_start_mtime() -> float | None:
+    """Return ``WIKIMEDIA_STEP_START`` as a float, or None if unset/malformed.
+
+    The launcher exports this via ``$(date +%s)`` right before each step,
+    scoping the failure-log lookup to files created after the step began.
+    Malformed values (empty, non-numeric) return None — same as if the launcher
+    predates the export, so the failure handler falls back to the unbounded
+    lookup rather than suppressing every message.
+    """
+    raw = os.environ.get("WIKIMEDIA_STEP_START", "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 # Counted markers shown in the failure summary.  Patterns match what the
@@ -122,6 +159,12 @@ def _summarize_log(log_path: str, tail_lines: int = 8) -> str | None:
     Tries to be cheap: only reads up to ~2 MB from the end of the file.  Counts
     common markers and tails the last N lines so the cause of the failure is
     visible without SSM-ing in.
+
+    Suppresses the "Counts so far" marker line when the tail already contains
+    the tool's own ``COUNTS:`` block: those tracker-side counters are
+    authoritative, and showing both side by side made the two numbers look
+    contradictory (the marker regex misses categories like
+    ``UPLOAD_SKIPPED_NOT_PRESENT`` that don't emit a ``Skipping …`` line).
     """
     try:
         size = os.path.getsize(log_path)
@@ -132,13 +175,16 @@ def _summarize_log(log_path: str, tail_lines: int = 8) -> str | None:
     except OSError:
         return None
 
-    counts = []
-    for label, pat in _LOG_MARKERS:
-        n = len(pat.findall(data))
-        if n:
-            counts.append(f"{n} {label}")
+    tail_line_list = data.splitlines()[-tail_lines:]
+    tail = "\n".join(tail_line_list)
+    tail_has_counts = any(line.startswith("COUNTS:") for line in tail_line_list)
 
-    tail = "\n".join(data.splitlines()[-tail_lines:])
+    counts = []
+    if not tail_has_counts:
+        for label, pat in _LOG_MARKERS:
+            n = len(pat.findall(data))
+            if n:
+                counts.append(f"{n} {label}")
 
     parts = [f"Log: `{os.path.basename(log_path)}`"]
     if counts:
@@ -303,13 +349,33 @@ def notify_pipeline_fail() -> None:
     # the tee'd stderr file the launcher writes — without this, a
     # failure inside get-ids-es would only ever surface as a bare
     # "exit N" in Slack.
+    #
+    # ``step_start`` filters out log files from earlier runs so a step
+    # that died before ``setup_logging`` ran doesn't get a stale log
+    # (potentially weeks old) attached to its failure message. See
+    # :func:`_find_latest_log` for the rationale.
     partner_dir = os.environ.get("WIKIMEDIA_PARTNER_DIR", "")
+    step_start = _step_start_mtime()
     summary: str | None = None
     log_suffix = _PHASE_LOG_SUFFIX.get(step)
     if log_suffix is not None:
-        log_path = _find_latest_log(partner_dir, label, phase=log_suffix)
+        log_path = _find_latest_log(
+            partner_dir, label, phase=log_suffix, min_mtime=step_start
+        )
         if log_path is not None:
             summary = _summarize_log(log_path)
+        elif step_start is not None:
+            # The mtime filter dropped every candidate, which means the
+            # step died before ``setup_logging`` could write its own log
+            # file. Say so explicitly instead of silently omitting the
+            # summary — surfacing a log from a prior run (the previous
+            # behavior) confused operators into diagnosing the wrong
+            # incident.
+            summary = (
+                f"No `{step}` log written for this run "
+                "(step likely died before `setup_logging` ran — "
+                "check tmux buffer or preceding step's exit chain)."
+            )
     elif step == "id-generation":
         stderr_tail = _tail_text_file(id_generation_stderr_tail_file(raw_label))
         if stderr_tail:
@@ -318,7 +384,7 @@ def notify_pipeline_fail() -> None:
         # Unknown step (or step unset on a stale launcher): fall back to
         # the legacy any-phase log lookup so we don't regress on the
         # info-density of the pre-step-tracking message.
-        log_path = _find_latest_log(partner_dir, label)
+        log_path = _find_latest_log(partner_dir, label, min_mtime=step_start)
         if log_path is not None:
             summary = _summarize_log(log_path)
     if summary:

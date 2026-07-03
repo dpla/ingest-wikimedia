@@ -18,6 +18,7 @@ from ingest_wikimedia.slack import (
     _decode_exit_code,
     _find_latest_log,
     _read_download_failed_count,
+    _step_start_mtime,
     _summarize_log,
     notify_phase_start,
     notify_pipeline_fail,
@@ -65,7 +66,7 @@ def test_notify_phase_start_supports_sdc_sync_phase():
         ("", ""),
         (None, ""),
         ("not-a-number", ""),
-        ("1", " (exit 1 — uncaught exception — see traceback)"),
+        ("1", " (exit 1)"),
         ("2", " (exit 2 — rejected its arguments)"),
         ("124", " (exit 124 — timed out)"),
         ("137", " (exit 137 — SIGKILL — likely OOM)"),
@@ -103,6 +104,70 @@ def test_find_latest_log_picks_most_recent_match(tmp_path):
 def test_find_latest_log_returns_none_when_no_match(tmp_path):
     (tmp_path / "logs").mkdir()
     assert _find_latest_log(str(tmp_path), "nope") is None
+
+
+def test_find_latest_log_filters_files_older_than_min_mtime(tmp_path):
+    """A log written before the current step began must NOT be surfaced —
+    this is the June-13 incident: today's ``si`` upload step died before
+    ``setup_logging`` ran, so no fresh log existed, and the failure
+    handler picked up a 3-week-old ``si-upload.log`` from a prior run
+    and attached its (irrelevant, successful) COUNTS block to a Slack
+    failure message. The mtime filter is the read-side of the
+    launcher's ``WIKIMEDIA_STEP_START`` stamp.
+    """
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    label = "si"
+    step_start = time.time()
+
+    ancient = logs_dir / f"20260613-141221-{label}-upload.log"
+    ancient.write_text("[INFO] a run from three weeks ago\nCOUNTS:\nUPLOADED: 30\n")
+    # Force the file to look 20 days old relative to step_start.
+    twenty_days_ago = step_start - 20 * 86400
+    os.utime(str(ancient), (twenty_days_ago, twenty_days_ago))
+
+    # Unbounded lookup still returns it (legacy behavior; regression guard).
+    assert _find_latest_log(str(tmp_path), label, phase="upload") == str(ancient)
+
+    # Scoped lookup drops it — the caller sees ``None`` and can say
+    # "no log written yet" instead of surfacing a stale log.
+    assert (
+        _find_latest_log(str(tmp_path), label, phase="upload", min_mtime=step_start)
+        is None
+    )
+
+
+def test_find_latest_log_returns_current_run_when_present(tmp_path):
+    """The mtime filter must not drop a legitimately fresh log — a
+    step that failed AFTER ``setup_logging`` wrote its file should
+    still surface that log."""
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    label = "si"
+    step_start = time.time() - 60  # step began a minute ago
+
+    fresh = logs_dir / f"20260703-041300-{label}-upload.log"
+    fresh.write_text("[INFO] fresh run\n")
+    os.utime(str(fresh), (time.time(), time.time()))
+
+    assert _find_latest_log(
+        str(tmp_path), label, phase="upload", min_mtime=step_start
+    ) == str(fresh)
+
+
+def test_step_start_mtime_reads_env_and_handles_malformed():
+    """A stale launcher (no export) or a malformed value must fall back to
+    ``None`` — same as if the filter wasn't wired up — rather than
+    suppressing every failure message."""
+    with patch.dict(os.environ, {"WIKIMEDIA_STEP_START": "1751500000"}, clear=False):
+        assert _step_start_mtime() == 1751500000.0
+    with patch.dict(os.environ, {"WIKIMEDIA_STEP_START": ""}, clear=False):
+        assert _step_start_mtime() is None
+    with patch.dict(os.environ, {"WIKIMEDIA_STEP_START": "not-a-number"}, clear=False):
+        assert _step_start_mtime() is None
+    # Fully unset.
+    with patch.dict(os.environ, {}, clear=True):
+        assert _step_start_mtime() is None
 
 
 def test_find_latest_log_handles_missing_dir():
@@ -185,7 +250,7 @@ def test_drain_deferred_opportunistic_step_name_is_wired_consistently():
     from ingest_wikimedia.slack import _PHASE_LOG_SUFFIX
 
     wrapped = _wrap_step_with_marker("drain-deferred --no-wait nara")
-    assert "export WIKIMEDIA_STEP=drain-deferred-opportunistic &&" in wrapped, (
+    assert "WIKIMEDIA_STEP=drain-deferred-opportunistic " in wrapped, (
         "launcher must emit ``drain-deferred-opportunistic`` as the "
         "WIKIMEDIA_STEP value for the per-target ``--no-wait`` drain"
     )
@@ -274,11 +339,14 @@ def test_notify_pipeline_fail_treats_any_value_other_than_1_as_not_last():
 # ---------------------------------------------------------------------------
 
 
-def test_decode_exit_code_interprets_python_exit_1():
-    """Exit 1 ≈ Python uncaught exception. Including the hint makes the
-    Slack message actionable — "look for a CRITICAL traceback in the log"
-    instead of "the pipeline failed somehow with exit 1"."""
-    assert _decode_exit_code("1") == " (exit 1 — uncaught exception — see traceback)"
+def test_decode_exit_code_exit_1_has_no_hint():
+    """Exit 1 deliberately has no hint. The previous ``uncaught exception —
+    see traceback`` phrasing over-promised a traceback that the message
+    often couldn't deliver — the raise may happen in a ``finally`` block
+    (past ``setup_logging``'s excepthook install) or before ``setup_logging``
+    even ran, both of which leave no traceback in the file the failure
+    handler tails."""
+    assert _decode_exit_code("1") == " (exit 1)"
 
 
 def test_decode_exit_code_interprets_click_exit_2():
@@ -302,7 +370,6 @@ def test_notify_pipeline_fail_names_the_failing_step():
         }
     )
     assert "`id-generation` step failed" in msg, msg
-    assert "uncaught exception" in msg, msg
     assert "pipeline step failed" not in msg, (
         "step-aware header must replace the generic phrasing"
     )
@@ -432,6 +499,115 @@ def test_notify_pipeline_fail_phase_log_scopes_to_failing_step(tmp_path):
     # download log should NOT be the tailed file.
     assert "boom in uploader" in msg
     assert "downloader ran fine" not in msg
+
+
+def test_notify_pipeline_fail_says_no_log_when_step_died_before_setup_logging(
+    tmp_path,
+):
+    """When ``WIKIMEDIA_STEP_START`` is set and no matching log has been
+    written since (i.e. the step died before ``setup_logging`` ran), the
+    failure handler must say so explicitly rather than surfacing a
+    log from a prior run. This is the exact June-13-log-on-July-3 bug
+    the fix targets."""
+    base = tmp_path
+    logs = base / "logs"
+    logs.mkdir()
+    label = "si"
+    # Simulate a 3-week-old upload log left on disk from a prior run.
+    stale = logs / "20260613-141221-si-upload.log"
+    stale.write_text(
+        "[INFO] 14:12:21: unrelated older run\nCOUNTS:\nUPLOADED: 30\nSKIPPED: 6925\n"
+    )
+    twenty_days_ago = time.time() - 20 * 86400
+    os.utime(str(stale), (twenty_days_ago, twenty_days_ago))
+
+    step_start = int(time.time())
+    msg = _capture_message(
+        {
+            "DPLA_SLACK_BOT_TOKEN": "x",
+            "WIKIMEDIA_SESSION_LABEL": label,
+            "WIKIMEDIA_PARTNER_DIR": str(base),
+            "WIKIMEDIA_LAST_EXIT": "1",
+            "WIKIMEDIA_STEP": "upload",
+            "WIKIMEDIA_STEP_START": str(step_start),
+        }
+    )
+    # The stale log's tail must NOT be attached.
+    assert "unrelated older run" not in msg
+    assert "UPLOADED: 30" not in msg
+    # The message must say why there's no summary.
+    assert "No `upload` log written for this run" in msg
+    assert "setup_logging" in msg
+
+
+def test_summarize_log_suppresses_marker_counts_when_tail_has_counts_block(tmp_path):
+    """When the tail already contains the tool's authoritative ``COUNTS:``
+    block, suppress the ``Counts so far`` marker-regex line. Both
+    numbers shown side-by-side confused operators — the regex misses
+    categories that don't emit a ``Skipping …`` line
+    (``UPLOAD_SKIPPED_NOT_PRESENT`` in particular), so a 6925-vs-6918
+    mismatch reads like a bug even when both figures are ``correct``
+    for what they measure."""
+    log = tmp_path / "upload.log"
+    lines = [
+        "[INFO] 14:12:21: Skipping abc 1: Already exists on commons.",
+        "[INFO] 14:12:22: Skipping abc 2: Already exists on commons.",
+        "[INFO] 14:12:23: Uploaded to https://commons.wikimedia.org/wiki/File:Foo.jpg",
+        "[INFO] 14:43:29: ",
+        "COUNTS:",
+        "SKIPPED: 6925",
+        "UPLOAD_SKIPPED_NOT_PRESENT: 7",
+        "UPLOADED: 30",
+        "BYTES: 8991594",
+        "",
+        "[INFO] 14:43:29: 1868.85 seconds.",
+    ]
+    log.write_text("\n".join(lines) + "\n")
+
+    summary = _summarize_log(str(log), tail_lines=8)
+    assert summary is not None
+    # The authoritative COUNTS block is in the tail.
+    assert "COUNTS:" in summary
+    assert "UPLOADED: 30" in summary
+    # The "Counts so far" marker line MUST be gone — that's the whole point.
+    assert "Counts so far" not in summary
+
+
+def test_summarize_log_keeps_marker_counts_when_no_counts_block(tmp_path):
+    """The suppression must be conditional: when the tail does NOT contain
+    a ``COUNTS:`` block (e.g. the tool crashed mid-run), the marker-regex
+    line is still useful and should still appear."""
+    log = tmp_path / "crashed.log"
+    lines = [
+        "[INFO] Starting",
+        "[INFO] Uploaded to https://commons.wikimedia.org/wiki/File:A.jpg",
+        "[INFO] Uploaded to https://commons.wikimedia.org/wiki/File:B.jpg",
+        "[INFO] Skipping x 1: Already exists on commons.",
+        "[ERROR] Failed: something went wrong",
+    ]
+    log.write_text("\n".join(lines) + "\n")
+
+    summary = _summarize_log(str(log), tail_lines=8)
+    assert summary is not None
+    assert "Counts so far" in summary
+    assert "2 uploaded" in summary
+
+
+def test_wrap_step_with_marker_exports_step_start_alongside_step():
+    """The launcher must stamp ``WIKIMEDIA_STEP_START`` on the same
+    ``export`` line as ``WIKIMEDIA_STEP`` so the slack failure
+    handler can filter out logs older than the failing step. Both
+    must be evaluated at export time (not script-parse time) so
+    each step's start is fresh."""
+    from scripts.wikimedia_launch import _wrap_step_with_marker
+
+    wrapped = _wrap_step_with_marker("uploader nara.csv nara")
+    assert "WIKIMEDIA_STEP=upload " in wrapped or "WIKIMEDIA_STEP=upload\t" in wrapped
+    # Runtime-evaluated epoch stamp, quoted to survive shell splitting.
+    assert 'WIKIMEDIA_STEP_START="$(date +%s)"' in wrapped, wrapped
+    # Order: exports first, then the wrapped command after ``&&``.
+    assert wrapped.startswith("export WIKIMEDIA_STEP=")
+    assert " && uploader nara.csv nara" in wrapped
 
 
 # ---------------------------------------------------------------------------

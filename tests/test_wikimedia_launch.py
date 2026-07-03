@@ -426,23 +426,30 @@ def test_wrap_step_with_marker_tags_each_tool_with_its_phase():
     pass through unchanged."""
     from scripts.wikimedia_launch import _wrap_step_with_marker
 
-    assert _wrap_step_with_marker("downloader x.csv georgia").startswith(
-        "export WIKIMEDIA_STEP=download && downloader "
+    # The export line now also stamps WIKIMEDIA_STEP_START (Unix epoch) so
+    # the failure handler can filter out logs older than the current step
+    # — see ``ingest_wikimedia.slack._find_latest_log``'s ``min_mtime``.
+    _STEP_START_FRAGMENT = 'WIKIMEDIA_STEP_START="$(date +%s)"'
+
+    def _assert_step_export(cmd: str, step: str, cmd_prefix: str) -> None:
+        w = _wrap_step_with_marker(cmd)
+        assert w.startswith(f"export WIKIMEDIA_STEP={step} ")
+        assert _STEP_START_FRAGMENT in w
+        assert f" && {cmd_prefix}" in w
+
+    _assert_step_export("downloader x.csv georgia", "download", "downloader ")
+    _assert_step_export("uploader x.csv ohio --no-create", "upload", "uploader ")
+    _assert_step_export(
+        "sdc-sync --partner texas --ids-file x.csv --workers 6", "sdc-sync", "sdc-sync "
     )
-    assert _wrap_step_with_marker("uploader x.csv ohio --no-create").startswith(
-        "export WIKIMEDIA_STEP=upload && uploader "
-    )
-    assert _wrap_step_with_marker(
-        "sdc-sync --partner texas --ids-file x.csv --workers 6"
-    ).startswith("export WIKIMEDIA_STEP=sdc-sync && sdc-sync ")
-    assert _wrap_step_with_marker("drain-deferred nara").startswith(
-        "export WIKIMEDIA_STEP=drain-deferred && drain-deferred "
-    )
+    _assert_step_export("drain-deferred nara", "drain-deferred", "drain-deferred ")
     # ``drain-deferred --no-wait`` (per-target opportunistic phase)
     # gets a distinct step name so the failure handler tails the
     # opportunistic log file rather than the batch-terminal one.
-    assert _wrap_step_with_marker("drain-deferred --no-wait nara").startswith(
-        "export WIKIMEDIA_STEP=drain-deferred-opportunistic && drain-deferred "
+    _assert_step_export(
+        "drain-deferred --no-wait nara",
+        "drain-deferred-opportunistic",
+        "drain-deferred ",
     )
     # Non-step commands (``cd``, the case-2 graceful-skip ``echo … ; true``,
     # and the ``sdc-sync --cat`` flavour the maintain builder emits — wait,
@@ -468,7 +475,8 @@ def test_wrap_step_with_marker_tees_id_generation_stderr():
         "get-ids-es digitalnc --institution 'Duke University Libraries'"
         " --maintain --skip-media-filter > out.csv"
     )
-    assert wrapped.startswith("export WIKIMEDIA_STEP=id-generation && ")
+    assert wrapped.startswith("export WIKIMEDIA_STEP=id-generation ")
+    assert 'WIKIMEDIA_STEP_START="$(date +%s)"' in wrapped
     # The redirect must keep stdout on the CSV (the existing >),
     # tee stderr to a per-session path interpolated from
     # ``${WIKIMEDIA_SESSION_LABEL}`` at runtime (so concurrent tmux
