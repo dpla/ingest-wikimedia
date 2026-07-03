@@ -169,6 +169,13 @@ def _wrap_step_with_marker(cmd: str) -> str:
     step = _STEP_BY_FIRST_TOKEN.get(first)
     if step is None:
         return cmd
+    # ``drain-deferred --no-wait`` is the per-target opportunistic
+    # phase; a distinct step name routes the failure handler to a
+    # distinct log-file suffix, avoiding collision with the terminal
+    # patient drain's ``drain-deferred`` log. The slack failure
+    # handler's ``_PHASE_LOG_SUFFIX`` map has the matching entry.
+    if step == "drain-deferred" and "--no-wait" in shlex.split(cmd):
+        step = "drain-deferred-opportunistic"
     wrapped = cmd
     if step == "id-generation":
         # The existing build emits ``... > csv_file`` for stdout; appending
@@ -1215,6 +1222,15 @@ def main() -> None:
     )
     target_blocks = []
     last_idx = len(targets) - 1
+    # A batch of full upload runs (not maintain, not sdc-only, not
+    # refresh-only) queues a terminal patient-drain phase per unique
+    # partner AFTER every target's chain finishes — so no partner sits
+    # idle waiting on Commons volunteers while later targets could be
+    # uploading. When those drains exist, the last TARGET is not the
+    # last thing in the batch — the last drain block is — so
+    # ``WIKIMEDIA_TARGET_IS_LAST`` moves to that drain block instead
+    # of the last target.
+    batch_has_terminal_drain = not maintain and not sdc_only and not refresh_only
     for idx, (canonical, institutions, session_label, dpla_id, collection) in enumerate(
         targets
     ):
@@ -1243,7 +1259,7 @@ def main() -> None:
         # earlier in the batch doesn't inherit a stale "is last" flag.
         is_last_env = (
             "export WIKIMEDIA_TARGET_IS_LAST=1"
-            if idx == last_idx
+            if idx == last_idx and not batch_has_terminal_drain
             else "unset WIKIMEDIA_TARGET_IS_LAST"
         )
         # ``unset WIKIMEDIA_STEP`` first so a failure in this target's
@@ -1327,11 +1343,15 @@ def main() -> None:
                 pipeline_steps.append(
                     f"sdc-sync --partner {canonical} --ids-file {csv_file}{sdc_opts}"
                 )
-                # Drain any Case-2 hash-drift uploads the uploader deferred
-                # because Category:Duplicate was at capacity. No-op when
-                # nothing deferred (the common case); patient loop when
-                # non-empty. See tools/drain_deferred.py for the design.
-                pipeline_steps.append(f"drain-deferred {canonical}")
+                # Opportunistic drain: single best-effort round that
+                # runs if Category:Duplicate happens to be below the
+                # resume threshold RIGHT NOW, otherwise exits without
+                # waiting. Never blocks the next target. The batch's
+                # patient drain (per partner, at the end of the whole
+                # pipeline — see the ``final_drain_blocks`` build
+                # below) picks up whatever this pass left in the
+                # sidecar.
+                pipeline_steps.append(f"drain-deferred --no-wait {canonical}")
         # Wrap each step with an ``export WIKIMEDIA_STEP=<name>`` prefix so
         # the per-target failure handler (``notify_pipeline_fail``) can name
         # the failing phase in Slack instead of just reporting an exit code.
@@ -1342,7 +1362,56 @@ def main() -> None:
             f"{label_export}; {{ {target_steps}; }}"
             f" || {{ {notify_fail_cmd} >/dev/null 2>&1 || true; }}"
         )
-    pipeline_cmd = f"{setup} && {{ {'; '.join(target_blocks)}; }}"
+
+    # Terminal patient-drain phase — one block per unique partner
+    # in the batch. Runs AFTER every target's chain has finished, so
+    # no partner sits idle waiting on Commons volunteers to clear
+    # Category:Duplicate while later targets could be uploading.
+    # The per-target opportunistic drain (``--no-wait``) inside each
+    # chain already actioned anything that fit; this phase does the
+    # unbounded patient wait. Dedup by canonical: two collection-
+    # scoped targets for the same partner share one terminal drain
+    # (a second drain would see an empty sidecar and no-op).
+    final_drain_blocks: list[str] = []
+    if batch_has_terminal_drain:
+        # ``dict.fromkeys`` gives an order-preserving unique iterator —
+        # same idiom used elsewhere in the tree (wikimedia.py, maintain.py).
+        unique_canonical = list(dict.fromkeys(t[0] for t in targets))
+        partners_to_drain: list[tuple[str, str]] = [
+            (
+                canonical,
+                f"/home/ec2-user/ingest-wikimedia/{PARTNER_DIR.get(canonical, canonical)}",
+            )
+            for canonical in unique_canonical
+        ]
+        for i, (canonical, base) in enumerate(partners_to_drain):
+            is_last_drain = i == len(partners_to_drain) - 1
+            drain_is_last_env = (
+                "export WIKIMEDIA_TARGET_IS_LAST=1"
+                if is_last_drain
+                else "unset WIKIMEDIA_TARGET_IS_LAST"
+            )
+            # Distinct session label per partner drain so the
+            # failure-handler's log lookup finds
+            # ``…-drain-{canonical}-drain-deferred.log`` (via
+            # ``setup_logging(canonical, "drain-deferred")`` in the
+            # drain tool).
+            drain_label = f"drain-{canonical}"
+            drain_label_export = (
+                f"export WIKIMEDIA_SESSION_LABEL={shlex.quote(drain_label)}; "
+                f"export WIKIMEDIA_PARTNER_DIR={shlex.quote(base)}; "
+                f"{drain_is_last_env}; "
+                f"unset WIKIMEDIA_SINGLE_ITEM; "
+                f"unset WIKIMEDIA_STEP"
+            )
+            drain_step = _wrap_step_with_marker(f"drain-deferred {canonical}")
+            final_drain_blocks.append(
+                f"{drain_label_export}; {{ cd {base} && {drain_step}; }}"
+                f" || {{ {notify_fail_cmd} >/dev/null 2>&1 || true; }}"
+            )
+
+    all_blocks = target_blocks + final_drain_blocks
+    pipeline_cmd = f"{setup} && {{ {'; '.join(all_blocks)}; }}"
 
     if slack_token:
         single_item_targets = [

@@ -274,26 +274,31 @@ class NewFilePageBlocked(RuntimeError):
     """
 
 
-_WHITESPACE_RUN_RE = re.compile(r"\s+")
+_TITLE_WHITESPACE_RE = re.compile(r"[\s_]+")
 
 
 def _canonicalize_commons_title(title: str) -> str:
     """Return ``title`` under a light MediaWiki-title normalisation:
-    strip leading/trailing whitespace and collapse internal whitespace
-    runs to a single space.
+    strip leading/trailing whitespace/underscores and collapse runs
+    of whitespace and underscores to a single space.
 
-    Used by ``_tag_drift_duplicate``'s self-tag defense — a raw Python
-    string comparison of "the old title" vs "the new title" can miss
-    a match when the two names disagree only in whitespace-run form
-    (the exact shape ``get_page_title``'s ``[:181]`` truncation-lands-
-    on-whitespace bug used to produce). This helper mirrors just enough
-    of MediaWiki's title normalisation to catch that class of case
-    without pulling in the broader normalisation surface (Unicode NFC,
-    underscore ↔ space, namespace-first-letter capitalisation, etc.);
-    those live on the API side and the defense-in-depth guard doesn't
-    need every one of them to be a safety net.
+    MediaWiki treats ``_`` and space as equivalent in page titles
+    (``File:X_Y`` and ``File:X Y`` are the same page). Callers doing
+    Python-string equality between an uploader-constructed title and
+    one returned from Commons must fold both forms — otherwise a
+    same-page pair reads as drift and misroutes through
+    ``_resolve_hash_drift`` → Case 2 → UPLOAD_AND_TAG, inflating
+    the Case-2 deferral sidecar with false positives.
+
+    Also folds whitespace-run vs single-space differences (the
+    ``get_page_title`` truncation-lands-on-whitespace edge case).
+
+    Not exhaustive — Unicode NFC, namespace-first-letter
+    capitalisation, and other server-side normalisations still live
+    on the API side. Covers exactly the two classes that produce
+    false-drift signals in the uploader's Python-side identity check.
     """
-    return _WHITESPACE_RUN_RE.sub(" ", title).strip()
+    return _TITLE_WHITESPACE_RE.sub(" ", title).strip()
 
 
 class Uploader:

@@ -438,6 +438,12 @@ def test_wrap_step_with_marker_tags_each_tool_with_its_phase():
     assert _wrap_step_with_marker("drain-deferred nara").startswith(
         "export WIKIMEDIA_STEP=drain-deferred && drain-deferred "
     )
+    # ``drain-deferred --no-wait`` (per-target opportunistic phase)
+    # gets a distinct step name so the failure handler tails the
+    # opportunistic log file rather than the batch-terminal one.
+    assert _wrap_step_with_marker("drain-deferred --no-wait nara").startswith(
+        "export WIKIMEDIA_STEP=drain-deferred-opportunistic && drain-deferred "
+    )
     # Non-step commands (``cd``, the case-2 graceful-skip ``echo … ; true``,
     # and the ``sdc-sync --cat`` flavour the maintain builder emits — wait,
     # that one IS sdc-sync. Use a true non-step instead.):

@@ -162,6 +162,11 @@ _PHASE_LOG_SUFFIX: dict[str, str] = {
     "upload": "upload",
     "sdc-sync": "sdc",
     "drain-deferred": "drain-deferred",
+    # Per-target opportunistic (``--no-wait``) drain runs inside each
+    # target's chain; a distinct log-file suffix keeps it from
+    # colliding with the batch-terminal patient drain of the same
+    # partner.
+    "drain-deferred-opportunistic": "drain-deferred-opportunistic",
 }
 
 # Per-session-label path the launcher tees ``get-ids-es`` stderr to.
