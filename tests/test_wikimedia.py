@@ -88,6 +88,37 @@ def test_get_page_title_replaces_underscore_with_space():
     assert "_" not in title.split(" - DPLA -")[0]
 
 
+def test_get_page_title_collapses_mixed_underscore_and_space_runs():
+    """Regression (CR flagged on PR #365): ``.replace("_", " ")`` alone
+    leaves ``foo__bar`` as ``foo  bar`` (two spaces) and ``foo_ bar``
+    similarly. MediaWiki collapses whitespace runs to a single space at
+    store time, so the constructed title MUST match. Without this
+    collapse, :func:`find_file_by_hash` (at
+    ``ingest_wikimedia/wikimedia.py`` — compares
+    ``img.title(with_ns=False) == preferred_title``) misses matches
+    against files stored with the single-space canonical form, sending
+    the item down the wrong drift path.
+    """
+    # Two adjacent underscores → single space.
+    t1 = get_page_title("foo__bar", "abcd1234", ".jpg")
+    assert t1 == "Foo bar - DPLA - abcd1234.jpg", t1
+
+    # Underscore + space (either order) → single space.
+    t2 = get_page_title("foo_ bar", "abcd1234", ".jpg")
+    assert t2 == "Foo bar - DPLA - abcd1234.jpg", t2
+    t3 = get_page_title("foo _bar", "abcd1234", ".jpg")
+    assert t3 == "Foo bar - DPLA - abcd1234.jpg", t3
+
+    # Multi-space run (no underscores) also collapses.
+    t4 = get_page_title("foo   bar", "abcd1234", ".jpg")
+    assert t4 == "Foo bar - DPLA - abcd1234.jpg", t4
+
+    # Leading/trailing whitespace stripped (matches MediaWiki's
+    # ``Title`` trim on stored titles).
+    t5 = get_page_title("  foo bar  ", "abcd1234", ".jpg")
+    assert t5 == "Foo bar - DPLA - abcd1234.jpg", t5
+
+
 def test_get_page_title_capitalizes_first_character_only():
     """MediaWiki's ``Title::capitalize`` uppercases the FIRST character
     of any title in a capitalized namespace (which ``File:`` is), but

@@ -204,6 +204,20 @@ def get_page_title(
 
     escaped_visible_title = replace_invisible(escaped_title)
 
+    # MediaWiki collapses any run of whitespace in a stored title down to
+    # a single space and trims leading/trailing whitespace. Applied AFTER
+    # the ``_`` → space replacement above so mixed inputs like
+    # ``foo__bar`` (2 underscores → 2 spaces) or ``foo_ bar`` (underscore
+    # + space → 2 spaces) also collapse to the single-space form Commons
+    # actually stores. Without this collapse,
+    # :func:`find_file_by_hash` — which compares
+    # ``img.title(with_ns=False)`` to the raw ``preferred_title`` we
+    # construct here — would miss the match on any DPLA title with
+    # adjacent whitespace/underscore, sending the item down the wrong
+    # drift path. ``" ".join(s.split())`` collapses any Unicode
+    # whitespace run and strips edges, matching MediaWiki's behavior.
+    escaped_visible_title = " ".join(escaped_visible_title.split())
+
     # MediaWiki's ``Title::capitalize`` uppercases the first character
     # of every title in a capitalized namespace, which ``File:`` is.
     # A constructed title of ``doris ulmann 0001 - DPLA - <id>.jpg`` is
