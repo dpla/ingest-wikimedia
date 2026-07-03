@@ -2081,6 +2081,15 @@ def main(
     workers_budget: int,
 ) -> None:
     start_time = time.time()
+    # ``setup_logging`` is the first thing we do so its
+    # ``_install_logging_excepthook`` covers the whole run — including
+    # pre-``try`` setup calls (``check_partner``, ``WorkerSlotBudget``,
+    # ``DuplicateCategoryThrottle``, ``get_site``) that historically ran
+    # before it. Without this, any of those raising produced an exit-1 with
+    # no log at all: the launcher's failure handler would then attach a
+    # log from an entirely different (older) run, leading operators to
+    # diagnose the wrong incident.
+    setup_logging(partner, "upload", logging.INFO)
     tools_context = ToolsContext.init(partner)
 
     commons_site = get_site()
@@ -2153,7 +2162,6 @@ def main(
 
     try:
         local_fs.setup_temp_dir()
-        setup_logging(partner, "upload", logging.INFO)
         notify_phase_start(partner, "upload")
         if dry_run:
             logging.warning("---=== DRY RUN ===---")

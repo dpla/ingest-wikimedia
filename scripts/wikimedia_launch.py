@@ -143,11 +143,17 @@ _STEP_BY_FIRST_TOKEN: dict[str, str] = {
 
 
 def _wrap_step_with_marker(cmd: str) -> str:
-    """Prefix ``cmd`` with ``export WIKIMEDIA_STEP=<name> &&`` so the bash
-    shell's WIKIMEDIA_STEP reflects which step was running when the
+    """Prefix ``cmd`` with ``export WIKIMEDIA_STEP=<name> WIKIMEDIA_STEP_START=<epoch> &&``
+    so the bash shell's WIKIMEDIA_STEP reflects which step was running when the
     ``&&``-chain breaks. The export goes BEFORE the step's command in the
     same chain, so the failed-step's name is the most recent assignment
     when ``notify_pipeline_fail`` reads it.
+
+    ``WIKIMEDIA_STEP_START`` (Unix epoch seconds, evaluated at export time via
+    ``$(date +%s)``) scopes the failure-log lookup to files created after
+    this step began, so a step that dies before ``setup_logging`` runs
+    doesn't get a stale log from a prior day attached to its Slack message.
+    Read side: :func:`ingest_wikimedia.slack._find_latest_log`.
 
     For ``get-ids-es`` / ``get-ids-nara`` (the id-generation step), also
     tees stderr to the per-session path returned by
@@ -199,7 +205,9 @@ def _wrap_step_with_marker(cmd: str) -> str:
             '"/tmp/wm-id-generation-stderr-${WIKIMEDIA_SESSION_LABEL:-unknown}.log"'
         )
         wrapped = f"{cmd} 2> >(tee {per_session_path} >&2)"
-    return f"export WIKIMEDIA_STEP={step} && {wrapped}"
+    return (
+        f'export WIKIMEDIA_STEP={step} WIKIMEDIA_STEP_START="$(date +%s)" && {wrapped}'
+    )
 
 
 def _build_get_ids_command(
