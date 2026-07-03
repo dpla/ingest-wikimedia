@@ -17,6 +17,7 @@ from pywikibot import pagegenerators
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
+    NARA_PROVIDER_NAME,
     casefold_for_compare,
     ingest_date_from_doc,
     parse_date_range,
@@ -3675,7 +3676,7 @@ def _parse_dpla_doc(dpla, dpla_id):
             creators = [creators]
     except Exception:
         creators = []
-    if dpla["provider"]["name"] == "National Archives and Records Administration":
+    if dpla["provider"]["name"] == NARA_PROVIDER_NAME:
         naids = dpla["sourceResource"]["identifier"]
         if isinstance(naids, str):
             naids = [naids]
