@@ -56,6 +56,7 @@ import click
 from ingest_wikimedia import drain_sidecar
 from ingest_wikimedia.dup_throttle import DuplicateCategoryThrottle
 from ingest_wikimedia.logs import setup_logging
+from ingest_wikimedia.wikimedia import get_site
 from ingest_wikimedia.slack import (
     notify_drain_phase_complete,
     notify_drain_phase_start,
@@ -190,7 +191,10 @@ def main(partner: str) -> None:
     lock_fd = _acquire_host_lock()
     try:
         started_at = time.monotonic()
-        throttle = DuplicateCategoryThrottle()
+        # ``get_site()`` — same helper the uploader/retirer/fix-categories
+        # tools use; also runs ``site.login()``. The throttle requires a
+        # non-None site (see :class:`DuplicateCategoryThrottle` guard).
+        throttle = DuplicateCategoryThrottle(get_site())
         initial_category_size = throttle.category_size()
         notify_drain_phase_start(partner, len(initial_ids), initial_category_size)
 

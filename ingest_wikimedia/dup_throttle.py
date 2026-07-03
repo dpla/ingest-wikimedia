@@ -67,6 +67,12 @@ class DuplicateCategoryThrottle:
             raise ValueError("resume_below must be <= threshold")
         if recheck_cap < 1:
             raise ValueError("recheck_cap must be >= 1")
+        if site is None and size_fn is None:
+            raise ValueError(
+                "DuplicateCategoryThrottle requires either a pywikibot "
+                "``site`` (for the default categoryinfo query) or an "
+                "injected ``size_fn`` (for tests)."
+            )
         self._site = site
         self.threshold = threshold
         self.resume_below = resume_below

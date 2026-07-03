@@ -245,10 +245,12 @@ def notify_pipeline_fail() -> None:
       WIKIMEDIA_PARTNER_DIR    — absolute path to the partner dir, used to
                                  locate the most recent log for tailing
       WIKIMEDIA_TARGET_IS_LAST — "1" iff this is the final target in the
-                                 batch; switches the message suffix from
-                                 "skipping to next target" to "no further
-                                 targets in batch", which is accurate even
-                                 for single-target sessions
+                                 batch; switches the failure message
+                                 suffix between "aborting this target;
+                                 batch continues with the next" and
+                                 "aborting batch (this was the final
+                                 target)". Accurate even for
+                                 single-target sessions.
 
     Designed to be called as a one-liner from a shell failure handler:
         rc=$?; WIKIMEDIA_LAST_EXIT=$rc python3 -c \\
@@ -275,7 +277,9 @@ def notify_pipeline_fail() -> None:
 
     is_last = os.environ.get("WIKIMEDIA_TARGET_IS_LAST") == "1"
     tail_phrase = (
-        "no further targets in batch" if is_last else "skipping to next target"
+        "aborting batch (this was the final target)"
+        if is_last
+        else "aborting this target; batch continues with the next"
     )
     # Step-aware header: tells the operator WHICH phase failed
     # (id-generation / download / upload / sdc-sync), not just "the

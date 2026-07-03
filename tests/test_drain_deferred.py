@@ -29,10 +29,16 @@ def stub_host_lock(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def stub_setup_logging(monkeypatch):
-    """The real setup_logging writes to <partner>/logs/... and expects
-    a partner dir; tests just need it to be a no-op."""
+def stub_setup_logging_and_get_site(monkeypatch):
+    """The real ``setup_logging`` writes to ``<partner>/logs/...`` and
+    expects a partner dir; tests just need it to be a no-op. Also
+    stub ``get_site`` — the real helper runs ``pywikibot.Site(...)``
+    plus ``.login()`` and requires a ``user-config.py``, which tests
+    don't have. Every test in this file patches
+    ``DuplicateCategoryThrottle``, so the return value is only used
+    as an opaque argument to the patched throttle constructor."""
     monkeypatch.setattr(drain_deferred, "setup_logging", lambda *a, **kw: None)
+    monkeypatch.setattr(drain_deferred, "get_site", MagicMock)
 
 
 @pytest.fixture

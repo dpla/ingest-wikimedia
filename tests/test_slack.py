@@ -160,7 +160,13 @@ def _capture_message(env: dict) -> str:
     return sent.get("text", "")
 
 
-def test_notify_pipeline_fail_says_skipping_to_next_when_not_last():
+def test_notify_pipeline_fail_says_aborting_this_target_when_not_last():
+    """Wording on the not-last branch must unambiguously frame the
+    message as a failure — the prior ``skipping to next target`` was
+    OK but the new phrasing keeps ``aborting`` in both branches so an
+    operator scanning Slack can't misread either as a normal-completion
+    state (which the prior ``no further targets in batch`` on the
+    last-target branch did suggest)."""
     msg = _capture_message(
         {
             "DPLA_SLACK_BOT_TOKEN": "x",
@@ -168,11 +174,19 @@ def test_notify_pipeline_fail_says_skipping_to_next_when_not_last():
             "WIKIMEDIA_LAST_EXIT": "1",
         }
     )
-    assert "skipping to next target" in msg
+    assert "aborting this target" in msg
+    assert "batch continues with the next" in msg
+    assert "aborting batch" not in msg
+    # The OLD wording must be gone — a soft-completion phrasing on a
+    # failure notification is what motivated the reword.
     assert "no further targets in batch" not in msg
+    assert "skipping to next target" not in msg
 
 
-def test_notify_pipeline_fail_says_no_further_when_last():
+def test_notify_pipeline_fail_says_aborting_batch_when_last():
+    """On the final target, the failure ends the batch — the wording
+    now says so explicitly (rather than the prior ``no further targets
+    in batch``, which read like a normal-completion summary)."""
     msg = _capture_message(
         {
             "DPLA_SLACK_BOT_TOKEN": "x",
@@ -181,8 +195,11 @@ def test_notify_pipeline_fail_says_no_further_when_last():
             "WIKIMEDIA_TARGET_IS_LAST": "1",
         }
     )
-    assert "no further targets in batch" in msg
-    assert "skipping to next target" not in msg
+    assert "aborting batch" in msg
+    assert "this was the final target" in msg
+    assert "aborting this target" not in msg
+    # Old wording is gone.
+    assert "no further targets in batch" not in msg
     # The OOM hint should still be included.
     assert "SIGKILL" in msg
 
@@ -198,7 +215,7 @@ def test_notify_pipeline_fail_treats_any_value_other_than_1_as_not_last():
                 "WIKIMEDIA_TARGET_IS_LAST": value,
             }
         )
-        assert "skipping to next target" in msg, (
+        assert "aborting this target" in msg, (
             f"value {value!r} should be treated as not-last"
         )
 
