@@ -25,16 +25,36 @@ from ingest_wikimedia.worker_slots import (
     UPLOADER_PRIORITY_SLOT_DIR,
 )
 
-# Bash regex used inside :func:`_fetch_slot_snapshot` to filter ``lslocks``
-# rows to just this project's slot pools. Interpolated from the shared
-# ``worker_slots`` constants so a rename of either directory can't leave
-# this file silently wrong (previously the basenames were hardcoded here
-# alongside their definitions in ``worker_slots.py`` — a two-site
-# stringly-typed contract that would drift on any pool rename).
-_SLOT_DIR_BASENAME_RE = "|".join(
+# Bash regexes used inside :func:`_fetch_slot_snapshot` to filter
+# ``lslocks`` rows. The shared-pool regex drives the ``free``/``held``
+# aggregate line (bounded by the shared pool's known ``TOTAL``); the
+# both-pools regex drives per-session attribution (a Case-2 uploader
+# holding a priority-pool slot should still be visible in the per-session
+# ``[Slots: 1]`` readout even though the shared pool's aggregate ignores
+# it). Interpolated from the shared ``worker_slots`` constants so a
+# rename of either directory can't leave this file silently wrong.
+_SHARED_SLOT_DIR_BASENAME = os.path.basename(DEFAULT_SLOT_DIR)
+_ALL_SLOT_DIR_BASENAME_RE = "|".join(
     re.escape(os.path.basename(p))
     for p in (DEFAULT_SLOT_DIR, UPLOADER_PRIORITY_SLOT_DIR)
 )
+
+
+def _strip_batch_suffix(display_id: str) -> str:
+    """Return ``display_id`` with any trailing ``" [n/m]"`` batch-position
+    annotation removed.
+
+    Multi-target sessions render ``"partner+institution [pos/total]"`` as
+    their row label (see ``_with_batch_suffix`` in ``main``), but the
+    ``WIKIMEDIA_SESSION_LABEL`` env var carries only the raw
+    ``partner+institution`` slug. Any keyed lookup against a dict of
+    session-labels must strip the batch suffix first — otherwise
+    multi-target rows will miss their own slot-holder counts.
+    """
+    return _BATCH_SUFFIX_RE.sub("", display_id)
+
+
+_BATCH_SUFFIX_RE = re.compile(r" \[\d+/\d+\]$")
 
 
 class SlotSnapshot(NamedTuple):
@@ -511,17 +531,23 @@ def _fetch_slot_snapshot(ssm) -> SlotSnapshot | None:
             f"command -v lslocks >/dev/null 2>&1 || {{ echo NODATA; exit 0; }}; "
             f'echo "TOTAL $(ls "$D" 2>/dev/null | wc -l)"; '
             # Three quick count-only samples for median smoothing (transient
-            # all-held/all-free blips are common on churn). The final
-            # sample also emits per-PID session-label lines so callers can
-            # attribute holds to rows under saturation.
-            f"SLOT_RE='{_SLOT_DIR_BASENAME_RE}'; "
+            # all-held/all-free blips are common on churn). Counts the
+            # SHARED pool only — the ``TOTAL`` line above is the shared
+            # pool's file count, so ``free = TOTAL - held`` only balances
+            # when both operands sample the same pool.
+            f"SHARED_RE='{_SHARED_SLOT_DIR_BASENAME}'; "
+            f"ALL_RE='{_ALL_SLOT_DIR_BASENAME_RE}'; "
             f"for i in 1 2 3; do "
-            f'  lslocks 2>/dev/null | grep -cE "$SLOT_RE"; '
+            f'  lslocks 2>/dev/null | grep -cE "$SHARED_RE"; '
             f"  sleep 1; "
             f"done; "
+            # Final structured pass: both pools for per-session attribution
+            # (a Case-2 uploader in the priority pool should still appear in
+            # ``[Slots: 1]`` for its row) plus a 4th shared-only count that
+            # feeds the median alongside the earlier samples.
             f"HOLDERS=$(lslocks -n -o PID,PATH 2>/dev/null "
-            f'  | grep -E "$SLOT_RE" || true); '
-            f'echo "$HOLDERS" | grep -c . '
+            f'  | grep -E "$ALL_RE" || true); '
+            f'echo "$HOLDERS" | grep -cE "$SHARED_RE" '
             f"  | (read -r n; echo COUNT $n); "
             f'echo "$HOLDERS" | awk "{{print \\$1}}" | while read pid; do '
             f'  [ -z "$pid" ] && continue; '
@@ -586,7 +612,12 @@ def _slot_suffix_for_row(
     """
     if not any(phase.startswith(p) for p in _SLOT_CONSUMING_PHASE_PREFIXES):
         return ""
-    held = holds_by_label.get(display_id, 0)
+    # ``display_id`` may carry a trailing ``" [n/m]"`` for multi-target
+    # sessions; ``holds_by_label`` is keyed by the raw
+    # ``WIKIMEDIA_SESSION_LABEL`` (no such suffix), so strip before lookup
+    # or every multi-target row would miss its own hold count and render
+    # ``[Awaiting slot]`` even while its workers are actively uploading.
+    held = holds_by_label.get(_strip_batch_suffix(display_id), 0)
     if held > 0:
         return f" [Slots: {held}]"
     if "waiting on slots" in phase:

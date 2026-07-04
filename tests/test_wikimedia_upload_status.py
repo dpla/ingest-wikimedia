@@ -631,6 +631,52 @@ def test_fetch_slot_snapshot_none_when_lslocks_absent():
         assert _fetch_slot_snapshot(object()) is None
 
 
+def test_fetch_slot_snapshot_aggregate_scopes_to_shared_pool_only():
+    """Regression (CR flagged on PR #366): ``held`` / ``free`` / ``line``
+    must reflect ONLY the shared 24-slot pool — the ``TOTAL`` line is
+    ``ls DEFAULT_SLOT_DIR | wc -l`` = shared pool size, so mixing in
+    uploader-priority-pool holds would let ``held`` exceed ``TOTAL``
+    and clamp ``free`` to zero even when the shared pool has headroom.
+
+    ``holds_by_label`` MUST still cover both pools — a Case-2 uploader
+    holding a priority slot should surface in its row's ``[Slots: 1]``
+    readout regardless of whether the shared pool is saturated.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
+
+    # TOTAL 24. Three shared-pool-only count samples all say 22.
+    # Final structured pass: shared-pool COUNT is 22 (median stays 22 →
+    # held = 22, free = 2), but the HOLDER lines include a
+    # priority-pool uploader whose slot is NOT in that 22.
+    out = (
+        "TOTAL 24\n"
+        "22\n"
+        "22\n"
+        "22\n"
+        "COUNT 22\n"
+        "HOLDER nara+franklin-d-roosevelt-library\n"  # priority-pool uploader
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value=out):
+        snap = _fetch_slot_snapshot(object())
+    assert snap is not None
+    # Aggregate is shared-pool only: 22 held of 24 → 2 free.
+    assert snap.line == "Worker slots: ~2 free of 24 (22 held)"
+    assert snap.free == 2
+    # But per-session attribution still includes the priority-pool holder.
+    assert snap.holds_by_label == {
+        "nara+franklin-d-roosevelt-library": 1,
+        "nara+jimmy-carter-library": 6,
+    }
+
+
 def test_fetch_slot_snapshot_tolerates_no_holders():
     """Some polls will legitimately catch a moment with zero holders
     (transient slack). ``holds_by_label`` is empty and the aggregate
@@ -676,6 +722,26 @@ def test_slot_suffix_marks_awaiting_when_slot_phase_holds_zero():
         {"nara+franklin-d-roosevelt-library": 1},
     )
     assert suffix == " [Awaiting slot]"
+
+
+def test_slot_suffix_strips_batch_suffix_before_lookup():
+    """Regression (CR flagged on PR #366): multi-target sessions render
+    with a ``[n/m]`` batch-position annotation on their display id
+    (via ``_with_batch_suffix``), but ``WIKIMEDIA_SESSION_LABEL`` — the
+    key in ``holds_by_label`` — carries only the raw slug. The suffix
+    helper must strip the ``[n/m]`` before lookup, otherwise every
+    multi-target row would miss its own hold count and render
+    ``[Awaiting slot]`` while its workers are actively uploading.
+    """
+    from scripts.wikimedia_upload_status import _slot_suffix_for_row
+
+    # Batch-annotated display_id, holds are keyed by the raw label.
+    suffix = _slot_suffix_for_row(
+        "texas+baylor-county-free-library [17/54]",
+        "SDC syncing (11 / 4,452 files, ~0.2%)",
+        {"texas+baylor-county-free-library": 6},
+    )
+    assert suffix == " [Slots: 6]"
 
 
 def test_slot_suffix_suppressed_when_phase_already_shows_waiting_marker():
