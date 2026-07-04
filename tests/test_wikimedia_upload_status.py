@@ -1151,12 +1151,28 @@ def test_main_appends_slot_suffixes_when_pool_is_saturated():
     section_text = "\n".join(
         b["text"]["text"] for b in payload["blocks"] if b.get("type") == "section"
     )
-    # jimmy-carter holds 4 slots → [Slots: 4]
-    assert "nara+jimmy-carter-library" in section_text
-    assert "[Slots: 4]" in section_text
+
+    # Each status row renders as a single line (``\`display_id\` phase{suffix}``),
+    # so locate each session's own row and assert the suffix is attached to *that*
+    # row — not merely present somewhere in the concatenated block. This pins
+    # attribution: swapping the suffixes between rows must fail the test.
+    def _row_for(display_id: str) -> str:
+        matches = [ln for ln in section_text.splitlines() if display_id in ln]
+        assert len(matches) == 1, (
+            f"expected exactly one row for {display_id!r}, got {matches!r}"
+        )
+        return matches[0]
+
+    # jimmy-carter holds 4 slots → [Slots: 4] on its own row, and it must not
+    # be the one flagged as awaiting.
+    jimmy_row = _row_for("nara+jimmy-carter-library")
+    assert "[Slots: 4]" in jimmy_row, jimmy_row
+    assert "[Awaiting slot]" not in jimmy_row, jimmy_row
     # state-library-of-ohio is in an upload phase but holds zero → [Awaiting slot]
-    assert "ohio+state-library-of-ohio" in section_text
-    assert "[Awaiting slot]" in section_text
+    # on its own row, and it must not claim any held slots.
+    ohio_row = _row_for("ohio+state-library-of-ohio")
+    assert "[Awaiting slot]" in ohio_row, ohio_row
+    assert "[Slots:" not in ohio_row, ohio_row
 
 
 def test_fetch_slot_snapshot_returns_none_on_malformed_output():
