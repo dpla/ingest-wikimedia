@@ -569,39 +569,215 @@ def test_post_to_slack_omits_memory_block_when_none():
     assert not any(b.get("type") == "context" for b in payload["blocks"])
 
 
-def test_format_slots_line_reports_free_headroom():
-    """Median of the held-count samples → free = total − held; reports the
-    stable headroom count, not who holds what."""
+def test_fetch_slot_snapshot_reports_free_headroom_and_holds_by_label():
+    """The snapshot returns median-smoothed headroom PLUS a per-session
+    map of holds derived from the final ``HOLDER <label>`` block. Both
+    pieces travel in a single SSM roundtrip because the saturated
+    per-session view is only ever useful with the aggregate — sending
+    them separately would double-charge Slack's 3-second ack budget."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import _format_slots_line
+    from scripts.wikimedia_upload_status import SlotSnapshot, _fetch_slot_snapshot
 
-    # TOTAL 24, held samples [16,14,17,15] → median 15.5 → 16 held → 8 free.
-    out = "TOTAL 24\n16\n14\n17\n15\n"
+    # TOTAL 24; three count-only samples [22, 24, 23]; final structured
+    # pass reports COUNT 24 + six HOLDER labels (one uploader + a
+    # 6-worker sdc-sync would look like this in the wild).
+    out = (
+        "TOTAL 24\n"
+        "22\n"
+        "24\n"
+        "23\n"
+        "COUNT 24\n"
+        "HOLDER nara+franklin-d-roosevelt-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER ohio+state-library-of-ohio\n"
+    )
     with patch("scripts.wikimedia_upload_status.ssm_run", return_value=out):
-        line = _format_slots_line(object())
-    assert line == "Worker slots: ~8 free of 24 (16 held)"
+        snap = _fetch_slot_snapshot(object())
+    assert isinstance(snap, SlotSnapshot)
+    # Median of [22, 24, 23, 24] = 23.5 → 24 held → 0 free.
+    assert snap.line == "Worker slots: ~0 free of 24 (24 held)"
+    assert snap.free == 0
+    assert snap.holds_by_label == {
+        "nara+franklin-d-roosevelt-library": 1,
+        "nara+jimmy-carter-library": 6,
+        "ohio+state-library-of-ohio": 1,
+    }
 
 
-def test_format_slots_line_none_when_no_slot_dir():
-    """No slot dir (no budget-enabled session has run) → no line."""
+def test_fetch_slot_snapshot_none_when_no_slot_dir():
+    """No slot dir (no budget-enabled session has run) → no snapshot."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import _format_slots_line
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
 
     with patch("scripts.wikimedia_upload_status.ssm_run", return_value="NODIR\n"):
-        assert _format_slots_line(object()) is None
+        assert _fetch_slot_snapshot(object()) is None
 
 
-def test_format_slots_line_none_when_lslocks_absent():
-    """lslocks missing → NODATA → no line (rather than a misleading "all
-    free" from grep -c on empty stdin)."""
+def test_fetch_slot_snapshot_none_when_lslocks_absent():
+    """lslocks missing → NODATA → no snapshot (rather than a misleading
+    "all free" from grep -c on empty stdin)."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import _format_slots_line
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
 
     with patch("scripts.wikimedia_upload_status.ssm_run", return_value="NODATA\n"):
-        assert _format_slots_line(object()) is None
+        assert _fetch_slot_snapshot(object()) is None
+
+
+def test_fetch_slot_snapshot_aggregate_scopes_to_shared_pool_only():
+    """Regression (CR flagged on PR #366): ``held`` / ``free`` / ``line``
+    must reflect ONLY the shared 24-slot pool — the ``TOTAL`` line is
+    ``ls DEFAULT_SLOT_DIR | wc -l`` = shared pool size, so mixing in
+    uploader-priority-pool holds would let ``held`` exceed ``TOTAL``
+    and clamp ``free`` to zero even when the shared pool has headroom.
+
+    ``holds_by_label`` MUST still cover both pools — a Case-2 uploader
+    holding a priority slot should surface in its row's ``[Slots: 1]``
+    readout regardless of whether the shared pool is saturated.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
+
+    # TOTAL 24. Three shared-pool-only count samples all say 22.
+    # Final structured pass: shared-pool COUNT is 22 (median stays 22 →
+    # held = 22, free = 2), but the HOLDER lines include a
+    # priority-pool uploader whose slot is NOT in that 22.
+    out = (
+        "TOTAL 24\n"
+        "22\n"
+        "22\n"
+        "22\n"
+        "COUNT 22\n"
+        "HOLDER nara+franklin-d-roosevelt-library\n"  # priority-pool uploader
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+        "HOLDER nara+jimmy-carter-library\n"
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value=out):
+        snap = _fetch_slot_snapshot(object())
+    assert snap is not None
+    # Aggregate is shared-pool only: 22 held of 24 → 2 free.
+    assert snap.line == "Worker slots: ~2 free of 24 (22 held)"
+    assert snap.free == 2
+    # But per-session attribution still includes the priority-pool holder.
+    assert snap.holds_by_label == {
+        "nara+franklin-d-roosevelt-library": 1,
+        "nara+jimmy-carter-library": 6,
+    }
+
+
+def test_fetch_slot_snapshot_tolerates_no_holders():
+    """Some polls will legitimately catch a moment with zero holders
+    (transient slack). ``holds_by_label`` is empty and the aggregate
+    still renders."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
+
+    out = "TOTAL 24\n0\n0\n0\nCOUNT 0\n"
+    with patch("scripts.wikimedia_upload_status.ssm_run", return_value=out):
+        snap = _fetch_slot_snapshot(object())
+    assert snap is not None
+    assert snap.line == "Worker slots: ~24 free of 24 (0 held)"
+    assert snap.free == 24
+    assert snap.holds_by_label == {}
+
+
+def test_slot_suffix_appends_slots_when_session_holds_slots():
+    """Under saturation, a slot-consuming row that holds N slots gets a
+    ``[Slots: N]`` suffix so the reader can attribute pool usage
+    without SSM-ing in."""
+    from scripts.wikimedia_upload_status import _slot_suffix_for_row
+
+    suffix = _slot_suffix_for_row(
+        "nara+jimmy-carter-library",
+        "SDC syncing (1,359 / 11,011 files, ~12.3%)",
+        {"nara+jimmy-carter-library": 4, "ohio+state-library-of-ohio": 1},
+    )
+    assert suffix == " [Slots: 4]"
+
+
+def test_slot_suffix_marks_awaiting_when_slot_phase_holds_zero():
+    """Under saturation, a session that IS in a slot-consuming phase
+    but appears in zero holders gets ``[Awaiting slot]`` — every worker
+    in that session is blocked on acquire (or transiently between
+    items, which under 0-free-slot conditions is dominated by the
+    acquire wait)."""
+    from scripts.wikimedia_upload_status import _slot_suffix_for_row
+
+    suffix = _slot_suffix_for_row(
+        "ohio+toledo-lucas-county-public-library",
+        "Uploading (10,747 / 142,392 files, ~7.5%)",
+        {"nara+franklin-d-roosevelt-library": 1},
+    )
+    assert suffix == " [Awaiting slot]"
+
+
+def test_slot_suffix_strips_batch_suffix_before_lookup():
+    """Regression (CR flagged on PR #366): multi-target sessions render
+    with a ``[n/m]`` batch-position annotation on their display id
+    (via ``_with_batch_suffix``), but ``WIKIMEDIA_SESSION_LABEL`` — the
+    key in ``holds_by_label`` — carries only the raw slug. The suffix
+    helper must strip the ``[n/m]`` before lookup, otherwise every
+    multi-target row would miss its own hold count and render
+    ``[Awaiting slot]`` while its workers are actively uploading.
+    """
+    from scripts.wikimedia_upload_status import _slot_suffix_for_row
+
+    # Batch-annotated display_id, holds are keyed by the raw label.
+    suffix = _slot_suffix_for_row(
+        "texas+baylor-county-free-library [17/54]",
+        "SDC syncing (11 / 4,452 files, ~0.2%)",
+        {"texas+baylor-county-free-library": 6},
+    )
+    assert suffix == " [Slots: 6]"
+
+
+def test_slot_suffix_suppressed_when_phase_already_shows_waiting_marker():
+    """A phase text that already ends with the ``⏸ waiting on slots``
+    marker (appended by ``get_phase_and_progress`` when the session's
+    last log line is ``SLOTS_BUSY_LOG_MARKER``) must NOT ALSO get a
+    ``[Awaiting slot]`` suffix. The two indicators mean the same
+    thing; rendering both produces phrasing like
+    ``Uploading (…) ⏸ waiting on slots [Awaiting slot]`` which reads
+    like a compound state. When the log-tail marker is already there
+    we defer to it and add nothing.
+    """
+    from scripts.wikimedia_upload_status import _slot_suffix_for_row
+
+    suffix = _slot_suffix_for_row(
+        "ohio+state-library-of-ohio",
+        "Uploading (75 / 17,349 files, ~0.4%) ⏸ waiting on slots",
+        {},  # zero holds for this session
+    )
+    assert suffix == ""
+
+
+def test_slot_suffix_empty_for_non_slot_phase():
+    """A session in a phase that doesn't touch the slot pool
+    (downloading, generating IDs, complete, error) gets NO slot
+    suffix — the pool line is irrelevant to it."""
+    from scripts.wikimedia_upload_status import _slot_suffix_for_row
+
+    for phase in (
+        "Downloading (500 / 1000 items, ~50.0%)",
+        "Generating IDs",
+        "Upload complete (1200 items)",
+        "Unknown (error)",
+        "Starting...",
+    ):
+        assert _slot_suffix_for_row("anything", phase, {}) == "", phase
 
 
 # ---------------------------------------------------------------------------
@@ -873,7 +1049,7 @@ def test_main_rows_use_display_id_from_fetch_not_session_name():
             return_value=None,
         ),
         patch(
-            "scripts.wikimedia_upload_status._format_slots_line",
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
             return_value=None,
         ),
         patch(
@@ -905,6 +1081,118 @@ def test_main_rows_use_display_id_from_fetch_not_session_name():
 
 # ---------------------------------------------------------------------------
 # Upload-phase file-level progress (PR: file progress + position-in-chain)
+
+
+def test_main_appends_slot_suffixes_when_pool_is_saturated():
+    """CR nitpick on PR #366: prior ``main()`` tests all mock
+    ``_fetch_slot_snapshot`` to ``None``, leaving the saturated-suffix
+    wiring untested end-to-end. This exercise it: snapshot reports
+    ``free == 0`` with a populated ``holds_by_label`` covering one
+    session's SDC-sync worker pool + a second session that holds zero
+    slots. Assertions verify that the final Slack section text carries
+    ``[Slots: 4]`` and ``[Awaiting slot]`` on the appropriate rows.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import SlotSnapshot, main
+
+    sessions_out = (
+        "wikimedia-nara+jimmy-carter-library: 1 windows\n"
+        "wikimedia-ohio+state-library-of-ohio: 1 windows\n"
+    )
+    captured, fake_post = _capture_slack_post()
+
+    # Deterministic per-session phase results. jimmy-carter is
+    # SDC-syncing with 4 workers currently holding slots (2 waiting).
+    # state-library-of-ohio is an uploader that holds zero slots
+    # (saturation blocked it before it could grab one).
+    def fake_get_phase_and_progress(client, session, hub, label):
+        if label == "nara+jimmy-carter-library":
+            return ("SDC syncing (1,359 / 11,011 files, ~12.3%)", 1700000000)
+        if label == "ohio+state-library-of-ohio":
+            return ("Uploading (75 / 17,349 files, ~0.4%)", 1700000000)
+        return (None, 0)
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch("scripts.wikimedia_upload_status.ssm_run", return_value=sessions_out),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
+            return_value=SlotSnapshot(
+                line="Worker slots: ~0 free of 24 (24 held)",
+                free=0,
+                holds_by_label={"nara+jimmy-carter-library": 4},
+            ),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.find_active_label",
+            side_effect=lambda ssm, labels: (labels[0], 1700000000),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            side_effect=fake_get_phase_and_progress,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.requests.post",
+            side_effect=fake_post,
+        ),
+    ):
+        main()
+
+    payload = captured["payload"]
+    section_text = "\n".join(
+        b["text"]["text"] for b in payload["blocks"] if b.get("type") == "section"
+    )
+
+    # Each status row renders as a single line (``\`display_id\` phase{suffix}``),
+    # so locate each session's own row and assert the suffix is attached to *that*
+    # row — not merely present somewhere in the concatenated block. This pins
+    # attribution: swapping the suffixes between rows must fail the test.
+    def _row_for(display_id: str) -> str:
+        matches = [ln for ln in section_text.splitlines() if display_id in ln]
+        assert len(matches) == 1, (
+            f"expected exactly one row for {display_id!r}, got {matches!r}"
+        )
+        return matches[0]
+
+    # jimmy-carter holds 4 slots → [Slots: 4] on its own row, and it must not
+    # be the one flagged as awaiting.
+    jimmy_row = _row_for("nara+jimmy-carter-library")
+    assert "[Slots: 4]" in jimmy_row, jimmy_row
+    assert "[Awaiting slot]" not in jimmy_row, jimmy_row
+    # state-library-of-ohio is in an upload phase but holds zero → [Awaiting slot]
+    # on its own row, and it must not claim any held slots.
+    ohio_row = _row_for("ohio+state-library-of-ohio")
+    assert "[Awaiting slot]" in ohio_row, ohio_row
+    assert "[Slots:" not in ohio_row, ohio_row
+
+
+def test_fetch_slot_snapshot_returns_none_on_malformed_output():
+    """CR nitpick on PR #366: the parse block must degrade to ``None``
+    rather than letting a malformed ``TOTAL``/``COUNT`` line propagate
+    out of ``slots_future.result()`` and abort the whole status post.
+    Matches :func:`fetch_memory_snapshot`'s own graceful-degradation
+    contract — the slot line is optional context, not load-bearing.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
+
+    # ``TOTAL`` line with a non-integer value → ``int(...)`` raises;
+    # helper must swallow and return ``None``.
+    with patch(
+        "scripts.wikimedia_upload_status.ssm_run",
+        return_value="TOTAL nope\n1\n1\n1\nCOUNT 1\n",
+    ):
+        assert _fetch_slot_snapshot(object()) is None
 
 
 def test_upload_progress_reports_file_level_when_download_log_available():
@@ -1266,7 +1554,9 @@ def test_fetch_position_annotation_for_multi_label_batch():
         patch(
             "scripts.wikimedia_upload_status.fetch_memory_snapshot", return_value=None
         ),
-        patch("scripts.wikimedia_upload_status._format_slots_line", return_value=None),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot", return_value=None
+        ),
         # Active label is the 3rd of 4 (texas+c).
         patch(
             "scripts.wikimedia_upload_status.find_active_label",
@@ -1311,7 +1601,9 @@ def test_fetch_no_position_annotation_for_single_label_session():
         patch(
             "scripts.wikimedia_upload_status.fetch_memory_snapshot", return_value=None
         ),
-        patch("scripts.wikimedia_upload_status._format_slots_line", return_value=None),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot", return_value=None
+        ),
         patch(
             "scripts.wikimedia_upload_status.find_active_label",
             return_value=("bpl+phillips-academy", 1700000000),

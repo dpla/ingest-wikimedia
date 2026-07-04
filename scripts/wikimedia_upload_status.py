@@ -15,9 +15,77 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import requests
 
+from typing import NamedTuple
+
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.ssm import REGION, fetch_memory_snapshot, ssm_run
-from ingest_wikimedia.worker_slots import DEFAULT_SLOT_DIR, SLOTS_BUSY_LOG_MARKER
+from ingest_wikimedia.worker_slots import (
+    DEFAULT_SLOT_DIR,
+    SLOTS_BUSY_LOG_MARKER,
+    UPLOADER_PRIORITY_SLOT_DIR,
+)
+
+# Bash regexes used inside :func:`_fetch_slot_snapshot` to filter
+# ``lslocks`` rows. The shared-pool regex drives the ``free``/``held``
+# aggregate line (bounded by the shared pool's known ``TOTAL``); the
+# both-pools regex drives per-session attribution (a Case-2 uploader
+# holding a priority-pool slot should still be visible in the per-session
+# ``[Slots: 1]`` readout even though the shared pool's aggregate ignores
+# it). Interpolated from the shared ``worker_slots`` constants so a
+# rename of either directory can't leave this file silently wrong.
+_SHARED_SLOT_DIR_BASENAME = os.path.basename(DEFAULT_SLOT_DIR)
+_ALL_SLOT_DIR_BASENAME_RE = "|".join(
+    re.escape(os.path.basename(p))
+    for p in (DEFAULT_SLOT_DIR, UPLOADER_PRIORITY_SLOT_DIR)
+)
+
+
+def _strip_batch_suffix(display_id: str) -> str:
+    """Return ``display_id`` with any trailing ``" [n/m]"`` batch-position
+    annotation removed.
+
+    Multi-target sessions render ``"partner+institution [pos/total]"`` as
+    their row label (see ``_with_batch_suffix`` in ``main``), but the
+    ``WIKIMEDIA_SESSION_LABEL`` env var carries only the raw
+    ``partner+institution`` slug. Any keyed lookup against a dict of
+    session-labels must strip the batch suffix first — otherwise
+    multi-target rows will miss their own slot-holder counts.
+    """
+    return _BATCH_SUFFIX_RE.sub("", display_id)
+
+
+_BATCH_SUFFIX_RE = re.compile(r" \[\d+/\d+\]$")
+
+
+class SlotSnapshot(NamedTuple):
+    """Aggregate + per-session view of the box-wide slot pool at snapshot time.
+
+    ``line`` is the human-readable summary rendered under the row block.
+    ``free`` is the free-slot count in the shared 24-slot pool (used to gate
+    the per-session ``[Slots: N]`` augmentation — we only show it under
+    saturation so the row block stays quiet during headroom).
+    ``holds_by_label`` maps WIKIMEDIA_SESSION_LABEL → number of slots that
+    session currently holds. Includes holders from BOTH the shared pool and
+    the uploader priority pool. Labels are extracted from
+    ``/proc/<pid>/environ`` on each holder PID; a session appears with
+    ``holds == 0`` only implicitly (via absence from the dict).
+    """
+
+    line: str
+    free: int
+    holds_by_label: dict[str, int]
+
+
+# Phase-string prefixes that indicate a session is CURRENTLY in a
+# slot-consuming phase (upload / SDC-sync / drain). Used to decide whether
+# ``[Awaiting slot]`` is applicable when a saturated snapshot shows the
+# session holds zero slots — a session in "Downloading" or "Generating IDs"
+# is legitimately not waiting for a Commons-write slot, so no suffix.
+_SLOT_CONSUMING_PHASE_PREFIXES: tuple[str, ...] = (
+    "Uploading",
+    "SDC syncing",
+    "Draining",
+)
 
 SLACK_CHANNEL = "C02HEU2L3"
 SLACK_API_URL = "https://slack.com/api/chat.postMessage"
@@ -438,13 +506,21 @@ def _format_memory_line(snapshot: tuple[int, int] | None) -> str | None:
     return f"Memory: {used_mb:,} / {total_mb:,} MB used ({pct_available}% available)"
 
 
-def _format_slots_line(ssm) -> str | None:
-    """Report box-wide worker-slot headroom (free count) for the status post,
-    or ``None`` if no budget-enabled session has created the slot dir.
+def _fetch_slot_snapshot(ssm) -> SlotSnapshot | None:
+    """Return a :class:`SlotSnapshot` for the box-wide worker-slot pool, or
+    ``None`` if no budget-enabled session has created the slot dir.
 
     The cap is shared by every Commons-writing phase — uploader (uploads,
-    renames, template migrations, purges) as well as sdc-sync — so the line
-    is not SDC-specific."""
+    renames, template migrations, purges) as well as sdc-sync — so the
+    reported line is not SDC-specific.
+
+    One SSM roundtrip collects both the median-smoothed held-count (three
+    count-only polls) AND the final PID→session-label mapping (one
+    lslocks pass with the PIDs looked up in ``/proc/<pid>/environ``).
+    Consolidating into a single roundtrip avoids double-charging Slack's
+    3-second slash-command budget when the saturated per-session view is
+    also needed for the readout.
+    """
     try:
         out = ssm_run(
             ssm,
@@ -454,29 +530,110 @@ def _format_slots_line(ssm) -> str | None:
             # silently report "all free" — so bail to NODATA instead of lying.
             f"command -v lslocks >/dev/null 2>&1 || {{ echo NODATA; exit 0; }}; "
             f'echo "TOTAL $(ls "$D" 2>/dev/null | wc -l)"; '
-            f"for i in 1 2 3 4; do lslocks 2>/dev/null | grep -c sdc-sync-worker-slots; sleep 1; done",
+            # Three quick count-only samples for median smoothing (transient
+            # all-held/all-free blips are common on churn). Counts the
+            # SHARED pool only — the ``TOTAL`` line above is the shared
+            # pool's file count, so ``free = TOTAL - held`` only balances
+            # when both operands sample the same pool.
+            f"SHARED_RE='{_SHARED_SLOT_DIR_BASENAME}'; "
+            f"ALL_RE='{_ALL_SLOT_DIR_BASENAME_RE}'; "
+            f"for i in 1 2 3; do "
+            f'  lslocks 2>/dev/null | grep -cE "$SHARED_RE"; '
+            f"  sleep 1; "
+            f"done; "
+            # Final structured pass: both pools for per-session attribution
+            # (a Case-2 uploader in the priority pool should still appear in
+            # ``[Slots: 1]`` for its row) plus a 4th shared-only count that
+            # feeds the median alongside the earlier samples.
+            f"HOLDERS=$(lslocks -n -o PID,PATH 2>/dev/null "
+            f'  | grep -E "$ALL_RE" || true); '
+            f'echo "$HOLDERS" | grep -cE "$SHARED_RE" '
+            f"  | (read -r n; echo COUNT $n); "
+            f'echo "$HOLDERS" | awk "{{print \\$1}}" | while read pid; do '
+            f'  [ -z "$pid" ] && continue; '
+            # Each pipeline process (uploader, sdc-sync main and its pool
+            # workers, drain) inherits WIKIMEDIA_SESSION_LABEL from the tmux
+            # environ set by the launcher — a robust per-target signal that
+            # survives multiprocessing.Pool forks.
+            f"  label=$(tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null "
+            f"    | grep -m1 '^WIKIMEDIA_SESSION_LABEL=' | cut -d= -f2-); "
+            f'  [ -n "$label" ] && echo "HOLDER $label"; '
+            f"done",
         )
     except Exception as e:
-        logging.warning("Could not read slot headroom: %s", e)
+        logging.warning("Could not read slot snapshot: %s", e)
         return None
-    # Parse "TOTAL <n>" followed by the integer held-count samples.
-    total = None
-    held_samples: list[int] = []
-    for ln in (out or "").splitlines():
-        ln = ln.strip()
-        if ln in ("NODIR", "NODATA"):
+
+    # Parse guarded by its own try/except: unexpected output (a malformed
+    # ``TOTAL``/``COUNT`` sample, an ``lslocks`` upgrade that reshapes a
+    # column) MUST NOT propagate through ``slots_future.result()`` in
+    # ``main`` and abort the entire status post — the slot line is
+    # optional context, not load-bearing. Degrades to ``None`` the same
+    # way :func:`fetch_memory_snapshot` does for its own parse failures.
+    try:
+        total: int | None = None
+        held_samples: list[int] = []
+        holds_by_label: dict[str, int] = {}
+        final_holder_count: int | None = None
+        for ln in (out or "").splitlines():
+            ln = ln.strip()
+            if ln in ("NODIR", "NODATA"):
+                return None
+            if ln.startswith("TOTAL "):
+                total = int(ln.split()[1])
+            elif ln.startswith("COUNT "):
+                final_holder_count = int(ln.split()[1])
+            elif ln.startswith("HOLDER "):
+                label = ln[len("HOLDER ") :]
+                holds_by_label[label] = holds_by_label.get(label, 0) + 1
+            elif ln.isdigit():
+                held_samples.append(int(ln))
+        if not total or not held_samples:
             return None
-        if ln.startswith("TOTAL "):
-            total = int(ln.split()[1])
-        elif ln.isdigit():
-            held_samples.append(int(ln))
-    if not total or not held_samples:
+        # Feed the final structured pass into the median alongside the
+        # count-only samples so a run that transiently drops between samples
+        # still smooths.
+        if final_holder_count is not None:
+            held_samples.append(final_holder_count)
+        held = round(statistics.median(held_samples))
+        free = max(0, total - held)
+        line = f"Worker slots: ~{free} free of {total} ({held} held)"
+        return SlotSnapshot(line=line, free=free, holds_by_label=holds_by_label)
+    except Exception as e:
+        logging.warning("Could not parse slot snapshot output: %s", e)
         return None
-    # Median of the samples: slot ownership churns every few seconds, so this
-    # smooths a transient all-held/all-free blip into a representative reading.
-    held = round(statistics.median(held_samples))
-    free = max(0, total - held)
-    return f"Worker slots: ~{free} free of {total} ({held} held)"
+
+
+def _slot_suffix_for_row(
+    display_id: str, phase: str, holds_by_label: dict[str, int]
+) -> str:
+    """Return the ``[Slots: N]`` / ``[Awaiting slot]`` suffix (with leading
+    space) to append to a row's phase text, or an empty string when the
+    row is not in a slot-consuming phase.
+
+    Only called when the pool is fully saturated — see the ``free == 0``
+    gate at the caller. In the headroom regime every slot-phase session
+    trivially holds its full allotment, so surfacing the number is noise.
+
+    Suppresses ``[Awaiting slot]`` when the row's phase text already
+    carries the ``⏸ waiting on slots`` marker (appended earlier by
+    :func:`get_phase_and_progress` when the session's last log line is
+    ``SLOTS_BUSY_LOG_MARKER``). Otherwise a fully-blocked uploader would
+    render both indicators back-to-back — same signal, twice.
+    """
+    if not any(phase.startswith(p) for p in _SLOT_CONSUMING_PHASE_PREFIXES):
+        return ""
+    # ``display_id`` may carry a trailing ``" [n/m]"`` for multi-target
+    # sessions; ``holds_by_label`` is keyed by the raw
+    # ``WIKIMEDIA_SESSION_LABEL`` (no such suffix), so strip before lookup
+    # or every multi-target row would miss its own hold count and render
+    # ``[Awaiting slot]`` even while its workers are actively uploading.
+    held = holds_by_label.get(_strip_batch_suffix(display_id), 0)
+    if held > 0:
+        return f" [Slots: {held}]"
+    if "waiting on slots" in phase:
+        return ""
+    return " [Awaiting slot]"
 
 
 def _format_rows_into_blocks(rows: list[tuple[str, str]]) -> list[dict]:
@@ -704,7 +861,7 @@ def main() -> None:
     # phase resolution rather than serializing after it.
     with ThreadPoolExecutor(max_workers=min(len(sessions) + 2, 8)) as executor:
         memory_future = executor.submit(fetch_memory_snapshot, ssm)
-        slots_future = executor.submit(_format_slots_line, ssm)
+        slots_future = executor.submit(_fetch_slot_snapshot, ssm)
         futures = {executor.submit(fetch, s): s for s in sessions}
         for future in as_completed(futures):
             session = futures[future]
@@ -712,9 +869,24 @@ def main() -> None:
             results[session] = (display_id, phase)
             print(f"{display_id}: {phase}")
         memory_line = _format_memory_line(memory_future.result())
-        slots_line = slots_future.result()
+        slot_snapshot = slots_future.result()
 
     rows = [results[s] for s in sessions if s in results]
+    slots_line = slot_snapshot.line if slot_snapshot is not None else None
+    # Under saturation (0 shared slots free), attach a per-session [Slots: N]
+    # or [Awaiting slot] suffix so an operator can see at a glance which
+    # sessions are actually holding the pool vs. blocked on acquire. Skipped
+    # in the headroom regime because every session in a slot-consuming phase
+    # trivially holds its full allotment there.
+    if slot_snapshot is not None and slot_snapshot.free == 0:
+        rows = [
+            (
+                display_id,
+                phase
+                + _slot_suffix_for_row(display_id, phase, slot_snapshot.holds_by_label),
+            )
+            for display_id, phase in rows
+        ]
     post_to_slack(token, rows, memory_line=memory_line, slots_line=slots_line)
     print("Posted to Slack.")
 
