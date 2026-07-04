@@ -1083,6 +1083,102 @@ def test_main_rows_use_display_id_from_fetch_not_session_name():
 # Upload-phase file-level progress (PR: file progress + position-in-chain)
 
 
+def test_main_appends_slot_suffixes_when_pool_is_saturated():
+    """CR nitpick on PR #366: prior ``main()`` tests all mock
+    ``_fetch_slot_snapshot`` to ``None``, leaving the saturated-suffix
+    wiring untested end-to-end. This exercise it: snapshot reports
+    ``free == 0`` with a populated ``holds_by_label`` covering one
+    session's SDC-sync worker pool + a second session that holds zero
+    slots. Assertions verify that the final Slack section text carries
+    ``[Slots: 4]`` and ``[Awaiting slot]`` on the appropriate rows.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import SlotSnapshot, main
+
+    sessions_out = (
+        "wikimedia-nara+jimmy-carter-library: 1 windows\n"
+        "wikimedia-ohio+state-library-of-ohio: 1 windows\n"
+    )
+    captured, fake_post = _capture_slack_post()
+
+    # Deterministic per-session phase results. jimmy-carter is
+    # SDC-syncing with 4 workers currently holding slots (2 waiting).
+    # state-library-of-ohio is an uploader that holds zero slots
+    # (saturation blocked it before it could grab one).
+    def fake_get_phase_and_progress(client, session, hub, label):
+        if label == "nara+jimmy-carter-library":
+            return ("SDC syncing (1,359 / 11,011 files, ~12.3%)", 1700000000)
+        if label == "ohio+state-library-of-ohio":
+            return ("Uploading (75 / 17,349 files, ~0.4%)", 1700000000)
+        return (None, 0)
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch("scripts.wikimedia_upload_status.ssm_run", return_value=sessions_out),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
+            return_value=SlotSnapshot(
+                line="Worker slots: ~0 free of 24 (24 held)",
+                free=0,
+                holds_by_label={"nara+jimmy-carter-library": 4},
+            ),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.find_active_label",
+            side_effect=lambda ssm, labels: (labels[0], 1700000000),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            side_effect=fake_get_phase_and_progress,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.requests.post",
+            side_effect=fake_post,
+        ),
+    ):
+        main()
+
+    payload = captured["payload"]
+    section_text = "\n".join(
+        b["text"]["text"] for b in payload["blocks"] if b.get("type") == "section"
+    )
+    # jimmy-carter holds 4 slots → [Slots: 4]
+    assert "nara+jimmy-carter-library" in section_text
+    assert "[Slots: 4]" in section_text
+    # state-library-of-ohio is in an upload phase but holds zero → [Awaiting slot]
+    assert "ohio+state-library-of-ohio" in section_text
+    assert "[Awaiting slot]" in section_text
+
+
+def test_fetch_slot_snapshot_returns_none_on_malformed_output():
+    """CR nitpick on PR #366: the parse block must degrade to ``None``
+    rather than letting a malformed ``TOTAL``/``COUNT`` line propagate
+    out of ``slots_future.result()`` and abort the whole status post.
+    Matches :func:`fetch_memory_snapshot`'s own graceful-degradation
+    contract — the slot line is optional context, not load-bearing.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import _fetch_slot_snapshot
+
+    # ``TOTAL`` line with a non-integer value → ``int(...)`` raises;
+    # helper must swallow and return ``None``.
+    with patch(
+        "scripts.wikimedia_upload_status.ssm_run",
+        return_value="TOTAL nope\n1\n1\n1\nCOUNT 1\n",
+    ):
+        assert _fetch_slot_snapshot(object()) is None
+
+
 def test_upload_progress_reports_file_level_when_download_log_available():
     """When the downloader has finished and the per-item `Item <id>: N
     ordinals` summary lines are present in the download log, the Upload

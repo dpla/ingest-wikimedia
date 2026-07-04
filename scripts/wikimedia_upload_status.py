@@ -564,33 +564,44 @@ def _fetch_slot_snapshot(ssm) -> SlotSnapshot | None:
         logging.warning("Could not read slot snapshot: %s", e)
         return None
 
-    total: int | None = None
-    held_samples: list[int] = []
-    holds_by_label: dict[str, int] = {}
-    final_holder_count: int | None = None
-    for ln in (out or "").splitlines():
-        ln = ln.strip()
-        if ln in ("NODIR", "NODATA"):
+    # Parse guarded by its own try/except: unexpected output (a malformed
+    # ``TOTAL``/``COUNT`` sample, an ``lslocks`` upgrade that reshapes a
+    # column) MUST NOT propagate through ``slots_future.result()`` in
+    # ``main`` and abort the entire status post — the slot line is
+    # optional context, not load-bearing. Degrades to ``None`` the same
+    # way :func:`fetch_memory_snapshot` does for its own parse failures.
+    try:
+        total: int | None = None
+        held_samples: list[int] = []
+        holds_by_label: dict[str, int] = {}
+        final_holder_count: int | None = None
+        for ln in (out or "").splitlines():
+            ln = ln.strip()
+            if ln in ("NODIR", "NODATA"):
+                return None
+            if ln.startswith("TOTAL "):
+                total = int(ln.split()[1])
+            elif ln.startswith("COUNT "):
+                final_holder_count = int(ln.split()[1])
+            elif ln.startswith("HOLDER "):
+                label = ln[len("HOLDER ") :]
+                holds_by_label[label] = holds_by_label.get(label, 0) + 1
+            elif ln.isdigit():
+                held_samples.append(int(ln))
+        if not total or not held_samples:
             return None
-        if ln.startswith("TOTAL "):
-            total = int(ln.split()[1])
-        elif ln.startswith("COUNT "):
-            final_holder_count = int(ln.split()[1])
-        elif ln.startswith("HOLDER "):
-            label = ln[len("HOLDER ") :]
-            holds_by_label[label] = holds_by_label.get(label, 0) + 1
-        elif ln.isdigit():
-            held_samples.append(int(ln))
-    if not total or not held_samples:
+        # Feed the final structured pass into the median alongside the
+        # count-only samples so a run that transiently drops between samples
+        # still smooths.
+        if final_holder_count is not None:
+            held_samples.append(final_holder_count)
+        held = round(statistics.median(held_samples))
+        free = max(0, total - held)
+        line = f"Worker slots: ~{free} free of {total} ({held} held)"
+        return SlotSnapshot(line=line, free=free, holds_by_label=holds_by_label)
+    except Exception as e:
+        logging.warning("Could not parse slot snapshot output: %s", e)
         return None
-    # Feed the final structured pass into the median alongside the count-only
-    # samples so a run that transiently drops between samples still smooths.
-    if final_holder_count is not None:
-        held_samples.append(final_holder_count)
-    held = round(statistics.median(held_samples))
-    free = max(0, total - held)
-    line = f"Worker slots: ~{free} free of {total} ({held} held)"
-    return SlotSnapshot(line=line, free=free, holds_by_label=holds_by_label)
 
 
 def _slot_suffix_for_row(
