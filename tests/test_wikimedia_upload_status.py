@@ -790,12 +790,12 @@ def test_find_active_label_picks_freshest_log_across_labels():
     helper parses out the label."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import find_active_label
+    from ingest_wikimedia.session_state import find_active_label
 
     # Latest-mtime log file in the partner dir is the upload log for
     # bpl+phillips-academy. The helper should pick that label.
     with patch(
-        "scripts.wikimedia_upload_status.ssm_run",
+        "ingest_wikimedia.session_state.ssm_run",
         return_value="1700005000.000000000 20260528-091047-bpl+phillips-academy-upload.log",
     ):
         result = find_active_label(
@@ -814,9 +814,9 @@ def test_find_active_label_returns_none_when_no_logs_match():
     session that hasn't yet written any downstream phase log."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import find_active_label
+    from ingest_wikimedia.session_state import find_active_label
 
-    with patch("scripts.wikimedia_upload_status.ssm_run", return_value=""):
+    with patch("ingest_wikimedia.session_state.ssm_run", return_value=""):
         result = find_active_label(client=None, labels=["bpl+phillips-academy"])
     assert result is None
 
@@ -827,9 +827,9 @@ def test_find_active_label_returns_none_for_empty_label_list():
     can return an empty list on a malformed session name."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import find_active_label
+    from ingest_wikimedia.session_state import find_active_label
 
-    with patch("scripts.wikimedia_upload_status.ssm_run") as ssm:
+    with patch("ingest_wikimedia.session_state.ssm_run") as ssm:
         result = find_active_label(client=None, labels=[])
     assert result is None
     assert not ssm.called, "Empty label list must skip the SSM round trip"
@@ -843,7 +843,7 @@ def test_find_active_label_groups_multi_hub_labels_into_single_find():
     ``get_phase_and_progress`` per label — O(labels) round trips."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import find_active_label
+    from ingest_wikimedia.session_state import find_active_label
 
     captured: list[str] = []
 
@@ -851,7 +851,7 @@ def test_find_active_label_groups_multi_hub_labels_into_single_find():
         captured.append(command)
         return "1700000000.0 20260528-091047-bpl+phillips-academy-upload.log"
 
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+    with patch("ingest_wikimedia.session_state.ssm_run", side_effect=fake_ssm_run):
         find_active_label(
             client=None,
             labels=[
@@ -879,14 +879,14 @@ def test_find_active_label_picks_active_when_earlier_label_aborted():
     that's the active label."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import find_active_label
+    from ingest_wikimedia.session_state import find_active_label
 
     # ``find ... | sort -rn | head -1`` returns the highest-mtime line;
     # we just have to feed it that one line. The active CFLA SDC log
     # would be ranked above the aborted Clinton SDC log because its
     # mtime is later.
     with patch(
-        "scripts.wikimedia_upload_status.ssm_run",
+        "ingest_wikimedia.session_state.ssm_run",
         return_value="1700018000.0 20260528-140954-nara+center-for-legislative-archives-sdc.log",
     ):
         result = find_active_label(
@@ -911,10 +911,10 @@ def test_find_active_label_rejects_filename_not_in_label_list():
     label."""
     from unittest.mock import patch
 
-    from scripts.wikimedia_upload_status import find_active_label
+    from ingest_wikimedia.session_state import find_active_label
 
     with patch(
-        "scripts.wikimedia_upload_status.ssm_run",
+        "ingest_wikimedia.session_state.ssm_run",
         return_value="1700000000.0 20260528-091047-some+other-hub-upload.log",
     ):
         result = find_active_label(client=None, labels=["bpl+phillips-academy"])

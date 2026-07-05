@@ -18,6 +18,10 @@ import requests
 from typing import NamedTuple
 
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
+from ingest_wikimedia.session_state import (
+    find_active_label,
+    log_filename_pattern_for_label,
+)
 from ingest_wikimedia.ssm import REGION, fetch_memory_snapshot, ssm_run
 from ingest_wikimedia.worker_slots import (
     DEFAULT_SLOT_DIR,
@@ -101,19 +105,6 @@ _SDC_COMPLETE_PREFIX = "SDC complete"
 _SLACK_BLOCK_SOFT_LIMIT = 2800
 
 
-def log_filename_pattern_for_label(label: str) -> str:
-    """Anchored regex matching log filenames for exactly this label.
-
-    Log filenames follow "{YYYYMMDD}-{HHMMSS}-{label}-(download|upload|sdc).log".
-    The pattern must match `…-bpl+phillips-academy-download.log` and NOT
-    `…-bpl+phillips-academy-andover-download.log` — otherwise sibling
-    labels whose names extend this one steal the log selection and the
-    status report sticks on the wrong target. See lessons.md
-    "Log filename phase detection".
-    """
-    return rf"-{re.escape(label)}-(download|upload|sdc)\.log$"
-
-
 _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 # A session that hasn't written a log line in this many seconds is considered hung.
 # Uploads normally complete items in seconds; downloads in seconds to low minutes.
@@ -126,54 +117,6 @@ _STALE_SECONDS = 1800  # 30 minutes
 # slug shape at runtime to keep that interpolation safe regardless of
 # how callers obtain the label.
 _LABEL_SLUG_RE = re.compile(r"[a-z0-9+\-]+")
-
-
-def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
-    """Return ``(label, log_mtime)`` for the most-recently-written log file
-    across all labels in this session, or ``None`` if no matching log exists.
-
-    A wikimedia-upload session runs its labels sequentially (downloader →
-    uploader → sdc-sync per label, then on to the next label), so at any
-    moment **at most one label is active**. The freshest log file across
-    all labels in the session uniquely identifies that label — an aborted
-    earlier label's last log write is hours stale, while the running one
-    is being written right now.
-
-    Picking the active label this way takes one SSM round-trip per
-    session regardless of label count. Previously the script polled
-    ``get_phase_and_progress`` once per label, which scaled the SSM round
-    trips linearly with batch size and pushed multi-institution sessions
-    past Slack's three-second slash-command ack deadline. See PR #325-vintage
-    multi-institution batches accumulating 50+ labels each.
-    """
-    if not labels:
-        return None
-
-    # Group labels by hub so we touch each partner log directory exactly once.
-    hubs = sorted({lbl.split("+")[0] for lbl in labels})
-    paths = " ".join(
-        shlex.quote(f"/home/ec2-user/ingest-wikimedia/{PARTNER_DIR.get(h, h)}/logs")
-        for h in hubs
-    )
-    label_alt = "|".join(re.escape(lbl) for lbl in labels)
-    cmd = (
-        f"find {paths} -maxdepth 1 -type f -name '*.log' "
-        f"-regextype posix-extended "
-        f"-regex '.*-({label_alt})-(download|upload|sdc)\\.log' "
-        f"-printf '%T@ %f\\n' 2>/dev/null | sort -rn | head -1"
-    )
-    out = ssm_run(client, cmd).strip()
-    if not out:
-        return None
-    mtime_str, _, filename = out.partition(" ")
-    # Identify which of our labels matched via the per-label helper —
-    # same anchored-pattern logic the rest of this file uses, so
-    # suffix-collision (e.g. ``bpl+phillips-academy`` vs
-    # ``bpl+phillips-academy-andover``) is handled exactly once.
-    for lbl in labels:
-        if re.search(log_filename_pattern_for_label(lbl), filename):
-            return lbl, int(float(mtime_str))
-    return None
 
 
 def get_phase_and_progress(
