@@ -51,10 +51,20 @@ jobs:
       - name: Install dependencies
         run: uv sync --no-dev
 
-      - name: Create pywikibot password file
+      # Both pywikibot config files are generated at runtime (the password
+      # file is secret; the site config is non-sensitive but generated too so
+      # no duplicate config lives in the repo). PYWIKIBOT_DIR below points the
+      # job at this directory.
+      - name: Create pywikibot config
         env:
           PYWIKIBOT_PASSWORD: ${{ secrets.PYWIKIBOT_PASSWORD }}
         run: |
+          cat > metrics/dpla-dup-window/user-config.py <<'CFG'
+          family = 'commons'
+          mylang = 'commons'
+          usernames['commons']['commons'] = 'DPLA bot'  # noqa: F821
+          password_file = 'user-password.py'
+          CFG
           python - <<'PY'
           import os
           from pathlib import Path

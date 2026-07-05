@@ -1,8 +1,7 @@
-# Ignore everything (the bot password file is materialized at runtime from
-# the PYWIKIBOT_PASSWORD secret and must never be committed)...
+# Ignore everything — both pywikibot config files (user-config.py and the
+# secret user-password.py) are generated at runtime by the workflow and must
+# never be committed...
 *
-# ...except the site config (not sensitive), this ignore file, and the
-# release job.
+# ...except this ignore file and the release job.
 !.gitignore
-!user-config.py
 !release_window.py
