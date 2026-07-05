@@ -313,5 +313,28 @@ def test_count_visible_filters_by_dpla_token():
     with patch.object(release_window.pywikibot, "Category", return_value=fake_cat):
         n = release_window._count_visible(MagicMock())
     assert n == 2
-    # Counts File-namespace members of Category:Duplicate.
-    fake_cat.members.assert_called_once()
+    # Counts File-namespace members of Category:Duplicate — assert the
+    # namespace filter is actually applied, not just that members() was called.
+    fake_cat.members.assert_called_once_with(namespaces=[release_window.FILE_NAMESPACE])
+
+
+def test_purge_forcelinkupdate_survives_chunk_failure():
+    """A purge chunk that raises must not abort the run (the window is
+    already saved by the time purge runs) or drop the remaining chunks —
+    the release still lands via the window edit's fan-out."""
+    calls = []
+
+    def _factory(*, site, parameters):
+        calls.append(parameters)
+        req = MagicMock()
+        # First chunk raises; later chunks succeed.
+        if len(calls) == 1:
+            req.submit.side_effect = RuntimeError("maxlag / transient")
+        return req
+
+    titles = [f"File:{i}.jpg" for i in range(45)]  # 3 chunks of 20/20/5
+    with patch.object(release_window.api, "Request", side_effect=_factory):
+        # Must not raise despite the first chunk failing.
+        release_window._purge_forcelinkupdate(MagicMock(), titles)
+    # All three chunks were still attempted.
+    assert len(calls) == 3

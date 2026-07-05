@@ -261,15 +261,29 @@ def _purge_forcelinkupdate(site: pywikibot.site.APISite, titles: list[str]) -> N
         return
     for i in range(0, len(titles), 20):
         chunk = titles[i : i + 20]
-        api.Request(
-            site=site,
-            parameters={
-                "action": "purge",
-                "forcelinkupdate": "1",
-                "titles": "|".join(chunk),
-            },
-        ).submit()
-        logging.info("Purged (forcelinkupdate) %d file(s).", len(chunk))
+        try:
+            api.Request(
+                site=site,
+                parameters={
+                    "action": "purge",
+                    "forcelinkupdate": "1",
+                    "titles": "|".join(chunk),
+                },
+            ).submit()
+            logging.info("Purged (forcelinkupdate) %d file(s).", len(chunk))
+        except Exception as ex:
+            # Best-effort: the window edit that already committed will re-parse
+            # these files via its own refreshLinks fan-out (just less
+            # promptly), and the next run re-reads the live count — so a purge
+            # failure must neither abort the run (the window has already
+            # advanced) nor drop the remaining chunks.
+            logging.warning(
+                "Purge (forcelinkupdate) failed for %d file(s) (%s); "
+                "continuing — release still lands via the window edit's "
+                "fan-out and the count self-corrects next run.",
+                len(chunk),
+                ex,
+            )
 
 
 def main() -> int:
