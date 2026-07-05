@@ -14,6 +14,7 @@ a package namespace — cross-script imports fail at runtime under that entry-
 point shape even though they work in tests via ``conftest`` path-fixup.
 """
 
+import logging
 import re
 import shlex
 
@@ -81,3 +82,53 @@ def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
         if re.search(log_filename_pattern_for_label(lbl), filename):
             return lbl, int(float(mtime_str))
     return None
+
+
+def active_and_upcoming_labels(ssm, labels: list[str]) -> set[str]:
+    """Return the subset of ``labels`` that a chained session hasn't yet
+    completed — the currently-active label plus everything after it in
+    the chain-run order.
+
+    A wikimedia-upload tmux session runs its targets sequentially. Once
+    a target's ``sdc-sync`` phase finishes and the ``&&`` chain moves on,
+    that target is done; a new incoming request naming that same target
+    is NOT a conflict and should be allowed to run alongside the ongoing
+    session. Pre-fix, the launcher's conflict check naively compared
+    against **every** label in the tmux session name, causing a 54-target
+    chained session to block every new request naming any of its 54
+    institutions — even institutions whose target completed hours ago.
+
+    Uses :func:`find_active_label`'s log-mtime heuristic: the freshest
+    log across the label set identifies the currently-running target;
+    everything at or after that position is still upcoming, everything
+    before is done. If no log exists yet (session is in id-generation
+    for its first target) OR the lookup raises (transient SSM error),
+    fall back to treating all labels as active — the conservative
+    choice, so a failed lookup can't silently let a real conflict
+    through. The exception path is logged at warning level so silent
+    regressions to the old over-conflicting behavior are visible in
+    operator diagnostics.
+    """
+    if not labels:
+        return set()
+    try:
+        active = find_active_label(ssm, labels)
+    except Exception as e:
+        logging.warning(
+            "active_and_upcoming_labels: find_active_label raised %r; "
+            "falling back to conservative all-labels conflict scope. "
+            "Some completed targets may over-conflict until the SSM "
+            "lookup recovers.",
+            e,
+        )
+        return set(labels)
+    if active is None:
+        return set(labels)
+    try:
+        start_idx = labels.index(active[0])
+    except ValueError:
+        # ``find_active_label`` returned a label not in the input list —
+        # shouldn't happen (its selection loop only returns labels from
+        # this list), but treat as unknown → conservative all-labels.
+        return set(labels)
+    return set(labels[start_idx:])

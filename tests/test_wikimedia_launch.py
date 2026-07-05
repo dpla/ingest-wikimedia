@@ -966,10 +966,10 @@ def test_active_and_upcoming_labels_scopes_to_labels_at_or_after_current():
     ]
 
     with patch(
-        "scripts.wikimedia_launch.find_active_label",
+        "ingest_wikimedia.session_state.find_active_label",
         return_value=("texas+bicentennial-city-county-library", 1700000000),
     ):
-        result = launch_mod._active_and_upcoming_labels(object(), labels)
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
 
     # Completed labels absent — new requests naming them do not conflict.
     assert "texas+livingston-municipal-library" not in result
@@ -992,8 +992,8 @@ def test_active_and_upcoming_labels_all_when_no_log_yet():
     import scripts.wikimedia_launch as launch_mod
 
     labels = ["nara+franklin-d-roosevelt-library", "nara+jimmy-carter-library"]
-    with patch("scripts.wikimedia_launch.find_active_label", return_value=None):
-        result = launch_mod._active_and_upcoming_labels(object(), labels)
+    with patch("ingest_wikimedia.session_state.find_active_label", return_value=None):
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
     assert result == set(labels)
 
 
@@ -1007,10 +1007,10 @@ def test_active_and_upcoming_labels_all_when_ssm_lookup_raises():
 
     labels = ["nara+franklin-d-roosevelt-library", "nara+jimmy-carter-library"]
     with patch(
-        "scripts.wikimedia_launch.find_active_label",
+        "ingest_wikimedia.session_state.find_active_label",
         side_effect=RuntimeError("SSM transient failure"),
     ):
-        result = launch_mod._active_and_upcoming_labels(object(), labels)
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
     assert result == set(labels)
 
 
@@ -1020,8 +1020,8 @@ def test_active_and_upcoming_labels_empty_list_short_circuits():
     return an empty list on a malformed session name."""
     import scripts.wikimedia_launch as launch_mod
 
-    with patch("scripts.wikimedia_launch.find_active_label") as mock_find:
-        result = launch_mod._active_and_upcoming_labels(object(), [])
+    with patch("ingest_wikimedia.session_state.find_active_label") as mock_find:
+        result = launch_mod.active_and_upcoming_labels(object(), [])
     assert result == set()
     assert not mock_find.called
 
@@ -1035,8 +1035,8 @@ def test_active_and_upcoming_labels_active_at_position_zero_returns_all():
 
     labels = ["texas+lib-a", "texas+lib-b", "texas+lib-c"]
     with patch(
-        "scripts.wikimedia_launch.find_active_label",
+        "ingest_wikimedia.session_state.find_active_label",
         return_value=("texas+lib-a", 1700000000),
     ):
-        result = launch_mod._active_and_upcoming_labels(object(), labels)
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
     assert result == set(labels)

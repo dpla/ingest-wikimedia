@@ -49,7 +49,7 @@ from ingest_wikimedia.partners import (
     slugify_session_label_component,
     wikidata_qid_for_target,
 )
-from ingest_wikimedia.session_state import find_active_label
+from ingest_wikimedia.session_state import active_and_upcoming_labels
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
 
@@ -141,47 +141,6 @@ _STEP_BY_FIRST_TOKEN: dict[str, str] = {
     "sdc-sync": "sdc-sync",
     "drain-deferred": "drain-deferred",
 }
-
-
-def _active_and_upcoming_labels(ssm, labels: list[str]) -> set[str]:
-    """Return the subset of ``labels`` that a chained session hasn't yet
-    completed — the currently-active label plus everything after it in
-    the chain-run order.
-
-    A wikimedia-upload tmux session runs its targets sequentially. Once
-    a target's ``sdc-sync`` phase finishes and the ``&&`` chain moves on,
-    that target is done; a new incoming request naming that same target
-    is NOT a conflict and should be allowed to run alongside the ongoing
-    session. Pre-fix (before this helper existed), the conflict check
-    naively compared against **every** label in the tmux session name,
-    causing the 54-target texas chain to block every new request naming
-    any of its 54 institutions — even institutions whose target
-    completed hours ago.
-
-    Uses :func:`ingest_wikimedia.session_state.find_active_label`'s
-    log-mtime heuristic: the freshest log across the label set
-    identifies the currently-running target; everything AT or AFTER
-    that position is still upcoming, everything before is done. If no
-    log exists yet (session is in id-generation for its first target
-    or a transient SSM error prevented the lookup), fall back to
-    treating all labels as active — the conservative choice, so a
-    failed lookup can't silently let a real conflict through.
-    """
-    if not labels:
-        return set()
-    try:
-        active = find_active_label(ssm, labels)
-    except Exception:
-        return set(labels)
-    if active is None:
-        return set(labels)
-    try:
-        start_idx = labels.index(active[0])
-    except ValueError:
-        # ``find_active_label`` returned a label not in the input list —
-        # shouldn't happen, but treat as unknown → fall back to all.
-        return set(labels)
-    return set(labels[start_idx:])
 
 
 def _wrap_step_with_marker(cmd: str) -> str:
@@ -1142,7 +1101,7 @@ def main() -> None:
         existing_labels_ordered = parse_session_labels(
             existing_name[len("wikimedia-") :]
         )
-        existing_labels = _active_and_upcoming_labels(ssm, existing_labels_ordered)
+        existing_labels = active_and_upcoming_labels(ssm, existing_labels_ordered)
         for canonical, institutions, label, dpla_id, collection in targets:
             if not institutions and dpla_id is None:
                 # Hub-level request conflicts with any existing session touching this hub
