@@ -1,4 +1,0 @@
-<includeonly>{{#ifexpr: {{{ts|0}}} < {{#if:{{DPLA duplicate/moving window}}|{{DPLA duplicate/moving window}}|0}}
- | {{Duplicate|{{{1|}}}}}
- | [[Category:DPLA duplicates for deletion|{{{ts|0}}}]]
-}}</includeonly><noinclude>{{Documentation}}</noinclude>
