@@ -118,6 +118,108 @@ _STALE_SECONDS = 1800  # 30 minutes
 # how callers obtain the label.
 _LABEL_SLUG_RE = re.compile(r"[a-z0-9+\-]+")
 
+# The drain-deferred phase emits its `Category:Duplicate at N (>= resume
+# threshold M); waiting Ss…` line every poll interval. Extract N and M
+# so the status readout can show both the current queue size and how
+# close it is to the resume gate.
+_DRAIN_THROTTLE_RE = re.compile(
+    r"Category:Duplicate at (\d+) \(>= resume threshold (\d+)\)"
+)
+
+
+def _drain_deferred_phase(
+    *,
+    client,
+    pdir: str,
+    log_path: str,
+    log_file: str,
+    session_created: int,
+) -> tuple[str, int]:
+    """Report the drain-deferred phase's live state.
+
+    Sidecar queue length comes from ``<partner>/deferred-drain.json``
+    (the file the drain loop rewrites atomically after each round —
+    reading it gives the live count, not the initial count from the
+    log's "N item(s) queued" line, which grows stale as items drain).
+
+    Lock state and throttle numbers come from the log itself: presence
+    of ``Drain-phase host lock acquired.`` distinguishes lock-holder
+    from lock-waiter, and the most recent
+    ``Category:Duplicate at N (>= resume threshold M)`` line gives the
+    current throttle position.
+
+    ``opportunistic`` mode is a one-shot best-effort drain that exits
+    fast — its logs are terminal by design, so the phase string
+    reflects that final state rather than "still working".
+    """
+    is_opportunistic = log_file.endswith("-drain-deferred-opportunistic.log")
+    sidecar = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{pdir}/deferred-drain.json")
+    sep = "__WM_DRAIN_SEP__"
+    # Live sidecar count: each DPLA ID is a 32-hex-char string on its
+    # own line in the JSON array (the drain sidecar writer emits a
+    # pretty-printed shape). Counting `[0-9a-f]{32}` matches is more
+    # robust than parsing JSON through a here-python (no dependency on
+    # shell quoting the interpreter body correctly).
+    out = ssm_run(
+        client,
+        f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
+        f"echo {sep}; "
+        f"tail -8 {log_path} 2>/dev/null; "
+        f"echo {sep}; "
+        f"grep -oE '[0-9a-f]{{32}}' {sidecar} 2>/dev/null | wc -l",
+    )
+    sections = out.split(f"{sep}\n", 2)
+
+    def _int(s: str) -> int:
+        try:
+            return int(s.strip())
+        except ValueError:
+            return 0
+
+    log_mtime = _int(sections[0]) if sections else 0
+    tail = sections[1] if len(sections) > 1 else ""
+    queued = _int(sections[2]) if len(sections) > 2 else 0
+
+    if session_created > 0 and log_mtime > 0 and log_mtime < session_created:
+        return "", 0
+
+    mode = "opportunistic drain" if is_opportunistic else "drain"
+
+    # Terminal states first — a completed / capacity-declined drain
+    # doesn't need lock / throttle qualifiers.
+    if "Drain-deferred: complete." in tail:
+        return f"Drain complete ({queued:,} still queued)", log_mtime
+    if "at capacity; " in tail and is_opportunistic:
+        return (
+            f"Drain (opportunistic) skipped ({queued:,} deferred to terminal drain)",
+            log_mtime,
+        )
+
+    # Non-terminal: determine lock state.
+    if "Drain-phase host lock acquired." not in tail:
+        # Still waiting on the flock — another partner's drain is
+        # holding it.
+        return (
+            f"Draining ({mode}: {queued:,} queued, ⏸ waiting for host lock)",
+            log_mtime,
+        )
+
+    # Lock held. Try to surface the most recent throttle poll.
+    m = None
+    for line in reversed(tail.splitlines()):
+        m = _DRAIN_THROTTLE_RE.search(line)
+        if m:
+            break
+    if m:
+        cat_size, threshold = int(m.group(1)), int(m.group(2))
+        return (
+            f"Draining ({mode}: {queued:,} queued, "
+            f"Category:Duplicate at {cat_size:,}, needs < {threshold:,})",
+            log_mtime,
+        )
+    # Lock acquired but no throttle poll yet — first tick of the loop.
+    return f"Draining ({mode}: {queued:,} queued, host lock acquired)", log_mtime
+
 
 def get_phase_and_progress(
     client, session: str, hub: str, label: str
@@ -193,6 +295,22 @@ def get_phase_and_progress(
         return None, 0
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
+
+    # Drain-deferred phase has its own tight state machine: sidecar queue
+    # size + host-lock state + throttle poll number are what matter, not
+    # the download/upload/sdc markers the awk pass below counts. Short-
+    # circuit before the heavier SSM call — one round-trip, direct
+    # signals.
+    if log_file.endswith("-drain-deferred.log") or log_file.endswith(
+        "-drain-deferred-opportunistic.log"
+    ):
+        return _drain_deferred_phase(
+            client=client,
+            pdir=pdir,
+            log_path=log_path,
+            log_file=log_file,
+            session_created=session_created,
+        )
     # Resolve the CSV(s) backing this label so `wc -l` returns a meaningful
     # "items in scope" denominator.
     #
