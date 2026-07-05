@@ -1093,6 +1093,15 @@ def main() -> None:
             f"⚠️ Failed to list tmux sessions: {e}",
             operational=True,
         )
+    # In-memory pre-filter: an existing session can only conflict with a
+    # requested target if they share a hub prefix. Sessions on unrelated
+    # hubs — the common case when the box runs 3+ concurrent partner
+    # chains — skip the ``active_and_upcoming_labels`` SSM round trip
+    # entirely, keeping the launcher's total SSM budget bounded by the
+    # number of overlapping sessions rather than by the number of running
+    # sessions. Extracted once outside the loop; ``targets`` is set at
+    # this point and doesn't change during conflict detection.
+    target_hubs = {canonical for canonical, _, _, _, _ in targets}
     label_conflicts: dict[str, list[str]] = {}
     for line in tmux_list.splitlines():
         existing_name = line.split(":")[0].strip()
@@ -1101,6 +1110,11 @@ def main() -> None:
         existing_labels_ordered = parse_session_labels(
             existing_name[len("wikimedia-") :]
         )
+        if not any(lbl.split("+")[0] in target_hubs for lbl in existing_labels_ordered):
+            # No shared hub with any requested target — can't conflict
+            # regardless of which label is currently active in this
+            # session. Skip the SSM lookup and move on.
+            continue
         existing_labels = active_and_upcoming_labels(ssm, existing_labels_ordered)
         for canonical, institutions, label, dpla_id, collection in targets:
             if not institutions and dpla_id is None:
