@@ -7,13 +7,19 @@ Background
 DPLA tags duplicate uploads for deletion. ``Category:Duplicate`` is patrolled
 by Commons admins (speedy-deletion criterion F8); flooding it with tens of
 thousands of DPLA files at once overwhelms them. Instead, every DPLA duplicate
-is tagged with ``{{DPLA duplicate|<correct file>|ts=<sortkey>}}`` which:
+is tagged with ``{{DPLA duplicate|1=<correct file>|ts=<sortkey>|reason=<why>}}``
+which:
 
   * places the file in ``Category:DPLA duplicates for deletion`` (a private
     backlog, sorted oldest-first by the ``ts`` sortkey) when its ``ts`` is
     NOT below the moving window, and
-  * transcludes ``{{Duplicate}}`` (emitting the real ``Category:Duplicate``
-    + F8) when its ``ts`` IS below the moving window.
+  * transcludes ``{{Duplicate|1=<correct file>|2=<reason>}}`` (emitting the
+    real ``Category:Duplicate`` + F8, with the duplicate's target and reason)
+    when its ``ts`` IS below the moving window.
+
+  A tag with no ``ts`` fails closed: it lands in the backlog without a sort
+  key and is skipped by this job (non-integer sort key), so it is never
+  released.
 
 The window value lives at ``Template:DPLA duplicate/moving window`` — a single
 integer. A file is "released" (visible to admins) iff ``ts < window``. Because
