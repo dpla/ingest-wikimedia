@@ -1,0 +1,7 @@
+# Ignore everything — both pywikibot config files (user-config.py and the
+# secret user-password.py) are generated at runtime by the workflow and must
+# never be committed...
+*
+# ...except this ignore file and the release job.
+!.gitignore
+!release_window.py
