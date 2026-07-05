@@ -935,3 +935,108 @@ def test_maintain_stage_cmd_routes_bare_nara_to_get_ids_nara():
         "get-ids-es nara --institution 'National Archives at College Park'"
         " --maintain --skip-media-filter > out.csv"
     )
+
+
+# ---------------------------------------------------------------------------
+# _active_and_upcoming_labels: conflict detection scoped to labels the
+# chained session still has to work on
+# ---------------------------------------------------------------------------
+
+
+def test_active_and_upcoming_labels_scopes_to_labels_at_or_after_current():
+    """A chained session with N targets is currently on target ``k``
+    (its log is the freshest). Everything before ``k`` in the chain has
+    completed and is no longer a conflict candidate — a new request
+    naming one of those labels must be free to run. Regression for the
+    54-target texas-chain incident where a new request naming
+    ``montgomery-county-memorial-library`` (long-completed by then) was
+    blocked because the naive check compared against every label in the
+    tmux session name.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    labels = [
+        "texas+livingston-municipal-library",
+        "texas+friends-of-the-nocona-public-library",
+        "texas+montgomery-county-memorial-library",  # completed
+        "texas+harrie-p-woodson-memorial-library",  # completed
+        "texas+bicentennial-city-county-library",  # currently active
+        "texas+nesbitt-memorial-library",  # upcoming
+        "texas+baylor-county-free-library",  # upcoming
+    ]
+
+    with patch(
+        "ingest_wikimedia.session_state.find_active_label",
+        return_value=("texas+bicentennial-city-county-library", 1700000000),
+    ):
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
+
+    # Completed labels absent — new requests naming them do not conflict.
+    assert "texas+livingston-municipal-library" not in result
+    assert "texas+friends-of-the-nocona-public-library" not in result
+    assert "texas+montgomery-county-memorial-library" not in result
+    assert "texas+harrie-p-woodson-memorial-library" not in result
+    # Active label + upcoming labels present — new requests naming these
+    # DO still conflict.
+    assert "texas+bicentennial-city-county-library" in result
+    assert "texas+nesbitt-memorial-library" in result
+    assert "texas+baylor-county-free-library" in result
+
+
+def test_active_and_upcoming_labels_all_when_no_log_yet():
+    """A session in id-generation for its first target hasn't written any
+    downstream-phase log — ``find_active_label`` returns ``None``.
+    Fall back to conservative "all labels active" so an ambiguous state
+    doesn't silently let a real conflict through.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    labels = ["nara+franklin-d-roosevelt-library", "nara+jimmy-carter-library"]
+    with patch("ingest_wikimedia.session_state.find_active_label", return_value=None):
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
+    assert result == set(labels)
+
+
+def test_active_and_upcoming_labels_all_when_ssm_lookup_raises():
+    """A transient SSM error during the log-mtime lookup must NOT crash
+    the whole conflict check nor silently drop conflict candidates.
+    Fall back to treating all labels as active so a real conflict can't
+    slip through under partial SSM failure.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    labels = ["nara+franklin-d-roosevelt-library", "nara+jimmy-carter-library"]
+    with patch(
+        "ingest_wikimedia.session_state.find_active_label",
+        side_effect=RuntimeError("SSM transient failure"),
+    ):
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
+    assert result == set(labels)
+
+
+def test_active_and_upcoming_labels_empty_list_short_circuits():
+    """Defensive: empty label list returns empty set, no SSM call. The
+    helper is reached from :func:`parse_session_labels`, which can
+    return an empty list on a malformed session name."""
+    import scripts.wikimedia_launch as launch_mod
+
+    with patch("ingest_wikimedia.session_state.find_active_label") as mock_find:
+        result = launch_mod.active_and_upcoming_labels(object(), [])
+    assert result == set()
+    assert not mock_find.called
+
+
+def test_active_and_upcoming_labels_active_at_position_zero_returns_all():
+    """When the currently-active label is the FIRST target in the chain,
+    every label is still active or upcoming — the whole set is returned.
+    Guards against off-by-one in the ``labels.index(active[0])`` slice.
+    """
+    import scripts.wikimedia_launch as launch_mod
+
+    labels = ["texas+lib-a", "texas+lib-b", "texas+lib-c"]
+    with patch(
+        "ingest_wikimedia.session_state.find_active_label",
+        return_value=("texas+lib-a", 1700000000),
+    ):
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
+    assert result == set(labels)
