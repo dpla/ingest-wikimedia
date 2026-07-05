@@ -76,9 +76,17 @@ jobs:
           PY
 
       - name: Advance window
+        # workflow_dispatch inputs are routed through env and read as shell
+        # variables — never interpolated as ${{ }} directly into the run
+        # script, which would let a crafted `target` inject shell commands on
+        # the runner (where PYWIKIBOT_PASSWORD is materialized).
         env:
           PYWIKIBOT_DIR: ${{ github.workspace }}/metrics/dpla-dup-window
+          TARGET: ${{ github.event.inputs.target || '100' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          uv run python metrics/dpla-dup-window/release_window.py \
-            --target "${{ github.event.inputs.target || '100' }}" \
-            ${{ (github.event.inputs.dry_run == 'true') && '--dry-run' || '' }}
+          args=(--target "$TARGET")
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          uv run python metrics/dpla-dup-window/release_window.py "${args[@]}"

@@ -211,6 +211,11 @@ def _fetch_oldest_unrevealed(
     computed from real keys rather than inferred from order. Skips any member
     whose sortkey prefix isn't a plain integer (defensive against a
     hand-tagged page).
+
+    ``limit`` is clamped to the API's single-request ceiling (500 for
+    non-bot; we stay at the universal floor rather than assume the bot
+    flag). A ``--target`` large enough to exceed it just fetches 500 this
+    run and catches up next run — the window is self-correcting.
     """
     request = api.Request(
         site=site,
@@ -222,7 +227,7 @@ def _fetch_oldest_unrevealed(
             "cmsort": "sortkey",
             "cmdir": "ascending",
             "cmnamespace": FILE_NAMESPACE,
-            "cmlimit": str(limit),
+            "cmlimit": str(min(limit, 500)),
         },
     )
     data = request.submit()

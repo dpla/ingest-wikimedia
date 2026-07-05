@@ -204,3 +204,114 @@ def test_plan_first_fill_from_zero_window():
     )
     assert len(plan.keys_to_reveal) == 100
     assert plan.new_window == 100 + 1  # keys[99] == 100
+
+
+# --------------------------------------------------------------------------
+# Site-interaction helpers — mocked pywikibot/API to pin the request
+# contracts (cmprop/cmsort/cmdir/cmlimit, forcelinkupdate) without a live site.
+# --------------------------------------------------------------------------
+
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+
+def _fake_request_returning(payload):
+    """Build a patch target for release_window.api.Request that records the
+    parameters it was constructed with and returns ``payload`` from submit()."""
+    captured = {}
+
+    def _factory(*, site, parameters):
+        captured["parameters"] = parameters
+        req = MagicMock()
+        req.submit.return_value = payload
+        return req
+
+    return _factory, captured
+
+
+def test_fetch_oldest_unrevealed_request_contract_and_parse():
+    payload = {
+        "query": {
+            "categorymembers": [
+                {
+                    "title": "File:A - DPLA - a.jpg",
+                    "sortkeyprefix": "00000000000000000010",
+                },
+                {
+                    "title": "File:B - DPLA - b.jpg",
+                    "sortkeyprefix": "00000000000000000020",
+                },
+                # Non-integer sortkey prefix must be skipped defensively.
+                {"title": "File:C.jpg", "sortkeyprefix": "not-a-number"},
+            ]
+        }
+    }
+    factory, captured = _fake_request_returning(payload)
+    with patch.object(release_window.api, "Request", side_effect=factory):
+        out = release_window._fetch_oldest_unrevealed(MagicMock(), limit=50)
+
+    # Contract: sorted-ascending sortkey query over the backlog category.
+    p = captured["parameters"]
+    assert p["list"] == "categorymembers"
+    assert p["cmtitle"] == release_window.BACKLOG_CATEGORY
+    assert p["cmsort"] == "sortkey"
+    assert p["cmdir"] == "ascending"
+    assert "sortkeyprefix" in p["cmprop"]
+    assert p["cmnamespace"] == release_window.FILE_NAMESPACE
+    # Parsed pairs, non-integer prefix dropped.
+    assert out == [(10, "File:A - DPLA - a.jpg"), (20, "File:B - DPLA - b.jpg")]
+
+
+def test_fetch_oldest_unrevealed_clamps_cmlimit_to_500():
+    factory, captured = _fake_request_returning({"query": {"categorymembers": []}})
+    with patch.object(release_window.api, "Request", side_effect=factory):
+        release_window._fetch_oldest_unrevealed(MagicMock(), limit=100_000)
+    # A huge --target must not ask the API for more than the 500 ceiling.
+    assert captured["parameters"]["cmlimit"] == "500"
+
+
+def test_purge_forcelinkupdate_sets_flag_and_chunks():
+    calls = []
+
+    def _factory(*, site, parameters):
+        calls.append(parameters)
+        return MagicMock()
+
+    titles = [f"File:{i}.jpg" for i in range(45)]
+    with patch.object(release_window.api, "Request", side_effect=_factory):
+        release_window._purge_forcelinkupdate(MagicMock(), titles)
+
+    # 45 titles → 3 chunks of 20/20/5.
+    assert len(calls) == 3
+    assert all(c["action"] == "purge" for c in calls)
+    assert all(c["forcelinkupdate"] == "1" for c in calls)
+    # Every title is covered exactly once across the chunks.
+    covered = "|".join(c["titles"] for c in calls).split("|")
+    assert sorted(covered) == sorted(titles)
+
+
+def test_purge_forcelinkupdate_empty_is_noop():
+    def _factory(*, site, parameters):
+        raise AssertionError("should not issue a purge for an empty title list")
+
+    with patch.object(release_window.api, "Request", side_effect=_factory):
+        release_window._purge_forcelinkupdate(MagicMock(), [])
+
+
+def test_count_visible_filters_by_dpla_token():
+    def _page(name):
+        p = MagicMock()
+        p.title.return_value = name
+        return p
+
+    members = [
+        _page("A - DPLA - a.jpg"),  # counts
+        _page("Community Photo.jpg"),  # not DPLA
+        _page("B - DPLA - b.jpg"),  # counts
+    ]
+    fake_cat = MagicMock()
+    fake_cat.members.return_value = iter(members)
+    with patch.object(release_window.pywikibot, "Category", return_value=fake_cat):
+        n = release_window._count_visible(MagicMock())
+    assert n == 2
+    # Counts File-namespace members of Category:Duplicate.
+    fake_cat.members.assert_called_once()
