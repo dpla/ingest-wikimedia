@@ -25,14 +25,27 @@ from ingest_wikimedia.ssm import ssm_run
 def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
 
-    Log filenames follow ``{YYYYMMDD}-{HHMMSS}-{label}-(download|upload|sdc).log``.
+    Log filenames follow ``{YYYYMMDD}-{HHMMSS}-{label}-<phase>.log`` where
+    ``<phase>`` is one of ``download``, ``upload``, ``sdc``,
+    ``drain-deferred``, or ``drain-deferred-opportunistic``.
     The pattern must match ``…-bpl+phillips-academy-download.log`` and NOT
     ``…-bpl+phillips-academy-andover-download.log`` — otherwise sibling
     labels whose names extend this one steal the log selection and the
     caller sticks on the wrong target. See lessons.md
     "Log filename phase detection".
+
+    ``drain-deferred`` is included so the status reporter can see the
+    post-SDC deferred-tagging phase — a session that has completed
+    upload+SDC and moved on to draining its Case-2 duplicate-tag
+    sidecar was previously invisible here and misreported as
+    ``SDC complete`` while actually holding a host-level flock and
+    polling ``Category:Duplicate`` capacity.
     """
-    return rf"-{re.escape(label)}-(download|upload|sdc)\.log$"
+    return (
+        rf"-{re.escape(label)}-"
+        r"(download|upload|sdc|drain-deferred(?:-opportunistic)?)"
+        r"\.log$"
+    )
 
 
 def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
@@ -64,10 +77,14 @@ def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
         for h in hubs
     )
     label_alt = "|".join(re.escape(lbl) for lbl in labels)
+    # Phase alternation MUST stay in sync with
+    # :func:`log_filename_pattern_for_label` — drain-deferred(-opportunistic)
+    # logs are legitimate "newest phase" candidates for a session whose
+    # download/upload/sdc chain finished and moved on to drain.
     cmd = (
         f"find {paths} -maxdepth 1 -type f -name '*.log' "
         f"-regextype posix-extended "
-        f"-regex '.*-({label_alt})-(download|upload|sdc)\\.log' "
+        f"-regex '.*-({label_alt})-(download|upload|sdc|drain-deferred(-opportunistic)?)\\.log' "
         f"-printf '%T@ %f\\n' 2>/dev/null | sort -rn | head -1"
     )
     out = ssm_run(client, cmd).strip()

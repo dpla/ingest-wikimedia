@@ -35,16 +35,24 @@ def test_log_filename_pattern_matches_only_exact_label():
 
 
 def test_log_filename_pattern_matches_only_phase_suffixes():
-    """Only -download.log, -upload.log, and -sdc.log are valid phase logs."""
+    """The five recognised phase suffixes: download, upload, sdc,
+    drain-deferred, drain-deferred-opportunistic. Anything else (e.g.
+    legacy retirer logs) must not match."""
     from scripts.wikimedia_upload_status import log_filename_pattern_for_label
 
     pattern = re.compile(log_filename_pattern_for_label("nara"))
     assert pattern.search("20260522-100000-nara-download.log")
     assert pattern.search("20260522-100000-nara-upload.log")
     assert pattern.search("20260522-100000-nara-sdc.log")
+    assert pattern.search("20260522-100000-nara-drain-deferred.log")
+    assert pattern.search("20260522-100000-nara-drain-deferred-opportunistic.log")
     # Other phases (e.g. legacy retirer logs) must NOT match
     assert not pattern.search("20251220-012010-nara-retirer.log")
     assert not pattern.search("20260522-100000-nara-fix.log")
+    # Guard against a partial-match footgun: the pattern must be anchored
+    # so that "nara-drain-deferred-oops.log" is NOT interpreted as a
+    # valid drain-deferred variant.
+    assert not pattern.search("20260522-100000-nara-drain-deferred-oops.log")
 
 
 def test_log_filename_pattern_handles_regex_metachars_in_label():
@@ -468,6 +476,232 @@ def test_main_picks_latest_active_label_by_mtime_when_earlier_label_aborted():
     chosen_label, chosen_phase, _ = max(active_labels, key=lambda t: t[2])
     assert chosen_label == "nara+center-for-legislative-archives"
     assert chosen_phase == active_phase
+
+
+def _fake_ssm_for_drain(
+    *,
+    log_filename: str,
+    tail: str,
+    queued: int,
+    lock_acquired_count: int | None = None,
+    mtime: int = 1700000000,
+    session_created: int = 0,
+):
+    """Two-call SSM fake for the drain-deferred phase code path.
+
+    Call 1 (precheck): ``session_created\\nlog_filename\\n``.
+    Call 2 (drain state): four SEP-delimited sections —
+    ``{mtime}<SEP>{tail}<SEP>{queued}<SEP>{lock_acquired_count}`` where
+    SEP is ``__WM_DRAIN_SEP__``. The 4th section is the whole-file
+    ``grep -c`` of the lock-acquired marker (decoupled from ``tail`` so
+    the reporter can't be fooled by tail-window eviction on long
+    drains).
+
+    ``lock_acquired_count`` defaults to being derived from ``tail`` —
+    mirroring the common case where the marker is still in-window — but
+    can be set explicitly to exercise the tail-eviction regression
+    (marker present in the full file, absent from the tail).
+    """
+    call = [0]
+    sep = "__WM_DRAIN_SEP__"
+    if lock_acquired_count is None:
+        lock_acquired_count = 1 if "Drain-phase host lock acquired." in tail else 0
+
+    def fake(_client, _cmd, **_kw):
+        call[0] += 1
+        if call[0] == 1:
+            return f"{session_created}\n{log_filename}\n"
+        return (
+            f"{mtime}\n{sep}\n{tail}\n{sep}\n{queued}\n{sep}\n{lock_acquired_count}\n"
+        )
+
+    return fake
+
+
+def test_drain_deferred_reports_waiting_for_lock():
+    """Session queued behind another partner's drain: no
+    ``Drain-phase host lock acquired.`` line yet — must be flagged as
+    lock-waiting rather than as SDC-complete-and-idle."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_drain(
+        log_filename="20260705-120631-northwest-heritage+oregon-state-archives-drain-deferred.log",
+        tail=(
+            "[INFO] 12:06:31: Drain-deferred: sidecar for partner "
+            "northwest-heritage has 8 item(s) queued; acquiring host lock "
+            "(mode: patient).\n"
+            "[INFO] 12:06:31: Acquiring drain-phase host lock at "
+            "/home/ec2-user/ingest-wikimedia/.drain-lock (blocking until "
+            "available)…"
+        ),
+        queued=8,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-northwest-heritage+oregon-state-archives",
+            hub="northwest-heritage",
+            label="northwest-heritage+oregon-state-archives",
+        )
+    assert "waiting for host lock" in phase
+    assert "8 queued" in phase
+
+
+def test_drain_deferred_reports_throttle_state_when_holding_lock():
+    """Session holding the lock and polling ``Category:Duplicate``:
+    surface the live throttle numbers so operators can gauge how
+    close the resume gate is to opening."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_drain(
+        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
+        tail=(
+            "[INFO] 14:58:16: Drain-phase host lock acquired.\n"
+            "[INFO] 14:58:16: Category:Duplicate at 979 (>= resume "
+            "threshold 900); waiting 300s before retrying deferred "
+            "duplicate-tags.\n"
+            "[INFO] 15:03:17: Category:Duplicate at 954 (>= resume "
+            "threshold 900); waiting 300s before retrying deferred "
+            "duplicate-tags."
+        ),
+        queued=42,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-ohio",
+            hub="ohio",
+            label="ohio",
+        )
+    assert "42 queued" in phase
+    # Uses the MOST RECENT throttle poll (954), not the earliest (979).
+    assert "954" in phase
+    assert "900" in phase
+
+
+def test_drain_deferred_reports_opportunistic_capacity_skip():
+    """Opportunistic drain that hit ``at capacity`` and exited fast is
+    terminal — surface how many items remain deferred to the
+    batch-terminal patient drain, not a still-working state."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_drain(
+        log_filename="20260705-092302-bpl+phillips-academy-drain-deferred-opportunistic.log",
+        tail=(
+            "[INFO] 09:23:02: Drain-phase host lock acquired.\n"
+            "[INFO] 09:23:03: Drain-deferred (opportunistic): "
+            "Category:Duplicate at capacity; 7 item(s) remain in sidecar "
+            "for the batch's terminal drain."
+        ),
+        queued=7,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+phillips-academy",
+            hub="bpl",
+            label="bpl+phillips-academy",
+        )
+    assert "opportunistic" in phase
+    assert "7" in phase
+
+
+def test_drain_deferred_reports_complete_when_sidecar_drained():
+    """Sidecar drained to empty + ``Drain-deferred: complete.`` marker
+    → the phase is terminal and reports completion so the walker can
+    move on."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_drain(
+        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
+        tail=(
+            "[INFO] 15:00:00: Drain-deferred: complete. Emitted "
+            "42 item(s) over 3600 seconds."
+        ),
+        queued=0,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-ohio",
+            hub="ohio",
+            label="ohio",
+        )
+    assert phase.startswith("Drain complete")
+
+
+def test_drain_deferred_lock_marker_read_from_full_log_not_tail():
+    """Regression (CR #368): a patient drain that has held the lock for
+    hours has scrolled the one-shot ``Drain-phase host lock acquired.``
+    line out of the tail window — the tail is now all throttle-poll
+    lines. The lock state must come from the FULL-log grep count (4th
+    SSM section), so this session still reports its throttle state, NOT
+    a false 'waiting for host lock'."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_drain(
+        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
+        # Tail is ONLY throttle polls — lock-acquired line evicted.
+        tail=(
+            "[INFO] 14:53:17: Category:Duplicate at 958 (>= resume "
+            "threshold 900); waiting 300s before retrying deferred "
+            "duplicate-tags.\n"
+            "[INFO] 14:58:17: Category:Duplicate at 954 (>= resume "
+            "threshold 900); waiting 300s before retrying deferred "
+            "duplicate-tags."
+        ),
+        queued=42,
+        # But the full-file grep still finds the marker.
+        lock_acquired_count=1,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _mtime = get_phase_and_progress(
+            client=None,
+            session="wikimedia-ohio",
+            hub="ohio",
+            label="ohio",
+        )
+    assert "waiting for host lock" not in phase, (
+        "lock marker evicted from tail must not be misread as lock-waiting"
+    )
+    assert "954" in phase and "900" in phase
+
+
+def test_drain_deferred_returns_none_for_stale_log_predating_session():
+    """Regression (CR #368): when the drain log predates the current
+    session (log_mtime < session_created), the helper must return the
+    ``None`` sentinel — matching every other branch of
+    get_phase_and_progress — so the caller's fallback fires instead of
+    rendering a blank phase string."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_drain(
+        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
+        tail="[INFO] 09:23:02: Drain-phase host lock acquired.",
+        queued=5,
+        mtime=1700000000,
+        session_created=1700000000 + 3600,  # session started AFTER this log
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        result = get_phase_and_progress(
+            client=None,
+            session="wikimedia-ohio",
+            hub="ohio",
+            label="ohio",
+        )
+    assert result == (None, 0)
 
 
 def test_get_phase_and_progress_returns_none_tuple_when_no_log_exists():
