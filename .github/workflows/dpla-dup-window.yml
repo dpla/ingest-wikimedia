@@ -1,0 +1,74 @@
+name: DPLA Duplicate Window
+
+# Advances the DPLA duplicate "moving window" so a bounded number of DPLA
+# duplicate files stay visible in Commons Category:Duplicate, oldest-first, as
+# admins clear them. Runs hourly. The repo is public, so Actions minutes are
+# free; hourly scheduled runs are best-effort (GitHub may delay or drop a run
+# under load) which is fine — the window is self-correcting on the next run.
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target number of DPLA files visible in Category:Duplicate"
+        required: false
+        default: "100"
+        type: string
+      dry_run:
+        description: "Compute the plan but make no edits/purges"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Never let two window advances overlap (a delayed scheduled run colliding
+# with a manual dispatch could double-count the deficit and overshoot).
+concurrency:
+  group: dpla-dup-window
+  cancel-in-progress: false
+
+jobs:
+  advance-window:
+    name: Advance duplicate moving window
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.5.3"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Create pywikibot password file
+        env:
+          PYWIKIBOT_PASSWORD: ${{ secrets.PYWIKIBOT_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          Path("metrics/dpla-dup-window/user-password.py").write_text(
+              f"('DPLA bot', BotPassword('PARTNER_UPLOADS', {os.environ['PYWIKIBOT_PASSWORD']!r}))\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Advance window
+        env:
+          PYWIKIBOT_DIR: ${{ github.workspace }}/metrics/dpla-dup-window
+        run: |
+          uv run python metrics/dpla-dup-window/release_window.py \
+            --target "${{ github.event.inputs.target || '100' }}" \
+            ${{ (github.event.inputs.dry_run == 'true') && '--dry-run' || '' }}
