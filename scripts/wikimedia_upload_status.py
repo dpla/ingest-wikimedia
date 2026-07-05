@@ -134,19 +134,33 @@ def _drain_deferred_phase(
     log_path: str,
     log_file: str,
     session_created: int,
-) -> tuple[str, int]:
+) -> tuple[str | None, int]:
     """Report the drain-deferred phase's live state.
+
+    Returns ``(None, 0)`` for the "no usable log yet" case (log predates
+    this session), matching :func:`get_phase_and_progress`'s sentinel so
+    the caller's ``phase is None`` fallback fires instead of rendering a
+    blank phase string.
 
     Sidecar queue length comes from ``<partner>/deferred-drain.json``
     (the file the drain loop rewrites atomically after each round —
     reading it gives the live count, not the initial count from the
     log's "N item(s) queued" line, which grows stale as items drain).
 
-    Lock state and throttle numbers come from the log itself: presence
-    of ``Drain-phase host lock acquired.`` distinguishes lock-holder
-    from lock-waiter, and the most recent
-    ``Category:Duplicate at N (>= resume threshold M)`` line gives the
-    current throttle position.
+    Lock state and throttle numbers come from the log: whether the
+    ``Drain-phase host lock acquired.`` marker is present ANYWHERE in
+    the file distinguishes lock-holder from lock-waiter, and the most
+    recent ``Category:Duplicate at N (>= resume threshold M)`` line
+    gives the current throttle position.
+
+    The lock marker is grepped from the WHOLE file, not the tail: a
+    patient drain emits one throttle-poll line every poll interval
+    (5 min), so after ~8 polls the one-shot "lock acquired" line
+    scrolls out of any fixed-size tail window. Reading it from the tail
+    alone would make a session that has held the lock for hours
+    misreport as "waiting for host lock". Terminal markers and the
+    throttle poll are still read from the tail (they recur / live at
+    the end).
 
     ``opportunistic`` mode is a one-shot best-effort drain that exits
     fast — its logs are terminal by design, so the phase string
@@ -160,15 +174,21 @@ def _drain_deferred_phase(
     # pretty-printed shape). Counting `[0-9a-f]{32}` matches is more
     # robust than parsing JSON through a here-python (no dependency on
     # shell quoting the interpreter body correctly).
+    #
+    # The lock-marker grep runs over the FULL log (see docstring) and
+    # emits its own count in a dedicated section so tail-window
+    # eviction can't hide a long-held lock.
     out = ssm_run(
         client,
         f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
         f"echo {sep}; "
         f"tail -8 {log_path} 2>/dev/null; "
         f"echo {sep}; "
-        f"grep -oE '[0-9a-f]{{32}}' {sidecar} 2>/dev/null | wc -l",
+        f"grep -oE '[0-9a-f]{{32}}' {sidecar} 2>/dev/null | wc -l; "
+        f"echo {sep}; "
+        f"grep -cF 'Drain-phase host lock acquired.' {log_path} 2>/dev/null || echo 0",
     )
-    sections = out.split(f"{sep}\n", 2)
+    sections = out.split(f"{sep}\n", 3)
 
     def _int(s: str) -> int:
         try:
@@ -179,9 +199,10 @@ def _drain_deferred_phase(
     log_mtime = _int(sections[0]) if sections else 0
     tail = sections[1] if len(sections) > 1 else ""
     queued = _int(sections[2]) if len(sections) > 2 else 0
+    lock_acquired = (_int(sections[3]) if len(sections) > 3 else 0) > 0
 
     if session_created > 0 and log_mtime > 0 and log_mtime < session_created:
-        return "", 0
+        return None, 0
 
     mode = "opportunistic drain" if is_opportunistic else "drain"
 
@@ -195,8 +216,8 @@ def _drain_deferred_phase(
             log_mtime,
         )
 
-    # Non-terminal: determine lock state.
-    if "Drain-phase host lock acquired." not in tail:
+    # Non-terminal: determine lock state from the full-log marker count.
+    if not lock_acquired:
         # Still waiting on the flock — another partner's drain is
         # holding it.
         return (
