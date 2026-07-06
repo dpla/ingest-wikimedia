@@ -226,6 +226,42 @@ def test_parse_artwork_params_stitching_ignores_pipes_inside_nested_templates():
     }
 
 
+def test_parse_artwork_params_pipe_overflow_with_equals_fragment_is_dropped():
+    """Known limitation of the stitching heuristic: an overflow fragment
+    that contains ``=`` (e.g. ``| description = A | region=north | …``)
+    is parsed by ``mwparserfromhell`` as a NAMED parameter
+    (``region=north``) rather than as an anonymous positional. Only
+    anonymous positional overflow is stitched, so the ``region=north``
+    fragment is dropped and the literal-pipe form's parse diverges
+    from the corresponding ``{{!}}`` form for the same source text.
+
+    Pinned here as a regression test — the shape is rare in real DPLA
+    metadata (typical subject lists don't contain ``key=value``) and
+    handling it would require a wider allowlist-based heuristic. If
+    we ever fix this, the test flips to assert successful stitching.
+    """
+    literal_pipe_form = (
+        "{{Artwork\n"
+        "| description = A | region=north\n"
+        "| date = 1937\n"
+        "}}"
+    )
+    p = parse_artwork_params(literal_pipe_form)
+    # Current behavior: ``region=north`` is dropped because mwparserfromhell
+    # parses it as a named param and stitching only rejoins positional
+    # overflow. Description ends at the truncation point.
+    assert p == {"description": "A", "date": "1937"}
+    # For contrast, the {{!}} form keeps the whole value:
+    magic_word_form = (
+        "{{Artwork\n"
+        "| description = A {{!}} region=north\n"
+        "| date = 1937\n"
+        "}}"
+    )
+    q = parse_artwork_params(magic_word_form)
+    assert q == {"description": "A | region=north", "date": "1937"}
+
+
 def test_parse_artwork_params_unescapes_magic_words_in_values():
     """A community AWB pass sometimes rewrites literal ``|`` inside a
     template param to the ``{{!}}`` magic word (parser expands it back

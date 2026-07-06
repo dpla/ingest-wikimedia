@@ -219,6 +219,20 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
     the provenance walker (Rev N-1 parse ends at first pipe; Rev N
     parse gets the full value), and the description gets misattributed
     as community-contributed on migration.
+
+    Known limitation: only ANONYMOUS positional overflow is stitched.
+    An overflow fragment that itself happens to contain ``=`` (e.g.
+    ``| description = A | region=north | date = …``) is parsed by
+    ``mwparserfromhell`` as a NAMED parameter (``region=north``) and
+    the current logic drops it — the literal-pipe form's parse then
+    diverges from the corresponding ``{{!}}`` form (which would keep
+    the whole ``A | region=north`` as one description value). In
+    practice DPLA metadata values rarely contain ``key=value`` shapes
+    (typical subject lists are noun phrases like ``Ranch houses`` or
+    ``Dwellings``), and none of the migration incidents observed to
+    date hit this shape. See
+    :func:`test_parse_artwork_params_pipe_overflow_with_equals_fragment_is_dropped`
+    for the pinned current behaviour.
     """
     template = find_legacy_template(wikitext)
     if template is None:
