@@ -1840,6 +1840,143 @@ def test_plan_migration_still_imports_substantively_different_title():
     assert plan.community_imports == {"title": "A Completely Different Title"}
 
 
+def test_plan_migration_skips_description_that_is_multi_value_subset_of_canonical():
+    """A community editor reduces a multi-valued DPLA description
+    (removes one entry) — the remaining values are all still DPLA-
+    authored, so the wikitext content is a subset of DPLA canonical
+    and no ``inferred-from-Wikitext`` import should fire. Subset
+    check widens equivalence to catch this case; without it, the
+    community edit gets preserved forever as a spurious P10358.
+
+    Regression: File:%22Principles_of_Causality%22_essay_by_Sarah_..._-_DPLA_-_b3f489f90ebb903b961500c0cf71edfc
+    — DPLA has 6 description values, wikitext concatenation had 5;
+    the pre-fix migration wrote an inferred-from-Wikitext P10358
+    with the 5-value concatenation preserved as a bogus community
+    contribution.
+
+    Test forces the community classification with a real editor
+    revision (removing one value) — without a non-bot revision the
+    provenance walker attributes the value to DPLA_bot and skips the
+    equivalence check entirely.
+    """
+    canonical_description = "; ".join(
+        [
+            "Eight page essay with markings made by teacher in pencil.",
+            "Date supplied by cataloger.",
+            "Sallie M. Field",
+            "Phillips Academy Archives received the collection.",
+            "From The Trustees of Phillips Academy.",
+            "This date is inferred.",
+        ]
+    )
+    # Rev 1 matches full DPLA (6 values). Editor removed one value.
+    initial_wikitext_description = canonical_description
+    edited_wikitext_description = "; ".join(
+        [
+            "Eight page essay with markings made by teacher in pencil.",
+            "Date supplied by cataloger.",
+            "Sallie M. Field",
+            "Phillips Academy Archives received the collection.",
+            "From The Trustees of Phillips Academy.",
+        ]
+    )
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            f"{{{{Artwork|description={initial_wikitext_description}}}}}",
+        ),
+        (
+            2,
+            "Editor1",
+            f"{{{{Artwork|description={edited_wikitext_description}}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(description=canonical_description),
+    )
+    assert plan is not None
+    # Editor last touched description → classified community → equivalence
+    # check runs. Subset check widens to say the 5-value wikitext ⊆
+    # 6-value canonical, so no community_import.
+    assert plan.community_imports == {}, (
+        f"community edit whose values are all in DPLA canonical should "
+        f"not be an import; got community_imports={plan.community_imports}"
+    )
+
+
+def test_plan_migration_subset_handles_single_value_wikitext_vs_multi_canonical():
+    """N=1 boundary of the subset check: wikitext has a single value
+    (no ``; `` delimiter) but canonical is multi-value. Still a
+    subset — the wikitext value appears in the canonical set — and
+    must not classify as community. Pre-fix, the guard required the
+    delimiter on both sides, short-circuiting this case to False and
+    forcing an inferred-from-Wikitext import for what is really a
+    single-value-at-upload-then-DPLA-expanded record."""
+    canonical_description = "; ".join(["only value", "later addition"])
+    # Rev 1 has two values; Rev 2 (community editor) reduces to one.
+    # Reduction changes the parsed value, so provenance walker attributes
+    # description to Editor1 → classified as community → subset check
+    # runs on the (now single-value) wikitext against the multi-value
+    # canonical.
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            "{{Artwork|description=only value; later addition}}",
+        ),
+        (2, "Editor1", "{{Artwork|description=only value}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(description=canonical_description),
+    )
+    assert plan is not None
+    # Wikitext value = "only value" (no delim). Canonical = "only value;
+    # later addition". Subset check: {"only value"} ⊆ {"only value",
+    # "later addition"} → True → not community_import.
+    assert plan.community_imports == {}, (
+        f"single-value wikitext that's a subset of multi-value canonical "
+        f"should not be an import; got community_imports={plan.community_imports}"
+    )
+
+
+def test_plan_migration_still_imports_description_with_extra_community_value():
+    """Guard against overshoot — a community editor appended a value
+    NOT in DPLA canonical to the description concatenation. Subset
+    check correctly says the wikitext isn't a subset of canonical, so
+    the community edit is preserved as an inferred-from-Wikitext SDC
+    statement rather than silently dropped as an equivalent."""
+    canonical_description = "; ".join(["DPLA one.", "DPLA two."])
+    wikitext_description = "; ".join(
+        ["DPLA one.", "DPLA two.", "Community-added extra value."]
+    )
+    original_description = "; ".join(["DPLA one.", "DPLA two."])
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            f"{{{{Artwork|description={original_description}}}}}",
+        ),
+        (
+            2,
+            "Editor1",
+            f"{{{{Artwork|description={wikitext_description}}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(description=canonical_description),
+    )
+    assert plan is not None
+    assert "description" in plan.community_imports
+    assert "Community-added extra value" in plan.community_imports["description"]
+
+
 # ---------------------------------------------------------------------------
 # plan_migration — institution Q-ID equivalence (this commit).
 # For NARA files in particular, the legacy `{{Artwork}}` template wrote
