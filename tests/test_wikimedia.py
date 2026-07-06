@@ -38,6 +38,37 @@ def test_get_site(mock_site):
     mock_site_instance.login.assert_called_once()
 
 
+def test_get_site_pins_pywikibot_socket_timeout(monkeypatch):
+    """Every ``get_site`` handout must pin ``pywikibot.config.socket_timeout``
+    so a hung socket surfaces as a ``requests.exceptions.ReadTimeout``
+    rather than blocking indefinitely at kernel recv (in-the-wild
+    NPRC sdc-sync stall of 80 min against a CLOSE-WAIT socket)."""
+    import pywikibot
+
+    from ingest_wikimedia.wikimedia import PYWIKIBOT_SOCKET_TIMEOUT, get_site
+
+    monkeypatch.setattr(pywikibot.config, "socket_timeout", None)
+    monkeypatch.setattr("ingest_wikimedia.wikimedia.pywikibot.Site", MagicMock())
+    get_site()
+    assert pywikibot.config.socket_timeout == PYWIKIBOT_SOCKET_TIMEOUT
+
+
+def test_get_wikidata_site_pins_pywikibot_socket_timeout(monkeypatch):
+    """Same invariant on the Wikidata handout — the same failure mode
+    exists whenever pywikibot's HTTP layer is used against any wiki."""
+    import pywikibot
+
+    from ingest_wikimedia.wikimedia import (
+        PYWIKIBOT_SOCKET_TIMEOUT,
+        get_wikidata_site,
+    )
+
+    monkeypatch.setattr(pywikibot.config, "socket_timeout", None)
+    monkeypatch.setattr("ingest_wikimedia.wikimedia.pywikibot.Site", MagicMock())
+    get_wikidata_site()
+    assert pywikibot.config.socket_timeout == PYWIKIBOT_SOCKET_TIMEOUT
+
+
 def test_check_content_type_valid():
     content_type = "image/jpeg"
     assert check_content_type(content_type)

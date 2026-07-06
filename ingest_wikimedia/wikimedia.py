@@ -641,8 +641,27 @@ def get_page(site: BaseSite, title: str) -> FilePage:
         raise RuntimeError(f"Unable to create page {title}: {str(e)}") from e
 
 
+# HTTP (connect, read) timeouts pinned on every ``pywikibot.Site`` this
+# module hands out. Prevents an in-the-wild pattern (NPRC sdc-sync,
+# 2026-07-06) where a socket in kernel CLOSE-WAIT sat 80 minutes with
+# no per-recv deadline enforced — one hung descriptor stalled the whole
+# session's worker pool. A 60s read timeout means a stuck socket
+# surfaces as a ``requests.exceptions.ReadTimeout`` promptly and
+# pywikibot's retry loop takes over.
+PYWIKIBOT_SOCKET_TIMEOUT: tuple[float, float] = (10, 60)
+
+
+def _pin_socket_timeout() -> None:
+    """Set ``pywikibot.config.socket_timeout`` process-wide. Idempotent;
+    safe to call from every ``get_site``/``get_wikidata_site`` entry
+    so callers that never go through ``sdc-sync``'s ``_initialize()``
+    still get the bounded timeout."""
+    pywikibot.config.socket_timeout = PYWIKIBOT_SOCKET_TIMEOUT
+
+
 def get_site() -> BaseSite:
     """Returns the Site object for Wikimedia Commons."""
+    _pin_socket_timeout()
     site = pywikibot.Site(COMMONS_SITE_NAME)
     site.login()
     return site
@@ -650,6 +669,7 @@ def get_site() -> BaseSite:
 
 def get_wikidata_site() -> BaseSite:
     """Returns the Site object for Wikidata."""
+    _pin_socket_timeout()
     site = pywikibot.Site("wikidata", "wikidata")
     site.login()
     return site
