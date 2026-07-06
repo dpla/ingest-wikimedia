@@ -1226,10 +1226,87 @@ CASEFOLD_COMPARE_KEYS: frozenset[str] = frozenset(
 )
 
 
+def is_wikitext_junk_value(value: str) -> bool:
+    """True when ``value`` looks like a wikitext-extraction artifact —
+    1–2 characters after strip, all punctuation/whitespace (no
+    alphanumerics). Almost always a markup / regex / human error in
+    the source template rather than a genuine metadata contribution
+    worth preserving.
+
+    Motivating cases: ``| date = ;`` (stray semicolon left over from
+    a template rewrite), ``| title = --``, ``| creator = .``. Values
+    of 3+ characters, or values containing a letter or digit, are
+    treated as potentially legitimate — a single-character title
+    like ``A`` (film) or a date like ``1`` (unlikely but syntactically
+    parseable) is not filtered here.
+    """
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not (1 <= len(stripped) <= 2):
+        return False
+    return not any(c.isalnum() for c in stripped)
+
+
+# MediaWiki character-escape magic words. When a literal ``|`` or ``=``
+# would confuse the template parser (`|` separates params, `=`
+# separates key from value), community editors escape it with the
+# builtin magic-word form on the LEFT — which the parser expands back
+# to the character on the RIGHT before rendering. Docs:
+# https://www.mediawiki.org/wiki/Help:Magic_words
+#
+# When we read a value OUT of a template parameter position — either to
+# store it as an SDC statement or to compare it against DPLA canonical
+# — we must undo the escape or the value carries the meaningless magic-
+# word text into a context where it doesn't mean anything (the SDC
+# value ends up literally containing "{{!}}", and the comparator against
+# DPLA's canonical "|" fails).
+_WIKITEXT_MAGIC_WORD_TABLE: dict[str, str] = {
+    "{{!}}": "|",
+    "{{=}}": "=",
+    "{{((}}": "{{",
+    "{{))}}": "}}",
+    # ``{{!(}}`` / ``{{)!}}`` are community templates (Template:!( and
+    # Template:)!) that render as ``{|`` and ``|}`` — the MediaWiki
+    # table-start and table-end markers. Used inside template params
+    # to keep a nested wikitable's opening/closing tokens from being
+    # consumed by the outer template's argument parser.
+    "{{!(}}": "{|",
+    "{{)!}}": "|}",
+}
+_WIKITEXT_MAGIC_WORD_RE = re.compile(
+    "|".join(re.escape(k) for k in _WIKITEXT_MAGIC_WORD_TABLE)
+)
+
+
+def unescape_wikitext_magic_words(s: str) -> str:
+    """Replace MediaWiki character-escape magic words with the literal
+    characters they render as. Non-string / empty input returns as-is.
+
+    Applied when moving a value from wikitext (where these escapes are
+    required inside template parameters) to any other context (SDC
+    storage, comparator keys, log messages) where the magic-word form
+    is meaningless literal text.
+
+    Single-pass — regex substitution walks the original string once,
+    so the output of one un-escape can't be rescanned as input to
+    another. Sequential ``str.replace()`` would over-un-escape
+    ``{{((}}))}}`` (the community idiom for a literal ``{{}}``) all
+    the way to ``}}`` because ``{{((}}`` → ``{{`` leaves ``{{))}}``
+    on the tape, which the next pass would then match.
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    return _WIKITEXT_MAGIC_WORD_RE.sub(
+        lambda m: _WIKITEXT_MAGIC_WORD_TABLE[m.group(0)], s
+    )
+
+
 def casefold_for_compare(s: str) -> str:
     """Fold ``s`` to a comparable form for equivalence checks against
-    another display string. Strips leading/trailing whitespace and
-    punctuation, collapses internal whitespace runs, and casefolds.
+    another display string. Unescapes MediaWiki character-escape magic
+    words (``{{!}}``, ``{{=}}``, …), strips leading/trailing whitespace
+    and punctuation, collapses internal whitespace runs, and casefolds.
 
     Used ONLY as a comparator key — never to rewrite stored or rendered
     values. DPLA-authored SDC and rendered wikitext must continue to
@@ -1244,6 +1321,7 @@ def casefold_for_compare(s: str) -> str:
     """
     if not isinstance(s, str) or not s:
         return ""
+    s = unescape_wikitext_magic_words(s)
     s = _LEADING_TRIM_RE.sub("", s)
     s = _TRAILING_TRIM_RE.sub("", s)
     s = _INTERNAL_WS_RE.sub(" ", s)

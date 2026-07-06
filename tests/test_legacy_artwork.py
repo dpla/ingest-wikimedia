@@ -110,6 +110,71 @@ def test_parse_artwork_params_drops_empty_values():
     assert params == {"title": "A"}
 
 
+def test_parse_artwork_params_drops_wikitext_junk_values():
+    """A 1-2-character punctuation-only value (``| date = ;``,
+    ``| title = --``) is a wikitext-extraction artifact — parser or
+    editor error, not real metadata. Extraction drops it the same way
+    it drops empty values, so the migrator doesn't preserve markup
+    junk as an SDC statement.
+
+    Motivating example: File:A_Toledo_Symphony_Orchestra_---_why%3F_
+    -_DPLA_-_640c3941bd35b12a39cb3820e9f778b2_(page_6).jpg — legacy
+    template carried ``| date = ;`` and the 2026-06-25 migrator
+    dutifully wrote a P571 = somevalue statement with the ``;`` as
+    its P1932 stated-as qualifier.
+    """
+    wikitext = (
+        "{{Artwork\n"
+        "| title = --\n"
+        "| description = A real description here\n"
+        "| date = ; \n"
+        "| creator = .\n"
+        "}}"
+    )
+    params = parse_artwork_params(wikitext)
+    assert params == {"description": "A real description here"}
+
+
+def test_parse_artwork_params_keeps_single_alnum_values():
+    """A single-letter title (film title ``A``) or single-digit value
+    passes through — the junk filter targets only punctuation-only
+    shorts."""
+    wikitext = "{{Artwork|title=A|date=1}}"
+    assert parse_artwork_params(wikitext) == {"title": "A", "date": "1"}
+
+
+def test_parse_artwork_params_unescapes_magic_words_in_values():
+    """A community AWB pass sometimes rewrites literal ``|`` inside a
+    template param to the ``{{!}}`` magic word (parser expands it back
+    to ``|`` at render time — display-invariant). Extraction must
+    un-escape so:
+
+    (a) the value stored downstream as an SDC statement is the literal
+        text a reader sees, not the magic-word form that has no meaning
+        outside a template context, and
+    (b) the migration provenance walker doesn't credit the AWB pass for
+        a content change that didn't actually change display.
+
+    Motivating example: File:Block_Card_6_E._Bancroft_Street_-_DPLA_-
+    _307d98570261183ed48eb3b1880fce14.jpg — 2020-06-04 AWB pass
+    replaced ``|`` with ``{{!}}`` in the description; the July 2026
+    legacy-Artwork migrator then stored the escaped form as a P10358
+    SDC statement, permanently diverging from DPLA canonical.
+    """
+    wikitext = (
+        "{{Artwork\n"
+        "| title = A {{=}} B\n"
+        "| description = terms include: buildings {{!}} Italianate "
+        "{{!}} one story\n"
+        "}}"
+    )
+    params = parse_artwork_params(wikitext)
+    assert params == {
+        "title": "A = B",
+        "description": ("terms include: buildings | Italianate | one story"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # trace_param_provenance — revision-history walker
 # ---------------------------------------------------------------------------

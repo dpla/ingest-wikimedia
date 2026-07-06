@@ -617,6 +617,120 @@ def test_casefold_for_compare_handles_falsy_input():
     assert casefold_for_compare("   .,  ") == ""
 
 
+def test_casefold_for_compare_unescapes_wikitext_magic_words():
+    """A community AWB pass sometimes rewrites literal ``|`` inside a
+    template param to the ``{{!}}`` magic word (the parser expands it
+    back to ``|`` at render time). If the escaped form leaks into
+    stored SDC and DPLA's canonical carries the literal, byte- and
+    casefold-comparison fail on a display-invariant transform. The
+    comparator must un-escape.
+
+    Motivating example: File:Block_Card_6_E._Bancroft_Street_-_DPLA_-
+    _307d98570261183ed48eb3b1880fce14.jpg — description migrated to
+    P10358 with literal ``{{!}}`` between terms, but DPLA canonical
+    description carries ``|``.
+    """
+    from ingest_wikimedia.sdc import casefold_for_compare
+
+    dpla = (
+        "Descriptive terms related to this photograph include: "
+        "commercial buildings | Italianate | one story"
+    )
+    community = (
+        "Descriptive terms related to this photograph include: "
+        "commercial buildings {{!}} Italianate {{!}} one story"
+    )
+    assert casefold_for_compare(dpla) == casefold_for_compare(community)
+
+    # ``{{=}}`` and the bracket variants land the same way.
+    assert casefold_for_compare("a = b") == casefold_for_compare("a {{=}} b")
+    assert casefold_for_compare("{{x}}") == casefold_for_compare("{{((}}x{{))}}")
+
+
+def test_unescape_wikitext_magic_words_leaves_regular_text_alone():
+    """The helper is pure substitution of the documented magic words —
+    ordinary text (including stray braces that aren't part of a magic-
+    word) passes through unchanged."""
+    from ingest_wikimedia.sdc import unescape_wikitext_magic_words
+
+    assert unescape_wikitext_magic_words("plain text") == "plain text"
+    assert unescape_wikitext_magic_words("{{cite}}") == "{{cite}}"
+    assert unescape_wikitext_magic_words("") == ""
+    assert unescape_wikitext_magic_words(None) is None  # type: ignore[arg-type]
+
+
+def test_is_wikitext_junk_value_flags_short_punctuation_only():
+    """1-2 characters that are all punctuation/whitespace read as a
+    wikitext-extraction artifact rather than metadata worth keeping."""
+    from ingest_wikimedia.sdc import is_wikitext_junk_value
+
+    assert is_wikitext_junk_value(";")
+    assert is_wikitext_junk_value(" ; ")
+    assert is_wikitext_junk_value("--")
+    assert is_wikitext_junk_value(".")
+    assert is_wikitext_junk_value(",,")
+    assert is_wikitext_junk_value("()")
+
+
+def test_is_wikitext_junk_value_lets_content_through():
+    """Anything with a letter or digit — or 3+ characters — is
+    considered potentially-legitimate and passes through unfiltered."""
+    from ingest_wikimedia.sdc import is_wikitext_junk_value
+
+    # Single letters / digits are legitimate values (title "A", etc.).
+    assert not is_wikitext_junk_value("A")
+    assert not is_wikitext_junk_value("1")
+    assert not is_wikitext_junk_value("1.")
+    # 3+ punctuation is likely a stylistic choice / ellipsis proxy —
+    # not caught by this narrow filter.
+    assert not is_wikitext_junk_value("---")
+    assert not is_wikitext_junk_value("...")
+    assert not is_wikitext_junk_value("1937")
+    assert not is_wikitext_junk_value("A Title")
+
+
+def test_is_wikitext_junk_value_handles_falsy_input():
+    from ingest_wikimedia.sdc import is_wikitext_junk_value
+
+    assert not is_wikitext_junk_value("")
+    assert not is_wikitext_junk_value("   ")
+    assert not is_wikitext_junk_value(None)  # type: ignore[arg-type]
+
+
+def test_unescape_wikitext_magic_words_covers_documented_forms():
+    """All the character-escape magic words documented on
+    https://www.mediawiki.org/wiki/Help:Magic_words expand to the
+    literal char they render as."""
+    from ingest_wikimedia.sdc import unescape_wikitext_magic_words
+
+    assert unescape_wikitext_magic_words("a{{!}}b") == "a|b"
+    assert unescape_wikitext_magic_words("a{{=}}b") == "a=b"
+    assert unescape_wikitext_magic_words("{{((}}x{{))}}") == "{{x}}"
+    # {{!(}} and {{)!}} are the community table-start / table-end
+    # escapes used to keep a nested wikitable's `{|` / `|}` tokens
+    # from being consumed by the outer template's argument parser.
+    assert unescape_wikitext_magic_words("{{!(}}row{{)!}}") == "{|row|}"
+
+
+def test_unescape_wikitext_magic_words_is_single_pass():
+    """``{{((}}))}}`` is the community idiom for a literal ``{{}}``:
+    the ``{{((}}`` token expands to ``{{`` and the trailing ``))}}``
+    stays literal because it's not a magic-word token on its own —
+    ``{{))}}`` (with the leading ``{{``) is, but the tail alone is
+    not. A sequential-replace implementation would first swap
+    ``{{((}}`` for ``{{`` and then rescan its own output, matching a
+    spurious ``{{))}}`` and collapsing the whole thing to ``}}``.
+    Single-pass regex substitution matches each source token exactly
+    once against the original string.
+    """
+    from ingest_wikimedia.sdc import unescape_wikitext_magic_words
+
+    assert unescape_wikitext_magic_words("{{((}}))}}") == "{{))}}"
+    # Adjacent magic words unescape independently — sequential replace
+    # would still get this right, but the case pins the intent.
+    assert unescape_wikitext_magic_words("{{!}}{{!}}") == "||"
+
+
 # ---------------------------------------------------------------------------
 # dates_semantically_equal — semantic date equivalence for
 # ``{{DPLA metadata}}`` ``date =`` overrides that reformat DPLA's own
