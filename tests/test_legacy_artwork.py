@@ -1840,6 +1840,88 @@ def test_plan_migration_still_imports_substantively_different_title():
     assert plan.community_imports == {"title": "A Completely Different Title"}
 
 
+def test_plan_migration_skips_description_that_is_multi_value_subset_of_canonical():
+    """A multi-valued DPLA description field renders in wikitext as a
+    single ``; ``-joined string. If DPLA later added a value that
+    wasn't in the wikitext concatenation at upload time, byte- and
+    casefold-comparison fail but the wikitext content is still every
+    bit DPLA-originated. Subset check must recognise the wikitext
+    list as a subset of DPLA canonical and NOT flag it as
+    community-contributed.
+
+    Regression: File:%22Principles_of_Causality%22_essay_by_Sarah_..._-_DPLA_-_b3f489f90ebb903b961500c0cf71edfc
+    — DPLA has 6 description values, wikitext concatenation had 5;
+    the pre-fix migration wrote an inferred-from-Wikitext P10358
+    with the 5-value concatenation preserved as a bogus community
+    contribution.
+    """
+    canonical_description = "; ".join(
+        [
+            "Eight page essay with markings made by teacher in pencil.",
+            "Date supplied by cataloger.",
+            "Sallie M. Field",
+            "Phillips Academy Archives received the collection.",
+            "From The Trustees of Phillips Academy.",
+            "This date is inferred.",  # 6th value not in wikitext
+        ]
+    )
+    wikitext_description = "; ".join(
+        [
+            "Eight page essay with markings made by teacher in pencil.",
+            "Date supplied by cataloger.",
+            "Sallie M. Field",
+            "Phillips Academy Archives received the collection.",
+            "From The Trustees of Phillips Academy.",
+        ]
+    )
+    revs = _make_revs(
+        (1, "DPLA_bot", f"{{{{Artwork|description={wikitext_description}}}}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(description=canonical_description),
+    )
+    assert plan is not None
+    assert plan.community_imports == {}, (
+        f"description whose values are all in DPLA canonical should not "
+        f"be a community import; got community_imports={plan.community_imports}"
+    )
+
+
+def test_plan_migration_still_imports_description_with_extra_community_value():
+    """Guard against overshoot — a community editor appended a value
+    NOT in DPLA canonical to the description concatenation. Subset
+    check correctly says the wikitext isn't a subset of canonical, so
+    the community edit is preserved as an inferred-from-Wikitext SDC
+    statement rather than silently dropped as an equivalent."""
+    canonical_description = "; ".join(["DPLA one.", "DPLA two."])
+    wikitext_description = "; ".join(
+        ["DPLA one.", "DPLA two.", "Community-added extra value."]
+    )
+    original_description = "; ".join(["DPLA one.", "DPLA two."])
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            f"{{{{Artwork|description={original_description}}}}}",
+        ),
+        (
+            2,
+            "Editor1",
+            f"{{{{Artwork|description={wikitext_description}}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(description=canonical_description),
+    )
+    assert plan is not None
+    assert "description" in plan.community_imports
+    assert "Community-added extra value" in plan.community_imports["description"]
+
+
 # ---------------------------------------------------------------------------
 # plan_migration — institution Q-ID equivalence (this commit).
 # For NARA files in particular, the legacy `{{Artwork}}` template wrote

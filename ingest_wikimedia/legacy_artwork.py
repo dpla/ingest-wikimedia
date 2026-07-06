@@ -455,6 +455,51 @@ def _extract_institution_qid(value: str) -> str | None:
     return None
 
 
+_MULTI_VALUE_DELIMITER = "; "
+
+
+def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
+    """True when ``value`` and ``canonical`` are both ``; ``-joined
+    string lists AND every casefolded entry in ``value`` also appears
+    in ``canonical``.
+
+    Legacy ``{{Artwork}}`` uploads concatenated multi-valued DPLA
+    fields (``sourceResource.description`` is often a list) into a
+    single template parameter with ``; `` separators;
+    :func:`ingest_wikimedia.wikimedia.extract_strings` — the source of
+    ``canonical_params['description']`` — joins with the same
+    ``VALUE_JOIN_DELIMITER = "; "`` shape. Byte-comparing the two
+    concatenations misses the case where DPLA has drifted between
+    upload and migration (adding a value, dropping a value,
+    reordering) even though every value the wikitext carries is still
+    part of the DPLA-authored set. In that case the wikitext content
+    is DPLA-originated, not community-contributed, and no
+    ``inferred-from-Wikitext`` import should fire.
+
+    Subset — not equal — because the wikitext-side list at migration
+    time reflects DPLA data as of upload; DPLA canonical may have
+    added values since. The migrated ``{{DPLA metadata}}`` template
+    will render the current (superset) canonical from SDC anyway.
+    """
+    if _MULTI_VALUE_DELIMITER not in value or _MULTI_VALUE_DELIMITER not in canonical:
+        return False
+    value_parts = {
+        folded
+        for folded in (
+            casefold_for_compare(p) for p in value.split(_MULTI_VALUE_DELIMITER)
+        )
+        if folded
+    }
+    canonical_parts = {
+        folded
+        for folded in (
+            casefold_for_compare(p) for p in canonical.split(_MULTI_VALUE_DELIMITER)
+        )
+        if folded
+    }
+    return bool(value_parts) and value_parts.issubset(canonical_parts)
+
+
 def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
     """Return True when ``value`` (from wikitext) and ``canonical`` (from
     DPLA) are the same fact for the purpose of migration-planning.
@@ -468,14 +513,18 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
     semantic date-equivalence check runs first — an override like
     ``19 November 1902`` collapses cleanly against ``1902-11-19``.
 
+    A ``; ``-joined multi-value subset check widens equivalence for
+    keys whose canonical form is a semicolon-joined list (notably
+    ``description``): if every value in the wikitext concatenation
+    also appears in DPLA canonical's concatenation after casefold,
+    the wikitext content is DPLA-originated and no community import
+    fires — DPLA-side drift (an extra value added, one dropped, or a
+    reorder) between upload and migration doesn't matter.
+
     For ``institution`` the wikitext value may be a bare Q-ID (flat
     ``{{DPLA metadata}}`` shape) or the legacy sub-template
     ``{{Institution|wikidata=Q...}}`` shape; both extract to a plain
     Q-ID that is byte-compared to the canonical DPLA institution Q-ID.
-    This closes the case where a legacy NARA file's ``Institution``
-    sub-template holds the (custodial-unit) Q-ID that DPLA now emits as
-    ``institution`` in canonical params, but where a wrap difference
-    prevents plain equality from firing.
 
     Keys outside those sets (other sub-template shapes) fall back to
     strict equality.
@@ -493,6 +542,8 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
         folded_value = casefold_for_compare(value)
         folded_canonical = casefold_for_compare(canonical)
         if folded_value and folded_value == folded_canonical:
+            return True
+        if _multi_value_subset_of_canonical(value, canonical):
             return True
     return False
 
