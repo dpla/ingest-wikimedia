@@ -562,6 +562,7 @@ def _initialize() -> None:
     pywikibot.config.max_retries = _PYWIKIBOT_MAX_RETRIES
     pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
+    pywikibot.config.socket_timeout = _PYWIKIBOT_SOCKET_TIMEOUT
 
     site = pywikibot.Site()
     site.login()
@@ -709,10 +710,20 @@ def formattedclaim(prop, value, value_type, dpla_id):
 
 # Pywikibot retry budget — applied process-wide in ``_initialize()``.
 # Worst-case single-call stall ≈ max_retries × (read_timeout + retry_max)
-# = 5 × (45s + 60s) ≈ 9 min, vs pywikibot's ~30-min default.
+# = 5 × (60s + 60s) ≈ 10 min, vs pywikibot's ~30-min default.
 _PYWIKIBOT_MAX_RETRIES = 5
 _PYWIKIBOT_RETRY_WAIT = 5
 _PYWIKIBOT_RETRY_MAX = 60
+
+# HTTP (connect, read) timeouts for every request pywikibot makes. Set
+# explicitly rather than trusting the pywikibot default — an in-the-
+# wild sdc-sync stall (NPRC, 2026-07-06) sat 80 minutes on a socket
+# that was in kernel CLOSE-WAIT, indicating no per-recv deadline was
+# enforced. A 60s read timeout means a hung socket surfaces as a
+# ``requests.exceptions.ReadTimeout`` promptly and pywikibot's retry
+# loop picks up rather than the whole pool stalling behind one
+# blocked descriptor. Applies to reads AND writes.
+_PYWIKIBOT_SOCKET_TIMEOUT: tuple[float, float] = (10, 60)
 
 
 # Per-file cache for wbgetentities. Populated at the start of process_one()
@@ -5021,6 +5032,7 @@ def _init_partner_worker(
     pywikibot.config.max_retries = _PYWIKIBOT_MAX_RETRIES
     pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
+    pywikibot.config.socket_timeout = _PYWIKIBOT_SOCKET_TIMEOUT
 
     global site, hubs, rights, subject_ids, _normalize_wikitext_enabled
     global _worker_slot_budget
@@ -5539,6 +5551,7 @@ def _init_maintain_worker(
     pywikibot.config.max_retries = _PYWIKIBOT_MAX_RETRIES
     pywikibot.config.retry_wait = _PYWIKIBOT_RETRY_WAIT
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
+    pywikibot.config.socket_timeout = _PYWIKIBOT_SOCKET_TIMEOUT
 
     global site, hubs, _s3_partner, _s3_client
     global _normalize_wikitext_enabled, _worker_slot_budget

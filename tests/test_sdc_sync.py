@@ -2167,6 +2167,7 @@ def test_initialize_pins_pywikibot_retry_budget(monkeypatch, tmp_path):
     monkeypatch.setattr(pywikibot.config, "max_retries", 15)
     monkeypatch.setattr(pywikibot.config, "retry_wait", 5)
     monkeypatch.setattr(pywikibot.config, "retry_max", 120)
+    monkeypatch.setattr(pywikibot.config, "socket_timeout", None)
 
     # _initialize() reads config.toml + rights.json from _REPO_ROOT; stub both.
     (tmp_path / "config.toml").write_text('dpla_api_key = "stub"\n')
@@ -2191,6 +2192,7 @@ def test_initialize_pins_pywikibot_retry_budget(monkeypatch, tmp_path):
     assert pywikibot.config.max_retries == sdc_sync._PYWIKIBOT_MAX_RETRIES
     assert pywikibot.config.retry_wait == sdc_sync._PYWIKIBOT_RETRY_WAIT
     assert pywikibot.config.retry_max == sdc_sync._PYWIKIBOT_RETRY_MAX
+    assert pywikibot.config.socket_timeout == sdc_sync._PYWIKIBOT_SOCKET_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
