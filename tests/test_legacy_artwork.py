@@ -143,6 +143,89 @@ def test_parse_artwork_params_keeps_single_alnum_values():
     assert parse_artwork_params(wikitext) == {"title": "A", "date": "1"}
 
 
+def test_parse_artwork_params_stitches_literal_pipe_truncation():
+    """A legacy upload that writes pipe-separated subject terms directly
+    into a named value (``| description = A | B | C``) gets truncated
+    by ``mwparserfromhell`` — the ``|`` reads as a parameter separator
+    and ``B`` / ``C`` land as anonymous positional args. Left
+    unrepaired, a later AWB pass rewriting ``|`` → ``{{!}}`` looks like
+    a content change (short truncated value → full value), causing the
+    provenance walker to misattribute description authorship to the
+    AWB editor and the migration to preserve DPLA-authored text as a
+    spurious ``inferred-from-Wikitext`` SDC claim.
+
+    Regression: Block_Card_633_Evesham_Avenue-DPLA-
+    ccb2717b29309f0ef0e58a8221e75019 — 2020 DPLA_bot upload with
+    literal ``|`` in description; 2020-06-04 JarektBot AWB pass
+    swapped for ``{{!}}``; the pre-fix migration misattributed the
+    description to JarektBot and wrote a P10358 statement preserving
+    the AWB form of the wikitext.
+    """
+    literal_pipe_form = (
+        "{{Artwork\n"
+        "| title = A Title\n"
+        "| description = terms: houses | 633 Evesham | Dwellings | Norwood\n"
+        "| date = 1937\n"
+        "}}"
+    )
+    magic_word_form = (
+        "{{Artwork\n"
+        "| title = A Title\n"
+        "| description = terms: houses {{!}} 633 Evesham {{!}} Dwellings {{!}} Norwood\n"
+        "| date = 1937\n"
+        "}}"
+    )
+    a = parse_artwork_params(literal_pipe_form)
+    b = parse_artwork_params(magic_word_form)
+    # Both revs parse to the same description — the AWB rewrite is
+    # display-invariant and must produce a display-invariant parse too.
+    assert a == b
+    assert a["description"] == "terms: houses | 633 Evesham | Dwellings | Norwood"
+    assert a["date"] == "1937"
+
+
+def test_parse_artwork_params_pipe_overflow_from_unrecognised_param_dropped():
+    """Overflow positional args from an unrecognised named param
+    (``| Other fields 1 = X | Y | title = …``) must NOT be misattributed
+    to a previous recognised named entry. ``Y`` is overflow from
+    ``Other fields 1``; dropping it is correct because we can't route
+    it to any canonical target."""
+    wikitext = (
+        "{{Artwork\n"
+        "| title = T\n"
+        "| Other fields 1 = X | Y | Z\n"
+        "| description = A real description\n"
+        "| date = 1937\n"
+        "}}"
+    )
+    p = parse_artwork_params(wikitext)
+    assert p == {
+        "title": "T",
+        "description": "A real description",
+        "date": "1937",
+    }
+
+
+def test_parse_artwork_params_stitching_ignores_pipes_inside_nested_templates():
+    """A nested ``{{Institution|wikidata=Q…}}`` inside a param value
+    keeps its own ``|`` scoped to the nested template — the outer
+    Artwork param value is one whole string, not truncated. The
+    stitching pass must not double-count or damage this case."""
+    wikitext = (
+        "{{Artwork\n"
+        "| title = T\n"
+        "| institution = {{Institution|wikidata=Q7814140}}\n"
+        "| date = 1937\n"
+        "}}"
+    )
+    p = parse_artwork_params(wikitext)
+    assert p == {
+        "title": "T",
+        "institution": "{{Institution|wikidata=Q7814140}}",
+        "date": "1937",
+    }
+
+
 def test_parse_artwork_params_unescapes_magic_words_in_values():
     """A community AWB pass sometimes rewrites literal ``|`` inside a
     template param to the ``{{!}}`` magic word (parser expands it back

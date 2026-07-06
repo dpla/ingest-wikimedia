@@ -202,16 +202,50 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
     silently — those don't have a canonical target and the wikitext-
     rewrite step preserves them by leaving the template untouched if
     the param wasn't migrated.
+
+    Repairs literal-``|`` truncation of named-param values. Legacy
+    ``{{Artwork}}`` uploads sometimes wrote pipe-separated subject
+    lists directly into ``| description = ... buildings | 633 Evesham
+    | Dwellings | ...`` without escaping. ``mwparserfromhell`` treats
+    each such ``|`` as a parameter separator and truncates the named
+    ``description`` value at the first pipe, spilling the rest into
+    anonymous positional params (``1``, ``2``, ``3``, …). The legacy
+    ``{{Artwork}}`` / ``{{Information}}`` / ``{{Photograph}}``
+    templates take only named params by convention, so any anonymous
+    positional at the top level is overflow from an earlier named
+    value; we stitch each back onto the preceding named param with a
+    literal ``|`` rejoin. Without this repair, a later AWB pass that
+    rewrote the raw ``|`` to ``{{!}}`` looks like a content change to
+    the provenance walker (Rev N-1 parse ends at first pipe; Rev N
+    parse gets the full value), and the description gets misattributed
+    as community-contributed on migration.
     """
     template = find_legacy_template(wikitext)
     if template is None:
         return {}
-    parsed: dict[str, str] = {}
+    # Stitch: iterate template params, accumulating overflow positional
+    # values into the preceding named param's raw value. Track whether
+    # the last named param was RECOGNISED so overflow from an
+    # unrecognised param (e.g. ``| Other fields 1 = X | Y | title = …``)
+    # is dropped rather than misattributed to the previous recognised
+    # named entry earlier in the template.
+    stitched: list[list[str]] = []
+    last_named_recognised = False
     for param in template.params:
+        if not param.showkey:
+            if last_named_recognised and stitched:
+                stitched[-1][1] += "|" + str(param.value)
+            continue
         canonical = ARTWORK_PARAM_TO_CANONICAL_KEY.get(_normalize_param_name(param))
         if canonical is None:
+            last_named_recognised = False
             continue
-        value = unescape_wikitext_magic_words(str(param.value).strip())
+        stitched.append([canonical, str(param.value)])
+        last_named_recognised = True
+
+    parsed: dict[str, str] = {}
+    for canonical, raw in stitched:
+        value = unescape_wikitext_magic_words(raw.strip())
         if not value or is_wikitext_junk_value(value):
             # Empty values and wikitext-extraction junk (a stray ``;`` in
             # a date field, ``--`` in a title, etc. — see
