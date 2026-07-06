@@ -43,15 +43,17 @@ def snapshot_running_active_labels(client) -> dict[str, str]:
     tell which session's subprocess is writing the log; env-var reads
     directly attribute the write.
 
-    ``sort -k2 -r`` on ``lstart`` picks the newest child as a tie-
-    breaker when a step has transient helper forks alongside the main
-    step.
+    Sorted numerically by ``etimes`` (elapsed seconds) ascending — the
+    smallest value is the most recently started direct child, which
+    is the correct pick when a step has transient helper forks
+    alongside the main step. ``lstart`` output is calendar text and
+    doesn't sort chronologically.
     """
     out = ssm_run(
         client,
         r"""tmux list-panes -aF '#{session_name}|#{pane_pid}' 2>/dev/null | while IFS='|' read name pane_pid; do
   case "$name" in wikimedia-*) : ;; *) continue ;; esac
-  child_pid=$(ps --ppid "$pane_pid" -o pid=,lstart= 2>/dev/null | sort -k2 -r | head -1 | awk '{print $1}')
+  child_pid=$(ps --ppid "$pane_pid" -o pid=,etimes= 2>/dev/null | sort -k2 -n | head -1 | awk '{print $1}')
   [ -z "$child_pid" ] && continue
   label=$(tr '\0' '\n' < /proc/"$child_pid"/environ 2>/dev/null | grep -m1 '^WIKIMEDIA_SESSION_LABEL=' | cut -d= -f2-)
   [ -n "$label" ] && echo "$name|$label"
