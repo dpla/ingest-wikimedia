@@ -1916,17 +1916,11 @@ def test_plan_migration_subset_handles_single_value_wikitext_vs_multi_canonical(
     forcing an inferred-from-Wikitext import for what is really a
     single-value-at-upload-then-DPLA-expanded record."""
     canonical_description = "; ".join(["only value", "later addition"])
-    revs = _make_revs(
-        (1, "DPLA_bot", "{{Artwork|description=only value}}"),
-        (2, "Editor1", "{{Artwork|description=only value}}"),
-    )
-    # Rev 2 didn't change description content, so provenance walker
-    # keeps attribution with DPLA_bot; force a change by having Rev 2
-    # touch a different field. Description then stays classified as
-    # dpla, and this test verifies the subset check doesn't over-fire
-    # (i.e., single-value wikitext isn't the community path). To
-    # actually exercise the subset check on N=1, we need a real
-    # community reduction to N=1:
+    # Rev 1 has two values; Rev 2 (community editor) reduces to one.
+    # Reduction changes the parsed value, so provenance walker attributes
+    # description to Editor1 → classified as community → subset check
+    # runs on the (now single-value) wikitext against the multi-value
+    # canonical.
     revs = _make_revs(
         (
             1,
