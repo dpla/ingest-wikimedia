@@ -49,7 +49,10 @@ from ingest_wikimedia.partners import (
     slugify_session_label_component,
     wikidata_qid_for_target,
 )
-from ingest_wikimedia.session_state import active_and_upcoming_labels
+from ingest_wikimedia.session_state import (
+    active_and_upcoming_labels,
+    snapshot_running_active_labels,
+)
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
 
@@ -1086,9 +1089,13 @@ def main() -> None:
     # Maps each requested label to the existing session name(s) it conflicts with.
     # ``tmux ls -F`` returns ``name|epoch`` per line — the epoch is fed to
     # ``active_and_upcoming_labels`` so :func:`find_active_label` can bound its
-    # log-mtime lookup to files created after each session began, keeping a
+    # log-mtime fallback to files created after each session began, keeping a
     # concurrent second session's writes from stealing "which label is active"
-    # for the wrong session.
+    # for the wrong session. The active-label snapshot below is the primary
+    # (direct-evidence) signal — one SSM roundtrip covers every session, so
+    # the per-session loop can look up ``active_label`` in a dict rather than
+    # firing its own ``find_active_label_via_subprocess`` SSM roundtrip per
+    # candidate.
     print(f"Checking for existing sessions that overlap with {session_name}...")
     try:
         tmux_list = ssm_run(
@@ -1101,6 +1108,14 @@ def main() -> None:
             f"⚠️ Failed to list tmux sessions: {e}",
             operational=True,
         )
+    try:
+        active_label_snapshot = snapshot_running_active_labels(ssm)
+    except Exception as e:
+        # Fall through to the mtime heuristic per session on failure —
+        # conservative correctness is more important than the shared-
+        # label edge case when the snapshot roundtrip is broken.
+        print(f"Failed to snapshot active labels; falling back to mtime: {e}")
+        active_label_snapshot = {}
     # In-memory pre-filter: an existing session can only conflict with a
     # requested target if they share a hub prefix. Sessions on unrelated
     # hubs — the common case when the box runs 3+ concurrent partner
@@ -1132,7 +1147,10 @@ def main() -> None:
             # session. Skip the SSM lookup and move on.
             continue
         existing_labels = active_and_upcoming_labels(
-            ssm, existing_labels_ordered, session_created=existing_created
+            ssm,
+            existing_labels_ordered,
+            session_created=existing_created,
+            active_label=active_label_snapshot.get(existing_name),
         )
         for canonical, institutions, label, dpla_id, collection in targets:
             if not institutions and dpla_id is None:

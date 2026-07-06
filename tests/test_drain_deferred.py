@@ -14,8 +14,11 @@ from tools import drain_deferred
 
 
 @pytest.fixture(autouse=True)
-def chdir_tmp(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def override_root(tmp_path, monkeypatch):
+    """Redirect ``drain_sidecar``'s absolute-anchor root into ``tmp_path``
+    so tests don't touch (or depend on) the real
+    ``/home/ec2-user/ingest-wikimedia/`` tree."""
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path)
     return tmp_path
 
 

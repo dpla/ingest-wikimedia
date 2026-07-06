@@ -1253,6 +1253,148 @@ def test_find_active_label_rejects_filename_not_in_label_list():
     assert result is None
 
 
+def test_snapshot_running_active_labels_parses_multiple_sessions():
+    """Ground-truth signal for active-label detection: one SSM
+    roundtrip parses tmux+ps+/proc/<pid>/environ output into
+    ``{session_name: label}``. Each pipe-delimited line comes from a
+    running child of a distinct tmux session's bash pipeline; the
+    label field is that child's ``WIKIMEDIA_SESSION_LABEL`` env var.
+    """
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import snapshot_running_active_labels
+
+    with patch(
+        "ingest_wikimedia.session_state.ssm_run",
+        return_value=(
+            "wikimedia-texas+livingston-and-53-more"
+            "|texas+botanical-research-institute-of-texas\n"
+            "wikimedia-texas+montgomery-plus-2"
+            "|texas+harrie-p-woodson-memorial-library\n"
+            "wikimedia-ohio-and-3-more|drain-ohio\n"
+        ),
+    ):
+        snap = snapshot_running_active_labels(client=None)
+    assert snap == {
+        "wikimedia-texas+livingston-and-53-more": (
+            "texas+botanical-research-institute-of-texas"
+        ),
+        "wikimedia-texas+montgomery-plus-2": (
+            "texas+harrie-p-woodson-memorial-library"
+        ),
+        "wikimedia-ohio-and-3-more": "drain-ohio",
+    }
+
+
+def test_snapshot_running_active_labels_disambiguates_shared_labels():
+    """The core defect the subprocess signal fixes: two concurrent
+    sessions have the SAME target label (e.g. both texas chains include
+    harrie-p-woodson). The mtime heuristic can't distinguish which
+    session's subprocess is writing the log right now, so it mis-
+    attributes. The subprocess signal (reading each session's running
+    child's ``WIKIMEDIA_SESSION_LABEL``) resolves that unambiguously.
+    """
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import snapshot_running_active_labels
+
+    # Big chain is on 'botanical', small chain is on 'harrie-p-woodson'.
+    # A pure-mtime heuristic would have picked harrie-p-woodson for
+    # BOTH sessions because the small chain is writing that log right
+    # now (highest mtime across the big chain's label set too).
+    with patch(
+        "ingest_wikimedia.session_state.ssm_run",
+        return_value=(
+            "wikimedia-texas+livingston-and-53-more"
+            "|texas+botanical-research-institute-of-texas\n"
+            "wikimedia-texas+montgomery-plus-2"
+            "|texas+harrie-p-woodson-memorial-library\n"
+        ),
+    ):
+        snap = snapshot_running_active_labels(client=None)
+    assert (
+        snap["wikimedia-texas+livingston-and-53-more"]
+        == "texas+botanical-research-institute-of-texas"
+    )
+    assert (
+        snap["wikimedia-texas+montgomery-plus-2"]
+        == "texas+harrie-p-woodson-memorial-library"
+    )
+
+
+def test_snapshot_running_active_labels_empty_output():
+    """No sessions with a running child (all sessions in id-generation
+    cold start, or no sessions at all) → empty dict, callers fall back
+    to :func:`find_active_label`."""
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import snapshot_running_active_labels
+
+    with patch("ingest_wikimedia.session_state.ssm_run", return_value=""):
+        assert snapshot_running_active_labels(client=None) == {}
+
+
+def test_active_and_upcoming_labels_uses_provided_active_label_over_mtime():
+    """Passing a pre-resolved ``active_label`` skips the mtime lookup —
+    load-bearing property: callers pre-fetch the snapshot once, then
+    invoke this helper per-session as a pure decision over the
+    resolved label."""
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import active_and_upcoming_labels
+
+    labels = ["ohio+a", "ohio+b", "ohio+c"]
+    with patch(
+        "ingest_wikimedia.session_state.find_active_label",
+        side_effect=AssertionError("mtime path must not run"),
+    ) as mtime:
+        upcoming = active_and_upcoming_labels(
+            ssm=None,
+            labels=labels,
+            session_created=1700000000,
+            active_label="ohio+b",
+        )
+    mtime.assert_not_called()
+    assert upcoming == {"ohio+b", "ohio+c"}
+
+
+def test_active_and_upcoming_labels_falls_back_to_mtime_when_active_label_none():
+    """No pre-resolved active_label → fall through to the mtime
+    heuristic (id-generation cold start, between steps, chain
+    finished)."""
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import active_and_upcoming_labels
+
+    labels = ["ohio+a", "ohio+b", "ohio+c"]
+    with patch(
+        "ingest_wikimedia.session_state.find_active_label",
+        return_value=("ohio+c", 1700009999),
+    ) as mtime:
+        upcoming = active_and_upcoming_labels(
+            ssm=None,
+            labels=labels,
+            session_created=1700000000,
+            active_label=None,
+        )
+    mtime.assert_called_once()
+    assert upcoming == {"ohio+c"}
+
+
+def test_active_and_upcoming_labels_empty_set_for_drain_hub_active_label():
+    """``drain-<hub>`` means the terminal partner-level drain phase —
+    all per-target work is done → empty set so a new request for any
+    per-target label is not a conflict."""
+    from ingest_wikimedia.session_state import active_and_upcoming_labels
+
+    upcoming = active_and_upcoming_labels(
+        ssm=None,
+        labels=["ohio+a", "nwh+b"],
+        active_label="drain-ohio",
+    )
+    assert upcoming == set()
+
+
 # ---------------------------------------------------------------------------
 # Slack output safety — multi-block splitting
 
@@ -1344,6 +1486,158 @@ def test_post_to_slack_payload_contains_multiple_section_blocks_for_busy_day():
     for block in section_blocks:
         assert block["text"]["text"].strip(), "Empty section block emitted"
     assert json.dumps(payload)
+
+
+def test_main_uses_subprocess_snapshot_over_mtime_for_active_label():
+    """When ``snapshot_running_active_labels`` returns an active label
+    for a session, ``fetch`` must use it — NOT fall through to
+    :func:`find_active_label`'s log-mtime heuristic. This is the fix
+    for the two-sessions-share-a-label bug: mtime can't distinguish
+    which session's subprocess is writing a shared log, but the
+    ``WIKIMEDIA_SESSION_LABEL`` env var of each session's running
+    child does.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import main
+
+    sessions_out = "wikimedia-texas+livingston-and-1-more|1700000000\n"
+    captured, fake_post = _capture_slack_post()
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok-xxx", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch(
+            "scripts.wikimedia_upload_status.ssm_run",
+            return_value=sessions_out,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.parse_session_labels",
+            return_value=[
+                "texas+livingston-municipal-library",
+                "texas+botanical-research-institute-of-texas",
+            ],
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.snapshot_running_active_labels",
+            return_value={
+                "wikimedia-texas+livingston-and-1-more": (
+                    "texas+botanical-research-institute-of-texas"
+                ),
+            },
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.find_active_label",
+            side_effect=AssertionError(
+                "find_active_label (mtime) must not be consulted when "
+                "the subprocess snapshot has a label for the session"
+            ),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            return_value=("Uploading (100 / 500 files, ~20.0%)", 1700009999),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.requests.post",
+            side_effect=fake_post,
+        ),
+    ):
+        main()
+
+    payload = captured["payload"]
+    section_blocks = [b for b in payload["blocks"] if b.get("type") == "section"]
+    text = section_blocks[0]["text"]["text"]
+    # The subprocess signal (botanical) wins over any mtime latch onto
+    # a shared label. Row is positioned [2/2] because botanical is
+    # position 2 of the batch.
+    assert "texas+botanical-research-institute-of-texas [2/2]" in text
+    assert "Uploading (100 / 500 files, ~20.0%)" in text
+
+
+def test_main_drain_hub_row_attributes_to_parent_chain():
+    """When a chained session is in its terminal partner-level drain
+    phase (subprocess signal reports
+    ``WIKIMEDIA_SESSION_LABEL=drain-<hub>``), the row must be
+    attributed to the parent multi-target session — ``<first-target>
+    +N more (drain: <hub>)`` — not displayed as a standalone
+    ``drain-<hub>`` identity, which reads as a whole new session to
+    operators.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import main
+
+    sessions_out = "wikimedia-ohio+ohio-uni-and-3-more|1700000000\n"
+    captured, fake_post = _capture_slack_post()
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok-xxx", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch(
+            "scripts.wikimedia_upload_status.ssm_run",
+            return_value=sessions_out,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.parse_session_labels",
+            return_value=[
+                "ohio+ohio-university-libraries",
+                "northwest-heritage+whitman-county-library",
+                "minnesota+minnesota-legislative-reference-library",
+                "bpl+phillips-academy",
+            ],
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.snapshot_running_active_labels",
+            return_value={"wikimedia-ohio+ohio-uni-and-3-more": "drain-ohio"},
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            return_value=(
+                "Draining (drain: 0 queued, Category:Duplicate at 1,004, needs < 900)",
+                1700009999,
+            ),
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.requests.post",
+            side_effect=fake_post,
+        ),
+    ):
+        main()
+
+    payload = captured["payload"]
+    section_blocks = [b for b in payload["blocks"] if b.get("type") == "section"]
+    text = section_blocks[0]["text"]["text"]
+    # Row identifies the parent chain (first target + count of remaining
+    # targets) with a `(drain: ohio)` phase annotation, NOT the raw
+    # synthetic `drain-ohio` label as a standalone session identity.
+    assert "ohio+ohio-university-libraries +3 more (drain: ohio)" in text
+    assert "drain: 0 queued" in text
+    # And critically, the raw `drain-ohio` string is not the row's
+    # identity (the phase annotation still contains "drain: ohio" but
+    # not as the label — the assertion above pins that).
+    assert "`drain-ohio`" not in text
 
 
 def test_main_rows_use_display_id_from_fetch_not_session_name():

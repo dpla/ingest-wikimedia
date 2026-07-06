@@ -22,6 +22,55 @@ from ingest_wikimedia.partners import PARTNER_DIR
 from ingest_wikimedia.ssm import ssm_run
 
 
+# Valid launcher-exported ``WIKIMEDIA_SESSION_LABEL`` shapes:
+# ``<hub>+<institution>`` (per-target), ``drain-<hub>`` (terminal
+# partner drain), ``retry-<hub>`` (retry pipeline).
+def _valid_session_label(label: str) -> bool:
+    return bool(label) and ("+" in label or label.startswith(("drain-", "retry-")))
+
+
+def snapshot_running_active_labels(client) -> dict[str, str]:
+    """One SSM roundtrip: for every ``wikimedia-*`` tmux session, return
+    the active session label read from its currently-running direct-
+    child subprocess's ``WIKIMEDIA_SESSION_LABEL`` env var. Sessions
+    with no running child are omitted; callers should fall back to
+    :func:`find_active_label` for those.
+
+    Direct-evidence signal: the launcher exports
+    ``WIKIMEDIA_SESSION_LABEL`` on every step, so every pipeline
+    subprocess inherits it. Beats :func:`find_active_label`'s log-mtime
+    heuristic when two sessions share a target label — mtime can't
+    tell which session's subprocess is writing the log; env-var reads
+    directly attribute the write.
+
+    Sorted numerically by ``etimes`` (elapsed seconds) ascending — the
+    smallest value is the most recently started direct child, which
+    is the correct pick when a step has transient helper forks
+    alongside the main step. ``lstart`` output is calendar text and
+    doesn't sort chronologically.
+    """
+    out = ssm_run(
+        client,
+        r"""tmux list-panes -aF '#{session_name}|#{pane_pid}' 2>/dev/null | while IFS='|' read name pane_pid; do
+  case "$name" in wikimedia-*) : ;; *) continue ;; esac
+  child_pid=$(ps --ppid "$pane_pid" -o pid=,etimes= 2>/dev/null | sort -k2 -n | head -1 | awk '{print $1}')
+  [ -z "$child_pid" ] && continue
+  label=$(tr '\0' '\n' < /proc/"$child_pid"/environ 2>/dev/null | grep -m1 '^WIKIMEDIA_SESSION_LABEL=' | cut -d= -f2-)
+  [ -n "$label" ] && echo "$name|$label"
+done""",
+    )
+    result: dict[str, str] = {}
+    for line in (out or "").splitlines():
+        name, sep, label = line.partition("|")
+        if not sep:
+            continue
+        name = name.strip()
+        label = label.strip()
+        if name and _valid_session_label(label):
+            result[name] = label
+    return result
+
+
 def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
 
@@ -141,72 +190,54 @@ def find_active_label(
 
 
 def active_and_upcoming_labels(
-    ssm, labels: list[str], session_created: int = 0
+    ssm,
+    labels: list[str],
+    session_created: int = 0,
+    active_label: str | None = None,
 ) -> set[str]:
-    """Return the subset of ``labels`` that a chained session hasn't yet
-    completed — the currently-active label plus everything after it in
-    the chain-run order.
+    """Return the subset of ``labels`` a chained session hasn't yet
+    completed — the currently-active label plus everything after it
+    in chain-run order.
 
-    A wikimedia-upload tmux session runs its targets sequentially. Once
-    a target's ``sdc-sync`` phase finishes and the ``&&`` chain moves on,
-    that target is done; a new incoming request naming that same target
-    is NOT a conflict and should be allowed to run alongside the ongoing
-    session. Pre-fix, the launcher's conflict check naively compared
-    against **every** label in the tmux session name, causing a 54-target
-    chained session to block every new request naming any of its 54
-    institutions — even institutions whose target completed hours ago.
+    A wikimedia-upload session runs its targets sequentially, so a
+    target the session has passed cannot conflict with a new request
+    naming that same target. Pre-fix, the launcher's conflict check
+    naively compared against every label in the tmux session name,
+    causing a 54-target chained session to block every new request
+    naming any of its 54 institutions — even institutions whose target
+    completed hours ago.
 
-    Uses :func:`find_active_label`'s log-mtime heuristic: the freshest
-    log across the label set identifies the currently-running target;
-    everything at or after that position is still upcoming, everything
-    before is done.
-
-    Special cases:
-
-    * ``find_active_label`` returns a synthetic ``drain-<hub>`` label
-      when the session is in its terminal partner-level drain phase.
-      All per-target work is done at that point — return the empty
-      set so a new request for any per-target label is not a conflict.
-    * ``find_active_label`` returns ``None`` (no log exists yet,
-      session is in id-generation for its first target) → fall back
-      to treating all labels as active.
-    * ``find_active_label`` raises (transient SSM error) → same
-      conservative all-labels fallback so a failed lookup can't
-      silently let a real conflict through. Logged at warning level
-      so silent regressions to the old over-conflicting behavior are
-      visible in operator diagnostics.
-
-    ``session_created`` (Unix epoch seconds; 0 = no filter) is
-    threaded through to :func:`find_active_label` — see its docstring
-    for the rationale.
+    ``active_label`` (from
+    :func:`snapshot_running_active_labels`) is the direct-evidence
+    signal — one ``WIKIMEDIA_SESSION_LABEL`` env-var read from the
+    session's running child. When ``None``, falls back to
+    :func:`find_active_label`'s log-mtime heuristic
+    (``session_created``-bounded so a concurrent session's write can't
+    steal identity). Both a ``drain-<hub>`` active label and a lookup
+    that finds no log yet return the empty and all-labels sets
+    respectively; a transient SSM error is logged and treated as the
+    latter so a lookup failure can't silently let a real conflict
+    through.
     """
     if not labels:
         return set()
-    try:
-        active = find_active_label(ssm, labels, session_created=session_created)
-    except Exception as e:
-        logging.warning(
-            "active_and_upcoming_labels: find_active_label raised %r; "
-            "falling back to conservative all-labels conflict scope. "
-            "Some completed targets may over-conflict until the SSM "
-            "lookup recovers.",
-            e,
-        )
-        return set(labels)
-    if active is None:
-        return set(labels)
-    if active[0].startswith("drain-"):
-        # Session is in the terminal partner-level drain phase — all
-        # per-target chain steps finished. No per-target label is a
-        # conflict candidate; the drain is per-partner and doesn't
-        # exclude a new institution-scoped request.
+    if active_label is None:
+        try:
+            found = find_active_label(ssm, labels, session_created=session_created)
+        except Exception as e:
+            logging.warning(
+                "active_and_upcoming_labels: find_active_label raised %r; "
+                "falling back to conservative all-labels conflict scope.",
+                e,
+            )
+            return set(labels)
+        if found is None:
+            return set(labels)
+        active_label = found[0]
+    if active_label.startswith("drain-"):
         return set()
     try:
-        start_idx = labels.index(active[0])
+        start_idx = labels.index(active_label)
     except ValueError:
-        # ``find_active_label`` returned a label not in the input list —
-        # shouldn't happen (its selection loop only returns labels from
-        # this list or synthetic drain-hub labels, and drain-hub is
-        # handled above), but treat as unknown → conservative all-labels.
         return set(labels)
     return set(labels[start_idx:])
