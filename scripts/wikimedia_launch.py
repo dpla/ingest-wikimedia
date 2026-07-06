@@ -1084,9 +1084,17 @@ def main() -> None:
 
     # Check for any existing session that includes one of the requested targets.
     # Maps each requested label to the existing session name(s) it conflicts with.
+    # ``tmux ls -F`` returns ``name|epoch`` per line — the epoch is fed to
+    # ``active_and_upcoming_labels`` so :func:`find_active_label` can bound its
+    # log-mtime lookup to files created after each session began, keeping a
+    # concurrent second session's writes from stealing "which label is active"
+    # for the wrong session.
     print(f"Checking for existing sessions that overlap with {session_name}...")
     try:
-        tmux_list = ssm_run(ssm, "tmux ls 2>/dev/null || true")
+        tmux_list = ssm_run(
+            ssm,
+            "tmux ls -F '#{session_name}|#{session_created}' 2>/dev/null || true",
+        )
     except Exception as e:
         _slack_fail(
             response_url,
@@ -1104,9 +1112,17 @@ def main() -> None:
     target_hubs = {canonical for canonical, _, _, _, _ in targets}
     label_conflicts: dict[str, list[str]] = {}
     for line in tmux_list.splitlines():
-        existing_name = line.split(":")[0].strip()
+        # ``tmux ls -F '#{session_name}|#{session_created}'`` format:
+        # ``wikimedia-foo|1751706567``. Parse name + epoch; fall back to
+        # 0 for the epoch if a line is malformed (older tmux, unexpected
+        # format, or a non-wikimedia session using ``:`` in its name).
+        existing_name, _, epoch_str = line.strip().partition("|")
         if not existing_name.startswith("wikimedia-"):
             continue
+        try:
+            existing_created = int(epoch_str)
+        except ValueError:
+            existing_created = 0
         existing_labels_ordered = parse_session_labels(
             existing_name[len("wikimedia-") :]
         )
@@ -1115,7 +1131,9 @@ def main() -> None:
             # regardless of which label is currently active in this
             # session. Skip the SSM lookup and move on.
             continue
-        existing_labels = active_and_upcoming_labels(ssm, existing_labels_ordered)
+        existing_labels = active_and_upcoming_labels(
+            ssm, existing_labels_ordered, session_created=existing_created
+        )
         for canonical, institutions, label, dpla_id, collection in targets:
             if not institutions and dpla_id is None:
                 # Hub-level request conflicts with any existing session touching this hub

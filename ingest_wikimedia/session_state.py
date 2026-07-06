@@ -48,9 +48,13 @@ def log_filename_pattern_for_label(label: str) -> str:
     )
 
 
-def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
+def find_active_label(
+    client,
+    labels: list[str],
+    session_created: int = 0,
+) -> tuple[str, int] | None:
     """Return ``(label, log_mtime)`` for the most-recently-written log file
-    across all ``labels`` in a chained session, or ``None`` if no matching
+    that plausibly belongs to this session, or ``None`` if no matching
     log exists yet.
 
     A wikimedia-upload session runs its labels sequentially (downloader →
@@ -66,6 +70,26 @@ def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
     SSM round trips linearly with batch size and pushed multi-institution
     sessions past Slack's three-second slash-command ack deadline. See
     PR #325-vintage multi-institution batches accumulating 50+ labels each.
+
+    ``session_created`` (Unix epoch seconds; 0 = no filter) bounds the
+    lookup to log files whose mtime is at or after the tmux session's
+    creation time. Without this bound, a concurrent second session that
+    happens to be writing to a log file with a label THIS session's
+    chain has already completed would be picked up as "active" here —
+    stealing the row's identity and progress numbers. The filter is a
+    strict prefix on the ``find`` command (``-newermt "@N"``); when 0
+    it's omitted and behavior matches the original unbounded query.
+
+    Also matches ``drain-<hub>`` logs for each unique hub appearing in
+    ``labels``. The launcher's terminal partner-level drain step
+    exports ``WIKIMEDIA_SESSION_LABEL=drain-<partner>``, so its log
+    file is ``…-drain-<partner>-drain-deferred.log`` — that name is
+    NOT one of the per-target labels callers pass, and before this
+    change the reporter's "which label is active" lookup silently
+    ignored it, misreporting sessions in terminal drain as
+    ``SDC complete``. On a match the synthetic ``drain-<hub>`` label
+    is returned; downstream callers can either display it as-is or
+    strip the prefix for the row label.
     """
     if not labels:
         return None
@@ -76,17 +100,30 @@ def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
         shlex.quote(f"/home/ec2-user/ingest-wikimedia/{PARTNER_DIR.get(h, h)}/logs")
         for h in hubs
     )
-    label_alt = "|".join(re.escape(lbl) for lbl in labels)
+    # Include synthetic ``drain-<hub>`` alternatives so the terminal
+    # partner-level drain step (launcher exports
+    # ``WIKIMEDIA_SESSION_LABEL=drain-<partner>`` before that step) is
+    # visible here. Combined regex alternation avoids doubling the
+    # SSM round trip count.
+    drain_hub_labels = [f"drain-{h}" for h in hubs]
+    label_alt = "|".join(re.escape(lbl) for lbl in [*labels, *drain_hub_labels])
     # Phase alternation MUST stay in sync with
     # :func:`log_filename_pattern_for_label` — drain-deferred(-opportunistic)
     # logs are legitimate "newest phase" candidates for a session whose
     # download/upload/sdc chain finished and moved on to drain.
-    cmd = (
-        f"find {paths} -maxdepth 1 -type f -name '*.log' "
-        f"-regextype posix-extended "
-        f"-regex '.*-({label_alt})-(download|upload|sdc|drain-deferred(-opportunistic)?)\\.log' "
-        f"-printf '%T@ %f\\n' 2>/dev/null | sort -rn | head -1"
-    )
+    cmd_parts = [
+        f"find {paths} -maxdepth 1 -type f -name '*.log'",
+        "-regextype posix-extended",
+        f"-regex '.*-({label_alt})-(download|upload|sdc|drain-deferred(-opportunistic)?)\\.log'",
+    ]
+    if session_created > 0:
+        # Time-bound the lookup to files created after this session's
+        # tmux session began. Guards against a concurrent second session
+        # incidentally writing to one of THIS session's already-completed
+        # labels (and thereby stealing the "active label" position).
+        cmd_parts.append(f"-newermt '@{session_created}'")
+    cmd_parts.append("-printf '%T@ %f\\n' 2>/dev/null | sort -rn | head -1")
+    cmd = " ".join(cmd_parts)
     out = ssm_run(client, cmd).strip()
     if not out:
         return None
@@ -94,14 +131,18 @@ def find_active_label(client, labels: list[str]) -> tuple[str, int] | None:
     # Identify which of our labels matched via the per-label helper —
     # anchored-pattern logic so suffix-collision (e.g.
     # ``bpl+phillips-academy`` vs ``bpl+phillips-academy-andover``) is
-    # handled exactly once.
-    for lbl in labels:
+    # handled exactly once. Try synthetic drain-hub labels first because
+    # a ``drain-<hub>`` file name may otherwise be matched against a
+    # per-target label whose prefix coincidentally aligns.
+    for lbl in [*drain_hub_labels, *labels]:
         if re.search(log_filename_pattern_for_label(lbl), filename):
             return lbl, int(float(mtime_str))
     return None
 
 
-def active_and_upcoming_labels(ssm, labels: list[str]) -> set[str]:
+def active_and_upcoming_labels(
+    ssm, labels: list[str], session_created: int = 0
+) -> set[str]:
     """Return the subset of ``labels`` that a chained session hasn't yet
     completed — the currently-active label plus everything after it in
     the chain-run order.
@@ -118,18 +159,31 @@ def active_and_upcoming_labels(ssm, labels: list[str]) -> set[str]:
     Uses :func:`find_active_label`'s log-mtime heuristic: the freshest
     log across the label set identifies the currently-running target;
     everything at or after that position is still upcoming, everything
-    before is done. If no log exists yet (session is in id-generation
-    for its first target) OR the lookup raises (transient SSM error),
-    fall back to treating all labels as active — the conservative
-    choice, so a failed lookup can't silently let a real conflict
-    through. The exception path is logged at warning level so silent
-    regressions to the old over-conflicting behavior are visible in
-    operator diagnostics.
+    before is done.
+
+    Special cases:
+
+    * ``find_active_label`` returns a synthetic ``drain-<hub>`` label
+      when the session is in its terminal partner-level drain phase.
+      All per-target work is done at that point — return the empty
+      set so a new request for any per-target label is not a conflict.
+    * ``find_active_label`` returns ``None`` (no log exists yet,
+      session is in id-generation for its first target) → fall back
+      to treating all labels as active.
+    * ``find_active_label`` raises (transient SSM error) → same
+      conservative all-labels fallback so a failed lookup can't
+      silently let a real conflict through. Logged at warning level
+      so silent regressions to the old over-conflicting behavior are
+      visible in operator diagnostics.
+
+    ``session_created`` (Unix epoch seconds; 0 = no filter) is
+    threaded through to :func:`find_active_label` — see its docstring
+    for the rationale.
     """
     if not labels:
         return set()
     try:
-        active = find_active_label(ssm, labels)
+        active = find_active_label(ssm, labels, session_created=session_created)
     except Exception as e:
         logging.warning(
             "active_and_upcoming_labels: find_active_label raised %r; "
@@ -141,11 +195,18 @@ def active_and_upcoming_labels(ssm, labels: list[str]) -> set[str]:
         return set(labels)
     if active is None:
         return set(labels)
+    if active[0].startswith("drain-"):
+        # Session is in the terminal partner-level drain phase — all
+        # per-target chain steps finished. No per-target label is a
+        # conflict candidate; the drain is per-partner and doesn't
+        # exclude a new institution-scoped request.
+        return set()
     try:
         start_idx = labels.index(active[0])
     except ValueError:
         # ``find_active_label`` returned a label not in the input list —
         # shouldn't happen (its selection loop only returns labels from
-        # this list), but treat as unknown → conservative all-labels.
+        # this list or synthetic drain-hub labels, and drain-hub is
+        # handled above), but treat as unknown → conservative all-labels.
         return set(labels)
     return set(labels[start_idx:])
