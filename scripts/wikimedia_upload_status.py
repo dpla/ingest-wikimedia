@@ -17,6 +17,7 @@ import requests
 
 from typing import NamedTuple
 
+from ingest_wikimedia.drain_sidecar import sidecar_path
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.session_state import (
     find_active_label,
@@ -131,61 +132,37 @@ _DRAIN_THROTTLE_RE = re.compile(
 def _drain_deferred_phase(
     *,
     client,
-    pdir: str,
+    queue_hubs: list[str],
     log_path: str,
     log_file: str,
     session_created: int,
 ) -> tuple[str | None, int]:
     """Report the drain-deferred phase's live state.
 
-    Returns ``(None, 0)`` for the "no usable log yet" case (log predates
-    this session), matching :func:`get_phase_and_progress`'s sentinel so
-    the caller's ``phase is None`` fallback fires instead of rendering a
-    blank phase string.
+    Queue count sums live sidecar contents across every partner in
+    ``queue_hubs``. Lock and throttle state come from ``log_path``
+    (the currently-running drain's log). The lock-acquired grep runs
+    over the full file, not the tail — a patient drain that has held
+    the lock for hours emits enough throttle-poll lines to scroll the
+    one-shot "lock acquired" marker out of any fixed tail window.
 
-    Sidecar queue length comes from ``<partner>/deferred-drain.json``
-    (the file the drain loop rewrites atomically after each round —
-    reading it gives the live count, not the initial count from the
-    log's "N item(s) queued" line, which grows stale as items drain).
-
-    Lock state and throttle numbers come from the log: whether the
-    ``Drain-phase host lock acquired.`` marker is present ANYWHERE in
-    the file distinguishes lock-holder from lock-waiter, and the most
-    recent ``Category:Duplicate at N (>= resume threshold M)`` line
-    gives the current throttle position.
-
-    The lock marker is grepped from the WHOLE file, not the tail: a
-    patient drain emits one throttle-poll line every poll interval
-    (5 min), so after ~8 polls the one-shot "lock acquired" line
-    scrolls out of any fixed-size tail window. Reading it from the tail
-    alone would make a session that has held the lock for hours
-    misreport as "waiting for host lock". Terminal markers and the
-    throttle poll are still read from the tail (they recur / live at
-    the end).
-
-    ``opportunistic`` mode is a one-shot best-effort drain that exits
-    fast — its logs are terminal by design, so the phase string
-    reflects that final state rather than "still working".
+    Returns ``(None, 0)`` when the log predates this session, matching
+    :func:`get_phase_and_progress`'s sentinel.
     """
     is_opportunistic = log_file.endswith("-drain-deferred-opportunistic.log")
-    sidecar = shlex.quote(f"/home/ec2-user/ingest-wikimedia/{pdir}/deferred-drain.json")
+    sidecar_paths = " ".join(shlex.quote(str(sidecar_path(h))) for h in queue_hubs)
     sep = "__WM_DRAIN_SEP__"
-    # Live sidecar count: each DPLA ID is a 32-hex-char string on its
-    # own line in the JSON array (the drain sidecar writer emits a
-    # pretty-printed shape). Counting `[0-9a-f]{32}` matches is more
-    # robust than parsing JSON through a here-python (no dependency on
-    # shell quoting the interpreter body correctly).
-    #
-    # The lock-marker grep runs over the FULL log (see docstring) and
-    # emits its own count in a dedicated section so tail-window
-    # eviction can't hide a long-held lock.
+    # Each DPLA ID is a 32-hex-char string on its own line in the JSON
+    # array. ``cat`` silently skips missing files (an empty sidecar =
+    # nothing to drain for that partner), so summing across the batch
+    # is one grep over the concatenation.
     out = ssm_run(
         client,
         f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
         f"echo {sep}; "
         f"tail -8 {log_path} 2>/dev/null; "
         f"echo {sep}; "
-        f"grep -oE '[0-9a-f]{{32}}' {sidecar} 2>/dev/null | wc -l; "
+        f"cat {sidecar_paths} 2>/dev/null | grep -oE '[0-9a-f]{{32}}' | wc -l; "
         f"echo {sep}; "
         f"grep -cF 'Drain-phase host lock acquired.' {log_path} 2>/dev/null || echo 0",
     )
@@ -205,10 +182,6 @@ def _drain_deferred_phase(
     if session_created > 0 and log_mtime > 0 and log_mtime < session_created:
         return None, 0
 
-    mode = "opportunistic drain" if is_opportunistic else "drain"
-
-    # Terminal states first — a completed / capacity-declined drain
-    # doesn't need lock / throttle qualifiers.
     if "Drain-deferred: complete." in tail:
         return f"Drain complete ({queued:,} still queued)", log_mtime
     if "at capacity; " in tail and is_opportunistic:
@@ -217,16 +190,12 @@ def _drain_deferred_phase(
             log_mtime,
         )
 
-    # Non-terminal: determine lock state from the full-log marker count.
+    draining = "Draining opportunistically" if is_opportunistic else "Draining"
     if not lock_acquired:
-        # Still waiting on the flock — another partner's drain is
-        # holding it.
         return (
-            f"Draining ({mode}: {queued:,} queued, ⏸ waiting for host lock)",
+            f"{draining} ({queued:,} queued, ⏸ waiting for host lock)",
             log_mtime,
         )
-
-    # Lock held. Try to surface the most recent throttle poll.
     m = None
     for line in reversed(tail.splitlines()):
         m = _DRAIN_THROTTLE_RE.search(line)
@@ -235,16 +204,19 @@ def _drain_deferred_phase(
     if m:
         cat_size, threshold = int(m.group(1)), int(m.group(2))
         return (
-            f"Draining ({mode}: {queued:,} queued, "
+            f"{draining} ({queued:,} queued, "
             f"Category:Duplicate at {cat_size:,}, needs < {threshold:,})",
             log_mtime,
         )
-    # Lock acquired but no throttle poll yet — first tick of the loop.
-    return f"Draining ({mode}: {queued:,} queued, host lock acquired)", log_mtime
+    return f"{draining} ({queued:,} queued, host lock acquired)", log_mtime
 
 
 def get_phase_and_progress(
-    client, session: str, hub: str, label: str
+    client,
+    session: str,
+    hub: str,
+    label: str,
+    queue_hubs: list[str] | None = None,
 ) -> tuple[str | None, int]:
     """Return ``(phase_str, log_mtime)`` for this label.
 
@@ -257,11 +229,15 @@ def get_phase_and_progress(
     "complete" via the count-marker test) must not eclipse a subsequent
     label that's actively progressing now.
 
+    ``queue_hubs`` (optional): for a multi-partner batch's terminal
+    drain phase, list of every canonical partner in the batch so the
+    drain readout sums sidecar counts across all of them — the whole
+    terminal drain is one conceptual "the batch is draining"
+    operation. Defaults to ``[hub]`` — the single-partner case where
+    the row's own hub is the only relevant sidecar.
+
     ``label`` MUST be slug-shaped (``[a-z0-9+\\-]+``) — the download-log
-    glob below interpolates it unquoted into a shell command. A
-    non-slug label is rejected here so the shell-interpolation
-    contract is enforced at the boundary rather than relying on every
-    caller to feed only slug-form values.
+    glob below interpolates it unquoted into a shell command.
     """
     if not _LABEL_SLUG_RE.fullmatch(label):
         raise ValueError(
@@ -328,7 +304,7 @@ def get_phase_and_progress(
     ):
         return _drain_deferred_phase(
             client=client,
-            pdir=pdir,
+            queue_hubs=queue_hubs or [hub],
             log_path=log_path,
             log_file=log_file,
             session_created=session_created,
@@ -967,20 +943,23 @@ def main() -> None:
             return _with_batch_suffix(labels[0]), "Generating IDs"
 
         label, _ = active
-        # Terminal partner-level drain: attribute the row to the batch's
-        # identity + a ``(drain: <hub>)`` annotation rather than
-        # displaying the raw ``drain-<hub>`` label as a standalone row.
+        queue_hubs: list[str] | None = None
         if label.startswith("drain-"):
+            # Terminal drain: one batch-wide row; queue sums every
+            # canonical partner's sidecar so the count is remaining
+            # work across the batch, not just the current partner.
             hub = label[len("drain-") :]
-            if multi:
-                display_label = f"{labels[0]} +{len(labels) - 1} more (drain: {hub})"
-            else:
-                display_label = f"{labels[0]} (drain: {hub})"
+            display_label = (
+                f"{labels[0]} +{len(labels) - 1} more" if multi else labels[0]
+            )
+            queue_hubs = sorted({lbl.split("+")[0] for lbl in labels})
         else:
             hub = label.split("+")[0]
             display_label = _with_batch_suffix(label)
         try:
-            phase, _ = get_phase_and_progress(ssm, session, hub, label)
+            phase, _ = get_phase_and_progress(
+                ssm, session, hub, label, queue_hubs=queue_hubs
+            )
         except Exception:
             logging.exception("Failed to get status for %s (%s)", session, label)
             return display_label, "Unknown (error)"
