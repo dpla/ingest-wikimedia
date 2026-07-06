@@ -706,7 +706,10 @@ def test_unescape_wikitext_magic_words_covers_documented_forms():
     assert unescape_wikitext_magic_words("a{{!}}b") == "a|b"
     assert unescape_wikitext_magic_words("a{{=}}b") == "a=b"
     assert unescape_wikitext_magic_words("{{((}}x{{))}}") == "{{x}}"
-    assert unescape_wikitext_magic_words("{{!(}}x{{)!}}") == "|[x]|"
+    # {{!(}} and {{)!}} are the community table-start / table-end
+    # escapes used to keep a nested wikitable's `{|` / `|}` tokens
+    # from being consumed by the outer template's argument parser.
+    assert unescape_wikitext_magic_words("{{!(}}row{{)!}}") == "{|row|}"
 
 
 def test_unescape_wikitext_magic_words_is_single_pass():

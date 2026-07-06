@@ -1266,8 +1266,13 @@ _WIKITEXT_MAGIC_WORD_TABLE: dict[str, str] = {
     "{{=}}": "=",
     "{{((}}": "{{",
     "{{))}}": "}}",
-    "{{!(}}": "|[",
-    "{{)!}}": "]|",
+    # ``{{!(}}`` / ``{{)!}}`` are community templates (Template:!( and
+    # Template:)!) that render as ``{|`` and ``|}`` — the MediaWiki
+    # table-start and table-end markers. Used inside template params
+    # to keep a nested wikitable's opening/closing tokens from being
+    # consumed by the outer template's argument parser.
+    "{{!(}}": "{|",
+    "{{)!}}": "|}",
 }
 _WIKITEXT_MAGIC_WORD_RE = re.compile(
     "|".join(re.escape(k) for k in _WIKITEXT_MAGIC_WORD_TABLE)
