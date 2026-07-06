@@ -37,9 +37,17 @@ arg = parse.parse_args()
 if arg.cat and arg.mode == 'categories':
     parse.error('--cat is only valid with --mode data')
 
-# Connect and authenticate to Wikimedia Commons
+# Connect to Wikimedia Commons. Do not log in eagerly: most of this script is
+# reads, and many scheduled runs (especially daily categories mode) make no
+# edits at all. Logging in only when we first write avoids a Wikimedia "login
+# from a new device" email on every no-op run — each CI runner has a fresh IP.
+# ensure_login() is called immediately before every write and logs in once.
 site = pywikibot.Site()
-site.login()
+
+
+def ensure_login():
+    if not site.logged_in():
+        site.login()
 
 # Counters for the summary report
 updated = 0      # data pages written/updated
@@ -91,6 +99,7 @@ if arg.mode == 'categories':
         category = pywikibot.Page(site, cimreq_title)
         if cimreq_title in cimlist:
             print(cimreq_title)
+            ensure_login()
             category.change_category(cimcat, None, 'Remove category: [[Category:Category requested for Commons Impact Metrics]]')
             print('Removed request for ' + cimreq_title)
             fulfilled += 1
@@ -152,6 +161,7 @@ for cat in cats:
         if cat not in cimlist:
             if cimcat not in category.categories():
                 category.text += '\n[[Category:Category requested for Commons Impact Metrics]]'
+                ensure_login()
                 category.save(summary='Adding category: [[Category:Category requested for Commons Impact Metrics]]')
                 print('   Category requested for Commons Impact Metrics!')
                 requested += 1
@@ -197,6 +207,7 @@ for cat in cats:
             print(f'   Request error, skipping: {e}')
             continue
         pagename.text = json.dumps(datapage, indent=4)
+        ensure_login()
         pagename.save('Adding tabular data for category page views from Commons Impact Metrics.')
         updated += 1
 
@@ -214,6 +225,7 @@ for cat in cats:
         print(chartpage)
         chartpagename.text = json.dumps(chartpage, indent=4, ensure_ascii=False)
         print(chartpagename.text)
+        ensure_login()
         chartpagename.save('   Creating chart page for category page views from Commons Impact Metrics.')
 
 print("""

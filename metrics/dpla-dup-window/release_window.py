@@ -303,7 +303,11 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
     site = pywikibot.Site()
-    site.login()
+    # Do not log in eagerly. Every read below (window value, category count,
+    # backlog fetch) works anonymously; we log in only if we actually write.
+    # Otherwise every scheduled run — almost always a no-op, since the category
+    # sits at/above target — would log in from a fresh CI-runner IP and trigger
+    # a Wikimedia "login from a new device" email for nothing.
 
     window_page = pywikibot.Page(site, WINDOW_PAGE)
     current_window = parse_window_value(
@@ -345,6 +349,7 @@ def main() -> int:
         logging.info("Dry run: no edits or purges made.")
         return 0
 
+    site.login()  # only reached when actually releasing — never on no-op runs
     window_page.text = render_window_value(plan.new_window)
     window_page.save(
         summary=(
