@@ -1226,10 +1226,50 @@ CASEFOLD_COMPARE_KEYS: frozenset[str] = frozenset(
 )
 
 
+# MediaWiki character-escape magic words. When a literal ``|`` or ``=``
+# would confuse the template parser (`|` separates params, `=`
+# separates key from value), community editors escape it with the
+# builtin magic-word form on the LEFT — which the parser expands back
+# to the character on the RIGHT before rendering. Docs:
+# https://www.mediawiki.org/wiki/Help:Magic_words
+#
+# When we read a value OUT of a template parameter position — either to
+# store it as an SDC statement or to compare it against DPLA canonical
+# — we must undo the escape or the value carries the meaningless magic-
+# word text into a context where it doesn't mean anything (the SDC
+# value ends up literally containing "{{!}}", and the comparator against
+# DPLA's canonical "|" fails).
+_WIKITEXT_MAGIC_WORD_UNESCAPES: tuple[tuple[str, str], ...] = (
+    ("{{!}}", "|"),
+    ("{{=}}", "="),
+    ("{{((}}", "{{"),
+    ("{{))}}", "}}"),
+    ("{{!(}}", "|["),
+    ("{{)!}}", "]|"),
+)
+
+
+def unescape_wikitext_magic_words(s: str) -> str:
+    """Replace MediaWiki character-escape magic words with the literal
+    characters they render as. Non-string / empty input returns as-is.
+
+    Applied when moving a value from wikitext (where these escapes are
+    required inside template parameters) to any other context (SDC
+    storage, comparator keys, log messages) where the magic-word form
+    is meaningless literal text.
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    for magic, literal in _WIKITEXT_MAGIC_WORD_UNESCAPES:
+        s = s.replace(magic, literal)
+    return s
+
+
 def casefold_for_compare(s: str) -> str:
     """Fold ``s`` to a comparable form for equivalence checks against
-    another display string. Strips leading/trailing whitespace and
-    punctuation, collapses internal whitespace runs, and casefolds.
+    another display string. Unescapes MediaWiki character-escape magic
+    words (``{{!}}``, ``{{=}}``, …), strips leading/trailing whitespace
+    and punctuation, collapses internal whitespace runs, and casefolds.
 
     Used ONLY as a comparator key — never to rewrite stored or rendered
     values. DPLA-authored SDC and rendered wikitext must continue to
@@ -1244,6 +1284,7 @@ def casefold_for_compare(s: str) -> str:
     """
     if not isinstance(s, str) or not s:
         return ""
+    s = unescape_wikitext_magic_words(s)
     s = _LEADING_TRIM_RE.sub("", s)
     s = _TRAILING_TRIM_RE.sub("", s)
     s = _INTERNAL_WS_RE.sub(" ", s)

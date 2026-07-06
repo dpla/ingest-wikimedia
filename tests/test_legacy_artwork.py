@@ -110,6 +110,38 @@ def test_parse_artwork_params_drops_empty_values():
     assert params == {"title": "A"}
 
 
+def test_parse_artwork_params_unescapes_magic_words_in_values():
+    """A community AWB pass sometimes rewrites literal ``|`` inside a
+    template param to the ``{{!}}`` magic word (parser expands it back
+    to ``|`` at render time — display-invariant). Extraction must
+    un-escape so:
+
+    (a) the value stored downstream as an SDC statement is the literal
+        text a reader sees, not the magic-word form that has no meaning
+        outside a template context, and
+    (b) the migration provenance walker doesn't credit the AWB pass for
+        a content change that didn't actually change display.
+
+    Motivating example: File:Block_Card_6_E._Bancroft_Street_-_DPLA_-
+    _307d98570261183ed48eb3b1880fce14.jpg — 2020-06-04 AWB pass
+    replaced ``|`` with ``{{!}}`` in the description; the July 2026
+    legacy-Artwork migrator then stored the escaped form as a P10358
+    SDC statement, permanently diverging from DPLA canonical.
+    """
+    wikitext = (
+        "{{Artwork\n"
+        "| title = A {{=}} B\n"
+        "| description = terms include: buildings {{!}} Italianate "
+        "{{!}} one story\n"
+        "}}"
+    )
+    params = parse_artwork_params(wikitext)
+    assert params == {
+        "title": "A = B",
+        "description": ("terms include: buildings | Italianate | one story"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # trace_param_provenance — revision-history walker
 # ---------------------------------------------------------------------------

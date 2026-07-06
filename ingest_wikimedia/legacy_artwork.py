@@ -42,6 +42,7 @@ from ingest_wikimedia.sdc import (
     dates_semantically_equal,
     parse_date_range,
     parse_dpla_date,
+    unescape_wikitext_magic_words,
 )
 
 # DPLA's Commons-bot account names. Revisions authored by these accounts
@@ -188,10 +189,18 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
 
     Returns ``{}`` when no legacy template is found, or when one is
     present but carries no recognised params. Values are whitespace-
-    stripped (matching the renderer's behavior); the unrecognised
-    param names are dropped silently — those don't have a canonical
-    target and the wikitext-rewrite step preserves them by leaving
-    the template untouched if the param wasn't migrated.
+    stripped (matching the renderer's behavior) and character-escape
+    magic words (``{{!}}`` / ``{{=}}`` / …) are un-escaped to the
+    literal characters they render as — a community editor's AWB pass
+    that swapped ``|`` for ``{{!}}`` inside a param value is a display
+    no-op and must be treated as one by both the provenance walk
+    (crediting the AWB edit for a real content change would misclassify
+    the value as community-contributed) and by downstream SDC-storage
+    paths (a stored value that literally contains ``{{!}}`` is nonsense
+    outside a template context). Unrecognised param names are dropped
+    silently — those don't have a canonical target and the wikitext-
+    rewrite step preserves them by leaving the template untouched if
+    the param wasn't migrated.
     """
     template = find_legacy_template(wikitext)
     if template is None:
@@ -201,7 +210,7 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
         canonical = ARTWORK_PARAM_TO_CANONICAL_KEY.get(_normalize_param_name(param))
         if canonical is None:
             continue
-        value = str(param.value).strip()
+        value = unescape_wikitext_magic_words(str(param.value).strip())
         if value:
             # On duplicate canonical keys (e.g. both ``author`` and
             # ``creator`` set), the *last* wins — matches the renderer

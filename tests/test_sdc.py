@@ -617,6 +617,60 @@ def test_casefold_for_compare_handles_falsy_input():
     assert casefold_for_compare("   .,  ") == ""
 
 
+def test_casefold_for_compare_unescapes_wikitext_magic_words():
+    """A community AWB pass sometimes rewrites literal ``|`` inside a
+    template param to the ``{{!}}`` magic word (the parser expands it
+    back to ``|`` at render time). If the escaped form leaks into
+    stored SDC and DPLA's canonical carries the literal, byte- and
+    casefold-comparison fail on a display-invariant transform. The
+    comparator must un-escape.
+
+    Motivating example: File:Block_Card_6_E._Bancroft_Street_-_DPLA_-
+    _307d98570261183ed48eb3b1880fce14.jpg — description migrated to
+    P10358 with literal ``{{!}}`` between terms, but DPLA canonical
+    description carries ``|``.
+    """
+    from ingest_wikimedia.sdc import casefold_for_compare
+
+    dpla = (
+        "Descriptive terms related to this photograph include: "
+        "commercial buildings | Italianate | one story"
+    )
+    community = (
+        "Descriptive terms related to this photograph include: "
+        "commercial buildings {{!}} Italianate {{!}} one story"
+    )
+    assert casefold_for_compare(dpla) == casefold_for_compare(community)
+
+    # ``{{=}}`` and the bracket variants land the same way.
+    assert casefold_for_compare("a = b") == casefold_for_compare("a {{=}} b")
+    assert casefold_for_compare("{{x}}") == casefold_for_compare("{{((}}x{{))}}")
+
+
+def test_unescape_wikitext_magic_words_leaves_regular_text_alone():
+    """The helper is pure substitution of the documented magic words —
+    ordinary text (including stray braces that aren't part of a magic-
+    word) passes through unchanged."""
+    from ingest_wikimedia.sdc import unescape_wikitext_magic_words
+
+    assert unescape_wikitext_magic_words("plain text") == "plain text"
+    assert unescape_wikitext_magic_words("{{cite}}") == "{{cite}}"
+    assert unescape_wikitext_magic_words("") == ""
+    assert unescape_wikitext_magic_words(None) is None  # type: ignore[arg-type]
+
+
+def test_unescape_wikitext_magic_words_covers_documented_forms():
+    """All the character-escape magic words documented on
+    https://www.mediawiki.org/wiki/Help:Magic_words expand to the
+    literal char they render as."""
+    from ingest_wikimedia.sdc import unescape_wikitext_magic_words
+
+    assert unescape_wikitext_magic_words("a{{!}}b") == "a|b"
+    assert unescape_wikitext_magic_words("a{{=}}b") == "a=b"
+    assert unescape_wikitext_magic_words("{{((}}x{{))}}") == "{{x}}"
+    assert unescape_wikitext_magic_words("{{!(}}x{{)!}}") == "|[x]|"
+
+
 # ---------------------------------------------------------------------------
 # dates_semantically_equal — semantic date equivalence for
 # ``{{DPLA metadata}}`` ``date =`` overrides that reformat DPLA's own
