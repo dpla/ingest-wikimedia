@@ -31,9 +31,17 @@ from collections.abc import Callable
 
 import pywikibot
 
-DEFAULT_THRESHOLD = 1000
-DEFAULT_RESUME_BELOW = 900
-DEFAULT_RECHECK_CAP = 100
+# Commons admins asked us (2026-07) to keep Category:Duplicate lean. Defer new
+# hash-drift {{duplicate}} tags once the category reaches DEFAULT_THRESHOLD, and
+# don't resume draining the deferred backlog until it falls back below
+# DEFAULT_RESUME_BELOW — a 50-member hysteresis band so the drain works a real
+# batch each cycle instead of thrashing at the ceiling.
+DEFAULT_THRESHOLD = 190
+DEFAULT_RESUME_BELOW = 140
+# Max tags emitted per cached size reading. Kept <= the hysteresis band so
+# concurrent partner runs can't overshoot the ceiling by much before
+# re-querying (worst case ~= recheck_cap x concurrent sessions).
+DEFAULT_RECHECK_CAP = 50
 # Category:Duplicate drains on human-admin timescales — days, not
 # minutes — so polling every 5 minutes is fast enough that we won't sit
 # idle after a batch clears while still being a good API citizen. The
