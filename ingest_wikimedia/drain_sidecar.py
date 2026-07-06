@@ -25,19 +25,35 @@ import os
 import tempfile
 from pathlib import Path
 
+from ingest_wikimedia.partners import PARTNER_DIR
+
 SIDECAR_FILENAME = "deferred-drain.json"
+
+# Absolute anchor for the sidecar path — CWD-independent, so
+# uploader/sdc-sync/drain-deferred callers (which ``cd`` into
+# ``<root>/<partner_dir>/`` before executing) all resolve to the same
+# flat ``<root>/<partner_dir>/deferred-drain.json`` rather than a
+# doubly-nested variant. Tests monkeypatch this to a tmp dir.
+INGEST_WIKI_ROOT = Path("/home/ec2-user/ingest-wikimedia")
+
+
+def partner_dir_path(partner: str) -> Path:
+    """Absolute path to the partner's working directory under
+    :data:`INGEST_WIKI_ROOT`. Resolves ``si`` → ``smithsonian`` via
+    :data:`PARTNER_DIR`; other slugs pass through unchanged.
+    """
+    return INGEST_WIKI_ROOT / PARTNER_DIR.get(partner, partner)
 
 
 def sidecar_path(partner: str) -> Path:
     """Absolute path to the deferred-drain sidecar for ``partner``.
 
-    Uses the same per-partner working directory the uploader / sdc-sync
-    CLI commands run from (their CWD when launched by the tmux
-    pipeline). Callers may pass either the canonical partner slug
-    (``nara``) or a directory-name variant (``smithsonian`` for the ``si``
-    slug); resolution belongs on the caller side.
+    Anchored at :data:`INGEST_WIKI_ROOT` so it's independent of the
+    caller's CWD. The partner slug is resolved through
+    :data:`PARTNER_DIR` to handle slugs whose on-disk directory name
+    differs (``si`` → ``smithsonian``).
     """
-    return Path(partner) / SIDECAR_FILENAME
+    return partner_dir_path(partner) / SIDECAR_FILENAME
 
 
 def read_sidecar(partner: str) -> list[str]:

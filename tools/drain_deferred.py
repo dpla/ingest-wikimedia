@@ -94,9 +94,10 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
     sidecar for the next loop iteration, which is the intended
     behaviour.
     """
+    partner_base = drain_sidecar.partner_dir_path(partner)
     with tempfile.NamedTemporaryFile(
         "w",
-        dir=partner,
+        dir=partner_base,
         prefix=".drain-ids-",
         suffix=".csv",
         delete=False,
@@ -112,7 +113,7 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
         )
         result = subprocess.run(
             ["uploader", os.path.basename(csv_path), partner],
-            cwd=partner,
+            cwd=partner_base,
             check=False,
         )
         if result.returncode != 0:
@@ -135,7 +136,7 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
                 "--ids-file",
                 os.path.basename(csv_path),
             ],
-            cwd=partner,
+            cwd=partner_base,
             check=False,
         )
         if result.returncode != 0:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
 
@@ -11,11 +10,13 @@ from ingest_wikimedia import drain_sidecar
 
 
 @pytest.fixture(autouse=True)
-def chdir_tmp(tmp_path, monkeypatch):
-    """Every test runs in an isolated tmp directory so the sidecar
-    path (``<partner>/deferred-drain.json``) doesn't collide with any
-    real partner tree or between tests."""
-    monkeypatch.chdir(tmp_path)
+def override_root(tmp_path, monkeypatch):
+    """Every test runs against an isolated tmp root so the (absolute)
+    sidecar path doesn't collide with any real partner tree or between
+    tests. Anchoring at ``INGEST_WIKI_ROOT`` (not CWD) is what the
+    production code does — see the module docstring on ``drain_sidecar``.
+    """
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path)
     return tmp_path
 
 
@@ -176,10 +177,33 @@ def test_sidecar_path_is_partner_scoped():
     assert p.parent.name == "nara"
 
 
+def test_sidecar_path_is_absolute_and_ignores_cwd(tmp_path, monkeypatch):
+    """Path is anchored at ``INGEST_WIKI_ROOT``, independent of CWD."""
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path)
+    partner_dir = tmp_path / "nara"
+    partner_dir.mkdir()
+    monkeypatch.chdir(partner_dir)  # simulate the uploader's CWD
+    p = drain_sidecar.sidecar_path("nara")
+    assert p.is_absolute()
+    assert p == tmp_path / "nara" / "deferred-drain.json"
+    assert p != partner_dir / "nara" / "deferred-drain.json"
+
+
+def test_sidecar_path_uses_partner_dir_mapping_for_smithsonian(monkeypatch, tmp_path):
+    """The ``si`` slug maps to the ``smithsonian/`` directory on disk
+    (see :data:`ingest_wikimedia.partners.PARTNER_DIR`). Sidecar_path
+    must honor that so the drain finds the file at the same location
+    the launcher's ``cd`` targets."""
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path)
+    p = drain_sidecar.sidecar_path("si")
+    assert p == tmp_path / "smithsonian" / "deferred-drain.json"
+
+
 def test_write_creates_partner_directory_if_missing():
     """A drain phase that starts before any partner-dir files exist
     still gets a working sidecar."""
-    assert not os.path.isdir("nara")
+    partner_dir = drain_sidecar.sidecar_path("nara").parent
+    assert not partner_dir.exists()
     drain_sidecar.write_sidecar("nara", ["abc"])
-    assert os.path.isdir("nara")
+    assert partner_dir.is_dir()
     assert drain_sidecar.read_sidecar("nara") == ["abc"]

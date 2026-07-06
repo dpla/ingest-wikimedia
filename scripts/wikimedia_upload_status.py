@@ -10,7 +10,7 @@ import os
 import re
 import shlex
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
 import boto3
 import requests
@@ -21,6 +21,7 @@ from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve
 from ingest_wikimedia.session_state import (
     find_active_label,
     log_filename_pattern_for_label,
+    snapshot_running_active_labels,
 )
 from ingest_wikimedia.ssm import REGION, fetch_memory_snapshot, ssm_run
 from ingest_wikimedia.worker_slots import (
@@ -857,6 +858,11 @@ def main() -> None:
     results: dict[str, tuple[str, str]] = {}
 
     session_created_by_name = dict(sessions_with_created)
+    # ``fetch`` waits on this future for the subprocess-based active-
+    # label signal (see :func:`snapshot_running_active_labels`). Assigned
+    # inside the executor block below; declared here so the closure
+    # captures the name and can be mutated at runtime.
+    active_labels_future: Future[dict[str, str]] | None = None
 
     def fetch(session: str) -> tuple[str, str]:
         suffix = session.removeprefix("wikimedia-")
@@ -920,15 +926,23 @@ def main() -> None:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
 
-        # See find_active_label's docstring. ``session_created`` bounds
-        # the log-mtime lookup so a concurrent session writing to one of
-        # this session's completed labels can't steal the active-row
-        # identity (see PR bug 1).
+        # Prefer the subprocess-based active-label snapshot; fall back
+        # to the log-mtime lookup only when no running child was found
+        # (id-generation cold start, between steps, or chain finished).
         try:
-            active = find_active_label(ssm, labels, session_created=session_created)
+            snapshot = active_labels_future.result() if active_labels_future else {}
         except Exception:
-            logging.exception("Failed to find active label for %s", session)
-            return labels[0], "Unknown (error)"
+            logging.exception("Snapshot future failed for %s", session)
+            snapshot = {}
+        subprocess_label = snapshot.get(session)
+        if subprocess_label is not None:
+            active: tuple[str, int] | None = (subprocess_label, 0)
+        else:
+            try:
+                active = find_active_label(ssm, labels, session_created=session_created)
+            except Exception:
+                logging.exception("Failed to find active label for %s", session)
+                return labels[0], "Unknown (error)"
 
         # For multi-label batches, suffix a `[<pos>/<total>]` position
         # annotation so the reader can tell at a glance how far along
@@ -953,18 +967,15 @@ def main() -> None:
             return _with_batch_suffix(labels[0]), "Generating IDs"
 
         label, _ = active
-        # ``find_active_label`` may return a synthetic ``drain-<hub>``
-        # label when the session is in its terminal partner-level drain
-        # phase. Its log file (``…-drain-<hub>-drain-deferred.log``) is
-        # NOT indexed by any per-target label, so the reporter would
-        # previously miss it and misreport the session as ``SDC complete``
-        # (PR bug 2). For those, the ``hub`` is the suffix after
-        # ``drain-`` (not ``label.split("+")[0]``, which would return
-        # the whole ``drain-<hub>`` string), and no batch suffix is
-        # meaningful since the drain is a partner-level post-chain step.
+        # Terminal partner-level drain: attribute the row to the batch's
+        # identity + a ``(drain: <hub>)`` annotation rather than
+        # displaying the raw ``drain-<hub>`` label as a standalone row.
         if label.startswith("drain-"):
             hub = label[len("drain-") :]
-            display_label = label
+            if multi:
+                display_label = f"{labels[0]} +{len(labels) - 1} more (drain: {hub})"
+            else:
+                display_label = f"{labels[0]} (drain: {hub})"
         else:
             hub = label.split("+")[0]
             display_label = _with_batch_suffix(label)
@@ -977,8 +988,13 @@ def main() -> None:
 
     # Memory snapshot is independent of every per-session fetch — submit it
     # to the same executor so the SSM round-trip overlaps with the session
-    # phase resolution rather than serializing after it.
-    with ThreadPoolExecutor(max_workers=min(len(sessions) + 2, 8)) as executor:
+    # phase resolution rather than serializing after it. Same treatment
+    # for the active-label snapshot: submitted first so it can overlap
+    # with memory/slots/per-session lookups; each ``fetch`` blocks on
+    # its result only if the snapshot hasn't landed by the time the
+    # thread needs it.
+    with ThreadPoolExecutor(max_workers=min(len(sessions) + 3, 8)) as executor:
+        active_labels_future = executor.submit(snapshot_running_active_labels, ssm)
         memory_future = executor.submit(fetch_memory_snapshot, ssm)
         slots_future = executor.submit(_fetch_slot_snapshot, ssm)
         futures = {executor.submit(fetch, s): s for s in sessions}
