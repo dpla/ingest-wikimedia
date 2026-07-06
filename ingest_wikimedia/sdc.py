@@ -1239,13 +1239,16 @@ CASEFOLD_COMPARE_KEYS: frozenset[str] = frozenset(
 # word text into a context where it doesn't mean anything (the SDC
 # value ends up literally containing "{{!}}", and the comparator against
 # DPLA's canonical "|" fails).
-_WIKITEXT_MAGIC_WORD_UNESCAPES: tuple[tuple[str, str], ...] = (
-    ("{{!}}", "|"),
-    ("{{=}}", "="),
-    ("{{((}}", "{{"),
-    ("{{))}}", "}}"),
-    ("{{!(}}", "|["),
-    ("{{)!}}", "]|"),
+_WIKITEXT_MAGIC_WORD_TABLE: dict[str, str] = {
+    "{{!}}": "|",
+    "{{=}}": "=",
+    "{{((}}": "{{",
+    "{{))}}": "}}",
+    "{{!(}}": "|[",
+    "{{)!}}": "]|",
+}
+_WIKITEXT_MAGIC_WORD_RE = re.compile(
+    "|".join(re.escape(k) for k in _WIKITEXT_MAGIC_WORD_TABLE)
 )
 
 
@@ -1257,12 +1260,19 @@ def unescape_wikitext_magic_words(s: str) -> str:
     required inside template parameters) to any other context (SDC
     storage, comparator keys, log messages) where the magic-word form
     is meaningless literal text.
+
+    Single-pass — regex substitution walks the original string once,
+    so the output of one un-escape can't be rescanned as input to
+    another. Sequential ``str.replace()`` would over-un-escape
+    ``{{((}}))}}`` (the community idiom for a literal ``{{}}``) all
+    the way to ``}}`` because ``{{((}}`` → ``{{`` leaves ``{{))}}``
+    on the tape, which the next pass would then match.
     """
     if not isinstance(s, str) or not s:
         return s
-    for magic, literal in _WIKITEXT_MAGIC_WORD_UNESCAPES:
-        s = s.replace(magic, literal)
-    return s
+    return _WIKITEXT_MAGIC_WORD_RE.sub(
+        lambda m: _WIKITEXT_MAGIC_WORD_TABLE[m.group(0)], s
+    )
 
 
 def casefold_for_compare(s: str) -> str:

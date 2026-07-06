@@ -671,6 +671,25 @@ def test_unescape_wikitext_magic_words_covers_documented_forms():
     assert unescape_wikitext_magic_words("{{!(}}x{{)!}}") == "|[x]|"
 
 
+def test_unescape_wikitext_magic_words_is_single_pass():
+    """``{{((}}))}}`` is the community idiom for a literal ``{{}}``:
+    the ``{{((}}`` token expands to ``{{`` and the trailing ``))}}``
+    stays literal because it's not a magic-word token on its own —
+    ``{{))}}`` (with the leading ``{{``) is, but the tail alone is
+    not. A sequential-replace implementation would first swap
+    ``{{((}}`` for ``{{`` and then rescan its own output, matching a
+    spurious ``{{))}}`` and collapsing the whole thing to ``}}``.
+    Single-pass regex substitution matches each source token exactly
+    once against the original string.
+    """
+    from ingest_wikimedia.sdc import unescape_wikitext_magic_words
+
+    assert unescape_wikitext_magic_words("{{((}}))}}") == "{{))}}"
+    # Adjacent magic words unescape independently — sequential replace
+    # would still get this right, but the case pins the intent.
+    assert unescape_wikitext_magic_words("{{!}}{{!}}") == "||"
+
+
 # ---------------------------------------------------------------------------
 # dates_semantically_equal — semantic date equivalence for
 # ``{{DPLA metadata}}`` ``date =`` overrides that reformat DPLA's own
