@@ -1566,20 +1566,25 @@ def test_main_uses_subprocess_snapshot_over_mtime_for_active_label():
 
 
 def test_main_drain_hub_row_attributes_to_parent_chain():
-    """When a chained session is in its terminal partner-level drain
-    phase (subprocess signal reports
-    ``WIKIMEDIA_SESSION_LABEL=drain-<hub>``), the row must be
-    attributed to the parent multi-target session — ``<first-target>
-    +N more (drain: <hub>)`` — not displayed as a standalone
-    ``drain-<hub>`` identity, which reads as a whole new session to
-    operators.
-    """
+    """Terminal drain phase renders as one row for the whole batch:
+    label is the batch identity (no drain-<hub> annotation), and
+    ``queue_hubs`` names every canonical partner so the phase reader
+    can sum sidecars across the batch rather than showing only the
+    currently-active partner's slice."""
     from unittest.mock import patch
 
     from scripts.wikimedia_upload_status import main
 
     sessions_out = "wikimedia-ohio+ohio-uni-and-3-more|1700000000\n"
     captured, fake_post = _capture_slack_post()
+    captured_calls: list[dict] = []
+
+    def fake_phase(client, session, hub, label, **kw):
+        captured_calls.append({"hub": hub, "label": label, **kw})
+        return (
+            "Draining (13 queued, Category:Duplicate at 1,004, needs < 900)",
+            1700009999,
+        )
 
     with (
         patch.dict(
@@ -1614,10 +1619,7 @@ def test_main_drain_hub_row_attributes_to_parent_chain():
         ),
         patch(
             "scripts.wikimedia_upload_status.get_phase_and_progress",
-            return_value=(
-                "Draining (drain: 0 queued, Category:Duplicate at 1,004, needs < 900)",
-                1700009999,
-            ),
+            side_effect=fake_phase,
         ),
         patch(
             "scripts.wikimedia_upload_status.requests.post",
@@ -1629,15 +1631,69 @@ def test_main_drain_hub_row_attributes_to_parent_chain():
     payload = captured["payload"]
     section_blocks = [b for b in payload["blocks"] if b.get("type") == "section"]
     text = section_blocks[0]["text"]["text"]
-    # Row identifies the parent chain (first target + count of remaining
-    # targets) with a `(drain: ohio)` phase annotation, NOT the raw
-    # synthetic `drain-ohio` label as a standalone session identity.
-    assert "ohio+ohio-university-libraries +3 more (drain: ohio)" in text
-    assert "drain: 0 queued" in text
-    # And critically, the raw `drain-ohio` string is not the row's
-    # identity (the phase annotation still contains "drain: ohio" but
-    # not as the label — the assertion above pins that).
+    assert "ohio+ohio-university-libraries +3 more" in text
+    assert "(drain: ohio)" not in text
     assert "`drain-ohio`" not in text
+    assert len(captured_calls) == 1
+    assert set(captured_calls[0]["queue_hubs"]) == {
+        "ohio",
+        "northwest-heritage",
+        "minnesota",
+        "bpl",
+    }
+
+
+def test_main_non_drain_row_passes_no_queue_hubs():
+    """Non-drain per-target rows pass ``queue_hubs=None`` so
+    ``_drain_deferred_phase`` (if reached) sums only the row's own
+    partner's sidecar — the batch-total behavior is scoped to the
+    terminal drain phase."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import main
+
+    captured_calls: list[dict] = []
+
+    def fake_phase(client, session, hub, label, **kw):
+        captured_calls.append({"hub": hub, "label": label, **kw})
+        return ("Uploading (10 / 100, ~10%)", 1700000000)
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"DPLA_SLACK_BOT_TOKEN": "tok", "NOTIFY_IF_IDLE": "false"},
+        ),
+        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
+        patch(
+            "scripts.wikimedia_upload_status.ssm_run",
+            return_value="wikimedia-bpl+phillips-academy|1700000000\n",
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.snapshot_running_active_labels",
+            return_value={"wikimedia-bpl+phillips-academy": "bpl+phillips-academy"},
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.get_phase_and_progress",
+            side_effect=fake_phase,
+        ),
+        patch(
+            "scripts.wikimedia_upload_status.requests.post",
+            side_effect=_capture_slack_post()[1],
+        ),
+    ):
+        main()
+
+    assert captured_calls == [
+        {"hub": "bpl", "label": "bpl+phillips-academy", "queue_hubs": None}
+    ]
 
 
 def test_main_rows_use_display_id_from_fetch_not_session_name():
@@ -1736,7 +1792,7 @@ def test_main_appends_slot_suffixes_when_pool_is_saturated():
     # SDC-syncing with 4 workers currently holding slots (2 waiting).
     # state-library-of-ohio is an uploader that holds zero slots
     # (saturation blocked it before it could grab one).
-    def fake_get_phase_and_progress(client, session, hub, label):
+    def fake_get_phase_and_progress(client, session, hub, label, **_kw):
         if label == "nara+jimmy-carter-library":
             return ("SDC syncing (1,359 / 11,011 files, ~12.3%)", 1700000000)
         if label == "ohio+state-library-of-ohio":
