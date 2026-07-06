@@ -5176,6 +5176,125 @@ def test_inferred_dupe_cleanup_skips_property_with_no_dpla_claim():
 
 
 # ---------------------------------------------------------------------------
+# _reconcile_inferred_from_wikitext_junk — sweeps out inferred-from-Wikitext
+# claims whose stored display text is a 1-2-character punctuation-only
+# wikitext-extraction artifact (a stray ``;`` in a date, ``--`` in a title).
+# Only touches the migration's own imports (P887 → Q131783016 reference);
+# third-party community claims are never removed.
+# ---------------------------------------------------------------------------
+
+
+def _string_stmt(stmt_id, prop, value, references=None):
+    """Build a value-typed string-datavalue statement — the shape used
+    for description (P10358), page counts, and other free-text
+    claims. ``_stmt`` above defaults to wikibase-entityid; this helper
+    fills the string-typed gap for the junk-cleanup tests."""
+    return {
+        "id": stmt_id,
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": prop,
+            "datavalue": {"type": "string", "value": value},
+        },
+        "references": references or [],
+    }
+
+
+def test_inferred_junk_cleanup_removes_p571_somevalue_with_punctuation_p1932():
+    """Toledo Symphony repro — a legacy ``| date = ;`` extracted to a
+    P571 somevalue+P1932=";" inferred claim. The stated-as qualifier
+    is punctuation only; the pass drops the whole statement."""
+    from tools import sdc_sync
+
+    junk_claim = _p571_somevalue_with_p1932(
+        "M640$JUNK",
+        ";",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {"pageid": 640, "statements": {"P571": [junk_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_junk("M640")
+    assert sdc_sync.removals == ["M640$JUNK"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_junk_cleanup_removes_string_mainsnak_junk():
+    """A string-typed inferred claim whose stored value is ``--`` (or
+    any 1-2-char punctuation-only run) is a wikitext extraction
+    artifact; drop it."""
+    from tools import sdc_sync
+
+    junk = _string_stmt(
+        "M111$JUNK",
+        "P10358",
+        "--",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 111, "statements": {"P10358": [junk]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_junk("M111")
+    assert sdc_sync.removals == ["M111$JUNK"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_junk_cleanup_preserves_real_content():
+    """Non-junk inferred claims (real dates, real strings) are never
+    touched — this pass only removes markup-error shapes."""
+    from tools import sdc_sync
+
+    real = _p571_somevalue_with_p1932(
+        "M111$REAL",
+        "1937",
+        references=[_inferred_from_wikitext_reference()],
+        p459=False,
+    )
+    entity = {"pageid": 111, "statements": {"P571": [real]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_junk("M111")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_junk_cleanup_skips_non_inferred_claims():
+    """DPLA-authored claims and third-party community claims (no
+    P887→Q131783016 reference) are never removed even when their
+    value shape is coincidentally junk-like. This pass strictly
+    unwrites the legacy migrator's imports."""
+    from tools import sdc_sync
+
+    dpla_junk = _p571_somevalue_with_p1932(
+        "M111$DPLA",
+        ";",  # coincidentally junk-shaped — untouchable regardless
+        references=[_dpla_reference()],
+    )
+    third_party = _string_stmt(
+        "M111$3P",
+        "P10358",
+        "--",
+        references=[],
+    )
+    entity = {
+        "pageid": 111,
+        "statements": {"P571": [dpla_junk], "P10358": [third_party]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_junk("M111")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+# ---------------------------------------------------------------------------
 # _find_existing_commons_files_by_dpla_id — Commons-side discovery primitive
 # that decouples SDC eligibility from the upload phase's per-ordinal status.
 # Lets a file already on Commons get its SDC re-synced when the current

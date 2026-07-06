@@ -1226,6 +1226,28 @@ CASEFOLD_COMPARE_KEYS: frozenset[str] = frozenset(
 )
 
 
+def is_wikitext_junk_value(value: str) -> bool:
+    """True when ``value`` looks like a wikitext-extraction artifact —
+    1–2 characters after strip, all punctuation/whitespace (no
+    alphanumerics). Almost always a markup / regex / human error in
+    the source template rather than a genuine metadata contribution
+    worth preserving.
+
+    Motivating cases: ``| date = ;`` (stray semicolon left over from
+    a template rewrite), ``| title = --``, ``| creator = .``. Values
+    of 3+ characters, or values containing a letter or digit, are
+    treated as potentially legitimate — a single-character title
+    like ``A`` (film) or a date like ``1`` (unlikely but syntactically
+    parseable) is not filtered here.
+    """
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not (1 <= len(stripped) <= 2):
+        return False
+    return not any(c.isalnum() for c in stripped)
+
+
 # MediaWiki character-escape magic words. When a literal ``|`` or ``=``
 # would confuse the template parser (`|` separates params, `=`
 # separates key from value), community editors escape it with the

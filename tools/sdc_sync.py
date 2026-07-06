@@ -20,6 +20,7 @@ from ingest_wikimedia.sdc import (
     NARA_PROVIDER_NAME,
     casefold_for_compare,
     ingest_date_from_doc,
+    is_wikitext_junk_value,
     parse_date_range,
     parse_dpla_date,
     parse_nara_access_level,
@@ -2989,6 +2990,7 @@ def dpla_claims(
         mediaid, dpla_id, expected, protected_props=CHUNKABLE_PROPS
     )
     _reconcile_inferred_from_wikitext_dupes(mediaid)
+    _reconcile_inferred_from_wikitext_junk(mediaid)
 
 
 def _build_expected_from_parsed(
@@ -3474,6 +3476,75 @@ def _reconcile_inferred_from_wikitext_dupes(mediaid):
         for stmt in inferred_stmts:
             comp = _statement_comparable_value(stmt)
             if comp is not None and comp in dpla_comparables:
+                removals.append(stmt["id"])
+
+
+def _inferred_stored_text(stmt) -> str | None:
+    """Return the raw display text stored on an inferred-from-Wikitext
+    claim, or ``None`` when the statement carries no plain-text
+    display value.
+
+    ``value`` mainsnaks of type ``string`` return the string directly.
+    ``monolingualtext`` returns the inner ``text`` field. ``somevalue``
+    claims (the shape the migrator falls back to when
+    :func:`parse_dpla_date` rejects the input) return the raw
+    ``P1932`` stated-as qualifier — that's where a junk date like
+    ``;`` actually lives, since the mainsnak has no string of its
+    own.
+
+    Non-text mainsnaks (structured time, wikibase-entityid, quantity)
+    return ``None`` — the junk sweep skips them; if a time-typed
+    claim parsed successfully, the underlying value can't be markup
+    junk by construction.
+    """
+    ms = stmt.get("mainsnak") or {}
+    if ms.get("snaktype") == "value":
+        dv = ms.get("datavalue") or {}
+        dtype = dv.get("type")
+        v = dv.get("value")
+        if dtype == "string" and isinstance(v, str):
+            return v
+        if dtype == "monolingualtext" and isinstance(v, dict):
+            text = v.get("text")
+            return text if isinstance(text, str) else None
+        return None
+    if ms.get("snaktype") == "somevalue":
+        for q in (stmt.get("qualifiers") or {}).get("P1932", []):
+            qv = q.get("datavalue") or {}
+            if qv.get("type") == "string":
+                s = qv.get("value")
+                if isinstance(s, str):
+                    return s
+    return None
+
+
+def _reconcile_inferred_from_wikitext_junk(mediaid):
+    """Remove inferred-from-Wikitext claims whose stored display text
+    is a wikitext-extraction artifact — a stray ``;`` in a date field,
+    ``--`` in a title, and other 1-2-character punctuation-only values
+    that :func:`ingest_wikimedia.sdc.is_wikitext_junk_value` flags.
+    These are markup / regex / human errors in the source template,
+    never real metadata worth preserving as SDC.
+
+    Pushes statement IDs onto the module-level ``removals`` accumulator
+    so the per-file dispatcher flushes them alongside DPLA-drift and
+    dupe removals in one wbeditentity.
+
+    Safety: only touches claims carrying the ``P887 → Q131783016``
+    (inferred-from-Wikitext) reference fingerprint — the migration's
+    own imports. Third-party community claims are never removed even
+    when they happen to be punctuation-only; this pass strictly
+    unwrites the legacy migrator's mistakes.
+    """
+    entity = get_entity(mediaid)
+    statements = entity.get("statements") or {}
+    for stmts in statements.values():
+        for stmt in stmts:
+            refs = stmt.get("references") or []
+            if not any(_is_inferred_from_wikitext_reference(ref) for ref in refs):
+                continue
+            text = _inferred_stored_text(stmt)
+            if text is not None and is_wikitext_junk_value(text):
                 removals.append(stmt["id"])
 
 

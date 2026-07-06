@@ -110,6 +110,39 @@ def test_parse_artwork_params_drops_empty_values():
     assert params == {"title": "A"}
 
 
+def test_parse_artwork_params_drops_wikitext_junk_values():
+    """A 1-2-character punctuation-only value (``| date = ;``,
+    ``| title = --``) is a wikitext-extraction artifact — parser or
+    editor error, not real metadata. Extraction drops it the same way
+    it drops empty values, so the migrator doesn't preserve markup
+    junk as an SDC statement.
+
+    Motivating example: File:A_Toledo_Symphony_Orchestra_---_why%3F_
+    -_DPLA_-_640c3941bd35b12a39cb3820e9f778b2_(page_6).jpg — legacy
+    template carried ``| date = ;`` and the 2026-06-25 migrator
+    dutifully wrote a P571 = somevalue statement with the ``;`` as
+    its P1932 stated-as qualifier.
+    """
+    wikitext = (
+        "{{Artwork\n"
+        "| title = --\n"
+        "| description = A real description here\n"
+        "| date = ; \n"
+        "| creator = .\n"
+        "}}"
+    )
+    params = parse_artwork_params(wikitext)
+    assert params == {"description": "A real description here"}
+
+
+def test_parse_artwork_params_keeps_single_alnum_values():
+    """A single-letter title (film title ``A``) or single-digit value
+    passes through — the junk filter targets only punctuation-only
+    shorts."""
+    wikitext = "{{Artwork|title=A|date=1}}"
+    assert parse_artwork_params(wikitext) == {"title": "A", "date": "1"}
+
+
 def test_parse_artwork_params_unescapes_magic_words_in_values():
     """A community AWB pass sometimes rewrites literal ``|`` inside a
     template param to the ``{{!}}`` magic word (parser expands it back

@@ -40,6 +40,7 @@ from ingest_wikimedia.sdc import (
     CASEFOLD_COMPARE_KEYS,
     casefold_for_compare,
     dates_semantically_equal,
+    is_wikitext_junk_value,
     parse_date_range,
     parse_dpla_date,
     unescape_wikitext_magic_words,
@@ -211,12 +212,18 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
         if canonical is None:
             continue
         value = unescape_wikitext_magic_words(str(param.value).strip())
-        if value:
-            # On duplicate canonical keys (e.g. both ``author`` and
-            # ``creator`` set), the *last* wins — matches the renderer
-            # behavior under MediaWiki, where the later assignment
-            # overrides the earlier.
-            parsed[canonical] = value
+        if not value or is_wikitext_junk_value(value):
+            # Empty values and wikitext-extraction junk (a stray ``;`` in
+            # a date field, ``--`` in a title, etc. — see
+            # :func:`is_wikitext_junk_value`) aren't useful provenance
+            # to import. Skip them same as we skip missing params so
+            # the migrator doesn't preserve markup errors as SDC.
+            continue
+        # On duplicate canonical keys (e.g. both ``author`` and
+        # ``creator`` set), the *last* wins — matches the renderer
+        # behavior under MediaWiki, where the later assignment
+        # overrides the earlier.
+        parsed[canonical] = value
     return parsed
 
 

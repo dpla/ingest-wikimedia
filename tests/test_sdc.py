@@ -659,6 +659,44 @@ def test_unescape_wikitext_magic_words_leaves_regular_text_alone():
     assert unescape_wikitext_magic_words(None) is None  # type: ignore[arg-type]
 
 
+def test_is_wikitext_junk_value_flags_short_punctuation_only():
+    """1-2 characters that are all punctuation/whitespace read as a
+    wikitext-extraction artifact rather than metadata worth keeping."""
+    from ingest_wikimedia.sdc import is_wikitext_junk_value
+
+    assert is_wikitext_junk_value(";")
+    assert is_wikitext_junk_value(" ; ")
+    assert is_wikitext_junk_value("--")
+    assert is_wikitext_junk_value(".")
+    assert is_wikitext_junk_value(",,")
+    assert is_wikitext_junk_value("()")
+
+
+def test_is_wikitext_junk_value_lets_content_through():
+    """Anything with a letter or digit — or 3+ characters — is
+    considered potentially-legitimate and passes through unfiltered."""
+    from ingest_wikimedia.sdc import is_wikitext_junk_value
+
+    # Single letters / digits are legitimate values (title "A", etc.).
+    assert not is_wikitext_junk_value("A")
+    assert not is_wikitext_junk_value("1")
+    assert not is_wikitext_junk_value("1.")
+    # 3+ punctuation is likely a stylistic choice / ellipsis proxy —
+    # not caught by this narrow filter.
+    assert not is_wikitext_junk_value("---")
+    assert not is_wikitext_junk_value("...")
+    assert not is_wikitext_junk_value("1937")
+    assert not is_wikitext_junk_value("A Title")
+
+
+def test_is_wikitext_junk_value_handles_falsy_input():
+    from ingest_wikimedia.sdc import is_wikitext_junk_value
+
+    assert not is_wikitext_junk_value("")
+    assert not is_wikitext_junk_value("   ")
+    assert not is_wikitext_junk_value(None)  # type: ignore[arg-type]
+
+
 def test_unescape_wikitext_magic_words_covers_documented_forms():
     """All the character-escape magic words documented on
     https://www.mediawiki.org/wiki/Help:Magic_words expand to the
