@@ -1841,19 +1841,23 @@ def test_plan_migration_still_imports_substantively_different_title():
 
 
 def test_plan_migration_skips_description_that_is_multi_value_subset_of_canonical():
-    """A multi-valued DPLA description field renders in wikitext as a
-    single ``; ``-joined string. If DPLA later added a value that
-    wasn't in the wikitext concatenation at upload time, byte- and
-    casefold-comparison fail but the wikitext content is still every
-    bit DPLA-originated. Subset check must recognise the wikitext
-    list as a subset of DPLA canonical and NOT flag it as
-    community-contributed.
+    """A community editor reduces a multi-valued DPLA description
+    (removes one entry) — the remaining values are all still DPLA-
+    authored, so the wikitext content is a subset of DPLA canonical
+    and no ``inferred-from-Wikitext`` import should fire. Subset
+    check widens equivalence to catch this case; without it, the
+    community edit gets preserved forever as a spurious P10358.
 
     Regression: File:%22Principles_of_Causality%22_essay_by_Sarah_..._-_DPLA_-_b3f489f90ebb903b961500c0cf71edfc
     — DPLA has 6 description values, wikitext concatenation had 5;
     the pre-fix migration wrote an inferred-from-Wikitext P10358
     with the 5-value concatenation preserved as a bogus community
     contribution.
+
+    Test forces the community classification with a real editor
+    revision (removing one value) — without a non-bot revision the
+    provenance walker attributes the value to DPLA_bot and skips the
+    equivalence check entirely.
     """
     canonical_description = "; ".join(
         [
@@ -1862,10 +1866,12 @@ def test_plan_migration_skips_description_that_is_multi_value_subset_of_canonica
             "Sallie M. Field",
             "Phillips Academy Archives received the collection.",
             "From The Trustees of Phillips Academy.",
-            "This date is inferred.",  # 6th value not in wikitext
+            "This date is inferred.",
         ]
     )
-    wikitext_description = "; ".join(
+    # Rev 1 matches full DPLA (6 values). Editor removed one value.
+    initial_wikitext_description = canonical_description
+    edited_wikitext_description = "; ".join(
         [
             "Eight page essay with markings made by teacher in pencil.",
             "Date supplied by cataloger.",
@@ -1875,7 +1881,16 @@ def test_plan_migration_skips_description_that_is_multi_value_subset_of_canonica
         ]
     )
     revs = _make_revs(
-        (1, "DPLA_bot", f"{{{{Artwork|description={wikitext_description}}}}}"),
+        (
+            1,
+            "DPLA_bot",
+            f"{{{{Artwork|description={initial_wikitext_description}}}}}",
+        ),
+        (
+            2,
+            "Editor1",
+            f"{{{{Artwork|description={edited_wikitext_description}}}}}",
+        ),
     )
     plan = plan_migration(
         "File:Foo.jpg",
@@ -1883,9 +1898,55 @@ def test_plan_migration_skips_description_that_is_multi_value_subset_of_canonica
         _canonical_params(description=canonical_description),
     )
     assert plan is not None
+    # Editor last touched description → classified community → equivalence
+    # check runs. Subset check widens to say the 5-value wikitext ⊆
+    # 6-value canonical, so no community_import.
     assert plan.community_imports == {}, (
-        f"description whose values are all in DPLA canonical should not "
-        f"be a community import; got community_imports={plan.community_imports}"
+        f"community edit whose values are all in DPLA canonical should "
+        f"not be an import; got community_imports={plan.community_imports}"
+    )
+
+
+def test_plan_migration_subset_handles_single_value_wikitext_vs_multi_canonical():
+    """N=1 boundary of the subset check: wikitext has a single value
+    (no ``; `` delimiter) but canonical is multi-value. Still a
+    subset — the wikitext value appears in the canonical set — and
+    must not classify as community. Pre-fix, the guard required the
+    delimiter on both sides, short-circuiting this case to False and
+    forcing an inferred-from-Wikitext import for what is really a
+    single-value-at-upload-then-DPLA-expanded record."""
+    canonical_description = "; ".join(["only value", "later addition"])
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|description=only value}}"),
+        (2, "Editor1", "{{Artwork|description=only value}}"),
+    )
+    # Rev 2 didn't change description content, so provenance walker
+    # keeps attribution with DPLA_bot; force a change by having Rev 2
+    # touch a different field. Description then stays classified as
+    # dpla, and this test verifies the subset check doesn't over-fire
+    # (i.e., single-value wikitext isn't the community path). To
+    # actually exercise the subset check on N=1, we need a real
+    # community reduction to N=1:
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            "{{Artwork|description=only value; later addition}}",
+        ),
+        (2, "Editor1", "{{Artwork|description=only value}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(description=canonical_description),
+    )
+    assert plan is not None
+    # Wikitext value = "only value" (no delim). Canonical = "only value;
+    # later addition". Subset check: {"only value"} ⊆ {"only value",
+    # "later addition"} → True → not community_import.
+    assert plan.community_imports == {}, (
+        f"single-value wikitext that's a subset of multi-value canonical "
+        f"should not be an import; got community_imports={plan.community_imports}"
     )
 
 

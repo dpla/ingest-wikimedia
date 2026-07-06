@@ -481,7 +481,12 @@ def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
     added values since. The migrated ``{{DPLA metadata}}`` template
     will render the current (superset) canonical from SDC anyway.
     """
-    if _MULTI_VALUE_DELIMITER not in value or _MULTI_VALUE_DELIMITER not in canonical:
+    # Only ``canonical`` needs the delimiter — a single-value wikitext
+    # (``| description = A``) can still be a subset of a multi-value
+    # canonical (``A; B; C``) when DPLA expanded the field after
+    # upload. Gating on both sides would reproduce the exact
+    # false-positive this helper exists to catch, just for N=1.
+    if _MULTI_VALUE_DELIMITER not in canonical:
         return False
     value_parts = {
         folded
