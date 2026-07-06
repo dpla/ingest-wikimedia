@@ -1040,3 +1040,48 @@ def test_active_and_upcoming_labels_active_at_position_zero_returns_all():
     ):
         result = launch_mod.active_and_upcoming_labels(object(), labels)
     assert result == set(labels)
+
+
+def test_active_and_upcoming_labels_empty_set_when_session_in_terminal_drain():
+    """Regression: when ``find_active_label`` returns a synthetic
+    ``drain-<hub>`` label, the session has completed ALL its
+    per-target chain work and moved on to the box-wide terminal drain
+    phase. No per-target label is a conflict candidate — a new
+    request for any of them must be allowed. Return an empty set to
+    signal "no conflicts from this session"."""
+    import scripts.wikimedia_launch as launch_mod
+
+    labels = [
+        "ohio+ohio-university-libraries",
+        "northwest-heritage+whitman-county-library",
+        "bpl+phillips-academy",
+    ]
+    with patch(
+        "ingest_wikimedia.session_state.find_active_label",
+        return_value=("drain-ohio", 1700000000),
+    ):
+        result = launch_mod.active_and_upcoming_labels(object(), labels)
+    assert result == set()
+
+
+def test_active_and_upcoming_labels_threads_session_created():
+    """``session_created`` must be forwarded to ``find_active_label`` so
+    the log-mtime bound is applied. Without threading, ``find_active_label``
+    would fall back to the unbounded lookup and re-open the "one
+    concurrent session steals another's active label" hole (PR bug 1)."""
+    from unittest.mock import Mock
+
+    import scripts.wikimedia_launch as launch_mod
+
+    labels = ["texas+lib-a", "texas+lib-b"]
+    mock_find = Mock(return_value=("texas+lib-a", 1700000000))
+    with patch("ingest_wikimedia.session_state.find_active_label", mock_find):
+        launch_mod.active_and_upcoming_labels(
+            object(), labels, session_created=1699000000
+        )
+
+    # find_active_label must have been called with session_created threaded through.
+    _args, kwargs = mock_find.call_args
+    assert kwargs.get("session_created") == 1699000000, (
+        f"session_created must be forwarded to find_active_label; got kwargs={kwargs!r}"
+    )

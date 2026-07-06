@@ -1138,6 +1138,104 @@ def test_find_active_label_picks_active_when_earlier_label_aborted():
     )
 
 
+def test_find_active_label_bounds_lookup_by_session_created():
+    """Regression: two concurrent sessions can each contain the same
+    label in their chain — e.g. a 54-target texas chain and a 3-target
+    fixup chain that overlap on ``texas+harrie-p-woodson-memorial-library``.
+    When the smaller chain writes to that label's log, the log's mtime
+    becomes the freshest across the big chain's label set too, and the
+    big chain gets misreported as "active on harrie" even though it
+    completed harrie hours ago and is really further down its own
+    chain.
+
+    Fix: pass the tmux session's creation epoch to ``find_active_label``
+    which appends ``-newermt "@N"`` to the ``find`` command, bounding
+    the lookup to files created after this session's tmux window
+    began. A completed-target log written by a concurrent session gets
+    filtered out.
+    """
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import find_active_label
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        return "1700005000.0 20260528-091047-bpl+phillips-academy-upload.log"
+
+    with patch("ingest_wikimedia.session_state.ssm_run", side_effect=fake_ssm_run):
+        find_active_label(
+            client=None,
+            labels=["bpl+phillips-academy"],
+            session_created=1700000000,
+        )
+
+    assert len(captured) == 1
+    assert "-newermt '@1700000000'" in captured[0], (
+        f"``find`` command must include a ``-newermt '@<epoch>'`` filter "
+        f"when session_created is set; got: {captured[0]!r}"
+    )
+
+
+def test_find_active_label_no_session_bound_when_created_is_zero():
+    """The ``-newermt`` filter must be OMITTED when ``session_created=0``
+    (default). This preserves backwards compatibility for callers that
+    don't yet thread the tmux session-creation epoch through — and
+    matches the semantics of "no bound".
+    """
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import find_active_label
+
+    captured: list[str] = []
+
+    def fake_ssm_run(_client, command, **_kwargs):
+        captured.append(command)
+        return "1700005000.0 20260528-091047-bpl+phillips-academy-upload.log"
+
+    with patch("ingest_wikimedia.session_state.ssm_run", side_effect=fake_ssm_run):
+        find_active_label(client=None, labels=["bpl+phillips-academy"])
+
+    assert len(captured) == 1
+    assert "-newermt" not in captured[0], (
+        f"``find`` command must NOT include ``-newermt`` when "
+        f"session_created is 0; got: {captured[0]!r}"
+    )
+
+
+def test_find_active_label_matches_drain_hub_log():
+    """Regression: a session in its terminal partner-level drain phase
+    writes ``…-drain-<hub>-drain-deferred.log``. That label is NOT in
+    the session's per-target label list, but the reporter needs to see
+    it — previously such a session showed ``SDC complete`` while the
+    tmux window was busy on the box-wide drain flock (PR bug 2).
+
+    ``find_active_label`` synthesizes ``drain-<hub>`` alternatives for
+    each unique hub in the input label set so the freshest drain log
+    surfaces correctly. On match the synthetic label is returned so
+    downstream callers can dispatch on it.
+    """
+    from unittest.mock import patch
+
+    from ingest_wikimedia.session_state import find_active_label
+
+    with patch(
+        "ingest_wikimedia.session_state.ssm_run",
+        return_value=("1700009000.0 20260705-092303-drain-ohio-drain-deferred.log"),
+    ):
+        result = find_active_label(
+            client=None,
+            labels=["ohio+ohio-university-libraries"],
+        )
+    assert result is not None
+    label, _ = result
+    assert label == "drain-ohio", (
+        f"drain-hub synthetic label must be returned when the freshest "
+        f"log is a drain-<hub> file; got {label!r}"
+    )
+
+
 def test_find_active_label_rejects_filename_not_in_label_list():
     """Defensive: if the ``find`` regex's alternation somehow returns a
     label that isn't in ``labels`` (regex prefix collision in a edge
@@ -1261,7 +1359,7 @@ def test_main_rows_use_display_id_from_fetch_not_session_name():
 
     from scripts.wikimedia_upload_status import main
 
-    sessions_out = "wikimedia-bpl+phillips-academy: 1 windows\n"
+    sessions_out = "wikimedia-bpl+phillips-academy|1700000000\n"
     captured, fake_post = _capture_slack_post()
 
     # Patch the helpers ``fetch`` calls so the real ``fetch`` returns
@@ -1330,9 +1428,13 @@ def test_main_appends_slot_suffixes_when_pool_is_saturated():
 
     from scripts.wikimedia_upload_status import SlotSnapshot, main
 
+    # ``tmux ls -F '#{session_name}|#{session_created}'`` output shape —
+    # matches what wikimedia_upload_status now issues so
+    # ``_parse_session_line`` extracts the creation epoch alongside the
+    # session name.
     sessions_out = (
-        "wikimedia-nara+jimmy-carter-library: 1 windows\n"
-        "wikimedia-ohio+state-library-of-ohio: 1 windows\n"
+        "wikimedia-nara+jimmy-carter-library|1700000000\n"
+        "wikimedia-ohio+state-library-of-ohio|1700000000\n"
     )
     captured, fake_post = _capture_slack_post()
 
@@ -1368,7 +1470,7 @@ def test_main_appends_slot_suffixes_when_pool_is_saturated():
         ),
         patch(
             "scripts.wikimedia_upload_status.find_active_label",
-            side_effect=lambda ssm, labels: (labels[0], 1700000000),
+            side_effect=lambda ssm, labels, **_kw: (labels[0], 1700000000),
         ),
         patch(
             "scripts.wikimedia_upload_status.get_phase_and_progress",
@@ -1776,7 +1878,7 @@ def test_fetch_position_annotation_for_multi_label_batch():
 
     from scripts.wikimedia_upload_status import main
 
-    sessions_out = "wikimedia-texas+a+texas+b+texas+c+texas+d: 1 windows\n"
+    sessions_out = "wikimedia-texas+a+texas+b+texas+c+texas+d|1700000000\n"
     captured, fake_post = _capture_slack_post()
     with (
         patch.dict(
@@ -1823,7 +1925,7 @@ def test_fetch_no_position_annotation_for_single_label_session():
 
     from scripts.wikimedia_upload_status import main
 
-    sessions_out = "wikimedia-bpl+phillips-academy: 1 windows\n"
+    sessions_out = "wikimedia-bpl+phillips-academy|1700000000\n"
     captured, fake_post = _capture_slack_post()
     with (
         patch.dict(

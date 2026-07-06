@@ -795,8 +795,15 @@ def main() -> None:
     notify_if_idle = os.environ.get("NOTIFY_IF_IDLE", "false").lower() == "true"
 
     try:
+        # ``-F`` returns structured ``name|epoch`` lines instead of the
+        # verbose default format. Pinning the fields we want avoids
+        # fragile string parsing of the "created Sun Jul 5 …" text and
+        # gives us the session-creation epoch we need to time-bound
+        # :func:`find_active_label`'s log lookup.
         session_out = ssm_run(
-            ssm, "tmux ls 2>/dev/null | grep '^wikimedia-' || echo NONE"
+            ssm,
+            "tmux ls -F '#{session_name}|#{session_created}' 2>/dev/null "
+            "| grep '^wikimedia-' || echo NONE",
         )
     except TimeoutError as e:
         logging.error("SSM poll timed out: %s", e)
@@ -811,11 +818,23 @@ def main() -> None:
         )
         return
 
-    sessions = (
-        [line.split(":")[0].strip() for line in session_out.splitlines()]
+    # Each entry: ``(session_name, session_created_epoch)``.
+    # session_created_epoch is used to bound the log-mtime lookup so a
+    # concurrent session writing to one of this session's completed
+    # labels can't hijack the "active" row.
+    def _parse_session_line(line: str) -> tuple[str, int]:
+        name, _, epoch = line.partition("|")
+        try:
+            return name.strip(), int(epoch.strip())
+        except ValueError:
+            return name.strip(), 0
+
+    sessions_with_created = (
+        [_parse_session_line(line) for line in session_out.splitlines()]
         if session_out and session_out != "NONE"
         else []
     )
+    sessions = [name for name, _ in sessions_with_created]
 
     if not sessions:
         print("No active wikimedia sessions.")
@@ -837,8 +856,11 @@ def main() -> None:
     # output in the Slack readout.
     results: dict[str, tuple[str, str]] = {}
 
+    session_created_by_name = dict(sessions_with_created)
+
     def fetch(session: str) -> tuple[str, str]:
         suffix = session.removeprefix("wikimedia-")
+        session_created = session_created_by_name.get(session, 0)
 
         # Retry sessions are named wikimedia-retry-<days>d[-<partner>].
         # parse_session_labels doesn't recognise the retry- prefix, so resolve
@@ -898,9 +920,12 @@ def main() -> None:
             return session, "Unknown (unrecognised session name)"
         multi = len(labels) > 1
 
-        # See find_active_label's docstring.
+        # See find_active_label's docstring. ``session_created`` bounds
+        # the log-mtime lookup so a concurrent session writing to one of
+        # this session's completed labels can't steal the active-row
+        # identity (see PR bug 1).
         try:
-            active = find_active_label(ssm, labels)
+            active = find_active_label(ssm, labels, session_created=session_created)
         except Exception:
             logging.exception("Failed to find active label for %s", session)
             return labels[0], "Unknown (error)"
@@ -928,15 +953,27 @@ def main() -> None:
             return _with_batch_suffix(labels[0]), "Generating IDs"
 
         label, _ = active
-        hub = label.split("+")[0]
+        # ``find_active_label`` may return a synthetic ``drain-<hub>``
+        # label when the session is in its terminal partner-level drain
+        # phase. Its log file (``…-drain-<hub>-drain-deferred.log``) is
+        # NOT indexed by any per-target label, so the reporter would
+        # previously miss it and misreport the session as ``SDC complete``
+        # (PR bug 2). For those, the ``hub`` is the suffix after
+        # ``drain-`` (not ``label.split("+")[0]``, which would return
+        # the whole ``drain-<hub>`` string), and no batch suffix is
+        # meaningful since the drain is a partner-level post-chain step.
+        if label.startswith("drain-"):
+            hub = label[len("drain-") :]
+            display_label = label
+        else:
+            hub = label.split("+")[0]
+            display_label = _with_batch_suffix(label)
         try:
             phase, _ = get_phase_and_progress(ssm, session, hub, label)
         except Exception:
             logging.exception("Failed to get status for %s (%s)", session, label)
-            return _with_batch_suffix(label), "Unknown (error)"
-        return _with_batch_suffix(
-            label
-        ), phase if phase is not None else "Generating IDs"
+            return display_label, "Unknown (error)"
+        return display_label, phase if phase is not None else "Generating IDs"
 
     # Memory snapshot is independent of every per-session fetch — submit it
     # to the same executor so the SSM round-trip overlaps with the session
