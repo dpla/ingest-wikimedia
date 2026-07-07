@@ -25,6 +25,16 @@ class Result(Enum):
     # in the drain pass); the number of items still deferred at run end is
     # logged separately. Not a skip: the work is retried, not abandoned.
     UPLOAD_DEFERRED_DUP_CATEGORY = auto()
+    # An upload attempt returned ``None`` from ``pywikibot.Site.upload()``
+    # AND the target title already holds a real file whose SHA1 does not
+    # match ours — the signature of Commons treating a subtly-different
+    # (typically 1-byte off) file as a duplicate of what it already has.
+    # Empirically dominates the "possible ID drift" error class (91k+ of
+    # the 109k events observed are Ohio PDFs with 1-byte S3-vs-Commons
+    # drift, not real ID drift); reporting them as FAILED inflates the
+    # counter and hides genuine drift-repair gaps in the same bucket.
+    # See the investigation notes on PR that introduced this counter.
+    UPLOAD_SKIPPED_COMMONS_DEDUP = auto()
     UPLOADED = auto()
     BYTES = auto()
     ITEM_NOT_PRESENT = auto()
