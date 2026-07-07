@@ -3442,6 +3442,46 @@ def _is_inferred_from_wikitext_reference(reference):
     return False
 
 
+_MULTI_VALUE_DELIMITER = "; "
+
+
+def _inferred_multi_value_matches_dpla_set(stmt, dpla_folded_values: set[str]) -> bool:
+    """True iff ``stmt``'s raw text (monolingual ``text`` or string
+    mainsnak) splits on ``"; "`` into pieces each of which folds via
+    :func:`casefold_for_compare` to a value in ``dpla_folded_values``.
+
+    Mirrors the migration-side subset check in
+    :func:`ingest_wikimedia.legacy_artwork._multi_value_subset_of_canonical`:
+    a legacy ``{{Artwork}}`` migration that ran BEFORE the migration-
+    side subset fix landed can leave an ``inferred-from-Wikitext``
+    monolingualtext statement whose value is the ``; ``-joined
+    concatenation of what DPLA stores as N separate single-value
+    statements. Neither the byte-equality check nor the whole-string
+    ``casefold_for_compare`` matches the individual DPLA-attributed
+    comparables, so the dupe-pass leaves the inferred statement in
+    place forever. Splitting the inferred text on ``"; "`` and
+    checking every folded piece against DPLA's per-statement folded
+    set closes that loop — the sync-time self-heal counterpart to
+    the migration-time fix.
+
+    Returns False when the inferred value has no ``"; "`` delimiter
+    (single-value shape → the regular ``comp in dpla_comparables``
+    check is authoritative for that case), or when any piece isn't
+    present in the DPLA set (real community contribution — preserve).
+    """
+    raw = _inferred_stored_text(stmt)
+    if not isinstance(raw, str) or _MULTI_VALUE_DELIMITER not in raw:
+        return False
+    parts = {
+        folded
+        for folded in (
+            casefold_for_compare(p) for p in raw.split(_MULTI_VALUE_DELIMITER)
+        )
+        if folded
+    }
+    return bool(parts) and parts.issubset(dpla_folded_values)
+
+
 def _reconcile_inferred_from_wikitext_dupes(mediaid):
     """Remove inferred-from-Wikitext claims whose comparable value
     equals a DPLA-attributed claim on the same property.
@@ -3464,6 +3504,18 @@ def _reconcile_inferred_from_wikitext_dupes(mediaid):
     previously-preserved community claim): nothing branches on whether
     the equivalence is new or was always there.
 
+    Multi-value subset case (:func:`_inferred_multi_value_matches_dpla_set`):
+    a pre-fix migration on a multi-valued DPLA field
+    (``description`` in particular — often a list, joined with
+    ``VALUE_JOIN_DELIMITER = "; "`` in the wikitext) writes ONE
+    inferred statement whose value is the ``; ``-joined
+    concatenation, alongside N per-value DPLA-attributed statements.
+    Straight ``comp in dpla_comparables`` misses that because the
+    concatenation is a different string from any single DPLA value.
+    Splitting the inferred text on ``"; "`` and checking every folded
+    piece against the DPLA-attributed folded-value set for the same
+    property removes those legacy artifacts on sync.
+
     Safety: only removes statements whose references carry the exact
     ``P887 → Q131783016`` fingerprint. Third-party community claims
     that happen to equal a DPLA value are never touched — this routine
@@ -3473,6 +3525,11 @@ def _reconcile_inferred_from_wikitext_dupes(mediaid):
     statements = entity.get("statements") or {}
     for stmts in statements.values():
         dpla_comparables = set()
+        # Per-property index of DPLA-attributed folded text values for
+        # the multi-value subset check. Only populated for the text-
+        # shaped comparables (``monolingual`` / ``string``) because
+        # subset-of-set only makes sense for concatenated string lists.
+        dpla_folded_texts: set[str] = set()
         inferred_stmts = []
         for stmt in stmts:
             refs = stmt.get("references") or []
@@ -3480,6 +3537,8 @@ def _reconcile_inferred_from_wikitext_dupes(mediaid):
                 comp = _statement_comparable_value(stmt)
                 if comp is not None:
                     dpla_comparables.add(comp)
+                    if comp[0] in ("monolingual", "string"):
+                        dpla_folded_texts.add(comp[1])
             elif any(_is_inferred_from_wikitext_reference(ref) for ref in refs):
                 inferred_stmts.append(stmt)
         if not dpla_comparables:
@@ -3487,6 +3546,9 @@ def _reconcile_inferred_from_wikitext_dupes(mediaid):
         for stmt in inferred_stmts:
             comp = _statement_comparable_value(stmt)
             if comp is not None and comp in dpla_comparables:
+                removals.append(stmt["id"])
+                continue
+            if _inferred_multi_value_matches_dpla_set(stmt, dpla_folded_texts):
                 removals.append(stmt["id"])
 
 
