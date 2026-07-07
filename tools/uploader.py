@@ -2133,6 +2133,23 @@ def _init_upload_worker(
     _worker_verbose = verbose
 
 
+def _worker_warmup(_ignored):
+    """Confirm this worker's ``_init_upload_worker`` finished. Returns
+    True on success; raises whatever the initializer already raised
+    (re-raised from a stashed error) on failure.
+
+    ``multiprocessing.Pool`` does not surface initializer exceptions
+    directly — a failed init leaves the pool respawning workers or
+    hanging on the first result forever. Running one warmup task per
+    worker slot from the parent before real dispatch forces any init
+    failure to surface as a ``pool.apply`` exception, so the parent
+    can abort fast instead of waiting on a job that will never
+    progress. See CPython issues 43306 / 35311 / cpython #103061."""
+    if _worker_uploader is None:
+        raise RuntimeError("upload worker initializer did not populate globals")
+    return True
+
+
 def _worker_upload_task(dpla_id: str):
     """Process one DPLA item in the pool worker; return
     ``(dpla_id, tracker_delta, deferred_count, newly_created_delta)``.
@@ -2238,6 +2255,16 @@ def _run_upload_pool(
                 priority_holdings,
             ),
         ) as pool:
+            # Warmup — force any ``_init_upload_worker`` failure to surface
+            # here instead of hanging the pool later. One task per configured
+            # worker slot so every worker's initializer is exercised. If any
+            # raises, ``AsyncResult.get`` re-raises in the parent, we log
+            # and abort — the ``with`` block terminates the whole pool.
+            warmup_results = [
+                pool.apply_async(_worker_warmup, (i,)) for i in range(workers)
+            ]
+            for r in warmup_results:
+                r.get(timeout=120)
             for dpla_id, delta, deferred_count, newly_created_delta in tqdm(
                 pool.imap_unordered(_worker_upload_task, dpla_ids),
                 total=len(dpla_ids),
