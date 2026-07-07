@@ -2039,6 +2039,220 @@ class Uploader:
             logging.warning(f"Failed: {message}", exc_info=ex)
 
 
+# Module-level worker state populated by _init_upload_worker in each pool
+# process. The pool worker task reads these directly rather than
+# threading them through per-call args (which multiprocessing would
+# have to pickle for every dispatch). Declared at module scope so the
+# task function's globals lookup finds them regardless of the spawn
+# start method's re-import.
+_worker_uploader = None
+_worker_slot_budget = None
+_worker_providers_json = None
+_worker_partner = None
+_worker_dry_run = False
+_worker_verbose = False
+
+
+def _init_upload_worker(
+    log_queue,
+    workers_budget: int,
+    partner: str,
+    dry_run: bool,
+    verbose: bool,
+    no_create: bool,
+    providers_json: dict,
+    fallback_gate,
+    priority_holdings,
+):
+    """Per-worker setup for the ``--workers > 1`` uploader Pool.
+
+    Each spawned worker process re-imports this module fresh and runs
+    this initializer once. Same shape as sdc-sync's
+    ``_init_partner_worker`` — fresh pywikibot ``Site``/login, cross-
+    process log routing via a ``QueueHandler``, and per-worker
+    construction of the stateful helpers the item loop needs
+    (Uploader, CategoryEnsurer, DupThrottle, ToolsContext).
+
+    The parent passes ``fallback_gate`` (a ``multiprocessing.Semaphore(1)``)
+    and ``priority_holdings`` (a ``multiprocessing.Value('i', 0)``) so
+    every worker's :class:`WorkerSlotBudget` shares the same two per-
+    session objects — enforcing "at most one shared-pool slot per
+    session" and "no shared slot when the session already holds any
+    priority slot" across the whole worker pool. See
+    :class:`ingest_wikimedia.worker_slots.WorkerSlotBudget` for the
+    invariants.
+    """
+    import logging.handlers
+
+    import pywikibot
+
+    pywikibot.config.max_retries = 5
+    pywikibot.config.retry_wait = 5
+    pywikibot.config.retry_max = 60
+    pywikibot.config.socket_timeout = (10, 60)
+
+    root = logging.getLogger()
+    root.handlers[:] = [logging.handlers.QueueHandler(log_queue)]
+    root.setLevel(logging.INFO)
+
+    global _worker_uploader, _worker_slot_budget
+    global _worker_providers_json, _worker_partner, _worker_dry_run, _worker_verbose
+
+    commons_site = get_site()
+    category_ensurer = CategoryEnsurer(commons_site, dry_run=dry_run)
+    dup_throttle = DuplicateCategoryThrottle(commons_site)
+    tools_context = ToolsContext.init(partner)
+    tools_context.get_local_fs().setup_temp_dir()
+
+    _worker_uploader = Uploader(
+        tools_context.get_tracker(),
+        tools_context.get_local_fs(),
+        tools_context.get_s3_client(),
+        tools_context.get_dpla(),
+        commons_site,
+        category_ensurer,
+        no_create=no_create,
+        dup_throttle=dup_throttle,
+    )
+
+    if workers_budget > 0:
+        shared_budget = WorkerSlotBudget(workers_budget)
+        _worker_slot_budget = WorkerSlotBudget(
+            UPLOADER_PRIORITY_SLOTS,
+            slot_dir=UPLOADER_PRIORITY_SLOT_DIR,
+            fallback=shared_budget,
+            fallback_gate=fallback_gate,
+            priority_holdings=priority_holdings,
+        )
+    else:
+        _worker_slot_budget = WorkerSlotBudget(0)
+
+    _worker_providers_json = providers_json
+    _worker_partner = partner
+    _worker_dry_run = dry_run
+    _worker_verbose = verbose
+
+
+def _worker_upload_task(dpla_id: str):
+    """Process one DPLA item in the pool worker; return
+    ``(dpla_id, tracker_delta, deferred_count, newly_created_delta)``.
+
+    ``tracker_delta`` is the change in the worker's tracker counters
+    across this one item — the parent merges it into its own tracker
+    so the final ``str(tracker)`` line and Slack summary reflect work
+    done across all workers. Uses the same ``snapshot`` → ``diff``
+    pattern as sdc-sync's parallel path so a long-lived worker doesn't
+    double-count across successive tasks.
+
+    ``newly_created_delta`` is the set of institution QIDs the worker's
+    :class:`CategoryEnsurer` created on Commons during this item.
+    The parent unions these across all tasks and feeds the combined
+    set into ``_post_upload_touch_new_institutions``, since each
+    spawned worker has its own ``category_ensurer.newly_created``
+    that the parent's ensurer would otherwise never see — leaving
+    first-batch files stranded in Category:Unknown institution.
+
+    Wraps ``process_item`` in the same slot-acquire that the single-
+    worker path uses. A worker-level exception is logged and swallowed
+    so a bad item doesn't kill the pool worker; ``CsrfRecoveryFailed``
+    re-raises so the pool sees it and the parent's outer try/except
+    can abort the whole run cleanly rather than skip-and-recur on
+    every subsequent item.
+    """
+    prior = _worker_uploader.tracker.snapshot()
+    prior_newly_created = set(_worker_uploader.category_ensurer.newly_created)
+    deferred_count = 0
+    try:
+        with _worker_slot_budget.acquire():
+            deferred_count = _worker_uploader.process_item(
+                dpla_id,
+                _worker_providers_json,
+                _worker_partner,
+                _worker_verbose,
+                _worker_dry_run,
+            )
+    except CsrfRecoveryFailed:
+        raise
+    except Exception:
+        logging.exception(f" -- Item {dpla_id}: worker task raised; skipping.")
+    delta = _worker_uploader.tracker.diff(prior)
+    newly_created_delta = (
+        _worker_uploader.category_ensurer.newly_created - prior_newly_created
+    )
+    return dpla_id, delta, deferred_count or 0, newly_created_delta
+
+
+def _run_upload_pool(
+    *,
+    dpla_ids,
+    partner: str,
+    dry_run: bool,
+    verbose: bool,
+    no_create: bool,
+    workers_budget: int,
+    providers_json: dict,
+    workers: int,
+    tracker,
+    deferred: dict[str, int],
+    newly_created: set[str],
+) -> None:
+    """Dispatch upload across ``workers`` spawned processes.
+
+    Creates the ``multiprocessing.Semaphore(1)`` fallback-gate and the
+    ``multiprocessing.Value('i', 0)`` priority-holdings counter shared
+    across all workers of this session, then runs the pool with
+    ``imap_unordered`` and merges each task's tracker delta into the
+    parent tracker. Cross-process log routing via ``QueueListener``
+    on the parent's already-open ``-upload.log`` handlers so worker
+    log lines land in the same file the operator is tailing.
+
+    Uses ``spawn`` start_method explicitly so workers don't inherit
+    the parent's pywikibot session sockets — fork-then-use of an
+    already-authenticated Site has been a source of half-broken
+    connections in similar bot setups.
+    """
+    import logging.handlers
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    log_queue = ctx.Manager().Queue(-1)
+    listener = logging.handlers.QueueListener(
+        log_queue, *logging.getLogger().handlers, respect_handler_level=True
+    )
+    listener.start()
+    fallback_gate = ctx.Semaphore(1)
+    priority_holdings = ctx.Value("i", 0)
+    try:
+        with ctx.Pool(
+            processes=workers,
+            initializer=_init_upload_worker,
+            initargs=(
+                log_queue,
+                workers_budget,
+                partner,
+                dry_run,
+                verbose,
+                no_create,
+                providers_json,
+                fallback_gate,
+                priority_holdings,
+            ),
+        ) as pool:
+            for dpla_id, delta, deferred_count, newly_created_delta in tqdm(
+                pool.imap_unordered(_worker_upload_task, dpla_ids),
+                total=len(dpla_ids),
+                desc="Uploading Items",
+                unit="Item",
+                ncols=100,
+            ):
+                tracker.merge(delta)
+                if deferred_count:
+                    deferred[dpla_id] = deferred_count
+                newly_created.update(newly_created_delta)
+    finally:
+        listener.stop()
+
+
 @click.command()
 @click.argument("ids_file", type=click.File("r"))
 @click.argument("partner")
@@ -2063,13 +2277,28 @@ class Uploader:
     help=(
         "Box-wide cap on concurrent Commons-writing processes across ALL "
         "wikimedia sessions on the host, shared with the SDC-sync phase. "
-        "The uploader is single-process (no parallelism), so it checks out "
-        "exactly ONE slot while working an item — making it count as one "
-        "writer against the shared budget alongside SDC-sync workers. "
         "0 (default) disables the budget — correct for a standalone run, "
         "which has no peers to coordinate with. Pass --workers-budget 16 "
         "to join the shared box-wide cap (the launch workflow does this). "
         "See ingest_wikimedia.worker_slots.WorkerSlotBudget."
+    ),
+)
+@click.option(
+    "--workers",
+    "workers",
+    type=int,
+    default=UPLOADER_PRIORITY_SLOTS,
+    show_default=True,
+    help=(
+        "Parallel uploader worker processes for this session. Each worker "
+        "acquires one slot per item from the priority pool (spilling into "
+        "the shared pool only when its session doesn't already hold a "
+        "priority slot, gated to at most one shared slot per session — see "
+        "WorkerSlotBudget's fallback_gate/priority_holdings). Default "
+        "matches UPLOADER_PRIORITY_SLOTS so a single uploader session can "
+        "saturate the priority pool by itself; 4 concurrent sessions "
+        "settle to ~1 priority slot each. Pass 1 for the legacy single-"
+        "process for-loop path."
     ),
 )
 def main(
@@ -2079,6 +2308,7 @@ def main(
     verbose: bool,
     no_create: bool,
     workers_budget: int,
+    workers: int,
 ) -> None:
     start_time = time.time()
     # ``setup_logging`` is the first thing we do so its
@@ -2178,15 +2408,41 @@ def main(
         # Map of dpla_id -> count of ordinals the dup-category throttle deferred.
         deferred: dict[str, int] = {}
         try:
-            for dpla_id in tqdm(
-                dpla_ids, desc="Uploading Items", unit="Item", ncols=100
-            ):
-                with slot_budget.acquire():
-                    deferred_count = uploader.process_item(
-                        dpla_id, providers_json, partner, verbose, dry_run
-                    )
-                    if deferred_count:
-                        deferred[dpla_id] = deferred_count
+            if workers > 1:
+                # Workers each have their own CategoryEnsurer with a private
+                # ``newly_created`` set — the parent's ensurer wouldn't otherwise
+                # see them, and the end-of-run touch helper would find nothing to
+                # touch. Union the deltas from each task and fold them into the
+                # parent ensurer so ``_post_upload_touch_new_institutions`` fires
+                # exactly once, box-serialised, for every institution any worker
+                # created.
+                worker_newly_created: set[str] = set()
+                _run_upload_pool(
+                    dpla_ids=dpla_ids,
+                    partner=partner,
+                    dry_run=dry_run,
+                    verbose=verbose,
+                    no_create=no_create,
+                    workers_budget=workers_budget,
+                    providers_json=providers_json,
+                    workers=workers,
+                    tracker=tracker,
+                    deferred=deferred,
+                    newly_created=worker_newly_created,
+                )
+                # ``newly_created`` is a copy-returning property; mutate the
+                # underlying set directly so the touch helper sees the union.
+                category_ensurer._newly_created.update(worker_newly_created)
+            else:
+                for dpla_id in tqdm(
+                    dpla_ids, desc="Uploading Items", unit="Item", ncols=100
+                ):
+                    with slot_budget.acquire():
+                        deferred_count = uploader.process_item(
+                            dpla_id, providers_json, partner, verbose, dry_run
+                        )
+                        if deferred_count:
+                            deferred[dpla_id] = deferred_count
 
             # Any item whose {{duplicate}}-tagging upload was deferred because
             # Category:Duplicate was full: persist the deferred DPLA IDs to
