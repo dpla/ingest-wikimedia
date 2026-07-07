@@ -2298,3 +2298,308 @@ def test_inject_preserved_extras_preserves_value_verbatim():
     assert weird in injected, (
         f"extras value must be preserved byte-identical; got: {injected!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Creator community-contribution extraction (this commit).
+# Legacy ``Other fields N = {{InFi|Creator|<inner>}}`` uploads carried
+# community-contributed creator values in a wrapper that the previous
+# extractor didn't recognise. This commit adds:
+#   * InFi-wrapper unwrap in parse_artwork_params
+#   * Inner-shape dispatch for {{Creator:Foo}}, {{creator|Wikidata=Q…}},
+#     {{NARA-Author|<name>|<id>}}, and plain strings
+#   * Materialise-time QID resolution for Creator: pages via Commons
+#     pageprops
+#   * P170-QID and P170-somevalue+P2093-stated-as claim shapes,
+#     replacing the previous P2093 mainsnak that Module:DPLA didn't
+#     read as a creator statement
+# ---------------------------------------------------------------------------
+
+
+def test_parse_artwork_params_unwraps_infi_creator_with_creator_page():
+    """The ``Other fields 1 = {{InFi|Creator|{{Creator:Foo}}}}`` wrapper
+    must be unwrapped and its inner ``{{Creator:Foo}}`` routed to the
+    canonical ``creator`` key with a page-title sentinel so the
+    executor can resolve to a Wikidata QID via Commons pageprops."""
+    from ingest_wikimedia.legacy_artwork import (
+        parse_artwork_params,
+        _CREATOR_PAGE_PREFIX,
+    )
+
+    wt = (
+        "{{Artwork\n"
+        "| Other fields 1 = {{ InFi | Creator | "
+        "{{Creator:Theodore E. Peiser}} | id=fileinfotpl_aut }}\n"
+        "| title = A title\n"
+        "}}"
+    )
+    params = parse_artwork_params(wt)
+    assert params.get("creator") == (_CREATOR_PAGE_PREFIX + "Theodore E. Peiser"), (
+        f"got {params!r}"
+    )
+
+
+def test_parse_artwork_params_unwraps_infi_creator_with_wikidata_template():
+    """``{{creator|Wikidata=Q…}}`` inside the InFi wrapper is
+    dispatched with a QID sentinel so the executor doesn't need to
+    resolve anything — the community already supplied the QID."""
+    from ingest_wikimedia.legacy_artwork import (
+        parse_artwork_params,
+        _CREATOR_QID_PREFIX,
+    )
+
+    wt = (
+        "{{Artwork\n"
+        "| Other fields 1 = {{ InFi | Creator | "
+        "{{creator|Wikidata=Q56159174}} | id=fileinfotpl_aut }}\n"
+        "}}"
+    )
+    params = parse_artwork_params(wt)
+    assert params.get("creator") == _CREATOR_QID_PREFIX + "Q56159174"
+
+
+def test_parse_artwork_params_strips_nara_author_completely():
+    """``{{NARA-Author|<name>|<id>}}`` is bot-authored legacy
+    scaffolding, never a real community edit. It must be stripped
+    entirely — no community-import claim fires — so any drift between
+    its captured value and current DPLA SDC doesn't become permanently
+    attributed as an inferred-from-Wikitext contribution. Verified by
+    the creator key being absent from the parse output entirely,
+    matching the behaviour of an omitted param."""
+    from ingest_wikimedia.legacy_artwork import parse_artwork_params
+
+    wt = (
+        "{{Artwork\n"
+        "| Other fields 1 = {{ InFi | Creator | "
+        "{{NARA-Author|Adams, Ansel, 1902-1984, Photographer|1332556}} "
+        "| id=fileinfotpl_aut }}\n"
+        "| title = A title\n"
+        "}}"
+    )
+    params = parse_artwork_params(wt)
+    assert "creator" not in params, (
+        f"NARA-Author must be stripped without producing a creator "
+        f"entry; got {params!r}"
+    )
+
+
+def test_parse_artwork_params_plain_string_creator_in_infi_wrapper():
+    """A plain stated-as name inside the InFi wrapper still routes to
+    ``creator`` as a plain string — same path as the flat ``|creator=``
+    shape."""
+    from ingest_wikimedia.legacy_artwork import parse_artwork_params
+
+    wt = (
+        "{{Artwork\n"
+        "| Other fields 1 = {{ InFi | Creator | Peiser, Theodore E "
+        "| id=fileinfotpl_aut }}\n"
+        "}}"
+    )
+    params = parse_artwork_params(wt)
+    assert params.get("creator") == "Peiser, Theodore E"
+
+
+def test_parse_artwork_params_creator_wikidata_template_in_flat_param():
+    """``{{creator|Wikidata=Q…}}`` in the flat ``| creator = …``
+    param (post-migration Commons-editor shape) is also dispatched
+    with a QID sentinel — same downstream handling as the wrapped
+    legacy form."""
+    from ingest_wikimedia.legacy_artwork import (
+        parse_artwork_params,
+        _CREATOR_QID_PREFIX,
+    )
+
+    wt = "{{Artwork\n| creator = {{creator|Wikidata=Q56159174}}\n}}"
+    params = parse_artwork_params(wt)
+    assert params.get("creator") == _CREATOR_QID_PREFIX + "Q56159174"
+
+
+def test_materialize_creator_qid_placeholder_drops_when_qid_already_on_entity():
+    """``{{creator|Wikidata=Q…}}`` whose QID already matches a P170
+    QID on the entity is a no-op community import — drop the claim
+    from the materialised list rather than posting a redundant
+    second P170 statement."""
+    from ingest_wikimedia.legacy_artwork import materialize_import_claims
+
+    placeholder = {
+        "type": "statement",
+        "rank": "normal",
+        "_phase3a_pending_creator_qid": "Q56159174",
+        "_permalink": "https://commons.wikimedia.org/w/index.php?oldid=1",
+    }
+    entity = {
+        "statements": {
+            "P170": [
+                {
+                    "mainsnak": {
+                        "snaktype": "value",
+                        "property": "P170",
+                        "datavalue": {
+                            "type": "wikibase-entityid",
+                            "value": {"entity-type": "item", "id": "Q56159174"},
+                        },
+                    }
+                }
+            ]
+        }
+    }
+    materialised = materialize_import_claims([placeholder], existing_entity=entity)
+    assert materialised == [], (
+        "creator-QID placeholder whose QID is already on the entity's "
+        f"P170 must not produce a claim; got {materialised!r}"
+    )
+
+
+def test_materialize_creator_qid_placeholder_emits_when_qid_differs():
+    """When the community QID isn't already on the entity, emit a
+    proper P170 mainsnak QID statement with the inferred-from-
+    Wikitext reference shape — NOT the previous P2093 mainsnak that
+    Module:DPLA doesn't render as a creator row."""
+    from ingest_wikimedia.legacy_artwork import materialize_import_claims
+
+    placeholder = {
+        "type": "statement",
+        "rank": "normal",
+        "_phase3a_pending_creator_qid": "Q56159174",
+        "_permalink": "https://commons.wikimedia.org/w/index.php?oldid=1",
+    }
+    # Entity has only a somevalue P170 (DPLA's stated-as name shape),
+    # no QID — the community QID is genuinely new information.
+    entity = {
+        "statements": {
+            "P170": [
+                {
+                    "mainsnak": {
+                        "snaktype": "somevalue",
+                        "property": "P170",
+                    }
+                }
+            ]
+        }
+    }
+    materialised = materialize_import_claims([placeholder], existing_entity=entity)
+    assert len(materialised) == 1
+    claim = materialised[0]
+    assert claim["mainsnak"]["property"] == "P170"
+    assert claim["mainsnak"]["snaktype"] == "value"
+    dv = claim["mainsnak"]["datavalue"]
+    assert dv["type"] == "wikibase-entityid"
+    assert dv["value"]["id"] == "Q56159174"
+    # Inferred-from-Wikitext reference shape must be intact.
+    refs = claim["references"][0]["snaks"]
+    assert refs["P887"][0]["datavalue"]["value"]["id"] == "Q131783016"
+
+
+def test_materialize_creator_page_placeholder_falls_back_to_stated_as_when_no_qid():
+    """A ``{{Creator:Foo}}`` transclusion whose Creator: page has no
+    linked Wikidata item (orphaned page, or the page doesn't exist)
+    falls back to a P170 somevalue + P2093 stated-as claim using the
+    page title as the name. Preserves the community contribution as
+    a stated-as string rather than dropping it silently.
+
+    The resolver is stubbed to return None so the fallback path fires
+    without requiring a live Commons API call."""
+    from ingest_wikimedia.legacy_artwork import materialize_import_claims
+
+    placeholder = {
+        "type": "statement",
+        "rank": "normal",
+        "_phase3a_pending_creator_page": "Orphaned Person",
+        "_permalink": "https://commons.wikimedia.org/w/index.php?oldid=1",
+    }
+    # ``site=None`` short-circuits ``_resolve_commons_creator_qid`` to
+    # None, exercising the stated-as fallback without a network call.
+    materialised = materialize_import_claims([placeholder], site=None)
+    assert len(materialised) == 1
+    claim = materialised[0]
+    assert claim["mainsnak"]["property"] == "P170"
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    stated_as = claim["qualifiers"]["P2093"][0]["datavalue"]["value"]
+    assert stated_as == "Orphaned Person", (
+        f"expected stated-as to fall back to the page title; got {stated_as!r}"
+    )
+    refs = claim["references"][0]["snaks"]
+    assert refs["P887"][0]["datavalue"]["value"]["id"] == "Q131783016"
+
+
+def test_plan_migration_extracts_infi_creator_with_wikidata_qid():
+    """Integration: a legacy Artwork upload with a community
+    contribution wrapped in ``Other fields 1 = {{InFi|Creator|
+    {{creator|Wikidata=Q…}}}}`` must produce a plan whose
+    community_imports carries the QID sentinel — which then
+    materialises into a P170 QID claim at execute time."""
+    from ingest_wikimedia.legacy_artwork import (
+        plan_migration,
+        _CREATOR_QID_PREFIX,
+    )
+
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            "{{Artwork\n| Other fields 1 = {{ InFi | Creator | "
+            "Peiser, Theodore E | id=fileinfotpl_aut }}\n}}",
+        ),
+        (
+            2,
+            "Community_editor",
+            "{{Artwork\n| Other fields 1 = {{ InFi | Creator | "
+            "{{creator|Wikidata=Q56159174}} | id=fileinfotpl_aut }}\n}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(creator="Peiser, Theodore E"),
+    )
+    assert plan is not None
+    assert plan.community_imports.get("creator") == (_CREATOR_QID_PREFIX + "Q56159174")
+
+
+def test_parse_creator_shape_matches_creator_page_case_insensitively():
+    """MediaWiki auto-capitalises the ``Creator:`` namespace on
+    template transclusions, so ``{{creator:Foo}}`` and ``{{Creator:Foo}}``
+    both resolve to the same page. The parser matches both."""
+    from ingest_wikimedia.legacy_artwork import (
+        _parse_creator_shape,
+        _CREATOR_PAGE_PREFIX,
+    )
+
+    assert _parse_creator_shape("{{creator:Theodore E. Peiser}}") == (
+        _CREATOR_PAGE_PREFIX + "Theodore E. Peiser"
+    )
+    assert _parse_creator_shape("{{CREATOR:Theodore E. Peiser}}") == (
+        _CREATOR_PAGE_PREFIX + "Theodore E. Peiser"
+    )
+
+
+def test_parse_creator_shape_strips_unknown_template_shapes():
+    """Any template-shaped value that doesn't match one of the
+    recognised creator shapes is dropped rather than passed through
+    as a literal string. Submitting raw ``{{…}}`` markup as a P2093
+    stated-as would be both wrong (SDC shouldn't store wikitext) and
+    a maintenance burden to reverse later. Deferring to a later phase
+    that widens the recognised set is safer than emitting nonsense
+    claims now."""
+    from ingest_wikimedia.legacy_artwork import _parse_creator_shape
+
+    # An unknown creator-authoring template shape.
+    assert _parse_creator_shape("{{some-unknown-creator-template|Foo Bar}}") is None
+    # A partially-typed Creator: shape that misses ``_CREATOR_PAGE_RE``
+    # (contains pipe → treated as a template with args rather than a
+    # bare page transclusion). Better to strip than to emit
+    # ``P2093="{{Creator:Foo|extra}}"``.
+    assert _parse_creator_shape("{{Creator:Foo|extra}}") is None
+
+
+def test_parse_creator_shape_passes_through_plain_names():
+    """Regression: plain-string creator names still pass through
+    unchanged. The unknown-template guard only fires on ``{{…}}``-
+    wrapped values."""
+    from ingest_wikimedia.legacy_artwork import _parse_creator_shape
+
+    assert _parse_creator_shape("Peiser, Theodore E") == "Peiser, Theodore E"
+    # A name that happens to contain balanced braces mid-string (not a
+    # template) must still pass through — the guard checks bounds, not
+    # substring occurrence.
+    assert _parse_creator_shape("Smith, John (author)") == "Smith, John (author)"
