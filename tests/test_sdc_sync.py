@@ -6359,3 +6359,136 @@ def test_inferred_dupe_cleanup_preserves_substantively_different_text():
         sdc_sync._reconcile_inferred_from_wikitext_dupes("M003")
     assert sdc_sync.removals == []
     sdc_sync._reset_per_file_accumulators()
+
+
+# ---- Multi-value subset self-heal (Principles_of_Causality repro) ----
+
+
+def test_inferred_dupe_cleanup_removes_multi_value_concatenation_of_dpla_set():
+    """A legacy migration ran BEFORE the migration-side subset fix
+    landed and wrote one inferred-from-Wikitext P10358 whose value is
+    the ``; ``-joined concatenation of what DPLA canonicalises as N
+    separate single-value statements. Byte- and casefold-equality miss
+    the shape (concat != any individual value), so the pre-fix dupe
+    pass left it in place. The multi-value subset check now recognises
+    the inferred concatenation as fully covered by the per-value DPLA
+    set and queues it for removal.
+
+    Regression: File:%22Principles_of_Causality%22_essay_by_Sarah_..._-_DPLA_-_b3f489f90ebb903b961500c0cf71edfc
+    — DPLA stores 6 P10358 statements; a pre-#378 migration wrote a
+    7th inferred statement whose value concatenated 5 of the 6, and
+    a fresh sync post-#378 didn't remove it because the reconciler
+    didn't know about the shape.
+    """
+    from tools import sdc_sync
+
+    dpla_values = [
+        "Eight page essay with markings made by teacher in pencil.",
+        "Date supplied by cataloger.",
+        "Sallie M. Field",
+        "Phillips Academy Archives received the collection.",
+        "From The Trustees of Phillips Academy.",
+        "This date is inferred.",
+    ]
+    dpla_claims = [
+        _monolingual_claim(
+            f"M100$DPLA{i}",
+            "P10358",
+            value,
+            "en",
+            references=[_dpla_reference()],
+            p459=True,
+        )
+        for i, value in enumerate(dpla_values)
+    ]
+    inferred_value = "; ".join(dpla_values[:5])  # subset of DPLA's set
+    inferred_claim = _monolingual_claim(
+        "M100$INFERRED",
+        "P10358",
+        inferred_value,
+        "en",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 100, "statements": {"P10358": [*dpla_claims, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M100")
+    assert sdc_sync.removals == ["M100$INFERRED"]
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_preserves_multi_value_concat_with_extra_content():
+    """Guard: if the inferred concatenation carries ANY value NOT in
+    DPLA's per-statement set, it's a real community contribution and
+    the reconciler must NOT drop it. Only pure-subset shapes get
+    self-healed."""
+    from tools import sdc_sync
+
+    dpla_values = ["DPLA value one.", "DPLA value two."]
+    dpla_claims = [
+        _monolingual_claim(
+            f"M101$DPLA{i}",
+            "P10358",
+            value,
+            "en",
+            references=[_dpla_reference()],
+            p459=True,
+        )
+        for i, value in enumerate(dpla_values)
+    ]
+    inferred_claim = _monolingual_claim(
+        "M101$INFERRED",
+        "P10358",
+        "DPLA value one.; DPLA value two.; Community-added extra.",
+        "en",
+        references=[_inferred_from_wikitext_reference()],
+    )
+    entity = {"pageid": 101, "statements": {"P10358": [*dpla_claims, inferred_claim]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M101")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_inferred_dupe_cleanup_multi_value_subset_ignores_non_inferred_claims():
+    """Safety: only inferred-from-Wikitext claims are candidates for
+    the multi-value subset removal. A DPLA-attributed or third-party
+    claim whose value happens to be a ``; ``-concatenation of other
+    DPLA values is never touched."""
+    from tools import sdc_sync
+
+    dpla_values = ["A.", "B.", "C."]
+    dpla_claims = [
+        _monolingual_claim(
+            f"M102$DPLA{i}",
+            "P10358",
+            value,
+            "en",
+            references=[_dpla_reference()],
+            p459=True,
+        )
+        for i, value in enumerate(dpla_values)
+    ]
+    # A third DPLA claim whose text is coincidentally a concat of the
+    # other DPLA values. Must not be removed — no inferred reference.
+    dpla_concat = _monolingual_claim(
+        "M102$DPLA_CONCAT",
+        "P10358",
+        "A.; B.; C.",
+        "en",
+        references=[_dpla_reference()],
+        p459=True,
+    )
+    entity = {
+        "pageid": 102,
+        "statements": {"P10358": [*dpla_claims, dpla_concat]},
+    }
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._reconcile_inferred_from_wikitext_dupes("M102")
+    assert sdc_sync.removals == []
+    sdc_sync._reset_per_file_accumulators()
