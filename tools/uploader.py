@@ -220,7 +220,18 @@ def select_upload_chunk_size(
 # ordinal in this run, so writing structured data would be pointing at the
 # wrong page or none at all.
 ORDINAL_UPLOADED = "UPLOADED"  # file just uploaded (or drift-moved into place)
-ORDINAL_SKIPPED = "SKIPPED"  # existing Commons file matches our SHA1
+# Existing Commons file present at the expected title. Usually its SHA1
+# matches the source S3 SHA1 (the ordinary hash-match skip). One
+# narrow exception: ``_detect_commons_dedup_skip`` also emits SKIPPED
+# when Commons has a real (non-redirect) file whose SHA1 differs from
+# ours — the byte-drift class the class docstring calls out. In both
+# subcases the Commons file at the expected title is CORRECT (the
+# byte-drift file was accepted by Commons on its original upload with
+# server-side normalisation), so ``UPLOADED``/``SKIPPED`` remains the
+# right signal to the SDC phase: a canonical Commons file exists at
+# this ordinal's title, safe to target for wbsetclaims. Audit the
+# byte-drift subcase via ``Result.UPLOAD_SKIPPED_COMMONS_DEDUP``.
+ORDINAL_SKIPPED = "SKIPPED"
 ORDINAL_NOT_PRESENT = "NOT_PRESENT"  # no S3 asset to upload (downloader gap)
 ORDINAL_INELIGIBLE = "INELIGIBLE"  # S3 asset present but uploader chose not
 # to upload (bad MIME, download-only, unguessable extension, etc.)
@@ -398,9 +409,17 @@ class Uploader:
             return None
         if not existing_sha1 or existing_sha1 == our_sha1:
             return None
+        # Persist the pywikibot-normalized title, not the raw
+        # constructed ``page_title`` — downstream sidecars / SDC-sync
+        # key on the Commons-stored form, so returning the raw form
+        # here would break the very equality checks elsewhere in the
+        # pipeline that skip results feed into. Same normalization
+        # ``_resolve_hash_drift``'s ALREADY_CORRECT branch does at
+        # line 693 for the same reason.
+        canonical_title = existing.title(with_ns=False)
         logging.info(
             f"Skipping {dpla_id} {ordinal}: Commons-dedup byte-drift — "
-            f"target [[File:{page_title}]] already holds a real file "
+            f"target [[File:{canonical_title}]] already holds a real file "
             f"(SHA1 {existing_sha1}) that Commons treats as a "
             f"duplicate of our re-upload (our S3 SHA1 {our_sha1}). "
             f"File on Commons is correct; nothing to repair. See "
@@ -410,7 +429,7 @@ class Uploader:
         self.tracker.increment(Result.UPLOAD_SKIPPED_COMMONS_DEDUP)
         return {
             "status": ORDINAL_SKIPPED,
-            "title": page_title,
+            "title": canonical_title,
             "pageid": existing.pageid,
         }
 

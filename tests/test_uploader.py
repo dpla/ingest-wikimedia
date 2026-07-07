@@ -2146,22 +2146,40 @@ def _dedup_uploader(tracker: Tracker) -> Uploader:
 
 
 def _fake_filepage(
-    *, exists: bool, is_redirect: bool, sha1: str | None, pageid: int = 42
+    *,
+    exists: bool,
+    is_redirect: bool,
+    sha1: str | None,
+    pageid: int = 42,
+    canonical_title: str = "File:Foo (page 2).pdf",
 ):
     """Build a MagicMock that quacks like ``pywikibot.FilePage`` for the
     narrow surface ``_detect_commons_dedup_skip`` reads: ``exists()``,
-    ``isRedirectPage()``, ``latest_file_info.sha1``, ``pageid``."""
-    page = MagicMock()
+    ``isRedirectPage()``, ``latest_file_info.sha1``, ``pageid``, and
+    ``title(with_ns=False)``.
+
+    The ``sha1=None`` branch simulates a fetch failure via a
+    per-instance subclass whose ``latest_file_info`` property raises.
+    Instance-scoped rather than mutating ``type(MagicMock)`` directly
+    — a class-level assignment would persist on the shared MagicMock
+    class and leak into unrelated tests, causing order-dependent
+    failures wherever another test later reads ``latest_file_info``
+    on any MagicMock."""
+    if sha1 is None:
+
+        class _RaisingLatestFileInfo(MagicMock):
+            @property
+            def latest_file_info(self):
+                raise RuntimeError("no info")
+
+        page = _RaisingLatestFileInfo()
+    else:
+        page = MagicMock()
+        page.latest_file_info.sha1 = sha1
     page.exists.return_value = exists
     page.isRedirectPage.return_value = is_redirect
-    if sha1 is None:
-        # Simulate a fetch failure to read the SHA1.
-        type(page).latest_file_info = property(
-            lambda _self: (_ for _ in ()).throw(RuntimeError("no info"))
-        )
-    else:
-        page.latest_file_info.sha1 = sha1
     page.pageid = pageid
+    page.title.return_value = canonical_title
     return page
 
 
@@ -2186,6 +2204,37 @@ def test_detect_commons_dedup_skip_fires_when_target_has_different_sha1():
     assert result["pageid"] == 42
     assert tracker.count(Result.UPLOAD_SKIPPED_COMMONS_DEDUP) == 1
     assert tracker.count(Result.SKIPPED) == 1
+
+
+def test_detect_commons_dedup_skip_returns_canonical_title_not_raw():
+    """Regression: the skip-result ``title`` must be the pywikibot-
+    normalized ``existing.title(with_ns=False)`` rather than the raw
+    constructed ``page_title``. Downstream sidecars + SDC sync key on
+    the Commons-stored title, so returning the raw form breaks
+    equality checks — same rationale as
+    ``_resolve_hash_drift``'s ALREADY_CORRECT branch. Fixture builds
+    a canonical title that differs from the raw ``page_title`` argument
+    so the assertion can distinguish the two."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(
+        exists=True,
+        is_redirect=False,
+        sha1="commons-sha1",
+        canonical_title="File:Foo  (page 2).pdf",  # double-space normalised
+    )
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",  # single-space raw
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is not None
+    assert result["title"] == "File:Foo  (page 2).pdf", (
+        f"expected canonical title from ``existing.title(with_ns=False)``; "
+        f"got {result['title']!r}"
+    )
 
 
 def test_detect_commons_dedup_skip_returns_none_when_target_is_redirect():
