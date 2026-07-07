@@ -1597,9 +1597,7 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
         patch.object(up, "notify_phase_start"),
         patch.object(up, "notify_upload_complete"),
         patch.object(up, "_post_upload_touch_new_institutions"),
-        patch.object(
-            up, "load_ids", return_value=["id_a", "id_b", "id_c"]
-        ),
+        patch.object(up, "load_ids", return_value=["id_a", "id_b", "id_c"]),
         patch.object(up.Uploader, "process_item", side_effect=track_process_item),
         patch.object(up, "_run_upload_pool", side_effect=fake_run_pool),
         patch.object(up.drain_sidecar, "merge_sidecar", return_value=["deferred_id"]),
@@ -2121,6 +2119,178 @@ def test_process_file_backend_fail_retry_exhaustion_counts_once():
 # — otherwise the fatal would be swallowed as "one FAILED ordinal" and
 # the main loop would keep going.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Commons-dedup byte-drift skip + unhandled-drift-shape reporting.
+# When ``site.upload()`` returns None, process_file used to raise
+# ``RuntimeError("File linked to another page (possible ID drift)")`` and let
+# the catch-all report it as FAILED + "Failed: Unknown". Empirically this
+# was 91k+ Ohio PDFs with 1-byte S3-vs-Commons drift — Commons treats our
+# re-upload as a duplicate of what it already has, nothing to repair, but
+# every retry counted as FAILED. This suite pins the split:
+#
+#   * ``_detect_commons_dedup_skip`` returns SKIPPED when the target exists
+#     at the intended title with a different SHA1 (increments a dedicated
+#     ``UPLOAD_SKIPPED_COMMONS_DEDUP`` breakdown).
+#   * The RuntimeError still raises when the target is a redirect, missing,
+#     or has no readable SHA1 — genuine drift-repair gaps.
+#   * ``handle_upload_exception`` maps the RuntimeError to a distinct
+#     "unhandled drift shape" message so it doesn't collapse into
+#     "Failed: Unknown".
+# ---------------------------------------------------------------------------
+
+
+def _dedup_uploader(tracker: Tracker) -> Uploader:
+    return _process_file_uploader(tracker)
+
+
+def _fake_filepage(
+    *, exists: bool, is_redirect: bool, sha1: str | None, pageid: int = 42
+):
+    """Build a MagicMock that quacks like ``pywikibot.FilePage`` for the
+    narrow surface ``_detect_commons_dedup_skip`` reads: ``exists()``,
+    ``isRedirectPage()``, ``latest_file_info.sha1``, ``pageid``."""
+    page = MagicMock()
+    page.exists.return_value = exists
+    page.isRedirectPage.return_value = is_redirect
+    if sha1 is None:
+        # Simulate a fetch failure to read the SHA1.
+        type(page).latest_file_info = property(
+            lambda _self: (_ for _ in ()).throw(RuntimeError("no info"))
+        )
+    else:
+        page.latest_file_info.sha1 = sha1
+    page.pageid = pageid
+    return page
+
+
+def test_detect_commons_dedup_skip_fires_when_target_has_different_sha1():
+    """The observed 91k-event class: target exists at intended title with
+    a real file whose SHA1 differs from ours. Return SKIPPED and bump the
+    dedicated dedup counter (plus the generic SKIPPED, mirroring how
+    UPLOAD_SKIPPED_NOT_PRESENT / _INELIGIBLE are counted)."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(exists=True, is_redirect=False, sha1="commons-sha1")
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is not None
+    assert result["status"] == "SKIPPED"
+    assert result["title"] == "File:Foo (page 2).pdf"
+    assert result["pageid"] == 42
+    assert tracker.count(Result.UPLOAD_SKIPPED_COMMONS_DEDUP) == 1
+    assert tracker.count(Result.SKIPPED) == 1
+
+
+def test_detect_commons_dedup_skip_returns_none_when_target_is_redirect():
+    """Target is a redirect — this is NOT the byte-drift class. Fall
+    through so the RuntimeError still raises and the shape stays
+    visible for future drift-resolution work."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(exists=True, is_redirect=True, sha1="commons-sha1")
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is None
+    assert tracker.count(Result.UPLOAD_SKIPPED_COMMONS_DEDUP) == 0
+
+
+def test_detect_commons_dedup_skip_returns_none_when_target_missing():
+    """Target doesn't exist. Also NOT byte-drift — probably a real
+    upload-attempt failure. Fall through."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(exists=False, is_redirect=False, sha1=None)
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is None
+    assert tracker.count(Result.UPLOAD_SKIPPED_COMMONS_DEDUP) == 0
+
+
+def test_detect_commons_dedup_skip_returns_none_when_sha1_matches():
+    """Target's SHA1 matches our S3 SHA1 — the pre-check should have
+    caught this earlier. This branch guards against the (theoretical)
+    case where the pre-check missed but the target genuinely holds
+    our bytes. Not byte-drift; fall through."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(exists=True, is_redirect=False, sha1="same-sha1")
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",
+            our_sha1="same-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is None
+
+
+def test_detect_commons_dedup_skip_returns_none_when_sha1_unreadable():
+    """Can't read the target's SHA1 — either the FilePage lookup threw
+    or ``latest_file_info`` raised. Don't classify as byte-drift when
+    we can't verify; fall through to the RuntimeError so the shape
+    stays visible."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(exists=True, is_redirect=False, sha1=None)
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is None
+
+
+def test_detect_commons_dedup_skip_returns_none_when_get_page_raises():
+    """API failure on the FilePage fetch itself — treat as
+    can't-verify, fall through. Prevents a transient Commons hiccup
+    from turning FAILEDs into false SKIPPEDs."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    with patch("tools.uploader.get_page", side_effect=RuntimeError("network down")):
+        result = uploader._detect_commons_dedup_skip(
+            page_title="File:Foo (page 2).pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=2,
+        )
+    assert result is None
+
+
+def test_handle_upload_exception_maps_possible_id_drift_to_distinct_message(caplog):
+    """A ``RuntimeError`` carrying the "possible ID drift" marker gets a
+    distinct log message ("unhandled drift shape") instead of collapsing
+    into the generic "Failed: Unknown". Reached only after
+    ``_detect_commons_dedup_skip`` ruled out the byte-drift class, so
+    the message intentionally reads as an actionable "we still need to
+    handle this shape" flag."""
+    import logging as _logging
+
+    with caplog.at_level(_logging.ERROR):
+        Uploader.handle_upload_exception(
+            RuntimeError("File linked to another page (possible ID drift)")
+        )
+    text = caplog.text
+    assert "Failed: File linked to another page (unhandled drift shape)" in text
+    assert "Failed: Unknown" not in text
 
 
 def _csrf_keyerror() -> KeyError:

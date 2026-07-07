@@ -339,6 +339,81 @@ class Uploader:
         # the gate (standalone / unit-test construction); main() injects one.
         self.dup_throttle = dup_throttle
 
+    def _detect_commons_dedup_skip(
+        self,
+        *,
+        page_title: str,
+        our_sha1: str,
+        dpla_id: str,
+        ordinal: int,
+    ) -> dict | None:
+        """Return an ``ORDINAL_SKIPPED`` result dict when the state at
+        ``page_title`` matches the "Commons-dedup byte-drift" pattern;
+        return ``None`` when it doesn't and the caller should keep its
+        RuntimeError path.
+
+        The pattern (from investigation of 109k historical events):
+        Commons has a real file at our expected title whose SHA1
+        differs from our S3 SHA1, typically by a single trailing byte.
+        Commons then treats every subsequent re-upload as a
+        "duplicate of current version" via a warning
+        ``IGNORE_WIKIMEDIA_WARNINGS`` doesn't cover — pywikibot returns
+        ``None`` from ``Site.upload()`` and the caller reaches here.
+        Nothing on Commons needs repair; the file is at the right
+        title with valid bytes, we just can't (and don't need to)
+        replace them. Reporting these as ``FAILED`` inflates the
+        counter and hides real drift-repair gaps in the same bucket.
+
+        The detection is intentionally narrow: only a real
+        (non-redirect) file at the exact expected title with a
+        readable, different SHA1 qualifies. Any other state — target
+        is a redirect, target doesn't exist, SHA1 unreadable — falls
+        through to the caller's RuntimeError so genuine
+        drift-repair gaps still surface as FAILED (which is
+        actionable: rerun after fix, investigate manually, or add
+        a new drift-resolution case).
+
+        Increments :attr:`Result.SKIPPED` + the dedicated
+        :attr:`Result.UPLOAD_SKIPPED_COMMONS_DEDUP` breakdown so the
+        SDC phase still targets the ordinal (its ``UPLOADED`` /
+        ``SKIPPED`` gate covers the correct file at the expected
+        title regardless of which counter fired) while the
+        summary keeps the byte-drift class audit-able.
+        """
+        try:
+            existing = get_page(self.site, page_title)
+            existing.exists()  # populate cache
+        except Exception as ex:
+            logging.warning(
+                f"Commons-dedup detection failed for {dpla_id} {ordinal}: "
+                f"could not fetch [[File:{page_title}]] ({ex!r}); "
+                f"falling through to RuntimeError."
+            )
+            return None
+        if not existing.exists() or existing.isRedirectPage():
+            return None
+        try:
+            existing_sha1 = existing.latest_file_info.sha1
+        except Exception:
+            return None
+        if not existing_sha1 or existing_sha1 == our_sha1:
+            return None
+        logging.info(
+            f"Skipping {dpla_id} {ordinal}: Commons-dedup byte-drift — "
+            f"target [[File:{page_title}]] already holds a real file "
+            f"(SHA1 {existing_sha1}) that Commons treats as a "
+            f"duplicate of our re-upload (our S3 SHA1 {our_sha1}). "
+            f"File on Commons is correct; nothing to repair. See "
+            f"``Result.UPLOAD_SKIPPED_COMMONS_DEDUP`` for the counter."
+        )
+        self.tracker.increment(Result.SKIPPED)
+        self.tracker.increment(Result.UPLOAD_SKIPPED_COMMONS_DEDUP)
+        return {
+            "status": ORDINAL_SKIPPED,
+            "title": page_title,
+            "pageid": existing.pageid,
+        }
+
     def _safe_upload(self, *, filepage, **kwargs):
         """Sole sanctioned wrapper around ``site.upload`` — every upload in
         this module MUST go through here so the no-create fence cannot be
@@ -1036,11 +1111,46 @@ class Uploader:
                     gc.collect()
 
                 if not result:
-                    # upload() returned None — file exists under a different page
-                    # title, likely due to DPLA ID drift between runs. The
-                    # ``raise`` below propagates to the generic
-                    # ``except Exception`` at the end of process_file, which
-                    # increments FAILED — no counter bump needed here.
+                    # ``site.upload()`` returned ``None`` — pywikibot's
+                    # signal that the upload response carried a warning
+                    # class our ``ignore_warnings`` list didn't cover.
+                    # Two very different situations reach here, and
+                    # they need to be reported very differently:
+                    #
+                    # 1. **Commons-dedup byte-drift** (the observed
+                    #    dominant class — 91k+ of the 109k historical
+                    #    events, mostly Ohio PDFs). The target title
+                    #    already holds a real file whose SHA1 does not
+                    #    match ours (a subtle byte difference; the
+                    #    file on Commons is one byte shorter than the
+                    #    S3 asset, likely from server-side ingest
+                    #    normalisation on the original upload).
+                    #    Commons rejects our re-upload as "duplicate
+                    #    of current version" via a warning that
+                    #    IGNORE_WIKIMEDIA_WARNINGS doesn't include.
+                    #    The file is CORRECT on Commons; nothing to
+                    #    repair. Reporting as FAILED inflates the
+                    #    counter and buries any real drift-repair
+                    #    gaps in the same log stream. Skip cleanly
+                    #    with a dedicated counter so operators can
+                    #    audit the drift class independently.
+                    # 2. **True unhandled drift** — target is still a
+                    #    redirect, or doesn't exist, or has an
+                    #    unexpected shape ``_resolve_hash_drift`` /
+                    #    the redirect-handler didn't cover. This IS
+                    #    a failure we need to see; keep the
+                    #    RuntimeError path so it lands in FAILED
+                    #    with a distinct log line (see
+                    #    ``handle_upload_exception``'s message
+                    #    mapping for the "possible ID drift" case).
+                    dedup_skipped = self._detect_commons_dedup_skip(
+                        page_title=page_title,
+                        our_sha1=sha1,
+                        dpla_id=dpla_id,
+                        ordinal=ordinal,
+                    )
+                    if dedup_skipped is not None:
+                        return dedup_skipped
                     raise RuntimeError(
                         "File linked to another page (possible ID drift)"
                     )
@@ -2031,6 +2141,18 @@ class Uploader:
             message = f"File exists, no change, {error_string}"
         elif ERROR_BACKEND_FAIL in error_string:
             message = "Wikimedia storage backend error (retries exhausted)"
+            error = True
+        elif "possible ID drift" in error_string:
+            # RuntimeError raised at the ``upload() returned None`` site
+            # in process_file. Reached only after
+            # ``_detect_commons_dedup_skip`` ruled out the byte-drift
+            # class, so what remains is a genuine drift-repair gap: the
+            # target is a redirect / missing / has no readable SHA1 /
+            # some shape ``_resolve_hash_drift`` and the redirect-
+            # handler didn't cover. Log distinctly so this doesn't
+            # disappear into "Failed: Unknown" and stays audit-able
+            # for future drift-resolution work.
+            message = "File linked to another page (unhandled drift shape)"
             error = True
 
         if error:
