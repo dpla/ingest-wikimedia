@@ -362,3 +362,240 @@ def test_priority_pool_release_does_not_leak_shared_slot(tmp_path):
     assert all(not _slot_is_held(str(shared_dir), i) for i in range(2)), (
         "shared slot must release when the uploader's with-block exits"
     )
+
+
+# ---- Parallel-worker gate + priority-holdings behaviour ----
+#
+# When an uploader session runs multiple workers (``--workers N``), the
+# session's slot budget carries a ``multiprocessing.Semaphore(1)`` gate
+# and a ``multiprocessing.Value('i', 0)`` counter to enforce:
+#
+#   (a) at most ONE shared-pool slot held per session, and
+#   (b) NO shared-pool slot held when the session also holds any
+#       priority slot.
+#
+# Tests below simulate the shared-across-workers state with plain
+# ``threading`` primitives (a threading.Semaphore(1) and a small object
+# with the same value/get_lock() surface as multiprocessing.Value) —
+# WorkerSlotBudget only uses those attributes, so a threading double is
+# a valid substitute in-process. Real cross-process coordination is
+# covered by mypy/importability + the multiprocessing.Value contract.
+
+
+class _FakeMPValue:
+    """Threading substitute for ``multiprocessing.Value('i', 0)``.
+
+    ``WorkerSlotBudget`` only touches ``.value`` and ``.get_lock()``.
+    Using a threading.Lock here lets in-process tests exercise the
+    same code paths without spawning subprocesses; the invariant the
+    class actually enforces (increment on grab, decrement on release,
+    atomically via the lock) is the same either way.
+    """
+
+    def __init__(self, initial: int = 0):
+        self.value = initial
+        self._lock = threading.Lock()
+
+    def get_lock(self):
+        return self._lock
+
+
+def test_fallback_gate_serialises_shared_pool_acquisition(tmp_path):
+    """When two workers of the SAME session both try to fall back to
+    shared, only one succeeds — the other is blocked by the gate
+    Semaphore and waits for priority instead. This is the invariant
+    that caps a 4-uploader worst case at 4 priority + 3 shared = 7
+    slots rather than 4 + 12."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=4, slot_dir=str(shared_dir))
+    gate = threading.Semaphore(1)
+    holdings = _FakeMPValue(0)
+    uploader = WorkerSlotBudget(
+        budget=2,
+        slot_dir=str(priority_dir),
+        fallback=shared,
+        fallback_gate=gate,
+        priority_holdings=holdings,
+    )
+    # Force fallback: hold both priority slots foreign.
+    with _foreign_flock(str(priority_dir), 0), _foreign_flock(str(priority_dir), 1):
+        # Worker 1 grabs a shared slot; hold it while probing Worker 2.
+        in_block = threading.Event()
+        release = threading.Event()
+
+        def worker1():
+            with uploader.acquire():
+                in_block.set()
+                release.wait(timeout=5)
+
+        t1 = threading.Thread(target=worker1)
+        t1.start()
+        assert in_block.wait(timeout=2), "worker1 never entered its acquire block"
+
+        # Exactly one shared slot must be held right now.
+        shared_held = sum(_slot_is_held(str(shared_dir), i) for i in range(4))
+        assert shared_held == 1, (
+            f"expected 1 shared slot held by worker1, got {shared_held}"
+        )
+
+        # Worker 2 tries to fall back — gate is taken, so it must NOT
+        # succeed while worker1 is still holding.
+        worker2_got_slot = threading.Event()
+
+        def worker2():
+            with uploader.acquire():
+                worker2_got_slot.set()
+
+        t2 = threading.Thread(target=worker2)
+        t2.start()
+        assert not worker2_got_slot.wait(timeout=0.6), (
+            "worker2 acquired a shared slot while worker1 already held one; "
+            "gate should have blocked it"
+        )
+        # Shared holdings still at 1, not 2.
+        assert sum(_slot_is_held(str(shared_dir), i) for i in range(4)) == 1
+
+        # Release worker1 → worker2 can now proceed (grabs gate + shared).
+        release.set()
+        assert worker2_got_slot.wait(timeout=3), (
+            "worker2 did not proceed after worker1 released the gate"
+        )
+        t1.join(timeout=1)
+        t2.join(timeout=1)
+
+
+def test_fallback_skipped_when_session_already_holds_priority(tmp_path):
+    """A session that already holds a priority slot must NOT spill
+    into shared for a subsequent worker's acquire, even if all
+    remaining priority slots are held by other sessions. Enforces the
+    invariant "hold priority OR shared, never both" per session."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=4, slot_dir=str(shared_dir))
+    gate = threading.Semaphore(1)
+    holdings = _FakeMPValue(0)
+    uploader = WorkerSlotBudget(
+        budget=2,
+        slot_dir=str(priority_dir),
+        fallback=shared,
+        fallback_gate=gate,
+        priority_holdings=holdings,
+    )
+
+    in_block = threading.Event()
+    release = threading.Event()
+
+    # Worker 1 grabs a priority slot (slot-0). While it holds:
+    def worker1():
+        with uploader.acquire():
+            in_block.set()
+            release.wait(timeout=5)
+
+    t1 = threading.Thread(target=worker1)
+    t1.start()
+    assert in_block.wait(timeout=2)
+    assert holdings.value == 1, "priority_holdings should increment on grab"
+
+    # Simulate another session holding the remaining priority slot so
+    # Worker 2 would spill to shared under the OLD semantics.
+    with _foreign_flock(str(priority_dir), 1):
+        worker2_took_slot = threading.Event()
+        worker2_took_shared = []
+
+        def worker2():
+            with uploader.acquire():
+                worker2_took_shared.append(
+                    any(_slot_is_held(str(shared_dir), i) for i in range(4))
+                )
+                worker2_took_slot.set()
+
+        t2 = threading.Thread(target=worker2)
+        t2.start()
+        # Session already holds a priority slot via worker1, so worker2
+        # must wait for priority — MUST NOT fall back to shared.
+        assert not worker2_took_slot.wait(timeout=0.6), (
+            "worker2 acquired while session already holds priority — "
+            "shared-pool fallback must be inhibited"
+        )
+        # Shared pool must remain untouched.
+        assert not any(_slot_is_held(str(shared_dir), i) for i in range(4)), (
+            "shared pool should remain empty when session already holds priority"
+        )
+
+        # Release worker1's priority slot → worker2 can grab it (still
+        # priority, not shared, because holdings drops to 0 and slot-0
+        # is free while slot-1 stays foreign-held).
+        release.set()
+        assert worker2_took_slot.wait(timeout=3)
+        assert worker2_took_shared == [False], (
+            f"worker2 should have taken a priority slot, not shared; "
+            f"took_shared={worker2_took_shared}"
+        )
+    t1.join(timeout=1)
+    t2.join(timeout=1)
+    assert holdings.value == 0, (
+        "priority_holdings should decrement back to 0 after all workers release"
+    )
+
+
+def test_gate_released_alongside_fd(tmp_path):
+    """The gate acquired for a shared-pool grab must release when the
+    with-block exits, so a subsequent acquire on the same session can
+    grab shared again. Otherwise a session that took shared once
+    would permanently lock out its own future shared attempts."""
+    priority_dir = tmp_path / "priority"
+    shared_dir = tmp_path / "shared"
+    priority_dir.mkdir()
+    shared_dir.mkdir()
+    shared = WorkerSlotBudget(budget=2, slot_dir=str(shared_dir))
+    gate = threading.Semaphore(1)
+    holdings = _FakeMPValue(0)
+    uploader = WorkerSlotBudget(
+        budget=1,
+        slot_dir=str(priority_dir),
+        fallback=shared,
+        fallback_gate=gate,
+        priority_holdings=holdings,
+    )
+    # Force fallback both times.
+    with _foreign_flock(str(priority_dir), 0):
+        with uploader.acquire():
+            # Gate is held here; a non-blocking acquire would fail.
+            assert not gate.acquire(blocking=False), (
+                "gate must be held while inside the with-block"
+            )
+        # Gate must be released now.
+        assert gate.acquire(blocking=False), (
+            "gate must be released when the with-block exits"
+        )
+        gate.release()
+        # A second acquire should succeed (gate free).
+        with uploader.acquire():
+            pass
+
+
+def test_priority_holdings_counter_decrements_on_exception(tmp_path):
+    """A with-block that raises still decrements ``priority_holdings``
+    so the session's counter doesn't leak on transient errors."""
+    priority_dir = tmp_path / "priority"
+    priority_dir.mkdir()
+    holdings = _FakeMPValue(0)
+    uploader = WorkerSlotBudget(
+        budget=2,
+        slot_dir=str(priority_dir),
+        priority_holdings=holdings,
+    )
+    try:
+        with uploader.acquire():
+            assert holdings.value == 1
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert holdings.value == 0, (
+        "priority_holdings must decrement even when the with-block raises"
+    )
