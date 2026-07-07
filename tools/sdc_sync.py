@@ -4533,6 +4533,13 @@ def _post_sdc_cleanup_for_page(
                 f" -- cleanup: legacy migration of '{file_page.title()}'"
                 f" for {dpla_id} failed; skipping."
             )
+            # Surface post-SDC migration failures in the Slack summary
+            # via the same counter the standalone migration-mode path
+            # uses. Previously this branch logged the traceback and
+            # returned False — the log line survived but the counter
+            # was never touched, so the summary reported zero problems
+            # even when every migration in the run had failed.
+            tracker.increment(Result.LEGACY_SKIPPED_ERROR)
             return False
         return bool(getattr(result, "wikitext_changed", False))
 
