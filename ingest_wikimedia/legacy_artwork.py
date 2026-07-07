@@ -1387,11 +1387,16 @@ def _inject_preserved_extras(text: str, extras: dict[str, str]) -> str:
         )
     # Force a newline right after the opening ``{{DPLA metadata`` so
     # the first ``| key = value`` starts on its own line, matching
-    # the multi-line shape a fresh ``get_wiki_text`` emits.
-    # mwparserfromhell doesn't expose that first-class; a targeted
-    # string replace is safe because ``{{DPLA metadata`` is a fixed
-    # sentinel and the empty template is a controlled shape.
-    return str(wikicode).replace("{{DPLA metadata|", "{{DPLA metadata\n|")
+    # the multi-line shape a fresh ``get_wiki_text`` emits. Appending
+    # ``"\n"`` to the template's own ``name`` attribute scopes the
+    # change to this template node — a page-wide string replace
+    # would also rewrite the same literal if it appeared inside a
+    # preserved extra (e.g. a nested template inside a user's
+    # gallery caption).
+    name_str = str(target.name)
+    if not name_str.endswith("\n"):
+        target.name = name_str + "\n"
+    return str(wikicode)
 
 
 # Edit summary the migration executor stamps on every wikitext save +

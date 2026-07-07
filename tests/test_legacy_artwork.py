@@ -2262,6 +2262,29 @@ def test_inject_preserved_extras_matches_fresh_upload_layout():
     assert "[[Category:Example]]" in injected
 
 
+def test_inject_preserved_extras_scoped_to_template_node_not_page_wide():
+    """Regression: newline-insertion must target the ``{{DPLA metadata}}``
+    template node only, not the whole serialised page. If a preserved
+    extra ever contains the literal ``{{DPLA metadata|`` (e.g. a nested
+    template inside a user's gallery caption, or an embedded example),
+    a page-wide string replace would rewrite that literal too and
+    corrupt the user's contribution."""
+    from ingest_wikimedia.legacy_artwork import _inject_preserved_extras
+
+    poisoned = (
+        "\nSee also the wrapper docs: <code>{{DPLA metadata|title=example}}</code>"
+    )
+    injected = _inject_preserved_extras("{{DPLA metadata}}", {"description": poisoned})
+    assert poisoned in injected, (
+        "extras value must survive verbatim — the newline insertion must "
+        f"not touch matches inside the value. Got: {injected!r}"
+    )
+    assert "{{DPLA metadata|title=example}}" in injected, (
+        "inline ``{{DPLA metadata|title=example}}`` inside the description "
+        f"extras was rewritten. Got: {injected!r}"
+    )
+
+
 def test_inject_preserved_extras_preserves_value_verbatim():
     """The extras value goes in byte-identical (aside from a trailing
     newline the layout helper appends when absent). No stripping of
