@@ -163,6 +163,23 @@ class WorkerSlotBudget:
     DIFFERENT directory and a DIFFERENT lock-file set, so they're
     accounted for separately and SDC workers using only the fallback
     can never lock priority slots.
+
+    Optional ``fallback_gate`` + ``priority_holdings`` (uploader
+    parallel-workers case): when a session runs multiple workers
+    (``--workers N``), we want it to greedily take priority slots
+    (up to N) while capping its shared-pool usage at AT MOST ONE slot
+    per session — so 4 concurrent uploader sessions occupy 4 priority
+    + 3 shared = 7 slots worst-case, not 4 + 12. ``fallback_gate`` is
+    a ``multiprocessing.Semaphore(1)`` shared across the session's
+    pool workers; a worker MUST hold this gate to attempt the
+    fallback pool. ``priority_holdings`` is a ``multiprocessing.Value
+    ('i', 0)`` shared across the same pool, incremented on priority-
+    slot grab and decremented on release. When ``priority_holdings >
+    0`` (i.e. this session already holds at least one priority slot),
+    subsequent workers skip the fallback path entirely and wait for
+    priority — the shared slot naturally drops out of the session's
+    holdings on its next item boundary, without needing an active
+    "yield my shared slot now" signal.
     """
 
     def __init__(
@@ -170,10 +187,14 @@ class WorkerSlotBudget:
         budget: int,
         slot_dir: str = DEFAULT_SLOT_DIR,
         fallback: "WorkerSlotBudget | None" = None,
+        fallback_gate=None,
+        priority_holdings=None,
     ):
         self.budget = budget
         self.slot_dir = slot_dir
         self.fallback = fallback
+        self.fallback_gate = fallback_gate
+        self.priority_holdings = priority_holdings
         # Cumulative seconds this process spent blocked in acquire() waiting
         # for a free slot. ~0 when the budget isn't contended; grows under
         # saturation. Callers read it to report slot contention.
@@ -238,9 +259,11 @@ class WorkerSlotBudget:
             return
 
         fd = None
+        got_priority = False
+        gate_held = False
         try:
             start = time.monotonic()
-            fd = self._acquire_slot_fd()
+            fd, got_priority, gate_held = self._acquire_slot_fd()
             self.total_wait_seconds += time.monotonic() - start
             yield
         finally:
@@ -248,6 +271,11 @@ class WorkerSlotBudget:
                 # Closing the fd releases the flock. No explicit
                 # LOCK_UN needed — close is the documented release.
                 os.close(fd)
+            if got_priority and self.priority_holdings is not None:
+                with self.priority_holdings.get_lock():
+                    self.priority_holdings.value -= 1
+            if gate_held and self.fallback_gate is not None:
+                self.fallback_gate.release()
 
     def _try_acquire_one_pass(self) -> int | None:
         """One non-blocking scan over this budget's slot files. Returns
@@ -277,9 +305,8 @@ class WorkerSlotBudget:
                 raise
         return None
 
-    def _acquire_slot_fd(self) -> int:
-        """Block until a slot is free in this budget or its fallback;
-        return the held fd.
+    def _acquire_slot_fd(self) -> tuple[int, bool, bool]:
+        """Block until a slot is free; return ``(fd, got_priority, gate_held)``.
 
         Tries the primary pool first (single non-blocking pass), then —
         only if all primary slots are held — the fallback pool. Sleeps
@@ -287,21 +314,35 @@ class WorkerSlotBudget:
         returned fd; closing releases the flock regardless of which
         pool's directory it came from.
 
-        The priority order (primary > fallback) is what makes the
-        uploader's dedicated pool actually a priority pool: the uploader
-        consistently gets a dedicated slot first if any are free, and
-        only spills into the shared pool when its own four slots are
-        exhausted by other simultaneously-running uploaders.
+        ``got_priority`` is True iff the returned fd came from THIS
+        budget (primary). Caller uses it to know whether to decrement
+        :attr:`priority_holdings` when releasing.
+
+        ``gate_held`` is True iff the returned fd came from the fallback
+        pool via successfully acquiring :attr:`fallback_gate`. Caller
+        uses it to know whether to release the gate alongside the fd.
+
+        Fallback path is gated by two conditions when both are
+        configured: :attr:`priority_holdings` must be 0 at check time
+        AND :attr:`fallback_gate` must be acquirable non-blockingly.
+        Re-checks ``priority_holdings`` after grabbing the gate to
+        close the race window where another worker took a priority
+        slot between the initial check and the gate acquisition — a
+        session that has ANY priority holding must never also take a
+        shared slot per the invariant.
         """
         waited_logged = False
         while True:
             fd = self._try_acquire_one_pass()
             if fd is not None:
-                return fd
-            if self.fallback is not None:
-                fd = self.fallback._try_acquire_one_pass()
+                if self.priority_holdings is not None:
+                    with self.priority_holdings.get_lock():
+                        self.priority_holdings.value += 1
+                return fd, True, False
+            if self.fallback is not None and self._session_may_use_fallback():
+                fd, gate_held = self._try_fallback_with_gate()
                 if fd is not None:
-                    return fd
+                    return fd, False, gate_held
             # Every slot busy across primary AND fallback. Log once so an
             # operator watching the log can see the budget is saturated
             # (expected under heavy concurrency), then poll.
@@ -314,3 +355,53 @@ class WorkerSlotBudget:
                 )
                 waited_logged = True
             time.sleep(_POLL_INTERVAL_SECONDS)
+
+    def _session_may_use_fallback(self) -> bool:
+        """True iff this session hasn't already claimed a priority slot.
+
+        Returning False here forces the caller to keep waiting on the
+        primary pool instead of spilling into fallback — preserving the
+        invariant that a session holding ANY priority slot must not also
+        hold a shared-pool slot. When :attr:`priority_holdings` isn't
+        configured (single-worker uploaders, sdc-sync), unconditionally
+        True — the invariant only applies to the parallel-worker case.
+        """
+        if self.priority_holdings is None:
+            return True
+        with self.priority_holdings.get_lock():
+            return self.priority_holdings.value == 0
+
+    def _try_fallback_with_gate(self) -> tuple[int | None, bool]:
+        """Attempt one fallback-pool acquisition, gated by
+        :attr:`fallback_gate` (per-session Semaphore(1)) when set.
+
+        Returns ``(fd, gate_held)``. ``fd`` is None on failure (gate
+        contended, or gate acquired but no fallback slot free, or
+        holdings-recheck aborted the attempt). Never blocks — polling
+        is the caller's job.
+        """
+        # No gate configured (sdc-sync single-worker legacy path):
+        # try fallback directly. gate_held stays False.
+        if self.fallback_gate is None:
+            fd = self.fallback._try_acquire_one_pass()
+            return fd, False
+
+        # Non-blocking gate acquire. Another worker in this session
+        # already holds it → skip fallback this iteration.
+        if not self.fallback_gate.acquire(False):
+            return None, False
+
+        # Gate held. Re-check priority_holdings to close the race
+        # window where another worker got a priority slot between the
+        # caller's initial check and this point.
+        if self.priority_holdings is not None:
+            with self.priority_holdings.get_lock():
+                if self.priority_holdings.value > 0:
+                    self.fallback_gate.release()
+                    return None, False
+
+        fd = self.fallback._try_acquire_one_pass()
+        if fd is None:
+            self.fallback_gate.release()
+            return None, False
+        return fd, True

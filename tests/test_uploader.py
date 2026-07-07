@@ -1516,8 +1516,13 @@ def test_main_acquires_one_budget_slot_per_item():
             # (load_ids is mocked, so contents don't matter).
             with open("ids.csv", "w") as fh:
                 fh.write("id_a\nid_b\nid_c\n")
+            # ``--workers 1`` forces the legacy single-process for-loop
+            # path this test targets — the ``workers > 1`` branch dispatches
+            # into a multiprocessing.spawn Pool, which would re-import the
+            # test module and hang under CliRunner.
             result = runner.invoke(
-                up.main, ["ids.csv", "nara", "--workers-budget", "16"]
+                up.main,
+                ["ids.csv", "nara", "--workers-budget", "16", "--workers", "1"],
             )
 
     assert result.exit_code == 0, result.output
@@ -1545,6 +1550,89 @@ def test_main_acquires_one_budget_slot_per_item():
     )
     assert all(b is priority for b in acquire_calls), (
         "per-item loop must acquire on the priority (outer) budget, not the shared one"
+    )
+
+
+def test_main_dispatches_to_pool_when_workers_gt_one():
+    """When ``--workers > 1``, main() must skip the single-process for-loop
+    and hand the item list to ``_run_upload_pool`` — the parent process
+    should NOT call ``Uploader.process_item`` itself, since the workers
+    do that inside their own processes."""
+    from click.testing import CliRunner
+
+    import tools.uploader as up
+
+    pool_calls: list[dict] = []
+
+    def fake_run_pool(**kwargs):
+        pool_calls.append(kwargs)
+        # Simulate the pool having populated the parent's newly_created
+        # set (each worker's CategoryEnsurer union).
+        kwargs["newly_created"].add("Q_worker_created")
+        # And having accounted for one deferred item so main()'s sidecar
+        # merge path also gets exercised.
+        kwargs["deferred"]["deferred_id"] = 2
+
+    fake_ctx = MagicMock()
+    fake_ctx.get_tracker.return_value = Tracker()
+    fake_ctx.get_local_fs.return_value = MagicMock()
+    fake_ctx.get_s3_client.return_value = MagicMock()
+    fake_dpla = MagicMock()
+    fake_dpla.get_providers_data.return_value = {}
+    fake_ctx.get_dpla.return_value = fake_dpla
+
+    fake_ensurer = MagicMock()
+    fake_ensurer._newly_created = set()
+
+    process_item_calls = []
+
+    def track_process_item(*args, **kwargs):
+        process_item_calls.append(args)
+
+    with (
+        patch.object(up.ToolsContext, "init", return_value=fake_ctx),
+        patch.object(up, "get_site", return_value=MagicMock()),
+        patch.object(up, "CategoryEnsurer", return_value=fake_ensurer),
+        patch.object(up, "setup_logging"),
+        patch.object(up, "notify_phase_start"),
+        patch.object(up, "notify_upload_complete"),
+        patch.object(up, "_post_upload_touch_new_institutions"),
+        patch.object(
+            up, "load_ids", return_value=["id_a", "id_b", "id_c"]
+        ),
+        patch.object(up.Uploader, "process_item", side_effect=track_process_item),
+        patch.object(up, "_run_upload_pool", side_effect=fake_run_pool),
+        patch.object(up.drain_sidecar, "merge_sidecar", return_value=["deferred_id"]),
+    ):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with open("ids.csv", "w") as fh:
+                fh.write("id_a\nid_b\nid_c\n")
+            result = runner.invoke(
+                up.main,
+                ["ids.csv", "nara", "--workers-budget", "16", "--workers", "3"],
+            )
+
+    assert result.exit_code == 0, result.output
+    assert len(pool_calls) == 1, "pool dispatch must fire exactly once"
+    kwargs = pool_calls[0]
+    assert kwargs["workers"] == 3
+    assert kwargs["dpla_ids"] == ["id_a", "id_b", "id_c"]
+    assert kwargs["partner"] == "nara"
+    assert kwargs["deferred"] == {"deferred_id": 2}, (
+        "pool must have received the parent-owned deferred dict so the "
+        "post-loop drain-sidecar merge sees deferred items from every worker"
+    )
+    assert kwargs["newly_created"] == {"Q_worker_created"}, (
+        "pool must have received the parent-owned newly_created set "
+        "so post-upload touches cover institutions any worker created"
+    )
+    assert process_item_calls == [], (
+        "parent process must NOT call process_item itself when the pool runs"
+    )
+    assert "Q_worker_created" in fake_ensurer._newly_created, (
+        "worker-created institution QIDs must be folded back into the "
+        "parent ensurer so _post_upload_touch_new_institutions sees them"
     )
 
 
