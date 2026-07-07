@@ -517,7 +517,10 @@ _CREATOR_WIKIDATA_RE = re.compile(
 
 # ``{{Creator:Theodore E. Peiser}}`` — Commons Creator: namespace page
 # transclusion (no Wikidata= param, resolved later via Commons API).
-_CREATOR_PAGE_RE = re.compile(r"^\s*\{\{\s*Creator:([^}|]+?)\s*\}\}\s*$")
+# Case-insensitive on the ``Creator:`` prefix because MediaWiki auto-
+# capitalises the namespace on a template transclusion; both
+# ``{{Creator:Foo}}`` and ``{{creator:Foo}}`` resolve to the same page.
+_CREATOR_PAGE_RE = re.compile(r"^\s*\{\{\s*Creator:([^}|]+?)\s*\}\}\s*$", re.IGNORECASE)
 
 # ``{{NARA-Author|Adams, Ansel, 1902-1984, Photographer|1332556}}`` —
 # legacy bot-authored NARA authorship template. Never a genuine
@@ -585,10 +588,19 @@ def _parse_creator_shape(value: str) -> str | None:
       find the linked Wikidata QID and either preserve it as
       P170 QID or fall back to a P170 somevalue + P2093 stated-as
       claim when the Creator: page has no Wikibase link.
-    * The unchanged ``value`` string for anything else — a plain
-      stated-as name (``Peiser, Theodore E``) or an unrecognised
-      shape. Passes through to the existing string-based comparator
-      + claim-builder path unchanged.
+    * The unchanged ``value`` string for anything that is *not*
+      template-shaped — a plain stated-as name
+      (``Peiser, Theodore E``), an already-expanded creator string
+      from any source. Passes through to the existing string-based
+      comparator + claim-builder path unchanged.
+    * ``None`` for any template-shaped value that doesn't match one
+      of the recognised shapes above — e.g. an unknown ``{{Foo}}``
+      wrapper, or a shape we haven't taught the parser about. Preserves
+      the "strip when we can't safely preserve" invariant: submitting
+      literal ``{{…}}`` markup as a P2093 stated-as string would be
+      both wrong (SDC shouldn't store wikitext) and hard to unwind
+      later. Deferring to a later phase that widens the recognised
+      set is safer than emitting nonsense claims now.
     """
     stripped = value.strip()
     if not stripped:
@@ -601,6 +613,11 @@ def _parse_creator_shape(value: str) -> str | None:
     m = _CREATOR_PAGE_RE.match(stripped)
     if m:
         return _CREATOR_PAGE_PREFIX + m.group(1).strip()
+    # Any remaining ``{{…}}`` template-shaped value we don't recognise
+    # is dropped rather than passed through as a raw string. See the
+    # returns-``None`` clause of the docstring for the rationale.
+    if stripped.startswith("{{") and stripped.endswith("}}"):
+        return None
     return stripped
 
 

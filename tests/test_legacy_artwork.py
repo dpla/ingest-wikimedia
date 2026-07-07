@@ -2554,3 +2554,52 @@ def test_plan_migration_extracts_infi_creator_with_wikidata_qid():
     )
     assert plan is not None
     assert plan.community_imports.get("creator") == (_CREATOR_QID_PREFIX + "Q56159174")
+
+
+def test_parse_creator_shape_matches_creator_page_case_insensitively():
+    """MediaWiki auto-capitalises the ``Creator:`` namespace on
+    template transclusions, so ``{{creator:Foo}}`` and ``{{Creator:Foo}}``
+    both resolve to the same page. The parser matches both."""
+    from ingest_wikimedia.legacy_artwork import (
+        _parse_creator_shape,
+        _CREATOR_PAGE_PREFIX,
+    )
+
+    assert _parse_creator_shape("{{creator:Theodore E. Peiser}}") == (
+        _CREATOR_PAGE_PREFIX + "Theodore E. Peiser"
+    )
+    assert _parse_creator_shape("{{CREATOR:Theodore E. Peiser}}") == (
+        _CREATOR_PAGE_PREFIX + "Theodore E. Peiser"
+    )
+
+
+def test_parse_creator_shape_strips_unknown_template_shapes():
+    """Any template-shaped value that doesn't match one of the
+    recognised creator shapes is dropped rather than passed through
+    as a literal string. Submitting raw ``{{…}}`` markup as a P2093
+    stated-as would be both wrong (SDC shouldn't store wikitext) and
+    a maintenance burden to reverse later. Deferring to a later phase
+    that widens the recognised set is safer than emitting nonsense
+    claims now."""
+    from ingest_wikimedia.legacy_artwork import _parse_creator_shape
+
+    # An unknown creator-authoring template shape.
+    assert _parse_creator_shape("{{some-unknown-creator-template|Foo Bar}}") is None
+    # A partially-typed Creator: shape that misses ``_CREATOR_PAGE_RE``
+    # (contains pipe → treated as a template with args rather than a
+    # bare page transclusion). Better to strip than to emit
+    # ``P2093="{{Creator:Foo|extra}}"``.
+    assert _parse_creator_shape("{{Creator:Foo|extra}}") is None
+
+
+def test_parse_creator_shape_passes_through_plain_names():
+    """Regression: plain-string creator names still pass through
+    unchanged. The unknown-template guard only fires on ``{{…}}``-
+    wrapped values."""
+    from ingest_wikimedia.legacy_artwork import _parse_creator_shape
+
+    assert _parse_creator_shape("Peiser, Theodore E") == "Peiser, Theodore E"
+    # A name that happens to contain balanced braces mid-string (not a
+    # template) must still pass through — the guard checks bounds, not
+    # substring occurrence.
+    assert _parse_creator_shape("Smith, John (author)") == "Smith, John (author)"
