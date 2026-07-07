@@ -240,12 +240,7 @@ def test_parse_artwork_params_pipe_overflow_with_equals_fragment_is_dropped():
     handling it would require a wider allowlist-based heuristic. If
     we ever fix this, the test flips to assert successful stitching.
     """
-    literal_pipe_form = (
-        "{{Artwork\n"
-        "| description = A | region=north\n"
-        "| date = 1937\n"
-        "}}"
-    )
+    literal_pipe_form = "{{Artwork\n| description = A | region=north\n| date = 1937\n}}"
     p = parse_artwork_params(literal_pipe_form)
     # Current behavior: ``region=north`` is dropped because mwparserfromhell
     # parses it as a named param and stitching only rejoins positional
@@ -253,10 +248,7 @@ def test_parse_artwork_params_pipe_overflow_with_equals_fragment_is_dropped():
     assert p == {"description": "A", "date": "1937"}
     # For contrast, the {{!}} form keeps the whole value:
     magic_word_form = (
-        "{{Artwork\n"
-        "| description = A {{!}} region=north\n"
-        "| date = 1937\n"
-        "}}"
+        "{{Artwork\n| description = A {{!}} region=north\n| date = 1937\n}}"
     )
     q = parse_artwork_params(magic_word_form)
     assert q == {"description": "A | region=north", "date": "1937"}
@@ -2072,3 +2064,214 @@ def test_plan_migration_preserves_question_marked_date_override():
     plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="1902"))
     assert plan is not None
     assert plan.community_imports == {"date": "1902?"}
+
+
+# ---------------------------------------------------------------------------
+# plan_migration — DPLA-prefixed extension (this commit).
+# A community editor extends a DPLA-authored template parameter by
+# appending structural wikitext (gallery, HR, wikitable, list, embedded
+# template) past the DPLA-authored text. Since Wikibase's monolingual-
+# text validator rejects vertical whitespace, the extras can't be
+# submitted as an SDC monolingualtext claim — but the DPLA prefix is
+# still intact and shouldn't be treated as community divergence.
+# The extras go to ``wikitext_preserved_extras`` for injection into
+# the migrated ``{{DPLA metadata}}`` template's own parameter; no SDC
+# import fires for that key.
+# ---------------------------------------------------------------------------
+
+
+_DPLA_SENTENCE = (
+    'Transcribed from photograph: "Portraits. Group. Faculty of Central '
+    'School. Opening day, May 7, 1883."'
+)
+
+
+def test_plan_migration_gallery_extension_preserves_extras_not_import():
+    """The mockup case: user appends ``----`` + ``<gallery>`` after the
+    DPLA sentence. The DPLA prefix stays DPLA-attributed (no
+    community-import for description), and the ``----\\n<gallery>``
+    block lands verbatim in ``wikitext_preserved_extras`` so the
+    migration executor can inject it onto the migrated template."""
+    extras = (
+        "\n----\n<gallery>\nFile:one.jpg|caption 1\nFile:two.jpg|caption 2\n</gallery>"
+    )
+    extended = _DPLA_SENTENCE + extras
+    revs = _make_revs(
+        (1, "DPLA_bot", f"{{{{Artwork|description={_DPLA_SENTENCE}}}}}"),
+        (2, "Editor1", f"{{{{Artwork|description={extended}}}}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(description=_DPLA_SENTENCE)
+    )
+    assert plan is not None
+    assert "description" not in plan.community_imports, (
+        "extension case must not emit an inferred-from-Wikitext claim; "
+        "Wikibase would reject the vertical whitespace"
+    )
+    assert plan.wikitext_preserved_extras.get("description") == extras
+
+
+def test_plan_migration_hr_only_extension_preserves_extras():
+    """No gallery, just an HR + extra prose. The rule is structural-
+    marker-agnostic — presence of a vertical whitespace boundary plus a
+    matching DPLA prefix is all that's required."""
+    extras = "\n----\nAdditional context added by Commons editor."
+    extended = _DPLA_SENTENCE + extras
+    revs = _make_revs(
+        (1, "DPLA_bot", f"{{{{Artwork|description={_DPLA_SENTENCE}}}}}"),
+        (2, "Editor1", f"{{{{Artwork|description={extended}}}}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(description=_DPLA_SENTENCE)
+    )
+    assert plan is not None
+    assert "description" not in plan.community_imports
+    assert plan.wikitext_preserved_extras.get("description") == extras
+
+
+def test_plan_migration_bulleted_list_extension_preserves_extras():
+    """A user-added bulleted list past the DPLA sentence — the shape
+    Ohio Cleveland Public Library used to link to related Wikipedia
+    entries (the class the log survey identified as the biggest
+    silent-skip source, 64 events / 3 unique DPLA IDs)."""
+    extras = (
+        "\n* [https://en.wikipedia.org/wiki/John_Doe John Doe]"
+        "\n* [https://en.wikipedia.org/wiki/Jane_Roe Jane Roe]"
+    )
+    extended = _DPLA_SENTENCE + extras
+    revs = _make_revs(
+        (1, "DPLA_bot", f"{{{{Artwork|description={_DPLA_SENTENCE}}}}}"),
+        (2, "Editor1", f"{{{{Artwork|description={extended}}}}}"),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(description=_DPLA_SENTENCE)
+    )
+    assert plan is not None
+    assert "description" not in plan.community_imports
+    assert plan.wikitext_preserved_extras.get("description") == extras
+
+
+def test_plan_migration_scalar_edit_stays_on_divergence_path():
+    """No vertical whitespace = not extension. A single-line reformat
+    like ``1949`` → ``1949-02-01`` is a genuine value replacement, not
+    an extension, and belongs on the ordinary community-import path so
+    the community's more-specific value gets an inferred-from-Wikitext
+    SDC claim."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|date=1949}}"),
+        (2, "Editor1", "{{Artwork|date=1949-02-01}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="1949"))
+    assert plan is not None
+    assert plan.community_imports == {"date": "1949-02-01"}
+    assert "date" not in plan.wikitext_preserved_extras
+
+
+def test_plan_migration_extension_prefix_must_match_canonical():
+    """A wikitext value that CONTAINS vertical whitespace but whose
+    prefix doesn't match canonical is not extension — it's a full
+    replacement that happens to have multiple lines. Falls through to
+    the ordinary community-import path (which will hit the pre-flight
+    validator and raise ``InvalidWikibaseTextValue``, catching the
+    unhandled shape loudly instead of silently mis-classifying it as
+    an extension)."""
+    revs = _make_revs(
+        (1, "DPLA_bot", f"{{{{Artwork|description={_DPLA_SENTENCE}}}}}"),
+        (
+            2,
+            "Editor1",
+            "{{Artwork|description=Totally different first line.\n"
+            "Followed by a second line.}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(description=_DPLA_SENTENCE)
+    )
+    assert plan is not None
+    assert "description" in plan.community_imports
+    assert "description" not in plan.wikitext_preserved_extras
+
+
+def test_format_legacy_import_claim_rejects_vertical_whitespace():
+    """Pre-flight validator refuses to build a monolingualtext claim
+    whose value contains vertical whitespace. This is belt-and-suspenders
+    — plan_migration should route such values to
+    ``wikitext_preserved_extras`` instead — but if a shape slips past
+    the extraction heuristic, the failure surfaces here with a clear
+    "value X for property Y failed local validation" message rather
+    than as a Wikibase APIError traceback."""
+    from ingest_wikimedia.legacy_artwork import InvalidWikibaseTextValue
+
+    with pytest.raises(InvalidWikibaseTextValue) as exc:
+        format_legacy_import_claim(
+            "description",
+            "line one\nline two",
+            "https://commons.wikimedia.org/w/index.php?title=X&oldid=1",
+        )
+    assert "description" in str(exc.value)
+    assert "P10358" in str(exc.value)
+
+
+def test_format_legacy_import_claim_rejects_leading_trailing_whitespace():
+    """Wikibase also rejects leading/trailing whitespace on monolingual
+    values (same validator, same rule). Same client-side pre-flight
+    behaviour."""
+    from ingest_wikimedia.legacy_artwork import InvalidWikibaseTextValue
+
+    with pytest.raises(InvalidWikibaseTextValue):
+        format_legacy_import_claim(
+            "description",
+            "   trailing space around a value   ",
+            "https://commons.wikimedia.org/w/index.php?title=X&oldid=1",
+        )
+
+
+def test_format_legacy_import_claim_accepts_clean_multiline_free_value():
+    """Sanity — a clean scalar description still passes and produces a
+    normal monolingualtext claim."""
+    claim = format_legacy_import_claim(
+        "description",
+        "Clean single-line description.",
+        "https://commons.wikimedia.org/w/index.php?title=X&oldid=1",
+    )
+    assert claim is not None
+    assert claim["mainsnak"]["datavalue"]["value"]["text"] == (
+        "Clean single-line description."
+    )
+
+
+def test_inject_preserved_extras_matches_fresh_upload_layout():
+    """Layout regression: injected extras must land in the same
+    multi-line ``{{DPLA metadata\\n| key = value\\n}}`` shape that a
+    fresh upload emits, not jammed onto the opening ``{{`` line. A
+    migrated file should read the same as a freshly-uploaded one so
+    operators reviewing diffs don't have to distinguish shapes."""
+    from ingest_wikimedia.legacy_artwork import _inject_preserved_extras
+
+    empty = "== {{int:filedesc}} ==\n\n{{DPLA metadata}}\n\n[[Category:Example]]\n"
+    extras = {"description": ("\n----\n<gallery>\nFile:one.jpg|front\n</gallery>")}
+    injected = _inject_preserved_extras(empty, extras)
+    assert "{{DPLA metadata\n| description =" in injected, (
+        f"expected first param on its own line; got: {injected!r}"
+    )
+    assert injected.rstrip().endswith("}}\n\n[[Category:Example]]".rstrip()) or (
+        "</gallery>\n}}" in injected
+    ), f"expected closing }} on its own line; got: {injected!r}"
+    # Category preservation — the injection must not disturb what comes
+    # after the template.
+    assert "[[Category:Example]]" in injected
+
+
+def test_inject_preserved_extras_preserves_value_verbatim():
+    """The extras value goes in byte-identical (aside from a trailing
+    newline the layout helper appends when absent). No stripping of
+    ``----``, ``<br />``, blank lines, headings, or any specific
+    marker — the user's structural markup is what it is."""
+    from ingest_wikimedia.legacy_artwork import _inject_preserved_extras
+
+    empty = "{{DPLA metadata}}"
+    weird = "\n\n<br />\n\n== Header ==\n{| \n| Cell \n|}"
+    injected = _inject_preserved_extras(empty, {"description": weird})
+    assert weird in injected, (
+        f"extras value must be preserved byte-identical; got: {injected!r}"
+    )

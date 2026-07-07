@@ -143,9 +143,20 @@ class MigrationPlan:
     every action Phase 3b's executor needs to perform.
 
     ``community_imports`` carries the field-by-field values that must
-    survive the migration. Each entry is keyed by canonical-params key
-    so Phase 3b can dispatch to the right SDC property without
-    re-doing the parsing work.
+    survive the migration as SDC statements. Each entry is keyed by
+    canonical-params key so Phase 3b can dispatch to the right SDC
+    property without re-doing the parsing work.
+
+    ``wikitext_preserved_extras`` carries values whose community
+    contribution is structural wikitext (galleries, wikitables,
+    bulleted lists, horizontal rules) that Wikibase can't hold — its
+    monolingual-text validator rejects vertical whitespace. These
+    values stay on the migrated ``{{DPLA metadata}}`` template's own
+    parameter instead, so the yellow-box renderer picks them up. The
+    dict value is the FULL extension remainder verbatim (with any
+    leading newline / HR / heading the user wrote) — preserving
+    whatever structural marker they chose without treating any single
+    one as a canonical signal.
 
     ``source_permalink`` is the value that gets stamped onto every
     imported claim's P4656 reference. It points at the revision *that
@@ -157,6 +168,7 @@ class MigrationPlan:
     source_permalink: str
     community_imports: dict[str, str] = field(default_factory=dict)
     dpla_originated_params: dict[str, str] = field(default_factory=dict)
+    wikitext_preserved_extras: dict[str, str] = field(default_factory=dict)
     artwork_template_name: str = ""
 
 
@@ -394,6 +406,7 @@ def plan_migration(
 
     community_imports: dict[str, str] = {}
     dpla_originated: dict[str, str] = {}
+    wikitext_preserved_extras: dict[str, str] = {}
 
     for key, value in wikitext_params.items():
         canonical_value = _canonical_value_for_key(canonical_params, key)
@@ -409,6 +422,22 @@ def plan_migration(
             # punctuation-trim for the display-string keys — so a
             # community edit that reformatted DPLA's own value is not
             # imported as a spurious community contribution.
+            #
+            # DPLA-prefixed extension: if the wikitext value is the
+            # canonical value with additional structural content
+            # appended (gallery, wikitable, HR, list, embedded
+            # template — anything that introduces vertical
+            # whitespace), split it. The DPLA prefix already lives in
+            # DPLA-attributed SDC so no ``community_import`` is
+            # emitted for it (that would fail Wikibase's
+            # monolingual-text validator anyway). The remainder is
+            # preserved verbatim on the migrated template's
+            # parameter, where the yellow-box renderer picks it up.
+            extras = _split_extension_extras(value, canonical_value)
+            if extras is not None:
+                wikitext_preserved_extras[key] = extras
+                dpla_originated[key] = value
+                continue
             community_imports[key] = value
         else:
             dpla_originated[key] = value
@@ -418,6 +447,7 @@ def plan_migration(
         source_permalink=_build_permalink(file_title, latest.revid),
         community_imports=community_imports,
         dpla_originated_params=dpla_originated,
+        wikitext_preserved_extras=wikitext_preserved_extras,
         artwork_template_name=_template_name(legacy_template),
     )
 
@@ -456,6 +486,67 @@ def _extract_institution_qid(value: str) -> str | None:
 
 
 _MULTI_VALUE_DELIMITER = "; "
+
+# Any of these characters would trip Wikibase's monolingual-text
+# validator (``wikibase-validator-illegal-string-chars``: "String
+# should not start or end with whitespace nor include vertical
+# whitespace or tabs"). Used to detect the "extension" pattern where
+# a user's wikitext contribution carries structural markup (gallery
+# blocks, wikitables, bulleted lists, horizontal rules) after the
+# DPLA-authored text — a shape that can't survive as-is in SDC and
+# needs a different preservation strategy than the default
+# community-import path. See :func:`_split_extension_extras`.
+_VERTICAL_WHITESPACE_RE = re.compile(r"[\n\r\t]")
+
+
+def _split_extension_extras(value: str, canonical: str) -> str | None:
+    """When ``value`` is a DPLA-prefixed extension, return the verbatim
+    remainder; otherwise return None.
+
+    An "extension" is the shape a Commons editor produces when they
+    add structural wikitext (gallery, wikitable, bulleted list, HR,
+    embedded template, etc.) to a DPLA-authored value by continuing
+    the template parameter past the DPLA text. Since Wikibase's
+    monolingual-text validator rejects vertical whitespace, values in
+    this shape can't be submitted as SDC monolingualtext claims — but
+    they're not community *divergence* either, they're community
+    *addition*. The DPLA-authored prefix is still intact and should
+    keep its DPLA-attributed SDC representation; only the remainder
+    needs to live on the migrated template as a wikitext-only
+    contribution.
+
+    Detection is deliberately structure-agnostic: any vertical
+    whitespace (``\\n``/``\\r``/``\\t``) marks the boundary between
+    the DPLA prefix and the community remainder. HRs, galleries, and
+    templates all imply vertical whitespace but so does plain
+    multi-line prose — none is treated as a canonical signal. The
+    substring up to the first vertical-whitespace character must
+    casefold-match the canonical value (same normalisation chain used
+    elsewhere in this module: magic-word unescape → strip
+    leading/trailing punctuation → collapse whitespace → casefold);
+    otherwise it's a scalar divergence (e.g. ``"1949"`` →
+    ``"1949-02-01"``) and falls through to the ordinary
+    community-import path.
+
+    Returns the verbatim remainder from the boundary character onward
+    (including the boundary itself) so the caller can inject it into
+    the migrated template's parameter byte-identical to what the user
+    wrote. Returns None when the value doesn't fit the extension
+    shape or when ``canonical`` is empty (nothing to prefix-match).
+    """
+    if not value or not canonical:
+        return None
+    match = _VERTICAL_WHITESPACE_RE.search(value)
+    if match is None:
+        return None
+    boundary = match.start()
+    prefix = value[:boundary]
+    remainder = value[boundary:]
+    folded_prefix = casefold_for_compare(prefix)
+    folded_canonical = casefold_for_compare(canonical)
+    if not folded_prefix or folded_prefix != folded_canonical:
+        return None
+    return remainder
 
 
 def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
@@ -634,6 +725,49 @@ def _reference_snaks(permalink: str) -> dict:
     }
 
 
+class InvalidWikibaseTextValue(ValueError):
+    """Raised when a value can't be safely submitted to Wikibase.
+
+    Client-side pre-flight for values that would trip Wikibase's
+    ``wikibase-validator-illegal-string-chars`` — the validator
+    rejects vertical whitespace (``\\n``/``\\r``/``\\t``) and
+    leading/trailing whitespace on monolingualtext + string values.
+    A dedicated exception (as opposed to letting the API raise
+    :class:`pywikibot.exceptions.APIError`) gives operators a clear
+    "value X for property Y didn't pass local validation" message
+    instead of a Wikibase traceback the reader has to decode; the
+    migration executor catches it with the same per-file boundary
+    that catches API errors, so behavior on the wire is unchanged.
+    """
+
+
+def _validate_wikibase_text(text: str, prop: str, canonical_key: str) -> None:
+    """Raise :class:`InvalidWikibaseTextValue` if ``text`` can't be
+    safely submitted as a monolingualtext / string claim value.
+
+    The migration pipeline's plan-time extension-detection routes
+    values containing vertical whitespace to the wikitext-preserved
+    path instead of the SDC-import path — so this check should never
+    fire on a healthy code path. It exists as belt-and-suspenders: a
+    new user-contribution shape the extraction heuristic hasn't been
+    taught yet would previously reach Wikibase and get rejected as a
+    generic ``APIError``. Failing loud, distinctly, and *before* the
+    wire trip keeps future incidents legible in the log.
+    """
+    if _VERTICAL_WHITESPACE_RE.search(text):
+        raise InvalidWikibaseTextValue(
+            f"legacy-artwork import claim for {canonical_key!r} → {prop} "
+            f"contains vertical whitespace (newline/tab/CR); Wikibase's "
+            f"monolingual-text validator would reject it. Value: {text!r}"
+        )
+    if text != text.strip():
+        raise InvalidWikibaseTextValue(
+            f"legacy-artwork import claim for {canonical_key!r} → {prop} "
+            f"has leading/trailing whitespace; Wikibase's monolingual-text "
+            f"validator would reject it. Value: {text!r}"
+        )
+
+
 def _monolingualtext_datavalue(text: str, language: str = "en") -> dict:
     return {
         "type": "monolingualtext",
@@ -669,9 +803,11 @@ def format_legacy_import_claim(
         return None
     prop, kind = mapping
     if kind == "monolingualtext":
+        _validate_wikibase_text(value, prop, canonical_key)
         datavalue = _monolingualtext_datavalue(value)
         datatype = "monolingualtext"
     elif kind == "string":
+        _validate_wikibase_text(value, prop, canonical_key)
         datavalue = _string_datavalue(value)
         datatype = "string"
     elif kind == "time":
@@ -1207,6 +1343,57 @@ def render_migrated_wikitext(
     return str(wikicode)
 
 
+def _inject_preserved_extras(text: str, extras: dict[str, str]) -> str:
+    """Inject each ``key = value`` extension remainder into the
+    ``{{DPLA metadata}}`` template inside ``text``.
+
+    Called after ``normalize``+``canonicalize`` have finished — at
+    that point the migrated template has already been stripped of
+    every DPLA-canonical param, so a preserved extras value (the
+    tail of a DPLA-prefixed extension: gallery, HR, wikitable, etc.)
+    lands on an otherwise-clean template. Verbatim insertion, no
+    whitespace normalisation — the user's structural markup is what
+    it is.
+
+    If the template's rendered form is the empty ``{{DPLA metadata}}``
+    the templates library folds it onto a single line; the injection
+    below places each ``| key = value`` on its own line for legibility
+    matching the ``get_wiki_text`` shape a fresh upload would produce.
+    Returns the original text unchanged when no ``{{DPLA metadata}}``
+    template can be found (defensive — the caller has already run
+    ``render_migrated_wikitext`` which guarantees it).
+    """
+    if not extras:
+        return text
+    wikicode = mwparserfromhell.parse(text)
+    target = None
+    for tpl in wikicode.filter_templates():
+        if _template_name(tpl) == "dpla metadata":
+            target = tpl
+            break
+    if target is None:
+        return text
+    # Add each param with a trailing newline on the value so the
+    # closing ``}}`` lands on its own line (mwparserfromhell defaults
+    # would jam it onto the last content line otherwise). Verbatim
+    # value preservation: don't touch the extras themselves; only the
+    # ``| key = `` surround gets shaped for readability.
+    for key, value in extras.items():
+        formatted_value = value if value.endswith("\n") else value + "\n"
+        target.add(
+            f" {key} ",
+            formatted_value,
+            preserve_spacing=False,
+        )
+    # Force a newline right after the opening ``{{DPLA metadata`` so
+    # the first ``| key = value`` starts on its own line, matching
+    # the multi-line shape a fresh ``get_wiki_text`` emits.
+    # mwparserfromhell doesn't expose that first-class; a targeted
+    # string replace is safe because ``{{DPLA metadata`` is a fixed
+    # sentinel and the empty template is a controlled shape.
+    return str(wikicode).replace("{{DPLA metadata|", "{{DPLA metadata\n|")
+
+
 # Edit summary the migration executor stamps on every wikitext save +
 # wbeditentity edit. Centralised so a future change to the wording
 # (e.g. linking to the Commons documentation page) doesn't need to be
@@ -1385,6 +1572,16 @@ def migrate_legacy_file(
 
     rewritten, _stripped = normalize(rewritten, canonical_params)
     rewritten = canonicalize(rewritten)
+    # Re-inject wikitext-preserved extension remainders (galleries,
+    # HRs, wikitables, etc. the user appended past the DPLA-authored
+    # text) onto the migrated ``{{DPLA metadata}}`` template. These
+    # can't live in SDC — Wikibase's monolingual-text validator
+    # rejects vertical whitespace — so the migration preserves them
+    # on the template's own parameter, where Module:DPLA's
+    # ``userValue`` renderer picks them up into the yellow row. See
+    # :func:`_split_extension_extras` for the detection rule.
+    if plan.wikitext_preserved_extras:
+        rewritten = _inject_preserved_extras(rewritten, plan.wikitext_preserved_extras)
     wikitext_changed = rewritten != file_page.text
     if wikitext_changed:
         file_page.text = rewritten
