@@ -17,13 +17,28 @@ your change must satisfy.
 
 **For every DPLA item we upload, the SHA1 of the S3-staged source
 bytes for that item must live at the Commons title
-`get_page_title(dpla_id, …)` produces.**
+`get_page_title(dpla_id, …)` produces — modulo Commons's own
+server-side ingest normalization for that file type.**
 
 That is the entire correctness criterion. Everything else — Commons
 redirects, `{{Duplicate}}` templates, "duplicate of" notices, human or
 bot dedup judgments, intuitions about whether a state "looks like a
 duplicate" — is downstream of this criterion and does not override
 it.
+
+**Commons-normalization equivalence.** MediaWiki normalizes some file
+formats on ingest — e.g., PDFs with a trailing `\r` after `%%EOF`
+have that byte stripped before storage. When we attempt to re-upload
+such a file, Commons responds with `fileexists-no-change` naming our
+intended target title. That response is authoritative: Commons is
+telling us our upload equals what it already stores at the correct
+title. The invariant is satisfied at the correct title even though
+our S3 SHA1 and Commons's stored SHA1 differ pre-normalization.
+Verified empirically byte-for-byte for the two files that motivated
+this amendment (b2bc51b… and 8ac21ee786… ord 2). Trust Commons's
+`fileexists-no-change`-with-target-title response as the invariant
+check; skip cleanly with `Result.UPLOAD_SKIPPED_COMMONS_DEDUP`
+rather than treating as FAILED.
 
 ## Corollaries (do not re-litigate these)
 

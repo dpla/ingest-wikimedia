@@ -433,6 +433,85 @@ class Uploader:
             "pageid": existing.pageid,
         }
 
+    # Match Commons's ``fileexists-no-change`` message and extract the
+    # namespaced title Commons named. The message pattern is stable:
+    # ``The upload is an exact duplicate of the current version of
+    # [[:File:<title>]]``. Captures the title without the leading
+    # colon so it matches our ``page_title`` shape (``File:<title>``).
+    _NOCHANGE_TITLE_RE = re.compile(
+        r"exact duplicate of the current version of \[\[:(File:[^\]]+)\]\]"
+    )
+
+    def _detect_commons_dedup_from_nochange_error(
+        self,
+        ex: Exception,
+        *,
+        page_title: str,
+        our_sha1: str,
+        dpla_id: str,
+        ordinal: int,
+    ) -> dict | None:
+        """When ``ex`` is Commons's ``fileexists-no-change`` response
+        naming our intended target, treat it as a Commons-dedup
+        byte-drift SKIP and return an ``ORDINAL_SKIPPED`` result;
+        return ``None`` otherwise so the caller keeps the FAILED
+        path.
+
+        Semantic contract: Commons's ``fileexists-no-change`` message
+        is the authoritative statement that our upload equals what
+        Commons already stores at the named title, after any
+        server-side normalisation (e.g., trailing ``\\r`` stripped
+        from PDFs — verified byte-for-byte for the two files that
+        originally motivated this treatment). When the named title
+        matches our intended ``page_title``, the upload invariant is
+        satisfied at the correct title. Trust Commons.
+
+        Defensive title match: if Commons's message names a DIFFERENT
+        title from our intended one (I can't construct that scenario
+        from Commons's current message format, but the check is
+        cheap), fall through to the FAILED path so we don't
+        misclassify a real cross-title drift as a benign skip. Same
+        defense-in-depth stance as ``_detect_commons_dedup_skip``'s
+        redirect / missing / SHA1-mismatch guards.
+
+        Reuses ``_detect_commons_dedup_skip`` for the actual result
+        construction — same counter, same log shape, same pageid
+        refresh — so the two upload paths (direct raise vs
+        chunked-None-return) produce identical outcomes for the same
+        underlying phenomenon.
+        """
+        if ERROR_NOCHANGE not in str(ex):
+            return None
+        m = self._NOCHANGE_TITLE_RE.search(str(ex))
+        if m is None:
+            return None
+        commons_named_title = m.group(1)
+        # ``page_title`` in this file is passed WITHOUT the ``File:`` prefix
+        # elsewhere in ``process_file`` (see the ``get_page_title`` return
+        # contract at line 581), so compare against the prefixed form.
+        if (
+            commons_named_title != f"File:{page_title}"
+            and commons_named_title != page_title
+        ):
+            logging.warning(
+                f"Commons ``fileexists-no-change`` for {dpla_id} {ordinal} "
+                f"names title {commons_named_title!r} which does not match "
+                f"our intended {page_title!r}; treating as FAILED (real "
+                f"drift, not the byte-drift class)."
+            )
+            return None
+        # Fetch the target to confirm state + populate the pageid for the
+        # sidecar. Even though Commons's message is authoritative for the
+        # invariant, downstream sdc-sync keys on the sidecar's pageid, so
+        # we still need a live lookup. This is what
+        # ``_detect_commons_dedup_skip`` already does — reuse it.
+        return self._detect_commons_dedup_skip(
+            page_title=page_title,
+            our_sha1=our_sha1,
+            dpla_id=dpla_id,
+            ordinal=ordinal,
+        )
+
     def _safe_upload(self, *, filepage, **kwargs):
         """Sole sanctioned wrapper around ``site.upload`` — every upload in
         this module MUST go through here so the no-create fence cannot be
@@ -1250,6 +1329,43 @@ class Uploader:
             # for every subsequent write, not just this ordinal).
             raise
         except Exception as ex:
+            # Commons-dedup byte-drift, direct-upload path. Commons's
+            # response ``fileexists-no-change: The upload is an exact
+            # duplicate of the current version of [[:File:X]]`` is an
+            # authoritative statement that our upload equals what
+            # Commons already stores at title X, *after* Commons's
+            # server-side normalization. When X matches our intended
+            # title, the upload invariant is satisfied at the correct
+            # title even though our S3 bytes and Commons's bytes may
+            # differ pre-normalization (e.g., partner PDFs with a
+            # trailing ``\r`` after ``%%EOF`` that Commons strips on
+            # ingest — verified for both b2bc51b… and 8ac21ee786…
+            # ord 2, byte-for-byte identical in the overlap). Skip
+            # cleanly with the dedicated dedup counter so the
+            # byte-drift class is audit-able independently of the
+            # FAILED bucket, mirroring the None-return branch's
+            # ``_detect_commons_dedup_skip`` treatment in the chunked-
+            # upload path. See ``docs/upload-invariant.md`` for the
+            # invariant amendment that admits Commons-normalization
+            # equivalence.
+            # ``page_title`` and ``sha1`` are populated after the pre-upload
+            # setup but before the upload attempt; an exception raised BEFORE
+            # they're computed (S3 read failure, provider lookup, etc.)
+            # reaches this except block without them bound. Only run the
+            # dedup check when both are in scope — matches the semantic
+            # intent (we only care about the specific
+            # ``fileexists-no-change`` shape emitted from the upload leg).
+            _frame_locals = locals()
+            if "page_title" in _frame_locals and "sha1" in _frame_locals:
+                dedup_skipped = self._detect_commons_dedup_from_nochange_error(
+                    ex,
+                    page_title=_frame_locals["page_title"],
+                    our_sha1=_frame_locals["sha1"],
+                    dpla_id=dpla_id,
+                    ordinal=ordinal,
+                )
+                if dedup_skipped is not None:
+                    return dedup_skipped
             # Single source of truth for the per-ordinal FAILED counter on
             # every non-timeout, non-session-fatal exception path — includes
             # pywikibot API errors like a *recoverable* CSRF ``KeyError``
