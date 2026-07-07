@@ -262,7 +262,24 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
             if last_named_recognised and stitched:
                 stitched[-1][1] += "|" + str(param.value)
             continue
-        canonical = ARTWORK_PARAM_TO_CANONICAL_KEY.get(_normalize_param_name(param))
+        param_name = _normalize_param_name(param)
+        canonical = ARTWORK_PARAM_TO_CANONICAL_KEY.get(param_name)
+        # ``Other fields`` / ``Other fields N`` — the legacy shape
+        # for creator (and historically other rows) wrapped in
+        # ``{{InFi | Creator | <inner>}}`` bot scaffolding. Unwrap the
+        # InFi and route the inner value to its canonical key when
+        # the label is one we can migrate. Non-Creator InFi wrappers
+        # (Description, Photographer, etc.) fall through as
+        # unrecognised — a later phase can widen the set.
+        if canonical is None and _OTHER_FIELDS_PARAM_RE.match(param_name):
+            inner = _unwrap_infi_creator(str(param.value))
+            if inner is None:
+                last_named_recognised = False
+                continue
+            canonical = "creator"
+            stitched.append([canonical, inner])
+            last_named_recognised = True
+            continue
         if canonical is None:
             last_named_recognised = False
             continue
@@ -279,6 +296,20 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
             # to import. Skip them same as we skip missing params so
             # the migrator doesn't preserve markup errors as SDC.
             continue
+        # Creator has multiple wikitext shapes: plain stated-as name,
+        # ``{{creator|Wikidata=Q…}}`` with a direct QID,
+        # ``{{Creator:Foo}}`` with a Creator: page transclusion, or
+        # ``{{NARA-Author|…}}`` legacy-bot scaffolding. Classify and
+        # tag with a sentinel; downstream comparator + claim-builder
+        # branch on the sentinel. ``None`` from the classifier means
+        # strip-only (never preserve) — the value is dropped from the
+        # parse output entirely, indistinguishable from an absent
+        # param, so no community-import fires.
+        if canonical == "creator":
+            classified = _parse_creator_shape(value)
+            if classified is None:
+                continue
+            value = classified
         # On duplicate canonical keys (e.g. both ``author`` and
         # ``creator`` set), the *last* wins — matches the renderer
         # behavior under MediaWiki, where the later assignment
@@ -456,10 +487,121 @@ def plan_migration(
 # Case-insensitive on the template name and param key so hand-typed
 # variants (``institution`` / ``Institution``, ``Wikidata`` / ``wikidata``)
 # both parse cleanly to the inner Q-ID.
+# Regexes for the legacy ``Other fields N`` creator shapes. Order-sensitive
+# only in that the most specific matcher runs first — NARA-Author's
+# name+id shape is distinct enough that it never collides with the
+# QID-bearing shapes. See :func:`_parse_creator_shape` for the dispatcher.
 _INSTITUTION_SUBTEMPLATE_RE = re.compile(
     r"^\s*\{\{\s*Institution\s*\|\s*wikidata\s*=\s*(Q\d+)\s*\}\}\s*$",
     re.IGNORECASE,
 )
+
+# ``Other fields 1 = {{InFi | Creator | <inner> | id=fileinfotpl_aut}}``
+# and variants. Case-insensitive on InFi and on the ``Creator`` label
+# so hand-typed variants (``infi`` / ``INFI``, ``creator`` / ``Creator``)
+# both parse cleanly.
+_INFI_CREATOR_LABEL_RE = re.compile(r"^\s*creator\s*$", re.IGNORECASE)
+
+# ``Other fields 1``, ``Other fields 2``, ..., or the bare ``Other fields``.
+# Case-folded param names since ``_normalize_param_name`` already lower-cases.
+_OTHER_FIELDS_PARAM_RE = re.compile(r"^other fields(?: \d+)?$")
+
+# ``{{creator|Wikidata=Q56159174}}`` — Commons Creator template with a
+# direct Wikidata QID. Case-insensitive on template name; the Wikidata
+# param name is conventionally capitalized ``Wikidata`` on Commons but
+# accepts any casing under MediaWiki's param-name rules.
+_CREATOR_WIKIDATA_RE = re.compile(
+    r"^\s*\{\{\s*creator\s*\|\s*[Ww]ikidata\s*=\s*(Q\d+)\s*\}\}\s*$",
+    re.IGNORECASE,
+)
+
+# ``{{Creator:Theodore E. Peiser}}`` — Commons Creator: namespace page
+# transclusion (no Wikidata= param, resolved later via Commons API).
+_CREATOR_PAGE_RE = re.compile(r"^\s*\{\{\s*Creator:([^}|]+?)\s*\}\}\s*$")
+
+# ``{{NARA-Author|Adams, Ansel, 1902-1984, Photographer|1332556}}`` —
+# legacy bot-authored NARA authorship template. Never a genuine
+# community contribution; strip without extracting either positional.
+_NARA_AUTHOR_RE = re.compile(r"^\s*\{\{\s*NARA-Author\s*\|", re.IGNORECASE)
+
+
+# Sentinel prefixes marking a creator value that carries structured
+# provenance beyond a plain stated-as name string. Downstream code
+# (comparator + claim-builder) branches on these; unrelated code paths
+# treat them as opaque strings that happen not to match anything.
+_CREATOR_QID_PREFIX = "__creator_qid__:"
+_CREATOR_PAGE_PREFIX = "__creator_page__:"
+
+
+def _unwrap_infi_creator(value: str) -> str | None:
+    """Return the inner value of ``{{InFi | Creator | <inner> …}}`` if
+    ``value`` is exactly that shape (any casing on ``InFi`` / ``Creator``,
+    any trailing ``id=`` or other kwargs), else ``None``.
+
+    Legacy uploads wrapped the creator row in ``Other fields N =
+    {{InFi|Creator|<value>|id=fileinfotpl_aut}}`` to attach the
+    machine-readable ``fileinfotpl_aut`` id. The inner value is what
+    a Commons editor actually contributed; the wrapper is bot
+    scaffolding that drops out on migration.
+    """
+    parsed = mwparserfromhell.parse(value)
+    templates = parsed.filter_templates(recursive=False)
+    if len(templates) != 1:
+        return None
+    tpl = templates[0]
+    if str(tpl.name).strip().casefold() != "infi":
+        return None
+    label_param = None
+    inner_param = None
+    for p in tpl.params:
+        if not p.showkey:
+            if label_param is None:
+                label_param = p
+            elif inner_param is None:
+                inner_param = p
+    if label_param is None or inner_param is None:
+        return None
+    if not _INFI_CREATOR_LABEL_RE.match(str(label_param.value)):
+        return None
+    return str(inner_param.value).strip()
+
+
+def _parse_creator_shape(value: str) -> str | None:
+    """Classify a raw wikitext creator value and return a comparable
+    representation.
+
+    Returns:
+
+    * ``None`` if the value is a strip-only shape that must NOT be
+      preserved as a community contribution (``{{NARA-Author|…}}`` —
+      bot-authored, never a real community edit).
+    * ``"__creator_qid__:Q…"`` sentinel when the value carries an
+      explicit Wikidata QID (``{{creator|Wikidata=Q…}}``). The QID
+      is stored as-is; the executor's comparator matches it directly
+      against DPLA-attributed P170 QIDs.
+    * ``"__creator_page__:<title>"`` sentinel when the value is a
+      Commons Creator: page transclusion (``{{Creator:Foo}}``). The
+      executor's QID resolver will call Commons ``pageprops`` to
+      find the linked Wikidata QID and either preserve it as
+      P170 QID or fall back to a P170 somevalue + P2093 stated-as
+      claim when the Creator: page has no Wikibase link.
+    * The unchanged ``value`` string for anything else — a plain
+      stated-as name (``Peiser, Theodore E``) or an unrecognised
+      shape. Passes through to the existing string-based comparator
+      + claim-builder path unchanged.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return stripped
+    if _NARA_AUTHOR_RE.match(stripped):
+        return None
+    m = _CREATOR_WIKIDATA_RE.match(stripped)
+    if m:
+        return _CREATOR_QID_PREFIX + m.group(1)
+    m = _CREATOR_PAGE_RE.match(stripped)
+    if m:
+        return _CREATOR_PAGE_PREFIX + m.group(1).strip()
+    return stripped
 
 
 def _extract_institution_qid(value: str) -> str | None:
@@ -798,6 +940,31 @@ def format_legacy_import_claim(
     the signature so a later phase can decide whether to add a
     secondary P813 reference snak without changing call sites.
     """
+    # Creator has multiple wikitext shapes: a plain stated-as name
+    # (existing string-datavalue path) OR the sentinel-tagged QID /
+    # Creator: page shapes emitted by :func:`_parse_creator_shape`.
+    # The QID and page shapes need a P170 mainsnak (not the default
+    # P2093 stated-as claim); page-shape values also need a Commons
+    # API round-trip to resolve the linked Wikidata QID. Surface
+    # both as pending markers so :func:`materialize_import_claims`
+    # can do the SDC comparison + resolution in the executor's
+    # network-touching context, keeping :func:`plan_migration` pure.
+    if canonical_key == "creator":
+        if value.startswith(_CREATOR_QID_PREFIX):
+            return {
+                "type": "statement",
+                "rank": "normal",
+                "_phase3a_pending_creator_qid": value[len(_CREATOR_QID_PREFIX) :],
+                "_permalink": permalink,
+            }
+        if value.startswith(_CREATOR_PAGE_PREFIX):
+            return {
+                "type": "statement",
+                "rank": "normal",
+                "_phase3a_pending_creator_page": value[len(_CREATOR_PAGE_PREFIX) :],
+                "_permalink": permalink,
+            }
+
     mapping = LEGACY_IMPORT_PROPERTY.get(canonical_key)
     if mapping is None:
         return None
@@ -1213,33 +1380,214 @@ def materialize_pending_date_claim(
     }
 
 
+def _entity_p170_qids(existing_entity: dict | None) -> set[str]:
+    """Return the set of Wikidata QIDs already stated in ``existing_entity``'s
+    P170 (creator) mainsnaks, DPLA-attributed or otherwise.
+
+    Used by the creator claim materialiser to detect when a community-
+    contributed QID (from ``{{Creator:Foo}}`` / ``{{creator|Wikidata=Q…}}``)
+    duplicates a QID already on the entity — in which case the community
+    import is a no-op and gets dropped rather than emitted as a redundant
+    second P170 statement carrying the same fact. Reads only the
+    ``wikibase-entityid`` mainsnak shape; somevalue + P2093 stated-as
+    claims contribute no QID and are ignored here.
+    """
+    if not existing_entity:
+        return set()
+    statements = (
+        existing_entity.get("statements") or existing_entity.get("claims") or {}
+    )
+    qids: set[str] = set()
+    for stmt in statements.get("P170", []):
+        ms = stmt.get("mainsnak") or {}
+        if ms.get("snaktype") != "value":
+            continue
+        dv = ms.get("datavalue") or {}
+        if dv.get("type") != "wikibase-entityid":
+            continue
+        qid = (dv.get("value") or {}).get("id")
+        if qid:
+            qids.add(qid)
+    return qids
+
+
+def _resolve_commons_creator_qid(site, page_title: str) -> str | None:
+    """Look up the Wikidata QID linked from a Commons ``Creator:<title>``
+    page via the ``prop=pageprops`` API.
+
+    Returns the QID string (``"Q…"``) when the Creator page exists and
+    has a ``wikibase_item`` sitelink; ``None`` for missing pages,
+    orphaned Creator pages, or any API failure. Falling back to
+    ``None`` is intentional: the caller substitutes a P170 somevalue
+    + P2093 stated-as name claim so the community contribution is
+    preserved as a stated-as string even when the QID resolution
+    can't succeed — same outcome as a plain ``| creator = <name>``
+    parameter would produce.
+
+    Requires ``site`` to be a live pywikibot Site; test callers can
+    pass ``None`` to short-circuit to the name-only fallback path.
+    """
+    if site is None or not page_title:
+        return None
+    try:
+        response = site.simple_request(
+            action="query",
+            prop="pageprops",
+            titles=f"Creator:{page_title}",
+            format="json",
+        ).submit()
+    except Exception:
+        return None
+    pages = (response.get("query") or {}).get("pages") or {}
+    for page in pages.values():
+        pp = page.get("pageprops") or {}
+        qid = pp.get("wikibase_item")
+        if isinstance(qid, str) and qid.startswith("Q"):
+            return qid
+    return None
+
+
+def _build_creator_qid_claim(qid: str, permalink: str) -> dict:
+    """Build a P170 (creator) statement whose mainsnak is a
+    wikibase-entityid pointing at ``qid``, with the inferred-from-
+    Wikitext reference shape."""
+    return {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": "P170",
+            "datatype": "wikibase-item",
+            "datavalue": {
+                "type": "wikibase-entityid",
+                "value": {"entity-type": "item", "id": qid},
+            },
+        },
+        "references": [_reference_snaks(permalink)],
+    }
+
+
+def _build_creator_stated_as_claim(name: str, permalink: str) -> dict:
+    """Build a P170 somevalue statement qualified by P2093 (stated as)
+    ``name``, matching the DPLA-bot's canonical creator shape for
+    files where the creator is a plain name string with no Wikidata
+    counterpart."""
+    return {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "somevalue",
+            "property": "P170",
+            "datatype": "wikibase-item",
+        },
+        "qualifiers": {
+            "P2093": [
+                {
+                    "snaktype": "value",
+                    "property": "P2093",
+                    "datatype": "string",
+                    "datavalue": {"type": "string", "value": name},
+                }
+            ],
+        },
+        "qualifiers-order": ["P2093"],
+        "references": [_reference_snaks(permalink)],
+    }
+
+
+def materialize_pending_creator_claim(
+    placeholder: dict,
+    *,
+    site=None,
+    existing_entity: dict | None = None,
+) -> dict | None:
+    """Convert a Phase-3a creator placeholder into a real P170 statement.
+
+    Two placeholder shapes are supported, matching the sentinels
+    :func:`_parse_creator_shape` emits:
+
+    * ``_phase3a_pending_creator_qid``: the QID is already known
+      (came from ``{{creator|Wikidata=Q…}}``). Compare against
+      :func:`_entity_p170_qids`; return ``None`` to drop the claim
+      when the QID is already on the entity, else build a P170 QID
+      statement.
+    * ``_phase3a_pending_creator_page``: the value is a Commons
+      Creator: page title (came from ``{{Creator:Foo}}``). Resolve
+      to a Wikidata QID via :func:`_resolve_commons_creator_qid`;
+      apply the same duplicate check on success. On resolution
+      failure (page missing, orphaned Creator, or API error),
+      fall back to a P170 somevalue + P2093 stated-as ``<title>``
+      claim so the community contribution is preserved as a stated-as
+      string.
+
+    Returns ``None`` for placeholders missing the expected sentinel
+    keys (defensive — the caller drops such claims) or for the
+    duplicate-QID drop case.
+    """
+    permalink = placeholder.get("_permalink", "")
+    existing_qids = _entity_p170_qids(existing_entity)
+
+    qid = placeholder.get("_phase3a_pending_creator_qid")
+    if isinstance(qid, str) and qid:
+        if qid in existing_qids:
+            return None
+        return _build_creator_qid_claim(qid, permalink)
+
+    page_title = placeholder.get("_phase3a_pending_creator_page")
+    if isinstance(page_title, str) and page_title:
+        resolved = _resolve_commons_creator_qid(site, page_title)
+        if resolved is not None:
+            if resolved in existing_qids:
+                return None
+            return _build_creator_qid_claim(resolved, permalink)
+        # No Wikidata QID on the Creator: page. Preserve as a stated-as
+        # string using the page title as the name — best-effort
+        # fallback that mirrors what a plain ``| creator = <name>``
+        # param would produce.
+        return _build_creator_stated_as_claim(page_title, permalink)
+
+    return None
+
+
 def materialize_import_claims(
     claims: list[dict],
     *,
     site=None,
     existing_entity: dict | None = None,
 ) -> list[dict]:
-    """Walk an import-claim list and substitute every Phase-3a date
-    placeholder for a real P571 time statement.
+    """Walk an import-claim list and substitute every Phase-3a
+    placeholder for a real Wikibase statement.
 
-    Claims without a placeholder marker pass through unchanged.
-    Placeholders whose date can't be expanded (parser failure paired
-    with missing sentinel keys — should never happen for in-tree
-    callers) are dropped silently rather than crashing the migration.
+    Handles two placeholder shapes: date placeholders (P571 time
+    statements via :func:`materialize_pending_date_claim`) and
+    creator placeholders (P170 statements via
+    :func:`materialize_pending_creator_claim`). Claims without a
+    placeholder marker pass through unchanged. Placeholders whose
+    materialiser returns ``None`` — duplicate of existing SDC, or
+    an unparseable value — are dropped from the returned list.
 
-    ``site`` and ``existing_entity`` are forwarded to
-    :func:`materialize_pending_date_claim` so the date materialiser
-    can (a) expand wikitext templates server-side before parsing and
-    (b) drop a community-import claim whose parsed value already
-    exists DPLA-attributed on the entity. Both are optional — when
-    neither is supplied, the function preserves the historical
-    always-import behaviour. The original caller signature is also
-    preserved for tests that pass only the claims list.
+    ``site`` and ``existing_entity`` are forwarded to the
+    materialisers so they can (a) expand wikitext templates
+    server-side, (b) look up Commons Creator-page QIDs, and (c)
+    drop community-imports whose value already exists on the entity.
+    All optional — when none are supplied, the function preserves
+    the historical always-import behaviour. The original caller
+    signature is also preserved for tests that pass only the
+    claims list.
     """
     materialised: list[dict] = []
     for claim in claims:
         if "_phase3a_pending_date_parse" in claim:
             real = materialize_pending_date_claim(
+                claim, site=site, existing_entity=existing_entity
+            )
+            if real is not None:
+                materialised.append(real)
+        elif (
+            "_phase3a_pending_creator_qid" in claim
+            or "_phase3a_pending_creator_page" in claim
+        ):
+            real = materialize_pending_creator_claim(
                 claim, site=site, existing_entity=existing_entity
             )
             if real is not None:
