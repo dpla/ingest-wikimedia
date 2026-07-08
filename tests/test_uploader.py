@@ -2324,6 +2324,120 @@ def test_detect_commons_dedup_skip_returns_none_when_get_page_raises():
     assert result is None
 
 
+# ---------------------------------------------------------------------------
+# ``_detect_commons_dedup_from_nochange_error`` — direct-upload path.
+# Extends the byte-drift skip logic to the ``APIError(fileexists-no-change)``
+# response shape (direct upload), symmetric to PR #383's None-return handling
+# (chunked upload). Trust Commons's authoritative "your upload equals the
+# current version of [[:File:X]]" statement: if X is our intended title, the
+# upload invariant is satisfied at the correct title after server-side
+# normalisation, and we skip cleanly with the dedup counter.
+# ---------------------------------------------------------------------------
+
+
+def _nochange_error(title: str) -> Exception:
+    """Build an exception with the same message shape pywikibot raises
+    from Commons's ``fileexists-no-change`` API response."""
+    return RuntimeError(
+        f"fileexists-no-change: The upload is an exact duplicate of the "
+        f"current version of [[:{title}]]."
+    )
+
+
+def test_nochange_matches_intended_title_skips_with_dedup_counter():
+    """b2bc51b… motivating case: direct upload → Commons responds
+    fileexists-no-change naming our target title → invariant is
+    satisfied at the correct title (Commons has our bytes post-
+    normalisation). Skip cleanly."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    fake_page = _fake_filepage(
+        exists=True,
+        is_redirect=False,
+        sha1="commons-sha1",
+        canonical_title="Final Report - DPLA - b2bc.pdf",
+    )
+    ex = _nochange_error("File:Final Report - DPLA - b2bc.pdf")
+    with patch("tools.uploader.get_page", return_value=fake_page):
+        result = uploader._detect_commons_dedup_from_nochange_error(
+            ex,
+            page_title="Final Report - DPLA - b2bc.pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=1,
+        )
+    assert result is not None
+    assert result["status"] == "SKIPPED"
+    assert tracker.count(Result.UPLOAD_SKIPPED_COMMONS_DEDUP) == 1
+    assert tracker.count(Result.SKIPPED) == 1
+
+
+def test_nochange_naming_different_title_falls_through_to_failed():
+    """Defense-in-depth: if Commons's message names a title that
+    isn't ours, DON'T classify as skip — it's a real cross-title
+    situation that should stay as FAILED for investigation. The
+    check is cheap and prevents mis-classifying real drift."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    ex = _nochange_error("File:Some Other Unrelated File.pdf")
+    with patch("tools.uploader.get_page") as get_page:
+        result = uploader._detect_commons_dedup_from_nochange_error(
+            ex,
+            page_title="Our Intended - DPLA - xyz.pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=1,
+        )
+    assert result is None
+    # get_page must not have been called — we fell through BEFORE the
+    # target-state fetch. Otherwise, a mis-titled response could still
+    # short-circuit into a skip if the target happened to exist.
+    get_page.assert_not_called()
+    assert tracker.count(Result.UPLOAD_SKIPPED_COMMONS_DEDUP) == 0
+
+
+def test_nochange_without_nochange_marker_returns_none():
+    """The helper must only fire on the specific ``no-change`` marker
+    Commons emits. Any other exception falls through to the current
+    FAILED handling."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    ex = RuntimeError("some unrelated CSRF token failure")
+    with patch("tools.uploader.get_page") as get_page:
+        result = uploader._detect_commons_dedup_from_nochange_error(
+            ex,
+            page_title="Our Intended - DPLA - xyz.pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=1,
+        )
+    assert result is None
+    get_page.assert_not_called()
+
+
+def test_nochange_with_marker_but_unparseable_title_falls_through():
+    """If the message somehow contains the ``no-change`` marker but
+    doesn't parse into a title (unexpected message format), don't
+    guess — return None so the caller keeps FAILED. Preserves the
+    invariant that any classification-to-SKIP is backed by an
+    explicit target-title match."""
+    tracker = Tracker()
+    uploader = _dedup_uploader(tracker)
+    # Contains ``no-change`` but not the full ``exact duplicate of
+    # the current version of [[:File:X]]`` pattern.
+    ex = RuntimeError("fileexists-no-change: garbled response body")
+    with patch("tools.uploader.get_page") as get_page:
+        result = uploader._detect_commons_dedup_from_nochange_error(
+            ex,
+            page_title="Our Intended - DPLA - xyz.pdf",
+            our_sha1="s3-sha1",
+            dpla_id="abc",
+            ordinal=1,
+        )
+    assert result is None
+    get_page.assert_not_called()
+
+
 def test_handle_upload_exception_maps_possible_id_drift_to_distinct_message(caplog):
     """A ``RuntimeError`` carrying the "possible ID drift" marker gets a
     distinct log message ("unhandled drift shape") instead of collapsing
