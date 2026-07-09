@@ -112,6 +112,28 @@ _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 # Uploads normally complete items in seconds; downloads in seconds to low minutes.
 _STALE_SECONDS = 1800  # 30 minutes
 
+
+def _idle_suffix(now: int, log_mtime: int) -> str:
+    """Return a `` ⚠ idle {duration}`` suffix when a log hasn't been written
+    in over ``_STALE_SECONDS``, else ``""``.
+
+    Shared by every active (non-complete) phase so a hung run reads distinctly
+    instead of looking active. Callers gate the call on phase-specific
+    conditions (not yet complete, not blocked on slots); this helper only owns
+    the threshold check and the ``h``/``m`` duration formatting.
+    """
+    if now <= 0 or log_mtime <= 0:
+        return ""
+    idle = now - log_mtime
+    if idle <= _STALE_SECONDS:
+        return ""
+    idle_min = idle // 60
+    idle_str = (
+        f"{idle_min // 60}h{idle_min % 60:02d}m" if idle_min >= 60 else f"{idle_min}m"
+    )
+    return f" ⚠ idle {idle_str}"
+
+
 # Labels constructed by ``parse_session_labels`` and ``PARTNER_HUBS`` are
 # slug-form: hub-name-or-institution-name lowercase plus ``+`` and ``-``.
 # The download-log glob below interpolates ``label`` directly into a
@@ -182,6 +204,11 @@ def _drain_deferred_phase(
     if session_created > 0 and log_mtime > 0 and log_mtime < session_created:
         return None, 0
 
+    if "nothing to do." in tail:
+        # Empty/missing sidecar: the drain logged this and exited immediately,
+        # never acquiring the lock. It's done, not waiting for the host lock —
+        # without this it fell through to the "⏸ waiting for host lock" default.
+        return "Drain complete (nothing queued)", log_mtime
     if "Drain-deferred: complete." in tail:
         return f"Drain complete ({queued:,} still queued)", log_mtime
     if "at capacity; " in tail and is_opportunistic:
@@ -278,11 +305,19 @@ def get_phase_and_progress(
     # use hub-slug-only filenames (e.g. nara-download.log). If no label-prefixed log
     # is found, fall back to the most recent hub-slug log, excluding new-format files
     # (which contain '+' in the name and belong to a different institution).
-    if not log_file:
+    if not log_file and "+" not in label:
+        # Backward-compat ONLY for bare-hub labels: pre-session-label sessions
+        # used hub-slug-only filenames (e.g. nara-download.log). An institution
+        # label ("hub+institution") with no matching log is in id-generation,
+        # not a legacy hub-slug run — falling back here would attach an
+        # unrelated hub log (in particular a partner-level drain-<hub> log) to
+        # it and misreport an id-gen session as "Draining". Exclude drain-<hub>
+        # logs too (they belong to the terminal-drain path, not a target row).
         hub_prefix = shlex.quote(hub + "-")
         log_file = ssm_run(
             client,
-            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' | head -1 || true",
+            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' "
+            "| grep -vF 'drain-' | head -1 || true",
         ).strip()
 
     if not log_file:
@@ -309,6 +344,34 @@ def get_phase_and_progress(
             log_file=log_file,
             session_created=session_created,
         )
+
+    if log_file.endswith("-id-generation.log"):
+        # get-ids-es logs a scope line + periodic "N items enumerated so far".
+        # Surface the latest count so a long enumeration reads as progress, not
+        # a hang — and so an id-gen session isn't misclassified (previously it
+        # had no recognized log and fell through to a mislabel).
+        out = ssm_run(
+            client,
+            f"date +%s; "
+            f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
+            f"grep -oE '[0-9,]+ items enumerated' {log_path} 2>/dev/null | tail -1",
+        )
+        id_lines = out.splitlines()
+        id_now = _safe_int(id_lines[0]) if id_lines else 0
+        id_mtime = _safe_int(id_lines[1]) if len(id_lines) > 1 else 0
+        # Log predates this session — a stale id-generation log from a prior
+        # run of this label, picked before the new session has written its
+        # own. Same "predates this session" sentinel as the drain and
+        # download/upload/sdc branches (return None → caller renders a bare
+        # "Generating IDs" rather than a stale enumerated count).
+        if session_created > 0 and id_mtime < session_created:
+            return None, 0
+        enumerated = id_lines[2].strip() if len(id_lines) > 2 else ""
+        label_txt = f"Generating IDs ({enumerated})" if enumerated else "Generating IDs"
+        # Same idle/staleness signal as the download/upload/sdc phases: a hung
+        # enumeration (no log write in _STALE_SECONDS) reads distinctly instead
+        # of looking active.
+        return label_txt + _idle_suffix(id_now, id_mtime), id_mtime
     # Resolve the CSV(s) backing this label so `wc -l` returns a meaningful
     # "items in scope" denominator.
     #
@@ -444,20 +507,14 @@ def get_phase_and_progress(
     waiting_on_slots = SLOTS_BUSY_LOG_MARKER in last_log_line
     slot_suffix = " ⏸ waiting on slots" if waiting_on_slots else ""
 
-    stale_suffix = ""
     # A blocked session legitimately stops writing to its log while polling,
     # so don't also flag it as idle/hung — the slot suffix already explains
     # the silence.
-    if counts_marker == 0 and now > 0 and log_mtime > 0 and not waiting_on_slots:
-        idle = now - log_mtime
-        if idle > _STALE_SECONDS:
-            idle_min = idle // 60
-            idle_str = (
-                f"{idle_min // 60}h{idle_min % 60:02d}m"
-                if idle_min >= 60
-                else f"{idle_min}m"
-            )
-            stale_suffix = f" ⚠ idle {idle_str}"
+    stale_suffix = (
+        _idle_suffix(now, log_mtime)
+        if counts_marker == 0 and not waiting_on_slots
+        else ""
+    )
 
     if log_file.endswith("-download.log"):
         # Use the COUNTS: terminal marker as the definitive completion signal —

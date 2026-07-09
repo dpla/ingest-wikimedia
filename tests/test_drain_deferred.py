@@ -366,3 +366,48 @@ def test_no_wait_empty_sidecar_early_exits(lock_fd):
     lock_mock.assert_not_called()
     sp.assert_not_called()
     throttle_ctor.assert_not_called()
+
+
+def test_acquire_host_lock_nonblocking_skips_when_held():
+    """The opportunistic pass acquires the host lock NON-BLOCKING: if another
+    drain already holds it, ``_acquire_host_lock(blocking=False)`` returns None
+    (so the pass skips) instead of blocking behind a patient drain that can
+    hold the lock for hours. Regression for the drain-lock-blocking bug."""
+    import fcntl
+
+    # Hold the lock via an independent fd (separate open file description, so
+    # flock genuinely conflicts even within this process).
+    held = os.open(drain_deferred._DRAIN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        assert drain_deferred._acquire_host_lock(blocking=False) is None
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    # Lock now free → non-blocking acquire succeeds and returns an fd.
+    fd = drain_deferred._acquire_host_lock(blocking=False)
+    assert fd is not None
+    os.close(fd)
+
+
+def test_no_wait_skips_when_host_lock_held():
+    """When another drain holds the host lock, the opportunistic pass must skip
+    immediately — no throttle, no subprocesses — leaving the sidecar for the
+    terminal drain. Regression: the blocking acquire kept finished sessions
+    open for hours behind a patient drain."""
+    drain_sidecar.write_sidecar("nara", ["id-1"])
+    with (
+        patch(
+            "tools.drain_deferred._acquire_host_lock", return_value=None
+        ) as lock_mock,
+        patch("tools.drain_deferred._drain_opportunistic_once") as opp,
+        patch("tools.drain_deferred.DuplicateCategoryThrottle") as throttle_ctor,
+        patch("tools.drain_deferred.subprocess.run") as sp,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
+    assert result.exit_code == 0, result.output
+    lock_mock.assert_called_once_with(blocking=False)
+    opp.assert_not_called()
+    throttle_ctor.assert_not_called()
+    sp.assert_not_called()
+    assert drain_sidecar.read_sidecar("nara") == ["id-1"]
