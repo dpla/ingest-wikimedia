@@ -64,6 +64,7 @@ from ingest_wikimedia.sdc import (
     load_rights_json,
     reconcile_subjects,
 )
+from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.slack import notify_phase_start
 from ingest_wikimedia.staging import (
     make_s3_stage_context,
@@ -358,6 +359,23 @@ def main(
     except ValueError as e:
         raise click.BadParameter(str(e)) from e
 
+    # File-only logging (console=False): this tool's STDOUT is the ID CSV, so a
+    # stdout console handler would corrupt it. Without this, the id-generation
+    # phase produced NO persistent log at all — a long enumeration (e.g. a
+    # skip-media-filter maintain scan over a 60K+ item institution) was
+    # indistinguishable from a hang. The scope line below makes the size of the
+    # scan visible immediately.
+    setup_logging(partner, "id-generation", console=False)
+    logging.info(
+        "id-generation start: partner=%s institutions=%s collection=%s "
+        "single_id=%s maintain=%s skip_media_filter=%s",
+        partner,
+        list(institutions) or "ALL",
+        collection,
+        single_id,
+        maintain,
+        skip_media_filter,
+    )
     notify_phase_start(partner, "id-generation")
     provider_name = PARTNER_HUBS[partner]
 
@@ -519,6 +537,7 @@ def main(
             if single_id is not None:
                 # No pagination — single-id mode is a one-shot lookup.
                 break
+            logging.info(f"id-generation: {len(dpla_ids):,} items enumerated so far")
             search_after = hits[-1]["sort"]
 
     if single_id is not None and not dpla_ids:

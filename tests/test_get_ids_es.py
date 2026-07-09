@@ -22,6 +22,10 @@ def _invoke(*args: str):
 
     with (
         patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        # get-ids-es now calls setup_logging (file-only) right after
+        # check_partner; stub it so tests don't write a stray ./logs file or
+        # mutate global logging state.
+        patch.object(get_ids_es, "setup_logging"),
         patch.object(get_ids_es, "notify_phase_start"),
         patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
         patch.object(
@@ -192,6 +196,10 @@ def _invoke_single_id(single_id, hits):
 
     with (
         patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        # get-ids-es now calls setup_logging (file-only) right after
+        # check_partner; stub it so tests don't write a stray ./logs file or
+        # mutate global logging state.
+        patch.object(get_ids_es, "setup_logging"),
         patch.object(get_ids_es, "notify_phase_start"),
         patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
         patch.object(
@@ -287,6 +295,10 @@ def test_single_id_banlist_hit_gets_distinct_error():
     )
     with (
         patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        # get-ids-es now calls setup_logging (file-only) right after
+        # check_partner; stub it so tests don't write a stray ./logs file or
+        # mutate global logging state.
+        patch.object(get_ids_es, "setup_logging"),
         patch.object(get_ids_es, "notify_phase_start"),
         patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
         patch.object(

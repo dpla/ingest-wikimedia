@@ -348,24 +348,26 @@ def get_phase_and_progress(
     # shlex.quote) — single-quoting would disable shell glob expansion
     # so the ``*`` would no longer expand. The slug-shape guard at the
     # top of this function makes the unquoted interpolation safe.
-    # Total-ordinals denominator from the download log. Count the
-    # per-ordinal ``Downloading <partner> <id> <ordinal> from <url>`` line
-    # at `downloader.py:532` — emitted unconditionally for every ordinal
-    # attempted, regardless of whether the bytes ended up downloaded or
-    # skipped (key already in S3) — rather than the per-item summary
-    # ``Item <id>: N ordinals`` line, which PR #272 added but didn't
-    # backfill into older logs.
+    # Total-ordinals denominator from the download log. Prefer the per-item
+    # summary ``Item <id>: N ordinals`` line (downloader.py:563) — emitted for
+    # EVERY item regardless of whether its media was freshly fetched or already
+    # staged/skipped — and sum its N. Fall back to counting the per-ordinal
+    # ``Downloading <partner> <id> <ordinal> from <url>`` line (downloader.py:543)
+    # ONLY when no Item-summary lines exist, i.e. old pre-#272 download logs.
     #
-    # This matters because for large multi-day hubs (NARA in particular)
-    # the download phase runs once and stays in its original form
-    # forever — the bot then iterates upload + SDC many times against the
-    # already-staged data without re-downloading. A status report run
-    # today against an SDC-only relaunch sees a fresh SDC log but an
-    # old download log whose Item-summary lines never existed; counting
-    # ``Downloading`` works on logs from every version of the downloader.
+    # The previous code counted ``Downloading`` alone on the assumption it was
+    # "emitted unconditionally for every ordinal" — but it fires only on an
+    # actual fetch ATTEMPT, not for already-staged skips. So any run whose media
+    # was already downloaded (re-runs, SDC-only relaunches, download-once-then-
+    # iterate hubs like NARA) had 0 ``Downloading`` lines, collapsing the total
+    # to 0 and wrongly dropping the status row from file- to item-granularity —
+    # even though the ``Item`` summaries carried the true counts.
     ordinals_awk = (
-        "BEGIN{n=0} /Downloading [a-z0-9-]+ [a-f0-9]+ [0-9]+ from / {n++} "
-        "END {print n+0}"
+        "BEGIN{item=0; dl=0} "
+        "/Item [a-f0-9]+: [0-9]+ ordinals/ "
+        '{for(i=1;i<=NF;i++) if($i=="ordinals"){item+=$(i-1); break}} '
+        "/Downloading [a-z0-9-]+ [a-f0-9]+ [0-9]+ from / {dl++} "
+        "END {print (item>0 ? item : dl)}"
     )
     # One awk pass counts all four marker lines in a single sequential read
     # of the upload log; the previous code ran four separate `grep -c`
