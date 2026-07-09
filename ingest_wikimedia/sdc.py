@@ -82,7 +82,7 @@ from typing import Any
 
 import requests
 
-from ingest_wikimedia.dpla import INSTITUTIONS_URL
+from ingest_wikimedia.partners import load_institutions, load_subjects
 
 # Hardcoded Wikibase entities used across the SDC mapping. Centralized here
 # so any change has a single edit site.
@@ -228,14 +228,6 @@ CHUNKABLE_PROPS = frozenset(
 # what Wikibase will actually store after the wbeditentity round-trip.
 _CONTROL_CHAR_RUN = re.compile(r"[\x00-\x1F\x7F-\x9F]+")
 
-# DPLA subject → Wikidata Q-ID lookup table; sourced from dpla/ingestion3
-# alongside institutions_v2.json. Fetched fresh per run so upstream changes
-# land in the next sync without a redeploy.
-SUBJECTS_URL = (
-    "https://raw.githubusercontent.com/dpla/ingestion3/develop/"
-    "src/main/resources/subjects.json"
-)
-
 # Locate rights.json by walking up from this module's directory. sdc.py
 # lives at <repo>/ingest_wikimedia/sdc.py, so two dirname's above gives the
 # repo root.
@@ -245,23 +237,22 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_institutions_v2() -> dict:
-    """Fetch the full institutions_v2.json document used for hub/institution
-    eligibility and (in the SDC pre-compute pass) Wikidata-ID resolution."""
-    resp = requests.get(INSTITUTIONS_URL, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    """Full institutions_v2.json (hub/institution eligibility + Wikidata IDs).
+
+    Delegates to ``partners.load_institutions`` so it reads the launch-staged
+    local copy when present instead of re-fetching from raw.githubusercontent.com
+    (per-IP HTTP 429 under a multi-target batch).
+    """
+    return load_institutions()
 
 
 def fetch_subjects_json() -> dict:
-    """Fetch the DPLA-subject → Wikidata-ID map used to populate P921.
+    """DPLA-subject → Wikidata-QID map used to populate P921.
 
-    Sourced from dpla/ingestion3 alongside institutions_v2.json; fetched
-    fresh per run so upstream changes land in the next sync without a
-    redeploy.
+    Delegates to ``partners.load_subjects`` (local-first, see there) instead of
+    re-fetching from raw.githubusercontent.com per run.
     """
-    resp = requests.get(SUBJECTS_URL, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return load_subjects()
 
 
 def load_rights_json() -> dict:

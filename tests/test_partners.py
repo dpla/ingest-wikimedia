@@ -28,10 +28,10 @@ from ingest_wikimedia.partners import (
 
 
 def _mock_institutions(data: dict):
-    """Patch ``_get_institutions`` to return ``data`` instead of fetching
+    """Patch ``load_institutions`` to return ``data`` instead of fetching
     institutions_v2.json over the network. Returns the patch context
     manager for use in ``with`` blocks."""
-    return patch("ingest_wikimedia.partners._get_institutions", return_value=data)
+    return patch("ingest_wikimedia.partners.load_institutions", return_value=data)
 
 
 def _json_urlopen(data: dict):
@@ -50,34 +50,36 @@ def _http_429(retry_after=None):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_institutions(monkeypatch):
-    """Reset the module cache and clear WIKIMEDIA_INSTITUTIONS_FILE around every
-    test so cached data or a stray env var can't leak between tests."""
+def _isolate_staged_config(monkeypatch):
+    """Reset the staged-config cache and clear the WIKIMEDIA_*_FILE env vars
+    around every test so cached data or a stray env var can't leak between
+    tests."""
     monkeypatch.delenv(partners.INSTITUTIONS_FILE_ENV, raising=False)
-    partners._institutions_cache = None
+    monkeypatch.delenv(partners.SUBJECTS_FILE_ENV, raising=False)
+    partners._staged_config_cache.clear()
     yield
-    partners._institutions_cache = None
+    partners._staged_config_cache.clear()
 
 
-def test_get_institutions_prefers_local_file(tmp_path, monkeypatch):
+def test_load_institutions_prefers_local_file(tmp_path, monkeypatch):
     data = {"Hub": {"upload": True}}
     f = tmp_path / "institutions_v2.json"
     f.write_text(json.dumps(data))
     monkeypatch.setenv(partners.INSTITUTIONS_FILE_ENV, str(f))
     with patch.object(partners.urllib.request, "urlopen") as urlopen:
-        assert partners._get_institutions() == data
+        assert partners.load_institutions() == data
         urlopen.assert_not_called()  # local copy → no network fetch
 
 
-def test_get_institutions_fetches_when_no_local_file():
+def test_load_institutions_fetches_when_no_local_file():
     data = {"Hub": {"upload": True}}
     with patch.object(
         partners.urllib.request, "urlopen", return_value=_json_urlopen(data)
     ):
-        assert partners._get_institutions() == data
+        assert partners.load_institutions() == data
 
 
-def test_get_institutions_empty_local_file_falls_back_to_fetch(tmp_path, monkeypatch):
+def test_load_institutions_empty_local_file_falls_back_to_fetch(tmp_path, monkeypatch):
     fetched = {"Hub": {"upload": True}}
     f = tmp_path / "institutions_v2.json"
     f.write_text("{}")  # valid JSON but empty → treated as unusable, fetch instead
@@ -85,11 +87,11 @@ def test_get_institutions_empty_local_file_falls_back_to_fetch(tmp_path, monkeyp
     with patch.object(
         partners.urllib.request, "urlopen", return_value=_json_urlopen(fetched)
     ) as urlopen:
-        assert partners._get_institutions() == fetched
+        assert partners.load_institutions() == fetched
         urlopen.assert_called_once()
 
 
-def test_get_institutions_retries_on_429_then_succeeds():
+def test_load_institutions_retries_on_429_then_succeeds():
     data = {"Hub": {"upload": True}}
     queue = [_http_429(), _http_429(), _json_urlopen(data)]
 
@@ -103,11 +105,11 @@ def test_get_institutions_retries_on_429_then_succeeds():
         patch.object(partners.time, "sleep") as sleep,
         patch.object(partners.urllib.request, "urlopen", side_effect=_urlopen),
     ):
-        assert partners._get_institutions() == data
+        assert partners.load_institutions() == data
         assert sleep.call_count == 2  # two 429s → two backoff sleeps
 
 
-def test_get_institutions_honors_retry_after_header():
+def test_load_institutions_honors_retry_after_header():
     data = {"Hub": {"upload": True}}
     queue = [_http_429(retry_after="1"), _json_urlopen(data)]
 
@@ -121,17 +123,54 @@ def test_get_institutions_honors_retry_after_header():
         patch.object(partners.time, "sleep") as sleep,
         patch.object(partners.urllib.request, "urlopen", side_effect=_urlopen),
     ):
-        assert partners._get_institutions() == data
+        assert partners.load_institutions() == data
         sleep.assert_called_once_with(1.0)  # honors Retry-After, not default backoff
 
 
-def test_get_institutions_raises_after_exhausting_429_retries():
+def test_load_institutions_raises_after_exhausting_429_retries():
     with (
         patch.object(partners.time, "sleep"),
         patch.object(partners.urllib.request, "urlopen", side_effect=_http_429()),
         pytest.raises(urllib.error.HTTPError),
     ):
-        partners._get_institutions()
+        partners.load_institutions()
+
+
+def test_load_subjects_prefers_local_file(tmp_path, monkeypatch):
+    """subjects.json rides the same local-first loader: a staged file is read
+    from disk with no network fetch (the whole point of WIKIMEDIA_SUBJECTS_FILE)."""
+    data = {"Photographs": "Q125191"}
+    f = tmp_path / "subjects.json"
+    f.write_text(json.dumps(data))
+    monkeypatch.setenv(partners.SUBJECTS_FILE_ENV, str(f))
+    with patch.object(partners.urllib.request, "urlopen") as urlopen:
+        assert partners.load_subjects() == data
+        urlopen.assert_not_called()
+
+
+def test_load_subjects_fetches_when_no_local_file():
+    data = {"Photographs": "Q125191"}
+    with patch.object(
+        partners.urllib.request, "urlopen", return_value=_json_urlopen(data)
+    ):
+        assert partners.load_subjects() == data
+
+
+def test_load_institutions_and_subjects_cached_independently(tmp_path, monkeypatch):
+    """The shared staged-config cache is keyed by URL, so institutions and
+    subjects staged to different files must not collide."""
+    insts = {"Hub": {"upload": True}}
+    subs = {"Photographs": "Q125191"}
+    fi = tmp_path / "institutions_v2.json"
+    fi.write_text(json.dumps(insts))
+    fs = tmp_path / "subjects.json"
+    fs.write_text(json.dumps(subs))
+    monkeypatch.setenv(partners.INSTITUTIONS_FILE_ENV, str(fi))
+    monkeypatch.setenv(partners.SUBJECTS_FILE_ENV, str(fs))
+    with patch.object(partners.urllib.request, "urlopen") as urlopen:
+        assert partners.load_institutions() == insts
+        assert partners.load_subjects() == subs
+        urlopen.assert_not_called()
 
 
 def test_resolve_wikidata_id_drops_hub_level_match_when_hub_upload_false():

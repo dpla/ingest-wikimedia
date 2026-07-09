@@ -39,6 +39,7 @@ import requests
 from ingest_wikimedia.partners import (
     INSTITUTIONS_URL,
     PARTNER_DIR,
+    SUBJECTS_URL,
     commons_has_files_for_qid,
     is_dpla_id,
     is_upload_eligible,
@@ -57,11 +58,33 @@ from ingest_wikimedia.session_state import (
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
 
-# Where the launcher stages ingestion3's institutions_v2.json on EC2 (fetched
-# once per launch) so the per-target pipeline processes read it from disk via
-# WIKIMEDIA_INSTITUTIONS_FILE instead of each hitting raw.githubusercontent.com
+# Where the launcher stages ingestion3's config JSON on EC2 (fetched once per
+# launch) so the per-target pipeline processes read it from disk via the
+# WIKIMEDIA_*_FILE env vars instead of each hitting raw.githubusercontent.com
 # (which rate-limits the box IP to HTTP 429). See ingest_wikimedia.partners.
 INSTITUTIONS_LOCAL_PATH = "/home/ec2-user/ingest-wikimedia/institutions_v2.json"
+SUBJECTS_LOCAL_PATH = "/home/ec2-user/ingest-wikimedia/subjects.json"
+
+
+def _stage_config_cmd(url: str, local_path: str) -> str:
+    """Shell snippet staging one ingestion3 config JSON to a local path.
+
+    Best-effort: one fetch per launch won't rate-limit, and if it fails the
+    runtime falls back to a retrying live fetch, so a GitHub hiccup must not
+    block the launch (`|| echo`, not `&&`). Atomic: curl to a temp file, mv
+    into place only on success, so a failed/interrupted fetch can't truncate a
+    good copy staged by an earlier launch (which would silently drop this
+    launch back to live fetch).
+    """
+    name = local_path.rsplit("/", 1)[-1]
+    tmp = local_path + ".tmp"
+    return (
+        f"( curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors {shlex.quote(url)} "
+        f"-o {shlex.quote(tmp)} "
+        f"&& mv {shlex.quote(tmp)} {shlex.quote(local_path)} "
+        f"|| echo 'WARN: {name} stage failed; runtime falls back to live fetch' ) && "
+    )
+
 
 # Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
 MEMORY_HEADROOM_PCT = 30
@@ -889,20 +912,13 @@ def main() -> None:
         "cp -r ingest-wikimedia-update/tools/* /home/ec2-user/ingest-wikimedia/tools/ && "
         "cp ingest-wikimedia-update/pyproject.toml /home/ec2-user/ingest-wikimedia/pyproject.toml && "
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
-        # Stage ingestion3's institutions_v2.json once per launch so the many
-        # short-lived pipeline processes read it from disk (via
-        # WIKIMEDIA_INSTITUTIONS_FILE) instead of each hitting anonymous
-        # raw.githubusercontent.com, which rate-limits the box IP to HTTP 429.
-        # Best-effort: one fetch won't rate-limit, and if it fails the runtime
-        # falls back to a retrying live fetch (partners._get_institutions), so a
-        # GitHub hiccup must not block the launch (`|| echo`, not `&&`).
-        # Atomic: curl to a temp file, mv into place only on success, so a
-        # failed/interrupted fetch can't truncate a good copy staged by an
-        # earlier launch (which would silently drop this launch back to live fetch).
-        + f"( curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors {shlex.quote(INSTITUTIONS_URL)} "
-        + f"-o {shlex.quote(INSTITUTIONS_LOCAL_PATH + '.tmp')} "
-        + f"&& mv {shlex.quote(INSTITUTIONS_LOCAL_PATH + '.tmp')} {shlex.quote(INSTITUTIONS_LOCAL_PATH)} "
-        + "|| echo 'WARN: institutions_v2.json stage failed; runtime falls back to live fetch' ) && "
+        # Stage ingestion3's config JSON (institutions_v2.json + subjects.json)
+        # once per launch so the many short-lived pipeline processes read them
+        # from disk (via WIKIMEDIA_INSTITUTIONS_FILE / WIKIMEDIA_SUBJECTS_FILE)
+        # instead of each hitting anonymous raw.githubusercontent.com, which
+        # rate-limits the box IP to HTTP 429 under a multi-target batch.
+        + _stage_config_cmd(INSTITUTIONS_URL, INSTITUTIONS_LOCAL_PATH)
+        + _stage_config_cmd(SUBJECTS_URL, SUBJECTS_LOCAL_PATH)
         + "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
     )
     out = ""
@@ -1301,10 +1317,12 @@ def main() -> None:
         [
             "source ~/.bashrc",
             "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate",
-            # Point partners._get_institutions at the launch-staged copy so
-            # every target reads it from disk instead of re-fetching from
-            # raw.githubusercontent.com (per-IP 429 under a multi-target batch).
+            # Point partners.load_institutions / load_subjects at the
+            # launch-staged copies so every target reads them from disk instead
+            # of re-fetching from raw.githubusercontent.com (per-IP 429 under a
+            # multi-target batch).
             f"export WIKIMEDIA_INSTITUTIONS_FILE={shlex.quote(INSTITUTIONS_LOCAL_PATH)}",
+            f"export WIKIMEDIA_SUBJECTS_FILE={shlex.quote(SUBJECTS_LOCAL_PATH)}",
         ]
     )
     target_blocks = []

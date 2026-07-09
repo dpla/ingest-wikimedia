@@ -8,7 +8,7 @@ from requests import Session
 from .banlist import Banlist
 from .common import null_safe, get_str, get_list, get_dict
 from .iiif import IIIF
-from .partners import PARTNER_HUBS, is_upload_eligible
+from .partners import PARTNER_HUBS, is_upload_eligible, load_institutions
 from .s3 import S3Client
 from .tracker import Tracker, Result
 
@@ -336,8 +336,13 @@ class DPLA:
         return provider, data_provider
 
     def get_providers_data(self) -> dict:
-        """Loads the institutions file from ingestion3 in GitHub."""
-        return self.http_session.get(INSTITUTIONS_URL).json()
+        """Loads institutions_v2.json (hub → config) from ingestion3.
+
+        Delegates to ``partners.load_institutions`` so it reads the launch-staged
+        local copy when present instead of re-fetching from
+        raw.githubusercontent.com (per-IP HTTP 429 under a multi-target batch).
+        """
+        return load_institutions()
 
     def extract_urls(
         self,
@@ -383,10 +388,6 @@ class DPLA:
 
 DPLA_API_URL_BASE = "https://api.dp.la/v2/items/"
 DPLA_API_DOCS = "docs"
-INSTITUTIONS_URL = (
-    "https://raw.githubusercontent.com/dpla/ingestion3"
-    "/refs/heads/main/src/main/resources/wiki/institutions_v2.json"
-)
 UPLOAD_FIELD_NAME = "upload"
 INSTITUTIONS_FIELD_NAME = "institutions"
 SOURCE_RESOURCE_FIELD_NAME = "sourceResource"
