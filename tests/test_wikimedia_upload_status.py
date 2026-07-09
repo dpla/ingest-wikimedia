@@ -2384,7 +2384,7 @@ def test_drain_deferred_phase_recognizes_empty_sidecar_completion():
 
     from scripts.wikimedia_upload_status import get_phase_and_progress
 
-    sep = "__WM_SEP__"
+    sep = "__WM_DRAIN_SEP__"  # _drain_deferred_phase's own separator
     calls = []
 
     def fake_ssm_run(_client, _command, **_kwargs):
