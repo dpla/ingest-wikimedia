@@ -537,31 +537,59 @@ def test_per_target_preamble_unsets_wikimedia_step():
     )
 
 
-def test_maintain_real_run_stages_sidecars_then_syncs_from_s3():
+def test_maintain_lite_non_nara_skips_prestage_and_builds_sdc_on_miss():
     steps = _maintain_steps("digitalnc", (), count_only=False)
-    # One ES scan stages sdc.json sidecars, then the category walk reads them.
+    # Non-NARA lite maintain no longer pre-stages the whole hub (the
+    # over-staging fix): the --cat sync builds each sidecar on demand from ES
+    # via --build-sdc-on-miss, scoped to the category's already-uploaded files.
     assert steps[0] == "cd /srv/base"
-    assert steps[1] == "get-ids-es digitalnc --maintain --skip-media-filter > out.csv"
-    assert steps[2] == (
-        "sdc-sync --cat 'Category:Media contributed by X' --maintain"
-        " --from-s3 digitalnc"
-    )
-    assert "--count-only" not in steps[2]
-
-
-def test_maintain_per_institution_get_ids_repeats_institution_flags():
-    steps = _maintain_steps(
-        "georgia", ("Athens-Clarke County Library", "Atlanta History Center"), False
-    )
+    assert not any("get-ids-es" in s for s in steps)
     assert steps[1] == (
+        "sdc-sync --cat 'Category:Media contributed by X' --maintain"
+        " --from-s3 digitalnc --build-sdc-on-miss"
+    )
+    assert "--count-only" not in steps[1]
+
+
+def test_maintain_lite_nara_keeps_prestage_no_build_on_miss():
+    # NARA keeps the up-front get-ids stage: its sdc.json carries
+    # batch-reconciled P921 subjects an on-demand build (subjects_lookup=None)
+    # would omit — and maintain reconciliation would then strip them. So its
+    # --cat sync must NOT get --build-sdc-on-miss.
+    steps = _maintain_steps("nara", (), count_only=False)
+    assert steps[1] == "get-ids-nara > out.csv"
+    sync = next(s for s in steps if s.startswith("sdc-sync"))
+    assert "--from-s3 nara" in sync
+    assert "--build-sdc-on-miss" not in sync
+
+
+def test_maintain_stage_cmd_repeats_institution_flags():
+    # _maintain_stage_cmd is still used by NARA lite and both hash routes; it
+    # repeats --institution per institution and keeps --skip-media-filter.
+    from scripts.wikimedia_launch import _maintain_stage_cmd
+
+    cmd = _maintain_stage_cmd(
+        "georgia",
+        ("Athens-Clarke County Library", "Atlanta History Center"),
+        "out.csv",
+    )
+    assert cmd == (
         "get-ids-es georgia --institution 'Athens-Clarke County Library'"
         " --institution 'Atlanta History Center' --maintain --skip-media-filter"
         " > out.csv"
     )
-    # One --cat sync per institution category, all reading from S3.
+
+
+def test_maintain_per_institution_non_nara_cat_sync_per_category():
+    # Non-NARA per-institution lite maintain: no pre-stage; one --cat sync per
+    # institution category, each building sidecars on demand from ES.
+    steps = _maintain_steps(
+        "georgia", ("Athens-Clarke County Library", "Atlanta History Center"), False
+    )
+    assert not any("get-ids-es" in s for s in steps)
     syncs = [s for s in steps if s.startswith("sdc-sync")]
     assert len(syncs) == 2
-    assert all("--from-s3 georgia" in s for s in syncs)
+    assert all("--from-s3 georgia --build-sdc-on-miss" in s for s in syncs)
 
 
 def test_maintain_count_only_skips_staging_and_from_s3():
@@ -581,8 +609,9 @@ def test_maintain_write_run_passes_worker_opts_to_cat_sync():
     )
     sync = next(s for s in steps if s.startswith("sdc-sync"))
     # Parallel maintain runs the pool under the box-wide slot budget, same flags
-    # as partner mode, appended after --from-s3.
-    assert sync.endswith("--from-s3 digitalnc --workers 6 --workers-budget 24")
+    # as partner mode, appended after --from-s3; --build-sdc-on-miss follows.
+    assert "--from-s3 digitalnc --workers 6 --workers-budget 24" in sync
+    assert sync.endswith("--build-sdc-on-miss")
 
 
 def test_maintain_count_only_ignores_worker_opts():

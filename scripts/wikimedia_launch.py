@@ -396,13 +396,16 @@ def _build_maintain_lite_pipeline_steps(
     sitelink — authoritative, never derived from the display name) and walked
     with ``sdc-sync --cat … --maintain``.
 
-    The sync reads each (re-linked) item's claims from its precomputed
-    ``sdc.json`` sidecar (``--from-s3``) rather than calling ``api.dp.la`` per
-    file, so a real run first stages those sidecars with ONE ``get-ids-es
-    --maintain`` ES scan over the scope (drops only the upload gate, keeps the
-    QID requirement). ``count_only`` is a pre-flight that just resolves how each
-    file would re-link and writes nothing — it needs neither the staging step
-    nor ``--from-s3``.
+    The sync reads each (re-linked) item's claims from its ``sdc.json`` sidecar
+    (``--from-s3``) rather than calling ``api.dp.la`` per file. For **non-NARA**
+    targets it runs without a pre-stage: ``--build-sdc-on-miss`` makes the sync
+    build each sidecar on demand from the internal ES index, scoped to exactly
+    the category's already-uploaded files (avoiding the over-staging of a
+    whole-hub scan). **NARA** keeps the up-front ``get-ids-es --maintain`` scan
+    (drops only the upload gate, keeps the QID requirement) because its
+    ``sdc.json`` carries batch-reconciled P921 subjects an on-demand build would
+    omit. ``count_only`` is a pre-flight that just resolves how each file would
+    re-link and writes nothing — it needs neither staging nor ``--from-s3``.
 
     A single-DPLA-id or collection-scoped target has no whole-category to walk,
     so it's rejected loudly rather than silently widening the write scope.
@@ -429,7 +432,19 @@ def _build_maintain_lite_pipeline_steps(
     )
     steps = []
     if not count_only:
-        steps.append(_maintain_stage_cmd(canonical, institutions, csv_file))
+        if canonical == "nara":
+            # NARA keeps the whole-scope pre-stage: its sdc.json carries
+            # batch-reconciled P921 subject QIDs that an on-demand build
+            # (subjects_lookup=None) omits, and maintain's claim reconciliation
+            # would then strip those existing P921 statements.
+            steps.append(_maintain_stage_cmd(canonical, institutions, csv_file))
+        else:
+            # Non-NARA: skip the whole-hub pre-stage — the over-staging. It
+            # staged dpla-map.json + sdc.json for every ES-eligible item, but
+            # the ``--cat`` sync only reads the sidecars for files already on
+            # Commons. ``--build-sdc-on-miss`` makes the sync build each file's
+            # sidecar on demand from ES, scoped to exactly the category's files.
+            sync_tail += " --build-sdc-on-miss"
     steps += _maintain_sdc_cat_steps(canonical, institutions, sync_tail)
     return [f"cd {base}", *steps]
 

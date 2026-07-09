@@ -1,6 +1,7 @@
 # TODO caption, date, page, iiif manifest, url
 
 import copy
+import functools
 import logging
 import pywikibot
 import requests
@@ -18,6 +19,7 @@ from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
     NARA_PROVIDER_NAME,
+    build_claims_for_doc,
     casefold_for_compare,
     fetch_institutions_v2,
     fetch_subjects_json,
@@ -59,6 +61,38 @@ rights: dict
 subject_ids: dict
 _s3_partner: str | None = None
 _s3_client = None
+# Maintain ``--cat`` mode (``--build-sdc-on-miss``): when a re-linked id has no
+# staged ``sdc.json``, build its claims on demand from the internal ES index
+# instead of skipping the file. Lets the lite ``--cat`` maintain route run
+# without the whole-hub ``get-ids-es`` pre-stage, so sidecars are built only for
+# the category's already-uploaded files. ``subjects_lookup`` is None on this
+# path (NARA P921 reconciliation is batched only during a get-ids-es stage), so
+# it MUST NOT be used for NARA — maintain's claim reconciliation would strip
+# existing P921 statements. Bound in ``_initialize`` (serial) and injected into
+# ``_init_maintain_worker`` (parallel).
+_build_sdc_on_miss: bool = False
+
+
+def _assert_build_sdc_on_miss_allowed(build_sdc_on_miss: bool, s3_partner) -> None:
+    """Guard the one combination that would silently destroy data: NARA +
+    ``--build-sdc-on-miss``. On that combo the on-demand build passes
+    ``subjects_lookup=None`` (NARA's P921 subjects are only batch-reconciled by a
+    ``get-ids-es`` stage), and maintain's claim reconciliation would then strip
+    the existing P921 statements off NARA items on Commons — irreversible. The
+    launcher never emits this pairing (it keeps NARA's pre-stage and omits the
+    flag), but a hand-run ``sdc-sync --cat --from-s3 nara --build-sdc-on-miss``
+    would. Raises ``ValueError`` so both entry points fail fast before any write:
+    ``_initialize`` converts it to a ``parser.error``; ``_init_maintain_worker``
+    lets it abort the worker.
+    """
+    if build_sdc_on_miss and s3_partner == "nara":
+        raise ValueError(
+            "--build-sdc-on-miss must not be used with --from-s3 nara: it omits "
+            "batch-reconciled P921 subjects, so maintain would strip existing "
+            "P921 statements from NARA items."
+        )
+
+
 # Maintain mode: {institution Wikidata QID -> dataProvider name}, built lazily
 # from ``hubs`` (institutions_v2.json) the first time the anchor-3 wildcard
 # needs to scope a re-link to the file's own institution. None until built.
@@ -146,6 +180,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "S3Client.get_item_metadata) rather than reading each item from ES "
             "at sync time. Falls back to a direct ES read when an item's "
             "dpla-map.json is missing."
+        ),
+    )
+    p.add_argument(
+        "--build-sdc-on-miss",
+        dest="build_sdc_on_miss",
+        action="store_true",
+        default=False,
+        help=(
+            "Maintain --cat mode: when a re-linked id has no staged sdc.json, "
+            "build its claims on demand from the internal ES index (via "
+            "_fetch_dpla_doc_from_es) instead of skipping the file. Lets the "
+            "lite maintain route run without the whole-hub get-ids-es "
+            "pre-stage, so sidecars are built only for the category's "
+            "already-uploaded files. Omits reconciled subject (P921) statements "
+            "(subjects_lookup=None); do NOT use for NARA, where maintain would "
+            "then strip existing P921 claims."
         ),
     )
     p.add_argument(
@@ -545,7 +595,7 @@ def _initialize() -> None:
     """
     global parser, args, method, dpla_api, site, hubs, rights, subject_ids
     global _s3_partner, _s3_client, _normalize_wikitext_enabled, _workers
-    global _workers_budget
+    global _workers_budget, _build_sdc_on_miss
 
     parser = _build_parser()
     args = parser.parse_args()
@@ -599,6 +649,11 @@ def _initialize() -> None:
     _normalize_wikitext_enabled = bool(args.normalize_wikitext)
     _workers = max(1, int(getattr(args, "workers", 1) or 1))
     _workers_budget = max(0, int(getattr(args, "workers_budget", 0) or 0))
+    _build_sdc_on_miss = bool(getattr(args, "build_sdc_on_miss", False))
+    try:
+        _assert_build_sdc_on_miss_allowed(_build_sdc_on_miss, _s3_partner)
+    except ValueError as e:
+        parser.error(str(e))
 
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
@@ -3971,25 +4026,68 @@ def _maintain_resolve(title, embedded_id, file_page, mediaid):
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _maintain_es_doc(dpla_id):
+    """Return the item's ES ``_source`` for the ``--build-sdc-on-miss`` route,
+    fetched at most once per file.
+
+    The title path (:func:`_maintain_canonical_title`) and claims path
+    (:func:`_maintain_sidecar_payload`) both need the same doc for the same id
+    within one file's processing. ``lru_cache(maxsize=1)`` holds the most recent
+    ``dpla_id``'s result, so the two share one :func:`_fetch_dpla_doc_from_es`
+    round-trip; the next id evicts it, so the cache never holds more than one
+    entry. A ``None`` doc (item gone) is cached too, so both paths skip on one
+    fetch. Per-process (spawn workers each build their own); tests call
+    ``_maintain_es_doc.cache_clear()``.
+    """
+    return _fetch_dpla_doc_from_es(dpla_id)
+
+
 def _maintain_sidecar_payload(dpla_id):
-    """Maintain mode: load the precomputed ``sdc.json`` for ``dpla_id`` from S3
-    (staged by ``get-ids-es --maintain``) so the sync runs through
-    :func:`process_one_from_sdc` — no ``api.dp.la`` call, no runtime claim
-    build. Requires ``--from-s3 <partner>`` (which sets ``_s3_partner`` /
-    ``_s3_client``); returns the parsed payload, or None when no sidecar is
-    staged for this id. A None result means the caller should SKIP the file
-    rather than fall back to a per-file live API call — at hub scale (100Ks of
-    files, possibly parallel) that fallback is exactly the api.dp.la load this
-    path exists to avoid.
+    """Maintain mode: return the ``sdc.json`` claim envelope for ``dpla_id`` so
+    the sync runs through :func:`process_one_from_sdc` — no ``api.dp.la`` call.
+    Requires ``--from-s3 <partner>`` (which sets ``_s3_partner`` /
+    ``_s3_client``).
+
+    Reads the precomputed sidecar staged by ``get-ids-es --maintain`` from S3.
+    On a miss the behavior depends on ``--build-sdc-on-miss``:
+
+    * **off (default):** return None. A None result means the caller SKIPs the
+      file rather than falling back to a per-file live ``api.dp.la`` call — at
+      hub scale (100Ks of files, possibly parallel) that fallback is exactly the
+      load this path exists to avoid. NARA relies on this: its staged sdc.json
+      carries batch-reconciled P921 subject QIDs.
+    * **on (non-NARA lite ``--cat`` route, run without a pre-stage):** build the
+      envelope on demand from the internal ES index — the same
+      :func:`build_claims_for_doc` get-ids-es Phase 3 runs, on the same
+      ``_source`` doc, so the result is identical to a staged sidecar
+      (``subjects_lookup=None`` omits only the NARA-specific reconciled P921
+      statements, which never apply off NARA). No ``api.dp.la`` load:
+      :func:`_fetch_dpla_doc_from_es` hits internal ES. None on an
+      unresolvable/unparseable doc → caller SKIPs, as before.
     """
     if _s3_partner is None:
         return None
     raw = _s3_client.get_sdc_json(_s3_partner, dpla_id)
-    if raw is None:
+    if raw is not None:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not _build_sdc_on_miss:
+        return None
+    doc = _maintain_es_doc(dpla_id)
+    if doc is None:
         return None
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
+        return build_claims_for_doc(doc, dpla_id, hubs, rights, subject_ids, None)
+    except ValueError:
+        # doc lacks a valid ingestDate — same per-item log-and-skip convention
+        # as get-ids-es / get-ids-nara; treat as no sidecar (caller SKIPs).
+        logging.warning(
+            "maintain: could not build sdc.json for %s (invalid ingestDate); skipping.",
+            dpla_id,
+        )
         return None
 
 
@@ -4003,18 +4101,31 @@ def _maintain_canonical_title(file_page, dpla_id):
     title-text change) — never a fresh normalization rule. Maintain changes
     neither the bytes nor the page structure, so the extension and page ordinal
     are taken from the file's own existing title; only the descriptive prefix
-    and the embedded id can move. The descriptive title comes from the item's
-    staged ``dpla-map.json`` (``sourceResource.title``), so this requires
-    ``--from-s3``.
+    and the embedded id can move. The descriptive title
+    (``sourceResource.title``) comes from the item's staged ``dpla-map.json``;
+    this requires ``--from-s3``. When that sidecar is missing and
+    ``--build-sdc-on-miss`` is set (the non-NARA lite ``--cat`` route, run
+    without a pre-stage), the same ``_source`` doc is fetched on demand from ES
+    via :func:`_maintain_es_doc` instead.
     """
     if _s3_partner is None:
         return None
     raw = _s3_client.get_item_metadata(_s3_partner, dpla_id)
-    if not raw:
-        return None
-    try:
-        metadata = json.loads(raw)
-    except json.JSONDecodeError:
+    if raw:
+        try:
+            metadata = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    elif _build_sdc_on_miss:
+        # No staged dpla-map.json — the lite ``--cat`` maintain route runs
+        # without the whole-hub pre-stage. Fetch the same ``_source`` doc on
+        # demand from the internal ES index (the dpla-map.json IS that doc) so
+        # title-drift renames still work; ``_maintain_sidecar_payload`` builds
+        # its sdc.json from the same doc (shared via ``_maintain_es_doc``).
+        metadata = _maintain_es_doc(dpla_id)
+        if metadata is None:
+            return None
+    else:
         return None
     titles = get_list(
         get_dict(metadata, SOURCE_RESOURCE_FIELD_NAME), DC_TITLE_FIELD_NAME
@@ -5596,19 +5707,26 @@ def _enumerate_maintain_groups(generator, limit):
 def _init_maintain_worker(
     log_queue,
     hubs_data,
+    rights_data,
+    subject_ids_data,
     s3_partner,
     normalize_wikitext_enabled,
     workers_budget,
+    build_sdc_on_miss,
 ):
     """Per-worker setup for parallel maintain — mirrors
     :func:`_init_partner_worker`: a fresh pywikibot session, the parent's
-    ``hubs`` snapshot (anchor-3 QID scope map + post-SDC cleanup provider
-    lookup), the ``--from-s3`` partner key and an S3 client for sidecar reads,
-    the normalize flag, the box-wide slot budget, and log routing to the parent.
+    ``hubs`` / ``rights`` / ``subject_ids`` snapshots, the ``--from-s3`` partner
+    key and an S3 client for sidecar reads, the normalize flag, the
+    ``--build-sdc-on-miss`` flag, the box-wide slot budget, and log routing to
+    the parent.
 
     No ``dpla_api`` is injected: embedded ids are precomputed by the parent and
     carried in each group tuple, and the sync reads claims from the staged
-    sidecar — neither path calls ``api.dp.la``.
+    sidecar or (``--build-sdc-on-miss``) builds them from the internal ES index
+    via :func:`build_claims_for_doc` — neither path calls ``api.dp.la``.
+    ``rights`` / ``subject_ids`` are injected (as in partner mode) because that
+    on-demand build needs them.
     """
     import logging.handlers
 
@@ -5619,14 +5737,20 @@ def _init_maintain_worker(
     pywikibot.config.retry_max = _PYWIKIBOT_RETRY_MAX
     pywikibot.config.socket_timeout = _PYWIKIBOT_SOCKET_TIMEOUT
 
-    global site, hubs, _s3_partner, _s3_client
-    global _normalize_wikitext_enabled, _worker_slot_budget
+    global site, hubs, rights, subject_ids, _s3_partner, _s3_client
+    global _normalize_wikitext_enabled, _worker_slot_budget, _build_sdc_on_miss
     site = pywikibot.Site("commons", "commons")
     site.login()
     hubs = hubs_data
+    rights = rights_data
+    subject_ids = subject_ids_data
     _s3_partner = s3_partner
     _normalize_wikitext_enabled = bool(normalize_wikitext_enabled)
     _worker_slot_budget = WorkerSlotBudget(workers_budget)
+    _build_sdc_on_miss = bool(build_sdc_on_miss)
+    # Defense in depth: the parent _initialize already rejects this combo, but
+    # re-check here so a worker can never run the P921-stripping path.
+    _assert_build_sdc_on_miss_allowed(_build_sdc_on_miss, _s3_partner)
     if s3_partner is not None:
         from ingest_wikimedia.s3 import S3Client
 
@@ -5707,9 +5831,12 @@ def _run_maintain_parallel(groups, workers):
         initializer=_init_maintain_worker,
         initargs=(
             hubs,
+            rights,
+            subject_ids,
             _s3_partner,
             _normalize_wikitext_enabled,
             _workers_budget,
+            _build_sdc_on_miss,
         ),
         task_fn=_worker_maintain_group_task,
     )
