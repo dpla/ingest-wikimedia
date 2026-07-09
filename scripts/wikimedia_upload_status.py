@@ -359,6 +359,13 @@ def get_phase_and_progress(
         id_lines = out.splitlines()
         id_now = _safe_int(id_lines[0]) if id_lines else 0
         id_mtime = _safe_int(id_lines[1]) if len(id_lines) > 1 else 0
+        # Log predates this session — a stale id-generation log from a prior
+        # run of this label, picked before the new session has written its
+        # own. Same "predates this session" sentinel as the drain and
+        # download/upload/sdc branches (return None → caller renders a bare
+        # "Generating IDs" rather than a stale enumerated count).
+        if session_created > 0 and id_mtime < session_created:
+            return None, 0
         enumerated = id_lines[2].strip() if len(id_lines) > 2 else ""
         label_txt = f"Generating IDs ({enumerated})" if enumerated else "Generating IDs"
         # Same idle/staleness signal as the download/upload/sdc phases: a hung

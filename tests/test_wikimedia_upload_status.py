@@ -2377,6 +2377,39 @@ def test_get_phase_and_progress_flags_stale_id_generation():
     assert phase == "Generating IDs (42,345 items enumerated) ⚠ idle 2h05m", phase
 
 
+def test_get_phase_and_progress_ignores_stale_id_generation_log():
+    """A stale ``-id-generation.log`` from a prior run of this label (mtime
+    before the session was created) must not be reported as live progress.
+    get_phase_and_progress returns None — same "predates this session"
+    sentinel as the other phase branches — so the caller renders a bare
+    ``Generating IDs`` instead of an old enumerated count."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    calls = []
+
+    def fake_ssm_run(_client, _command, **_kwargs):
+        calls.append(_command)
+        if len(calls) == 1:  # precheck: session_created + newest matching log
+            # Session created AFTER the stale log's mtime returned below.
+            return (
+                "1700009999\n"
+                "20260701-120000-bpl+boston-public-library-id-generation.log\n"
+            )
+        # id-generation branch: now, then a mtime that PREDATES session_created.
+        return "1700010000\n1700000000\n42,345 items enumerated\n"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+boston-public-library",
+            hub="bpl",
+            label="bpl+boston-public-library",
+        )
+    assert phase is None, phase
+
+
 def test_institution_label_no_log_does_not_grab_partner_drain_log():
     """An institution session in id-generation (no matching log yet) must NOT
     fall back to the hub-slug glob and pick up an unrelated partner-level
