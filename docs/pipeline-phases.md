@@ -39,7 +39,7 @@ Source: `tools/get_ids_es.py`.
 - `check_es_response()` rejects any response with `timed_out=true` or `_shards.failed > 0` so a 200-OK partial response cannot silently terminate a `search_after` paginator.
 - Bounded-semaphore-protected S3 writes so the worker pool's task queue doesn't OOM on a 100 K-item hub.
 
-**Flags.** No `--dry-run` or `--max-records`. To bound a run, redirect stdout to a temporary CSV and `head` it. Two maintain-mode flags exist: `--maintain` (relax the institution upload-eligibility gate to QID-only, so already-uploaded items of no-longer-opted-in institutions are still enumerated) and `--skip-media-filter` (drop the per-item media/rights gate so the full Commons category can be reconciled — used by lite maintain). Both are set by the launcher's maintain pipelines; see Alternate run modes → `maintain` below. Pre-flight Slack notification fires from `notify_phase_start("get-ids-es")`.
+**Flags.** No `--dry-run` or `--max-records`. To bound a run, redirect stdout to a temporary CSV and `head` it. Two maintain-mode flags exist: `--maintain` (relax the institution upload-eligibility gate to QID-only, so already-uploaded items of no-longer-opted-in institutions are still enumerated) and `--skip-media-filter` (drop the per-item media/rights gate so the full Commons category can be reconciled — used by the category-anchored maintain staging scan, i.e. both the hash and lite routes; the id-list-anchored single-DPLA-id/collection sub-path keeps the filter). Both are set by the launcher's maintain pipelines; see Alternate run modes → `maintain` below. Pre-flight Slack notification fires from `notify_phase_start("get-ids-es")`.
 
 ### NARA's special enumerator (`tools/get_ids_nara.py`)
 
