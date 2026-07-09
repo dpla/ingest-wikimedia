@@ -107,6 +107,24 @@ def test_get_institutions_retries_on_429_then_succeeds():
         assert sleep.call_count == 2  # two 429s → two backoff sleeps
 
 
+def test_get_institutions_honors_retry_after_header():
+    data = {"Hub": {"upload": True}}
+    queue = [_http_429(retry_after="1"), _json_urlopen(data)]
+
+    def _urlopen(*args, **kwargs):
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with (
+        patch.object(partners.time, "sleep") as sleep,
+        patch.object(partners.urllib.request, "urlopen", side_effect=_urlopen),
+    ):
+        assert partners._get_institutions() == data
+        sleep.assert_called_once_with(1.0)  # honors Retry-After, not default backoff
+
+
 def test_get_institutions_raises_after_exhausting_429_retries():
     with (
         patch.object(partners.time, "sleep"),

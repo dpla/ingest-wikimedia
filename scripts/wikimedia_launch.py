@@ -896,8 +896,12 @@ def main() -> None:
         # Best-effort: one fetch won't rate-limit, and if it fails the runtime
         # falls back to a retrying live fetch (partners._get_institutions), so a
         # GitHub hiccup must not block the launch (`|| echo`, not `&&`).
+        # Atomic: curl to a temp file, mv into place only on success, so a
+        # failed/interrupted fetch can't truncate a good copy staged by an
+        # earlier launch (which would silently drop this launch back to live fetch).
         + f"( curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors {shlex.quote(INSTITUTIONS_URL)} "
-        + f"-o {shlex.quote(INSTITUTIONS_LOCAL_PATH)} "
+        + f"-o {shlex.quote(INSTITUTIONS_LOCAL_PATH + '.tmp')} "
+        + f"&& mv {shlex.quote(INSTITUTIONS_LOCAL_PATH + '.tmp')} {shlex.quote(INSTITUTIONS_LOCAL_PATH)} "
         + "|| echo 'WARN: institutions_v2.json stage failed; runtime falls back to live fetch' ) && "
         + "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
     )
