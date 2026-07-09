@@ -143,8 +143,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Read each DPLA item's metadata from the dpla-map.json staged in S3 "
             "by get-ids-es (under the partner's sharded item prefix; resolved by "
-            "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
-            "to ES when an item's dpla-map.json is missing."
+            "S3Client.get_item_metadata) rather than reading each item from ES "
+            "at sync time. Falls back to a direct ES read when an item's "
+            "dpla-map.json is missing."
         ),
     )
     p.add_argument(
@@ -586,8 +587,8 @@ def _initialize() -> None:
     subject_ids = fetch_subjects_json()
 
     # When --from-s3 <partner> is set, parsed() reads each item's dpla-map.json
-    # from S3 instead of calling api.dp.la. Imported lazily so this module
-    # doesn't pay the boto3 import cost when nothing needs S3.
+    # from S3, falling back to a direct ES read on miss. Imported lazily so this
+    # module doesn't pay the boto3 import cost when nothing needs S3.
     _s3_partner = args.from_s3
     _s3_client = None
     if _s3_partner is not None:
@@ -3646,6 +3647,9 @@ def _fetch_dpla_doc_from_es(dpla_id):
             else:
                 print(f" -- ES retry failed for {dpla_id}: {e!r}")
                 return None
+    # Unreachable — the loop returns on every attempt — but makes the
+    # "doc or None" contract explicit (no implicit fall-through to None).
+    return None
 
 
 def _fetch_dpla_doc_from_s3(s3_client, partner, dpla_id):
@@ -3713,7 +3717,7 @@ def parsed(dpla_id, dpla_api):
         return None
     # Stash the raw doc so ``_post_sdc_cleanup_for_legacy_mode`` can
     # reuse it after ``process_one`` returns, skipping a redundant
-    # S3 / api.dp.la fetch on the same dpla_id. Cache is per dpla_id
+    # S3 / ES fetch on the same dpla_id. Cache is per dpla_id
     # and pop-on-read in the cleanup helper so it doesn't grow.
     _legacy_mode_doc_cache[dpla_id] = dpla
     return _parse_dpla_doc(dpla, dpla_id)

@@ -73,6 +73,28 @@ def _invoke(*args: str):
         return runner.invoke(get_ids_es.main, list(args))
 
 
+def test_id_generation_uses_file_only_logging():
+    """get-ids-es's stdout IS the ID CSV, so it must set up FILE-ONLY logging
+    (console=False) — the tqdm console handler writes to stdout and would
+    interleave log lines into the CSV. Pin the call args so a regression can't
+    silently re-enable console logging and corrupt the CSV."""
+    from tools import get_ids_es
+
+    with (
+        patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        patch.object(get_ids_es, "setup_logging") as setup_logging,
+        patch.object(get_ids_es, "notify_phase_start"),
+        patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
+        patch.object(
+            get_ids_es,
+            "fetch_institutions_v2",
+            side_effect=RuntimeError("stop-after-validation"),
+        ),
+    ):
+        CliRunner().invoke(get_ids_es.main, ["bpl"])
+    setup_logging.assert_called_once_with("bpl", "id-generation", console=False)
+
+
 def test_collection_without_institution_is_hub_wide():
     """``--collection`` with no ``--institution`` is valid: the collection
     is matched across every upload-eligible institution in the hub (some
