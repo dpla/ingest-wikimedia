@@ -2181,9 +2181,11 @@ def test_initialize_pins_pywikibot_retry_budget(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(pywikibot, "Site", MagicMock)
-    monkeypatch.setattr(
-        sdc_sync.requests, "get", lambda *a, **k: MagicMock(json=lambda: {})
-    )
+    # _initialize() pulls the two ingestion3 configs via fetch_institutions_v2 /
+    # fetch_subjects_json (partners' local-first loader, urllib) — not
+    # requests.get — so stub those to keep this test offline.
+    monkeypatch.setattr(sdc_sync, "fetch_institutions_v2", lambda *a, **k: {})
+    monkeypatch.setattr(sdc_sync, "fetch_subjects_json", lambda *a, **k: {})
 
     sdc_sync._initialize()
 

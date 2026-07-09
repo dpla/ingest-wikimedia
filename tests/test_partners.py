@@ -49,6 +49,19 @@ def _http_429(retry_after=None):
     return urllib.error.HTTPError("https://x", 429, "Too Many Requests", hdrs, None)
 
 
+def _queue_urlopen(queue):
+    """urlopen side-effect that pops ``queue`` in order, raising Exception items
+    (to simulate 429s) and returning the rest — for multi-attempt retry tests."""
+
+    def _urlopen(*args, **kwargs):
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return _urlopen
+
+
 @pytest.fixture(autouse=True)
 def _isolate_staged_config(monkeypatch):
     """Reset the staged-config cache and clear the WIKIMEDIA_*_FILE env vars
@@ -94,16 +107,11 @@ def test_load_institutions_empty_local_file_falls_back_to_fetch(tmp_path, monkey
 def test_load_institutions_retries_on_429_then_succeeds():
     data = {"Hub": {"upload": True}}
     queue = [_http_429(), _http_429(), _json_urlopen(data)]
-
-    def _urlopen(*args, **kwargs):
-        item = queue.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
-
     with (
         patch.object(partners.time, "sleep") as sleep,
-        patch.object(partners.urllib.request, "urlopen", side_effect=_urlopen),
+        patch.object(
+            partners.urllib.request, "urlopen", side_effect=_queue_urlopen(queue)
+        ),
     ):
         assert partners.load_institutions() == data
         assert sleep.call_count == 2  # two 429s → two backoff sleeps
@@ -112,16 +120,11 @@ def test_load_institutions_retries_on_429_then_succeeds():
 def test_load_institutions_honors_retry_after_header():
     data = {"Hub": {"upload": True}}
     queue = [_http_429(retry_after="1"), _json_urlopen(data)]
-
-    def _urlopen(*args, **kwargs):
-        item = queue.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
-
     with (
         patch.object(partners.time, "sleep") as sleep,
-        patch.object(partners.urllib.request, "urlopen", side_effect=_urlopen),
+        patch.object(
+            partners.urllib.request, "urlopen", side_effect=_queue_urlopen(queue)
+        ),
     ):
         assert partners.load_institutions() == data
         sleep.assert_called_once_with(1.0)  # honors Retry-After, not default backoff
