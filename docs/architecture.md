@@ -42,6 +42,9 @@ AWS SSM  →  EC2  (i-033eff6c8c168f999, "wiki downloads")
     │    3. uploader   <partner>.csv <partner> --workers-budget 24
     │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv \
     │                    --workers 6 --workers-budget 24
+    │    5. drain-deferred --no-wait <partner>   (opportunistic duplicate-tag drain)
+    │  Then once per unique partner, at batch end:
+    │    6. drain-deferred <partner>             (terminal patient duplicate-tag drain)
     ▼
 S3 (s3://dpla-wikimedia/)        Wikimedia Commons
     sidecars + media bytes       file pages + MediaInfo SDC
@@ -78,7 +81,7 @@ Four `workflow_dispatch`-only workflows handle the slash-command traffic:
 
 | Workflow | Triggered by | Concurrency group |
 |---|---|---|
-| `wikimedia-launch.yml` | `/wikimedia-upload`, `/wikimedia-upload sdc`, `/wikimedia-upload refresh` | `wikimedia-launch-${concurrency_key \|\| run_id}` |
+| `wikimedia-launch.yml` | `/wikimedia-upload`, `/wikimedia-upload sdc`, `/wikimedia-upload refresh`, `/wikimedia-upload maintain` | `wikimedia-launch-${concurrency_key \|\| run_id}` |
 | `wikimedia-kill.yml` | `/wikimedia-upload kill` | none — fire-and-forget |
 | `wikimedia-retry.yml` | `/wikimedia-upload retry` | `wikimedia-retry-${partner \|\| 'all'}` |
 | `wikimedia-upload-status.yml` | `/wikimedia-status` + cron `0 */6 * * *` | fixed `wikimedia-upload-status` |
@@ -93,20 +96,30 @@ This is the bulk of the dispatch logic. In order, it:
 2. **Resolves targets.** QIDs are looked up against `institutions_v2.json` (live-fetched from `github.com/dpla/ingestion3/.../wiki/institutions_v2.json`, module-cached so warm Lambda calls don't refetch). DPLA IDs are batched into one SSM call to `resolve-dpla-ids` on EC2, which does an ES `terms` query and applies the full eligibility filter.
 3. **Checks EC2 memory.** Aborts when available RAM is below 30 %. Each session uses ~300–500 MB on a 7.6 GB instance, so 30 % free leaves room for 4–5 concurrent sessions.
 4. **Detects session conflicts.** Hub-level, institution-level, and collection-level targets define conflict rules so that, e.g., a hub run blocks any institution-level run inside that hub. `force=true` (GH-Actions-manual-only — the Lambda never sets it) kills offending sessions instead of aborting.
-5. **Updates EC2 source code.** Clones `dpla/ingest-wikimedia` at `GITHUB_SHA` into `/tmp` and runs `cp -r` over `ingest_wikimedia/`, `tools/`, `pyproject.toml`, `uv.lock` onto the EC2 install, then runs `uv sync`. The EC2 install is an editable install, so updated source files take effect immediately.
-6. **Builds the pipeline shell script.** Each target becomes a `cd <base> && get-ids-es ... && downloader ... && uploader ... && sdc-sync ... || { notify_pipeline_fail; }` block; the blocks are joined with `; ` so one target's failure doesn't abort the batch (only the `&&` chain inside one target).
+5. **Updates EC2 source code (and stages config).** Clones `dpla/ingest-wikimedia` at `GITHUB_SHA` into `/tmp` and runs `cp -r` over `ingest_wikimedia/`, `tools/`, `pyproject.toml`, `uv.lock` onto the EC2 install, then runs `uv sync`. The EC2 install is an editable install, so updated source files take effect immediately. The same SSM command also stages ingestion3's config JSON — it fetches `institutions_v2.json` and `subjects.json` once to `/home/ec2-user/ingest-wikimedia/` (atomically, best-effort) so the many short-lived per-target processes read config local-first from disk instead of each re-fetching from `raw.githubusercontent.com` and tripping its anonymous HTTP-429 rate limit. `partners.load_institutions`/`load_subjects` fall back to a retrying live fetch when the staged file is absent (the Lambda / GitHub Actions path, where no local checkout exists).
+6. **Builds the pipeline shell script.** Each target becomes a `cd <base> && get-ids-es ... && downloader ... && uploader ... && sdc-sync ... || { notify_pipeline_fail; }` block; the blocks are joined with `"; "` so one target's failure doesn't abort the batch (only the `&&` chain inside one target).
 7. **Launches the tmux session via SSM.** The script is base64-encoded, written to `/tmp/wm-pipeline-<sha1>.sh` on EC2, then started under `tmux new-session -d -s <session_name> -c <cwd> 'bash <script>'`. Base64 avoids SSM's command-length cap (~25 KB) and shell-metacharacter escaping issues — large batches of 20+ targets hit the cap before this change.
 8. **Posts a launch confirmation** to #tech-alerts.
 
 ### Step 4 — EC2 execution
 
-The tmux session runs detached. For each target block, `bash` exports `WIKIMEDIA_SESSION_LABEL`, `WIKIMEDIA_PARTNER_DIR`, `WIKIMEDIA_TARGET_IS_LAST`, and (for single-item targets) `WIKIMEDIA_SINGLE_ITEM`. These env vars are read by the Slack-notification helpers inside the Python phase tools so completion / failure messages identify the right target.
+The tmux session runs detached. Its `setup` prefix exports `WIKIMEDIA_INSTITUTIONS_FILE` and `WIKIMEDIA_SUBJECTS_FILE` once (session-wide, pointing at the launch-staged config on disk) so every phase loads config local-first. Then, for each target block, `bash` exports `WIKIMEDIA_SESSION_LABEL`, `WIKIMEDIA_PARTNER_DIR`, `WIKIMEDIA_TARGET_IS_LAST`, and (for single-item targets) `WIKIMEDIA_SINGLE_ITEM`. These per-target env vars are read by the Slack-notification helpers inside the Python phase tools so completion / failure messages identify the right target.
 
 Phase output is logged to `<partner_dir>/logs/<timestamp>-<label>-<phase>.log` (download / upload / sdc). The status workflow tails these logs to derive progress.
 
+### Maintain mode
+
+`/wikimedia-upload maintain [lite|count] <target> …` dispatches `wikimedia-launch.yml` with `maintain=true` (plus optional `lite`/`count_only`) to reconcile files **already on Commons** for a hub or institution *in place* — no new items are downloaded and no new File pages are created (the uploader runs behind a `--no-create` fence). Because nothing new is uploaded, upload-ineligible (de-opted, `upload:false`) targets are allowed. Three routes:
+
+- **default (hash)** — downloads media and content-reconciles: re-links drifted files, overwrites changed bytes, then SDC.
+- **`lite`** — no-download route: SDC-in-place + name-drift rename only.
+- **`count`** — read-only pre-flight sizing; writes nothing.
+
+`partners.resolve_wikidata_id(qid, maintain=True)` drops the upload-eligibility filter (see [Target resolution](#target-resolution)) so a de-opted institution's QID still resolves, and the launcher likewise relaxes the id-list scan's institution gate to QID-only. The `ingest_wikimedia/maintain.py` re-link engine resolves the current DPLA ID for a possibly-drifted Commons file (via a provider-agnostic `isShownAt`/wildcard ladder against the live index).
+
 ## Target resolution
 
-`/wikimedia-upload` accepts five target forms, mixed freely on the same command:
+`/wikimedia-upload` accepts six target forms, mixed freely on the same command:
 
 | Form | Example | Resolves to |
 |---|---|---|
@@ -114,10 +127,11 @@ Phase output is logged to `<partner_dir>/logs/<timestamp>-<label>-<phase>.log` (
 | Hub alias | `ma`, `mass` (= `bpl`) | One full-hub target, slug normalised |
 | `hub\|institution` | `"indiana\|Indiana State Library"` | One institution-level target |
 | `hub\|institution\|collection` | `"indiana\|Indiana State Library\|Cushman Photographs"` | One collection-level target |
+| `hub\|\|collection` | `"nara\|\|General Records of the United States Government"` | One hub-wide collection target — the collection across every upload-eligible institution in the hub (empty institution slot) |
 | Wikidata QID | `Q72380652` | One or more targets, looked up in `institutions_v2.json` |
 | DPLA item ID | `06b558045c5fd4cc5dc697248272159a` | One single-item target (32-hex) |
 
-**Wikidata QID resolution.** `partners.resolve_wikidata_id(qid)` walks every hub in `institutions_v2.json` and returns every match — a QID at hub level becomes a full-hub target; a QID at institution level becomes an institution-level target; a QID matching multiple institutions inside the same hub becomes one combined target with all matching institution names ORed in the ES filter. If a QID matches *both* a hub and one of its own institutions (e.g. an institution that runs its own hub), the hub-level scope wins and the per-institution matches are discarded as strictly narrower.
+**Wikidata QID resolution.** `partners.resolve_wikidata_id(qid)` walks every hub in `institutions_v2.json` and returns every **upload-eligible** match — a QID at hub level becomes a full-hub target (kept only if the hub has `upload:true`); a QID at institution level becomes an institution-level target (kept only if the hub or the institution has `upload:true`); a QID matching multiple institutions inside the same hub becomes one combined target with all matching institution names ORed in the ES filter. If a QID matches *both* a hub and one of its own institutions (e.g. an institution that runs its own hub), the hub-level scope wins and the per-institution matches are discarded as strictly narrower. Matches that fail the eligibility filter — e.g. `Q131454` (Library of Congress), listed but not opted in — are dropped and reported back as "not upload-eligible per institutions_v2.json" rather than routed onto the broad `lc` hub. maintain mode (`resolve_wikidata_id(qid, maintain=True)`) deliberately drops the filter so files of de-opted (`upload:false`) institutions can still be reconciled.
 
 **DPLA ID resolution.** DPLA IDs are batched into a single SSM call to `tools/resolve_dpla_ids.py`, which does one ES `terms` query and applies the eligibility filter (banlist, `rightsCategory == "Unlimited Re-Use"`, has-media, hub resolves, institution upload-eligible). Eligible IDs become single-item targets and get re-staged through `get-ids-es --single-id <id>` so their `dpla-map.json` and `sdc.json` reflect the latest mapping code before the downstream phases run.
 
@@ -150,22 +164,23 @@ The session-conflict rules above keep *distinct targets* from clobbering each ot
 
 Two phases write to Commons: the **uploader** (single-process) and **sdc-sync** (parallelised across a spawn-start `multiprocessing.Pool` via `--workers N`). Each sdc-sync worker — and the uploader — does per-DPLA-*item* work, and Commons' MediaWiki parser pool only tolerates a limited number of concurrent bot writes before maxlag starts to bind. Per-session worker counts can't see each other, so 6 sessions × 6 workers would oversubscribe.
 
-`ingest_wikimedia/worker_slots.py` provides `WorkerSlotBudget`: a box-wide N-permit semaphore backed by `N` `fcntl`-flock slot files under `/tmp/sdc-sync-worker-slots` (`--workers-budget N`). Every writer — each sdc-sync Pool worker *and* the single-process uploader — checks out exactly one slot per item before its per-item Commons work and releases it on return, so **all upload and sdc-sync sessions on the host contend over the same cap**. The downloader is deliberately not in the pool (it writes to source sites, not Commons). `budget <= 0` disables the semaphore (acquire is a no-op); `flock` makes it crash-safe (a dead holder's slot frees automatically when its fd closes).
+`ingest_wikimedia/worker_slots.py` provides `WorkerSlotBudget`: a box-wide N-permit semaphore backed by `N` `fcntl`-flock slot files. There are **two pools**. The **shared pool** (`/tmp/sdc-sync-worker-slots`, sized by `--workers-budget N`) is the box-wide budget every sdc-sync Pool worker contends over — one slot per item. The **uploader priority pool** (`/tmp/dpla-uploader-priority-slots`, `UPLOADER_PRIORITY_SLOTS = 4`) is a smaller dedicated pool only uploaders use: the uploader's `WorkerSlotBudget` is wired with the priority pool as primary and the shared pool as `fallback`, so it tries a priority slot first and spills into the shared pool only when all priority slots are held by other uploaders. sdc-sync workers construct no fallback, so they can *never* lock a priority slot. The priority pool is **additive** — not carved out of the shared budget — so total box-wide Commons writers = shared budget + 4. Net effect: an uploader is never blocked by sdc-sync workers as long as fewer than 4 uploader items are in flight box-wide. The downloader is deliberately in neither pool (it writes to source sites, not Commons). `budget <= 0` disables the semaphore (acquire is a no-op); `flock` makes it crash-safe (a dead holder's slot frees automatically when its fd closes).
 
 ```text
-  --workers-budget 24  →  /tmp/sdc-sync-worker-slots/{slot-0 … slot-23}
-                                  ▲  ▲  ▲          ▲   ▲
-   ┌───────────────────────┐     │  │  │          │   │   (24 flock'd slot files,
-   │ sdc-sync session A     │     │  │  │          │   │    box-wide, shared)
-   │  Pool(--workers 6)     │─────┘  │  │          │   │
-   │   w1 w2 w3 w4 w5 w6     │────────┘  │          │   │
-   └───────────────────────┘  (1 slot/item)        │   │
-   ┌───────────────────────┐                       │   │
-   │ sdc-sync session B …   │───────────────────────┘   │
-   └───────────────────────┘  (its 6 workers …)         │
-   ┌───────────────────────┐                            │
-   │ uploader (any session) │────────────────────────────┘
-   └───────────────────────┘  (single process, 1 slot/item)
+  Shared pool   --workers-budget 24        → /tmp/sdc-sync-worker-slots/{slot-0 … slot-23}
+  Priority pool UPLOADER_PRIORITY_SLOTS=4   → /tmp/dpla-uploader-priority-slots/{slot-0 … slot-3}
+
+   ┌───────────────────────┐
+   │ sdc-sync session A     │──┐
+   │  Pool(--workers 6)     │  │
+   │   w1 w2 w3 w4 w5 w6     │  ├──▶ shared pool (24 slots, box-wide)
+   └───────────────────────┘  │        ▲   (sdc-sync can ONLY use the shared pool)
+   ┌───────────────────────┐  │        │
+   │ sdc-sync session B …   │──┘        │  overflow: only when all 4 priority slots held
+   └───────────────────────┘           │
+   ┌───────────────────────┐           │
+   │ uploader (any session) │──▶ priority pool (4 slots) ──┘
+   └───────────────────────┘   (tries priority first; 1 slot/item; additive to shared)
 ```
 
 **Invariant: the budget value must be identical across every concurrent session.** It is the cap's whole meaning — if two sessions disagree (24 vs 12), the effective cap degrades to the larger value while the smaller-budget session only ever competes for the lower slots. In practice the value comes from one launch-time default (see below), so all sessions agree.
@@ -199,6 +214,7 @@ The downloader and uploader also handle per-item failures internally; they only 
 | Download | `tools/downloader.py` | Iterate IDs, download media (mediaMaster / IIIF), stage to S3, write `file-list.txt` + `iiif.json` |
 | Upload | `tools/uploader.py` | Iterate IDs, upload from S3 to Commons, resolve hash drift, write `upload-result.json` |
 | SDC sync | `tools/sdc_sync.py` | Read sidecars, post atomic per-file `wbeditentity` to Commons MediaInfo |
+| Deferred-tag drain | `tools/drain_deferred.py` | Patient (terminal) + opportunistic (`--no-wait`) drain of the per-partner deferred-tag sidecar — re-runs the deferred `{{duplicate}}`-tag work once `Category:Duplicate` clears |
 | Partner registry | `ingest_wikimedia/partners.py` | Hub slugs, aliases, eligibility lookup, slugification, parsing |
 | ES client | `ingest_wikimedia/es.py` | Validated `post_es`, hard timeout, partial-response guards |
 | S3 client | `ingest_wikimedia/s3.py` | `dpla-wikimedia` bucket, sidecar paths, get/put helpers |
@@ -207,7 +223,9 @@ The downloader and uploader also handle per-item failures internally; they only 
 | Tracker | `ingest_wikimedia/tracker.py` | Per-phase counter set, used in completion messages |
 | SDC builders | `ingest_wikimedia/sdc.py` | `build_claims_for_doc`, P1545 chunking, rights mapping, NARA XML parsing, content-hub/service-hub partnership model (P195 + P3831 roles, `CONTENT_HUB_QIDS`) |
 | Legacy migration | `ingest_wikimedia/legacy_artwork.py` | `{{Artwork}}`→`{{DPLA metadata}}` migration: provenance walk, community-value import as SDC, wikitext rewrite |
-| Worker-slot budget | `ingest_wikimedia/worker_slots.py` | Box-wide `flock`-backed concurrent-Commons-write cap shared across all upload + sdc-sync sessions |
+| Worker-slot budget | `ingest_wikimedia/worker_slots.py` | Box-wide `flock`-backed concurrent-Commons-write cap: a shared sdc-sync pool plus an additive dedicated uploader priority pool |
+| Deferred-drain sidecar | `ingest_wikimedia/drain_sidecar.py` | Persistent per-partner deferred-tag queue (`<partner>/deferred-drain.json`) the uploader writes when the duplicate-tag throttle defers |
+| Duplicate-tag throttle | `ingest_wikimedia/dup_throttle.py` | `Category:Duplicate` capacity gate — defers `{{duplicate}}` tags at/above `threshold`, resumes below `resume_below` (hysteresis) |
 | Wikimedia helpers | `ingest_wikimedia/wikimedia.py` | Title generation, hash-drift handling, CommonsDelinker post |
 | Banlist | `ingest_wikimedia/banlist.py` + `dpla-id-banlist.txt` | Per-DPLA-ID skip list |
 

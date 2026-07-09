@@ -38,7 +38,14 @@ Verified empirically byte-for-byte for the two files that motivated
 this amendment (b2bc51b… and 8ac21ee786… ord 2). Trust Commons's
 `fileexists-no-change`-with-target-title response as the invariant
 check; skip cleanly with `Result.UPLOAD_SKIPPED_COMMONS_DEDUP`
-rather than treating as FAILED.
+rather than treating as FAILED. The uploader detects this equivalence
+via two paths that resolve identically: Commons may raise
+`fileexists-no-change` naming our intended target
+(`_detect_commons_dedup_from_nochange_error`), or a chunked upload may
+return `None` against a real (non-redirect) file already at the
+intended title whose stored SHA1 differs from ours pre-normalization
+(`_detect_commons_dedup_skip`). Both land on
+`Result.UPLOAD_SKIPPED_COMMONS_DEDUP`.
 
 ## Corollaries (do not re-litigate these)
 

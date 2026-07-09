@@ -1,7 +1,7 @@
 {% raw %}
 # S3 Sidecars
 
-The four pipeline phases communicate via JSON / text sidecar files in S3, plus the media bytes themselves. Every sidecar for a DPLA item lives under one prefix:
+The five pipeline phases communicate via JSON / text sidecar files, plus the media bytes themselves. Every per-item sidecar lives in S3 under one prefix:
 
 ```text
 s3://dpla-wikimedia/<partner>/images/<a>/<b>/<c>/<d>/<dpla-id>/
@@ -21,7 +21,9 @@ def get_item_s3_path(dpla_id, filename, partner):
     )
 ```
 
-Three special slug-to-directory mappings: `si` (Smithsonian) maps to `smithsonian/` for the local EC2 working directory but the S3 prefix is still `si/`.
+One special slug-to-directory mapping: `si` (Smithsonian) maps to `smithsonian/` for the local EC2 working directory, but the S3 prefix is still `si/`.
+
+One sidecar is the exception to the S3 rule: the per-partner `deferred-drain.json` queue lives on the EC2 working disk, not S3 — see [`deferred-drain.json`](#deferred-drainjson-local-disk-not-s3) below.
 
 ## Inventory
 
@@ -179,7 +181,8 @@ Per-item upload verdict — the SDC phase's source of truth for which Commons pa
     "2": {"status": "SKIPPED",     "title": "...", "pageid": 234567},
     "3": {"status": "NOT_PRESENT"},
     "4": {"status": "INELIGIBLE"},
-    "5": {"status": "FAILED",      "error": "..."}
+    "5": {"status": "FAILED",      "error": "..."},
+    "6": {"status": "DEFERRED",    "title": "...", "pageid": null}
   }
 }
 ```
@@ -193,6 +196,7 @@ Per-item upload verdict — the SDC phase's source of truth for which Commons pa
 | `NOT_PRESENT` | No corresponding S3 object for this ordinal (downloader didn't write it) |
 | `INELIGIBLE` | Pre-flight rejected (bad MIME, banned filetype, etc.) |
 | `FAILED` | Catastrophic failure; see `error` field |
+| `DEFERRED` | `{{duplicate}}`-tagging upload deferred because Category:Duplicate was at capacity; retried by the drain-deferred phase |
 
 **Critical correctness detail.** `pageid` is `None` on failure (not `0`) so `sdc_sync.py`'s `if not pageid:` guard cleanly skips malformed entries — `M0` is not a valid Commons mediaid and would propagate downstream as a confusing pywikibot APIError.
 
@@ -220,6 +224,26 @@ The actual media file, one S3 object per ordinal. 1-indexed.
 
 ---
 
+## `deferred-drain.json` (local disk, not S3)
+
+The per-partner queue of DPLA IDs whose Case-2 hash-drift upload+tag was deferred because `Category:Duplicate` on Commons was at capacity. Unlike every other sidecar it lives on the EC2 working disk, not S3: `<INGEST_WIKI_ROOT>/<partner-dir>/deferred-drain.json` (e.g. `/home/ec2-user/ingest-wikimedia/smithsonian/deferred-drain.json` for `si`).
+
+**Writer.** `tools/uploader.py` via `drain_sidecar.merge_sidecar` — appends (never overwrites) the deferred IDs at the end of the upload pass.
+
+**Reader / remover.** `tools/drain_deferred.py` — the `drain-deferred` phase. Patient mode (the default, terminal phase of a batch) blocks on `DuplicateCategoryThrottle.wait_for_capacity`, polling `Category:Duplicate` every 300 s with no time budget until it drops below the resume threshold of 140; `--no-wait` runs a single opportunistic round and exits immediately if the category is at capacity. Each round removes its IDs from the sidecar, re-invokes `uploader` + `sdc-sync` on them as subprocesses, and the patient loop repeats until the sidecar is empty. A host-level `flock` at `/home/ec2-user/ingest-wikimedia/.drain-lock` serialises drains across partners.
+
+**Shape:**
+
+```json
+{"partner": "<slug>", "deferred_dpla_ids": ["<dpla-id>", "..."]}
+```
+
+Atomic write (tempfile + `os.replace`); the file is removed when the queue empties.
+
+**Throttle.** `ingest_wikimedia/dup_throttle.py::DuplicateCategoryThrottle` gates the hash-drift `{{duplicate}}` tag path: defer once `Category:Duplicate` reaches 190 members, resume draining once it falls below 140 (a 50-member hysteresis band).
+
+---
+
 ## Helper APIs
 
 `ingest_wikimedia/s3.py` provides these accessors:
@@ -227,7 +251,7 @@ The actual media file, one S3 object per ordinal. 1-indexed.
 ```python
 class S3Client:
     def write_item_metadata(self, partner, dpla_id, body_bytes)        # dpla-map.json
-    def write_item_file(self, partner, dpla_id, filename, body, ctype) # arbitrary sidecar
+    def write_item_file(self, partner, dpla_id, data, filename, content_type) # arbitrary sidecar
     def write_file_list(self, partner, dpla_id, urls)                  # file-list.txt
     def write_iiif_manifest(self, partner, dpla_id, body_bytes)        # iiif.json
     def get_item_metadata(self, partner, dpla_id) -> str | None        # dpla-map.json
@@ -235,10 +259,10 @@ class S3Client:
     def get_upload_result(self, partner, dpla_id) -> str | None        # upload-result.json
     def get_file_list(self, partner, dpla_id) -> list[str]             # file-list.txt
     def get_item_file(self, partner, dpla_id, file_name) -> str | None # arbitrary sidecar
-    def get_metadata_files_for_partner(self, partner) -> Iterator      # walks all dpla-map.json under a partner
+    def get_metadata_files_for_partner(self, partner) -> Generator[dict] # walks all dpla-map.json under a partner
 ```
 
-`get_metadata_files_for_partner()` is used by maintenance tools (`retirer`, `nuke`, `sign`, `remimer`) to iterate every item under a partner without holding the full ID list in memory. It yields `(dpla_id, body_bytes)` pairs lazily.
+`get_metadata_files_for_partner()` is used by the `retirer` maintenance tool to iterate every item under a partner without holding the full ID list in memory. It yields each item's parsed `dpla-map.json` dict lazily. (`nuke`, `sign`, and `remimer` walk the partner prefix with `bucket.objects.filter(Prefix=…)` directly rather than through this helper.)
 
 ---
 
@@ -253,6 +277,7 @@ The phases hand off via these sidecars:
 | Upload → SDC | `upload-result.json` | sdc-sync skips ordinals whose status isn't `UPLOADED`/`SKIPPED` |
 | Enumeration → SDC (separate pass) | `sdc.json` | sdc-sync diffs against Commons-side state |
 | Download → SDC (separate pass) | `file-list.txt` | sdc-sync uses per-ordinal URL for `P2699` qualifier |
+| Upload → Drain-deferred | `deferred-drain.json` (local disk) | drain-deferred re-invokes uploader + sdc-sync on the queued IDs once Category:Duplicate drains below 140 |
 
 This decoupling is what lets `sdc-sync` re-run independently of the other phases (the `sdc_only` mode), and lets `refresh-only` re-download without disturbing already-uploaded files.
 {% endraw %}

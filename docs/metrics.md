@@ -57,6 +57,8 @@ For categories tracked by `{{views from category}}` but NOT yet in the Wikimedia
 
 In effect: `data` mode publishes the numbers; `categories` mode manages the queue of categories that *should* have numbers published.
 
+**Login is deferred.** `site = pywikibot.Site()` connects to Commons but does not authenticate. Both modes are read-dominated — the daily `categories` run and most `data` runs make no edits — so the bot logs in lazily via `ensure_login()`, called immediately before each write (`category.change_category`, `category.save`, `pagename.save`, `chartpagename.save`). Runs that make no edits never authenticate, which avoids Wikimedia emailing a "login from a new device" alert on every scheduled run (each CI runner has a fresh IP).
+
 ## The workflow: `.github/workflows/cim-pageviews.yml`
 
 Triggers:
@@ -78,7 +80,7 @@ Two jobs (`categories`, `data`), each gated by the matching trigger:
 
 Both jobs do the same setup:
 
-1. Checkout the repo.
+1. Checkout the repo with `persist-credentials: false`, so the auto-generated `GITHUB_TOKEN` isn't left in the runner's Git config for later steps.
 2. Install `uv` via `astral-sh/setup-uv`.
 3. Run `uv python install` to provision the Python interpreter `uv` will use, then `uv sync --no-dev` to install dependencies.
 4. Build `metrics/cim-pageviews/user-password.py` at runtime via a HEREDOC, embedding `BotPassword('PARTNER_UPLOADS', '<secret>')` where `<secret>` is `secrets.PYWIKIBOT_PASSWORD`. (The committed `user-config.py` references this file but doesn't contain the secret.)
@@ -105,6 +107,10 @@ The page does no server-side work; everything is client-side JS in `metrics/metr
 A pre-paint inline script (`metrics/index.html` line 11) sets a `.filter-view` class on `<html>` when the URL has a `show` or `hub` parameter — this lets CSS hide the input form without a flash-of-unstyled-content.
 
 The frontend and the bot read the same REST API, but they're decoupled: the bot writes Commons `Data:Views/<category>.tab` / `.chart` pages so other on-wiki templates and tools can consume the monthly series without hitting the REST endpoint themselves, while this site goes direct to the REST endpoint for freshness. A change to either side doesn't break the other as long as the REST response schema is stable.
+
+## Sibling scheduled job: `metrics/dpla-dup-window/`
+
+`metrics/` also houses a separate scheduled pywikibot job: `dpla-dup-window/release_window.py`, run hourly by `.github/workflows/dpla-dup-window.yml` as `User:DPLA bot`. It advances the DPLA duplicate "moving window" (`Template:DPLA duplicate/moving window`) so a bounded number of DPLA duplicate files (`--target`, default 100) stay visible, oldest-first, in `Category:Duplicate` for Commons admins to clear. It is a duplicate-throttle for the upload pipeline, not a pageview-metrics job — it shares only the `metrics/` directory, the DPLA bot identity, and the same deferred-login pattern described above (`site.login()` is called only on a run that actually releases files).
 
 ## Why this is separate from the ingest pipeline
 
