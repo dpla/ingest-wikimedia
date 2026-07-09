@@ -19,6 +19,8 @@ from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
     NARA_PROVIDER_NAME,
     casefold_for_compare,
+    fetch_institutions_v2,
+    fetch_subjects_json,
     ingest_date_from_doc,
     is_wikitext_junk_value,
     parse_date_range,
@@ -577,16 +579,10 @@ def _initialize() -> None:
     # that data, and a vendored snapshot would defeat the point. rights.json
     # is the exception — it lives here because it's a small, slow-moving
     # SDC-specific mapping not maintained in ingestion3.
-    hubs = requests.get(
-        "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/wiki/institutions_v2.json",
-        timeout=30,
-    ).json()
+    hubs = fetch_institutions_v2()
     with open(os.path.join(_REPO_ROOT, "rights.json")) as f:
         rights = {_normalize_rights_uri(k): v for k, v in json.load(f).items()}
-    subject_ids = requests.get(
-        "https://raw.githubusercontent.com/dpla/ingestion3/develop/src/main/resources/subjects.json",
-        timeout=30,
-    ).json()
+    subject_ids = fetch_subjects_json()
 
     # When --from-s3 <partner> is set, parsed() reads each item's dpla-map.json
     # from S3 instead of calling api.dp.la. Imported lazily so this module

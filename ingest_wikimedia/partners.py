@@ -5,18 +5,36 @@ GitHub Actions without installing the full ingest_wikimedia package dependencies
 """
 
 import json
+import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-# Module-level cache so warm Lambda invocations skip repeated network fetches.
-_institutions_cache: dict | None = None
+# Per-URL cache so a warm/long-lived process fetches each config at most once.
+_staged_config_cache: dict[str, dict] = {}
 
+# Config files sourced from dpla/ingestion3 (main is the source of authority).
 INSTITUTIONS_URL = (
     "https://raw.githubusercontent.com/dpla/ingestion3"
     "/refs/heads/main/src/main/resources/wiki/institutions_v2.json"
 )
+SUBJECTS_URL = (
+    "https://raw.githubusercontent.com/dpla/ingestion3"
+    "/refs/heads/main/src/main/resources/subjects.json"
+)
+
+# A session may stage these JSON configs to local paths and point these env vars
+# at them, so the many short-lived pipeline processes read them from disk
+# instead of each re-fetching from raw.githubusercontent.com. That anonymous
+# fetch is rate-limited per IP: a batch of dozens of targets (each a fresh
+# get-ids/uploader/sdc-sync process) otherwise hits HTTP 429 and crashes. Unset
+# / unusable file (Lambda, GitHub Actions — no local checkout) → live fetch with
+# retry/backoff instead. See scripts/wikimedia_launch.py, which stages the files
+# and sets these vars.
+INSTITUTIONS_FILE_ENV = "WIKIMEDIA_INSTITUTIONS_FILE"
+SUBJECTS_FILE_ENV = "WIKIMEDIA_SUBJECTS_FILE"
 
 # Wikidata QID pattern (e.g. Q12345).
 _QID_RE = re.compile(r"^Q\d+$")
@@ -122,13 +140,77 @@ def resolve_slug(slug: str) -> str | None:
     return _SLUG_BY_HUB_NAME.get(s)
 
 
-def _get_institutions(timeout: int = 5) -> dict:
-    """Fetch institutions_v2.json from GitHub, caching after the first call."""
-    global _institutions_cache
-    if _institutions_cache is None:
-        with urllib.request.urlopen(INSTITUTIONS_URL, timeout=timeout) as resp:
-            _institutions_cache = json.loads(resp.read())
-    return _institutions_cache
+def _load_local_json(env_var: str) -> dict | None:
+    """Return a staged JSON config from the path named by ``env_var``, or None.
+
+    None (→ caller falls back to the live fetch) when the var is unset, the file
+    is missing/unreadable, or its contents aren't a non-empty object — so a
+    truncated or empty stage never silently yields empty config (which for
+    institutions would make every hub ineligible).
+    """
+    path = os.environ.get(env_var)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
+def _fetch_remote_json(url: str, timeout: int, attempts: int = 4) -> dict:
+    """Fetch ``url``, retrying with exponential backoff (honoring ``Retry-After``)
+    on HTTP 429 so a transient rate-limit doesn't crash the caller. Re-raises
+    immediately on any non-429 error and after the final attempt.
+    """
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as ex:
+            if ex.code != 429 or attempt == attempts:
+                raise
+            retry_after = ex.headers.get("Retry-After") if ex.headers else None
+            try:
+                wait = float(retry_after) if retry_after else delay
+            except (TypeError, ValueError):
+                wait = delay
+            time.sleep(min(wait, 60.0))
+            delay *= 2
+    raise RuntimeError("unreachable: staged-config fetch retry loop exited")
+
+
+def _load_staged_config(url: str, env_var: str, timeout: int = 5) -> dict:
+    """Local-first loader for a staged ingestion3 JSON config, cached per URL.
+
+    Prefers the launch-staged copy named by ``env_var`` (no network); falls back
+    to a retrying live fetch of ``url`` (the Lambda / GitHub Actions path, where
+    no local file exists).
+    """
+    if url not in _staged_config_cache:
+        local = _load_local_json(env_var)
+        _staged_config_cache[url] = (
+            local if local is not None else _fetch_remote_json(url, timeout)
+        )
+    return _staged_config_cache[url]
+
+
+def load_institutions(timeout: int = 5) -> dict:
+    """institutions_v2.json (hub name → hub/institution config), local-first."""
+    return _load_staged_config(INSTITUTIONS_URL, INSTITUTIONS_FILE_ENV, timeout)
+
+
+def load_subjects(timeout: int = 30) -> dict:
+    """subjects.json (DPLA subject name → Wikidata-QID map for P921), local-first.
+
+    Larger fallback timeout than load_institutions: subjects.json is ~2.7 MB and
+    the live-fetch fallback is only retried on HTTP 429, not on a socket timeout,
+    so keep subjects' historical 30s ceiling rather than risk an un-retried
+    timeout on the rare no-local-file path.
+    """
+    return _load_staged_config(SUBJECTS_URL, SUBJECTS_FILE_ENV, timeout)
 
 
 def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:
@@ -136,7 +218,7 @@ def is_upload_eligible(canonical_slug: str, timeout: int = 5) -> bool:
     hub_name = PARTNER_HUBS.get(canonical_slug)
     if not hub_name:
         return False
-    hub = _get_institutions(timeout).get(hub_name, {})
+    hub = load_institutions(timeout).get(hub_name, {})
     return hub.get("upload", False) or any(
         inst.get("upload", False) for inst in hub.get("institutions", {}).values()
     )
@@ -154,7 +236,7 @@ def is_institution_upload_eligible(
     hub_name = PARTNER_HUBS.get(canonical_slug)
     if not hub_name:
         return False
-    hub = _get_institutions(timeout).get(hub_name, {})
+    hub = load_institutions(timeout).get(hub_name, {})
     if hub.get("upload", False):
         return True
     inst_data = hub.get("institutions", {}).get(institution_name, {})
@@ -174,7 +256,7 @@ def is_item_upload_eligible(
     hub_name = PARTNER_HUBS.get(canonical_slug)
     if not hub_name:
         return False
-    hub = _get_institutions(timeout).get(hub_name, {})
+    hub = load_institutions(timeout).get(hub_name, {})
     if not hub.get("Wikidata", ""):
         return False
     inst_data = hub.get("institutions", {}).get(institution_name, {})
@@ -228,7 +310,7 @@ def wikidata_qid_for_target(
     hub_name = PARTNER_HUBS.get(canonical_slug)
     if not hub_name:
         return None
-    hub = _get_institutions(timeout).get(hub_name, {})
+    hub = load_institutions(timeout).get(hub_name, {})
     if institution_name is None:
         return hub.get("Wikidata") or None
     inst = hub.get("institutions", {}).get(institution_name, {})
@@ -391,7 +473,7 @@ def canonical_matches_session_component(
     hub_name = PARTNER_HUBS.get(canonical)
     if not hub_name:
         return False
-    hub_data = _get_institutions(timeout).get(hub_name, {})
+    hub_data = load_institutions(timeout).get(hub_name, {})
     return any(
         inst.lower().replace(" ", "-") == component
         for inst in hub_data.get("institutions", {})
@@ -434,7 +516,7 @@ def resolve_wikidata_id(
     one session each (as it does for any cross-hub QID); the same
     QID-derived Commons category is therefore walked once per hub.
     """
-    institutions = _get_institutions(timeout)
+    institutions = load_institutions(timeout)
     results: list[tuple[str, str | None]] = []
     for hub_name, hub_data in institutions.items():
         canonical = _SLUG_BY_HUB_NAME.get(hub_name.lower())

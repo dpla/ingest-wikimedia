@@ -239,15 +239,13 @@ def test_get_provider_and_data_provider(dpla):
 
 
 def test_get_providers_data(dpla):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"provider": "data"}
-
-    mock_http_session = MagicMock()
-    mock_http_session.get.return_value = mock_response
-
-    dpla.http_session = mock_http_session
-
-    result = dpla.get_providers_data()
+    # get_providers_data delegates to partners.load_institutions (local-first,
+    # urllib) — no longer the requests http_session — so patch that.
+    with patch(
+        "ingest_wikimedia.dpla.load_institutions",
+        return_value={"provider": "data"},
+    ):
+        result = dpla.get_providers_data()
     assert result == {"provider": "data"}
 
 
