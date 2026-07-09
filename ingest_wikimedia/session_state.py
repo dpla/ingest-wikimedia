@@ -71,6 +71,13 @@ done""",
     return result
 
 
+# Ordered phase suffixes in log filenames (``…-<label>-<phase>.log``). Shared by
+# the two patterns below so a new phase is a one-line change; only the trailing
+# optional ``-opportunistic`` differs by regex dialect (Python ``re`` uses a
+# non-capturing ``(?:…)`` group; ``find``'s POSIX ERE can't, so it uses ``(…)``).
+_PHASE_ALT = "id-generation|download|upload|sdc|drain-deferred"
+
+
 def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
 
@@ -92,7 +99,7 @@ def log_filename_pattern_for_label(label: str) -> str:
     """
     return (
         rf"-{re.escape(label)}-"
-        r"(id-generation|download|upload|sdc|drain-deferred(?:-opportunistic)?)"
+        rf"({_PHASE_ALT}(?:-opportunistic)?)"
         r"\.log$"
     )
 
@@ -163,7 +170,7 @@ def find_active_label(
     cmd_parts = [
         f"find {paths} -maxdepth 1 -type f -name '*.log'",
         "-regextype posix-extended",
-        f"-regex '.*-({label_alt})-(id-generation|download|upload|sdc|drain-deferred(-opportunistic)?)\\.log'",
+        f"-regex '.*-({label_alt})-({_PHASE_ALT}(-opportunistic)?)\\.log'",
     ]
     if session_created > 0:
         # Time-bound the lookup to files created after this session's
