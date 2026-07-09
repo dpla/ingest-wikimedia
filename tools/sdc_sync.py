@@ -4101,9 +4101,12 @@ def _maintain_canonical_title(file_page, dpla_id):
     title-text change) — never a fresh normalization rule. Maintain changes
     neither the bytes nor the page structure, so the extension and page ordinal
     are taken from the file's own existing title; only the descriptive prefix
-    and the embedded id can move. The descriptive title comes from the item's
-    staged ``dpla-map.json`` (``sourceResource.title``), so this requires
-    ``--from-s3``.
+    and the embedded id can move. The descriptive title
+    (``sourceResource.title``) comes from the item's staged ``dpla-map.json``;
+    this requires ``--from-s3``. When that sidecar is missing and
+    ``--build-sdc-on-miss`` is set (the non-NARA lite ``--cat`` route, run
+    without a pre-stage), the same ``_source`` doc is fetched on demand from ES
+    via :func:`_maintain_es_doc` instead.
     """
     if _s3_partner is None:
         return None
