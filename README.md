@@ -22,7 +22,7 @@ A run is triggered from Slack (e.g. `/wikimedia-upload bpl`), dispatched through
 - **[docs/special-cases.md](docs/special-cases.md)** — Duplicate detection (SHA1-based and title-based), the four hash-drift cases the uploader resolves, file renames, CommonsDelinker integration, redirect handling, orphan tagging.
 - **[docs/templates.md](docs/templates.md)** — How `{{DPLA metadata}}` is emitted at upload and read by `Module:DPLA` after SDC sync, how legacy `{{Artwork}}` files are migrated, and the per-file lifecycle (upload → SDC → wikitext cleanup).
 - **[docs/metrics.md](docs/metrics.md)** — The scheduled CIM-pageviews workflow that publishes monthly pageview data to Commons `Data:` pages, plus the GitHub Pages site that consumes them.
-- **[docs/maintenance-tools.md](docs/maintenance-tools.md)** — `verify-item`, `retirer`, `nuke`, `remimer`, `sign`, `get-incomplete-items`, `get-ids-retry`, `fix-unknown-categories`.
+- **[docs/maintenance-tools.md](docs/maintenance-tools.md)** — `verify-item`, `retirer`, `nuke`, `sign`, `get-incomplete-items`, `get-ids-retry`, `fix-unknown-categories`.
 
 ## Development setup
 
