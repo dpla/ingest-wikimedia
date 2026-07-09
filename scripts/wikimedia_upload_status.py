@@ -112,6 +112,28 @@ _DOWNLOAD_COMPLETE_PREFIX = "Download complete"
 # Uploads normally complete items in seconds; downloads in seconds to low minutes.
 _STALE_SECONDS = 1800  # 30 minutes
 
+
+def _idle_suffix(now: int, log_mtime: int) -> str:
+    """Return a `` ⚠ idle {duration}`` suffix when a log hasn't been written
+    in over ``_STALE_SECONDS``, else ``""``.
+
+    Shared by every active (non-complete) phase so a hung run reads distinctly
+    instead of looking active. Callers gate the call on phase-specific
+    conditions (not yet complete, not blocked on slots); this helper only owns
+    the threshold check and the ``h``/``m`` duration formatting.
+    """
+    if now <= 0 or log_mtime <= 0:
+        return ""
+    idle = now - log_mtime
+    if idle <= _STALE_SECONDS:
+        return ""
+    idle_min = idle // 60
+    idle_str = (
+        f"{idle_min // 60}h{idle_min % 60:02d}m" if idle_min >= 60 else f"{idle_min}m"
+    )
+    return f" ⚠ idle {idle_str}"
+
+
 # Labels constructed by ``parse_session_labels`` and ``PARTNER_HUBS`` are
 # slug-form: hub-name-or-institution-name lowercase plus ``+`` and ``-``.
 # The download-log glob below interpolates ``label`` directly into a
@@ -330,16 +352,19 @@ def get_phase_and_progress(
         # had no recognized log and fell through to a mislabel).
         out = ssm_run(
             client,
+            f"date +%s; "
             f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
             f"grep -oE '[0-9,]+ items enumerated' {log_path} 2>/dev/null | tail -1",
         )
         id_lines = out.splitlines()
-        id_mtime = _safe_int(id_lines[0]) if id_lines else 0
-        enumerated = id_lines[1].strip() if len(id_lines) > 1 else ""
-        return (
-            f"Generating IDs ({enumerated})" if enumerated else "Generating IDs",
-            id_mtime,
-        )
+        id_now = _safe_int(id_lines[0]) if id_lines else 0
+        id_mtime = _safe_int(id_lines[1]) if len(id_lines) > 1 else 0
+        enumerated = id_lines[2].strip() if len(id_lines) > 2 else ""
+        label_txt = f"Generating IDs ({enumerated})" if enumerated else "Generating IDs"
+        # Same idle/staleness signal as the download/upload/sdc phases: a hung
+        # enumeration (no log write in _STALE_SECONDS) reads distinctly instead
+        # of looking active.
+        return label_txt + _idle_suffix(id_now, id_mtime), id_mtime
     # Resolve the CSV(s) backing this label so `wc -l` returns a meaningful
     # "items in scope" denominator.
     #
@@ -475,20 +500,14 @@ def get_phase_and_progress(
     waiting_on_slots = SLOTS_BUSY_LOG_MARKER in last_log_line
     slot_suffix = " ⏸ waiting on slots" if waiting_on_slots else ""
 
-    stale_suffix = ""
     # A blocked session legitimately stops writing to its log while polling,
     # so don't also flag it as idle/hung — the slot suffix already explains
     # the silence.
-    if counts_marker == 0 and now > 0 and log_mtime > 0 and not waiting_on_slots:
-        idle = now - log_mtime
-        if idle > _STALE_SECONDS:
-            idle_min = idle // 60
-            idle_str = (
-                f"{idle_min // 60}h{idle_min % 60:02d}m"
-                if idle_min >= 60
-                else f"{idle_min}m"
-            )
-            stale_suffix = f" ⚠ idle {idle_str}"
+    stale_suffix = (
+        _idle_suffix(now, log_mtime)
+        if counts_marker == 0 and not waiting_on_slots
+        else ""
+    )
 
     if log_file.endswith("-download.log"):
         # Use the COUNTS: terminal marker as the definitive completion signal —

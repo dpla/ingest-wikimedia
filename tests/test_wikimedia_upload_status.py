@@ -2333,8 +2333,9 @@ def test_get_phase_and_progress_reports_generating_ids():
                 "1700000000\n"
                 "20260709-120000-bpl+boston-public-library-id-generation.log\n"
             )
-        # id-generation branch: stat mtime + latest "N items enumerated" line
-        return "1700000000\n42,345 items enumerated\n"
+        # id-generation branch: date +%s (now) + stat mtime + latest
+        # "N items enumerated" line. now == mtime here → not stale.
+        return "1700000000\n1700000000\n42,345 items enumerated\n"
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
         phase, _ = get_phase_and_progress(
@@ -2344,6 +2345,36 @@ def test_get_phase_and_progress_reports_generating_ids():
             label="bpl+boston-public-library",
         )
     assert phase == "Generating IDs (42,345 items enumerated)", phase
+
+
+def test_get_phase_and_progress_flags_stale_id_generation():
+    """A hung enumeration (no log write in over ``_STALE_SECONDS``) gets the
+    same ``⚠ idle`` suffix as the download/upload/sdc phases, so it reads
+    distinctly instead of looking active."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    calls = []
+
+    def fake_ssm_run(_client, _command, **_kwargs):
+        calls.append(_command)
+        if len(calls) == 1:  # precheck: session_created + newest matching log
+            return (
+                "1700000000\n"
+                "20260709-120000-bpl+boston-public-library-id-generation.log\n"
+            )
+        # id-generation branch: now is 7500s (2h05m) after the log mtime → stale.
+        return "1700007500\n1700000000\n42,345 items enumerated\n"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+boston-public-library",
+            hub="bpl",
+            label="bpl+boston-public-library",
+        )
+    assert phase == "Generating IDs (42,345 items enumerated) ⚠ idle 2h05m", phase
 
 
 def test_institution_label_no_log_does_not_grab_partner_drain_log():
