@@ -37,6 +37,7 @@ import boto3
 import requests
 
 from ingest_wikimedia.partners import (
+    INSTITUTIONS_URL,
     PARTNER_DIR,
     commons_has_files_for_qid,
     is_dpla_id,
@@ -55,6 +56,12 @@ from ingest_wikimedia.session_state import (
 )
 from ingest_wikimedia.slack import post_message
 from ingest_wikimedia.ssm import REGION, ssm_run, stage_and_launch_tmux
+
+# Where the launcher stages ingestion3's institutions_v2.json on EC2 (fetched
+# once per launch) so the per-target pipeline processes read it from disk via
+# WIKIMEDIA_INSTITUTIONS_FILE instead of each hitting raw.githubusercontent.com
+# (which rate-limits the box IP to HTTP 429). See ingest_wikimedia.partners.
+INSTITUTIONS_LOCAL_PATH = "/home/ec2-user/ingest-wikimedia/institutions_v2.json"
 
 # Each ingest session peaks at ~300–500 MB; 30% of 7.6 GB leaves headroom for 4–5 concurrent sessions.
 MEMORY_HEADROOM_PCT = 30
@@ -882,7 +889,17 @@ def main() -> None:
         "cp -r ingest-wikimedia-update/tools/* /home/ec2-user/ingest-wikimedia/tools/ && "
         "cp ingest-wikimedia-update/pyproject.toml /home/ec2-user/ingest-wikimedia/pyproject.toml && "
         "cp ingest-wikimedia-update/uv.lock /home/ec2-user/ingest-wikimedia/uv.lock && "
-        "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
+        # Stage ingestion3's institutions_v2.json once per launch so the many
+        # short-lived pipeline processes read it from disk (via
+        # WIKIMEDIA_INSTITUTIONS_FILE) instead of each hitting anonymous
+        # raw.githubusercontent.com, which rate-limits the box IP to HTTP 429.
+        # Best-effort: one fetch won't rate-limit, and if it fails the runtime
+        # falls back to a retrying live fetch (partners._get_institutions), so a
+        # GitHub hiccup must not block the launch (`|| echo`, not `&&`).
+        + f"( curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors {shlex.quote(INSTITUTIONS_URL)} "
+        + f"-o {shlex.quote(INSTITUTIONS_LOCAL_PATH)} "
+        + "|| echo 'WARN: institutions_v2.json stage failed; runtime falls back to live fetch' ) && "
+        + "/home/ec2-user/.local/bin/uv sync --project /home/ec2-user/ingest-wikimedia && echo UPDATE_DONE"
     )
     out = ""
     try:
@@ -1280,6 +1297,10 @@ def main() -> None:
         [
             "source ~/.bashrc",
             "source /home/ec2-user/ingest-wikimedia/.venv/bin/activate",
+            # Point partners._get_institutions at the launch-staged copy so
+            # every target reads it from disk instead of re-fetching from
+            # raw.githubusercontent.com (per-IP 429 under a multi-target batch).
+            f"export WIKIMEDIA_INSTITUTIONS_FILE={shlex.quote(INSTITUTIONS_LOCAL_PATH)}",
         ]
     )
     target_blocks = []

@@ -13,7 +13,10 @@ non-eligible matches never leak to the launcher.
 """
 
 import json
+import urllib.error
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from ingest_wikimedia import partners
 from ingest_wikimedia.partners import (
@@ -29,6 +32,88 @@ def _mock_institutions(data: dict):
     institutions_v2.json over the network. Returns the patch context
     manager for use in ``with`` blocks."""
     return patch("ingest_wikimedia.partners._get_institutions", return_value=data)
+
+
+def _json_urlopen(data: dict):
+    """urlopen replacement: a context manager whose read() yields ``data`` as JSON bytes."""
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(data).encode()
+    cm = MagicMock()
+    cm.__enter__.return_value = resp
+    cm.__exit__.return_value = False
+    return cm
+
+
+def _http_429(retry_after=None):
+    hdrs = {"Retry-After": retry_after} if retry_after is not None else None
+    return urllib.error.HTTPError("https://x", 429, "Too Many Requests", hdrs, None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_institutions(monkeypatch):
+    """Reset the module cache and clear WIKIMEDIA_INSTITUTIONS_FILE around every
+    test so cached data or a stray env var can't leak between tests."""
+    monkeypatch.delenv(partners.INSTITUTIONS_FILE_ENV, raising=False)
+    partners._institutions_cache = None
+    yield
+    partners._institutions_cache = None
+
+
+def test_get_institutions_prefers_local_file(tmp_path, monkeypatch):
+    data = {"Hub": {"upload": True}}
+    f = tmp_path / "institutions_v2.json"
+    f.write_text(json.dumps(data))
+    monkeypatch.setenv(partners.INSTITUTIONS_FILE_ENV, str(f))
+    with patch.object(partners.urllib.request, "urlopen") as urlopen:
+        assert partners._get_institutions() == data
+        urlopen.assert_not_called()  # local copy → no network fetch
+
+
+def test_get_institutions_fetches_when_no_local_file():
+    data = {"Hub": {"upload": True}}
+    with patch.object(
+        partners.urllib.request, "urlopen", return_value=_json_urlopen(data)
+    ):
+        assert partners._get_institutions() == data
+
+
+def test_get_institutions_empty_local_file_falls_back_to_fetch(tmp_path, monkeypatch):
+    fetched = {"Hub": {"upload": True}}
+    f = tmp_path / "institutions_v2.json"
+    f.write_text("{}")  # valid JSON but empty → treated as unusable, fetch instead
+    monkeypatch.setenv(partners.INSTITUTIONS_FILE_ENV, str(f))
+    with patch.object(
+        partners.urllib.request, "urlopen", return_value=_json_urlopen(fetched)
+    ) as urlopen:
+        assert partners._get_institutions() == fetched
+        urlopen.assert_called_once()
+
+
+def test_get_institutions_retries_on_429_then_succeeds():
+    data = {"Hub": {"upload": True}}
+    queue = [_http_429(), _http_429(), _json_urlopen(data)]
+
+    def _urlopen(*args, **kwargs):
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with (
+        patch.object(partners.time, "sleep") as sleep,
+        patch.object(partners.urllib.request, "urlopen", side_effect=_urlopen),
+    ):
+        assert partners._get_institutions() == data
+        assert sleep.call_count == 2  # two 429s → two backoff sleeps
+
+
+def test_get_institutions_raises_after_exhausting_429_retries():
+    with (
+        patch.object(partners.time, "sleep"),
+        patch.object(partners.urllib.request, "urlopen", side_effect=_http_429()),
+        pytest.raises(urllib.error.HTTPError),
+    ):
+        partners._get_institutions()
 
 
 def test_resolve_wikidata_id_drops_hub_level_match_when_hub_upload_false():

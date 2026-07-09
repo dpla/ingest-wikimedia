@@ -5,7 +5,9 @@ GitHub Actions without installing the full ingest_wikimedia package dependencies
 """
 
 import json
+import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +19,15 @@ INSTITUTIONS_URL = (
     "https://raw.githubusercontent.com/dpla/ingestion3"
     "/refs/heads/main/src/main/resources/wiki/institutions_v2.json"
 )
+
+# A session may stage institutions_v2.json to a local path and point this env
+# var at it, so the many short-lived pipeline processes read it from disk
+# instead of each re-fetching INSTITUTIONS_URL. That anonymous
+# raw.githubusercontent.com fetch is rate-limited per IP: a batch of dozens of
+# targets (each a fresh uploader/sdc-sync process) otherwise hits HTTP 429 and
+# every target's eligibility precheck crashes. Unset / unusable file (Lambda,
+# GitHub Actions — no local checkout) → live fetch with retry/backoff instead.
+INSTITUTIONS_FILE_ENV = "WIKIMEDIA_INSTITUTIONS_FILE"
 
 # Wikidata QID pattern (e.g. Q12345).
 _QID_RE = re.compile(r"^Q\d+$")
@@ -122,12 +133,62 @@ def resolve_slug(slug: str) -> str | None:
     return _SLUG_BY_HUB_NAME.get(s)
 
 
+def _load_local_institutions() -> dict | None:
+    """Return institutions data from the locally-staged file, or None.
+
+    None (→ caller falls back to the live fetch) when the env var is unset, the
+    file is missing/unreadable, or its contents aren't a non-empty object — so a
+    truncated or empty stage never silently makes every hub ineligible.
+    """
+    path = os.environ.get(INSTITUTIONS_FILE_ENV)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
+def _fetch_remote_institutions(timeout: int, attempts: int = 4) -> dict:
+    """Fetch INSTITUTIONS_URL, retrying with exponential backoff (honoring
+    ``Retry-After``) on HTTP 429 so a transient rate-limit doesn't crash the
+    caller. Re-raises immediately on any non-429 error and after the final
+    attempt.
+    """
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(INSTITUTIONS_URL, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as ex:
+            if ex.code != 429 or attempt == attempts:
+                raise
+            retry_after = ex.headers.get("Retry-After") if ex.headers else None
+            try:
+                wait = float(retry_after) if retry_after else delay
+            except (TypeError, ValueError):
+                wait = delay
+            time.sleep(min(wait, 60.0))
+            delay *= 2
+    raise RuntimeError("unreachable: institutions fetch retry loop exited")
+
+
 def _get_institutions(timeout: int = 5) -> dict:
-    """Fetch institutions_v2.json from GitHub, caching after the first call."""
+    """Return institutions_v2.json (hub → config), cached after the first call.
+
+    Prefers a locally-staged copy (``WIKIMEDIA_INSTITUTIONS_FILE``) so pipeline
+    processes don't each re-fetch and trip raw.githubusercontent.com's per-IP
+    rate limit; falls back to a retrying live fetch when no local copy exists
+    (the Lambda / GitHub Actions path).
+    """
     global _institutions_cache
     if _institutions_cache is None:
-        with urllib.request.urlopen(INSTITUTIONS_URL, timeout=timeout) as resp:
-            _institutions_cache = json.loads(resp.read())
+        local = _load_local_institutions()
+        _institutions_cache = (
+            local if local is not None else _fetch_remote_institutions(timeout)
+        )
     return _institutions_cache
 
 
