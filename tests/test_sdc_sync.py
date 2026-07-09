@@ -6494,3 +6494,203 @@ def test_inferred_dupe_cleanup_multi_value_subset_ignores_non_inferred_claims():
         sdc_sync._reconcile_inferred_from_wikitext_dupes("M102")
     assert sdc_sync.removals == []
     sdc_sync._reset_per_file_accumulators()
+
+
+# ---------------------------------------------------------------------------
+# Maintain --cat sidecar sourcing: staged sdc.json, SKIP-on-miss (default),
+# and the --build-sdc-on-miss ES fallback (non-NARA over-staging fix).
+# ---------------------------------------------------------------------------
+
+
+def _stub_maintain_globals(monkeypatch, *, build_on_miss, s3_client):
+    """Bind the module globals _maintain_sidecar_payload / _maintain_canonical_title
+    read at call time, without going through _initialize()."""
+    from tools import sdc_sync
+
+    monkeypatch.setattr(sdc_sync, "_s3_partner", "ohio", raising=False)
+    monkeypatch.setattr(sdc_sync, "_s3_client", s3_client, raising=False)
+    monkeypatch.setattr(sdc_sync, "_build_sdc_on_miss", build_on_miss, raising=False)
+    monkeypatch.setattr(sdc_sync, "_maintain_es_doc_cache", None, raising=False)
+    monkeypatch.setattr(sdc_sync, "hubs", {"stub": True}, raising=False)
+    monkeypatch.setattr(sdc_sync, "rights", {"stub": True}, raising=False)
+    monkeypatch.setattr(sdc_sync, "subject_ids", {"stub": True}, raising=False)
+
+
+def test_maintain_sidecar_payload_returns_staged_sidecar_when_present(monkeypatch):
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_sdc_json.return_value = '{"claims": [{"P": 1}], "ingest_date": "2026-01-01"}'
+    _stub_maintain_globals(monkeypatch, build_on_miss=True, s3_client=s3)
+    # ES fallback must NOT be consulted when a sidecar is staged.
+    es_calls = []
+    monkeypatch.setattr(
+        sdc_sync, "_fetch_dpla_doc_from_es", lambda i: es_calls.append(i)
+    )
+
+    payload = sdc_sync._maintain_sidecar_payload("abc123")
+
+    assert payload == {"claims": [{"P": 1}], "ingest_date": "2026-01-01"}
+    assert es_calls == []
+
+
+def test_maintain_sidecar_payload_skips_on_miss_without_build_flag(monkeypatch):
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_sdc_json.return_value = None
+    _stub_maintain_globals(monkeypatch, build_on_miss=False, s3_client=s3)
+    es_calls = []
+    monkeypatch.setattr(
+        sdc_sync, "_fetch_dpla_doc_from_es", lambda i: es_calls.append(i)
+    )
+
+    # Sidecar-or-SKIP by default: a miss returns None (no ES/api fallback) —
+    # this is the contract NARA relies on.
+    assert sdc_sync._maintain_sidecar_payload("abc123") is None
+    assert es_calls == []
+
+
+def test_maintain_sidecar_payload_builds_from_es_on_miss(monkeypatch):
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_sdc_json.return_value = None
+    _stub_maintain_globals(monkeypatch, build_on_miss=True, s3_client=s3)
+
+    doc = {"_id": "abc123", "sourceResource": {"title": ["T"]}}
+    monkeypatch.setattr(sdc_sync, "_fetch_dpla_doc_from_es", lambda i: doc)
+    seen = {}
+
+    def fake_build(d, dpla_id, hubs, rights, subject_ids, subjects_lookup):
+        seen.update(
+            doc=d,
+            dpla_id=dpla_id,
+            subjects_lookup=subjects_lookup,
+        )
+        return {"claims": [{"built": True}], "ingest_date": "2026-07-09"}
+
+    monkeypatch.setattr(sdc_sync, "build_claims_for_doc", fake_build)
+
+    payload = sdc_sync._maintain_sidecar_payload("abc123")
+
+    assert payload == {"claims": [{"built": True}], "ingest_date": "2026-07-09"}
+    assert seen["doc"] is doc and seen["dpla_id"] == "abc123"
+    # Off-NARA there is no reconciled subjects table — must pass None.
+    assert seen["subjects_lookup"] is None
+
+
+def test_maintain_sidecar_payload_build_on_miss_skips_when_doc_gone(monkeypatch):
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_sdc_json.return_value = None
+    _stub_maintain_globals(monkeypatch, build_on_miss=True, s3_client=s3)
+    monkeypatch.setattr(sdc_sync, "_fetch_dpla_doc_from_es", lambda i: None)
+    # build_claims_for_doc must not be reached when the ES doc is gone.
+    monkeypatch.setattr(
+        sdc_sync,
+        "build_claims_for_doc",
+        lambda *a, **k: pytest.fail("should not build when doc is None"),
+    )
+
+    assert sdc_sync._maintain_sidecar_payload("abc123") is None
+
+
+def test_maintain_canonical_title_falls_back_to_es_on_miss(monkeypatch):
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_item_metadata.return_value = None  # no staged dpla-map.json
+    _stub_maintain_globals(monkeypatch, build_on_miss=True, s3_client=s3)
+    doc = {"sourceResource": {"title": ["My Title"]}}
+    es_calls = []
+
+    def fake_es(dpla_id):
+        es_calls.append(dpla_id)
+        return doc
+
+    monkeypatch.setattr(sdc_sync, "_fetch_dpla_doc_from_es", fake_es)
+    monkeypatch.setattr(
+        sdc_sync.wikimedia, "extract_page_ordinal_from_commons_title", lambda _t: None
+    )
+    monkeypatch.setattr(
+        sdc_sync.wikimedia,
+        "get_page_title",
+        lambda title, dpla_id, ext, page=None: f"NEW::{title}::{dpla_id}",
+    )
+    file_page = MagicMock()
+    file_page.title.return_value = "Old_abc123.jpg"
+
+    result = sdc_sync._maintain_canonical_title(file_page, "abc123")
+
+    assert result == "NEW::My Title::abc123"
+    assert es_calls == ["abc123"]
+
+
+def test_maintain_canonical_title_returns_none_on_miss_without_flag(monkeypatch):
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_item_metadata.return_value = None
+    _stub_maintain_globals(monkeypatch, build_on_miss=False, s3_client=s3)
+    es_calls = []
+    monkeypatch.setattr(
+        sdc_sync, "_fetch_dpla_doc_from_es", lambda i: es_calls.append(i)
+    )
+    file_page = MagicMock()
+
+    assert sdc_sync._maintain_canonical_title(file_page, "abc123") is None
+    assert es_calls == []
+
+
+def test_maintain_es_doc_shared_between_title_and_claims_paths(monkeypatch):
+    """With no pre-stage, the title path and the claims path both need the same
+    ES doc for one file — ``_maintain_es_doc`` memoizes it so only ONE
+    ``_fetch_dpla_doc_from_es`` round-trip happens, not two."""
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_item_metadata.return_value = None
+    s3.get_sdc_json.return_value = None
+    _stub_maintain_globals(monkeypatch, build_on_miss=True, s3_client=s3)
+    doc = {"sourceResource": {"title": ["T"]}}
+    calls = []
+
+    def fake_es(dpla_id):
+        calls.append(dpla_id)
+        return doc
+
+    monkeypatch.setattr(sdc_sync, "_fetch_dpla_doc_from_es", fake_es)
+    monkeypatch.setattr(
+        sdc_sync.wikimedia, "extract_page_ordinal_from_commons_title", lambda _t: None
+    )
+    monkeypatch.setattr(sdc_sync.wikimedia, "get_page_title", lambda *a, **k: "NEW.jpg")
+    monkeypatch.setattr(
+        sdc_sync, "build_claims_for_doc", lambda *a, **k: {"claims": []}
+    )
+    file_page = MagicMock()
+    file_page.title.return_value = "Old_abc123.jpg"
+
+    # Title path (rename) then claims path, same id, within one file.
+    sdc_sync._maintain_canonical_title(file_page, "abc123")
+    sdc_sync._maintain_sidecar_payload("abc123")
+
+    assert calls == ["abc123"]  # one fetch, shared across both paths
+
+
+def test_maintain_es_doc_refetches_for_a_different_id(monkeypatch):
+    """The memo holds exactly one entry keyed by id — a different id overwrites
+    it and triggers a fresh fetch (so it can't serve a stale doc)."""
+    from tools import sdc_sync
+
+    _stub_maintain_globals(monkeypatch, build_on_miss=True, s3_client=MagicMock())
+    calls = []
+    monkeypatch.setattr(
+        sdc_sync, "_fetch_dpla_doc_from_es", lambda i: calls.append(i) or {"id": i}
+    )
+
+    assert sdc_sync._maintain_es_doc("id-a") == {"id": "id-a"}
+    assert sdc_sync._maintain_es_doc("id-a") == {"id": "id-a"}  # memo hit
+    assert sdc_sync._maintain_es_doc("id-b") == {"id": "id-b"}  # new id → refetch
+    assert calls == ["id-a", "id-b"]
