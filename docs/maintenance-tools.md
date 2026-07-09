@@ -9,7 +9,6 @@ These tools sit alongside the four pipeline phases but are not part of the Slack
 | [`get-incomplete-items`](#get-incomplete-items) | Detect items whose download phase didn't complete |
 | [`resolve-dpla-ids`](#resolve-dpla-ids) | Single-item eligibility check + staging for Slack-driven launches |
 | [`sign`](#sign) | Backfill SHA1 metadata on legacy S3 objects |
-| [`remimer`](#remimer) | Re-detect and fix wrong content-types on S3 objects |
 | [`retirer`](#retirer) | "Retire" ineligible items by zeroing their S3 bytes |
 | [`nuke`](#nuke) | Hard-delete S3 contents for a list of DPLA IDs |
 | [`get-ids-retry`](#get-ids-retry) | Parse logs to build per-hub retry CSVs |
@@ -94,22 +93,6 @@ Walks `s3://dpla-wikimedia/<partner>/images/` looking for objects with no `CHECK
 Idempotent — skips objects whose `CHECKSUM` is already set.
 
 Used to backfill SHA1 metadata on items uploaded to S3 before the SHA1-on-write convention was established. The pipeline today writes SHA1 on every download (`downloader.py::upload_file_to_s3`), so `sign` is only needed for legacy backlog.
-
----
-
-## `remimer`
-
-Source: `tools/remimer.py`.
-
-Walks `s3://dpla-wikimedia/<partner>/images/` looking for objects whose stored content-type is `binary/octet-stream` or `application/octet-stream`. For each:
-
-1. Downloads to a temp file.
-2. Re-detects MIME via `local_fs.get_content_type()` (libmagic).
-3. Writes the detected content-type back to S3 via `copy_object(MetadataDirective="REPLACE", ContentType=detected, CopySource=...)`.
-
-Used when the original downloader couldn't determine MIME (typically because the source server returned `application/octet-stream`). Once libmagic identifies the actual type, the uploader can pick a sensible file extension.
-
-The companion `MetadataDirective="REPLACE"` rule applies. `MetadataDirective="REPLACE"` silently drops every user-metadata field not provided in the request, so any time you re-stamp an S3 object's content-type (or any other system metadata) you have to pass the existing user metadata back through explicitly (as `sign` does with `Metadata=obj.metadata`) or you'll lose the SHA1 and break duplicate detection. **`remimer`'s `copy_object` call currently does NOT pass a `Metadata=` argument (`tools/remimer.py:55-61`)**, so it drops `CHECKSUM` on every object it touches — a bug that should be fixed to pass `Metadata=dict(obj.metadata)`. Until then, do not run `remimer` on objects whose SHA1 you need to preserve.
 
 ---
 

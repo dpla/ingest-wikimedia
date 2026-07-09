@@ -262,7 +262,7 @@ class S3Client:
     def get_metadata_files_for_partner(self, partner) -> Generator[dict] # walks all dpla-map.json under a partner
 ```
 
-`get_metadata_files_for_partner()` is used by the `retirer` maintenance tool to iterate every item under a partner without holding the full ID list in memory. It yields each item's parsed `dpla-map.json` dict lazily. (`nuke`, `sign`, and `remimer` walk the partner prefix with `bucket.objects.filter(Prefix=…)` directly rather than through this helper.)
+`get_metadata_files_for_partner()` is used by the `retirer` maintenance tool to iterate every item under a partner without holding the full ID list in memory. It yields each item's parsed `dpla-map.json` dict lazily. (`nuke` and `sign` walk the partner prefix with `bucket.objects.filter(Prefix=…)` directly rather than through this helper.)
 
 ---
 
