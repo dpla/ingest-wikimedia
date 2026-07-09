@@ -12,6 +12,7 @@ Non-technical reference for triggering Wikimedia upload runs from Slack. Every c
 | Upload one specific DPLA item | `/wikimedia-upload <dpla-id>` |
 | Upload by Wikidata identifier (hub or institution) | `/wikimedia-upload <QID>` |
 | Re-sync SDC only (no re-upload) | `/wikimedia-upload sdc <target>` |
+| Reconcile files already on Commons (no upload) | `/wikimedia-upload maintain <target>` |
 | Refresh aged media in S3 (no upload, no SDC) | `/wikimedia-upload refresh <target> [<target> ...] <days>` |
 | Retry recent failures | `/wikimedia-upload retry <days> [<hub>]` |
 | Stop a running upload | `/wikimedia-upload kill <label>` |
@@ -107,7 +108,7 @@ Behaviour:
 
 - QID matches a **hub** Wikidata field → equivalent to the hub slug.
 - QID matches an **institution** Wikidata field → equivalent to `hub|Institution Name`.
-- QID matches multiple institutions inside one hub → all of them are ORed together as a single target.
+- QID matches multiple institutions inside one hub → all *upload-eligible* ones are ORed together as a single target; ineligible ones are silently dropped, and a QID that resolves only to ineligible institutions is rejected outright (`Wikidata ID '<QID>': not upload-eligible per institutions_v2.json.`). Maintain mode relaxes this — see the maintain section — keeping every match regardless of the upload flag.
 - QID matches both a hub and one of its own institutions → the hub wins (broader scope).
 
 Collection-level QIDs are *not* supported as bare arguments — use the explicit `hub|institution|collection` syntax for collections.
@@ -145,7 +146,23 @@ Single-item runs:
 
 **Caveat for single-item and NARA targets:** these targets don't re-stage `sdc.json` (NARA uses a separate enumerator and single-item targets use `resolve-dpla-ids`). For these, `sdc-sync` replays whatever sidecar was written by the last regular run. Useful for re-running fixed sdc-sync logic; not useful for picking up upstream mapping changes.
 
-## 7. Refresh-only (re-download)
+## 7. Maintain existing files in place (no re-upload)
+
+`/wikimedia-upload maintain [lite|count] <target> [<target> ...]` reconciles the files a hub or institution *already has* on Commons — re-linking drifted files, overwriting changed bytes, re-running SDC, and renaming title-drifted files — without ever creating a new File page. Because it only touches existing files, it works even for hubs or institutions that are no longer upload-eligible (that's exactly when you'd reach for it).
+
+```text
+/wikimedia-upload maintain "georgia|Atlanta History Center"   # default: hash
+/wikimedia-upload maintain lite digitalnc                     # quick, no download
+/wikimedia-upload maintain count digitalnc                    # pre-flight sizing
+```
+
+- **Default (hash)** — stages the scope, downloads each item's master, then runs `uploader --no-create` to content-reconcile the media-bearing subset (re-links orphaned files by content hash and overwrites byte-drifted ones, fenced so no new file is ever created), and finally SDC-syncs the whole live Commons category.
+- **`lite`** — the quick no-download route: SDC-in-place + name-drift rename only (no downloader, no uploader).
+- **`count`** — pre-flight sizing: resolves how each file *would* re-link and writes nothing (implies `lite`).
+
+The SDC phase is anchored on the target's live Commons category (resolved via Wikidata, property P8464), so it covers every file on Commons for that scope, not just an ID list. `maintain` is mutually exclusive with `sdc` and `refresh`; `lite` and `count` have no meaning without `maintain`. In `lite`/`count` mode the target must be a whole hub or institution — a single DPLA ID or a collection has no category to walk and is rejected. Maintain runs add **RENAMED** and **RENAME BLOCKED** lines to the *Wikimedia SDC Complete* summary (RENAME BLOCKED = the canonical title was already occupied, so the file was left non-canonical and flagged for DPLA follow-up).
+
+## 8. Refresh-only (re-download)
 
 `/wikimedia-upload refresh <target> [<target> ...] <days>` re-downloads aged media files in S3 without re-uploading. Used to refresh master copies for partners whose source URLs may have rotated. One or more targets, with the `<days>` threshold as the trailing positional.
 
@@ -159,7 +176,7 @@ The trailing number is a `--max-age-days` threshold — only S3 keys older than 
 
 The downloader is invoked with `--notify-complete` so a #tech-alerts summary fires when it finishes (`Wikimedia Download Refresh Complete:`).
 
-## 8. Retry recent failures
+## 9. Retry recent failures
 
 `/wikimedia-upload retry <days> [<hub>]` scans the last N days of upload + download + SDC logs across all partners (or one, if specified), classifies retryable failures, and launches new uploader / downloader / sdc-sync runs to clean them up.
 
@@ -178,7 +195,7 @@ When a hub has both upload and SDC failures, the retry pipeline runs upload firs
 
 The retry response is ephemeral (only you see the immediate Slack reply); the actual retry session posts to #tech-alerts normally once it starts.
 
-## 9. Kill a running session
+## 10. Kill a running session
 
 ```text
 /wikimedia-upload kill bpl
@@ -195,22 +212,22 @@ The retry response is ephemeral (only you see the immediate Slack reply); the ac
 
 If your kill argument matches zero active sessions, the response says so but no error is raised. If it matches multiple (e.g. `/wikimedia-upload kill bpl` against a session with three institutions inside the bpl hub), all of them in the same session are killed together — sessions are not split.
 
-## 10. Check status
+## 11. Check status
 
 ```text
 /wikimedia-status
 ```
 
-Posts to #tech-alerts a **Wikimedia Upload Status** header block, one row per active session (the session name in a fixed-width backtick column, followed by its current phase + progress), and a trailing context line summarising box-wide worker-slot and memory headroom:
+Posts to #tech-alerts a **Wikimedia Upload Status** header block, one row per active session — the session's **active label** (the hub, or `hub+institution`, of the target currently running; multi-institution chains also show a `[position/total]` marker), followed by its current phase + progress — and a trailing context line summarising box-wide worker-slot and memory headroom:
 
 ```text
 Wikimedia Upload Status
 
-`wikimedia-bpl                    ` Uploading (3,214 / 11,503, ~28%)
-`wikimedia-indiana+indiana-state-l` SDC syncing (812 / 4,002, ~20%) ⏸ waiting on slots
-`wikimedia-pa+free-library-of-phila` Uploading (queued)
+`bpl` Uploading (3,214 / 11,503 files, ~28%)
+`indiana+indiana-state-library [2/73]` SDC syncing (812 / 4,002 files, ~20%) ⏸ waiting on slots
+`pa+free-library-of-philadelphia` Uploading (queued)
 
-Worker slots: ~4 free of 16 (12 held)   •   Memory: 21,480 / 31,008 MB used (30% available)
+Worker slots: ~4 free of 24 (20 held)   •   Memory: 21,480 / 31,008 MB used (30% available)
 ```
 
 Phase annotations you may see on a row:
@@ -218,13 +235,15 @@ Phase annotations you may see on a row:
 - **`⏸ waiting on slots`** — every one of that session's workers is currently blocked on the box-wide worker-slot cap (`--workers-budget`). The session is healthy, just throttled while it waits for a slot to free.
 - **`(queued)`** — the session is parked behind the cap and hasn't logged its first item yet (vs. `starting...`, which means it's launching but not budget-blocked).
 - **`⚠ idle Nm`** — the session's log hasn't been written to in over 30 minutes and it isn't slot-blocked, so it may be hung.
+- **`[Slots: N]` / `[Awaiting slot]`** — shown only when the box-wide slot pool is fully saturated (0 free). `[Slots: N]` = this session currently holds N slots; `[Awaiting slot]` = it's in a slot-consuming phase (upload/SDC/drain) but holds none.
+- **`Draining (N queued, …)` / `Drain complete` / `Drain (opportunistic) skipped`** — the deferred drain phase that runs after a batch's uploads finish, working through a queued backlog of files. `N queued` is the number still waiting in the session's sidecar; the suffix shows host-lock state (`⏸ waiting for host lock`) or the current Commons `Category:Duplicate` size against the resume threshold (`Category:Duplicate at X, needs < Y`).
 
 The trailing context line:
 
 - **Worker slots** — box-wide free/held slot count (the median of four `lslocks` samples). This cap is shared by both the uploader and sdc-sync, so it reflects total Commons-writing concurrency across every session, not SDC alone. Omitted if no budget-enabled session has set up the slot directory.
 - **Memory** — used / total MB on the EC2 box, with percent available.
 
-The status workflow runs automatically every 6 hours and the Slack-triggered version (`/wikimedia-status`) runs on demand. **Both always post**, even when nothing is running — an idle run posts `No active Wikimedia upload sessions.` along with the memory line, so an empty result confirms "nothing's running" rather than looking like the command silently failed.
+The status workflow runs automatically every 6 hours and the Slack-triggered version (`/wikimedia-status`) runs on demand. The **on-demand** `/wikimedia-status` always posts, even when nothing is running — an idle run posts `No active Wikimedia upload sessions.` along with the memory line, so an empty result confirms "nothing's running" rather than looking like the command silently failed. The scheduled 6-hourly run stays silent when no sessions are active.
 
 ### Reading the SDC completion summary
 

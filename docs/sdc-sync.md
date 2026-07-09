@@ -16,7 +16,7 @@ This document covers the *internals* — the worker model and box-wide write bud
 7. [The canonical reference triple](#the-canonical-reference-triple)
 8. [Idempotency: `check()`](#idempotency-check)
 9. [Chunked claims](#chunked-claims)
-10. [The P813 refresh](#the-p813-refresh)
+10. [The reference refresh](#the-reference-refresh-p813--canonical-repair)
 11. [Legacy `{{Artwork}}` migration](#legacy-artwork-migration)
 12. [Post-SDC wikitext normalization (strip)](#post-sdc-wikitext-normalization-strip)
 13. [Wikibase API gotchas](#wikibase-api-gotchas)
@@ -97,7 +97,7 @@ Ordinals that can't be salvaged are counted distinctly: `SDC_ORDINALS_SKIPPED_ER
 | Fragment kind | Shape | When emitted |
 |---|---|---|
 | `new_claims` | Full claim dict, no `id` | A property that doesn't yet exist on the file |
-| `reference_updates` | `{id, type, mainsnak, qualifiers, rank, references}` | The P813 refresh (see below) |
+| `reference_updates` | `{id, type, mainsnak, qualifiers, rank, references}` | The reference refresh (see below) |
 | `qualifier_updates` | `{id, type, mainsnak, qualifiers, rank, references}` | Amending qualifiers on an existing DPLA-authored claim |
 | `removals` | `{id, remove: ""}` | The reconciler decided a stale DPLA claim must go |
 
@@ -117,7 +117,7 @@ Ordinals that can't be salvaged are counted distinctly: `SDC_ORDINALS_SKIPPED_ER
 
 ## What the bot writes (per property)
 
-All properties below are defined in `build_claims_for_doc()` (`ingest_wikimedia/sdc.py`) for new uploads and reconciled by `tools/sdc_sync.py` on re-runs.
+All properties below are defined in `build_claims_for_doc()` (`ingest_wikimedia/sdc.py`) for new uploads and reconciled by `tools/sdc_sync.py` on re-runs. The `sdc.json` envelope is `{"claims": [...], "ingest_date": "YYYY-MM-DD"}`; the top-level `ingest_date` (the DPLA item's `ingestDate`) anchors the P813 reference date. `process_one_from_sdc` raises if it is absent, so sidecars staged before P813 was pinned to the ingest date must be regenerated with a fresh `get-ids-*` run.
 
 | Property | Snaktype | Source | Notes |
 |---|---|---|---|
@@ -163,10 +163,12 @@ Every DPLA-authored statement carries the same reference triple:
   "snaks": {
     "P854": [<DPLA item URL = https://dp.la/item/<dpla_id>>],
     "P123": [<Q2944483 = Digital Public Library of America>],
-    "P813": [<retrieval date, precision day>]
+    "P813": [<retrieved on = the item's DPLA ingestDate, precision day>]
   }
 }
 ```
+
+P813 is pinned to the item's DPLA `ingestDate` (via `ingest_wikimedia.sdc.ingest_date_from_doc`), not the sync run's date, so a re-sync of unchanged partner data leaves the reference byte-identical.
 
 `_is_dpla_reference()` checks for `P123 = Q2944483` to identify "this is OUR reference" later. User-added references on the same claim (which carry different / no P123) are preserved verbatim.
 
@@ -206,22 +208,21 @@ Wikibase enforces a 1500-character cap on `string` and `monolingualtext` values.
 
 **On re-sync**, `check()` uses `_extract_comparable_value` to compare `(value, p1545)` tuples — so the chunked-statement set is treated atomically. A re-run only writes when the chunks differ from what's on Commons.
 
-## The P813 refresh
+## The reference refresh (P813 + canonical repair)
 
-When the dispatcher is making *any* other edit on a file, it also refreshes `P813` (retrieved on) on every DPLA-authored claim whose existing P813 isn't already today's date. The idea: when the bot has re-verified a file's metadata against DPLA, every DPLA assertion on the file is effectively "as-of today" — useful provenance for downstream consumers, free inside an edit being made anyway.
+When the dispatcher is making *any* other edit on a file, it also rewrites each DPLA-authored claim's DPLA reference to the full canonical `P854` + `P123` + `P813` triple — repairing a partial or stale DPLA reference (e.g. a foreign-bot claim that carries `P123` but no `P854`) and collapsing a duplicate second DPLA reference, all in the same revision. `P813` (retrieved on) is pinned to the item's DPLA `ingestDate`, **not** `datetime.date.today()`. Because re-asserting an already-canonical reference is a Wikibase no-op, back-to-back syncs of unchanged partner data produce no reference churn at all.
 
-`_build_p813_refresh_fragments()`:
+`_build_reference_refresh_fragments(mediaid, dpla_id, already_touched_ids, ingest_date)`:
 
-1. Computes today's P813 snak via `_build_p813_snak(datetime.date.today())`.
+1. Receives the item's `ingest_date`; the dispatcher reads it from `_current_ingest_date` (set by the entry point, ultimately from `ingest_wikimedia.sdc.ingest_date_from_doc`) via `_require_ingest_date()`.
 2. Walks every statement on the file's MediaInfo entity.
-3. Skips statements that are *already* being touched by another fragment (`already_touched_ids` from the dispatcher).
-4. Skips statements with no references.
-5. Per-statement, walks the existing references list: keeps user-added references verbatim, keeps DPLA references whose P813 is already today verbatim, and replaces DPLA references with stale P813.
-6. Emits a `reference_updates` fragment per modified statement — full statement shape (`mainsnak`/`qualifiers`/`rank`/new `references`) because Wikibase's partial-update semantics require it.
+3. Skips statements that are *already* being touched by another fragment (`already_touched_ids` from the dispatcher) and statements with no references.
+4. Per-statement, walks the existing references list: keeps user-added (non-DPLA) references verbatim; keeps an already-canonical DPLA reference (`_dpla_reference_is_canonical` — correct `P854` and `P813` == `ingestDate`) verbatim; rebuilds a non-canonical DPLA reference via `_build_dpla_reference`; drops any duplicate second DPLA reference.
+5. Emits a `reference_updates` fragment per modified statement — full statement shape (`mainsnak`/`qualifiers`/`rank`/new `references`) because Wikibase's partial-update semantics require it.
 
-**Conditional.** `_build_p813_refresh_fragments` is only invoked when the per-file dispatcher already has other edits to make (`has_any_other_edit`). Files where nothing else changed do *not* generate spurious revisions just to bump P813.
+**Conditional.** `_build_reference_refresh_fragments` is only invoked when the per-file dispatcher already has other edits to make (`has_any_other_edit`). Files where nothing else changed do *not* generate spurious revisions just to touch references.
 
-**Cosmetic note on diffs.** When `P813` changes, Wikibase's diff renderer shows the entire reference (URL, publisher, retrieved date) twice — once removed, once added — because reference identity is content-hash, not a stable ID. The data is correct; the diff is just noisy. Switching to `wbsetreference` for in-place reference updates is theoretically possible but would break the atomic-bundle property (separate API calls per refreshed reference) without changing the visual diff in any documented way.
+**Cosmetic note on diffs.** When a reference actually changes, Wikibase's diff renderer shows the entire reference (URL, publisher, retrieved date) twice — once removed, once added — because reference identity is content-hash, not a stable ID. The data is correct; the diff is just noisy. Because `P813` now tracks the item's `ingestDate` rather than `today()`, that noisy diff only appears on a real DPLA-side change, not on every re-sync. Switching to `wbsetreference` for in-place reference updates is theoretically possible but would break the atomic-bundle property (separate API calls per refreshed reference) without changing the visual diff in any documented way.
 
 ## Legacy `{{Artwork}}` migration
 
@@ -257,7 +258,7 @@ Once the SDC the bot just wrote makes a `{{DPLA metadata}}` template param redun
 
 > Note: this unwrapping affects **comparison only**. The SDC monolingualtext claims the bot writes (`P1476`, `P10358`, …) are still hardcoded `language="en"` — see `_build_monolingual_claim` in `ingest_wikimedia/sdc.py`. Don't infer that the written claim language tracks the source language.
 
-**`{{other date}}` expansion + year-range dedup.** On re-sync, `_reconcile_inferred_from_wikitext_dupes(mediaid)` (called from `process_one_from_sdc`) removes inferred-from-Wikitext date claims that have become redundant with a DPLA-attributed date claim. The comparison expands `{{other date}}` invocations (`parse_other_date_template`) and treats year-range equivalence (`parse_date_range`, both in `sdc.py`) as a match — so an inferred date claim whose comparable value equals a DPLA-attributed claim is pruned even when the two were written in different syntaxes.
+**`{{other date}}` expansion + year-range dedup.** On re-sync, `_reconcile_inferred_from_wikitext_dupes(mediaid)` (called from `process_one_from_sdc`) removes inferred-from-Wikitext date claims that have become redundant with a DPLA-attributed date claim. The comparison expands `{{other date}}` invocations (`parse_other_date_template`) and treats year-range equivalence (`parse_date_range`, both in `sdc.py`) as a match — so an inferred date claim whose comparable value equals a DPLA-attributed claim is pruned even when the two were written in different syntaxes. It also prunes an inferred statement whose value is a `; `-joined concatenation of several DPLA values (typical of a multi-valued `description`/P10358): the reconciler splits the inferred text on `; ` and removes it when every folded piece matches a DPLA-attributed value for the same property (`_inferred_multi_value_matches_dpla_set`). Comparison first unescapes MediaWiki magic words such as `{{!}}` (`casefold_for_compare` → `unescape_wikitext_magic_words`) so an escaped pipe matches the literal DPLA value.
 
 ## Wikibase API gotchas
 
@@ -271,7 +272,7 @@ Without it, Wikibase rejects the entire bundle with `invalid-claim: Type is miss
 
 `wbeditentity` treats every non-removal claim entry as a wholesale-replace operation, so the fragment must carry the full statement context (`mainsnak`, `rank`, `qualifiers`, `references`) — not just the field being amended. Partial fragments shaped `{id, type, qualifiers}` or `{id, type, references}` are rejected with `invalid-claim: Attribute "mainsnak" is missing`, and atomicity drops every other edit with them.
 
-The two fragment builders (`_build_qualifier_update_fragments`, `_build_p813_refresh_fragments`) copy `mainsnak` / `rank` / the sibling field from the cached statement so the diff is minimal but the fragment is complete. Deep-copies guard against subsequent helpers mutating shared cache state.
+The two fragment builders (`_build_qualifier_update_fragments`, `_build_reference_refresh_fragments`) copy `mainsnak` / `rank` / the sibling field from the cached statement so the diff is minimal but the fragment is complete. Deep-copies guard against subsequent helpers mutating shared cache state.
 
 ### Qualifier wholesale-replace semantics
 

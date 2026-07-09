@@ -1,14 +1,14 @@
 {% raw %}
 # Pipeline Phases
 
-Four sequential phases per target. All four are idempotent — re-running picks up where it left off. All four operate per-partner, reading and writing under `s3://dpla-wikimedia/<partner>/images/<sharded-prefix>/<dpla-id>/` (see [sidecars.md](sidecars.md) for the path layout and file inventory).
+Four sequential upload phases per target, followed by a `drain-deferred` phase that actions any duplicate-tag work the uploader deferred. All are idempotent — re-running picks up where it left off. The four upload phases operate per-partner, reading and writing under `s3://dpla-wikimedia/<partner>/images/<sharded-prefix>/<dpla-id>/` (see [sidecars.md](sidecars.md) for the path layout and file inventory).
 
 ```text
-get-ids-es  →  downloader  →  uploader  →  sdc-sync
-   ▼              ▼            ▼              ▼
-dpla-map.json   media bytes   Commons         MediaInfo
-sdc.json        file-list.txt upload-         statements
-                iiif.json     result.json
+get-ids-es  →  downloader  →  uploader  →  sdc-sync  →  drain-deferred
+   ▼              ▼            ▼              ▼             ▼
+dpla-map.json   media bytes   Commons        MediaInfo    deferred
+sdc.json        file-list.txt upload-        statements   {{Duplicate}}
+                iiif.json     result.json                 tags
 ```
 
 ## 1. `get-ids-es` — ID enumeration & metadata staging
@@ -30,7 +30,7 @@ Source: `tools/get_ids_es.py`.
 4. For CONTENTdm items with no `mediaMaster` and no `iiifManifest`, derives the IIIF manifest URL from `isShownAt` and patches it into the document as `iiifManifest`.
 5. Stamps `_staged_by_get_ids_es: true` on every document so the downloader can refuse to operate on legacy unstaged metadata.
 6. Stages each document to S3 as `dpla-map.json` via a `ThreadPoolExecutor` (max 10 workers, bounded semaphore of 40 in-flight tasks to bound memory).
-7. Echoes the DPLA ID to stdout — this stream **is** the IDs CSV the downloader consumes (the caller redirects it).
+7. Collects each DPLA ID (with a Commons-title sort key) during enumeration, then — after the Phase 3 `sdc.json` staging below completes — prints them all to stdout **sorted by Commons file-title prefix**. This sorted stream **is** the IDs CSV the downloader consumes (the caller redirects it), so every downstream phase processes items in human-readable alphabetical order. Deferring the emission to the very end also means a mid-run crash never produces a partial-but-misleading CSV.
 8. **Phase 3 — `sdc.json` pre-compute.** After enumeration, re-reads each item's `dpla-map.json` from S3 (not from in-memory state, to keep peak RAM at O(unique-subjects) rather than O(hub-size)), runs `build_claims_for_doc()` from `ingest_wikimedia/sdc.py`, and stages the resulting `{"claims": [...]}` envelope to S3 as `sdc.json`. Items whose provider/dataProvider don't resolve into `institutions_v2` are skipped at this step silently — their `dpla-map.json` is still written so the downloader/uploader can proceed; only the SDC phase will be a no-op.
 
 **Reliability features.**
@@ -39,7 +39,7 @@ Source: `tools/get_ids_es.py`.
 - `check_es_response()` rejects any response with `timed_out=true` or `_shards.failed > 0` so a 200-OK partial response cannot silently terminate a `search_after` paginator.
 - Bounded-semaphore-protected S3 writes so the worker pool's task queue doesn't OOM on a 100 K-item hub.
 
-**Flags.** No `--dry-run` or `--max-records`. To bound a run, redirect stdout to a temporary CSV and `head` it. Pre-flight Slack notification fires from `notify_phase_start("get-ids-es")`.
+**Flags.** No `--dry-run` or `--max-records`. To bound a run, redirect stdout to a temporary CSV and `head` it. Two maintain-mode flags exist: `--maintain` (relax the institution upload-eligibility gate to QID-only, so already-uploaded items of no-longer-opted-in institutions are still enumerated) and `--skip-media-filter` (drop the per-item media/rights gate so the full Commons category can be reconciled — used by lite maintain). Both are set by the launcher's maintain pipelines; see Alternate run modes → `maintain` below. Pre-flight Slack notification fires from `notify_phase_start("get-ids-es")`.
 
 ### NARA's special enumerator (`tools/get_ids_nara.py`)
 
@@ -103,19 +103,21 @@ Source: `tools/downloader.py`.
 
 Source: `tools/uploader.py`. The most complex phase.
 
-**Inputs.** `<ids.csv> <partner>` plus optional `--dry-run`, `--verbose`.
+**Inputs.** `<ids.csv> <partner>` plus optional `--dry-run`, `--verbose`, `--no-create` (maintain fence — never create a new Commons File page; a would-be net-new upload is blocked and recorded as `UPLOAD_SKIPPED_WOULD_CREATE`), `--workers N` (parallel worker processes; default `UPLOADER_PRIORITY_SLOTS` = 4, so a standalone or launched run uploads in parallel by default — pass `--workers 1` for the legacy single-process for-loop), and `--workers-budget N` (box-wide Commons-write cap shared with sdc-sync; `0` — the standalone default — disables it, launch runs pass `24`).
 
 **What it does (per item).**
 
 1. Reads `dpla-map.json` and `file-list.txt` from S3.
 2. Computes per-ordinal Commons file titles via `get_page_title()` and `compute_ordinal_exts_and_page_labels()` — see [special-cases.md](special-cases.md#title-generation) for the sanitization rules.
-3. For each ordinal: downloads the S3 object to a temp file, computes (or reads from S3 metadata) its SHA1, and decides how to upload it. The decision tree handles hash drift, redirects, and cross-item collisions — see [special-cases.md](special-cases.md#duplicate-detection-decision-tree) for the four cases.
+3. For each ordinal: downloads the S3 object to a temp file, computes (or reads from S3 metadata) its SHA1, and decides how to upload it. The decision tree handles hash drift, redirects, and cross-item collisions — see [special-cases.md](special-cases.md#duplicate-detection-decision-tree) for the four cases. When a Case-2 resolution would upload bytes **and** tag a stranded sha1-sibling `{{Duplicate}}` but `Category:Duplicate` is at capacity, the whole op is deferred rather than tagged inline: the ordinal is recorded `DEFERRED` and the item is queued in the per-partner drain sidecar for phase 5, `drain-deferred`.
 4. Composes Wikimedia file-page wikitext via `get_wiki_text()` — a `{{DPLA metadata}}` block with `| source = {{DPLA|...}}` and `| Institution = {{Institution|wikidata=...}}` parameters. See [templates.md](templates.md).
 5. Uploads via pywikibot's `site.upload()`. Catches `fileexists-shared-forbidden`, `filetype-badmime`, `filetype-banned`, `duplicate`, `no-change`, `backend-fail-internal` and other Wikimedia errors per the `IGNORE_WIKIMEDIA_WARNINGS` list (which suppresses cosmetic warnings but lets actual conflicts surface).
 6. After the per-ordinal loop, runs a **post-item orphan check**: probes `(page N+1)`, `(page N+2)`, etc. and tags any orphan from a previous run as `{{Duplicate|...}}` if its SHA1 matches a kept ordinal.
 7. Writes `upload-result.json` to S3 with one entry per ordinal (status / title / pageid / error). This sidecar is the SDC phase's source of truth for which Commons pages exist.
 
-**Per-ordinal statuses written to `upload-result.json`.** `UPLOADED`, `SKIPPED`, `NOT_PRESENT`, `INELIGIBLE`, `FAILED`. Only `UPLOADED` and `SKIPPED` are SDC-eligible.
+**Dispatch.** When `--workers > 1` (the default, `UPLOADER_PRIORITY_SLOTS` = 4) the items are handed to a spawn-start `multiprocessing.Pool` via `imap_unordered`, each worker process holding its own pywikibot session; `--workers 1` walks the items serially in-process. Either path uploads each item under one box-wide `WorkerSlotBudget` slot when `--workers-budget > 0`.
+
+**Per-ordinal statuses written to `upload-result.json`.** `UPLOADED`, `SKIPPED`, `NOT_PRESENT`, `INELIGIBLE`, `FAILED`, `DEFERRED`. Only `UPLOADED` and `SKIPPED` are SDC-eligible; `DEFERRED` means the duplicate-tag upload was postponed to the drain phase because `Category:Duplicate` was at capacity.
 
 **Critical correctness detail: pageid refresh.** `wiki_file_page.pageid` returns the cached `0` from the pre-upload existence check rather than the just-assigned ID. `process_file` constructs a fresh `FilePage` and forces `.exists()` to refresh `pageid` before persisting (`uploader.py:625-649`). On any failure, `pageid` is set to `None` (not `0`) so `sdc_sync.py`'s `if not pageid` guard cleanly skips malformed entries.
 
@@ -153,11 +155,22 @@ Legacy mode: `--file "File:Title.jpg"` (repeatable) or `--cat <Category>` or `--
 
 **Counters tracked.** Sync counters: `SDC_ITEMS_SYNCED` (item fully synced — every eligible ordinal succeeded), `SDC_ITEMS_PARTIALLY_SYNCED` (at least one ordinal synced *and* at least one sibling ordinal errored — broken out so dashboards keying on "items fully done" don't count mixed results as healthy), `SDC_CLAIMS_ADDED`, `SDC_REFS_ADDED`, `SDC_REMOVALS`, `SDC_QUALIFIER_UPDATES`, `SDC_PAGES_EDITED` (distinct Commons file pages actually written), `SDC_ITEMS_SKIPPED_NO_SIDECAR`, `SDC_ITEMS_SKIPPED_MAPPING`, `SDC_ITEMS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_MISSING_ENTITY`, `SDC_ORDINALS_SKIPPED_MISSING_PAGEID` (uploader recorded a null/zero pageid and the title→pageid fallback couldn't resolve it either), and `SDC_SLOT_WAIT_SECONDS` (aggregate worker-seconds blocked on a `WorkerSlotBudget` slot, summed across workers). The error / mapping / missing-entity split is deliberate — operators need to distinguish bad-data items from bad-network items from upload-never-happened items. Migration mode adds the `LEGACY_*` set (`LEGACY_MIGRATED`, `LEGACY_IMPORTS_POSTED`, `LEGACY_SKIPPED_NOT_LEGACY`, `LEGACY_SKIPPED_ALREADY`, `LEGACY_SKIPPED_ERROR`).
 
+## 5. `drain-deferred` — deferred duplicate-tag drain
+
+Source: `tools/drain_deferred.py`.
+
+The uploader defers a Case-2 duplicate-tag op (upload bytes + tag a stranded sha1-sibling `{{Duplicate}}`) whenever `Category:Duplicate` is at capacity — it records the ordinal `DEFERRED` and queues the item's DPLA ID in a per-partner sidecar (`<partner_dir>/deferred-drain.json`, a local file managed by `ingest_wikimedia/drain_sidecar.py`). The `drain-deferred` phase re-invokes `uploader` and `sdc-sync` on the queued IDs once the category has room. It holds a host-wide advisory `flock` so only one drain touches Commons at a time, and runs in two modes:
+
+- **Opportunistic (`drain-deferred --no-wait <partner>`).** Appended to the end of every upload target's chain. A single best-effort round: if `Category:Duplicate` is below its resume threshold right now it drains what's queued, otherwise it exits immediately without waiting. Never blocks the next target, and posts no Slack notification.
+- **Patient (`drain-deferred <partner>`).** One terminal block per unique partner, queued after every target's chain has finished. Loops until the sidecar is empty, re-polling `Category:Duplicate` every `DEFAULT_POLL_SECS` (300 s ≈ 5 min) with no time budget. Posts its own Slack start/complete messages via `notify_drain_phase_start` / `notify_drain_phase_complete` (not `notify_phase_start`).
+
+The terminal patient drain is queued only for full upload batches — not `refresh_only`, `sdc_only`, or `maintain` runs.
+
 ---
 
 ## Alternate run modes
 
-`wikimedia-launch.yml` accepts two boolean inputs that swap the default 4-phase chain for a shorter variant. They are mutually exclusive — pick at most one.
+`wikimedia-launch.yml` accepts three boolean inputs that swap the default upload chain for a different variant. They are mutually exclusive — pick at most one.
 
 ### `refresh_only=true`
 
@@ -168,6 +181,16 @@ Chain: `get-ids-es → downloader` only. No uploader, no SDC. The downloader is 
 Chain: `get-ids-es → sdc-sync` only. No downloader, no uploader. The `get-ids-es` step re-stages each item's `sdc.json` from current ingestion3 data; `sdc-sync` then reconciles Commons against that. Used for backfilling or refreshing SDC after pipeline changes.
 
 **Caveat.** Single-item DPLA IDs and NARA hub-level targets do not re-stage `sdc.json` — the former uses `resolve-dpla-ids` (which stages `dpla-map.json` only), the latter uses `get-ids-nara`. For these, `sdc-sync` replays the existing sidecar. The launcher prints a warning to stderr when this combination is detected.
+
+### `maintain=true`
+
+In-place upkeep of files **already** on Commons for a hub or institution — re-links ID-drifted files and re-syncs SDC / legacy templates, creating nothing new. It is anchored on the live Commons category (`sdc-sync --cat … --maintain`), not an ES id-list, so every already-uploaded file is reconciled; the uploader runs `--no-create` so no net-new File page is ever created. Two sub-flags pick the route:
+
+- Default (**hash**) route: a `get-ids-es --maintain --skip-media-filter` staging scan → `downloader --maintain` → `uploader --no-create` → `sdc-sync --cat … --maintain`. The download + `--no-create` pass repairs content drift for the media-bearing subset; the `--cat` sync reconciles SDC for the whole category.
+- `--lite`: skips the download and upload passes — it stages sidecars, then re-links + SDC-syncs via `sdc-sync --cat … --maintain --from-s3` only.
+- `--count-only` (forces `--lite`): a read-only pre-flight that only resolves how each file would re-link and writes nothing.
+
+Single-DPLA-ID and collection-scoped maintain targets have no whole category to walk, so they keep the id-list-anchored route (`sdc-sync --partner --ids-file`) instead of `--cat`.
 
 ---
 
@@ -190,7 +213,7 @@ logging.info("\n" + str(tracker))
 notify_*_complete(tracker, partner_label, elapsed, dry_run)
 ```
 
-The SDC phase resets the tracker at the start of `_run_partner_mode` so per-partner counts don't accumulate across invocations in the same process. Its completion call differs from the other phases': `notify_sdc_complete(tracker=, partner_label=, elapsed_seconds=, workers=)` passes the sync's worker count rather than `dry_run`, so the Slack summary can report the average per-worker slot wait (`SDC_SLOT_WAIT_SECONDS / workers`).
+The SDC phase resets the tracker at the start of `_run_partner_mode` so per-partner counts don't accumulate across invocations in the same process. Its completion call differs from the other phases': `notify_sdc_complete(tracker, partner_label, elapsed_seconds, dry_run=False, workers=1, maintain=False)` additionally takes `workers` and `maintain` on top of the usual `dry_run`. The `workers` value lets the Slack summary report the average per-worker slot wait (`SDC_SLOT_WAIT_SECONDS / workers`).
 
 ## Phase-start notifications
 

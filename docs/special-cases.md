@@ -26,7 +26,7 @@ The `(page N)` suffix is added by `compute_ordinal_exts_and_page_labels()` only 
 
 ### Sanitisation rules
 
-Applied in order to the first 181 chars of the source title:
+Applied in order to the first 181 chars of the source title (right-trimmed first):
 
 | Rule | Why |
 |---|---|
@@ -37,7 +37,10 @@ Applied in order to the first 181 chars of the source title:
 | `'' → "` | Titleblacklist double-apostrophe rule |
 | `[ → (`, `] → )`, `{ → (`, `} → )`, `# → -`, `\| → -` | Forbidden in MediaWiki page names; `\|` additionally breaks Commons' file-extension detection |
 | `� → '` | Unicode replacement char → right single quote |
+| `_ → space` | MediaWiki treats `_` as a space in titles; an unmatched underscore form reads as false Case-2 drift |
 | `replace_invisible()` | Strip zero-width / bidi characters that Commons rejects |
+| whitespace-run collapse + trim | MediaWiki collapses any whitespace run to a single space and trims edges in stored titles (`" ".join(s.split())`) |
+| first-char uppercase | `File:` is a capitalised namespace (`Title::capitalize`); slice-and-upper preserves internal case |
 
 There is no separate "title blacklist" file the uploader reads; the rules are encoded as the substitution table above. Each was added in response to a specific incident: the colon and slash substitutions trace back to NARA imports in May 2026 where the prior code silently orphaned items whose source titles contained mid-title `:` or `/`; the `&...=` together-only rule replaced an earlier unconditional `&`-replacer that was too aggressive (Commons' actual blacklist only matches when both characters appear together, typical of unencoded query-string titles). The pattern in all cases: match the *actual* MediaWiki rejection rule (which usually involves multiple characters together), not any single character in isolation, so the substitution doesn't damage benign titles.
 
@@ -67,22 +70,22 @@ if existing is None:
 elif existing.title == page_title:
     SKIPPED                          # exact match, our content is already there
 elif is_dup_sha1_sibling_at_expected_title(...):
-    proceed with "upload_only"       # legitimate intra-item duplicate, not drift
+    proceed with "leave_others_alone"       # legitimate intra-item duplicate, not drift
 else:
     drift_action = _resolve_hash_drift(...)  # see next section
 ```
 
 ## Hash drift: the four cases
 
-`_resolve_hash_drift()` is invoked when our SHA1 already exists on Commons but at a different title than we want. Four distinguishable cases:
+`_resolve_hash_drift()` is invoked when our SHA1 already exists on Commons but at a different title than we want. It returns a `DriftResolution` str-enum — `MOVED`, `UPLOAD_AND_TAG`, `LEAVE_OTHERS_ALONE`, or `ALREADY_CORRECT`. Four distinguishable drift cases, plus an `ALREADY_CORRECT` early-return guard (described after Case 3):
 
 ### Case 0 — Cross-item collision
 
 The existing title encodes a *different* DPLA ID (extracted via `extract_dpla_id_from_commons_title`, regex `- DPLA - ([0-9a-f]{32})`). Whether we leave the existing file alone or migrate it hinges on whether that other DPLA ID still resolves:
 
-- **Other item still valid in `api.dp.la`** — two genuinely distinct items happen to share a hash. Both files coexist; we upload to our intended title without touching the existing file. Return `"upload_only"`.
+- **Other item still valid in `api.dp.la`** — two genuinely distinct items happen to share a hash. Both files coexist; we upload to our intended title without touching the existing file. Return `"leave_others_alone"`.
 - **404 on the colliding DPLA ID** — the strongest possible signal that the existing Commons file is an orphan: its DPLA-side anchor is gone. We treat the 404 exactly like `other_item is None` and **fall through to Case 1/2/3 migration** (move or upload-and-tag), rather than silently creating a duplicate alongside the orphan.
-- **Any *other* error (network timeout, 5xx, JSON parse failure)** — none of these mean "the old ID is gone," so we stay on the conservative `"upload_only"` fallback. A transient API blip must not trigger a destructive move on a file that may still have a valid sibling item.
+- **Any *other* error (network timeout, 5xx, JSON parse failure)** — none of these mean "the old ID is gone," so we stay on the conservative `"leave_others_alone"` fallback. A transient API blip must not trigger a destructive move on a file that may still have a valid sibling item.
 
 The 404-vs-other distinction is read off `ex.response.status_code`.
 
@@ -95,12 +98,14 @@ The existing file lives at some other title, and our intended title is a redirec
 Conflict. The intended title is occupied by unrelated content; the existing file at the wrong title is ours. Three actions:
 
 1. Upload our SHA1 to the intended title with `force_ignore_warnings=True` (overwriting the unrelated content).
-2. Tag the old (wrong-title) file with `{{Duplicate|<correct-filename>|...}}` via `_tag_drift_duplicate` / `tag_as_duplicate` — using `prependtext` and the idempotent `_DUPLICATE_TAG_RE` regex so re-runs don't pile up tags.
+2. Tag the old (wrong-title) file with `{{Duplicate|<correct-filename>|...}}` via `_tag_drift_duplicate` / `tag_as_duplicate` — using `prependtext` and the idempotent `_DUPLICATE_TAG_RE` regex so re-runs don't pile up tags. Before tagging, `_tag_drift_duplicate` also **rescues community-contributed metadata** from the old file — merging its license tags, assessment templates (`{{Picture of the day}}`, `{{Featured picture}}`, …), `{{Image extracted}}` parents, and category links forward onto our new upload via `merge_preserved_wikitext` (best-effort; a rescue failure is logged but does not block the tag). This matches the metadata preservation the move and redirect-overwrite paths already do.
 3. No CommonsDelinker request (we didn't move anything; we overwrote and tagged).
 
 Return: `"upload_and_tag"`.
 
-**Sibling-slot fallback.** If the wrong-title file is itself one of this item's other expected ordinal positions (a sibling slot about to be overwritten this run), the duplicate tag is suppressed and the function returns `"upload_only"` instead — the about-to-be-overwritten sibling shouldn't be tagged as a duplicate of a title we're still in the middle of writing.
+**Throttled and deferrable.** Every `{{Duplicate}}` tag adds a file to the human-maintained Category:Duplicate, so this upload-and-tag op is throttled. When the category is at capacity, the **whole op is deferred** — not just the tag — the ordinal is recorded as `ORDINAL_DEFERRED` and re-run by the drain pass (see [{{Duplicate}} throttle and deferred drain](#duplicate-throttle-and-deferred-drain) under Orphan tagging).
+
+**Sibling-slot fallback.** If the wrong-title file is itself one of this item's other expected ordinal positions (a sibling slot about to be overwritten this run), the duplicate tag is suppressed and the function returns `"leave_others_alone"` instead — the about-to-be-overwritten sibling shouldn't be tagged as a duplicate of a title we're still in the middle of writing.
 
 ### Case 3 — Intended title is unoccupied
 
@@ -113,9 +118,13 @@ Exception: if the old title is one of *this item's own* expected ordinal positio
 
 Return: `"moved"`.
 
+### Already-correct (normalized identity)
+
+The file the SHA1 lookup returned IS the file at the intended title once MediaWiki's title normalisation (whitespace-run collapse, `_` → space, first-letter uppercase) is applied — typically a truncation/underscore artefact of `get_page_title`. There is no drift to resolve; falling through to Case 1/2/3 here would attempt a move-to-self or an upload-and-tag against the same page. The caller records SKIPPED against the pywikibot-normalised title. Return `"already_correct"`.
+
 ### Short-circuit: intra-item duplicate-SHA1
 
-`is_dup_sha1_sibling_at_expected_title` checks whether the existing Commons file is one of THIS item's other expected ordinal positions. If so, the existing file is a legitimate sibling (same source media listed at multiple ordinals), not drift; we go straight to `"upload_only"` and proceed.
+`is_dup_sha1_sibling_at_expected_title` checks whether the existing Commons file is one of THIS item's other expected ordinal positions. If so, the existing file is a legitimate sibling (same source media listed at multiple ordinals), not drift; we go straight to `"leave_others_alone"` and proceed.
 
 ## Redirect handling
 
@@ -166,6 +175,12 @@ The post-item orphan check sweeps for stale files left behind by source-media tr
 
 `{{Duplicate}}` tagging is idempotent via the regex `_DUPLICATE_TAG_RE` that recognises `{{Duplicate}}` / `{{duplicate}}` with whitespace tolerance and a `(?:\||\}\})` lookahead so existing `{{DuplicateImageFinder|…}}` tags don't false-match.
 
+### {{Duplicate}} throttle and deferred drain
+
+Every `{{Duplicate}}` tag adds a file to the human-maintained Category:Duplicate, which Commons volunteers clear by hand. Commons admins asked (2026-07) that the category stay lean, so the **Case-2 hash-drift** upload-and-tag path is throttled by `DuplicateCategoryThrottle` (`ingest_wikimedia/dup_throttle.py`): it refuses new tags once the category reaches `DEFAULT_THRESHOLD` (190) members and does not resume until it drops below `DEFAULT_RESUME_BELOW` (140) — a hysteresis band. When the gate refuses, the **whole Case-2 op is deferred** (not just the tag), so we never upload the duplicating bytes and leave an untagged duplicate behind: the ordinal is recorded as `ORDINAL_DEFERRED` / `Result.UPLOAD_DEFERRED_DUP_CATEGORY`. Deferred DPLA IDs are persisted to a per-partner `<partner>/deferred-drain.json` sidecar (`ingest_wikimedia/drain_sidecar.py`); a patient `drain-deferred` phase waits for the category to drain, re-invokes the uploader on just those IDs, and loops until the sidecar is empty.
+
+The trailing-page orphan path above is intentionally left **un-gated** — it is bounded to truncated trailing pages per item (low volume) and has no drain channel, so deferring an orphan tag would leave the orphan unresolved with no retry.
+
 ## Wikimedia error codes
 
 `ingest_wikimedia/wikimedia.py` exports the error-code constants:
@@ -183,18 +198,24 @@ ERROR_BACKEND_FAIL  = "backend-fail-internal"
 
 - `bad-prefix`, `badfilename`, `duplicate-archive`, `duplicate-version`, `empty-file`, `exists`, `exists-normalized`, `filetype-unwanted-type`, `page-exists`, `was-deleted`.
 
-But deliberately does NOT include `duplicate` or `no-change` — those still hard-fail because they indicate state we need to react to (different from a cosmetic "this filename is a bit weird" warning).
+But deliberately does NOT include `duplicate` or `no-change`, so pywikibot still raises on both. `duplicate` is a hard failure. `no-change` (Commons's `fileexists-no-change` response) is instead caught in `process_file`'s exception handler and, when Commons already holds our content at the intended title, is treated as an invariant-satisfied SKIP (see [Commons-dedup byte-drift](#commons-dedup-byte-drift) below) rather than a FAILED.
+
+### Commons-dedup byte-drift
+
+When our SHA1 differs from the file already at the intended title but Commons rejects the re-upload as an exact duplicate of the *current* version there — e.g. partner PDFs with a trailing byte Commons strips on ingest — the file on Commons is already correct after its server-side normalisation. The uploader records `ORDINAL_SKIPPED` (not FAILED) and increments `Result.UPLOAD_SKIPPED_COMMONS_DEDUP` so the class is auditable separately from real failures. It is detected in two paths: the chunked-upload path where `site.upload()` returns `None` (`_detect_commons_dedup_skip`), and the direct-upload path that catches Commons's `fileexists-no-change` exception (`_detect_commons_dedup_from_nochange_error`, which reuses `_detect_commons_dedup_skip` for the result).
 
 ### "File linked to another page"
 
-When `site.upload(...)` returns falsy (pywikibot returns `None` when the file exists under a different page title — typically a redirect not caught by the redirect-handling branch above), the uploader raises `RuntimeError("File linked to another page (possible ID drift)")`. The retry classifier (`tools/get_ids_retry.py`) catches this string and marks the item retryable.
+When `site.upload(...)` returns falsy (pywikibot returns `None` when the file exists under a different page title — typically a redirect not caught by the redirect-handling branch above), the uploader first checks for the [Commons-dedup byte-drift](#commons-dedup-byte-drift) class (`_detect_commons_dedup_skip`) and records `ORDINAL_SKIPPED` if it matches. Only if byte-drift is ruled out does it raise `RuntimeError("File linked to another page (possible ID drift)")`, which `handle_upload_exception` logs as `File linked to another page (unhandled drift shape)`. The retry classifier (`tools/get_ids_retry.py`) matches the `File linked to another page` substring and marks the item retryable.
 
 ### Retryable failure patterns
 
 `tools/get_ids_retry.py` parses logs for these patterns (full list in `UPLOAD_TRANSIENT_ERRORS`):
 
 - `lockmanager-fail-conflict`
+- `lockmanager-fail-svr-acquire`
 - `stashfailed: Could not acquire lock`
+- `stashfailed: Server failed to publish temporary file`
 - `uploadstash-exception`
 - `backend-fail-internal`
 - `File linked to another page`
@@ -242,9 +263,10 @@ ORDINAL_SKIPPED      # existing Commons file matches our SHA1
 ORDINAL_NOT_PRESENT  # no S3 asset to upload (downloader gap)
 ORDINAL_INELIGIBLE   # S3 asset present but uploader chose not to upload
 ORDINAL_FAILED       # upload attempted, raised, did not land
+ORDINAL_DEFERRED     # Case-2 upload+tag deferred: Category:Duplicate at capacity
 ```
 
-UPLOADED and SKIPPED ordinals carry a `title` and `pageid` and are eligible for `wbsetclaims`; NOT_PRESENT / INELIGIBLE / FAILED have no canonical Commons page to attach structured data to.
+UPLOADED and SKIPPED ordinals carry a `title` and `pageid` and are eligible for `wbsetclaims`; NOT_PRESENT / INELIGIBLE / DEFERRED / FAILED have no canonical Commons page to attach structured data to.
 
 **Pageid resolution and the fail-closed contract.** Commons can accept a large (chunked) upload and return without a real `.pageid` (or return `0`) while indexing lags. `_refresh_pageid_with_retries(page_title)` (in `tools/uploader.py`) re-fetches the page with bounded backoff to ride out that lag. If the budget is exhausted without a real id, it returns `None` and the sidecar records `pageid: null` rather than a malformed `0`. That `pageid: null` is a deliberate **fail-closed contract**: `sdc-sync`'s `if not pageid` guard feeds the title→pageid fallback, which recovers the real pageid on the next run.
 

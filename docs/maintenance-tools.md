@@ -109,7 +109,7 @@ Walks `s3://dpla-wikimedia/<partner>/images/` looking for objects whose stored c
 
 Used when the original downloader couldn't determine MIME (typically because the source server returned `application/octet-stream`). Once libmagic identifies the actual type, the uploader can pick a sensible file extension.
 
-The companion `MetadataDirective="REPLACE"` rule applies — `Metadata=dict(s3_object.metadata)` is explicitly passed to preserve the `CHECKSUM` field across the copy. `MetadataDirective="REPLACE"` silently drops every metadata field not provided in the request, so any time you re-stamp an S3 object's content-type (or any other system metadata), you have to pass the existing user metadata back through explicitly or you'll lose the SHA1 and break duplicate detection.
+The companion `MetadataDirective="REPLACE"` rule applies. `MetadataDirective="REPLACE"` silently drops every user-metadata field not provided in the request, so any time you re-stamp an S3 object's content-type (or any other system metadata) you have to pass the existing user metadata back through explicitly (as `sign` does with `Metadata=obj.metadata`) or you'll lose the SHA1 and break duplicate detection. **`remimer`'s `copy_object` call currently does NOT pass a `Metadata=` argument (`tools/remimer.py:55-61`)**, so it drops `CHECKSUM` on every object it touches — a bug that should be fixed to pass `Metadata=dict(obj.metadata)`. Until then, do not run `remimer` on objects whose SHA1 you need to preserve.
 
 ---
 
@@ -135,7 +135,7 @@ Entry: `python -m tools.retirer <partner> [--dry-run]`. Always run with `--dry-r
 
 Source: `tools/nuke.py`.
 
-42 lines. Takes an IDs file and a partner; for each DPLA ID runs:
+41 lines. Takes an IDs file and a partner; for each DPLA ID runs:
 
 ```bash
 aws s3 rm s3://dpla-wikimedia/<partner>/images/<a>/<b>/<c>/<d>/<dpla_id>/ --recursive
@@ -158,7 +158,9 @@ Parses recent upload + download + SDC logs and classifies failures into three re
 Matches against `UPLOAD_TRANSIENT_ERRORS`:
 
 - `lockmanager-fail-conflict`
+- `lockmanager-fail-svr-acquire`
 - `stashfailed: Could not acquire lock`
+- `stashfailed: Server failed to publish temporary file`
 - `uploadstash-exception`
 - `backend-fail-internal`
 - `File linked to another page`
@@ -200,9 +202,9 @@ The retry script merges upload-retry + download-retry CSVs per hub into one comb
 
 Source: `tools/fix_unknown_categories.py`.
 
-Walks Commons looking for files in `Category:Media contributed by the Digital Public Library of America with unknown partner` or `... with unknown institution` — files where the Lua module couldn't resolve a hub or institution category from SDC. For each, attempts to re-resolve against current `institutions_v2.json` mappings and writes the corrected categories back via wikitext edit.
+Drains `Category:Media contributed by the Digital Public Library of America with unknown institution` one institution at a time — files that landed there because their institution had no Commons category page yet. For each remaining file it reads the institution and hub Q-IDs already present in the file's own wikitext (`{{Institution|…|wikidata=Q…}}` / `{{DPLA|…|hub=Q…}}`), ensures that institution's Commons category-page infrastructure exists (via `CategoryEnsurer`), then touches every Commons file for that institution so the Wikidata Infobox template re-evaluates and moves them out of the unknown-institution category. Files whose Q-IDs can't be parsed are recorded and skipped so the loop doesn't retry them forever.
 
-Used after a major `institutions_v2.json` change (new hub added, institution moved between hubs, partner names normalised) to clean up the maintenance categories that accumulated under the old mappings.
+Used after new institutions are added to `institutions_v2.json` (or existing ones first get a category page), to clear the maintenance category that accumulated while those institutions had no category to sort into.
 
 ---
 
