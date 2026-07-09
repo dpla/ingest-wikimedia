@@ -788,7 +788,7 @@ def main() -> None:
             resolved = resolve_wikidata_id(token, maintain=maintain)
             if not resolved:
                 skipped_warnings.append(
-                    f"Wikidata ID {token!r}: not found in institutions_v2.json."
+                    f"Wikidata ID {token!r}: not upload-eligible per institutions_v2.json."
                 )
                 continue
             # Group resolved pairs by canonical hub so multiple institutions
