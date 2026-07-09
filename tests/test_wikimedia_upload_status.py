@@ -2143,20 +2143,20 @@ def test_download_log_glob_is_not_single_quoted():
     assert "/*-bpl+phillips-academy-download.log" in main_cmd, main_cmd
 
 
-def test_total_ordinals_awk_counts_universal_downloading_marker():
-    """The total-ordinals denominator must come from a marker that's
-    present in EVERY version of the downloader's log, not just
-    post-PR-272 logs. NARA-style large hubs run their download phase
-    once and iterate upload + SDC many times — the download log stays
-    in its original form forever, so the status script must work
-    against logs from before PR #272 added the per-item ``Item <id>:
-    N ordinals`` summary line.
+def test_total_ordinals_awk_prefers_item_summary_with_downloading_fallback():
+    """The total-ordinals denominator sums the per-item ``Item <id>: N
+    ordinals`` summary (downloader.py:563), which the downloader emits for
+    EVERY item regardless of whether its media was fetched or already-staged/
+    skipped. It falls back to counting the per-ordinal ``Downloading <partner>
+    <id> <ordinal> from <url>`` line ONLY when the Item-summary sum is 0 — i.e.
+    pre-PR-272 logs that lack the summary.
 
-    The ``Downloading <partner> <id> <ordinal> from <url>`` line at
-    ``downloader.py:532`` has been emitted unconditionally since the
-    downloader was first written, so it's the right universal source.
-    Pin the contract: the rendered SSM command must use that pattern,
-    not the post-PR-272-only Item-summary one."""
+    Counting ``Downloading`` alone (the previous contract) collapsed to 0 for
+    any already-staged run — re-runs, SDC-only relaunches, and download-once-
+    then-iterate hubs like NARA — because that line fires only on an actual
+    fetch attempt, which wrongly dropped the row from file- to
+    item-granularity. Pin the rendered SSM command: both patterns present,
+    Item-sum preferred."""
     from unittest.mock import patch
 
     from scripts.wikimedia_upload_status import get_phase_and_progress
@@ -2180,11 +2180,13 @@ def test_total_ordinals_awk_counts_universal_downloading_marker():
             label="bpl+phillips-academy",
         )
     main_cmd = captured[1]
-    # The new pattern that works on legacy AND current downloader logs.
+    # Primary: sum the per-item Item-summary (present for every item, even an
+    # already-staged/skipped run that logged no Downloading lines).
+    assert "Item [a-f0-9]+: [0-9]+ ordinals" in main_cmd, main_cmd
+    # Fallback for pre-#272 logs that lack the summary.
     assert "Downloading [a-z0-9-]+ [a-f0-9]+ [0-9]+ from" in main_cmd, main_cmd
-    # The old post-PR-272-only pattern must NOT be present — it would
-    # silently return 0 against any download log that predates PR #272.
-    assert "Item [a-f0-9]+: [0-9]+ ordinals" not in main_cmd, main_cmd
+    # END prefers the Item-sum, using the Downloading count only when it's 0.
+    assert "item>0 ? item : dl" in main_cmd, main_cmd
 
 
 def test_download_phase_classifies_no_media_skip_marker_as_active():
