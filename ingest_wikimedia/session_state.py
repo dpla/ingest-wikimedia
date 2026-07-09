@@ -75,8 +75,8 @@ def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
 
     Log filenames follow ``{YYYYMMDD}-{HHMMSS}-{label}-<phase>.log`` where
-    ``<phase>`` is one of ``download``, ``upload``, ``sdc``,
-    ``drain-deferred``, or ``drain-deferred-opportunistic``.
+    ``<phase>`` is one of ``id-generation``, ``download``, ``upload``,
+    ``sdc``, ``drain-deferred``, or ``drain-deferred-opportunistic``.
     The pattern must match ``…-bpl+phillips-academy-download.log`` and NOT
     ``…-bpl+phillips-academy-andover-download.log`` — otherwise sibling
     labels whose names extend this one steal the log selection and the
@@ -92,7 +92,7 @@ def log_filename_pattern_for_label(label: str) -> str:
     """
     return (
         rf"-{re.escape(label)}-"
-        r"(download|upload|sdc|drain-deferred(?:-opportunistic)?)"
+        r"(id-generation|download|upload|sdc|drain-deferred(?:-opportunistic)?)"
         r"\.log$"
     )
 
@@ -163,7 +163,7 @@ def find_active_label(
     cmd_parts = [
         f"find {paths} -maxdepth 1 -type f -name '*.log'",
         "-regextype posix-extended",
-        f"-regex '.*-({label_alt})-(download|upload|sdc|drain-deferred(-opportunistic)?)\\.log'",
+        f"-regex '.*-({label_alt})-(id-generation|download|upload|sdc|drain-deferred(-opportunistic)?)\\.log'",
     ]
     if session_created > 0:
         # Time-bound the lookup to files created after this session's

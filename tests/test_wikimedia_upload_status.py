@@ -2313,3 +2313,96 @@ def test_fetch_no_position_annotation_for_single_label_session():
     # No position bracket on a single-label session.
     assert "[1/1]" not in section_text
     assert "[/" not in section_text
+
+
+def test_get_phase_and_progress_reports_generating_ids():
+    """A session whose newest recognized log is an ``-id-generation.log``
+    surfaces as ``Generating IDs (N items enumerated)`` — get-ids-es writes
+    that log with per-page progress. Previously id-generation produced no
+    recognized log and the session was misclassified."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    calls = []
+
+    def fake_ssm_run(_client, _command, **_kwargs):
+        calls.append(_command)
+        if len(calls) == 1:  # precheck: session_created + newest matching log
+            return (
+                "1700000000\n"
+                "20260709-120000-bpl+boston-public-library-id-generation.log\n"
+            )
+        # id-generation branch: stat mtime + latest "N items enumerated" line
+        return "1700000000\n42,345 items enumerated\n"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+boston-public-library",
+            hub="bpl",
+            label="bpl+boston-public-library",
+        )
+    assert phase == "Generating IDs (42,345 items enumerated)", phase
+
+
+def test_institution_label_no_log_does_not_grab_partner_drain_log():
+    """An institution session in id-generation (no matching log yet) must NOT
+    fall back to the hub-slug glob and pick up an unrelated partner-level
+    ``drain-<hub>`` log — that misreported id-gen sessions as ``Draining``. It
+    returns None so the caller renders ``Generating IDs``."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    calls = []
+
+    def fake_ssm_run(_client, _command, **_kwargs):
+        calls.append(_command)
+        if len(calls) == 1:  # precheck: session_created + NO matching log
+            return "1700000000\n"
+        # A buggy hub-slug fallback WOULD return this partner-drain log.
+        return "20260709-143326-drain-bpl-drain-deferred.log\n"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-bpl+boston-public-library",
+            hub="bpl",
+            label="bpl+boston-public-library",
+        )
+    assert phase is None, phase  # caller (main) renders this as "Generating IDs"
+    assert len(calls) == 1, "must not run the hub-slug fallback query for a '+' label"
+
+
+def test_drain_deferred_phase_recognizes_empty_sidecar_completion():
+    """A drain that found an empty/missing sidecar logs ``nothing to do.`` and
+    exits without acquiring the lock — it must read as complete, not
+    ``⏸ waiting for host lock`` (the pre-fix default when no lock-acquired
+    marker was present)."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    sep = "__WM_SEP__"
+    calls = []
+
+    def fake_ssm_run(_client, _command, **_kwargs):
+        calls.append(_command)
+        if len(calls) == 1:  # precheck
+            return "1700000000\n20260709-143326-drain-bpl-drain-deferred.log\n"
+        # _drain_deferred_phase sections: mtime, tail, queued, lock_acquired
+        tail = (
+            "Drain-deferred: sidecar for partner bpl is empty (or missing); "
+            "nothing to do."
+        )
+        return f"1700000000\n{sep}\n{tail}\n{sep}\n0\n{sep}\n0"
+
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-drain-bpl",
+            hub="bpl",
+            label="drain-bpl",
+        )
+    assert phase == "Drain complete (nothing queued)", phase

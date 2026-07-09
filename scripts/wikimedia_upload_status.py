@@ -182,6 +182,11 @@ def _drain_deferred_phase(
     if session_created > 0 and log_mtime > 0 and log_mtime < session_created:
         return None, 0
 
+    if "nothing to do." in tail:
+        # Empty/missing sidecar: the drain logged this and exited immediately,
+        # never acquiring the lock. It's done, not waiting for the host lock —
+        # without this it fell through to the "⏸ waiting for host lock" default.
+        return "Drain complete (nothing queued)", log_mtime
     if "Drain-deferred: complete." in tail:
         return f"Drain complete ({queued:,} still queued)", log_mtime
     if "at capacity; " in tail and is_opportunistic:
@@ -278,11 +283,19 @@ def get_phase_and_progress(
     # use hub-slug-only filenames (e.g. nara-download.log). If no label-prefixed log
     # is found, fall back to the most recent hub-slug log, excluding new-format files
     # (which contain '+' in the name and belong to a different institution).
-    if not log_file:
+    if not log_file and "+" not in label:
+        # Backward-compat ONLY for bare-hub labels: pre-session-label sessions
+        # used hub-slug-only filenames (e.g. nara-download.log). An institution
+        # label ("hub+institution") with no matching log is in id-generation,
+        # not a legacy hub-slug run — falling back here would attach an
+        # unrelated hub log (in particular a partner-level drain-<hub> log) to
+        # it and misreport an id-gen session as "Draining". Exclude drain-<hub>
+        # logs too (they belong to the terminal-drain path, not a target row).
         hub_prefix = shlex.quote(hub + "-")
         log_file = ssm_run(
             client,
-            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' | head -1 || true",
+            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' "
+            "| grep -vF 'drain-' | head -1 || true",
         ).strip()
 
     if not log_file:
@@ -308,6 +321,24 @@ def get_phase_and_progress(
             log_path=log_path,
             log_file=log_file,
             session_created=session_created,
+        )
+
+    if log_file.endswith("-id-generation.log"):
+        # get-ids-es logs a scope line + periodic "N items enumerated so far".
+        # Surface the latest count so a long enumeration reads as progress, not
+        # a hang — and so an id-gen session isn't misclassified (previously it
+        # had no recognized log and fell through to a mislabel).
+        out = ssm_run(
+            client,
+            f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
+            f"grep -oE '[0-9,]+ items enumerated' {log_path} 2>/dev/null | tail -1",
+        )
+        id_lines = out.splitlines()
+        id_mtime = _safe_int(id_lines[0]) if id_lines else 0
+        enumerated = id_lines[1].strip() if len(id_lines) > 1 else ""
+        return (
+            f"Generating IDs ({enumerated})" if enumerated else "Generating IDs",
+            id_mtime,
         )
     # Resolve the CSV(s) backing this label so `wc -l` returns a meaningful
     # "items in scope" denominator.

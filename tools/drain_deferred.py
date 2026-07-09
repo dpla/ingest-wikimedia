@@ -63,21 +63,36 @@ from ingest_wikimedia.wikimedia import get_site
 _DRAIN_LOCK_PATH = "/home/ec2-user/ingest-wikimedia/.drain-lock"
 
 
-def _acquire_host_lock():
+def _acquire_host_lock(blocking: bool = True):
     """Return a file descriptor holding an exclusive ``flock`` on
-    ``_DRAIN_LOCK_PATH``. Blocks until acquired.
+    ``_DRAIN_LOCK_PATH``, or ``None`` when ``blocking=False`` and another
+    drain already holds it.
 
     Advisory ``flock`` is released automatically on process exit, so a
     crashed drain doesn't leave a stuck lock. The lock file itself is
     created (empty) if missing; it never grows.
+
+    ``blocking=True`` (patient/terminal drain) waits until the lock frees —
+    it legitimately holds the lock for hours while a human clears
+    ``Category:Duplicate``. ``blocking=False`` (opportunistic ``--no-wait``
+    pass) tries once (``LOCK_NB``) and returns ``None`` if the lock is held:
+    the opportunistic pass is a fire-and-forget interstitial round and must
+    NOT block its target's chain behind a long-running patient drain (that
+    was keeping finished sessions open for hours — see the drain-lock bug).
     """
     Path(_DRAIN_LOCK_PATH).parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(_DRAIN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
     logging.info(
-        "Acquiring drain-phase host lock at %s (blocking until available)…",
+        "Acquiring drain-phase host lock at %s (%s)…",
         _DRAIN_LOCK_PATH,
+        "blocking until available" if blocking else "non-blocking, skip if held",
     )
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(fd, flags)
+    except BlockingIOError:
+        os.close(fd)
+        return None
     logging.info("Drain-phase host lock acquired.")
     return fd
 
@@ -286,11 +301,21 @@ def main(no_wait: bool, partner: str) -> None:
         mode_label,
     )
 
-    # Advisory host-level lock. Held for the entire drain (potentially
-    # days in patient mode; usually milliseconds in opportunistic
-    # mode). The ``finally`` below closes the fd (releasing the flock)
-    # on normal exit or exception; a kill releases it on process exit.
-    lock_fd = _acquire_host_lock()
+    # Advisory host-level lock. The patient (terminal) drain BLOCKS until
+    # it's free (it can hold the lock for hours/days while a human clears
+    # Category:Duplicate). The opportunistic (--no-wait) pass acquires
+    # NON-BLOCKING and skips if another drain holds it — it must never block
+    # its target's chain behind a patient drain. The ``finally`` below closes
+    # the fd (releasing the flock) on normal exit or exception; a kill
+    # releases it on process exit.
+    lock_fd = _acquire_host_lock(blocking=not no_wait)
+    if lock_fd is None:
+        logging.info(
+            "Drain-deferred (opportunistic): host lock held by another drain; "
+            "skipping this pass — %d item(s) remain queued for the terminal drain.",
+            len(initial_ids),
+        )
+        return
     try:
         started_at = time.monotonic()
         # ``get_site()`` — same helper the uploader/retirer/fix-categories
