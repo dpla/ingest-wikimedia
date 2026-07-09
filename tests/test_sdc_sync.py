@@ -6510,7 +6510,7 @@ def _stub_maintain_globals(monkeypatch, *, build_on_miss, s3_client):
     monkeypatch.setattr(sdc_sync, "_s3_partner", "ohio", raising=False)
     monkeypatch.setattr(sdc_sync, "_s3_client", s3_client, raising=False)
     monkeypatch.setattr(sdc_sync, "_build_sdc_on_miss", build_on_miss, raising=False)
-    monkeypatch.setattr(sdc_sync, "_maintain_es_doc_cache", None, raising=False)
+    sdc_sync._maintain_es_doc.cache_clear()  # per-file memo; reset between tests
     monkeypatch.setattr(sdc_sync, "hubs", {"stub": True}, raising=False)
     monkeypatch.setattr(sdc_sync, "rights", {"stub": True}, raising=False)
     monkeypatch.setattr(sdc_sync, "subject_ids", {"stub": True}, raising=False)
@@ -6694,3 +6694,22 @@ def test_maintain_es_doc_refetches_for_a_different_id(monkeypatch):
     assert sdc_sync._maintain_es_doc("id-a") == {"id": "id-a"}  # memo hit
     assert sdc_sync._maintain_es_doc("id-b") == {"id": "id-b"}  # new id → refetch
     assert calls == ["id-a", "id-b"]
+
+
+def test_assert_build_sdc_on_miss_allowed_rejects_nara_combo():
+    """--build-sdc-on-miss + NARA is the one destructive combo (would strip
+    P921 during reconciliation) — the guard must raise before any write."""
+    from tools import sdc_sync
+
+    with pytest.raises(ValueError, match="P921"):
+        sdc_sync._assert_build_sdc_on_miss_allowed(True, "nara")
+
+
+def test_assert_build_sdc_on_miss_allowed_permits_safe_combos():
+    """Non-NARA with the flag, and NARA without it, are both fine (no raise)."""
+    from tools import sdc_sync
+
+    sdc_sync._assert_build_sdc_on_miss_allowed(True, "ohio")
+    sdc_sync._assert_build_sdc_on_miss_allowed(True, "georgia")
+    sdc_sync._assert_build_sdc_on_miss_allowed(False, "nara")
+    sdc_sync._assert_build_sdc_on_miss_allowed(False, None)

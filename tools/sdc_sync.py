@@ -1,6 +1,7 @@
 # TODO caption, date, page, iiif manifest, url
 
 import copy
+import functools
 import logging
 import pywikibot
 import requests
@@ -70,14 +71,28 @@ _s3_client = None
 # existing P921 statements. Bound in ``_initialize`` (serial) and injected into
 # ``_init_maintain_worker`` (parallel).
 _build_sdc_on_miss: bool = False
-# Per-file ES ``_source`` memo for the ``--build-sdc-on-miss`` route. With no
-# pre-stage, both the title path (``_maintain_canonical_title``) and the claims
-# path (``_maintain_sidecar_payload``) need the SAME doc for the same id within
-# one file's processing — this caches the last ``(dpla_id, doc)`` so they share
-# one ES round-trip instead of two. Keyed by id, so a new id overwrites: holds
-# exactly one entry and can't grow. Per-process (spawn workers each get their
-# own); files are processed serially within a worker, so no locking needed.
-_maintain_es_doc_cache: tuple[str, dict | None] | None = None
+
+
+def _assert_build_sdc_on_miss_allowed(build_sdc_on_miss: bool, s3_partner) -> None:
+    """Guard the one combination that would silently destroy data: NARA +
+    ``--build-sdc-on-miss``. On that combo the on-demand build passes
+    ``subjects_lookup=None`` (NARA's P921 subjects are only batch-reconciled by a
+    ``get-ids-es`` stage), and maintain's claim reconciliation would then strip
+    the existing P921 statements off NARA items on Commons — irreversible. The
+    launcher never emits this pairing (it keeps NARA's pre-stage and omits the
+    flag), but a hand-run ``sdc-sync --cat --from-s3 nara --build-sdc-on-miss``
+    would. Raises ``ValueError`` so both entry points fail fast before any write:
+    ``_initialize`` converts it to a ``parser.error``; ``_init_maintain_worker``
+    lets it abort the worker.
+    """
+    if build_sdc_on_miss and s3_partner == "nara":
+        raise ValueError(
+            "--build-sdc-on-miss must not be used with --from-s3 nara: it omits "
+            "batch-reconciled P921 subjects, so maintain would strip existing "
+            "P921 statements from NARA items."
+        )
+
+
 # Maintain mode: {institution Wikidata QID -> dataProvider name}, built lazily
 # from ``hubs`` (institutions_v2.json) the first time the anchor-3 wildcard
 # needs to scope a re-link to the file's own institution. None until built.
@@ -635,6 +650,10 @@ def _initialize() -> None:
     _workers = max(1, int(getattr(args, "workers", 1) or 1))
     _workers_budget = max(0, int(getattr(args, "workers_budget", 0) or 0))
     _build_sdc_on_miss = bool(getattr(args, "build_sdc_on_miss", False))
+    try:
+        _assert_build_sdc_on_miss_allowed(_build_sdc_on_miss, _s3_partner)
+    except ValueError as e:
+        parser.error(str(e))
 
 
 # This is the JSON used for formatting a claim. The P459 -> Q61848113 (determination method) qualifier is hardcoded in for everything DPLA adds. Not all data types have the same format for value, so this is formatted in the function for each property added.
@@ -4007,22 +4026,21 @@ def _maintain_resolve(title, embedded_id, file_page, mediaid):
     )
 
 
+@functools.lru_cache(maxsize=1)
 def _maintain_es_doc(dpla_id):
     """Return the item's ES ``_source`` for the ``--build-sdc-on-miss`` route,
     fetched at most once per file.
 
-    The title and claims paths both need the same doc for the same id in one
-    file's processing; this memoizes the last ``(dpla_id, doc)`` (via
-    :data:`_maintain_es_doc_cache`) so they share a single
-    :func:`_fetch_dpla_doc_from_es` round-trip. A ``None`` doc (item gone) is
-    cached too, so both paths skip on one fetch.
+    The title path (:func:`_maintain_canonical_title`) and claims path
+    (:func:`_maintain_sidecar_payload`) both need the same doc for the same id
+    within one file's processing. ``lru_cache(maxsize=1)`` holds the most recent
+    ``dpla_id``'s result, so the two share one :func:`_fetch_dpla_doc_from_es`
+    round-trip; the next id evicts it, so the cache never holds more than one
+    entry. A ``None`` doc (item gone) is cached too, so both paths skip on one
+    fetch. Per-process (spawn workers each build their own); tests call
+    ``_maintain_es_doc.cache_clear()``.
     """
-    global _maintain_es_doc_cache
-    if _maintain_es_doc_cache is not None and _maintain_es_doc_cache[0] == dpla_id:
-        return _maintain_es_doc_cache[1]
-    doc = _fetch_dpla_doc_from_es(dpla_id)
-    _maintain_es_doc_cache = (dpla_id, doc)
-    return doc
+    return _fetch_dpla_doc_from_es(dpla_id)
 
 
 def _maintain_sidecar_payload(dpla_id):
@@ -5727,6 +5745,9 @@ def _init_maintain_worker(
     _normalize_wikitext_enabled = bool(normalize_wikitext_enabled)
     _worker_slot_budget = WorkerSlotBudget(workers_budget)
     _build_sdc_on_miss = bool(build_sdc_on_miss)
+    # Defense in depth: the parent _initialize already rejects this combo, but
+    # re-check here so a worker can never run the P921-stripping path.
+    _assert_build_sdc_on_miss_allowed(_build_sdc_on_miss, _s3_partner)
     if s3_partner is not None:
         from ingest_wikimedia.s3 import S3Client
 
