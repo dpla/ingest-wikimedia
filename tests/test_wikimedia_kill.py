@@ -101,6 +101,19 @@ def test_wikidata_qid_resolves_to_canonical_only_when_no_institution():
         assert resolve_kill_components(["Q67890"]) == [frozenset({"indiana"})]
 
 
+def test_wikidata_qid_resolved_without_upload_eligibility_filter():
+    """Kill resolves QIDs with maintain=True (QID-presence only) so a present-
+    but-opted-out QID still resolves for killing. Regression: the default
+    upload-gated filter dropped opted-out matches, failing the kill (Q955764)."""
+    with patch(
+        "scripts.wikimedia_kill.resolve_wikidata_id",
+        return_value=[("nara", "Herbert Hoover Library")],
+    ) as resolve:
+        groups = resolve_kill_components(["Q955764"])
+    resolve.assert_called_once_with("Q955764", maintain=True)
+    assert groups == [frozenset({"nara", "herbert-hoover-library"})]
+
+
 def test_wikidata_qid_unknown_raises_value_error():
     with patch("scripts.wikimedia_kill.resolve_wikidata_id", return_value=[]):
         with pytest.raises(ValueError) as exc:

@@ -135,7 +135,15 @@ def resolve_kill_components(target_tokens: list[str]) -> list[frozenset[str]]:
         if not token:
             continue
         if is_wikidata_id(token):
-            resolved = resolve_wikidata_id(token)
+            # maintain=True → resolve by QID presence only, dropping the
+            # upload-eligibility filter. A kill must find the running session
+            # regardless of upload flags: opted-out (upload=false) institutions
+            # still launch (e.g. under maintain), and a hub/institution can be
+            # de-opted after its session starts. The default upload-gated filter
+            # would drop those matches and make a present-but-opted-out QID (e.g.
+            # Q955764) look absent, so the kill would refuse to run. With the
+            # filter dropped, an empty result now genuinely means "not in the JSON".
+            resolved = resolve_wikidata_id(token, maintain=True)
             if not resolved:
                 raise ValueError(
                     f"No hub or institution found for Wikidata ID {token!r} in institutions_v2.json."
