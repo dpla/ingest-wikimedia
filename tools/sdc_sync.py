@@ -32,6 +32,7 @@ from ingest_wikimedia import legacy_artwork, wikimedia, wikitext_normalize
 from ingest_wikimedia.common import get_dict, get_list
 from ingest_wikimedia.csrf import CsrfRecoveryFailed, with_csrf_recovery
 from ingest_wikimedia.dpla import DC_TITLE_FIELD_NAME, SOURCE_RESOURCE_FIELD_NAME
+from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.maintain import resolve_current_dpla_id
 from ingest_wikimedia.slack import notify_phase_start, notify_sdc_complete
 from ingest_wikimedia.tracker import Result, Tracker
@@ -64,7 +65,7 @@ _s3_client = None
 _maintain_qid_to_name: dict[str, str] | None = None
 # Legacy-mode (``--file`` / ``--cat`` / ``--list``) DPLA-doc cache.
 # ``parsed()`` populates it during ``process_one``; the post-SDC
-# cleanup helper pops on read so the same S3 / api.dp.la doc isn't
+# cleanup helper pops on read so the same S3 / ES doc isn't
 # re-fetched. One entry per in-flight ``dpla_id``; the pop keeps the
 # cache from growing past one entry in practice.
 _legacy_mode_doc_cache: dict[str, dict] = {}
@@ -142,8 +143,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Read each DPLA item's metadata from the dpla-map.json staged in S3 "
             "by get-ids-es (under the partner's sharded item prefix; resolved by "
-            "S3Client.get_item_metadata) instead of calling api.dp.la. Falls back "
-            "to api.dp.la when an item's dpla-map.json is missing."
+            "S3Client.get_item_metadata) rather than reading each item from ES "
+            "at sync time. Falls back to a direct ES read when an item's "
+            "dpla-map.json is missing."
         ),
     )
     p.add_argument(
@@ -585,8 +587,8 @@ def _initialize() -> None:
     subject_ids = fetch_subjects_json()
 
     # When --from-s3 <partner> is set, parsed() reads each item's dpla-map.json
-    # from S3 instead of calling api.dp.la. Imported lazily so this module
-    # doesn't pay the boto3 import cost when nothing needs S3.
+    # from S3, falling back to a direct ES read on miss. Imported lazily so this
+    # module doesn't pay the boto3 import cost when nothing needs S3.
     _s3_partner = args.from_s3
     _s3_client = None
     if _s3_partner is not None:
@@ -3617,37 +3619,37 @@ def _reconcile_inferred_from_wikitext_junk(mediaid):
                 removals.append(stmt["id"])
 
 
-def _fetch_dpla_doc_from_api(dpla_id, dpla_api):
-    """Fetch a single DPLA item's inner doc from the public DPLA API.
+def _fetch_dpla_doc_from_es(dpla_id):
+    """Fetch a single DPLA item's inner doc from the internal ES index.
 
-    Returns the inner doc (same shape as an ES `_source` and as the
-    dpla-map.json staged in S3 under the partner's sharded item prefix) on
-    success, or None on API error. Retries once after a 30-second sleep on
-    the first network failure; if the retry also raises, returns None so
-    parsed() can treat the item as Missing rather than aborting the batch.
+    Returns the ES ``_source`` — the same shape as the old api.dp.la inner doc
+    (``docs[0]``) and as the dpla-map.json staged in S3, since api.dp.la is just
+    a read layer over this same MAP index — or None when the id isn't in the
+    index or ES is unreachable. Queried directly against ES (the index
+    ``get-ids-es`` reads and ``maintain.resolve_current_dpla_id`` already uses)
+    rather than the public API, so a large or concurrent maintain run that
+    reconciles from scratch (no staged sidecars) doesn't hammer api.dp.la.
+    Retries once after a 30-second sleep on a transient failure; a None return
+    lets ``parsed()`` treat the item as Missing rather than aborting the batch.
     """
-    try:
-        response = requests.get(
-            f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
-            timeout=15,
-        ).json()
-    except Exception:
-        print(" -- Sleeping 30 seconds and retrying...")
-        time.sleep(30)
+    for attempt in (1, 2):
         try:
-            response = requests.get(
-                f"https://api.dp.la/v2/items/{dpla_id}?api_key={dpla_api}",
-                timeout=15,
-            ).json()
-        except Exception as retry_e:
-            print(f" -- DPLA API retry failed for {dpla_id}: {retry_e!r}")
-            return None
-    try:
-        return response["docs"][0]
-    except Exception:
-        print(response)
-        print("DPLA API returned error.")
-        return None
+            resp = post_es({"size": 1, "query": {"ids": {"values": [dpla_id]}}})
+            resp.raise_for_status()
+            data = resp.json()
+            check_es_response(data)
+            hits = data.get("hits", {}).get("hits", [])
+            return hits[0]["_source"] if hits else None
+        except Exception as e:
+            if attempt == 1:
+                print(f" -- ES fetch failed for {dpla_id} ({e!r}); retrying in 30s...")
+                time.sleep(30)
+            else:
+                print(f" -- ES retry failed for {dpla_id}: {e!r}")
+                return None
+    # Unreachable — the loop returns on every attempt — but makes the
+    # "doc or None" contract explicit (no implicit fall-through to None).
+    return None
 
 
 def _fetch_dpla_doc_from_s3(s3_client, partner, dpla_id):
@@ -3675,8 +3677,7 @@ def _fetch_dpla_doc_from_s3(s3_client, partner, dpla_id):
         raw = s3_client.get_item_metadata(partner, dpla_id)
     except ClientError as e:
         print(
-            f" -- S3 fetch failed for {partner}/{dpla_id} ({e!r}); "
-            "falling back to api.dp.la."
+            f" -- S3 fetch failed for {partner}/{dpla_id} ({e!r}); falling back to ES."
         )
         return None
     if raw is None:
@@ -3693,9 +3694,9 @@ def parsed(dpla_id, dpla_api):
 
     Source-of-truth selection:
       * When --from-s3 <partner> is configured, try S3 first. On miss
-        (object not present, parse error), fall back to api.dp.la so a
+        (object not present, parse error), fall back to ES so a
         not-yet-staged item still syncs.
-      * Otherwise hit api.dp.la directly.
+      * Otherwise read from ES directly.
 
     Returns None when neither source has a usable doc — process_one()
     treats that as a Missing ID.
@@ -3708,7 +3709,7 @@ def parsed(dpla_id, dpla_api):
         if dpla is not None:
             print(f" -- Loaded {dpla_id} from S3 ({_s3_partner})")
     if dpla is None:
-        dpla = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+        dpla = _fetch_dpla_doc_from_es(dpla_id)
 
     print(f" -- Accessed DPLA ID {dpla_id}")
 
@@ -3716,7 +3717,7 @@ def parsed(dpla_id, dpla_api):
         return None
     # Stash the raw doc so ``_post_sdc_cleanup_for_legacy_mode`` can
     # reuse it after ``process_one`` returns, skipping a redundant
-    # S3 / api.dp.la fetch on the same dpla_id. Cache is per dpla_id
+    # S3 / ES fetch on the same dpla_id. Cache is per dpla_id
     # and pop-on-read in the cleanup helper so it doesn't grow.
     _legacy_mode_doc_cache[dpla_id] = dpla
     return _parse_dpla_doc(dpla, dpla_id)
@@ -4725,7 +4726,7 @@ def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> bool:
     :func:`_post_sdc_cleanup_for_page`. On a cache miss (e.g. process_one
     early-returned on a missing-ID before the cache populated, or the
     cache was cleared by an earlier cleanup) the doc is fetched fresh
-    from S3 / api.dp.la so the cleanup still runs.
+    from S3 / ES so the cleanup still runs.
 
     Best-effort: any failure is logged but doesn't raise. Returns
     ``True`` if cleanup actually rewrote the page, else ``False`` —
@@ -4740,9 +4741,9 @@ def _post_sdc_cleanup_for_legacy_mode(file_page, dpla_id: str) -> bool:
             if _s3_partner is not None:
                 doc = _fetch_dpla_doc_from_s3(_s3_client, _s3_partner, dpla_id)
                 if doc is None:
-                    doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+                    doc = _fetch_dpla_doc_from_es(dpla_id)
             else:
-                doc = _fetch_dpla_doc_from_api(dpla_id, dpla_api)
+                doc = _fetch_dpla_doc_from_es(dpla_id)
         except Exception:
             logging.exception(
                 f" -- cleanup: DPLA-doc fetch failed for {dpla_id}; skipping."

@@ -1816,7 +1816,7 @@ def test_safe_process_one_clears_doc_cache_on_missing_entity(monkeypatch):
 
 def test_post_sdc_cleanup_for_legacy_mode_reuses_cached_doc(monkeypatch):
     """The doc ``parsed()`` cached during ``process_one`` gets popped
-    and reused in the cleanup helper — no second S3 / api.dp.la fetch.
+    and reused in the cleanup helper — no second S3 / ES fetch.
     Locks in the optimisation so a refactor can't silently regress to
     re-fetching the same doc."""
     from ingest_wikimedia.dpla import DPLA
@@ -1827,7 +1827,7 @@ def test_post_sdc_cleanup_for_legacy_mode_reuses_cached_doc(monkeypatch):
     sdc_sync._legacy_mode_doc_cache["dpla-1"] = cached_doc
 
     s3_fetches = []
-    api_fetches = []
+    es_fetches = []
     monkeypatch.setattr(
         sdc_sync,
         "_fetch_dpla_doc_from_s3",
@@ -1835,8 +1835,8 @@ def test_post_sdc_cleanup_for_legacy_mode_reuses_cached_doc(monkeypatch):
     )
     monkeypatch.setattr(
         sdc_sync,
-        "_fetch_dpla_doc_from_api",
-        lambda *a, **kw: api_fetches.append(a) or None,
+        "_fetch_dpla_doc_from_es",
+        lambda *a, **kw: es_fetches.append(a) or None,
     )
 
     dispatch_calls = []
@@ -1855,7 +1855,7 @@ def test_post_sdc_cleanup_for_legacy_mode_reuses_cached_doc(monkeypatch):
     sdc_sync._post_sdc_cleanup_for_legacy_mode(MagicMock(name="FilePage"), "dpla-1")
 
     assert s3_fetches == []
-    assert api_fetches == []
+    assert es_fetches == []
     assert len(dispatch_calls) == 1
     assert dispatch_calls[0][1] is cached_doc
     # Pop-on-read drains the cache so a second cleanup call on the

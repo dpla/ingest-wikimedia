@@ -462,13 +462,14 @@ def test_wrap_step_with_marker_tags_each_tool_with_its_phase():
 
 
 def test_wrap_step_with_marker_tees_id_generation_stderr():
-    """The id-generation step is the one tool that doesn't call
-    ``setup_logging``, so it produces no log file. To let the
-    failure handler include its stderr in Slack, the launcher tees
-    stderr to a known path while keeping the live stream visible in
-    the tmux pane (``>&2``). Pin the tee shape so a refactor can't
-    silently drop it — the digitalnc-class case (``click.BadParameter``
-    from ``DPLA.check_partner``) only reaches Slack via this tee."""
+    """get-ids-es now writes a file log (``setup_logging``, console=False), but
+    that only captures logging AFTER ``DPLA.check_partner`` — a
+    ``click.BadParameter`` from check_partner (the digitalnc class) raises
+    before logging is set up and reaches Slack ONLY via this stderr tee (which
+    also captures the tool's ``print(file=sys.stderr)`` output). So the launcher
+    tees stderr to a known path while keeping the live stream visible in the
+    tmux pane (``>&2``). Pin the tee shape so a refactor can't silently drop
+    it."""
     from scripts.wikimedia_launch import _wrap_step_with_marker
 
     wrapped = _wrap_step_with_marker(

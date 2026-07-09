@@ -22,6 +22,10 @@ def _invoke(*args: str):
 
     with (
         patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        # get-ids-es now calls setup_logging (file-only) right after
+        # check_partner; stub it so tests don't write a stray ./logs file or
+        # mutate global logging state.
+        patch.object(get_ids_es, "setup_logging"),
         patch.object(get_ids_es, "notify_phase_start"),
         patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
         patch.object(
@@ -67,6 +71,28 @@ def _invoke(*args: str):
         # runner re-raises into the test body, killing it before the
         # assertion runs.
         return runner.invoke(get_ids_es.main, list(args))
+
+
+def test_id_generation_uses_file_only_logging():
+    """get-ids-es's stdout IS the ID CSV, so it must set up FILE-ONLY logging
+    (console=False) — the tqdm console handler writes to stdout and would
+    interleave log lines into the CSV. Pin the call args so a regression can't
+    silently re-enable console logging and corrupt the CSV."""
+    from tools import get_ids_es
+
+    with (
+        patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        patch.object(get_ids_es, "setup_logging") as setup_logging,
+        patch.object(get_ids_es, "notify_phase_start"),
+        patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
+        patch.object(
+            get_ids_es,
+            "fetch_institutions_v2",
+            side_effect=RuntimeError("stop-after-validation"),
+        ),
+    ):
+        CliRunner().invoke(get_ids_es.main, ["bpl"])
+    setup_logging.assert_called_once_with("bpl", "id-generation", console=False)
 
 
 def test_collection_without_institution_is_hub_wide():
@@ -192,6 +218,10 @@ def _invoke_single_id(single_id, hits):
 
     with (
         patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        # get-ids-es now calls setup_logging (file-only) right after
+        # check_partner; stub it so tests don't write a stray ./logs file or
+        # mutate global logging state.
+        patch.object(get_ids_es, "setup_logging"),
         patch.object(get_ids_es, "notify_phase_start"),
         patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
         patch.object(
@@ -287,6 +317,10 @@ def test_single_id_banlist_hit_gets_distinct_error():
     )
     with (
         patch.object(get_ids_es.DPLA, "check_partner", return_value=None),
+        # get-ids-es now calls setup_logging (file-only) right after
+        # check_partner; stub it so tests don't write a stray ./logs file or
+        # mutate global logging state.
+        patch.object(get_ids_es, "setup_logging"),
         patch.object(get_ids_es, "notify_phase_start"),
         patch.object(get_ids_es, "PARTNER_HUBS", {"bpl": "Digital Commonwealth"}),
         patch.object(

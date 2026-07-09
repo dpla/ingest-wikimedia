@@ -67,26 +67,33 @@ class TqdmLoggingHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logging(partner: str, event_type: str, level: int = logging.INFO) -> None:
+def setup_logging(
+    partner: str, event_type: str, level: int = logging.INFO, console: bool = True
+) -> None:
     """
     Creates a logfile for this process with a unique timestamp and with the partner's
     name. Passes local logging through tqdm so the progress bars don't get mangled.
     Suppresses pywikibot logging below ERROR. Installs a
     logging-aware ``sys.excepthook`` so uncaught tracebacks reach the
     log file — see :func:`_install_logging_excepthook`.
+
+    ``console=False`` omits the tqdm/stdout console handler and logs only to the
+    file. Required for tools whose STDOUT is a data channel — e.g. ``get-ids-es``
+    redirects stdout to the ID CSV, and ``TqdmLoggingHandler`` writes to stdout,
+    so a console handler there would interleave log lines into the CSV.
     """
     os.makedirs(LOGS_DIR_BASE, exist_ok=True)
     time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_label = os.environ.get("WIKIMEDIA_SESSION_LABEL") or partner
     log_file_name = f"{time_str}-{session_label}-{event_type}.log"
     filename = f"{LOGS_DIR_BASE}/{log_file_name}"
+    handlers: list[logging.Handler] = [logging.FileHandler(filename=filename, mode="w")]
+    if console:
+        handlers.insert(0, TqdmLoggingHandler())
     logging.basicConfig(
         level=level,
         datefmt="%H:%M:%S",
-        handlers=[
-            TqdmLoggingHandler(),
-            logging.FileHandler(filename=filename, mode="w"),
-        ],
+        handlers=handlers,
         format="[%(levelname)s] %(asctime)s: %(message)s",
     )
     logging.info(f"Logging to {filename}.")
