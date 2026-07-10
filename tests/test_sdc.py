@@ -924,15 +924,17 @@ def test_build_claims_for_doc_tolerates_missing_rights_field():
     )
 
 
-def test_build_rights_claims_pdm_emits_public_domain_with_pd_us_qualifiers():
+def test_build_rights_claims_pdm_emits_bare_public_domain_status():
     """CC's Public Domain Mark is a rights-statement declaration, not a
     copyright license — emitting it as a P275 (copyright license) claim
     (as rights.json would naively have us do) produces SDC that
     Module:License's branch table can't reconcile. Assert the shape we
-    write instead: a single P6216=Q19652 (public domain) statement with
-    P459=Q47246828 (published >95 years ago) and P1001=Q30 (US
-    jurisdiction) qualifiers, which dispatches to {{PD-US-expired}}
-    through Wikidata's P1424 sitelink chain. No P275 emission."""
+    write instead: a single P6216=Q19652 (public domain) statement,
+    DPLA-authored via ``formattedclaim``'s default reference triple + P459
+    qualifier. No P275, no jurisdiction qualifier, no reason-specific
+    determination method — PDM doesn't warrant asserting a particular
+    reason (>95 years old, government work, etc.). Module:DPLA reads this
+    shape and emits ``{{PD-US}}`` directly."""
     import datetime as _dt
 
     from ingest_wikimedia.sdc import (
@@ -955,26 +957,22 @@ def test_build_rights_claims_pdm_emits_public_domain_with_pd_us_qualifiers():
     p6216 = claims[0]
     assert p6216["mainsnak"]["datavalue"]["value"]["numeric-id"] == 19652
 
+    # Only the default P459=Q61848113 (heuristic) qualifier is stamped by
+    # ``formattedclaim`` — no P1001, no reason-specific determination method.
     quals = p6216["qualifiers"]
-    assert quals["P459"][0]["datavalue"]["value"]["numeric-id"] == 47246828, (
-        "P459 must be Q47246828 (published >95 years ago), not the default "
-        "Q61848113 (heuristic) — Module:License needs the specific "
-        "determination-method to dispatch to {{PD-US-expired}}"
+    assert list(quals.keys()) == ["P459"], (
+        f"PDM P6216 must carry only the default P459 qualifier; got {list(quals.keys())}"
     )
-    assert quals["P1001"][0]["datavalue"]["value"]["numeric-id"] == 30, (
-        "P1001=Q30 (United States) satisfies Module:License's "
-        "jurisdiction-match branch against Q47246828's own P1001"
-    )
+    assert quals["P459"][0]["datavalue"]["value"]["numeric-id"] == 61848113
 
-    # DPLA-provenance reference triple still present — the switch to a
-    # non-heuristic P459 value doesn't strip DPLA-attribution.
+    # DPLA-provenance reference triple present.
     assert any(
         any(
             snak.get("datavalue", {}).get("value", {}).get("numeric-id") == 2944483
             for snak in ref.get("snaks", {}).get("P123", [])
         )
         for ref in p6216.get("references", [])
-    ), "PDM shape must still carry the DPLA-publisher reference marker"
+    ), "PDM shape must carry the DPLA-publisher reference marker"
 
 
 def test_build_rights_claims_pdm_uri_variants_all_route_through_pdm_branch():

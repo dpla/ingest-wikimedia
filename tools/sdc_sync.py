@@ -377,17 +377,13 @@ def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
 
     Mirrors :func:`Module:DPLA`'s ``isDplaDetermined`` filter on Commons:
     the canonical DPLA-provenance marker is the ``P123 = Q2944483``
-    (publisher = DPLA) snak in any statement reference — stamped by
-    ``formattedclaim`` on every claim DPLA writes. The
-    ``P459 = Q61848113`` qualifier is co-stamped as a display-side
-    "determination method = heuristic" marker but is not
-    reference-independent: the PDM-shape P6216 claim (see
-    ``ingest_wikimedia.sdc._build_rights_claims``) overrides it to
-    ``P459 = Q47246828`` so Module:License dispatches through the correct
-    determination method, yet the statement is still DPLA-authored via
-    its reference triple. Detecting provenance via the reference matches
-    Module:DPLA's own predicate and keeps this guard aligned with the
-    template renderer's notion of "has DPLA SDC".
+    (publisher = DPLA) snak in any statement reference, stamped by
+    ``formattedclaim`` on every claim DPLA writes. The prior implementation
+    checked the ``P459 = Q61848113`` qualifier instead — a display-side
+    co-stamp that isn't a reference-independent marker — despite the
+    docstring already claiming alignment with Module:DPLA. Detecting
+    provenance via the reference closes that drift and keeps this guard
+    aligned with the template renderer's notion of "has DPLA SDC".
     """
     if not entity:
         return False
@@ -999,12 +995,6 @@ _DPLA_EXTRA_QUALIFIER_PROPS = {
     # write time from upload-result.json by sdc-sync (multipage items only,
     # grouped per file extension).
     "P760": {"P304"},
-    # P1001 (jurisdiction) is DPLA-authored on P6216 (copyright status)
-    # statements built from a PDM source URI — see the ``is_pdm`` branch of
-    # ``ingest_wikimedia.sdc._build_rights_claims``. Marking it as
-    # DPLA-owned here lets amend-in-place round-trip the qualifier without
-    # treating it as user-added.
-    "P6216": {"P1001"},
 }
 for _chunkable_prop in CHUNKABLE_PROPS:
     _DPLA_EXTRA_QUALIFIER_PROPS.setdefault(_chunkable_prop, set()).add("P1545")

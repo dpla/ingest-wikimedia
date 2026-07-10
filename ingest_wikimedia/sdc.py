@@ -93,9 +93,6 @@ Q_PUBLIC_DOMAIN = "Q19652"
 Q_COPYRIGHTED = "Q50423863"
 Q_CC0_PD_SOMEWHERE = "Q88088423"
 Q_PD_MARK_RAW = "Q6938433"
-# PDM P6216 write shape — see ``_build_rights_claims`` for the full rationale.
-Q_PDM_DETERMINATION = "Q47246828"
-Q_US = "Q30"
 # DPLA distinguishes two kinds of hub, which take different SDC partnership
 # shapes (see ``_build_contributed_claims``):
 #   * Content hub — a large institution that IS the data provider (NARA,
@@ -925,38 +922,31 @@ def _build_rights_claims(
     out: list[dict] = []
     rs_key = normalize_rights_uri(rs)
 
-    # PDM (Creative Commons Public Domain Mark) is not a copyright license
-    # — it's an assertion by the source institution that the work is
-    # already in the public domain. Emitting it as a P275 (copyright
-    # license) claim, as rights.json would have us do, produces SDC that
-    # Module:License's branch table can't reconcile: a subsequent
-    # community edit adding a second P6216 value (a common shape on
-    # historical PD material) trips the ``#cs>=2, #cl>=1`` branch that
-    # falls through to an empty bundle, and no license template renders.
-    # Instead, express the PD assertion structurally via P6216 alone,
-    # with P459 (determination method) and P1001 (jurisdiction) qualifiers
-    # that dispatch to {{PD-US-expired}} through Wikidata's P1424 sitelink
-    # chain. Overriding P459 doesn't strip DPLA-attribution — the P123
-    # publisher marker in the reference triple ``formattedclaim`` emits is
-    # what Module:DPLA's ``isDplaDetermined`` predicate keys on.
+    # PDM (Creative Commons Public Domain Mark) is not a copyright license —
+    # it's an assertion by the source institution that the work is already in
+    # the public domain. Emitting it as a P275 (copyright license) claim, as
+    # rights.json would have us do, produces SDC that Module:License's branch
+    # table can't reconcile: a subsequent community edit adding a second P6216
+    # value trips the ``#cs>=2, #cl>=1`` branch that falls through to an empty
+    # bundle, and no license template renders on the file page.
     #
-    # This assumes US jurisdiction and >95-years-old publication — true for
-    # essentially all DPLA content (US-only aggregator, archival material).
-    # The corresponding ``rights.json`` PDM entry has been removed so this
-    # branch is the single source of truth.
+    # Express the PD assertion structurally via a bare P6216=Q19652 (public
+    # domain) statement instead. Module:DPLA reads this shape and emits
+    # ``{{PD-US}}`` directly, matching what the source institution has
+    # declared via PDM without asserting a specific reason (e.g. >95 years
+    # old, government work) that our upstream data doesn't warrant. The
+    # corresponding ``rights.json`` PDM entry has been removed so this branch
+    # is the single source of truth.
     if rs_key == PD_MARK_URI_CANONICAL:
-        claim = formattedclaim(
-            "P6216",
-            _item_value(Q_PUBLIC_DOMAIN),
-            "wikibase-entityid",
-            dpla_id,
-            retrieval_date,
+        out.append(
+            formattedclaim(
+                "P6216",
+                _item_value(Q_PUBLIC_DOMAIN),
+                "wikibase-entityid",
+                dpla_id,
+                retrieval_date,
+            )
         )
-        claim["qualifiers"]["P459"] = [
-            _qualifier_item_snak("P459", Q_PDM_DETERMINATION)
-        ]
-        claim["qualifiers"]["P1001"] = [_qualifier_item_snak("P1001", Q_US)]
-        out.append(claim)
         return out
 
     rights_entry = rights.get(rs_key)

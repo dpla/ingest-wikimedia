@@ -199,16 +199,9 @@ def test_safe_to_amend_dpla_qualifier_no_reference():
 
 def test_unsafe_when_user_authored_qualifier_alongside_dpla():
     """The residual bug case: claim has DPLA's P459 AND a user-added
-    qualifier that isn't in the DPLA envelope for this property
-    (e.g. P585 "point in time" added by a community editor after our
+    qualifier (e.g. P1001=Q30 added by a community editor after our
     write). The looser `_is_dpla_shaped` predecessor returned True here;
-    `_is_safe_to_amend_in_place` correctly returns False.
-
-    (Historically this test used P1001=Q30 as the foreign qualifier —
-    that specific case was the production incident that motivated the
-    gate. P1001 is now DPLA-authored on P6216 via the PDM-shape write,
-    so the regression coverage is expressed through a different foreign
-    qualifier property that will remain outside the envelope.)"""
+    `_is_safe_to_amend_in_place` correctly returns False."""
     from tools.sdc_sync import _is_safe_to_amend_in_place
 
     assert not _is_safe_to_amend_in_place(
@@ -217,7 +210,7 @@ def test_unsafe_when_user_authored_qualifier_alongside_dpla():
             "Q19652",
             qualifiers={
                 "P459": _dpla_p459(),
-                "P585": _qual_entity("P585", "Q42"),
+                "P1001": _qual_entity("P1001", "Q30"),
             },
         ),
         "P6216",
@@ -266,47 +259,23 @@ def test_safe_when_per_property_extra_qualifier_is_recognised():
     assert not _is_safe_to_amend_in_place(stmt_with_p973, "P6216")
 
 
-def test_safe_to_amend_pdm_shape_p6216_with_p1001():
-    """The PDM-shape P6216 claim carries P459 (repurposed from the
-    universal Q61848113 to Q47246828 = "published >95 years ago", so
-    Module:License dispatches to {{PD-US-expired}}) AND P1001=Q30
-    (US jurisdiction, satisfying Module:License's jurisdiction check).
-    P1001 is DPLA-authored for this property — an amend-in-place pass
-    must round-trip both qualifiers instead of stripping P1001 as
-    foreign."""
-    from tools.sdc_sync import _is_safe_to_amend_in_place
-
-    pdm_stmt = _item_statement(
-        "M999$pdm",
-        "Q19652",
-        qualifiers={
-            "P459": _qual_entity("P459", "Q47246828"),
-            "P1001": _qual_entity("P1001", "Q30"),
-        },
-        references=[_dpla_reference()],
-    )
-    assert _is_safe_to_amend_in_place(pdm_stmt, "P6216")
-
-
 # ---------------------------------------------------------------------------
 # check() — end-to-end behaviour through the tightened gate
 # ---------------------------------------------------------------------------
 
 
 def test_check_foreign_qualifier_match_adds_alongside():
-    """A P6216=Q19652 claim carrying a qualifier property outside the
-    DPLA envelope for P6216 (e.g. P585 "point in time" or another
-    community-added annotation) can't be safely amended: the bot must
-    NOT capture this claim's id or wbeditentity-with-id would clobber
-    the foreign qualifier. Instead add the DPLA-authored claim
-    alongside as a separate statement."""
+    """Production bug case: P6216=Q19652 claim with P1001+P459 qualifiers
+    that we didn't author. The bot must NOT capture this claim's id —
+    that would clobber P1001 via wbeditentity-with-id. Instead add the
+    DPLA-authored claim alongside as a separate statement."""
     from tools import sdc_sync
 
     foreign_stmt = _item_statement(
         "M999$abc",
         "Q19652",
         qualifiers={
-            "P585": _qual_entity("P585", "Q42"),
+            "P1001": _qual_entity("P1001", "Q30"),
             "P459": _qual_entity("P459", "Q60671452"),
         },
     )
@@ -318,10 +287,9 @@ def test_check_foreign_qualifier_match_adds_alongside():
 
 def test_check_mixed_dpla_and_foreign_qualifier_treated_as_foreign():
     """A claim with BOTH DPLA's P459=Q61848113 AND a user-added qualifier
-    outside the P6216 envelope (e.g. P585 "as of <date>" added by a
-    community editor later) is no longer safe to amend — the prior
-    `_is_dpla_shaped` gate would have misclassified this as
-    DPLA-shaped. Expected: add new alongside.
+    (e.g. P1001=Q30 added by a community editor later) is no longer
+    safe to amend — the prior `_is_dpla_shaped` gate would have
+    misclassified this as DPLA-shaped. Expected: add new alongside.
 
     This is the residual-bug case the tightened gate now handles."""
     from tools import sdc_sync
@@ -331,7 +299,7 @@ def test_check_mixed_dpla_and_foreign_qualifier_treated_as_foreign():
         "Q19652",
         qualifiers={
             "P459": _dpla_p459(),
-            "P585": _qual_entity("P585", "Q42"),
+            "P1001": _qual_entity("P1001", "Q30"),
         },
     )
     fake_entity = {"pageid": 999, "statements": {"P6216": [mixed_stmt]}}
@@ -4652,34 +4620,6 @@ def test_entity_has_dpla_attributed_claims_finds_dpla_reference():
             "P195": [
                 {
                     "mainsnak": {"snaktype": "value"},
-                    "references": [_dpla_reference()],
-                }
-            ]
-        }
-    }
-    assert sdc_sync._entity_has_dpla_attributed_claims(entity) is True
-
-
-def test_entity_has_dpla_attributed_claims_recognizes_pdm_shape():
-    """The PDM-shape P6216 claim (see
-    ``ingest_wikimedia.sdc._build_rights_claims``) uses a non-default
-    P459 qualifier value (Q47246828 rather than the universal
-    Q61848113) so Module:License dispatches through the correct
-    determination method. DPLA provenance is still detectable via
-    the reference triple — matching how Module:DPLA classifies the
-    statement — so the guard must recognise the entity as
-    DPLA-attributed on this shape."""
-    from tools import sdc_sync
-
-    entity = {
-        "statements": {
-            "P6216": [
-                {
-                    "mainsnak": {"snaktype": "value"},
-                    "qualifiers": {
-                        "P459": _qual_entity("P459", "Q47246828"),
-                        "P1001": _qual_entity("P1001", "Q30"),
-                    },
                     "references": [_dpla_reference()],
                 }
             ]
