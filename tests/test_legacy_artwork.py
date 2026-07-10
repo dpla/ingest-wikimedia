@@ -3106,6 +3106,38 @@ def test_resolve_commons_creator_qid_reads_wikidata_param_when_no_sitelink():
     assert _resolve_commons_creator_qid(site, "Theodore E. Peiser") == "Q56159174"
 
 
+def test_resolve_commons_creator_qid_reads_formatversion2_content_payload():
+    """Under formatversion=2 the API returns ``pages`` as a list and revision
+    content under the ``content`` key (not ``*``). The resolver must read the
+    Wikidata param from that modern shape too, or a pywikibot/API formatversion
+    bump would silently drop every Creator-page QID to the name-only fallback."""
+    from unittest.mock import MagicMock
+
+    from ingest_wikimedia.legacy_artwork import _resolve_commons_creator_qid
+
+    site = MagicMock()
+    site.simple_request.return_value.submit.return_value = {
+        "query": {
+            "pages": [
+                {
+                    "title": "Creator:Theodore E. Peiser",
+                    "pageprops": {},  # no wikibase_item sitelink
+                    "revisions": [
+                        {
+                            "slots": {
+                                "main": {
+                                    "content": "{{Creator\n | Wikidata = Q56159174\n}}"
+                                }
+                            }
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    assert _resolve_commons_creator_qid(site, "Theodore E. Peiser") == "Q56159174"
+
+
 def test_resolve_commons_creator_qid_prefers_sitelink():
     """When a wikibase_item sitelink IS present, use it directly."""
     from unittest.mock import MagicMock

@@ -1664,14 +1664,24 @@ def _resolve_commons_creator_qid(site, page_title: str) -> str | None:
     except Exception:
         return None
     pages = (response.get("query") or {}).get("pages") or {}
-    for page in pages.values():
+    # ``pages`` is a dict keyed by pageid under formatversion=1 and a list under
+    # formatversion=2; revision content likewise lives under the ``*`` key
+    # (fv=1) or ``content`` key (fv=2). Accept both so the resolver is immune to
+    # the pywikibot/API formatversion in effect.
+    for page in pages.values() if isinstance(pages, dict) else pages:
         pp = page.get("pageprops") or {}
         qid = pp.get("wikibase_item")
         if isinstance(qid, str) and qid.startswith("Q"):
             return qid
         for rev in page.get("revisions") or []:
-            slots = rev.get("slots") or {}
-            content = (slots.get("main") or {}).get("*") or rev.get("*") or ""
+            main = (rev.get("slots") or {}).get("main") or {}
+            content = (
+                main.get("content")
+                or main.get("*")
+                or rev.get("content")
+                or rev.get("*")
+                or ""
+            )
             match = _CREATOR_WIKIDATA_PARAM_RE.search(content)
             if match:
                 return match.group(1)
