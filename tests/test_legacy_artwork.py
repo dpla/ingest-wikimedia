@@ -2715,29 +2715,34 @@ def test_plan_migration_scalar_edit_stays_on_divergence_path():
     assert "date" not in plan.wikitext_preserved_extras
 
 
-def test_plan_migration_extension_prefix_must_match_canonical():
-    """A wikitext value that CONTAINS vertical whitespace but whose
-    prefix doesn't match canonical is not extension — it's a full
-    replacement that happens to have multiple lines. Falls through to
-    the ordinary community-import path (which will hit the pre-flight
-    validator and raise ``InvalidWikibaseTextValue``, catching the
-    unhandled shape loudly instead of silently mis-classifying it as
-    an extension)."""
+def test_plan_migration_full_replacement_multiline_value_preserved_as_wikitext():
+    """A wikitext value that contains vertical whitespace but whose prefix
+    doesn't match canonical is not a DPLA-prefixed extension — it's a full
+    community rewrite that happens to be multi-line (a multi-paragraph
+    description with an HR, italics, a wikilink). It can't be a monolingualtext
+    SDC claim, and there's no DPLA prefix to peel off, so it's preserved WHOLE
+    on the migrated template's param (``wikitext_preserved_extras``), NOT routed
+    to ``community_imports`` where build would raise ``InvalidWikibaseTextValue``.
+    (The validator stays as a belt-and-suspenders guard — see
+    ``test_format_legacy_import_claim_rejects_vertical_whitespace``.) Regression
+    for the drift-remediation Seattle-waterfront case."""
+    replacement = (
+        'Transcribed from photograph: "Seattle Waterfront. Ca. 1898."\n'
+        "----\n"
+        "The ''Tampico'' was launched in 1900. "
+        '[https://example.org/797 UW Libraries] says "between 1907 and 1911".'
+    )
     revs = _make_revs(
         (1, "DPLA_bot", f"{{{{Artwork|description={_DPLA_SENTENCE}}}}}"),
-        (
-            2,
-            "Editor1",
-            "{{Artwork|description=Totally different first line.\n"
-            "Followed by a second line.}}",
-        ),
+        (2, "Editor1", f"{{{{Artwork|description={replacement}}}}}"),
     )
     plan = plan_migration(
         "File:Foo.jpg", revs, _canonical_params(description=_DPLA_SENTENCE)
     )
     assert plan is not None
-    assert "description" in plan.community_imports
-    assert "description" not in plan.wikitext_preserved_extras
+    assert "description" not in plan.community_imports
+    assert plan.wikitext_preserved_extras.get("description") == replacement
+    build_legacy_import_claims(plan)  # must not raise
 
 
 def test_format_legacy_import_claim_rejects_vertical_whitespace():

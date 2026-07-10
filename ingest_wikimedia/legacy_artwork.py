@@ -582,8 +582,22 @@ def plan_migration(
             # parameter, where the yellow-box renderer picks it up.
             extras = _split_extension_extras(value, canonical_value)
             if extras is not None:
+                # DPLA value + community structural addition: the DPLA prefix
+                # keeps its canonical SDC, only the remainder rides the param.
                 wikitext_preserved_extras[key] = extras
                 dpla_originated[key] = value
+                continue
+            if _community_value_unfit_for_sdc(key, value):
+                # Fully community-authored value that can't be an SDC claim of
+                # its type — it carries vertical whitespace, which the
+                # monolingualtext/string validators reject (e.g. a
+                # multi-paragraph description with an HR, italics, a wikilink).
+                # There's no DPLA prefix to peel off, so preserve the WHOLE
+                # value on the migrated template's param — where Module:DPLA
+                # renders it in the yellow box — instead of failing the whole
+                # file's import. Same destination as the extension case above:
+                # community content that can't be SDC lands in wikitext.
+                wikitext_preserved_extras[key] = value
                 continue
             community_imports[key] = value
         else:
@@ -827,6 +841,28 @@ def _split_extension_extras(value: str, canonical: str) -> str | None:
     if not folded_prefix or folded_prefix != folded_canonical:
         return None
     return remainder
+
+
+def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
+    """True when a community value can't be posted as its SDC claim type
+    because it contains vertical whitespace.
+
+    ``title``/``description`` (monolingualtext) and ``creator`` (string) go
+    through :func:`_validate_wikibase_text`, whose validator rejects
+    newlines/tabs/CR. A value with such whitespace that is *not* a
+    DPLA-prefixed extension (:func:`_split_extension_extras`) can't be an SDC
+    claim at all, so the caller preserves it on the migrated template's param
+    rather than erroring the whole import. ``date`` (time) is parsed, not
+    text-validated, so it's excluded; keys with no import mapping never reach
+    the text validator either.
+    """
+    mapping = LEGACY_IMPORT_PROPERTY.get(key)
+    if mapping is None:
+        return False
+    _prop, kind = mapping
+    return kind in ("monolingualtext", "string") and bool(
+        _VERTICAL_WHITESPACE_RE.search(value)
+    )
 
 
 def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
