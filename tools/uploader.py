@@ -835,7 +835,6 @@ class Uploader:
                             page_title=page_title,
                             dpla_id=dpla_id,
                             ordinal=ordinal,
-                            wiki_markup=wiki_markup,
                             expected_item_titles=expected_item_titles,
                         )
                         if drift_action == DriftResolution.MOVED:
@@ -1511,13 +1510,15 @@ class Uploader:
         intended_page: pywikibot.FilePage,
         dpla_id: str,
         case_label: str,
-        wiki_markup: str | None = None,
         post_commonsdelinker: bool = True,
     ) -> None:
         """Move existing_file to intended_page and post a CommonsDelinker request.
 
-        If wiki_markup is provided, the moved page's description is updated to
-        reflect current DPLA metadata after the move.
+        The moved page's *description* is intentionally left untouched — the
+        community-preserving template migration is done later by the post-SDC
+        ``sdc-sync`` cleanup (see the NOTE in the body). This method only
+        restores the title invariant (the S3 SHA1 now lives at the canonical
+        title) and relinks inbound usage.
 
         post_commonsdelinker controls whether we ask CommonsDelinker to
         rewrite external references to actual_filename. Default True (the
@@ -1571,26 +1572,17 @@ class Uploader:
                 actual_filename,
             )
 
-        if wiki_markup:
-            moved_page = get_page(self.site, intended_page.title())
-            if moved_page.exists() and not moved_page.isRedirectPage():
-                # After the move, moved_page carries the original page's
-                # wikitext. Preserve license, Image-extracted, and category
-                # metadata from it before replacing with the {{DPLA metadata}} block.
-                moved_page.text = merge_preserved_wikitext(
-                    moved_page.text or "", wiki_markup
-                )
-                with_csrf_recovery(
-                    self.site,
-                    f"save {moved_page.title()} (post-drift description)",
-                    lambda: moved_page.save(
-                        summary=(
-                            f"Update description after title drift correction "
-                            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
-                        ),
-                        minor=False,
-                    ),
-                )
+        # NOTE: we deliberately do NOT rewrite the moved page's description
+        # here. Title/ID drift is DPLA-caused, so the old wikitext's
+        # DPLA-authored fields (id/url/title) legitimately differ from current —
+        # but the page may ALSO carry genuine community contributions. Safely
+        # distinguishing the two needs the revision-history *provenance* walk in
+        # ``ingest_wikimedia.legacy_artwork.migrate_legacy_file``, which the
+        # post-SDC ``sdc-sync`` cleanup (``_post_sdc_cleanup_for_page``) runs on
+        # this file later in the same pipeline: community edits are imported to
+        # SDC and only bot-authored (drifted) fields are replaced with canonical
+        # data. A blunt overwrite here previously discarded community metadata
+        # (e.g. ``{{Creator:...}}``); the move alone restores the title invariant.
 
     def _resolve_hash_drift(
         self,
@@ -1598,7 +1590,6 @@ class Uploader:
         page_title: str,
         dpla_id: str,
         ordinal: int,
-        wiki_markup: str | None = None,
         expected_item_titles: set[str] | None = None,
     ) -> DriftResolution:
         """Resolve the case where our S3 source's SHA1 already lives on
@@ -1801,7 +1792,6 @@ class Uploader:
                 intended_page,
                 dpla_id,
                 "title_text_drift_empty_intended (Case 3)",
-                wiki_markup,
                 post_commonsdelinker=not sibling_slot,
             )
             return DriftResolution.MOVED
@@ -1819,7 +1809,6 @@ class Uploader:
                     intended_page,
                     dpla_id,
                     "title_text_drift_redirect_at_intended (Case 1)",
-                    wiki_markup,
                     post_commonsdelinker=not sibling_slot,
                 )
                 return DriftResolution.MOVED

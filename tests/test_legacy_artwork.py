@@ -431,10 +431,31 @@ def test_classify_respects_explicit_bot_accounts_argument():
 
 def test_dpla_bot_allowlist_contains_known_accounts():
     """Pin the known accounts so a typo'd rename can't silently lose
-    classification coverage for the long-tenure files those bots
-    uploaded."""
-    assert "DPLA_bot" in DPLA_BOT_ACCOUNTS
+    classification coverage for the long-tenure files those bots uploaded.
+    Space form is canonical — it's what the Commons API returns in ``user``."""
+    assert "DPLA bot" in DPLA_BOT_ACCOUNTS
     assert "US National Archives bot" in DPLA_BOT_ACCOUNTS
+    assert "Flickr upload bot" in DPLA_BOT_ACCOUNTS
+
+
+def test_classify_matches_underscore_and_space_username_forms():
+    """Commons returns usernames with spaces ("DPLA bot"); the allowlist stores
+    the space form. Matching must be underscore/space-insensitive so DPLA-bot
+    edits are never misclassified as community — which, for a *drifted* value,
+    would resurrect stale DPLA metadata as a fake community contribution."""
+    classified = classify_param_provenance(
+        {"a": "DPLA bot", "b": "DPLA_bot", "c": "dpla_BOT"}
+    )
+    assert classified == {"a": "dpla", "b": "dpla", "c": "dpla"}
+
+
+def test_classify_flickr_upload_bot_is_dpla():
+    """Flickr2Commons imports are automated import data, not community
+    curation — a file the Flickr bot uploaded and we later renamed must not
+    have its (drifted) fields resurrected as community contributions."""
+    assert classify_param_provenance({"title": "Flickr upload bot"}) == {
+        "title": "dpla"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +509,26 @@ def test_plan_migration_classifies_bot_value_as_dpla_originated():
         "description": "A description",
         "date": "1900",
     }
+
+
+def test_plan_migration_does_not_resurrect_drifted_bot_value():
+    """Core drift-safety property: a value the *bot* last set that now DIFFERS
+    from canonical is drifted DPLA metadata (DPLA-caused) — NOT a community
+    edit — so it must stay dpla-originated (replaced by canonical), never
+    imported as a community contribution. Uses NARA's own bot (its pre-2020
+    uploads) with the space-form username the Commons API returns."""
+    revs = _make_revs(
+        (
+            1,
+            "US National Archives bot",
+            "{{Artwork|title=Old Drifted Title|date=1900}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(title="A Title"))
+    assert plan is not None
+    # Title differs from canonical ("A Title") but was bot-authored → NOT rescued.
+    assert plan.community_imports == {}
+    assert plan.dpla_originated_params["title"] == "Old Drifted Title"
 
 
 def test_plan_migration_imports_community_value_that_differs_from_canonical():

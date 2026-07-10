@@ -760,7 +760,6 @@ def test_resolve_hash_drift_case2_skips_tag_when_existing_in_expected_titles():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=4,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "leave_others_alone"
@@ -788,7 +787,6 @@ def test_resolve_hash_drift_case2_still_tags_when_existing_is_true_orphan():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=4,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "upload_and_tag"
@@ -810,7 +808,6 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=4,
-            wiki_markup="",
         )
     assert action == "upload_and_tag"
 
@@ -875,7 +872,6 @@ def test_resolve_hash_drift_404_on_colliding_id_falls_through_to_migration():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=2,
-            wiki_markup="",
         )
     assert action == "moved", (
         "404 on the colliding DPLA ID is the rename signal — the orphan "
@@ -903,7 +899,6 @@ def test_resolve_hash_drift_non_404_exception_stays_on_leave_others_alone():
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
-        wiki_markup="",
     )
     assert action == "leave_others_alone"
 
@@ -924,7 +919,6 @@ def test_resolve_hash_drift_5xx_response_stays_on_leave_others_alone():
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
-        wiki_markup="",
     )
     assert action == "leave_others_alone"
 
@@ -942,7 +936,6 @@ def test_resolve_hash_drift_valid_cross_item_collision_leaves_others_alone():
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
-        wiki_markup="",
     )
     assert action == "leave_others_alone"
 
@@ -1178,7 +1171,6 @@ def test_case3_move_suppresses_commonsdelinker_when_actual_is_sibling():
             page_title=_ITEM_PAGE_8,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=11,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "moved"
@@ -1207,7 +1199,6 @@ def test_case3_move_posts_commonsdelinker_when_actual_is_not_sibling():
             page_title=_ITEM_PAGE_8,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=11,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "moved"
@@ -1237,7 +1228,6 @@ def test_case1_move_suppresses_commonsdelinker_when_actual_is_sibling():
             page_title=_ITEM_PAGE_8,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=11,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "moved"
@@ -1294,6 +1284,26 @@ def test_move_to_correct_title_posts_with_check_usage_false_when_used():
     assert order == ["usage_check", "move"]
     mock_post.assert_called_once()
     assert mock_post.call_args.kwargs.get("check_usage") is False
+
+
+def test_move_to_correct_title_does_not_rewrite_description_defers_to_cleanup():
+    """Deferral fix: after the title-drift move, the method must NOT rewrite the
+    moved page's description. It previously blind-overwrote it (dropping
+    community metadata like {{Creator:...}}); the community-preserving migration
+    is now left to the post-SDC sdc-sync cleanup. Assert the move still happens
+    but there is no post-move page fetch/save (the only get_page use in this
+    method was the removed description-rewrite block)."""
+    uploader = _build_uploader_with_dpla()
+    existing = _drift_existing_file("Old Title - DPLA - a (page 1).jpg")
+    intended = _make_intended_page("New Title - DPLA - b (page 1).jpg")
+    with (
+        patch("tools.uploader.file_has_inbound_usage", return_value=False),
+        patch("tools.uploader.post_commonsdelinker_request"),
+        patch("tools.uploader.get_page") as mock_get_page,
+    ):
+        uploader._move_to_correct_title(existing, intended, "b", "Case 3")
+    existing.move.assert_called_once()
+    mock_get_page.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2753,7 +2763,6 @@ def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_mat
             page_title=raw_page_title,
             dpla_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             ordinal=1,
-            wiki_markup="",
         )
     assert action == "already_correct"
 

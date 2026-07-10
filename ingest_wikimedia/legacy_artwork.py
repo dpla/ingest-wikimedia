@@ -46,23 +46,44 @@ from ingest_wikimedia.sdc import (
     unescape_wikitext_magic_words,
 )
 
-# DPLA's Commons-bot account names. Revisions authored by these accounts
-# are treated as DPLA-originated for the purpose of provenance
-# classification — any param value they last touched is safe to
-# overwrite with canonical data. Other accounts are treated as
-# community contributors whose edits must be preserved (by importing
-# to SDC) before the wikitext is rewritten.
+# Bot accounts whose edits are treated as DPLA-/import-originated for provenance
+# classification — any param value they last touched is safe to overwrite with
+# canonical data (never preserved as a "community" contribution). Any OTHER
+# account is treated as a community contributor whose edits must be preserved
+# (imported to SDC) before the wikitext is rewritten.
 #
-# Extend this set in a follow-up if older DPLA bot accounts are
-# discovered in the upload-history of long-tenure files. The set is
-# matched case-insensitively against the revision's ``user`` field;
-# add the canonical form a Commons revision history would display.
+# Coverage:
+#   - "DPLA bot"                 — DPLA's current Commons uploader.
+#   - "US National Archives bot" — NARA's own bot. Every pre-2020 NARA upload
+#                                  was made by it (not DPLA's bot), so this folds
+#                                  the oldest NARA files — the highest-risk,
+#                                  most community-curated set — in correctly.
+#   - "Flickr upload bot"        — Flickr2Commons-style imports. Any partner
+#                                  (NARA especially) that also puts collections
+#                                  on Flickr can have a file uploaded by this bot
+#                                  that we later rename; its metadata is
+#                                  automated import data, not community curation.
+#
+# Matched case- AND underscore/space-insensitively against the revision ``user``
+# field (see :func:`_normalize_account`): Commons displays usernames with spaces
+# (e.g. "DPLA bot"), which is the form the API returns, so the space form is
+# canonical here and the underscore variant folds to it.
 DPLA_BOT_ACCOUNTS: frozenset[str] = frozenset(
     {
-        "DPLA_bot",
+        "DPLA bot",
         "US National Archives bot",
+        "Flickr upload bot",
     }
 )
+
+
+def _normalize_account(name: str) -> str:
+    """Casefold and collapse underscores to spaces so ``DPLA_bot`` and
+    ``DPLA bot`` compare equal — MediaWiki treats the two as one username and
+    the API returns the space form, so provenance matching must not depend on
+    which the code happens to write."""
+    return name.casefold().replace("_", " ")
+
 
 # Wikidata items / properties used in the legacy-import reference shape.
 # Hardcoded here (not behind a config knob) because they are part of the
@@ -318,11 +339,6 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
     return parsed
 
 
-def _is_dpla_bot(user: str) -> bool:
-    """Case-insensitive match against :data:`DPLA_BOT_ACCOUNTS`."""
-    return user.casefold() in {a.casefold() for a in DPLA_BOT_ACCOUNTS}
-
-
 def trace_param_provenance(
     revisions: Iterable[RevisionSnapshot],
 ) -> dict[str, str]:
@@ -394,9 +410,9 @@ def classify_param_provenance(
     default; new bot accounts get added to :data:`DPLA_BOT_ACCOUNTS`
     rather than the per-call argument.
     """
-    bot_set_cf = {a.casefold() for a in bot_accounts}
+    bot_set = {_normalize_account(a) for a in bot_accounts}
     return {
-        key: ("dpla" if editor.casefold() in bot_set_cf else "community")
+        key: ("dpla" if _normalize_account(editor) in bot_set else "community")
         for key, editor in provenance.items()
     }
 

@@ -998,14 +998,19 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     blank-line separator, since they conventionally sit in their
     own section between the description and the categories.)
 
-    TODO (Goal 2 follow-up): the title-drift rescue currently
-    overwrites the metadata template wholesale, discarding any
-    community-contributed template params an editor added between
-    the original upload and the rescue. The same provenance-aware
-    migration logic from :mod:`ingest_wikimedia.legacy_artwork`
-    would let us preserve community values as SDC imports first,
-    then overwrite. Out of scope for the flat-shape uploader PR;
-    flagged here so the integration point doesn't get lost.
+    Scope note: the primary title-drift path
+    (``Uploader._move_to_correct_title``) no longer calls this — after a move it
+    leaves the page's wikitext intact and the post-SDC ``sdc-sync`` cleanup runs
+    the provenance-aware :mod:`ingest_wikimedia.legacy_artwork` migration
+    (community values imported to SDC; only bot-authored, drifted fields
+    replaced with canonical). The two remaining callers —
+    ``_resolve_redirect_overwrite`` (overwrites a redirect) and
+    ``_tag_drift_duplicate`` (rescues into a survivor before the old file is
+    tagged as a duplicate) — are *cross-page* rescues: the metadata to preserve
+    lives on a different page whose history the cleanup never walks, so
+    capturing it inline here (the narrow license/category/assessment set) is the
+    only available point. That narrowness is inherent to cross-page rescue, not
+    pending work.
     """
     new_stripped = new_wikitext.rstrip()
     parts: list[str] = [new_stripped]
