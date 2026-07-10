@@ -21,7 +21,7 @@ import click
 from ingest_wikimedia.banlist import Banlist
 from ingest_wikimedia.es import check_es_response, post_es
 from ingest_wikimedia.iiif import IIIF
-from ingest_wikimedia.partners import is_item_upload_eligible, resolve_slug
+from ingest_wikimedia.partners import check_item_eligibility, resolve_slug
 from ingest_wikimedia.s3 import S3Client
 
 _IIIF_MANIFEST_FIELD = "iiifManifest"
@@ -31,8 +31,20 @@ _IS_SHOWN_AT_FIELD = "isShownAt"
 
 @click.command()
 @click.argument("dpla_ids", nargs=-1, required=True)
-def main(dpla_ids: tuple[str, ...]) -> None:
-    """Resolve DPLA_IDS, check upload eligibility, and stage metadata to S3."""
+@click.option(
+    "--maintain",
+    is_flag=True,
+    help=(
+        "Maintain mode: include institutions regardless of their upload flag"
+        " (Wikidata ID still required), so IDs + sdc.json are staged for"
+        " already-uploaded files of institutions no longer authorized for"
+        " new uploads. New-upload prevention is enforced by the uploader's"
+        " ``--no-create`` fence, not by this eligibility check. Mirrors the"
+        " same flag on get-ids-es."
+    ),
+)
+def main(dpla_ids: tuple[str, ...], maintain: bool) -> None:
+    """Resolve DPLA_IDS, check eligibility, and stage metadata to S3."""
     banlist = Banlist()
     s3_client = S3Client()
 
@@ -55,13 +67,18 @@ def main(dpla_ids: tuple[str, ...]) -> None:
             if source is None:
                 print(f"{dpla_id} NOT_FOUND", flush=True)
                 continue
-            _process_one(dpla_id, source, banlist, s3_client)
+            _process_one(dpla_id, source, banlist, s3_client, maintain=maintain)
         except Exception as e:
             print(f"{dpla_id} ERROR:{e}", flush=True)
 
 
 def _process_one(
-    dpla_id: str, source: dict, banlist: Banlist, s3_client: S3Client
+    dpla_id: str,
+    source: dict,
+    banlist: Banlist,
+    s3_client: S3Client,
+    *,
+    maintain: bool = False,
 ) -> None:
     if banlist.is_banned(dpla_id):
         print(f"{dpla_id} INELIGIBLE:on banlist", flush=True)
@@ -87,17 +104,17 @@ def _process_one(
         print(f"{dpla_id} INELIGIBLE:unknown hub {provider_name!r}", flush=True)
         return
 
-    # Check institution-level eligibility per institutions_v2.json:
-    # hub must have a Wikidata ID (required for hub Commons category), institution
-    # must have a Wikidata ID (required for institution Commons category), and
-    # either hub.upload=True or institution.upload=True.  Mirrors get-ids-es.
+    # Check institution-level eligibility per institutions_v2.json. Both
+    # profiles (upload / maintain) require the two Wikidata IDs; maintain
+    # relaxes the upload-flag requirement. ``check_item_eligibility``
+    # returns a specific reason so callers (and the operator) can tell
+    # which gate blocked the item — the historical conflated "missing
+    # Wikidata ID or upload flag" message hid that distinction and
+    # steered operators wrong on maintain-eligible items.
     dp_name = (source.get("dataProvider") or {}).get("name", "")
-    if not is_item_upload_eligible(canonical, dp_name):
-        print(
-            f"{dpla_id} INELIGIBLE:institution {dp_name!r} not eligible per"
-            " institutions_v2.json (missing Wikidata ID or upload flag)",
-            flush=True,
-        )
+    eligible, reason = check_item_eligibility(canonical, dp_name, maintain=maintain)
+    if not eligible:
+        print(f"{dpla_id} INELIGIBLE:{reason}", flush=True)
         return
 
     # Derive CONTENTdm IIIF manifest URL if needed (mirrors get-ids-es behaviour).

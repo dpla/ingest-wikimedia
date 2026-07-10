@@ -20,7 +20,9 @@ import pytest
 
 from ingest_wikimedia import partners
 from ingest_wikimedia.partners import (
+    check_item_eligibility,
     commons_has_files_for_qid,
+    is_item_upload_eligible,
     resolve_commons_category,
     resolve_wikidata_id,
     wikidata_qid_for_target,
@@ -505,3 +507,138 @@ def test_commons_has_files_for_qid_rejects_non_qid_without_network():
     with patch.object(partners.urllib.request, "urlopen") as urlopen:
         assert commons_has_files_for_qid("not-a-qid") is False
         urlopen.assert_not_called()
+
+
+# --- check_item_eligibility --------------------------------------------------
+#
+# Splits the historical conflated "missing Wikidata ID or upload flag"
+# response into four distinct reasons. Pins each branch, both eligibility
+# profiles (upload / maintain), and the legacy is_item_upload_eligible
+# boolean wrapper.
+
+_ELIG_HUB_DATA_UPLOAD_ON = {
+    "Digital Library of Georgia": {
+        "Wikidata": "Qhub",
+        "upload": True,
+        "institutions": {
+            "Some University": {"Wikidata": "Qinst", "upload": False},
+        },
+    },
+}
+
+_ELIG_HUB_DATA_UPLOAD_OFF = {
+    "Internet Archive": {
+        "Wikidata": "Q461",
+        "upload": False,
+        "institutions": {
+            "Internet Archive": {"Wikidata": "Q461", "upload": False},
+        },
+    },
+}
+
+
+def test_check_item_eligibility_unknown_hub_reason():
+    """A canonical slug missing from PARTNER_HUBS gets a distinct 'unknown
+    hub' reason, not the same conflated message as the flag/ID branches."""
+    with _mock_institutions({}):
+        ok, reason = check_item_eligibility("not-a-hub", "Anywhere")
+    assert ok is False
+    assert "unknown hub" in reason
+    assert "'not-a-hub'" in reason
+
+
+def test_check_item_eligibility_hub_missing_wikidata_reason():
+    """Hub-level Wikidata ID missing → specific reason mentioning the hub
+    display name and the Commons-category-resolution consequence."""
+    data = {
+        "Digital Library of Georgia": {
+            "Wikidata": "",
+            "upload": True,
+            "institutions": {
+                "Some University": {"Wikidata": "Qinst", "upload": True},
+            },
+        },
+    }
+    with _mock_institutions(data):
+        ok, reason = check_item_eligibility("georgia", "Some University")
+    assert ok is False
+    assert "hub" in reason and "Wikidata" in reason
+    assert "Digital Library of Georgia" in reason
+
+
+def test_check_item_eligibility_institution_missing_wikidata_reason():
+    """Institution-level Wikidata ID missing → distinct reason from the
+    upload-flag case, so an operator can tell why maintain wouldn't
+    unblock this item (Commons category can't be resolved either way)."""
+    data = {
+        "Digital Library of Georgia": {
+            "Wikidata": "Qhub",
+            "upload": True,
+            "institutions": {
+                "Some University": {"Wikidata": "", "upload": True},
+            },
+        },
+    }
+    with _mock_institutions(data):
+        ok, reason = check_item_eligibility("georgia", "Some University")
+    assert ok is False
+    assert "institution" in reason and "Wikidata" in reason
+    assert "'Some University'" in reason
+
+
+def test_check_item_eligibility_upload_off_reason_suggests_maintain():
+    """Both QIDs present but upload=False on hub AND institution → the
+    reported Internet Archive case. Reason must name the upload-flag
+    failure specifically and steer the operator toward maintain mode
+    (the exact scenario maintain is designed for)."""
+    with _mock_institutions(_ELIG_HUB_DATA_UPLOAD_OFF):
+        ok, reason = check_item_eligibility("ia", "Internet Archive")
+    assert ok is False
+    assert "upload=False" in reason
+    assert "maintain" in reason.lower()
+
+
+def test_check_item_eligibility_upload_true_passes():
+    """The happy path — hub.upload=True → eligible."""
+    with _mock_institutions(_ELIG_HUB_DATA_UPLOAD_ON):
+        ok, reason = check_item_eligibility("georgia", "Some University")
+    assert ok is True
+    assert reason == ""
+
+
+def test_check_item_eligibility_maintain_bypasses_upload_flag():
+    """The core bug fix: an institution with QIDs present but upload=False
+    is eligible under maintain=True. Same Internet Archive case as the
+    upload branch above; only the flag flips the result."""
+    with _mock_institutions(_ELIG_HUB_DATA_UPLOAD_OFF):
+        ok, reason = check_item_eligibility("ia", "Internet Archive", maintain=True)
+    assert ok is True
+    assert reason == ""
+
+
+def test_check_item_eligibility_maintain_still_requires_wikidata_ids():
+    """Maintain mode relaxes the upload-flag gate only; missing Wikidata
+    IDs still block (Commons categories can't be resolved without them)."""
+    data = {
+        "Digital Library of Georgia": {
+            "Wikidata": "",
+            "upload": False,
+            "institutions": {
+                "Some University": {"Wikidata": "Qinst", "upload": False},
+            },
+        },
+    }
+    with _mock_institutions(data):
+        ok, reason = check_item_eligibility("georgia", "Some University", maintain=True)
+    assert ok is False
+    assert "Wikidata" in reason
+
+
+def test_is_item_upload_eligible_wraps_check_item_eligibility():
+    """The legacy boolean wrapper stays False under upload=False even
+    though the maintain-mode call in the previous test returned True —
+    proving the wrapper defaults maintain=False."""
+    with _mock_institutions(_ELIG_HUB_DATA_UPLOAD_OFF):
+        assert is_item_upload_eligible("ia", "Internet Archive") is False
+    with _mock_institutions(_ELIG_HUB_DATA_UPLOAD_ON):
+        assert is_item_upload_eligible("georgia", "Some University") is True
