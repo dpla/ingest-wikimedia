@@ -85,7 +85,10 @@ FILE_NAMESPACE = 6
 # The window value is stored inside an <includeonly> block so the page can
 # also carry human-readable <noinclude> documentation without leaking it into
 # the transcluded expression. Match the first run of digits inside it.
-_WINDOW_VALUE_RE = re.compile(r"<includeonly>\s*(\d+)\s*</includeonly>", re.IGNORECASE)
+_WINDOW_VALUE_RE = re.compile(
+    r"(?P<prefix><includeonly>\s*)(?P<value>\d+)(?P<suffix>\s*</includeonly>)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -122,7 +125,7 @@ def parse_window_value(text: str | None) -> int:
         # includeonly wrapper), still fail-closed if nothing numeric is found.
         stripped = text.strip()
         return int(stripped) if stripped.isdigit() else 0
-    return int(m.group(1))
+    return int(m.group("value"))
 
 
 def render_window_value(value: int, doc_note: str = "") -> str:
@@ -157,7 +160,13 @@ def update_window_value(existing_text: str, value: int) -> str:
     ``<includeonly>N</includeonly>`` block is found.
     """
     new_text, n = _WINDOW_VALUE_RE.subn(
-        f"<includeonly>{value}</includeonly>", existing_text, count=1
+        # Preserve the maintainer's original tag casing and internal
+        # whitespace (``<INCLUDEONLY>\n  0  \n</INCLUDEONLY>`` stays that
+        # way modulo the integer). Substituting a static string instead
+        # would silently normalise both.
+        lambda match: f"{match.group('prefix')}{value}{match.group('suffix')}",
+        existing_text,
+        count=1,
     )
     if n == 0:
         logging.warning(

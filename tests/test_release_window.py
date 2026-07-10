@@ -146,6 +146,16 @@ def test_update_window_value_bootstrap_when_page_missing_or_bare():
         assert "<noinclude>" in out
 
 
+def test_update_window_value_preserves_tag_casing_and_inner_whitespace():
+    """The wrapper tags and any whitespace immediately inside the
+    ``<includeonly>`` block are maintainer choices — casing (uppercase,
+    mixed) or padding (``\\n  0  \\n``) may be deliberate. Substitute only
+    the digits; leave the wrapper byte-identical."""
+    existing = "<INCLUDEONLY>\n  0  \n</INCLUDEONLY><noinclude>docs</noinclude>"
+    out = update_window_value(existing, 99)
+    assert out == "<INCLUDEONLY>\n  99  \n</INCLUDEONLY><noinclude>docs</noinclude>"
+
+
 def test_update_window_value_first_includeonly_only():
     """Guardrail: only the first <includeonly> block is substituted. A
     maintainer might document the template body inside another
