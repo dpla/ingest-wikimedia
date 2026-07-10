@@ -129,15 +129,6 @@ LEGACY_IMPORT_PROPERTY: dict[str, tuple[str, str]] = {
     "creator": ("P2093", "string"),
 }
 
-# Every property a legacy migration can write — the LEGACY_IMPORT_PROPERTY
-# scalars plus P6802 (related image, handled outside that per-key map). The
-# idempotency probe (:func:`entity_was_already_migrated`) checks all of these
-# for the inferred-from-Wikitext reference.
-_LEGACY_IMPORT_PIDS: tuple[str, ...] = (
-    *dict.fromkeys(prop for prop, _ in LEGACY_IMPORT_PROPERTY.values()),
-    PID_RELATED_IMAGE,
-)
-
 # Canonical mapping from legacy template param names (case-folded) to
 # the canonical-params keys both the writer and comparator use. Covers
 # the param sets the legacy DPLA-bot ``{{Artwork}}`` form emitted plus
@@ -1883,15 +1874,20 @@ def entity_was_already_migrated(entity: dict) -> bool:
     today-practice is a manual re-edit).
 
     Looks for a P887 reference snak whose target is exactly
-    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of any property a
-    migration writes (:data:`_LEGACY_IMPORT_PIDS` — the scalar fields plus
-    P6802 related image). Subtle: a non-DPLA editor could in principle stamp
-    the same ref shape on a hand-authored claim, but that's the same semantic
-    ("inferred from Wikitext") and the skip-on-detect behaviour is still
-    correct — we just don't add duplicates.
+    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of a *scalar* import
+    property (:data:`LEGACY_IMPORT_PROPERTY`). Subtle: a non-DPLA editor could
+    in principle stamp the same ref shape on a hand-authored claim, but that's
+    the same semantic ("inferred from Wikitext") and the skip-on-detect
+    behaviour is still correct — we just don't add duplicates.
+
+    P6802 (related image) is deliberately EXCLUDED from this global trip-wire.
+    It's an always-preserve secondary output with its own value-level dedup in
+    :func:`materialize_pending_related_image_claim`; letting a P6802-only prior
+    import mark the whole file "migrated" would wrongly block a later rescue
+    from picking up a newly-added scalar community value on the source page.
     """
     statements = entity.get("statements") or entity.get("claims") or {}
-    for prop in _LEGACY_IMPORT_PIDS:
+    for prop, _ in LEGACY_IMPORT_PROPERTY.values():
         for stmt in statements.get(prop, []):
             for ref in stmt.get("references", []):
                 for snak in ref.get("snaks", {}).get(PID_BASED_ON_HEURISTIC, []):
@@ -2269,7 +2265,7 @@ def migrate_legacy_file(
 def import_cross_page_community_sdc(
     *,
     source_page,
-    dest_page,
+    dest_mediaid: str,
     item_metadata: dict,
     provider: dict,
     data_provider: dict,
@@ -2291,8 +2287,10 @@ def import_cross_page_community_sdc(
     (:func:`plan_migration`), and writes them to the destination as
     inferred-from-Wikitext SDC.
 
-    Reads the SOURCE page's history but writes the DESTINATION's MediaInfo
-    entity. Idempotent on the destination entity
+    Reads the SOURCE page's history but writes ``dest_mediaid`` (the
+    DESTINATION's ``M<pageid>`` MediaInfo id — the caller resolves the pageid,
+    riding out post-upload indexing lag, so this never targets a bogus "M0").
+    Idempotent on the destination entity
     (:func:`entity_was_already_migrated`). Returns the number of
     community-import claims posted — 0 when the source has no legacy template,
     nothing community-authored to rescue, or the destination was already
@@ -2321,7 +2319,7 @@ def import_cross_page_community_sdc(
     if find_legacy_template(source_page.text) is None:
         return 0
 
-    mediaid = f"M{dest_page.pageid}"
+    mediaid = dest_mediaid
     entity = _fetch_entity_or_empty(site, mediaid)
     if entity_was_already_migrated(entity):
         return 0

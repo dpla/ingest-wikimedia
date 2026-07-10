@@ -1955,16 +1955,30 @@ class Uploader:
                 # new page exists and isn't a redirect because we just
                 # uploaded it. Skip the exists/redirect round-trips.
                 new_page = get_page(self.site, f"File:{new_filename}")
-                imported = import_cross_page_community_sdc(
-                    source_page=old_page,
-                    dest_page=new_page,
-                    item_metadata=item_metadata,
-                    provider=provider,
-                    data_provider=data_provider,
-                    dpla_id=dpla_id,
-                    site=self.site,
-                    summary=rescue_summary,
-                )
+                # Resolve the destination pageid explicitly, riding out the
+                # post-upload indexing-lag race, so the SDC import targets a
+                # real MediaInfo entity — a lagged 0/None must never become
+                # the bogus "M0". The wikitext rescue below is independent and
+                # runs regardless.
+                dest_pageid = self._refresh_pageid_with_retries(f"File:{new_filename}")
+                imported = 0
+                if dest_pageid:
+                    imported = import_cross_page_community_sdc(
+                        source_page=old_page,
+                        dest_mediaid=f"M{dest_pageid}",
+                        item_metadata=item_metadata,
+                        provider=provider,
+                        data_provider=data_provider,
+                        dpla_id=dpla_id,
+                        site=self.site,
+                        summary=rescue_summary,
+                    )
+                else:
+                    logging.warning(
+                        f"Skipping community-SDC rescue into "
+                        f"[[File:{new_filename}]]: pageid unresolved post-upload "
+                        f"(sdc-sync's title→pageid fallback recovers next run)."
+                    )
                 rescued = rescue_wikitext(old_page.text or "", wiki_markup)
                 # Equality means the node-swap carried nothing beyond the
                 # fresh block we already uploaded (the old page had no

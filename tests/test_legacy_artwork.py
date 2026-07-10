@@ -1787,15 +1787,13 @@ def test_import_cross_page_community_sdc_imports_from_source_history():
         revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
 
     source = _mock_file_page("File:Old.jpg", _Rev2.text, [_Rev1(), _Rev2()])
-    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
-    dest.pageid = 99
     item, provider, dp = _item_md()
     site = _site_with_empty_entity()
     site.simple_request.return_value.submit.return_value = {"entities": {"M99": {}}}
 
     n = import_cross_page_community_sdc(
         source_page=source,
-        dest_page=dest,
+        dest_mediaid="M99",
         item_metadata=item,
         provider=provider,
         data_provider=dp,
@@ -1829,7 +1827,6 @@ def test_import_cross_page_community_sdc_idempotent_on_dest_entity():
         revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
 
     source = _mock_file_page("File:Old.jpg", _Rev2.text, [_Rev2()])
-    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
     item, provider, dp = _item_md()
     site = MagicMock()
     site.tokens = {"csrf": "CSRFTOKEN"}
@@ -1839,7 +1836,7 @@ def test_import_cross_page_community_sdc_idempotent_on_dest_entity():
 
     n = import_cross_page_community_sdc(
         source_page=source,
-        dest_page=dest,
+        dest_mediaid="M42",
         item_metadata=item,
         provider=provider,
         data_provider=dp,
@@ -1861,13 +1858,12 @@ def test_import_cross_page_community_sdc_nothing_to_rescue_on_bot_only_history()
         revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
 
     source = _mock_file_page("File:Old.jpg", _Rev.text, [_Rev()])
-    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
     item, provider, dp = _item_md()
     site = _site_with_empty_entity()
 
     n = import_cross_page_community_sdc(
         source_page=source,
-        dest_page=dest,
+        dest_mediaid="M42",
         item_metadata=item,
         provider=provider,
         data_provider=dp,
@@ -2022,8 +2018,14 @@ def test_materialize_related_image_dedups_across_title_surface_forms():
     assert claim is None
 
 
-def test_entity_was_already_migrated_detects_p6802_ref():
-    assert entity_was_already_migrated(_entity_with_legacy_import("P6802")) is True
+def test_entity_was_already_migrated_ignores_p6802_only():
+    """P6802 (related image) is deliberately NOT part of the global migrated
+    trip-wire: a file whose only prior import was a related image must stay
+    eligible so a later rescue can pick up a newly-added scalar community
+    value. (P6802 duplicate-prevention lives in the materializer instead.)"""
+    assert entity_was_already_migrated(_entity_with_legacy_import("P6802")) is False
+    # A scalar import property still trips it.
+    assert entity_was_already_migrated(_entity_with_legacy_import("P1476")) is True
 
 
 def test_migrate_legacy_file_imports_related_image_as_commons_media():
@@ -2085,7 +2087,6 @@ def test_import_cross_page_rescues_related_image_with_no_scalar_community():
         text = "{{Artwork|title=A Title|Other versions={{other version|Rel.jpg}}}}"
 
     source = _mock_file_page("File:Old.jpg", _Rev.text, [_Rev()])
-    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
     item, provider, dp = _item_md()
     site = MagicMock()
     site.tokens = {"csrf": "CSRFTOKEN"}
@@ -2095,7 +2096,7 @@ def test_import_cross_page_rescues_related_image_with_no_scalar_community():
     }
     n = import_cross_page_community_sdc(
         source_page=source,
-        dest_page=dest,
+        dest_mediaid="M42",
         item_metadata=item,
         provider=provider,
         data_provider=dp,

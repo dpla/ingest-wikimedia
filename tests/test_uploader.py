@@ -1678,6 +1678,9 @@ def _drift_uploader_with_pages(
 
     uploader = Uploader.__new__(Uploader)
     uploader.site = MagicMock(name="site")
+    # The tag-duplicate rescue resolves the destination pageid via this helper
+    # before the SDC import; give it a real id so the import path is exercised.
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=42)
 
     old_page = MagicMock(name="old_page")
     old_page.text = old_text
@@ -1799,8 +1802,29 @@ def test_rescue_imports_inside_template_sdc_from_old_page():
     sdc_mock.assert_called_once()
     kwargs = sdc_mock.call_args.kwargs
     assert kwargs["source_page"] is old_page
-    assert kwargs["dest_page"] is new_page
+    # Destination targeted by resolved mediaid (pageid refreshed to 42), not a
+    # raw page object — guards against a lagged pageid becoming "M0".
+    assert kwargs["dest_mediaid"] == "M42"
     assert kwargs["dpla_id"] == _DPLA_ID
+
+
+def test_rescue_skips_sdc_when_pageid_unresolved():
+    """If the destination pageid can't be resolved post-upload (indexing lag),
+    the SDC import is skipped (no bogus M0) while the wikitext rescue and the
+    tag still proceed."""
+    old_text = "{{Artwork|title=Old}}\n[[Category:Curated]]\n"
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=None)
+    sdc_mock = MagicMock(return_value=0)
+
+    with patch("tools.uploader.tag_as_duplicate") as tag_mock:
+        _call_tag_drift(
+            uploader, old_page, new_page, import_cross_page_community_sdc=sdc_mock
+        )
+
+    sdc_mock.assert_not_called()  # pageid unresolved → no M0 import
+    assert new_page.save.called  # outside-template wikitext rescue still runs
+    tag_mock.assert_called_once()  # tag still runs
 
 
 def test_rescue_no_save_when_nothing_to_preserve():
