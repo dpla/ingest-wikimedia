@@ -785,12 +785,15 @@ from ingest_wikimedia.legacy_artwork import (  # noqa: E402
     LEGACY_MIGRATION_BASE_SUMMARY,
     LEGACY_MIGRATION_EDIT_SUMMARY,
     MigrationResult,
+    _build_related_image_claim,
+    _extract_related_image_files,
     build_migration_summary,
     entity_was_already_migrated,
     fetch_revision_snapshots,
     import_cross_page_community_sdc,
     materialize_import_claims,
     materialize_pending_date_claim,
+    materialize_pending_related_image_claim,
     migrate_legacy_file,
     post_legacy_import_claims,
     render_migrated_wikitext,
@@ -1875,6 +1878,190 @@ def test_import_cross_page_community_sdc_nothing_to_rescue_on_bot_only_history()
         c.kwargs.get("action") != "wbeditentity"
         for c in site.simple_request.call_args_list
     )
+
+
+# --- related image (P6802, commonsMedia datatype) -------------------------
+
+
+def test_extract_related_image_files_parses_other_version_templates():
+    wt = (
+        "{{Artwork|title=T|Other versions="
+        "{{other version|File:First related.jpg}}"
+        "{{Other Version|Second related.jpg}}}}"
+    )
+    # File: prefix stripped; case-insensitive template name; order preserved.
+    assert _extract_related_image_files(wt) == [
+        "First related.jpg",
+        "Second related.jpg",
+    ]
+
+
+def test_extract_related_image_files_empty_when_absent():
+    assert _extract_related_image_files("{{Artwork|title=T}}") == []
+    assert _extract_related_image_files("no template here") == []
+
+
+def test_build_related_image_claim_serialises_commons_media_correctly():
+    """The first commonsMedia-typed property in the pipeline — verify the
+    exact Wikibase shape: string datavalue, 'commons-media' snak datatype,
+    bare filename, standard inferred-from-Wikitext reference."""
+    claim = _build_related_image_claim(
+        "A file.jpg", "https://commons.wikimedia.org/w/index.php?title=X&oldid=1"
+    )
+    ms = claim["mainsnak"]
+    assert ms["property"] == "P6802"
+    assert ms["datatype"] == "commons-media"
+    assert ms["datavalue"] == {"type": "string", "value": "A file.jpg"}
+    assert ms["snaktype"] == "value"
+    ref = claim["references"][0]["snaks"]
+    assert ref["P887"][0]["datavalue"]["value"]["id"] == "Q131783016"
+
+
+def test_plan_migration_extracts_related_images_unconditionally():
+    """Related images are preserved regardless of provenance — a bot-only
+    history (no community edits) still yields the P6802 import, because DPLA
+    has no canonical related-image value to drift from."""
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            "{{Artwork|title=A Title|Other versions={{other version|Rel.jpg}}}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports == {}  # bot-only → nothing provenance-gated
+    assert plan.related_image_imports == ["Rel.jpg"]  # ...but kept anyway
+
+
+def test_build_legacy_import_claims_emits_related_image_placeholder():
+    plan = MigrationPlan(source_permalink="P", related_image_imports=["Rel.jpg"])
+    claims = build_legacy_import_claims(plan)
+    assert len(claims) == 1
+    assert claims[0]["_phase3a_pending_related_image"] == "Rel.jpg"
+    assert claims[0]["_permalink"] == "P"
+
+
+def test_materialize_related_image_builds_when_site_none():
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Rel.jpg", "_permalink": "P"}
+    )
+    assert claim is not None
+    assert claim["mainsnak"]["datatype"] == "commons-media"
+    assert claim["mainsnak"]["datavalue"]["value"] == "Rel.jpg"
+
+
+def test_materialize_related_image_drops_missing_file():
+    """A {{other version}} pointing at a non-existent file is dropped, so it
+    can't fail Wikibase's commonsMedia validation and poison the whole atomic
+    claim bundle."""
+    site = MagicMock()
+    site.simple_request.return_value.submit.return_value = {
+        "query": {"pages": {"-1": {"missing": ""}}}
+    }
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Gone.jpg", "_permalink": "P"}, site=site
+    )
+    assert claim is None
+
+
+def test_materialize_related_image_dedups_existing_p6802():
+    entity = {
+        "statements": {
+            "P6802": [
+                {"mainsnak": {"snaktype": "value", "datavalue": {"value": "Rel.jpg"}}}
+            ]
+        }
+    }
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Rel.jpg", "_permalink": "P"},
+        site=None,
+        existing_entity=entity,
+    )
+    assert claim is None
+
+
+def test_entity_was_already_migrated_detects_p6802_ref():
+    assert entity_was_already_migrated(_entity_with_legacy_import("P6802")) is True
+
+
+def test_migrate_legacy_file_imports_related_image_as_commons_media():
+    """End-to-end: an {{Artwork}} with Other versions={{other version|X}}
+    posts a P6802 commonsMedia claim carrying the bare filename."""
+
+    class _Rev:
+        revid = 1
+        user = "DPLA_bot"
+        text = "{{Artwork|title=A Title|Other versions={{other version|Rel file.jpg}}}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    # One response satisfies both the wbgetentities fetch (entities key) and
+    # the commonsMedia existence query (query.pages, no "missing").
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": {}},
+        "query": {"pages": {"1": {"pageid": 1, "title": "File:Rel file.jpg"}}},
+    }
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert (
+        result.imports_posted == 1
+    )  # only the related image (title matches canonical)
+
+    import json as _json
+
+    wbedit = [
+        c
+        for c in site.simple_request.call_args_list
+        if c.kwargs.get("action") == "wbeditentity"
+    ]
+    assert len(wbedit) == 1
+    posted = _json.loads(wbedit[0].kwargs["data"])["claims"]
+    p6802 = [c for c in posted if c["mainsnak"]["property"] == "P6802"]
+    assert len(p6802) == 1
+    assert p6802[0]["mainsnak"]["datatype"] == "commons-media"
+    assert p6802[0]["mainsnak"]["datavalue"] == {
+        "type": "string",
+        "value": "Rel file.jpg",
+    }
+
+
+def test_import_cross_page_rescues_related_image_with_no_scalar_community():
+    """The cross-page guard must not skip a source whose only rescuable
+    content is a related image (no scalar community_imports)."""
+
+    class _Rev:
+        revid = 1
+        user = "DPLA_bot"
+        text = "{{Artwork|title=A Title|Other versions={{other version|Rel.jpg}}}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev.text, [_Rev()])
+    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": {}},
+        "query": {"pages": {"1": {"pageid": 1}}},
+    }
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_page=dest,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 1  # the related image, despite no scalar community imports
 
 
 def test_legacy_migration_edit_summary_mentions_q131783016():

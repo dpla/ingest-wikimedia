@@ -92,6 +92,15 @@ def _normalize_account(name: str) -> str:
 QID_INFERRED_FROM_WIKITEXT = "Q131783016"  # the source-of-truth item
 PID_BASED_ON_HEURISTIC = "P887"
 PID_WIKIMEDIA_IMPORT_URL = "P4656"
+# Related image (P6802) — a commonsMedia-datatype property pointing at another
+# Commons file. Populated from a legacy template's "other versions" param
+# ({{other version|<file>}}); Module:DPLA already renders it into the yellow
+# box. This is the pipeline's FIRST commonsMedia-typed SDC property: its
+# datavalue serialises as {"type": "string", "value": "<bare filename>"} while
+# the snak's datatype is "commons-media", and Wikibase validates the value
+# against a live Commons file — see _build_related_image_claim and
+# materialize_pending_related_image_claim.
+PID_RELATED_IMAGE = "P6802"
 
 # Per-param Wikidata-property mapping for the SDC import. Each key is a
 # canonical-params key (matching what `dpla_metadata_params` returns);
@@ -119,6 +128,15 @@ LEGACY_IMPORT_PROPERTY: dict[str, tuple[str, str]] = {
     # editors can promote individual statements to P170 manually later.
     "creator": ("P2093", "string"),
 }
+
+# Every property a legacy migration can write — the LEGACY_IMPORT_PROPERTY
+# scalars plus P6802 (related image, handled outside that per-key map). The
+# idempotency probe (:func:`entity_was_already_migrated`) checks all of these
+# for the inferred-from-Wikitext reference.
+_LEGACY_IMPORT_PIDS: tuple[str, ...] = (
+    *dict.fromkeys(prop for prop, _ in LEGACY_IMPORT_PROPERTY.values()),
+    PID_RELATED_IMAGE,
+)
 
 # Canonical mapping from legacy template param names (case-folded) to
 # the canonical-params keys both the writer and comparator use. Covers
@@ -222,6 +240,12 @@ class MigrationPlan:
     dpla_originated_params: dict[str, str] = field(default_factory=dict)
     wikitext_preserved_extras: dict[str, str] = field(default_factory=dict)
     artwork_template_name: str = ""
+    # Filenames from the template's "other versions" param ({{other version|X}})
+    # to import as P6802 (related image). Unconditional preserve, NOT
+    # provenance-gated: DPLA has no canonical related-image value, so it is
+    # never "drifted DPLA metadata" — it's an additive Commons relationship kept
+    # for every author. Each becomes one commonsMedia SDC statement.
+    related_image_imports: list[str] = field(default_factory=list)
 
 
 def _template_name(template) -> str:
@@ -368,6 +392,42 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
         # overrides the earlier.
         parsed[canonical] = value
     return parsed
+
+
+# {{other version|<file>}} inside an "other versions" param. Commons filenames
+# can't contain |, {, or }, so [^{}|]+ safely grabs the (first, positional)
+# filename; an optional |extra tail (rare) is consumed but ignored.
+_OTHER_VERSION_RE = re.compile(
+    r"\{\{\s*other[\s_]*version\s*\|([^{}|]+)(?:\|[^{}]*)?\}\}",
+    re.IGNORECASE,
+)
+
+
+def _extract_related_image_files(wikitext: str) -> list[str]:
+    """Bare Commons filenames referenced by ``{{other version|<file>}}`` inside
+    the legacy template's *other versions* param — the value form P6802
+    (commonsMedia) stores (no ``File:`` prefix).
+
+    Deduped, order-preserving. ``[]`` when there is no legacy template, no
+    *other versions* param, or no ``{{other version}}`` invocations. Only the
+    ``{{other version|…}}`` shape is parsed; galleries and bare ``[[File:…]]``
+    links in the param are left alone — out of scope, and they have no single
+    unambiguous P6802 target.
+    """
+    template = find_legacy_template(wikitext)
+    if template is None:
+        return []
+    files: list[str] = []
+    for param in template.params:
+        if _normalize_param_name(param) not in ("other versions", "other_versions"):
+            continue
+        for match in _OTHER_VERSION_RE.finditer(str(param.value)):
+            name = match.group(1).strip()
+            if name.lower().startswith("file:"):
+                name = name[len("File:") :].strip()
+            if name and name not in files:
+                files.append(name)
+    return files
 
 
 def trace_param_provenance(
@@ -527,6 +587,11 @@ def plan_migration(
         dpla_originated_params=dpla_originated,
         wikitext_preserved_extras=wikitext_preserved_extras,
         artwork_template_name=_template_name(legacy_template),
+        # Unconditional (not provenance-gated): DPLA has no canonical
+        # related-image value, so an "other versions" reference is never
+        # drifted DPLA metadata — preserve it for every author. See the
+        # MigrationPlan field docstring.
+        related_image_imports=_extract_related_image_files(latest.text),
     )
 
 
@@ -985,6 +1050,31 @@ def _string_datavalue(text: str) -> dict:
     return {"type": "string", "value": text}
 
 
+def _commons_media_datavalue(filename: str) -> dict:
+    # commonsMedia serialises as a plain string datavalue — the SAME shape as a
+    # string value (hence delegating to _string_datavalue). What marks it a file
+    # reference is the snak's ``datatype`` ("commons-media"), not the datavalue
+    # ``type``. The value is the BARE filename (no "File:" prefix); Wikibase
+    # validates it against a live Commons file at write time.
+    return _string_datavalue(filename)
+
+
+def _build_related_image_claim(filename: str, permalink: str) -> dict:
+    """Build a P6802 (related image) commonsMedia statement for ``filename``,
+    with the inferred-from-Wikitext reference shape (P887 + P4656)."""
+    return {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": PID_RELATED_IMAGE,
+            "datatype": "commons-media",
+            "datavalue": _commons_media_datavalue(filename),
+        },
+        "references": [_reference_snaks(permalink)],
+    }
+
+
 def format_legacy_import_claim(
     canonical_key: str,
     value: str,
@@ -1076,12 +1166,27 @@ def build_legacy_import_claims(plan: MigrationPlan) -> list[dict]:
     Skips canonical keys with no mapping in
     :data:`LEGACY_IMPORT_PROPERTY` — those values stay in wikitext
     until a later phase widens the supported set.
+
+    Also emits one P6802 (related image) placeholder per
+    ``plan.related_image_imports`` entry. These are placeholders (not final
+    claims) because commonsMedia values are validated against a live Commons
+    file, so :func:`materialize_import_claims` confirms existence in the
+    executor context before emitting the real claim.
     """
     claims: list[dict] = []
     for key, value in plan.community_imports.items():
         claim = format_legacy_import_claim(key, value, plan.source_permalink)
         if claim is not None:
             claims.append(claim)
+    for filename in plan.related_image_imports:
+        claims.append(
+            {
+                "type": "statement",
+                "rank": "normal",
+                "_phase3a_pending_related_image": filename,
+                "_permalink": plan.source_permalink,
+            }
+        )
     return claims
 
 
@@ -1613,6 +1718,79 @@ def materialize_pending_creator_claim(
     return None
 
 
+def _entity_p6802_files(existing_entity: dict | None) -> set[str]:
+    """Filenames already stated in ``existing_entity``'s P6802 (related image)
+    commonsMedia mainsnaks. Used to drop a related-image import the entity
+    already carries, so re-runs don't add duplicate statements."""
+    if not existing_entity:
+        return set()
+    statements = (
+        existing_entity.get("statements") or existing_entity.get("claims") or {}
+    )
+    files: set[str] = set()
+    for stmt in statements.get(PID_RELATED_IMAGE, []):
+        ms = stmt.get("mainsnak") or {}
+        if ms.get("snaktype") != "value":
+            continue
+        value = (ms.get("datavalue") or {}).get("value")
+        if isinstance(value, str) and value:
+            files.add(value)
+    return files
+
+
+def _commons_file_exists(site, filename: str) -> bool:
+    """True when ``File:<filename>`` exists on Commons.
+
+    ``site is None`` (test / pure contexts) short-circuits to True — the
+    existence gate is a live-Wikibase concern. Any API failure returns False so
+    an unconfirmable file is *dropped* rather than risking the commonsMedia
+    validation error that would fail the whole atomic ``wbeditentity`` bundle.
+    """
+    if site is None:
+        return True
+    try:
+        response = site.simple_request(
+            action="query",
+            titles=f"File:{filename}",
+            format="json",
+        ).submit()
+    except Exception:  # noqa: BLE001 — any lookup failure → treat as absent
+        return False
+    pages = (response.get("query") or {}).get("pages") or {}
+    page = next(iter(pages.values()), None)
+    return page is not None and "missing" not in page and "invalid" not in page
+
+
+def materialize_pending_related_image_claim(
+    placeholder: dict,
+    *,
+    site=None,
+    existing_entity: dict | None = None,
+) -> dict | None:
+    """Convert a Phase-3a related-image placeholder into a real P6802 (related
+    image) commonsMedia statement — or drop it (return ``None``) when:
+
+    * a required sentinel key is missing (defensive), or
+    * the file is already a P6802 value on the entity (re-run dedup), or
+    * the referenced Commons file does not exist / can't be confirmed.
+
+    The last case is the important one: commonsMedia is validated by Wikibase
+    against a live file, so emitting a claim for a missing target would fail the
+    entire atomic ``wbeditentity`` bundle and block the file's other imports.
+    Dropping the one claim keeps the rest; the reference still lives in the
+    page's revision history for manual recovery.
+    """
+    filename = placeholder.get("_phase3a_pending_related_image")
+    permalink = placeholder.get("_permalink")
+    if not filename or not permalink:
+        return None
+    if filename in _entity_p6802_files(existing_entity):
+        return None
+    if not _commons_file_exists(site, filename):
+        return None
+    return _build_related_image_claim(filename, permalink)
+
+
 def materialize_import_claims(
     claims: list[dict],
     *,
@@ -1622,13 +1800,16 @@ def materialize_import_claims(
     """Walk an import-claim list and substitute every Phase-3a
     placeholder for a real Wikibase statement.
 
-    Handles two placeholder shapes: date placeholders (P571 time
-    statements via :func:`materialize_pending_date_claim`) and
-    creator placeholders (P170 statements via
-    :func:`materialize_pending_creator_claim`). Claims without a
+    Handles three placeholder shapes: date placeholders (P571 time
+    statements via :func:`materialize_pending_date_claim`), creator
+    placeholders (P170 statements via
+    :func:`materialize_pending_creator_claim`), and related-image
+    placeholders (P6802 commonsMedia statements via
+    :func:`materialize_pending_related_image_claim`). Claims without a
     placeholder marker pass through unchanged. Placeholders whose
-    materialiser returns ``None`` — duplicate of existing SDC, or
-    an unparseable value — are dropped from the returned list.
+    materialiser returns ``None`` — duplicate of existing SDC, a
+    missing Commons file, or an unparseable value — are dropped from
+    the returned list.
 
     ``site`` and ``existing_entity`` are forwarded to the
     materialisers so they can (a) expand wikitext templates
@@ -1656,6 +1837,12 @@ def materialize_import_claims(
             )
             if real is not None:
                 materialised.append(real)
+        elif "_phase3a_pending_related_image" in claim:
+            real = materialize_pending_related_image_claim(
+                claim, site=site, existing_entity=existing_entity
+            )
+            if real is not None:
+                materialised.append(real)
         else:
             materialised.append(claim)
     return materialised
@@ -1675,15 +1862,15 @@ def entity_was_already_migrated(entity: dict) -> bool:
     today-practice is a manual re-edit).
 
     Looks for a P887 reference snak whose target is exactly
-    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of any
-    Phase-3a-mapped property. Subtle: a non-DPLA editor could in
-    principle stamp the same ref shape on a hand-authored claim, but
-    that's the same semantic ("inferred from Wikitext") and the
-    skip-on-detect behaviour is still correct — we just don't add
-    duplicates.
+    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of any property a
+    migration writes (:data:`_LEGACY_IMPORT_PIDS` — the scalar fields plus
+    P6802 related image). Subtle: a non-DPLA editor could in principle stamp
+    the same ref shape on a hand-authored claim, but that's the same semantic
+    ("inferred from Wikitext") and the skip-on-detect behaviour is still
+    correct — we just don't add duplicates.
     """
     statements = entity.get("statements") or entity.get("claims") or {}
-    for prop, _ in LEGACY_IMPORT_PROPERTY.values():
+    for prop in _LEGACY_IMPORT_PIDS:
         for stmt in statements.get(prop, []):
             for ref in stmt.get("references", []):
                 for snak in ref.get("snaks", {}).get(PID_BASED_ON_HEURISTIC, []):
@@ -2126,7 +2313,7 @@ def import_cross_page_community_sdc(
         canonical_params,
         bot_accounts,
     )
-    if plan is None or not plan.community_imports:
+    if plan is None or (not plan.community_imports and not plan.related_image_imports):
         return 0
     claims = materialize_import_claims(
         build_legacy_import_claims(plan), site=site, existing_entity=entity
