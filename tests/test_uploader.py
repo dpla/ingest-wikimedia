@@ -1648,12 +1648,13 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
 # _tag_drift_duplicate — rescue + tag combined operation
 #
 # Case 2 hash-drift (``upload_and_tag``) is the only title-correction path
-# where the bot must explicitly preserve community-contributed metadata
-# from the file it's about to queue for deletion (the move and redirect
-# paths do this via merge_preserved_wikitext inline). _tag_drift_duplicate
-# now does both: rescue community categories/licenses/assessments into the
-# new (correct-title) file, then tag the old one. The two steps are
-# independently best-effort so a rescue failure does not block the tag.
+# where the source page is destroyed, so the bot must explicitly preserve
+# community-contributed metadata before queuing it for deletion.
+# _tag_drift_duplicate does both: rescue the old page's content into the new
+# (correct-title) file — outside-template content via rescue_wikitext's
+# node-swap, inside-template community params via import_cross_page_community_sdc
+# — then tag the old one. The steps are independently best-effort so a rescue
+# failure does not block the tag.
 
 
 _NEW_WIKI_MARKUP = "{{DPLA metadata}}\n"
@@ -1704,25 +1705,37 @@ def _patch_get_page(old_page, new_page):
 
 def _call_tag_drift(uploader, old_page, new_page, **patches):
     """Invoke ``_tag_drift_duplicate`` with the standard arg shape so
-    each test asserts on outcomes instead of plumbing the call."""
-    extras = {f"tools.uploader.{name}": value for name, value in patches.items()}
-    with patch(
-        "tools.uploader.get_page",
-        side_effect=_patch_get_page(old_page, new_page),
-    ):
-        if extras:
-            from contextlib import ExitStack
+    each test asserts on outcomes instead of plumbing the call.
 
-            with ExitStack() as stack:
-                for target, value in extras.items():
-                    stack.enter_context(patch(target, value))
-                uploader._tag_drift_duplicate(
-                    "old.jpg", "new.jpg", _NEW_WIKI_MARKUP, _DPLA_ID
-                )
-        else:
-            uploader._tag_drift_duplicate(
-                "old.jpg", "new.jpg", _NEW_WIKI_MARKUP, _DPLA_ID
-            )
+    The inside-template SDC import is patched to a no-op (returns 0) by
+    default, so these tests exercise only the outside-template node-swap
+    rescue; pass ``import_cross_page_community_sdc=<mock>`` to override.
+    """
+    from contextlib import ExitStack
+
+    extras = {f"tools.uploader.{name}": value for name, value in patches.items()}
+    extras.setdefault(
+        "tools.uploader.import_cross_page_community_sdc",
+        MagicMock(return_value=0),
+    )
+    with (
+        patch(
+            "tools.uploader.get_page",
+            side_effect=_patch_get_page(old_page, new_page),
+        ),
+        ExitStack() as stack,
+    ):
+        for target, value in extras.items():
+            stack.enter_context(patch(target, value))
+        uploader._tag_drift_duplicate(
+            "old.jpg",
+            "new.jpg",
+            _NEW_WIKI_MARKUP,
+            _DPLA_ID,
+            item_metadata={},
+            provider={},
+            data_provider={},
+        )
 
 
 def test_rescue_preserves_community_categories_into_new_file():
@@ -1766,11 +1779,37 @@ def test_rescue_preserves_assessment_and_license_templates():
     assert "[[Category:Notable images]]" in saved_text
 
 
+def test_rescue_imports_inside_template_sdc_from_old_page():
+    """The tag-duplicate path invokes the inside-template SDC rescue,
+    passing the OLD page as source and the NEW (survivor) page as dest —
+    since the old page is about to be deleted, its in-template community
+    provenance has to be captured before it's gone."""
+    old_text = "{{Artwork|title=Old}}\n[[Category:Curated]]\n"
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+    sdc_mock = MagicMock(return_value=2)
+
+    with patch("tools.uploader.tag_as_duplicate"):
+        _call_tag_drift(
+            uploader,
+            old_page,
+            new_page,
+            import_cross_page_community_sdc=sdc_mock,
+        )
+
+    sdc_mock.assert_called_once()
+    kwargs = sdc_mock.call_args.kwargs
+    assert kwargs["source_page"] is old_page
+    assert kwargs["dest_page"] is new_page
+    assert kwargs["dpla_id"] == _DPLA_ID
+
+
 def test_rescue_no_save_when_nothing_to_preserve():
-    """If the old page has nothing in merge_preserved_wikitext's
-    pattern set, the new page must NOT be saved — calling save() on
-    identical content would emit a no-op revision on Commons."""
-    # Information template alone is NOT in the preserve set.
+    """If the old page has no content outside its metadata template, the
+    node-swap produces just the fresh block we already uploaded, so the new
+    page must NOT be saved — calling save() on identical content would emit a
+    no-op revision on Commons."""
+    # A bare {{Information}} with nothing around it: node-swapping it for
+    # {{DPLA metadata}} yields exactly wiki_markup, so there's nothing to save.
     old_text = "{{Information|description=Plain text}}\n"
     uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
 
@@ -2783,6 +2822,9 @@ def test_tag_drift_duplicate_refuses_self_tag_byte_equal():
             new_filename=same,
             wiki_markup="wt",
             dpla_id="cccccccccccccccccccccccccccccccc",
+            item_metadata={},
+            provider={},
+            data_provider={},
         )
     tag_mock.assert_not_called()
     get_page_mock.assert_not_called()
@@ -2805,6 +2847,9 @@ def test_tag_drift_duplicate_refuses_self_tag_whitespace_run_equal():
             new_filename=double_space,
             wiki_markup="wt",
             dpla_id="dddddddddddddddddddddddddddddddd",
+            item_metadata={},
+            provider={},
+            data_provider={},
         )
     tag_mock.assert_not_called()
     get_page_mock.assert_not_called()
@@ -2820,12 +2865,16 @@ def test_tag_drift_duplicate_still_tags_when_names_genuinely_differ():
     with (
         patch("tools.uploader.tag_as_duplicate") as tag_mock,
         patch("tools.uploader.get_page", return_value=old_page),
-        patch("tools.uploader.merge_preserved_wikitext", return_value="wt"),
+        patch("tools.uploader.rescue_wikitext", return_value="wt"),
+        patch("tools.uploader.import_cross_page_community_sdc", return_value=0),
     ):
         uploader._tag_drift_duplicate(
             old_filename="Old title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
             new_filename="New title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
             wiki_markup="wt",
             dpla_id="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            item_metadata={},
+            provider={},
+            data_provider={},
         )
     tag_mock.assert_called_once()

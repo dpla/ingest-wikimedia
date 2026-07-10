@@ -758,11 +758,13 @@ from ingest_wikimedia.legacy_artwork import (  # noqa: E402
     build_migration_summary,
     entity_was_already_migrated,
     fetch_revision_snapshots,
+    import_cross_page_community_sdc,
     materialize_import_claims,
     materialize_pending_date_claim,
     migrate_legacy_file,
     post_legacy_import_claims,
     render_migrated_wikitext,
+    rescue_wikitext,
 )
 
 
@@ -1358,6 +1360,28 @@ def test_render_migrated_wikitext_does_not_duplicate_section_heading():
     assert "[[Category:Foo]]" in result
 
 
+def test_render_migrated_wikitext_preserves_image_notes():
+    """The regular migration is a node-swap, so {{ImageNote}} annotation
+    blocks outside the legacy template survive verbatim. The #397 title-drift
+    fix defers to this path, so it must not drop community image notes."""
+    note = (
+        "{{ImageNote|id=1|x=10|y=20|w=30|h=40|dimx=100|dimy=200|style=2}}\n"
+        "a detail worth noting\n"
+        "{{ImageNoteEnd|id=1}}"
+    )
+    original = (
+        "== {{int:filedesc}} ==\n"
+        "{{Artwork|title=Old}}\n"
+        f"{note}\n"
+        "[[Category:Foo]]"
+    )
+    result = render_migrated_wikitext(original, "{{DPLA metadata|title=New}}")
+    assert "{{Artwork" not in result
+    assert "{{DPLA metadata|title=New}}" in result
+    assert note in result
+    assert "[[Category:Foo]]" in result
+
+
 def test_render_migrated_wikitext_accepts_template_only_block_for_back_compat():
     """The previous test asserts the new caller contract — but the
     extraction step must also be a no-op on the old caller contract
@@ -1439,6 +1463,84 @@ def test_fetch_revision_snapshots_tolerates_missing_user_and_text():
     snapshots = fetch_revision_snapshots(file_page)
     assert len(snapshots) == 1
     assert snapshots[0].user == "" and snapshots[0].text == ""
+
+
+# --- rescue_wikitext (cross-page, preserve-by-default) --------------------
+
+
+def test_rescue_wikitext_node_swaps_and_preserves_everything_outside():
+    """Preserve-by-default: node-swap the source's wrapper for the fresh
+    {{DPLA metadata}} block and keep ALL other content verbatim — including
+    image-note annotations and arbitrary community templates that no
+    allowlist ever enumerated."""
+    note = (
+        "{{ImageNote|id=1|x=10|y=20|w=30|h=40|dimx=100|dimy=200|style=2}}\n"
+        "a community annotation\n"
+        "{{ImageNoteEnd|id=1}}"
+    )
+    source = (
+        "== {{int:filedesc}} ==\n"
+        "{{Artwork|title=Old|creator={{Creator:Jane Doe}}}}\n"
+        f"{note}\n"
+        "{{SomeCommunityTemplate|x=1}}\n"
+        "[[Category:Community curated]]"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata|title=New}}")
+    assert "{{Artwork" not in result
+    assert "{{DPLA metadata|title=New}}" in result
+    assert note in result  # image notes preserved for free
+    assert "{{SomeCommunityTemplate|x=1}}" in result  # arbitrary template preserved
+    assert "[[Category:Community curated]]" in result
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "{{Artwork|title=Old}}",
+        "{{Information|title=Old}}",
+        "{{Photograph|title=Old}}",
+        "{{DPLA metadata|title=Old}}",
+        "{{NARA-image-full|title=Old}}",
+    ],
+)
+def test_rescue_wikitext_recognizes_all_wrappers(wrapper):
+    """Every wrapper the cross-page rescue can meet — the legacy forms, the
+    already-migrated {{DPLA metadata}}, and NARA's {{NARA-image-full}} — is
+    node-swapped for the fresh block, carrying a trailing category through."""
+    source = f"{wrapper}\n[[Category:Keep me]]"
+    result = rescue_wikitext(source, "{{DPLA metadata|title=New}}")
+    assert "{{DPLA metadata|title=New}}" in result
+    assert "[[Category:Keep me]]" in result
+    assert "title=Old" not in result  # old wrapper replaced, not appended
+
+
+def test_rescue_wikitext_falls_back_to_allowlist_when_no_wrapper():
+    """A source with no recognised metadata wrapper can't be node-swapped, so
+    rescue_wikitext falls back to the narrow merge_preserved_wikitext allowlist
+    — license/category kept, an unrecognised community template dropped (the
+    inherent limit of the no-wrapper case, not a regression)."""
+    source = (
+        "{{PD-USGov}}\n{{UnknownCommunityThing|x=1}}\n[[Category:Kept by allowlist]]"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata|title=New}}")
+    assert "{{DPLA metadata|title=New}}" in result
+    assert "{{PD-USGov}}" in result
+    assert "[[Category:Kept by allowlist]]" in result
+    assert "{{UnknownCommunityThing" not in result
+
+
+def test_rescue_wikitext_no_duplicate_heading_with_full_form_block():
+    """Regression (lesson from #299): the live callers pass get_wiki_text's
+    FULL upload form (heading + blank line + template), not a bare template.
+    rescue_wikitext must substitute template-only, so a source that already
+    carries a heading doesn't end up with two."""
+    source = "== {{int:filedesc}} ==\n{{Artwork|title=Old}}\n[[Category:Keep]]"
+    full_form_block = "== {{int:filedesc}} ==\n\n{{DPLA metadata\n| title = New\n}}"
+    result = rescue_wikitext(source, full_form_block)
+    assert result.count("== {{int:filedesc}} ==") == 1
+    assert "{{DPLA metadata" in result
+    assert "{{Artwork" not in result
+    assert "[[Category:Keep]]" in result
 
 
 # --- migrate_legacy_file end-to-end ---------------------------------------
@@ -1596,6 +1698,115 @@ def test_migrate_legacy_file_imports_community_value_and_rewrites_wikitext():
     assert (
         posted["claims"][0]["mainsnak"]["datavalue"]["value"]["text"]
         == "A Better Title"
+    )
+
+
+# --- import_cross_page_community_sdc (cross-page inside-template rescue) ---
+
+
+def test_import_cross_page_community_sdc_imports_from_source_history():
+    """Plans over the SOURCE page's history and posts the community-authored
+    value to the DESTINATION entity — the cross-page analogue of the SDC half
+    of migrate_legacy_file."""
+
+    class _Rev1:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    class _Rev2:
+        revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev2.text, [_Rev1(), _Rev2()])
+    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
+    dest.pageid = 99
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    site.simple_request.return_value.submit.return_value = {"entities": {"M99": {}}}
+
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_page=dest,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 1
+
+    import json as _json
+
+    wbeditentity = [
+        c
+        for c in site.simple_request.call_args_list
+        if c.kwargs.get("action") == "wbeditentity"
+    ]
+    assert len(wbeditentity) == 1
+    # Written to the DESTINATION entity (M99), not the source page.
+    assert wbeditentity[0].kwargs["id"] == "M99"
+    posted = _json.loads(wbeditentity[0].kwargs["data"])
+    assert (
+        posted["claims"][0]["mainsnak"]["datavalue"]["value"]["text"]
+        == "A Better Title"
+    )
+
+
+def test_import_cross_page_community_sdc_idempotent_on_dest_entity():
+    """If the destination entity already carries a legacy-import ref, bail
+    out with 0 and post nothing — a re-run must not duplicate claims."""
+
+    class _Rev2:
+        revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev2.text, [_Rev2()])
+    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": _entity_with_legacy_import("P1476")}
+    }
+
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_page=dest,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 0
+    assert all(
+        c.kwargs.get("action") != "wbeditentity"
+        for c in site.simple_request.call_args_list
+    )
+
+
+def test_import_cross_page_community_sdc_nothing_to_rescue_on_bot_only_history():
+    """A DPLA-bot-only source history has no community-authored value to
+    import, so nothing is posted and the count is 0."""
+
+    class _Rev:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev.text, [_Rev()])
+    dest = _mock_file_page("File:New.jpg", "{{DPLA metadata}}", [])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_page=dest,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 0
+    assert all(
+        c.kwargs.get("action") != "wbeditentity"
+        for c in site.simple_request.call_args_list
     )
 
 

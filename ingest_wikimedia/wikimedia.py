@@ -957,14 +957,13 @@ _ASSESSMENT_TEMPLATE_RE = re.compile(
 def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     """Append preserved metadata from existing_text to new_wikitext.
 
-    Used when the uploader rewrites a file description during a
-    redirect-overwrite or a cross-page metadata rescue (see the Scope note
-    below for the exact call sites — the title-drift *move* path no longer
-    calls this). The new {{DPLA metadata}} wikitext is
-    authoritative for the file's description, but page-level metadata that
-    pre-existed — PD-USGov license tags, Image-extracted parent links,
-    category membership, and assessment-class templates — must survive the
-    rewrite.
+    Narrow-allowlist fallback for the cross-page drift rescue, invoked by
+    :func:`ingest_wikimedia.legacy_artwork.rescue_wikitext` **only** when the
+    source page carries no recognised metadata wrapper to node-swap (see the
+    Scope note below). The new {{DPLA metadata}} wikitext is authoritative for
+    the file's description, but page-level metadata that pre-existed — PD-USGov
+    license tags, Image-extracted parent links, category membership, and
+    assessment-class templates — must survive the rewrite.
 
     Result order (matches Commons page-structure convention):
         1. new_wikitext (the freshly generated {{DPLA metadata}} block)
@@ -1000,19 +999,18 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     blank-line separator, since they conventionally sit in their
     own section between the description and the categories.)
 
-    Scope note: the primary title-drift path
-    (``Uploader._move_to_correct_title``) no longer calls this — after a move it
-    leaves the page's wikitext intact and the post-SDC ``sdc-sync`` cleanup runs
-    the provenance-aware :mod:`ingest_wikimedia.legacy_artwork` migration
-    (community values imported to SDC; only bot-authored, drifted fields
-    replaced with canonical). The two remaining callers —
-    ``_resolve_redirect_overwrite`` (overwrites a redirect) and
-    ``_tag_drift_duplicate`` (rescues into a survivor before the old file is
-    tagged as a duplicate) — are *cross-page* rescues: the metadata to preserve
-    lives on a different page whose history the cleanup never walks, so
-    capturing it inline here (the narrow license/category/assessment set) is the
-    only available point. That narrowness is inherent to cross-page rescue, not
-    pending work.
+    Scope note: this is no longer the primary rescue mechanism. Both the
+    regular migration and the cross-page drift rescue now *preserve by
+    default* — :func:`ingest_wikimedia.legacy_artwork.rescue_wikitext` and
+    :func:`~ingest_wikimedia.legacy_artwork.render_migrated_wikitext` node-swap
+    only the metadata-template node and keep everything else (categories,
+    {{ImageNote}} annotations, every community template) verbatim, so there is
+    no allowlist to keep chasing new community-template shapes. This function
+    survives solely as ``rescue_wikitext``'s fallback for the rare source page
+    that has *no* recognised wrapper to swap — nothing to preserve-by-default
+    around, so the narrow license/category/assessment allowlist is the best
+    available. That narrowness is inherent to the no-wrapper case, not pending
+    work.
     """
     new_stripped = new_wikitext.rstrip()
     parts: list[str] = [new_stripped]

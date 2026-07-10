@@ -145,6 +145,27 @@ ARTWORK_PARAM_TO_CANONICAL_KEY: dict[str, str] = {
 # match is migrated; the others are left alone for a manual sweep.
 LEGACY_TEMPLATE_NAMES: tuple[str, ...] = ("artwork", "information", "photograph")
 
+# Metadata wrappers the cross-page drift rescue can node-swap for a fresh
+# {{DPLA metadata}} block. A superset of LEGACY_TEMPLATE_NAMES: also the
+# already-migrated {{DPLA metadata}} form (a source page can already be on the
+# new template) and NARA's {{NARA-image-full}}. The rescue only needs to
+# *locate* the metadata wrapper so it can swap that one node and keep everything
+# else on the page verbatim — it does not parse the wrapper's params, so
+# {{NARA-image-full}} is fine here even though its param mapping isn't wired for
+# the regular migration yet. The regular migration keeps using the narrower
+# LEGACY_TEMPLATE_NAMES (it only ever runs on a not-yet-migrated legacy page and
+# must not treat an existing {{DPLA metadata}} as swappable).
+#
+# This set governs OUTSIDE-template preservation only (which node to swap so
+# everything around it survives). It is deliberately broader than the set whose
+# INSIDE-template params get lifted to SDC — see the asymmetry note in
+# ``import_cross_page_community_sdc`` before widening it.
+RESCUE_WRAPPER_NAMES: tuple[str, ...] = (
+    *LEGACY_TEMPLATE_NAMES,
+    "dpla metadata",
+    "nara-image-full",
+)
+
 
 @dataclass(frozen=True)
 class RevisionSnapshot:
@@ -1711,17 +1732,60 @@ def render_migrated_wikitext(
     page-level structure survive in their original positions. Only
     the legacy-template node itself is replaced.
     """
+    text, _swapped = _swap_wrapper_node(
+        original_text, new_template_block, LEGACY_TEMPLATE_NAMES
+    )
+    return text
+
+
+def _swap_wrapper_node(
+    original_text: str,
+    new_template_block: str,
+    wrapper_names: tuple[str, ...],
+) -> tuple[str, bool]:
+    """Replace the first template in ``original_text`` whose name is in
+    ``wrapper_names`` with the ``{{DPLA metadata}}`` template extracted
+    from ``new_template_block``, leaving everything else verbatim.
+
+    Returns ``(text, swapped)``. ``swapped`` is False — and ``text`` is
+    ``original_text`` byte-for-byte — when no matching wrapper is present,
+    so callers can distinguish "swapped the wrapper" from "nothing to do"
+    (the shared preserve-by-default primitive behind both the regular
+    migration and the cross-page drift rescue).
+    """
     wikicode = mwparserfromhell.parse(original_text)
-    template = None
     for tpl in wikicode.filter_templates():
-        if _template_name(tpl) in LEGACY_TEMPLATE_NAMES:
-            template = tpl
-            break
-    if template is None:
-        return original_text
-    replacement = _extract_dpla_metadata_template(new_template_block)
-    wikicode.replace(template, replacement)
-    return str(wikicode)
+        if _template_name(tpl) in wrapper_names:
+            wikicode.replace(tpl, _extract_dpla_metadata_template(new_template_block))
+            return str(wikicode), True
+    return original_text, False
+
+
+def rescue_wikitext(source_text: str, new_template_block: str) -> str:
+    """Destination wikitext for a cross-page drift rescue — preserve by default.
+
+    If the source page carries a recognised metadata wrapper
+    (:data:`RESCUE_WRAPPER_NAMES`), node-swap just that wrapper for the fresh
+    ``{{DPLA metadata}}`` block and keep everything else on the source verbatim:
+    categories, ``{{ImageNote}}`` annotations, and every other community
+    template survive with no allowlist to maintain. This is the same mechanism
+    the regular migration (:func:`render_migrated_wikitext`) uses — the drift
+    paths just never adopted it (the node-swap postdates them).
+
+    Only when the source has *no* recognised wrapper — nothing to swap, so
+    preserve-by-default is impossible — fall back to
+    :func:`ingest_wikimedia.wikimedia.merge_preserved_wikitext`, the narrow
+    license/category/assessment allowlist. That no-wrapper case is the sole
+    reason ``merge_preserved_wikitext`` still exists.
+    """
+    text, swapped = _swap_wrapper_node(
+        source_text, new_template_block, RESCUE_WRAPPER_NAMES
+    )
+    if swapped:
+        return text
+    from .wikimedia import merge_preserved_wikitext
+
+    return merge_preserved_wikitext(source_text, new_template_block)
 
 
 def _inject_preserved_extras(text: str, extras: dict[str, str]) -> str:
@@ -1982,6 +2046,89 @@ def migrate_legacy_file(
         wikitext_changed=wikitext_changed,
         plan=plan,
     )
+
+
+def import_cross_page_community_sdc(
+    *,
+    source_page,
+    dest_page,
+    item_metadata: dict,
+    provider: dict,
+    data_provider: dict,
+    dpla_id: str,
+    site,
+    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    summary: str | None = None,
+) -> int:
+    """Rescue community-authored, *in-template* metadata from a source page's
+    revision history into the destination file's SDC.
+
+    The cross-page analogue of the SDC half of :func:`migrate_legacy_file`,
+    for the case where the source page is about to be destroyed (tagged as a
+    duplicate) so its history — the only record of who authored each param —
+    won't survive. Node-swapping the wikitext (:func:`rescue_wikitext`)
+    preserves everything *outside* the metadata template, but the template's
+    own params are dropped in the swap; this recovers the ones a non-bot
+    editor set, via the same provenance attribution the regular migration uses
+    (:func:`plan_migration`), and writes them to the destination as
+    inferred-from-Wikitext SDC.
+
+    Reads the SOURCE page's history but writes the DESTINATION's MediaInfo
+    entity. Idempotent on the destination entity
+    (:func:`entity_was_already_migrated`). Returns the number of
+    community-import claims posted — 0 when the source has no legacy template,
+    nothing community-authored to rescue, or the destination was already
+    migrated.
+    """
+    from .wikimedia import dpla_metadata_params
+
+    # Cheap pre-check before any network I/O. ``plan_migration`` returns None
+    # unless the source's *current* wikitext carries a LEGACY_TEMPLATE_NAMES
+    # wrapper, and that decision rests on the latest revision alone — so gate
+    # on ``source_page.text`` (a single-revision read, usually already cached)
+    # and skip the ``wbgetentities`` round-trip and the full
+    # revision-history-with-content walk ``fetch_revision_snapshots`` does.
+    #
+    # This gate is also where the swap-set/rescue-set asymmetry lives, on
+    # purpose: ``rescue_wikitext`` node-swaps any RESCUE_WRAPPER_NAMES wrapper
+    # (so *outside*-template content is preserved for every wrapper, including
+    # {{DPLA metadata}} and {{NARA-image-full}}), but only the machine-parseable
+    # LEGACY_TEMPLATE_NAMES wrappers have their *inside*-template params lifted
+    # to SDC here. A source already on {{DPLA metadata}}/{{NARA-image-full}}
+    # short-circuits with 0 — no worse than the pre-refactor allowlist, which
+    # rescued no inside-template params at all. Extending SDC rescue to a new
+    # wrapper means teaching plan_migration/find_legacy_template to parse it,
+    # not merely widening RESCUE_WRAPPER_NAMES.
+    if find_legacy_template(source_page.text) is None:
+        return 0
+
+    mediaid = f"M{dest_page.pageid}"
+    entity = _fetch_entity_or_empty(site, mediaid)
+    if entity_was_already_migrated(entity):
+        return 0
+    canonical_params = dpla_metadata_params(
+        dpla_id, item_metadata, provider, data_provider
+    )
+    plan = plan_migration(
+        source_page.title(),
+        fetch_revision_snapshots(source_page),
+        canonical_params,
+        bot_accounts,
+    )
+    if plan is None or not plan.community_imports:
+        return 0
+    claims = materialize_import_claims(
+        build_legacy_import_claims(plan), site=site, existing_entity=entity
+    )
+    if not claims:
+        return 0
+    post_legacy_import_claims(
+        mediaid,
+        claims,
+        site,
+        summary=summary or build_migration_summary(len(claims)),
+    )
+    return len(claims)
 
 
 def _fetch_entity_or_empty(site, mediaid: str) -> dict:
