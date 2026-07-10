@@ -243,26 +243,72 @@ def is_institution_upload_eligible(
     return inst_data.get("upload", False)
 
 
+def check_item_eligibility(
+    canonical_slug: str,
+    institution_name: str,
+    *,
+    maintain: bool = False,
+    timeout: int = 5,
+) -> tuple[bool, str]:
+    """Check whether an item from this institution is eligible for processing.
+
+    Returns ``(True, "")`` when eligible. Returns ``(False, reason)`` with a
+    specific reason string when not — one of "unknown hub …", "hub … missing
+    Wikidata ID …", "institution … missing Wikidata ID …", or "institution …
+    has upload=False …". Splitting the reasons lets the caller surface which
+    gate blocked the item; the historical conflated "missing Wikidata ID or
+    upload flag" message hid the difference.
+
+    Two eligibility profiles:
+
+      * ``maintain=False`` (upload): requires hub Wikidata ID (for hub-level
+        Commons category), institution Wikidata ID (for institution-level
+        Commons category), AND ``upload=True`` on either the hub or the
+        institution. Mirrors get-ids-es's default eligibility.
+      * ``maintain=True``: requires the two Wikidata IDs but skips the
+        ``upload=True`` check. The whole point of maintain mode is to
+        re-link + SDC-sync files already on Commons for institutions that
+        are no longer opted in for new uploads (matches
+        ``get-ids-es --maintain`` semantics). New-upload prevention is
+        enforced by the uploader's ``--no-create`` fence, not by this gate.
+    """
+    hub_name = PARTNER_HUBS.get(canonical_slug)
+    if not hub_name:
+        return False, f"unknown hub slug {canonical_slug!r}"
+    hub = load_institutions(timeout).get(hub_name, {})
+    if not hub.get("Wikidata", ""):
+        return False, (
+            f"hub {hub_name!r} missing Wikidata ID in institutions_v2.json"
+            " (can't resolve Commons category)"
+        )
+    inst_data = hub.get("institutions", {}).get(institution_name, {})
+    if not inst_data.get("Wikidata", ""):
+        return False, (
+            f"institution {institution_name!r} missing Wikidata ID in"
+            " institutions_v2.json (can't resolve Commons category)"
+        )
+    if maintain:
+        return True, ""
+    if hub.get("upload", False) or inst_data.get("upload", False):
+        return True, ""
+    return False, (
+        f"institution {institution_name!r} has upload=False in"
+        " institutions_v2.json (retry with maintain mode to reconcile"
+        " already-uploaded files)"
+    )
+
+
 def is_item_upload_eligible(
     canonical_slug: str, institution_name: str, timeout: int = 5
 ) -> bool:
     """Return True if an item from this institution is fully eligible for upload.
 
-    Mirrors the per-institution check performed by get-ids-es: requires that
-    the hub has a Wikidata ID (needed for the hub-level Commons category), the
-    institution has a Wikidata ID (needed for the institution-level Commons
-    category), and either the hub or the institution has upload=True.
+    Thin boolean wrapper over :func:`check_item_eligibility`.
     """
-    hub_name = PARTNER_HUBS.get(canonical_slug)
-    if not hub_name:
-        return False
-    hub = load_institutions(timeout).get(hub_name, {})
-    if not hub.get("Wikidata", ""):
-        return False
-    inst_data = hub.get("institutions", {}).get(institution_name, {})
-    if not inst_data.get("Wikidata", ""):
-        return False
-    return hub.get("upload", False) or inst_data.get("upload", False)
+    eligible, _ = check_item_eligibility(
+        canonical_slug, institution_name, maintain=False, timeout=timeout
+    )
+    return eligible
 
 
 def slugify_session_label_component(name: str) -> str:

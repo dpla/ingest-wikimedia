@@ -954,8 +954,13 @@ def main() -> None:
     # (same as get-ids-es) so the downloader and uploader can proceed without changes.
     if dpla_id_tokens:
         print(f"Resolving {len(dpla_id_tokens)} DPLA ID(s)...")
+        # Under maintain mode, resolve-dpla-ids must bypass the upload-flag
+        # check — the whole point of maintain is to reconcile files whose
+        # institution is no longer opted in for new uploads. Wikidata-ID
+        # requirements still apply (Commons category resolution needs them).
         resolve_cmd = (
             "/home/ec2-user/ingest-wikimedia/.venv/bin/resolve-dpla-ids "
+            + ("--maintain " if maintain else "")
             + " ".join(shlex.quote(i) for i in dpla_id_tokens)
         )
         resolve_out = None
