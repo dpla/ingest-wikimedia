@@ -403,6 +403,26 @@ _OTHER_VERSION_RE = re.compile(
 )
 
 
+def _normalize_commons_filename(name: str) -> str:
+    """Canonicalise a Commons filename to MediaWiki's title form: strip a
+    ``File:`` prefix, underscores → spaces, collapse whitespace runs, and
+    uppercase the first character.
+
+    MediaWiki treats File: titles as first-letter-insensitive and
+    space/underscore-equivalent, so ``rel_image.jpg`` and ``Rel image.jpg`` name
+    the *same* file. Normalising both the extracted value and the stored P6802
+    values makes the dedup and existence checks compare like MediaWiki does (and
+    the value we write already matches the canonical form Wikibase stores, so
+    re-runs dedup cleanly)."""
+    name = name.strip()
+    if name.lower().startswith("file:"):
+        name = name[len("File:") :]
+    name = re.sub(r"[\s_]+", " ", name).strip()
+    if name:
+        name = name[0].upper() + name[1:]
+    return name
+
+
 def _extract_related_image_files(wikitext: str) -> list[str]:
     """Bare Commons filenames referenced by ``{{other version|<file>}}`` inside
     the legacy template's *other versions* param — the value form P6802
@@ -422,9 +442,7 @@ def _extract_related_image_files(wikitext: str) -> list[str]:
         if _normalize_param_name(param) not in ("other versions", "other_versions"):
             continue
         for match in _OTHER_VERSION_RE.finditer(str(param.value)):
-            name = match.group(1).strip()
-            if name.lower().startswith("file:"):
-                name = name[len("File:") :].strip()
+            name = _normalize_commons_filename(match.group(1))
             if name and name not in files:
                 files.append(name)
     return files
@@ -1719,9 +1737,12 @@ def materialize_pending_creator_claim(
 
 
 def _entity_p6802_files(existing_entity: dict | None) -> set[str]:
-    """Filenames already stated in ``existing_entity``'s P6802 (related image)
-    commonsMedia mainsnaks. Used to drop a related-image import the entity
-    already carries, so re-runs don't add duplicate statements."""
+    """MediaWiki-normalized filenames already stated in ``existing_entity``'s
+    P6802 (related image) commonsMedia mainsnaks. Used to drop a related-image
+    import the entity already carries, so re-runs don't add duplicate
+    statements. Values are normalized (:func:`_normalize_commons_filename`) so a
+    stored ``Rel_image.jpg`` dedups against an extracted ``rel image.jpg`` —
+    MediaWiki treats them as the same file."""
     if not existing_entity:
         return set()
     statements = (
@@ -1734,7 +1755,7 @@ def _entity_p6802_files(existing_entity: dict | None) -> set[str]:
             continue
         value = (ms.get("datavalue") or {}).get("value")
         if isinstance(value, str) and value:
-            files.add(value)
+            files.add(_normalize_commons_filename(value))
     return files
 
 

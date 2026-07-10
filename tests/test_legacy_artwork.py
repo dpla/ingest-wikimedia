@@ -787,6 +787,7 @@ from ingest_wikimedia.legacy_artwork import (  # noqa: E402
     MigrationResult,
     _build_related_image_claim,
     _extract_related_image_files,
+    _normalize_commons_filename,
     build_migration_summary,
     entity_was_already_migrated,
     fetch_revision_snapshots,
@@ -1901,6 +1902,23 @@ def test_extract_related_image_files_empty_when_absent():
     assert _extract_related_image_files("no template here") == []
 
 
+def test_normalize_commons_filename_canonicalises_title_form():
+    # underscore→space, first-letter upper, whitespace collapse, File: strip.
+    assert _normalize_commons_filename("rel_image.jpg") == "Rel image.jpg"
+    assert _normalize_commons_filename("File:rel image.jpg") == "Rel image.jpg"
+    assert _normalize_commons_filename("  a   b.jpg ") == "A b.jpg"
+
+
+def test_extract_related_image_files_normalizes_and_dedups_surface_forms():
+    # rel image.jpg and Rel_image.jpg name the SAME Commons file → one entry,
+    # in MediaWiki's canonical form.
+    wt = (
+        "{{Artwork|Other versions="
+        "{{other version|rel image.jpg}}{{other version|Rel_image.jpg}}}}"
+    )
+    assert _extract_related_image_files(wt) == ["Rel image.jpg"]
+
+
 def test_build_related_image_claim_serialises_commons_media_correctly():
     """The first commonsMedia-typed property in the pipeline — verify the
     exact Wikibase shape: string datavalue, 'commons-media' snak datatype,
@@ -1975,6 +1993,29 @@ def test_materialize_related_image_dedups_existing_p6802():
     }
     claim = materialize_pending_related_image_claim(
         {"_phase3a_pending_related_image": "Rel.jpg", "_permalink": "P"},
+        site=None,
+        existing_entity=entity,
+    )
+    assert claim is None
+
+
+def test_materialize_related_image_dedups_across_title_surface_forms():
+    """CR nitpick: a stored P6802 written as 'Rel_image.jpg' must dedup against
+    an extracted 'Rel image.jpg' — MediaWiki treats them as the same file."""
+    entity = {
+        "statements": {
+            "P6802": [
+                {
+                    "mainsnak": {
+                        "snaktype": "value",
+                        "datavalue": {"value": "Rel_image.jpg"},
+                    }
+                }
+            ]
+        }
+    }
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Rel image.jpg", "_permalink": "P"},
         site=None,
         existing_entity=entity,
     )
