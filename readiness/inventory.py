@@ -8,6 +8,8 @@ import requests
 from urllib.parse import urlparse, quote, quote_plus
 
 API_KEY = os.environ.get("DPLA_API_KEY", "YOUR_DPLA_API_KEY_HERE")
+# The API key is sent ONLY to this host (see fetch()) — never leaked elsewhere.
+DPLA_API_HOST = "api.dp.la"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(SCRIPT_DIR, "inventory_data.json")
 README_FILE = os.path.join(SCRIPT_DIR, "README.md")
@@ -21,21 +23,45 @@ contentdm_re = re.compile(
 )
 
 
-def fetch(url):
+def fetch(url, required=True):
+    """Fetch and JSON-parse ``url`` with bounded retries.
+
+    The DPLA API key is attached only when ``url``'s host is the DPLA API
+    (:data:`DPLA_API_HOST`) — never to any other host — so it can't leak to,
+    e.g., the raw.githubusercontent.com pipeline JSON. Gating on the host here
+    (rather than a per-call flag) makes that a structural invariant no caller
+    can violate.
+
+    ``required`` (default True) means the caller indexes the result, so a
+    definitive-failure response (HTTP 400) raises a clear error instead of
+    returning ``None`` and turning into a cryptic ``TypeError`` downstream. Pass
+    ``required=False`` for optional probes (e.g. the per-institution sample)
+    that treat 400 as "skip".
+    """
+    params = {"api_key": API_KEY} if urlparse(url).netloc == DPLA_API_HOST else None
     for attempt in range(RETRY_LIMIT):
         try:
-            r = requests.get(url, params={"api_key": API_KEY}, timeout=30)
+            r = requests.get(url, params=params, timeout=30)
+        except Exception as e:
+            print(
+                f"  Error: {e}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})"
+            )
+        else:
+            # Status handling sits in ``else`` (outside the try) so a
+            # ``required`` 400 raises cleanly instead of being swallowed by the
+            # transport-retry ``except`` above.
             if r.status_code == 200:
-                return json.loads(r.text)
+                return r.json()
             if r.status_code == 400:
+                # 400 won't change on retry.
+                if required:
+                    raise RuntimeError(
+                        f"HTTP 400 (bad request) for required URL: {url}"
+                    )
                 print("  HTTP 400 (bad request, skipping — will not retry)")
                 return None
             print(
                 f"  HTTP {r.status_code}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})"
-            )
-        except Exception as e:
-            print(
-                f"  Error: {e}, retrying in {RETRY_SLEEP}s... (attempt {attempt + 1}/{RETRY_LIMIT})"
             )
         time.sleep(RETRY_SLEEP)
     raise Exception(f"Failed after {RETRY_LIMIT} attempts: {url}")
@@ -202,7 +228,7 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         update_readme(hub, note="already participating hub-wide")
         return
 
-    hub_encoded = hub.replace(" ", "%20")
+    hub_encoded = quote(hub, safe="")
     hub_file_slug = hub.lower().replace(" ", "_").replace("/", "_")
     hub_md_slug = hub.lower().replace(" ", "-").replace("/", "-")
     output_file = os.path.join(SCRIPT_DIR, f"{hub_file_slug}_inventory.md")
@@ -308,7 +334,8 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         encoded = '"' + quote(name, safe=" ") + '"'
         sample = fetch(
             f"https://api.dp.la/v2/items?dataProvider={encoded}"
-            f"&provider=%22{hub_encoded}%22&page_size=1"
+            f"&provider=%22{hub_encoded}%22&page_size=1",
+            required=False,
         )
 
         if sample and sample["docs"]:
@@ -392,8 +419,11 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         if domain not in domain_map:
             domain_map[domain] = {
                 "domain": domain,
-                "is_eligible": False,
-                "all_partners": True,  # flipped to False as soon as one non-partner is found
+                # True once an eligible institution that is NOT already a
+                # partner is seen on this domain — i.e. there's actually someone
+                # here available to onboard. (An eligible partner + an
+                # ineligible non-partner must NOT qualify the domain.)
+                "has_eligible_non_partner": False,
                 "total": 0,
                 "unlim": 0,
                 "old_other": 0,
@@ -403,17 +433,13 @@ def process_hub(hub, pipelinejson, all_data, cutoff_year):
         domain_map[domain]["unlim"] += inst["unlim"]
         domain_map[domain]["old_other"] += inst["old_other"]
         domain_map[domain]["total"] += inst["total"]
-        if inst["is_eligible"]:
-            domain_map[domain]["is_eligible"] = True
-        if not inst["is_partner"]:
-            domain_map[domain]["all_partners"] = False
+        if inst["is_eligible"] and not inst["is_partner"]:
+            domain_map[domain]["has_eligible_non_partner"] = True
         if inst["total"] > domain_map[domain]["largest_inst_total"]:
             domain_map[domain]["largest_inst"] = inst["name"]
             domain_map[domain]["largest_inst_total"] = inst["total"]
 
-    eligible_domains = [
-        d for d in domain_map.values() if not d["all_partners"] and d["is_eligible"]
-    ]
+    eligible_domains = [d for d in domain_map.values() if d["has_eligible_non_partner"]]
     eligible_domains.sort(key=lambda d: (-d["unlim"], -d["old_other"]))
 
     # Phase 6: Write consolidated Markdown report
