@@ -1625,28 +1625,39 @@ def _entity_p170_qids(existing_entity: dict | None) -> set[str]:
     return qids
 
 
+_CREATOR_WIKIDATA_PARAM_RE = re.compile(r"\|\s*[Ww]ikidata\s*=\s*(Q\d+)")
+
+
 def _resolve_commons_creator_qid(site, page_title: str) -> str | None:
-    """Look up the Wikidata QID linked from a Commons ``Creator:<title>``
-    page via the ``prop=pageprops`` API.
+    """Look up the Wikidata QID for a Commons ``Creator:<title>`` page.
 
-    Returns the QID string (``"Q…"``) when the Creator page exists and
-    has a ``wikibase_item`` sitelink; ``None`` for missing pages,
-    orphaned Creator pages, or any API failure. Falling back to
-    ``None`` is intentional: the caller substitutes a P170 somevalue
-    + P2093 stated-as name claim so the community contribution is
-    preserved as a stated-as string even when the QID resolution
-    can't succeed — same outcome as a plain ``| creator = <name>``
-    parameter would produce.
+    Checks two sources, in order:
+      1. the ``wikibase_item`` pageprop — a Wikidata *sitelink* to the Creator
+         page, and
+      2. the ``{{Creator | Wikidata = Q… }}`` parameter in the page's own
+         wikitext — the far more common way Commons Creator pages carry their
+         Wikidata id (most are NOT sitelinked, so their ``wikibase_item`` is
+         empty; e.g. Creator:Theodore E. Peiser → Q56159174 lives only in the
+         template param).
 
-    Requires ``site`` to be a live pywikibot Site; test callers can
-    pass ``None`` to short-circuit to the name-only fallback path.
+    Returns the QID string (``"Q…"``) when found; ``None`` for missing/orphaned
+    pages or any API failure. Falling back to ``None`` is intentional: the
+    caller then substitutes a P170 somevalue + P2093 stated-as name claim so
+    the community contribution is still preserved as a string. Resolving the
+    QID instead lets the caller build a P170 → wikibase-entityid claim, so
+    Module:DPLA can render the full ``{{Creator:…}}`` template from SDC.
+
+    Requires ``site`` to be a live pywikibot Site; test callers can pass
+    ``None`` to short-circuit to the name-only fallback path.
     """
     if site is None or not page_title:
         return None
     try:
         response = site.simple_request(
             action="query",
-            prop="pageprops",
+            prop="pageprops|revisions",
+            rvprop="content",
+            rvslots="main",
             titles=f"Creator:{page_title}",
             format="json",
         ).submit()
@@ -1658,6 +1669,12 @@ def _resolve_commons_creator_qid(site, page_title: str) -> str | None:
         qid = pp.get("wikibase_item")
         if isinstance(qid, str) and qid.startswith("Q"):
             return qid
+        for rev in page.get("revisions") or []:
+            slots = rev.get("slots") or {}
+            content = (slots.get("main") or {}).get("*") or rev.get("*") or ""
+            match = _CREATOR_WIKIDATA_PARAM_RE.search(content)
+            if match:
+                return match.group(1)
     return None
 
 

@@ -3075,6 +3075,50 @@ def test_materialize_creator_page_placeholder_falls_back_to_stated_as_when_no_qi
     assert refs["P887"][0]["datavalue"]["value"]["id"] == "Q131783016"
 
 
+def test_resolve_commons_creator_qid_reads_wikidata_param_when_no_sitelink():
+    """Most Commons Creator: pages carry their Wikidata id in the
+    ``{{Creator | Wikidata = Q… }}`` param, NOT as a wikibase_item sitelink.
+    The resolver must read that param — otherwise the creator falls back to a
+    stated-as string and Module:DPLA can't render the {{Creator:…}} template
+    from SDC. Regression for Creator:Theodore E. Peiser → Q56159174."""
+    from unittest.mock import MagicMock
+
+    from ingest_wikimedia.legacy_artwork import _resolve_commons_creator_qid
+
+    site = MagicMock()
+    site.simple_request.return_value.submit.return_value = {
+        "query": {
+            "pages": {
+                "42": {
+                    "title": "Creator:Theodore E. Peiser",
+                    "pageprops": {},  # no wikibase_item sitelink
+                    "revisions": [
+                        {
+                            "slots": {
+                                "main": {"*": "{{Creator\n | Wikidata = Q56159174\n}}"}
+                            }
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    assert _resolve_commons_creator_qid(site, "Theodore E. Peiser") == "Q56159174"
+
+
+def test_resolve_commons_creator_qid_prefers_sitelink():
+    """When a wikibase_item sitelink IS present, use it directly."""
+    from unittest.mock import MagicMock
+
+    from ingest_wikimedia.legacy_artwork import _resolve_commons_creator_qid
+
+    site = MagicMock()
+    site.simple_request.return_value.submit.return_value = {
+        "query": {"pages": {"7": {"pageprops": {"wikibase_item": "Q123"}}}}
+    }
+    assert _resolve_commons_creator_qid(site, "Somebody") == "Q123"
+
+
 def test_plan_migration_extracts_infi_creator_with_wikidata_qid():
     """Integration: a legacy Artwork upload with a community
     contribution wrapped in ``Other fields 1 = {{InFi|Creator|
