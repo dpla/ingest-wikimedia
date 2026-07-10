@@ -107,7 +107,6 @@ from ingest_wikimedia.wikimedia import (
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
     is_same_item_redirect_relic,
-    merge_preserved_wikitext,
     tag_as_duplicate,
     check_content_type,
     is_download_only,
@@ -121,6 +120,10 @@ from ingest_wikimedia.wikimedia import (
     get_site,
     file_has_inbound_usage,
     post_commonsdelinker_request,
+)
+from ingest_wikimedia.legacy_artwork import (
+    import_cross_page_community_sdc,
+    rescue_wikitext,
 )
 
 MAX_UPLOAD_RETRIES = 3
@@ -835,7 +838,6 @@ class Uploader:
                             page_title=page_title,
                             dpla_id=dpla_id,
                             ordinal=ordinal,
-                            wiki_markup=wiki_markup,
                             expected_item_titles=expected_item_titles,
                         )
                         if drift_action == DriftResolution.MOVED:
@@ -1256,7 +1258,13 @@ class Uploader:
                 logging.info(f"Uploaded to {wikimedia_url(page_title)}")
                 if drift_old_filename:
                     self._tag_drift_duplicate(
-                        drift_old_filename, page_title, wiki_markup, dpla_id
+                        drift_old_filename,
+                        page_title,
+                        wiki_markup,
+                        dpla_id,
+                        item_metadata=item_metadata,
+                        provider=provider,
+                        data_provider=data_provider,
                     )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
@@ -1470,11 +1478,20 @@ class Uploader:
         edit), or a no-DPLA-ID legacy title. The S3 sha1 must land at the
         intended title regardless of where the redirect points.
 
-        When `preserve_from_target` is True (default), license/Image-extracted/
-        category metadata from the redirect target is carried into the new
-        page. Callers should pass False when the target is a foreign DPLA
-        item, since its categories and Image-extracted parent link don't
-        apply to our page.
+        When `preserve_from_target` is True (default), the redirect target's
+        content is carried into the new page by :func:`rescue_wikitext`:
+        node-swap the target's metadata wrapper for our fresh
+        ``{{DPLA metadata}}`` and keep everything else verbatim (categories,
+        image-note annotations, every community template). Callers should pass
+        False when the target is a foreign DPLA item, since its categories and
+        Image-extracted parent link don't apply to our page.
+
+        Unlike the tag-duplicate path, this does *not* import the target's
+        in-template community params to SDC: the redirect target is not
+        deleted here (we overwrite our own title in place, pre-upload — there
+        is no destination MediaInfo entity yet), so any in-template community
+        value keeps living on the still-existing target page. Only the
+        outside-template presentation is copied forward.
 
         Returns (updated_file_page, old_filename).
         """
@@ -1487,7 +1504,7 @@ class Uploader:
             f"preserve_metadata={preserve_from_target})"
         )
         if preserve_from_target:
-            new_text = merge_preserved_wikitext(redirect_target.text or "", wiki_markup)
+            new_text = rescue_wikitext(redirect_target.text or "", wiki_markup)
         else:
             new_text = wiki_markup
         wiki_file_page.text = new_text
@@ -1511,13 +1528,15 @@ class Uploader:
         intended_page: pywikibot.FilePage,
         dpla_id: str,
         case_label: str,
-        wiki_markup: str | None = None,
         post_commonsdelinker: bool = True,
     ) -> None:
         """Move existing_file to intended_page and post a CommonsDelinker request.
 
-        If wiki_markup is provided, the moved page's description is updated to
-        reflect current DPLA metadata after the move.
+        The moved page's *description* is intentionally left untouched — the
+        community-preserving template migration is done later by the post-SDC
+        ``sdc-sync`` cleanup (see the NOTE in the body). This method only
+        restores the title invariant (the S3 SHA1 now lives at the canonical
+        title) and relinks inbound usage.
 
         post_commonsdelinker controls whether we ask CommonsDelinker to
         rewrite external references to actual_filename. Default True (the
@@ -1571,26 +1590,17 @@ class Uploader:
                 actual_filename,
             )
 
-        if wiki_markup:
-            moved_page = get_page(self.site, intended_page.title())
-            if moved_page.exists() and not moved_page.isRedirectPage():
-                # After the move, moved_page carries the original page's
-                # wikitext. Preserve license, Image-extracted, and category
-                # metadata from it before replacing with the {{DPLA metadata}} block.
-                moved_page.text = merge_preserved_wikitext(
-                    moved_page.text or "", wiki_markup
-                )
-                with_csrf_recovery(
-                    self.site,
-                    f"save {moved_page.title()} (post-drift description)",
-                    lambda: moved_page.save(
-                        summary=(
-                            f"Update description after title drift correction "
-                            f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
-                        ),
-                        minor=False,
-                    ),
-                )
+        # NOTE: we deliberately do NOT rewrite the moved page's description
+        # here. Title/ID drift is DPLA-caused, so the old wikitext's
+        # DPLA-authored fields (id/url/title) legitimately differ from current —
+        # but the page may ALSO carry genuine community contributions. Safely
+        # distinguishing the two needs the revision-history *provenance* walk in
+        # ``ingest_wikimedia.legacy_artwork.migrate_legacy_file``, which the
+        # post-SDC ``sdc-sync`` cleanup (``_post_sdc_cleanup_for_page``) runs on
+        # this file later in the same pipeline: community edits are imported to
+        # SDC and only bot-authored (drifted) fields are replaced with canonical
+        # data. A blunt overwrite here previously discarded community metadata
+        # (e.g. ``{{Creator:...}}``); the move alone restores the title invariant.
 
     def _resolve_hash_drift(
         self,
@@ -1598,7 +1608,6 @@ class Uploader:
         page_title: str,
         dpla_id: str,
         ordinal: int,
-        wiki_markup: str | None = None,
         expected_item_titles: set[str] | None = None,
     ) -> DriftResolution:
         """Resolve the case where our S3 source's SHA1 already lives on
@@ -1801,7 +1810,6 @@ class Uploader:
                 intended_page,
                 dpla_id,
                 "title_text_drift_empty_intended (Case 3)",
-                wiki_markup,
                 post_commonsdelinker=not sibling_slot,
             )
             return DriftResolution.MOVED
@@ -1819,7 +1827,6 @@ class Uploader:
                     intended_page,
                     dpla_id,
                     "title_text_drift_redirect_at_intended (Case 1)",
-                    wiki_markup,
                     post_commonsdelinker=not sibling_slot,
                 )
                 return DriftResolution.MOVED
@@ -1881,17 +1888,26 @@ class Uploader:
         new_filename: str,
         wiki_markup: str,
         dpla_id: str,
+        item_metadata: dict,
+        provider: dict,
+        data_provider: dict,
     ) -> None:
         """Tag a stranded file as duplicate of the new (correct-title)
         file, AND carry any community-contributed metadata from the
         old page across to the new one before the admin-side delete.
 
-        Mirrors what ``_move_to_correct_title`` and
-        ``_resolve_redirect_overwrite`` already do in the move and
-        redirect-overwrite paths: license tags, assessment templates,
-        ``{{Image extracted}}`` parents, and category links community
-        editors have added are preserved via
-        :func:`merge_preserved_wikitext`.
+        This is the one drift path where the source page is *destroyed*, so
+        it does the full community rescue the regular migration does:
+
+        * **Outside the metadata template** — categories, ``{{ImageNote}}``
+          annotations, and every other community template — is carried into
+          the new page's wikitext by :func:`rescue_wikitext`'s node-swap
+          (preserve-by-default: no allowlist to keep in sync with whatever
+          template a community editor reaches for next).
+        * **Inside the old template's params** — values a non-bot editor set
+          — are imported to the new file's SDC by
+          :func:`import_cross_page_community_sdc`, via the same provenance
+          attribution (:func:`plan_migration`) the regular migration uses.
 
         Rescue and tag are independent best-effort steps — a failure
         on either is logged and does NOT block the other. The old
@@ -1926,40 +1942,62 @@ class Uploader:
 
         old_page = get_page(self.site, f"File:{old_filename}")
 
-        # Rescue community contributions, if any.
+        rescue_summary = (
+            f"Rescue community-contributed metadata from "
+            f"[[File:{old_filename}]] (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+        )
+        # Rescue community contributions, if any. SDC first — so a later
+        # wikitext-save failure can't strand the in-template provenance we
+        # imported — then the outside-template node-swap.
         try:
             if old_page.exists():
-                merged = merge_preserved_wikitext(old_page.text or "", wiki_markup)
-                # Equality means nothing matched merge_preserved_wikitext's
-                # patterns. Skip the save so we don't emit a no-op revision
-                # on the new file (the other two preserve sites — move,
-                # redirect-overwrite — don't need this guard because their
-                # destination text always differs from wiki_markup before
-                # the merge, but here new_page already carries wiki_markup
-                # from the upload we just completed).
-                if merged.rstrip() != wiki_markup.rstrip():
-                    # `get_page` is a constructor — no API hit — and we
-                    # know the page exists and isn't a redirect because
-                    # we just uploaded it. Skip the exists/redirect
-                    # round-trips and write directly.
-                    new_page = get_page(self.site, f"File:{new_filename}")
-                    new_page.text = merged
+                # `get_page` is a constructor — no API hit — and we know the
+                # new page exists and isn't a redirect because we just
+                # uploaded it. Skip the exists/redirect round-trips.
+                new_page = get_page(self.site, f"File:{new_filename}")
+                # Resolve the destination pageid explicitly, riding out the
+                # post-upload indexing-lag race, so the SDC import targets a
+                # real MediaInfo entity — a lagged 0/None must never become
+                # the bogus "M0". The wikitext rescue below is independent and
+                # runs regardless.
+                dest_pageid = self._refresh_pageid_with_retries(f"File:{new_filename}")
+                imported = 0
+                if dest_pageid:
+                    imported = import_cross_page_community_sdc(
+                        source_page=old_page,
+                        dest_mediaid=f"M{dest_pageid}",
+                        item_metadata=item_metadata,
+                        provider=provider,
+                        data_provider=data_provider,
+                        dpla_id=dpla_id,
+                        site=self.site,
+                        summary=rescue_summary,
+                    )
+                else:
+                    logging.warning(
+                        f"Skipping community-SDC rescue into "
+                        f"[[File:{new_filename}]]: pageid unresolved post-upload "
+                        f"(sdc-sync's title→pageid fallback recovers next run)."
+                    )
+                rescued = rescue_wikitext(old_page.text or "", wiki_markup)
+                # Equality means the node-swap carried nothing beyond the
+                # fresh block we already uploaded (the old page had no
+                # outside-template content). Skip the save so we don't emit a
+                # no-op revision on the new file.
+                wikitext_changed = rescued.rstrip() != wiki_markup.rstrip()
+                if wikitext_changed:
+                    new_page.text = rescued
                     with_csrf_recovery(
                         self.site,
                         f"save {new_page.title()} (rescue community metadata)",
-                        lambda: new_page.save(
-                            summary=(
-                                f"Rescue community-contributed metadata from "
-                                f"[[File:{old_filename}]] (DPLA ID "
-                                f"[[dpla:{dpla_id}|{dpla_id}]])"
-                            ),
-                            minor=False,
-                        ),
+                        lambda: new_page.save(summary=rescue_summary, minor=False),
                     )
+                if imported or wikitext_changed:
                     logging.info(
                         f"Rescued community-contributed metadata from "
-                        f"[[File:{old_filename}]] into "
-                        f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
+                        f"[[File:{old_filename}]] into [[File:{new_filename}]] "
+                        f"(DPLA ID {dpla_id}; {imported} SDC import(s), "
+                        f"wikitext {'updated' if wikitext_changed else 'unchanged'})"
                     )
         except CsrfRecoveryFailed:
             # Session-level fatal — the community-metadata rescue is a

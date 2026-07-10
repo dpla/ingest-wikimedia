@@ -760,7 +760,6 @@ def test_resolve_hash_drift_case2_skips_tag_when_existing_in_expected_titles():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=4,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "leave_others_alone"
@@ -788,7 +787,6 @@ def test_resolve_hash_drift_case2_still_tags_when_existing_is_true_orphan():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=4,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "upload_and_tag"
@@ -810,7 +808,6 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=4,
-            wiki_markup="",
         )
     assert action == "upload_and_tag"
 
@@ -875,7 +872,6 @@ def test_resolve_hash_drift_404_on_colliding_id_falls_through_to_migration():
             page_title=intended_title,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=2,
-            wiki_markup="",
         )
     assert action == "moved", (
         "404 on the colliding DPLA ID is the rename signal — the orphan "
@@ -903,7 +899,6 @@ def test_resolve_hash_drift_non_404_exception_stays_on_leave_others_alone():
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
-        wiki_markup="",
     )
     assert action == "leave_others_alone"
 
@@ -924,7 +919,6 @@ def test_resolve_hash_drift_5xx_response_stays_on_leave_others_alone():
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
-        wiki_markup="",
     )
     assert action == "leave_others_alone"
 
@@ -942,7 +936,6 @@ def test_resolve_hash_drift_valid_cross_item_collision_leaves_others_alone():
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
-        wiki_markup="",
     )
     assert action == "leave_others_alone"
 
@@ -1178,7 +1171,6 @@ def test_case3_move_suppresses_commonsdelinker_when_actual_is_sibling():
             page_title=_ITEM_PAGE_8,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=11,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "moved"
@@ -1207,7 +1199,6 @@ def test_case3_move_posts_commonsdelinker_when_actual_is_not_sibling():
             page_title=_ITEM_PAGE_8,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=11,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "moved"
@@ -1237,7 +1228,6 @@ def test_case1_move_suppresses_commonsdelinker_when_actual_is_sibling():
             page_title=_ITEM_PAGE_8,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=11,
-            wiki_markup="",
             expected_item_titles=expected_titles,
         )
     assert action == "moved"
@@ -1294,6 +1284,26 @@ def test_move_to_correct_title_posts_with_check_usage_false_when_used():
     assert order == ["usage_check", "move"]
     mock_post.assert_called_once()
     assert mock_post.call_args.kwargs.get("check_usage") is False
+
+
+def test_move_to_correct_title_does_not_rewrite_description_defers_to_cleanup():
+    """Deferral fix: after the title-drift move, the method must NOT rewrite the
+    moved page's description. It previously blind-overwrote it (dropping
+    community metadata like {{Creator:...}}); the community-preserving migration
+    is now left to the post-SDC sdc-sync cleanup. Assert the move still happens
+    but there is no post-move page fetch/save (the only get_page use in this
+    method was the removed description-rewrite block)."""
+    uploader = _build_uploader_with_dpla()
+    existing = _drift_existing_file("Old Title - DPLA - a (page 1).jpg")
+    intended = _make_intended_page("New Title - DPLA - b (page 1).jpg")
+    with (
+        patch("tools.uploader.file_has_inbound_usage", return_value=False),
+        patch("tools.uploader.post_commonsdelinker_request"),
+        patch("tools.uploader.get_page") as mock_get_page,
+    ):
+        uploader._move_to_correct_title(existing, intended, "b", "Case 3")
+    existing.move.assert_called_once()
+    mock_get_page.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1638,12 +1648,13 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
 # _tag_drift_duplicate — rescue + tag combined operation
 #
 # Case 2 hash-drift (``upload_and_tag``) is the only title-correction path
-# where the bot must explicitly preserve community-contributed metadata
-# from the file it's about to queue for deletion (the move and redirect
-# paths do this via merge_preserved_wikitext inline). _tag_drift_duplicate
-# now does both: rescue community categories/licenses/assessments into the
-# new (correct-title) file, then tag the old one. The two steps are
-# independently best-effort so a rescue failure does not block the tag.
+# where the source page is destroyed, so the bot must explicitly preserve
+# community-contributed metadata before queuing it for deletion.
+# _tag_drift_duplicate does both: rescue the old page's content into the new
+# (correct-title) file — outside-template content via rescue_wikitext's
+# node-swap, inside-template community params via import_cross_page_community_sdc
+# — then tag the old one. The steps are independently best-effort so a rescue
+# failure does not block the tag.
 
 
 _NEW_WIKI_MARKUP = "{{DPLA metadata}}\n"
@@ -1667,6 +1678,9 @@ def _drift_uploader_with_pages(
 
     uploader = Uploader.__new__(Uploader)
     uploader.site = MagicMock(name="site")
+    # The tag-duplicate rescue resolves the destination pageid via this helper
+    # before the SDC import; give it a real id so the import path is exercised.
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=42)
 
     old_page = MagicMock(name="old_page")
     old_page.text = old_text
@@ -1694,25 +1708,37 @@ def _patch_get_page(old_page, new_page):
 
 def _call_tag_drift(uploader, old_page, new_page, **patches):
     """Invoke ``_tag_drift_duplicate`` with the standard arg shape so
-    each test asserts on outcomes instead of plumbing the call."""
-    extras = {f"tools.uploader.{name}": value for name, value in patches.items()}
-    with patch(
-        "tools.uploader.get_page",
-        side_effect=_patch_get_page(old_page, new_page),
-    ):
-        if extras:
-            from contextlib import ExitStack
+    each test asserts on outcomes instead of plumbing the call.
 
-            with ExitStack() as stack:
-                for target, value in extras.items():
-                    stack.enter_context(patch(target, value))
-                uploader._tag_drift_duplicate(
-                    "old.jpg", "new.jpg", _NEW_WIKI_MARKUP, _DPLA_ID
-                )
-        else:
-            uploader._tag_drift_duplicate(
-                "old.jpg", "new.jpg", _NEW_WIKI_MARKUP, _DPLA_ID
-            )
+    The inside-template SDC import is patched to a no-op (returns 0) by
+    default, so these tests exercise only the outside-template node-swap
+    rescue; pass ``import_cross_page_community_sdc=<mock>`` to override.
+    """
+    from contextlib import ExitStack
+
+    extras = {f"tools.uploader.{name}": value for name, value in patches.items()}
+    extras.setdefault(
+        "tools.uploader.import_cross_page_community_sdc",
+        MagicMock(return_value=0),
+    )
+    with (
+        patch(
+            "tools.uploader.get_page",
+            side_effect=_patch_get_page(old_page, new_page),
+        ),
+        ExitStack() as stack,
+    ):
+        for target, value in extras.items():
+            stack.enter_context(patch(target, value))
+        uploader._tag_drift_duplicate(
+            "old.jpg",
+            "new.jpg",
+            _NEW_WIKI_MARKUP,
+            _DPLA_ID,
+            item_metadata={},
+            provider={},
+            data_provider={},
+        )
 
 
 def test_rescue_preserves_community_categories_into_new_file():
@@ -1756,11 +1782,58 @@ def test_rescue_preserves_assessment_and_license_templates():
     assert "[[Category:Notable images]]" in saved_text
 
 
+def test_rescue_imports_inside_template_sdc_from_old_page():
+    """The tag-duplicate path invokes the inside-template SDC rescue,
+    passing the OLD page as source and the NEW (survivor) page as dest —
+    since the old page is about to be deleted, its in-template community
+    provenance has to be captured before it's gone."""
+    old_text = "{{Artwork|title=Old}}\n[[Category:Curated]]\n"
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+    sdc_mock = MagicMock(return_value=2)
+
+    with patch("tools.uploader.tag_as_duplicate"):
+        _call_tag_drift(
+            uploader,
+            old_page,
+            new_page,
+            import_cross_page_community_sdc=sdc_mock,
+        )
+
+    sdc_mock.assert_called_once()
+    kwargs = sdc_mock.call_args.kwargs
+    assert kwargs["source_page"] is old_page
+    # Destination targeted by resolved mediaid (pageid refreshed to 42), not a
+    # raw page object — guards against a lagged pageid becoming "M0".
+    assert kwargs["dest_mediaid"] == "M42"
+    assert kwargs["dpla_id"] == _DPLA_ID
+
+
+def test_rescue_skips_sdc_when_pageid_unresolved():
+    """If the destination pageid can't be resolved post-upload (indexing lag),
+    the SDC import is skipped (no bogus M0) while the wikitext rescue and the
+    tag still proceed."""
+    old_text = "{{Artwork|title=Old}}\n[[Category:Curated]]\n"
+    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=None)
+    sdc_mock = MagicMock(return_value=0)
+
+    with patch("tools.uploader.tag_as_duplicate") as tag_mock:
+        _call_tag_drift(
+            uploader, old_page, new_page, import_cross_page_community_sdc=sdc_mock
+        )
+
+    sdc_mock.assert_not_called()  # pageid unresolved → no M0 import
+    assert new_page.save.called  # outside-template wikitext rescue still runs
+    tag_mock.assert_called_once()  # tag still runs
+
+
 def test_rescue_no_save_when_nothing_to_preserve():
-    """If the old page has nothing in merge_preserved_wikitext's
-    pattern set, the new page must NOT be saved — calling save() on
-    identical content would emit a no-op revision on Commons."""
-    # Information template alone is NOT in the preserve set.
+    """If the old page has no content outside its metadata template, the
+    node-swap produces just the fresh block we already uploaded, so the new
+    page must NOT be saved — calling save() on identical content would emit a
+    no-op revision on Commons."""
+    # A bare {{Information}} with nothing around it: node-swapping it for
+    # {{DPLA metadata}} yields exactly wiki_markup, so there's nothing to save.
     old_text = "{{Information|description=Plain text}}\n"
     uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
 
@@ -2753,7 +2826,6 @@ def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_mat
             page_title=raw_page_title,
             dpla_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             ordinal=1,
-            wiki_markup="",
         )
     assert action == "already_correct"
 
@@ -2774,6 +2846,9 @@ def test_tag_drift_duplicate_refuses_self_tag_byte_equal():
             new_filename=same,
             wiki_markup="wt",
             dpla_id="cccccccccccccccccccccccccccccccc",
+            item_metadata={},
+            provider={},
+            data_provider={},
         )
     tag_mock.assert_not_called()
     get_page_mock.assert_not_called()
@@ -2796,6 +2871,9 @@ def test_tag_drift_duplicate_refuses_self_tag_whitespace_run_equal():
             new_filename=double_space,
             wiki_markup="wt",
             dpla_id="dddddddddddddddddddddddddddddddd",
+            item_metadata={},
+            provider={},
+            data_provider={},
         )
     tag_mock.assert_not_called()
     get_page_mock.assert_not_called()
@@ -2811,12 +2889,16 @@ def test_tag_drift_duplicate_still_tags_when_names_genuinely_differ():
     with (
         patch("tools.uploader.tag_as_duplicate") as tag_mock,
         patch("tools.uploader.get_page", return_value=old_page),
-        patch("tools.uploader.merge_preserved_wikitext", return_value="wt"),
+        patch("tools.uploader.rescue_wikitext", return_value="wt"),
+        patch("tools.uploader.import_cross_page_community_sdc", return_value=0),
     ):
         uploader._tag_drift_duplicate(
             old_filename="Old title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
             new_filename="New title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
             wiki_markup="wt",
             dpla_id="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            item_metadata={},
+            provider={},
+            data_provider={},
         )
     tag_mock.assert_called_once()

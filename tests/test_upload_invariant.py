@@ -90,7 +90,6 @@ def test_invariant_corollary_1_cross_item_collision_uploads_to_our_intended_titl
             page_title=our_intended,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=1,
-            wiki_markup="",
         )
 
     assert action is DriftResolution.LEAVE_OTHERS_ALONE, (
@@ -157,7 +156,6 @@ def test_invariant_corollary_2_redirect_at_intended_title_defers_to_overwrite_ha
             page_title=our_intended,
             dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ordinal=1,
-            wiki_markup="",
         )
     assert action is DriftResolution.LEAVE_OTHERS_ALONE, (
         f"expected LEAVE_OTHERS_ALONE (cross-item collision detected "
@@ -202,7 +200,6 @@ def test_invariant_already_satisfied_via_normalized_identity_returns_already_cor
             page_title=raw_page_title,
             dpla_id="cccccccccccccccccccccccccccccccc",
             ordinal=1,
-            wiki_markup="",
         )
 
     assert action is DriftResolution.ALREADY_CORRECT, (
@@ -239,7 +236,6 @@ def test_drift_resolution_sentinel_contract_pin():
             page_title="Ours - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee (page 1).jpg",
             dpla_id="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             ordinal=1,
-            wiki_markup="",
         )
     assert action is DriftResolution.LEAVE_OTHERS_ALONE
     assert action.value == "leave_others_alone"

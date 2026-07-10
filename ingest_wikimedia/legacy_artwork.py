@@ -46,23 +46,44 @@ from ingest_wikimedia.sdc import (
     unescape_wikitext_magic_words,
 )
 
-# DPLA's Commons-bot account names. Revisions authored by these accounts
-# are treated as DPLA-originated for the purpose of provenance
-# classification — any param value they last touched is safe to
-# overwrite with canonical data. Other accounts are treated as
-# community contributors whose edits must be preserved (by importing
-# to SDC) before the wikitext is rewritten.
+# Bot accounts whose edits are treated as DPLA-/import-originated for provenance
+# classification — any param value they last touched is safe to overwrite with
+# canonical data (never preserved as a "community" contribution). Any OTHER
+# account is treated as a community contributor whose edits must be preserved
+# (imported to SDC) before the wikitext is rewritten.
 #
-# Extend this set in a follow-up if older DPLA bot accounts are
-# discovered in the upload-history of long-tenure files. The set is
-# matched case-insensitively against the revision's ``user`` field;
-# add the canonical form a Commons revision history would display.
+# Coverage:
+#   - "DPLA bot"                 — DPLA's current Commons uploader.
+#   - "US National Archives bot" — NARA's own bot. Every pre-2020 NARA upload
+#                                  was made by it (not DPLA's bot), so this folds
+#                                  the oldest NARA files — the highest-risk,
+#                                  most community-curated set — in correctly.
+#   - "Flickr upload bot"        — Flickr2Commons-style imports. Any partner
+#                                  (NARA especially) that also puts collections
+#                                  on Flickr can have a file uploaded by this bot
+#                                  that we later rename; its metadata is
+#                                  automated import data, not community curation.
+#
+# Matched case- AND underscore/space-insensitively against the revision ``user``
+# field (see :func:`_normalize_account`): Commons displays usernames with spaces
+# (e.g. "DPLA bot"), which is the form the API returns, so the space form is
+# canonical here and the underscore variant folds to it.
 DPLA_BOT_ACCOUNTS: frozenset[str] = frozenset(
     {
-        "DPLA_bot",
+        "DPLA bot",
         "US National Archives bot",
+        "Flickr upload bot",
     }
 )
+
+
+def _normalize_account(name: str) -> str:
+    """Casefold and collapse underscores to spaces so ``DPLA_bot`` and
+    ``DPLA bot`` compare equal — MediaWiki treats the two as one username and
+    the API returns the space form, so provenance matching must not depend on
+    which the code happens to write."""
+    return name.casefold().replace("_", " ")
+
 
 # Wikidata items / properties used in the legacy-import reference shape.
 # Hardcoded here (not behind a config knob) because they are part of the
@@ -71,6 +92,15 @@ DPLA_BOT_ACCOUNTS: frozenset[str] = frozenset(
 QID_INFERRED_FROM_WIKITEXT = "Q131783016"  # the source-of-truth item
 PID_BASED_ON_HEURISTIC = "P887"
 PID_WIKIMEDIA_IMPORT_URL = "P4656"
+# Related image (P6802) — a commonsMedia-datatype property pointing at another
+# Commons file. Populated from a legacy template's "other versions" param
+# ({{other version|<file>}}); Module:DPLA already renders it into the yellow
+# box. This is the pipeline's FIRST commonsMedia-typed SDC property: its
+# datavalue serialises as {"type": "string", "value": "<bare filename>"} while
+# the snak's datatype is "commons-media", and Wikibase validates the value
+# against a live Commons file — see _build_related_image_claim and
+# materialize_pending_related_image_claim.
+PID_RELATED_IMAGE = "P6802"
 
 # Per-param Wikidata-property mapping for the SDC import. Each key is a
 # canonical-params key (matching what `dpla_metadata_params` returns);
@@ -122,7 +152,38 @@ ARTWORK_PARAM_TO_CANONICAL_KEY: dict[str, str] = {
 # Template names (case-folded) whose params get walked during migration.
 # Order doesn't matter — if a page carries multiple, only the first
 # match is migrated; the others are left alone for a manual sweep.
-LEGACY_TEMPLATE_NAMES: tuple[str, ...] = ("artwork", "information", "photograph")
+#
+# {{NARA-image-full}} is included: its Title/Description/Date/Author/Creator
+# params share names with the {{Artwork}} form, so they map through
+# ARTWORK_PARAM_TO_CANONICAL_KEY with no NARA-specific parsing. Its many
+# NARA-only archival params (ARC, NAID, record group, series, scope & content,
+# …) have no canonical/SDC target and are dropped on migration — the same
+# treatment any unrecognised param gets on any template — so converting a
+# {{NARA-image-full}} page lifts its four core fields to SDC and does not carry
+# those archival fields onto the new {{DPLA metadata}} form.
+LEGACY_TEMPLATE_NAMES: tuple[str, ...] = (
+    "artwork",
+    "information",
+    "photograph",
+    "nara-image-full",
+)
+
+# Metadata wrappers the cross-page drift rescue can node-swap for a fresh
+# {{DPLA metadata}} block. A superset of LEGACY_TEMPLATE_NAMES: also the
+# already-migrated {{DPLA metadata}} form, since a source page can already be on
+# the new template. The rescue only needs to *locate* the metadata wrapper so it
+# can swap that one node and keep everything else on the page verbatim.
+#
+# This set governs OUTSIDE-template preservation (which node to swap so
+# everything around it survives). It is broader than the set whose
+# INSIDE-template params get lifted to SDC by exactly the {{DPLA metadata}}
+# entry: a source already on {{DPLA metadata}} carries no legacy params for
+# plan_migration to walk, so it is swapped for outside content only. See the
+# asymmetry note in ``import_cross_page_community_sdc``.
+RESCUE_WRAPPER_NAMES: tuple[str, ...] = (
+    *LEGACY_TEMPLATE_NAMES,
+    "dpla metadata",
+)
 
 
 @dataclass(frozen=True)
@@ -170,6 +231,12 @@ class MigrationPlan:
     dpla_originated_params: dict[str, str] = field(default_factory=dict)
     wikitext_preserved_extras: dict[str, str] = field(default_factory=dict)
     artwork_template_name: str = ""
+    # Filenames from the template's "other versions" param ({{other version|X}})
+    # to import as P6802 (related image). Unconditional preserve, NOT
+    # provenance-gated: DPLA has no canonical related-image value, so it is
+    # never "drifted DPLA metadata" — it's an additive Commons relationship kept
+    # for every author. Each becomes one commonsMedia SDC statement.
+    related_image_imports: list[str] = field(default_factory=list)
 
 
 def _template_name(template) -> str:
@@ -318,9 +385,58 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
     return parsed
 
 
-def _is_dpla_bot(user: str) -> bool:
-    """Case-insensitive match against :data:`DPLA_BOT_ACCOUNTS`."""
-    return user.casefold() in {a.casefold() for a in DPLA_BOT_ACCOUNTS}
+# {{other version|<file>}} inside an "other versions" param. Commons filenames
+# can't contain |, {, or }, so [^{}|]+ safely grabs the (first, positional)
+# filename; an optional |extra tail (rare) is consumed but ignored.
+_OTHER_VERSION_RE = re.compile(
+    r"\{\{\s*other[\s_]*version\s*\|([^{}|]+)(?:\|[^{}]*)?\}\}",
+    re.IGNORECASE,
+)
+
+
+def _normalize_commons_filename(name: str) -> str:
+    """Canonicalise a Commons filename to MediaWiki's title form: strip a
+    ``File:`` prefix, underscores → spaces, collapse whitespace runs, and
+    uppercase the first character.
+
+    MediaWiki treats File: titles as first-letter-insensitive and
+    space/underscore-equivalent, so ``rel_image.jpg`` and ``Rel image.jpg`` name
+    the *same* file. Normalising both the extracted value and the stored P6802
+    values makes the dedup and existence checks compare like MediaWiki does (and
+    the value we write already matches the canonical form Wikibase stores, so
+    re-runs dedup cleanly)."""
+    name = name.strip()
+    if name.lower().startswith("file:"):
+        name = name[len("File:") :]
+    name = re.sub(r"[\s_]+", " ", name).strip()
+    if name:
+        name = name[0].upper() + name[1:]
+    return name
+
+
+def _extract_related_image_files(wikitext: str) -> list[str]:
+    """Bare Commons filenames referenced by ``{{other version|<file>}}`` inside
+    the legacy template's *other versions* param — the value form P6802
+    (commonsMedia) stores (no ``File:`` prefix).
+
+    Deduped, order-preserving. ``[]`` when there is no legacy template, no
+    *other versions* param, or no ``{{other version}}`` invocations. Only the
+    ``{{other version|…}}`` shape is parsed; galleries and bare ``[[File:…]]``
+    links in the param are left alone — out of scope, and they have no single
+    unambiguous P6802 target.
+    """
+    template = find_legacy_template(wikitext)
+    if template is None:
+        return []
+    files: list[str] = []
+    for param in template.params:
+        if _normalize_param_name(param) not in ("other versions", "other_versions"):
+            continue
+        for match in _OTHER_VERSION_RE.finditer(str(param.value)):
+            name = _normalize_commons_filename(match.group(1))
+            if name and name not in files:
+                files.append(name)
+    return files
 
 
 def trace_param_provenance(
@@ -394,9 +510,9 @@ def classify_param_provenance(
     default; new bot accounts get added to :data:`DPLA_BOT_ACCOUNTS`
     rather than the per-call argument.
     """
-    bot_set_cf = {a.casefold() for a in bot_accounts}
+    bot_set = {_normalize_account(a) for a in bot_accounts}
     return {
-        key: ("dpla" if editor.casefold() in bot_set_cf else "community")
+        key: ("dpla" if _normalize_account(editor) in bot_set else "community")
         for key, editor in provenance.items()
     }
 
@@ -480,6 +596,11 @@ def plan_migration(
         dpla_originated_params=dpla_originated,
         wikitext_preserved_extras=wikitext_preserved_extras,
         artwork_template_name=_template_name(legacy_template),
+        # Unconditional (not provenance-gated): DPLA has no canonical
+        # related-image value, so an "other versions" reference is never
+        # drifted DPLA metadata — preserve it for every author. See the
+        # MigrationPlan field docstring.
+        related_image_imports=_extract_related_image_files(latest.text),
     )
 
 
@@ -938,6 +1059,31 @@ def _string_datavalue(text: str) -> dict:
     return {"type": "string", "value": text}
 
 
+def _commons_media_datavalue(filename: str) -> dict:
+    # commonsMedia serialises as a plain string datavalue — the SAME shape as a
+    # string value (hence delegating to _string_datavalue). What marks it a file
+    # reference is the snak's ``datatype`` ("commons-media"), not the datavalue
+    # ``type``. The value is the BARE filename (no "File:" prefix); Wikibase
+    # validates it against a live Commons file at write time.
+    return _string_datavalue(filename)
+
+
+def _build_related_image_claim(filename: str, permalink: str) -> dict:
+    """Build a P6802 (related image) commonsMedia statement for ``filename``,
+    with the inferred-from-Wikitext reference shape (P887 + P4656)."""
+    return {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "value",
+            "property": PID_RELATED_IMAGE,
+            "datatype": "commons-media",
+            "datavalue": _commons_media_datavalue(filename),
+        },
+        "references": [_reference_snaks(permalink)],
+    }
+
+
 def format_legacy_import_claim(
     canonical_key: str,
     value: str,
@@ -1029,12 +1175,27 @@ def build_legacy_import_claims(plan: MigrationPlan) -> list[dict]:
     Skips canonical keys with no mapping in
     :data:`LEGACY_IMPORT_PROPERTY` — those values stay in wikitext
     until a later phase widens the supported set.
+
+    Also emits one P6802 (related image) placeholder per
+    ``plan.related_image_imports`` entry. These are placeholders (not final
+    claims) because commonsMedia values are validated against a live Commons
+    file, so :func:`materialize_import_claims` confirms existence in the
+    executor context before emitting the real claim.
     """
     claims: list[dict] = []
     for key, value in plan.community_imports.items():
         claim = format_legacy_import_claim(key, value, plan.source_permalink)
         if claim is not None:
             claims.append(claim)
+    for filename in plan.related_image_imports:
+        claims.append(
+            {
+                "type": "statement",
+                "rank": "normal",
+                "_phase3a_pending_related_image": filename,
+                "_permalink": plan.source_permalink,
+            }
+        )
     return claims
 
 
@@ -1566,6 +1727,82 @@ def materialize_pending_creator_claim(
     return None
 
 
+def _entity_p6802_files(existing_entity: dict | None) -> set[str]:
+    """MediaWiki-normalized filenames already stated in ``existing_entity``'s
+    P6802 (related image) commonsMedia mainsnaks. Used to drop a related-image
+    import the entity already carries, so re-runs don't add duplicate
+    statements. Values are normalized (:func:`_normalize_commons_filename`) so a
+    stored ``Rel_image.jpg`` dedups against an extracted ``rel image.jpg`` —
+    MediaWiki treats them as the same file."""
+    if not existing_entity:
+        return set()
+    statements = (
+        existing_entity.get("statements") or existing_entity.get("claims") or {}
+    )
+    files: set[str] = set()
+    for stmt in statements.get(PID_RELATED_IMAGE, []):
+        ms = stmt.get("mainsnak") or {}
+        if ms.get("snaktype") != "value":
+            continue
+        value = (ms.get("datavalue") or {}).get("value")
+        if isinstance(value, str) and value:
+            files.add(_normalize_commons_filename(value))
+    return files
+
+
+def _commons_file_exists(site, filename: str) -> bool:
+    """True when ``File:<filename>`` exists on Commons.
+
+    ``site is None`` (test / pure contexts) short-circuits to True — the
+    existence gate is a live-Wikibase concern. Any API failure returns False so
+    an unconfirmable file is *dropped* rather than risking the commonsMedia
+    validation error that would fail the whole atomic ``wbeditentity`` bundle.
+    """
+    if site is None:
+        return True
+    try:
+        response = site.simple_request(
+            action="query",
+            titles=f"File:{filename}",
+            format="json",
+        ).submit()
+    except Exception:  # noqa: BLE001 — any lookup failure → treat as absent
+        return False
+    pages = (response.get("query") or {}).get("pages") or {}
+    page = next(iter(pages.values()), None)
+    return page is not None and "missing" not in page and "invalid" not in page
+
+
+def materialize_pending_related_image_claim(
+    placeholder: dict,
+    *,
+    site=None,
+    existing_entity: dict | None = None,
+) -> dict | None:
+    """Convert a Phase-3a related-image placeholder into a real P6802 (related
+    image) commonsMedia statement — or drop it (return ``None``) when:
+
+    * a required sentinel key is missing (defensive), or
+    * the file is already a P6802 value on the entity (re-run dedup), or
+    * the referenced Commons file does not exist / can't be confirmed.
+
+    The last case is the important one: commonsMedia is validated by Wikibase
+    against a live file, so emitting a claim for a missing target would fail the
+    entire atomic ``wbeditentity`` bundle and block the file's other imports.
+    Dropping the one claim keeps the rest; the reference still lives in the
+    page's revision history for manual recovery.
+    """
+    filename = placeholder.get("_phase3a_pending_related_image")
+    permalink = placeholder.get("_permalink")
+    if not filename or not permalink:
+        return None
+    if filename in _entity_p6802_files(existing_entity):
+        return None
+    if not _commons_file_exists(site, filename):
+        return None
+    return _build_related_image_claim(filename, permalink)
+
+
 def materialize_import_claims(
     claims: list[dict],
     *,
@@ -1575,13 +1812,16 @@ def materialize_import_claims(
     """Walk an import-claim list and substitute every Phase-3a
     placeholder for a real Wikibase statement.
 
-    Handles two placeholder shapes: date placeholders (P571 time
-    statements via :func:`materialize_pending_date_claim`) and
-    creator placeholders (P170 statements via
-    :func:`materialize_pending_creator_claim`). Claims without a
+    Handles three placeholder shapes: date placeholders (P571 time
+    statements via :func:`materialize_pending_date_claim`), creator
+    placeholders (P170 statements via
+    :func:`materialize_pending_creator_claim`), and related-image
+    placeholders (P6802 commonsMedia statements via
+    :func:`materialize_pending_related_image_claim`). Claims without a
     placeholder marker pass through unchanged. Placeholders whose
-    materialiser returns ``None`` — duplicate of existing SDC, or
-    an unparseable value — are dropped from the returned list.
+    materialiser returns ``None`` — duplicate of existing SDC, a
+    missing Commons file, or an unparseable value — are dropped from
+    the returned list.
 
     ``site`` and ``existing_entity`` are forwarded to the
     materialisers so they can (a) expand wikitext templates
@@ -1609,6 +1849,12 @@ def materialize_import_claims(
             )
             if real is not None:
                 materialised.append(real)
+        elif "_phase3a_pending_related_image" in claim:
+            real = materialize_pending_related_image_claim(
+                claim, site=site, existing_entity=existing_entity
+            )
+            if real is not None:
+                materialised.append(real)
         else:
             materialised.append(claim)
     return materialised
@@ -1628,12 +1874,17 @@ def entity_was_already_migrated(entity: dict) -> bool:
     today-practice is a manual re-edit).
 
     Looks for a P887 reference snak whose target is exactly
-    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of any
-    Phase-3a-mapped property. Subtle: a non-DPLA editor could in
-    principle stamp the same ref shape on a hand-authored claim, but
-    that's the same semantic ("inferred from Wikitext") and the
-    skip-on-detect behaviour is still correct — we just don't add
-    duplicates.
+    :data:`QID_INFERRED_FROM_WIKITEXT` on any statement of a *scalar* import
+    property (:data:`LEGACY_IMPORT_PROPERTY`). Subtle: a non-DPLA editor could
+    in principle stamp the same ref shape on a hand-authored claim, but that's
+    the same semantic ("inferred from Wikitext") and the skip-on-detect
+    behaviour is still correct — we just don't add duplicates.
+
+    P6802 (related image) is deliberately EXCLUDED from this global trip-wire.
+    It's an always-preserve secondary output with its own value-level dedup in
+    :func:`materialize_pending_related_image_claim`; letting a P6802-only prior
+    import mark the whole file "migrated" would wrongly block a later rescue
+    from picking up a newly-added scalar community value on the source page.
     """
     statements = entity.get("statements") or entity.get("claims") or {}
     for prop, _ in LEGACY_IMPORT_PROPERTY.values():
@@ -1695,17 +1946,60 @@ def render_migrated_wikitext(
     page-level structure survive in their original positions. Only
     the legacy-template node itself is replaced.
     """
+    text, _swapped = _swap_wrapper_node(
+        original_text, new_template_block, LEGACY_TEMPLATE_NAMES
+    )
+    return text
+
+
+def _swap_wrapper_node(
+    original_text: str,
+    new_template_block: str,
+    wrapper_names: tuple[str, ...],
+) -> tuple[str, bool]:
+    """Replace the first template in ``original_text`` whose name is in
+    ``wrapper_names`` with the ``{{DPLA metadata}}`` template extracted
+    from ``new_template_block``, leaving everything else verbatim.
+
+    Returns ``(text, swapped)``. ``swapped`` is False — and ``text`` is
+    ``original_text`` byte-for-byte — when no matching wrapper is present,
+    so callers can distinguish "swapped the wrapper" from "nothing to do"
+    (the shared preserve-by-default primitive behind both the regular
+    migration and the cross-page drift rescue).
+    """
     wikicode = mwparserfromhell.parse(original_text)
-    template = None
     for tpl in wikicode.filter_templates():
-        if _template_name(tpl) in LEGACY_TEMPLATE_NAMES:
-            template = tpl
-            break
-    if template is None:
-        return original_text
-    replacement = _extract_dpla_metadata_template(new_template_block)
-    wikicode.replace(template, replacement)
-    return str(wikicode)
+        if _template_name(tpl) in wrapper_names:
+            wikicode.replace(tpl, _extract_dpla_metadata_template(new_template_block))
+            return str(wikicode), True
+    return original_text, False
+
+
+def rescue_wikitext(source_text: str, new_template_block: str) -> str:
+    """Destination wikitext for a cross-page drift rescue — preserve by default.
+
+    If the source page carries a recognised metadata wrapper
+    (:data:`RESCUE_WRAPPER_NAMES`), node-swap just that wrapper for the fresh
+    ``{{DPLA metadata}}`` block and keep everything else on the source verbatim:
+    categories, ``{{ImageNote}}`` annotations, and every other community
+    template survive with no allowlist to maintain. This is the same mechanism
+    the regular migration (:func:`render_migrated_wikitext`) uses — the drift
+    paths just never adopted it (the node-swap postdates them).
+
+    Only when the source has *no* recognised wrapper — nothing to swap, so
+    preserve-by-default is impossible — fall back to
+    :func:`ingest_wikimedia.wikimedia.merge_preserved_wikitext`, the narrow
+    license/category/assessment allowlist. That no-wrapper case is the sole
+    reason ``merge_preserved_wikitext`` still exists.
+    """
+    text, swapped = _swap_wrapper_node(
+        source_text, new_template_block, RESCUE_WRAPPER_NAMES
+    )
+    if swapped:
+        return text
+    from .wikimedia import merge_preserved_wikitext
+
+    return merge_preserved_wikitext(source_text, new_template_block)
 
 
 def _inject_preserved_extras(text: str, extras: dict[str, str]) -> str:
@@ -1966,6 +2260,92 @@ def migrate_legacy_file(
         wikitext_changed=wikitext_changed,
         plan=plan,
     )
+
+
+def import_cross_page_community_sdc(
+    *,
+    source_page,
+    dest_mediaid: str,
+    item_metadata: dict,
+    provider: dict,
+    data_provider: dict,
+    dpla_id: str,
+    site,
+    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    summary: str | None = None,
+) -> int:
+    """Rescue community-authored, *in-template* metadata from a source page's
+    revision history into the destination file's SDC.
+
+    The cross-page analogue of the SDC half of :func:`migrate_legacy_file`,
+    for the case where the source page is about to be destroyed (tagged as a
+    duplicate) so its history — the only record of who authored each param —
+    won't survive. Node-swapping the wikitext (:func:`rescue_wikitext`)
+    preserves everything *outside* the metadata template, but the template's
+    own params are dropped in the swap; this recovers the ones a non-bot
+    editor set, via the same provenance attribution the regular migration uses
+    (:func:`plan_migration`), and writes them to the destination as
+    inferred-from-Wikitext SDC.
+
+    Reads the SOURCE page's history but writes ``dest_mediaid`` (the
+    DESTINATION's ``M<pageid>`` MediaInfo id — the caller resolves the pageid,
+    riding out post-upload indexing lag, so this never targets a bogus "M0").
+    Idempotent on the destination entity
+    (:func:`entity_was_already_migrated`). Returns the number of
+    community-import claims posted — 0 when the source has no legacy template,
+    nothing community-authored to rescue, or the destination was already
+    migrated.
+    """
+    from .wikimedia import dpla_metadata_params
+
+    # Cheap pre-check before any network I/O. ``plan_migration`` returns None
+    # unless the source's *current* wikitext carries a LEGACY_TEMPLATE_NAMES
+    # wrapper, and that decision rests on the latest revision alone — so gate
+    # on ``source_page.text`` (a single-revision read, usually already cached)
+    # and skip the ``wbgetentities`` round-trip and the full
+    # revision-history-with-content walk ``fetch_revision_snapshots`` does.
+    #
+    # This gate is also where the swap-set/rescue-set asymmetry lives, on
+    # purpose: ``rescue_wikitext`` node-swaps any RESCUE_WRAPPER_NAMES wrapper
+    # (so *outside*-template content is preserved for every wrapper), but only
+    # the LEGACY_TEMPLATE_NAMES wrappers have their *inside*-template params
+    # lifted to SDC here. The one swap-but-not-rescued wrapper is the
+    # already-migrated {{DPLA metadata}} form: it carries no legacy params for
+    # plan_migration to walk, so a source already on it short-circuits with 0 —
+    # no worse than the pre-refactor allowlist, which rescued no inside-template
+    # params at all. Extending SDC rescue to a new wrapper means adding it to
+    # LEGACY_TEMPLATE_NAMES (so find_legacy_template/parse_artwork_params walk
+    # it), not merely widening RESCUE_WRAPPER_NAMES.
+    if find_legacy_template(source_page.text) is None:
+        return 0
+
+    mediaid = dest_mediaid
+    entity = _fetch_entity_or_empty(site, mediaid)
+    if entity_was_already_migrated(entity):
+        return 0
+    canonical_params = dpla_metadata_params(
+        dpla_id, item_metadata, provider, data_provider
+    )
+    plan = plan_migration(
+        source_page.title(),
+        fetch_revision_snapshots(source_page),
+        canonical_params,
+        bot_accounts,
+    )
+    if plan is None or (not plan.community_imports and not plan.related_image_imports):
+        return 0
+    claims = materialize_import_claims(
+        build_legacy_import_claims(plan), site=site, existing_entity=entity
+    )
+    if not claims:
+        return 0
+    post_legacy_import_claims(
+        mediaid,
+        claims,
+        site,
+        summary=summary or build_migration_summary(len(claims)),
+    )
+    return len(claims)
 
 
 def _fetch_entity_or_empty(site, mediaid: str) -> dict:

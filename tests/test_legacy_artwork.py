@@ -431,10 +431,31 @@ def test_classify_respects_explicit_bot_accounts_argument():
 
 def test_dpla_bot_allowlist_contains_known_accounts():
     """Pin the known accounts so a typo'd rename can't silently lose
-    classification coverage for the long-tenure files those bots
-    uploaded."""
-    assert "DPLA_bot" in DPLA_BOT_ACCOUNTS
+    classification coverage for the long-tenure files those bots uploaded.
+    Space form is canonical — it's what the Commons API returns in ``user``."""
+    assert "DPLA bot" in DPLA_BOT_ACCOUNTS
     assert "US National Archives bot" in DPLA_BOT_ACCOUNTS
+    assert "Flickr upload bot" in DPLA_BOT_ACCOUNTS
+
+
+def test_classify_matches_underscore_and_space_username_forms():
+    """Commons returns usernames with spaces ("DPLA bot"); the allowlist stores
+    the space form. Matching must be underscore/space-insensitive so DPLA-bot
+    edits are never misclassified as community — which, for a *drifted* value,
+    would resurrect stale DPLA metadata as a fake community contribution."""
+    classified = classify_param_provenance(
+        {"a": "DPLA bot", "b": "DPLA_bot", "c": "dpla_BOT"}
+    )
+    assert classified == {"a": "dpla", "b": "dpla", "c": "dpla"}
+
+
+def test_classify_flickr_upload_bot_is_dpla():
+    """Flickr2Commons imports are automated import data, not community
+    curation — a file the Flickr bot uploaded and we later renamed must not
+    have its (drifted) fields resurrected as community contributions."""
+    assert classify_param_provenance({"title": "Flickr upload bot"}) == {
+        "title": "dpla"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +509,56 @@ def test_plan_migration_classifies_bot_value_as_dpla_originated():
         "description": "A description",
         "date": "1900",
     }
+
+
+def test_plan_migration_recognizes_nara_image_full():
+    """{{NARA-image-full}} is a recognised migration wrapper: its core params
+    map by NAME through ARTWORK_PARAM_TO_CANONICAL_KEY (no NARA-specific
+    parsing), so a community-edited Title is imported, while its NARA-only
+    archival params (ARC / Record group / …) have no canonical target and are
+    simply dropped — not imported, not errored."""
+    revs = _make_revs(
+        (
+            1,
+            "US National Archives bot",
+            "{{NARA-image-full|Title=A Title|Date=1900|ARC=12345|Record group=RG 26}}",
+        ),
+        (
+            2,
+            "CommunityEditor",
+            "{{NARA-image-full|Title=A Better Title|Date=1900"
+            "|ARC=12345|Record group=RG 26}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    # Community-edited core field rescued via the name-based mapping.
+    assert plan.community_imports == {"title": "A Better Title"}
+    # NARA-only archival params never became canonical keys.
+    assert "ARC" not in plan.dpla_originated_params
+    assert "record group" not in plan.dpla_originated_params
+    # Date matched canonical and was bot-set → dpla-originated (not imported).
+    assert plan.dpla_originated_params.get("date") == "1900"
+
+
+def test_plan_migration_does_not_resurrect_drifted_bot_value():
+    """Core drift-safety property: a value the *bot* last set that now DIFFERS
+    from canonical is drifted DPLA metadata (DPLA-caused) — NOT a community
+    edit — so it must stay dpla-originated (replaced by canonical), never
+    imported as a community contribution. Uses NARA's own bot (its pre-2020
+    uploads) with the space-form username the Commons API returns."""
+    revs = _make_revs(
+        (
+            1,
+            "US National Archives bot",
+            "{{Artwork|title=Old Drifted Title|date=1900}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(title="A Title"))
+    assert plan is not None
+    # Title differs from canonical ("A Title") but was bot-authored → NOT rescued.
+    assert plan.community_imports == {}
+    assert plan.dpla_originated_params["title"] == "Old Drifted Title"
 
 
 def test_plan_migration_imports_community_value_that_differs_from_canonical():
@@ -714,14 +785,20 @@ from ingest_wikimedia.legacy_artwork import (  # noqa: E402
     LEGACY_MIGRATION_BASE_SUMMARY,
     LEGACY_MIGRATION_EDIT_SUMMARY,
     MigrationResult,
+    _build_related_image_claim,
+    _extract_related_image_files,
+    _normalize_commons_filename,
     build_migration_summary,
     entity_was_already_migrated,
     fetch_revision_snapshots,
+    import_cross_page_community_sdc,
     materialize_import_claims,
     materialize_pending_date_claim,
+    materialize_pending_related_image_claim,
     migrate_legacy_file,
     post_legacy_import_claims,
     render_migrated_wikitext,
+    rescue_wikitext,
 )
 
 
@@ -1317,6 +1394,28 @@ def test_render_migrated_wikitext_does_not_duplicate_section_heading():
     assert "[[Category:Foo]]" in result
 
 
+def test_render_migrated_wikitext_preserves_image_notes():
+    """The regular migration is a node-swap, so {{ImageNote}} annotation
+    blocks outside the legacy template survive verbatim. The #397 title-drift
+    fix defers to this path, so it must not drop community image notes."""
+    note = (
+        "{{ImageNote|id=1|x=10|y=20|w=30|h=40|dimx=100|dimy=200|style=2}}\n"
+        "a detail worth noting\n"
+        "{{ImageNoteEnd|id=1}}"
+    )
+    original = (
+        "== {{int:filedesc}} ==\n"
+        "{{Artwork|title=Old}}\n"
+        f"{note}\n"
+        "[[Category:Foo]]"
+    )
+    result = render_migrated_wikitext(original, "{{DPLA metadata|title=New}}")
+    assert "{{Artwork" not in result
+    assert "{{DPLA metadata|title=New}}" in result
+    assert note in result
+    assert "[[Category:Foo]]" in result
+
+
 def test_render_migrated_wikitext_accepts_template_only_block_for_back_compat():
     """The previous test asserts the new caller contract — but the
     extraction step must also be a no-op on the old caller contract
@@ -1398,6 +1497,84 @@ def test_fetch_revision_snapshots_tolerates_missing_user_and_text():
     snapshots = fetch_revision_snapshots(file_page)
     assert len(snapshots) == 1
     assert snapshots[0].user == "" and snapshots[0].text == ""
+
+
+# --- rescue_wikitext (cross-page, preserve-by-default) --------------------
+
+
+def test_rescue_wikitext_node_swaps_and_preserves_everything_outside():
+    """Preserve-by-default: node-swap the source's wrapper for the fresh
+    {{DPLA metadata}} block and keep ALL other content verbatim — including
+    image-note annotations and arbitrary community templates that no
+    allowlist ever enumerated."""
+    note = (
+        "{{ImageNote|id=1|x=10|y=20|w=30|h=40|dimx=100|dimy=200|style=2}}\n"
+        "a community annotation\n"
+        "{{ImageNoteEnd|id=1}}"
+    )
+    source = (
+        "== {{int:filedesc}} ==\n"
+        "{{Artwork|title=Old|creator={{Creator:Jane Doe}}}}\n"
+        f"{note}\n"
+        "{{SomeCommunityTemplate|x=1}}\n"
+        "[[Category:Community curated]]"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata|title=New}}")
+    assert "{{Artwork" not in result
+    assert "{{DPLA metadata|title=New}}" in result
+    assert note in result  # image notes preserved for free
+    assert "{{SomeCommunityTemplate|x=1}}" in result  # arbitrary template preserved
+    assert "[[Category:Community curated]]" in result
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "{{Artwork|title=Old}}",
+        "{{Information|title=Old}}",
+        "{{Photograph|title=Old}}",
+        "{{DPLA metadata|title=Old}}",
+        "{{NARA-image-full|title=Old}}",
+    ],
+)
+def test_rescue_wikitext_recognizes_all_wrappers(wrapper):
+    """Every wrapper the cross-page rescue can meet — the legacy forms, the
+    already-migrated {{DPLA metadata}}, and NARA's {{NARA-image-full}} — is
+    node-swapped for the fresh block, carrying a trailing category through."""
+    source = f"{wrapper}\n[[Category:Keep me]]"
+    result = rescue_wikitext(source, "{{DPLA metadata|title=New}}")
+    assert "{{DPLA metadata|title=New}}" in result
+    assert "[[Category:Keep me]]" in result
+    assert "title=Old" not in result  # old wrapper replaced, not appended
+
+
+def test_rescue_wikitext_falls_back_to_allowlist_when_no_wrapper():
+    """A source with no recognised metadata wrapper can't be node-swapped, so
+    rescue_wikitext falls back to the narrow merge_preserved_wikitext allowlist
+    — license/category kept, an unrecognised community template dropped (the
+    inherent limit of the no-wrapper case, not a regression)."""
+    source = (
+        "{{PD-USGov}}\n{{UnknownCommunityThing|x=1}}\n[[Category:Kept by allowlist]]"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata|title=New}}")
+    assert "{{DPLA metadata|title=New}}" in result
+    assert "{{PD-USGov}}" in result
+    assert "[[Category:Kept by allowlist]]" in result
+    assert "{{UnknownCommunityThing" not in result
+
+
+def test_rescue_wikitext_no_duplicate_heading_with_full_form_block():
+    """Regression (lesson from #299): the live callers pass get_wiki_text's
+    FULL upload form (heading + blank line + template), not a bare template.
+    rescue_wikitext must substitute template-only, so a source that already
+    carries a heading doesn't end up with two."""
+    source = "== {{int:filedesc}} ==\n{{Artwork|title=Old}}\n[[Category:Keep]]"
+    full_form_block = "== {{int:filedesc}} ==\n\n{{DPLA metadata\n| title = New\n}}"
+    result = rescue_wikitext(source, full_form_block)
+    assert result.count("== {{int:filedesc}} ==") == 1
+    assert "{{DPLA metadata" in result
+    assert "{{Artwork" not in result
+    assert "[[Category:Keep]]" in result
 
 
 # --- migrate_legacy_file end-to-end ---------------------------------------
@@ -1556,6 +1733,377 @@ def test_migrate_legacy_file_imports_community_value_and_rewrites_wikitext():
         posted["claims"][0]["mainsnak"]["datavalue"]["value"]["text"]
         == "A Better Title"
     )
+
+
+def test_migrate_legacy_file_converts_nara_image_full_and_drops_archival_params():
+    """A {{NARA-image-full}} page migrates like any legacy template: its
+    community-edited core field imports to SDC and the wrapper is node-swapped
+    for {{DPLA metadata}}. Its NARA-only archival params are not carried onto
+    the new form — accepted loss, they have no canonical/SDC home."""
+
+    class _Rev1:
+        revid = 1
+        user = "US National Archives bot"
+        text = "{{NARA-image-full|Title=A Title|ARC=12345|Record group=RG 26}}"
+
+    class _Rev2:
+        revid = 2
+        user = "CommunityEditor"
+        text = "{{NARA-image-full|Title=A Better Title|ARC=12345|Record group=RG 26}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev2.text, [_Rev1(), _Rev2()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert result.imports_posted == 1
+    assert result.wikitext_changed is True
+    saved = page.text
+    assert "{{NARA-image-full" not in saved
+    assert "{{DPLA metadata" in saved
+    # Archival params dropped on the swap (no canonical/SDC home).
+    assert "ARC" not in saved
+    assert "RG 26" not in saved
+
+
+# --- import_cross_page_community_sdc (cross-page inside-template rescue) ---
+
+
+def test_import_cross_page_community_sdc_imports_from_source_history():
+    """Plans over the SOURCE page's history and posts the community-authored
+    value to the DESTINATION entity — the cross-page analogue of the SDC half
+    of migrate_legacy_file."""
+
+    class _Rev1:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    class _Rev2:
+        revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev2.text, [_Rev1(), _Rev2()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    site.simple_request.return_value.submit.return_value = {"entities": {"M99": {}}}
+
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_mediaid="M99",
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 1
+
+    import json as _json
+
+    wbeditentity = [
+        c
+        for c in site.simple_request.call_args_list
+        if c.kwargs.get("action") == "wbeditentity"
+    ]
+    assert len(wbeditentity) == 1
+    # Written to the DESTINATION entity (M99), not the source page.
+    assert wbeditentity[0].kwargs["id"] == "M99"
+    posted = _json.loads(wbeditentity[0].kwargs["data"])
+    assert (
+        posted["claims"][0]["mainsnak"]["datavalue"]["value"]["text"]
+        == "A Better Title"
+    )
+
+
+def test_import_cross_page_community_sdc_idempotent_on_dest_entity():
+    """If the destination entity already carries a legacy-import ref, bail
+    out with 0 and post nothing — a re-run must not duplicate claims."""
+
+    class _Rev2:
+        revid, user, text = 2, "EditorOne", "{{Artwork|title=A Better Title}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev2.text, [_Rev2()])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": _entity_with_legacy_import("P1476")}
+    }
+
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_mediaid="M42",
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 0
+    assert all(
+        c.kwargs.get("action") != "wbeditentity"
+        for c in site.simple_request.call_args_list
+    )
+
+
+def test_import_cross_page_community_sdc_nothing_to_rescue_on_bot_only_history():
+    """A DPLA-bot-only source history has no community-authored value to
+    import, so nothing is posted and the count is 0."""
+
+    class _Rev:
+        revid, user, text = 1, "DPLA_bot", "{{Artwork|title=A Title}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_mediaid="M42",
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 0
+    assert all(
+        c.kwargs.get("action") != "wbeditentity"
+        for c in site.simple_request.call_args_list
+    )
+
+
+# --- related image (P6802, commonsMedia datatype) -------------------------
+
+
+def test_extract_related_image_files_parses_other_version_templates():
+    wt = (
+        "{{Artwork|title=T|Other versions="
+        "{{other version|File:First related.jpg}}"
+        "{{Other Version|Second related.jpg}}}}"
+    )
+    # File: prefix stripped; case-insensitive template name; order preserved.
+    assert _extract_related_image_files(wt) == [
+        "First related.jpg",
+        "Second related.jpg",
+    ]
+
+
+def test_extract_related_image_files_empty_when_absent():
+    assert _extract_related_image_files("{{Artwork|title=T}}") == []
+    assert _extract_related_image_files("no template here") == []
+
+
+def test_normalize_commons_filename_canonicalises_title_form():
+    # underscore→space, first-letter upper, whitespace collapse, File: strip.
+    assert _normalize_commons_filename("rel_image.jpg") == "Rel image.jpg"
+    assert _normalize_commons_filename("File:rel image.jpg") == "Rel image.jpg"
+    assert _normalize_commons_filename("  a   b.jpg ") == "A b.jpg"
+
+
+def test_extract_related_image_files_normalizes_and_dedups_surface_forms():
+    # rel image.jpg and Rel_image.jpg name the SAME Commons file → one entry,
+    # in MediaWiki's canonical form.
+    wt = (
+        "{{Artwork|Other versions="
+        "{{other version|rel image.jpg}}{{other version|Rel_image.jpg}}}}"
+    )
+    assert _extract_related_image_files(wt) == ["Rel image.jpg"]
+
+
+def test_build_related_image_claim_serialises_commons_media_correctly():
+    """The first commonsMedia-typed property in the pipeline — verify the
+    exact Wikibase shape: string datavalue, 'commons-media' snak datatype,
+    bare filename, standard inferred-from-Wikitext reference."""
+    claim = _build_related_image_claim(
+        "A file.jpg", "https://commons.wikimedia.org/w/index.php?title=X&oldid=1"
+    )
+    ms = claim["mainsnak"]
+    assert ms["property"] == "P6802"
+    assert ms["datatype"] == "commons-media"
+    assert ms["datavalue"] == {"type": "string", "value": "A file.jpg"}
+    assert ms["snaktype"] == "value"
+    ref = claim["references"][0]["snaks"]
+    assert ref["P887"][0]["datavalue"]["value"]["id"] == "Q131783016"
+
+
+def test_plan_migration_extracts_related_images_unconditionally():
+    """Related images are preserved regardless of provenance — a bot-only
+    history (no community edits) still yields the P6802 import, because DPLA
+    has no canonical related-image value to drift from."""
+    revs = _make_revs(
+        (
+            1,
+            "DPLA_bot",
+            "{{Artwork|title=A Title|Other versions={{other version|Rel.jpg}}}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports == {}  # bot-only → nothing provenance-gated
+    assert plan.related_image_imports == ["Rel.jpg"]  # ...but kept anyway
+
+
+def test_build_legacy_import_claims_emits_related_image_placeholder():
+    plan = MigrationPlan(source_permalink="P", related_image_imports=["Rel.jpg"])
+    claims = build_legacy_import_claims(plan)
+    assert len(claims) == 1
+    assert claims[0]["_phase3a_pending_related_image"] == "Rel.jpg"
+    assert claims[0]["_permalink"] == "P"
+
+
+def test_materialize_related_image_builds_when_site_none():
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Rel.jpg", "_permalink": "P"}
+    )
+    assert claim is not None
+    assert claim["mainsnak"]["datatype"] == "commons-media"
+    assert claim["mainsnak"]["datavalue"]["value"] == "Rel.jpg"
+
+
+def test_materialize_related_image_drops_missing_file():
+    """A {{other version}} pointing at a non-existent file is dropped, so it
+    can't fail Wikibase's commonsMedia validation and poison the whole atomic
+    claim bundle."""
+    site = MagicMock()
+    site.simple_request.return_value.submit.return_value = {
+        "query": {"pages": {"-1": {"missing": ""}}}
+    }
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Gone.jpg", "_permalink": "P"}, site=site
+    )
+    assert claim is None
+
+
+def test_materialize_related_image_dedups_existing_p6802():
+    entity = {
+        "statements": {
+            "P6802": [
+                {"mainsnak": {"snaktype": "value", "datavalue": {"value": "Rel.jpg"}}}
+            ]
+        }
+    }
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Rel.jpg", "_permalink": "P"},
+        site=None,
+        existing_entity=entity,
+    )
+    assert claim is None
+
+
+def test_materialize_related_image_dedups_across_title_surface_forms():
+    """CR nitpick: a stored P6802 written as 'Rel_image.jpg' must dedup against
+    an extracted 'Rel image.jpg' — MediaWiki treats them as the same file."""
+    entity = {
+        "statements": {
+            "P6802": [
+                {
+                    "mainsnak": {
+                        "snaktype": "value",
+                        "datavalue": {"value": "Rel_image.jpg"},
+                    }
+                }
+            ]
+        }
+    }
+    claim = materialize_pending_related_image_claim(
+        {"_phase3a_pending_related_image": "Rel image.jpg", "_permalink": "P"},
+        site=None,
+        existing_entity=entity,
+    )
+    assert claim is None
+
+
+def test_entity_was_already_migrated_ignores_p6802_only():
+    """P6802 (related image) is deliberately NOT part of the global migrated
+    trip-wire: a file whose only prior import was a related image must stay
+    eligible so a later rescue can pick up a newly-added scalar community
+    value. (P6802 duplicate-prevention lives in the materializer instead.)"""
+    assert entity_was_already_migrated(_entity_with_legacy_import("P6802")) is False
+    # A scalar import property still trips it.
+    assert entity_was_already_migrated(_entity_with_legacy_import("P1476")) is True
+
+
+def test_migrate_legacy_file_imports_related_image_as_commons_media():
+    """End-to-end: an {{Artwork}} with Other versions={{other version|X}}
+    posts a P6802 commonsMedia claim carrying the bare filename."""
+
+    class _Rev:
+        revid = 1
+        user = "DPLA_bot"
+        text = "{{Artwork|title=A Title|Other versions={{other version|Rel file.jpg}}}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    # One response satisfies both the wbgetentities fetch (entities key) and
+    # the commonsMedia existence query (query.pages, no "missing").
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": {}},
+        "query": {"pages": {"1": {"pageid": 1, "title": "File:Rel file.jpg"}}},
+    }
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert (
+        result.imports_posted == 1
+    )  # only the related image (title matches canonical)
+
+    import json as _json
+
+    wbedit = [
+        c
+        for c in site.simple_request.call_args_list
+        if c.kwargs.get("action") == "wbeditentity"
+    ]
+    assert len(wbedit) == 1
+    posted = _json.loads(wbedit[0].kwargs["data"])["claims"]
+    p6802 = [c for c in posted if c["mainsnak"]["property"] == "P6802"]
+    assert len(p6802) == 1
+    assert p6802[0]["mainsnak"]["datatype"] == "commons-media"
+    assert p6802[0]["mainsnak"]["datavalue"] == {
+        "type": "string",
+        "value": "Rel file.jpg",
+    }
+
+
+def test_import_cross_page_rescues_related_image_with_no_scalar_community():
+    """The cross-page guard must not skip a source whose only rescuable
+    content is a related image (no scalar community_imports)."""
+
+    class _Rev:
+        revid = 1
+        user = "DPLA_bot"
+        text = "{{Artwork|title=A Title|Other versions={{other version|Rel.jpg}}}}"
+
+    source = _mock_file_page("File:Old.jpg", _Rev.text, [_Rev()])
+    item, provider, dp = _item_md()
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    site.simple_request.return_value.submit.return_value = {
+        "entities": {"M42": {}},
+        "query": {"pages": {"1": {"pageid": 1}}},
+    }
+    n = import_cross_page_community_sdc(
+        source_page=source,
+        dest_mediaid="M42",
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert n == 1  # the related image, despite no scalar community imports
 
 
 def test_legacy_migration_edit_summary_mentions_q131783016():
