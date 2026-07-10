@@ -126,11 +126,17 @@ def parse_window_value(text: str | None) -> int:
 
 
 def render_window_value(value: int, doc_note: str = "") -> str:
-    """Render the window page wikitext for ``value``.
+    """Render the window page wikitext for ``value`` from scratch.
 
     The value sits in an <includeonly> block (so transclusion yields exactly
     the integer) followed by a <noinclude> note pointing maintainers at the
     template docs. ``doc_note`` lets callers/tests override the note.
+
+    Used only for the bootstrap case (page absent or its wikitext has no
+    parseable <includeonly>N</includeonly>). On existing pages, callers
+    should use :func:`update_window_value` — the page's <noinclude>
+    documentation may have been edited by maintainers, and overwriting
+    the whole body strips their edits.
     """
     note = doc_note or (
         "This page holds a single integer: the DPLA duplicate moving-window "
@@ -140,6 +146,27 @@ def render_window_value(value: int, doc_note: str = "") -> str:
         "[[Template:DPLA duplicate/doc]]."
     )
     return f"<includeonly>{value}</includeonly><noinclude>\n{note}\n</noinclude>"
+
+
+def update_window_value(existing_text: str, value: int) -> str:
+    """Return ``existing_text`` with the <includeonly> integer replaced by
+    ``value``; everything else (noinclude docs, layout, community edits)
+    is preserved verbatim.
+
+    Falls back to :func:`render_window_value` when no
+    ``<includeonly>N</includeonly>`` block is found.
+    """
+    new_text, n = _WINDOW_VALUE_RE.subn(
+        f"<includeonly>{value}</includeonly>", existing_text, count=1
+    )
+    if n == 0:
+        logging.warning(
+            "window page has no parseable <includeonly>N</includeonly>; "
+            "rebuilding from scratch — any maintainer-authored noinclude "
+            "documentation will be lost"
+        )
+        return render_window_value(value)
+    return new_text
 
 
 def compute_release_plan(
@@ -350,7 +377,11 @@ def main() -> int:
         return 0
 
     site.login()  # only reached when actually releasing — never on no-op runs
-    window_page.text = render_window_value(plan.new_window)
+    # In-place integer swap so any human-edited noinclude documentation is
+    # preserved. Prior full-page rewrite via ``render_window_value`` wiped
+    # maintainer edits every advance — see the 2026-07-10 diff on
+    # Template:DPLA duplicate/moving window.
+    window_page.text = update_window_value(window_page.text, plan.new_window)
     window_page.save(
         summary=(
             f"Advance DPLA duplicate moving window {current_window} → "
