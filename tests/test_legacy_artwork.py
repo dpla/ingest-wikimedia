@@ -511,6 +511,36 @@ def test_plan_migration_classifies_bot_value_as_dpla_originated():
     }
 
 
+def test_plan_migration_recognizes_nara_image_full():
+    """{{NARA-image-full}} is a recognised migration wrapper: its core params
+    map by NAME through ARTWORK_PARAM_TO_CANONICAL_KEY (no NARA-specific
+    parsing), so a community-edited Title is imported, while its NARA-only
+    archival params (ARC / Record group / …) have no canonical target and are
+    simply dropped — not imported, not errored."""
+    revs = _make_revs(
+        (
+            1,
+            "US National Archives bot",
+            "{{NARA-image-full|Title=A Title|Date=1900|ARC=12345|Record group=RG 26}}",
+        ),
+        (
+            2,
+            "CommunityEditor",
+            "{{NARA-image-full|Title=A Better Title|Date=1900"
+            "|ARC=12345|Record group=RG 26}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    # Community-edited core field rescued via the name-based mapping.
+    assert plan.community_imports == {"title": "A Better Title"}
+    # NARA-only archival params never became canonical keys.
+    assert "ARC" not in plan.dpla_originated_params
+    assert "record group" not in plan.dpla_originated_params
+    # Date matched canonical and was bot-set → dpla-originated (not imported).
+    assert plan.dpla_originated_params.get("date") == "1900"
+
+
 def test_plan_migration_does_not_resurrect_drifted_bot_value():
     """Core drift-safety property: a value the *bot* last set that now DIFFERS
     from canonical is drifted DPLA metadata (DPLA-caused) — NOT a community
@@ -1699,6 +1729,43 @@ def test_migrate_legacy_file_imports_community_value_and_rewrites_wikitext():
         posted["claims"][0]["mainsnak"]["datavalue"]["value"]["text"]
         == "A Better Title"
     )
+
+
+def test_migrate_legacy_file_converts_nara_image_full_and_drops_archival_params():
+    """A {{NARA-image-full}} page migrates like any legacy template: its
+    community-edited core field imports to SDC and the wrapper is node-swapped
+    for {{DPLA metadata}}. Its NARA-only archival params are not carried onto
+    the new form — accepted loss, they have no canonical/SDC home."""
+
+    class _Rev1:
+        revid = 1
+        user = "US National Archives bot"
+        text = "{{NARA-image-full|Title=A Title|ARC=12345|Record group=RG 26}}"
+
+    class _Rev2:
+        revid = 2
+        user = "CommunityEditor"
+        text = "{{NARA-image-full|Title=A Better Title|ARC=12345|Record group=RG 26}}"
+
+    page = _mock_file_page("File:Foo.jpg", _Rev2.text, [_Rev1(), _Rev2()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()
+    result = migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    assert result.imports_posted == 1
+    assert result.wikitext_changed is True
+    saved = page.text
+    assert "{{NARA-image-full" not in saved
+    assert "{{DPLA metadata" in saved
+    # Archival params dropped on the swap (no canonical/SDC home).
+    assert "ARC" not in saved
+    assert "RG 26" not in saved
 
 
 # --- import_cross_page_community_sdc (cross-page inside-template rescue) ---

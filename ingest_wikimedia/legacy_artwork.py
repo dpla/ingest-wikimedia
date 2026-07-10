@@ -143,27 +143,37 @@ ARTWORK_PARAM_TO_CANONICAL_KEY: dict[str, str] = {
 # Template names (case-folded) whose params get walked during migration.
 # Order doesn't matter — if a page carries multiple, only the first
 # match is migrated; the others are left alone for a manual sweep.
-LEGACY_TEMPLATE_NAMES: tuple[str, ...] = ("artwork", "information", "photograph")
+#
+# {{NARA-image-full}} is included: its Title/Description/Date/Author/Creator
+# params share names with the {{Artwork}} form, so they map through
+# ARTWORK_PARAM_TO_CANONICAL_KEY with no NARA-specific parsing. Its many
+# NARA-only archival params (ARC, NAID, record group, series, scope & content,
+# …) have no canonical/SDC target and are dropped on migration — the same
+# treatment any unrecognised param gets on any template — so converting a
+# {{NARA-image-full}} page lifts its four core fields to SDC and does not carry
+# those archival fields onto the new {{DPLA metadata}} form.
+LEGACY_TEMPLATE_NAMES: tuple[str, ...] = (
+    "artwork",
+    "information",
+    "photograph",
+    "nara-image-full",
+)
 
 # Metadata wrappers the cross-page drift rescue can node-swap for a fresh
 # {{DPLA metadata}} block. A superset of LEGACY_TEMPLATE_NAMES: also the
-# already-migrated {{DPLA metadata}} form (a source page can already be on the
-# new template) and NARA's {{NARA-image-full}}. The rescue only needs to
-# *locate* the metadata wrapper so it can swap that one node and keep everything
-# else on the page verbatim — it does not parse the wrapper's params, so
-# {{NARA-image-full}} is fine here even though its param mapping isn't wired for
-# the regular migration yet. The regular migration keeps using the narrower
-# LEGACY_TEMPLATE_NAMES (it only ever runs on a not-yet-migrated legacy page and
-# must not treat an existing {{DPLA metadata}} as swappable).
+# already-migrated {{DPLA metadata}} form, since a source page can already be on
+# the new template. The rescue only needs to *locate* the metadata wrapper so it
+# can swap that one node and keep everything else on the page verbatim.
 #
-# This set governs OUTSIDE-template preservation only (which node to swap so
-# everything around it survives). It is deliberately broader than the set whose
-# INSIDE-template params get lifted to SDC — see the asymmetry note in
-# ``import_cross_page_community_sdc`` before widening it.
+# This set governs OUTSIDE-template preservation (which node to swap so
+# everything around it survives). It is broader than the set whose
+# INSIDE-template params get lifted to SDC by exactly the {{DPLA metadata}}
+# entry: a source already on {{DPLA metadata}} carries no legacy params for
+# plan_migration to walk, so it is swapped for outside content only. See the
+# asymmetry note in ``import_cross_page_community_sdc``.
 RESCUE_WRAPPER_NAMES: tuple[str, ...] = (
     *LEGACY_TEMPLATE_NAMES,
     "dpla metadata",
-    "nara-image-full",
 )
 
 
@@ -2091,14 +2101,15 @@ def import_cross_page_community_sdc(
     #
     # This gate is also where the swap-set/rescue-set asymmetry lives, on
     # purpose: ``rescue_wikitext`` node-swaps any RESCUE_WRAPPER_NAMES wrapper
-    # (so *outside*-template content is preserved for every wrapper, including
-    # {{DPLA metadata}} and {{NARA-image-full}}), but only the machine-parseable
-    # LEGACY_TEMPLATE_NAMES wrappers have their *inside*-template params lifted
-    # to SDC here. A source already on {{DPLA metadata}}/{{NARA-image-full}}
-    # short-circuits with 0 — no worse than the pre-refactor allowlist, which
-    # rescued no inside-template params at all. Extending SDC rescue to a new
-    # wrapper means teaching plan_migration/find_legacy_template to parse it,
-    # not merely widening RESCUE_WRAPPER_NAMES.
+    # (so *outside*-template content is preserved for every wrapper), but only
+    # the LEGACY_TEMPLATE_NAMES wrappers have their *inside*-template params
+    # lifted to SDC here. The one swap-but-not-rescued wrapper is the
+    # already-migrated {{DPLA metadata}} form: it carries no legacy params for
+    # plan_migration to walk, so a source already on it short-circuits with 0 —
+    # no worse than the pre-refactor allowlist, which rescued no inside-template
+    # params at all. Extending SDC rescue to a new wrapper means adding it to
+    # LEGACY_TEMPLATE_NAMES (so find_legacy_template/parse_artwork_params walk
+    # it), not merely widening RESCUE_WRAPPER_NAMES.
     if find_legacy_template(source_page.text) is None:
         return 0
 
