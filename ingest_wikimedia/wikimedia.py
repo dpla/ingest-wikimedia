@@ -957,8 +957,10 @@ _ASSESSMENT_TEMPLATE_RE = re.compile(
 def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     """Append preserved metadata from existing_text to new_wikitext.
 
-    Used when the uploader rewrites a file description after a title-drift
-    move or redirect-overwrite. The new {{DPLA metadata}} wikitext is
+    Used when the uploader rewrites a file description during a
+    redirect-overwrite or a cross-page metadata rescue (see the Scope note
+    below for the exact call sites — the title-drift *move* path no longer
+    calls this). The new {{DPLA metadata}} wikitext is
     authoritative for the file's description, but page-level metadata that
     pre-existed — PD-USGov license tags, Image-extracted parent links,
     category membership, and assessment-class templates — must survive the
