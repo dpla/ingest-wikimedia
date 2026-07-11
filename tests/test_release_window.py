@@ -167,9 +167,14 @@ def test_update_window_value_first_includeonly_only():
         "</noinclude>"
     )
     out = update_window_value(text, 99)
-    # First block updated, second (documentation example) untouched.
-    assert out.count("<includeonly>99</includeonly>") == 1
-    assert out.count("<includeonly>0</includeonly>") == 1
+    # Aggregate counts alone would pass even if the WRONG block got updated
+    # (both start with 0). Assert the full expected output so the FIRST
+    # block is provably the one that changed.
+    assert out == (
+        "<includeonly>99</includeonly><noinclude>\n"
+        "Example transclusion body: <includeonly>0</includeonly>\n"
+        "</noinclude>"
+    )
 
 
 # --------------------------------------------------------------------------
