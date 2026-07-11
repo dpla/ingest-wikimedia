@@ -916,10 +916,39 @@ def _build_rights_claims(
     effects. Order of precedence:
       * If the rights URI maps via rights.json, emit the mapped P275 or
         P6426 claim and a parallel P6216 (status) derived from it.
-      * Public Domain Mark gets a P6216=Q19652 status directly.
+      * Public Domain Mark is a rights-statement declaration (not a
+        copyright license), so it does NOT emit a P275 claim — see below.
     """
     out: list[dict] = []
     rs_key = normalize_rights_uri(rs)
+
+    # PDM (Creative Commons Public Domain Mark) is not a copyright license —
+    # it's an assertion by the source institution that the work is already in
+    # the public domain. Emitting it as a P275 (copyright license) claim, as
+    # rights.json would have us do, produces SDC that Module:License's branch
+    # table can't reconcile: a subsequent community edit adding a second P6216
+    # value trips the ``#cs>=2, #cl>=1`` branch that falls through to an empty
+    # bundle, and no license template renders on the file page.
+    #
+    # Express the PD assertion structurally via a bare P6216=Q19652 (public
+    # domain) statement instead. Module:DPLA reads this shape and emits
+    # ``{{PD-US}}`` directly, matching what the source institution has
+    # declared via PDM without asserting a specific reason (e.g. >95 years
+    # old, government work) that our upstream data doesn't warrant. The
+    # corresponding ``rights.json`` PDM entry has been removed so this branch
+    # is the single source of truth.
+    if rs_key == PD_MARK_URI_CANONICAL:
+        out.append(
+            formattedclaim(
+                "P6216",
+                _item_value(Q_PUBLIC_DOMAIN),
+                "wikibase-entityid",
+                dpla_id,
+                retrieval_date,
+            )
+        )
+        return out
+
     rights_entry = rights.get(rs_key)
     status_prop: str | None = None
     status_qid: str | None = None
@@ -939,9 +968,6 @@ def _build_rights_claims(
             status_prop, status_qid = "P6216", Q_PUBLIC_DOMAIN
         if qid == Q_PD_MARK_RAW:
             status_prop, status_qid = "P6216", Q_CC0_PD_SOMEWHERE
-
-    if rs_key == PD_MARK_URI_CANONICAL:
-        status_prop, status_qid = "P6216", Q_PUBLIC_DOMAIN
 
     if status_prop is not None and status_qid is not None:
         out.append(

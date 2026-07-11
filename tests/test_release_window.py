@@ -28,6 +28,7 @@ _spec.loader.exec_module(release_window)
 
 parse_window_value = release_window.parse_window_value
 render_window_value = release_window.render_window_value
+update_window_value = release_window.update_window_value
 compute_release_plan = release_window.compute_release_plan
 is_dpla_duplicate_title = release_window.is_dpla_duplicate_title
 
@@ -105,6 +106,75 @@ def test_render_window_value_transcludes_only_the_integer():
     assert "<noinclude>" in out and "</noinclude>" in out
     # Note text lives only in the noinclude section.
     assert out.index("777") < out.index("<noinclude>")
+
+
+def test_update_window_value_preserves_maintainer_edits():
+    """The 2026-07-10 regression: every window advance overwrote the whole
+    page via ``render_window_value`` and lost the noinclude documentation a
+    maintainer had expanded (``<code>`` blocks, a ``<nowiki>`` example,
+    prose). ``update_window_value`` must swap only the <includeonly>
+    integer and leave everything else byte-identical."""
+    existing = (
+        "<includeonly>0</includeonly><noinclude>\n"
+        "This page holds a single integer: the [[Template:DPLA duplicate]]\n"
+        "moving-window cutoff. A file tagged with "
+        "<code><nowiki>{{DPLA duplicate}}</nowiki></code> is released into "
+        "[[:Category:Duplicate]] when its <code>ts</code> sort key is less "
+        "than this value. It is maintained automatically by the "
+        "<code>dpla-dup-window</code> scheduled job, which advances it just "
+        "enough to keep the target number of DPLA files visible to "
+        "administrators as they clear the queue. The value is monotonic "
+        "and starts at <code>0</code> (nothing released).\n\n"
+        "'''Do not edit this page by hand.''' See "
+        "[[Template:DPLA duplicate/doc]].\n</noinclude>"
+    )
+    out = update_window_value(existing, 178328765700001)
+    assert "<includeonly>178328765700001</includeonly>" in out
+    # The entire noinclude body must be preserved verbatim.
+    _, _, tail_before = existing.partition("</includeonly>")
+    _, _, tail_after = out.partition("</includeonly>")
+    assert tail_before == tail_after
+
+
+def test_update_window_value_bootstrap_when_page_missing_or_bare():
+    """No parseable <includeonly> block → fall back to rendering the full
+    page. Covers both the missing-page (empty text) and never-initialised
+    (arbitrary content) cases so the job self-heals on a corrupted page."""
+    for empty in ("", "no includeonly here"):
+        out = update_window_value(empty, 42)
+        assert "<includeonly>42</includeonly>" in out
+        assert "<noinclude>" in out
+
+
+def test_update_window_value_preserves_tag_casing_and_inner_whitespace():
+    """The wrapper tags and any whitespace immediately inside the
+    ``<includeonly>`` block are maintainer choices — casing (uppercase,
+    mixed) or padding (``\\n  0  \\n``) may be deliberate. Substitute only
+    the digits; leave the wrapper byte-identical."""
+    existing = "<INCLUDEONLY>\n  0  \n</INCLUDEONLY><noinclude>docs</noinclude>"
+    out = update_window_value(existing, 99)
+    assert out == "<INCLUDEONLY>\n  99  \n</INCLUDEONLY><noinclude>docs</noinclude>"
+
+
+def test_update_window_value_first_includeonly_only():
+    """Guardrail: only the first <includeonly> block is substituted. A
+    maintainer might document the template body inside another
+    <includeonly> block as an example (nested inside a <noinclude> so it
+    doesn't actually transclude); a global replace would corrupt it."""
+    text = (
+        "<includeonly>0</includeonly><noinclude>\n"
+        "Example transclusion body: <includeonly>0</includeonly>\n"
+        "</noinclude>"
+    )
+    out = update_window_value(text, 99)
+    # Aggregate counts alone would pass even if the WRONG block got updated
+    # (both start with 0). Assert the full expected output so the FIRST
+    # block is provably the one that changed.
+    assert out == (
+        "<includeonly>99</includeonly><noinclude>\n"
+        "Example transclusion body: <includeonly>0</includeonly>\n"
+        "</noinclude>"
+    )
 
 
 # --------------------------------------------------------------------------

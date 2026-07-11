@@ -2010,17 +2010,7 @@ def test_post_sdc_cleanup_dispatches_to_strip_on_new_template(monkeypatch):
                 "P1476": [
                     {
                         "mainsnak": {"snaktype": "value"},
-                        "qualifiers": {
-                            "P459": [
-                                {
-                                    "snaktype": "value",
-                                    "datavalue": {
-                                        "value": {"id": "Q61848113"},
-                                        "type": "wikibase-entityid",
-                                    },
-                                }
-                            ]
-                        },
+                        "references": [_dpla_reference()],
                     }
                 ]
             }
@@ -4619,10 +4609,10 @@ def test_resolve_pageid_from_title_prepends_file_namespace(monkeypatch):
     )
 
 
-def test_entity_has_dpla_attributed_claims_finds_p459_q61848113():
-    """The cleanup guard's notion of "has DPLA SDC" matches
+def test_entity_has_dpla_attributed_claims_finds_dpla_reference():
+    """The cleanup guard's notion of "has DPLA SDC" mirrors
     Module:DPLA's ``isDplaDetermined`` filter: at least one statement
-    with P459 = Q61848113 qualifier."""
+    with a DPLA-authored reference (P123 = Q2944483)."""
     from tools import sdc_sync
 
     entity = {
@@ -4630,17 +4620,7 @@ def test_entity_has_dpla_attributed_claims_finds_p459_q61848113():
             "P195": [
                 {
                     "mainsnak": {"snaktype": "value"},
-                    "qualifiers": {
-                        "P459": [
-                            {
-                                "snaktype": "value",
-                                "datavalue": {
-                                    "value": {"id": "Q61848113"},
-                                    "type": "wikibase-entityid",
-                                },
-                            }
-                        ]
-                    },
+                    "references": [_dpla_reference()],
                 }
             ]
         }
@@ -4658,10 +4638,9 @@ def test_entity_has_dpla_attributed_claims_false_on_empty_entity():
     assert sdc_sync._entity_has_dpla_attributed_claims({"statements": {}}) is False
 
 
-def test_entity_has_dpla_attributed_claims_false_on_unrelated_p459_value():
-    """Other heuristic determination Q-IDs (e.g. P459 = Q131783016
-    for inferred-from-Wikitext community-import claims) don't count
-    as DPLA-attributed."""
+def test_entity_has_dpla_attributed_claims_false_on_foreign_reference():
+    """Community-added statements carry non-DPLA references (or none).
+    The guard must not classify them as DPLA-attributed."""
     from tools import sdc_sync
 
     entity = {
@@ -4669,17 +4648,7 @@ def test_entity_has_dpla_attributed_claims_false_on_unrelated_p459_value():
             "P1476": [
                 {
                     "mainsnak": {"snaktype": "value"},
-                    "qualifiers": {
-                        "P459": [
-                            {
-                                "snaktype": "value",
-                                "datavalue": {
-                                    "value": {"id": "Q131783016"},
-                                    "type": "wikibase-entityid",
-                                },
-                            }
-                        ]
-                    },
+                    "references": [_foreign_reference()],
                 }
             ]
         }
@@ -4770,17 +4739,7 @@ def test_post_sdc_cleanup_for_page_strips_when_entity_has_dpla_sdc(monkeypatch):
                 "P1476": [
                     {
                         "mainsnak": {"snaktype": "value"},
-                        "qualifiers": {
-                            "P459": [
-                                {
-                                    "snaktype": "value",
-                                    "datavalue": {
-                                        "value": {"id": "Q61848113"},
-                                        "type": "wikibase-entityid",
-                                    },
-                                }
-                            ]
-                        },
+                        "references": [_dpla_reference()],
                     }
                 ]
             }

@@ -924,6 +924,84 @@ def test_build_claims_for_doc_tolerates_missing_rights_field():
     )
 
 
+def test_build_rights_claims_pdm_emits_bare_public_domain_status():
+    """CC's Public Domain Mark is a rights-statement declaration, not a
+    copyright license — emitting it as a P275 (copyright license) claim
+    (as rights.json would naively have us do) produces SDC that
+    Module:License's branch table can't reconcile. Assert the shape we
+    write instead: a single P6216=Q19652 (public domain) statement,
+    DPLA-authored via ``formattedclaim``'s default reference triple + P459
+    qualifier. No P275, no jurisdiction qualifier, no reason-specific
+    determination method — PDM doesn't warrant asserting a particular
+    reason (>95 years old, government work, etc.). Module:DPLA reads this
+    shape and emits ``{{PD-US}}`` directly."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import (
+        PD_MARK_URI_CANONICAL,
+        _build_rights_claims,
+        load_rights_json,
+    )
+
+    claims = _build_rights_claims(
+        PD_MARK_URI_CANONICAL,
+        load_rights_json(),
+        "abc1234567890",
+        _dt.date(2026, 7, 10),
+    )
+
+    props = [c["mainsnak"]["property"] for c in claims]
+    assert props == ["P6216"], (
+        f"PDM shape must be a single P6216 statement, got {props}"
+    )
+    p6216 = claims[0]
+    assert p6216["mainsnak"]["datavalue"]["value"]["numeric-id"] == 19652
+
+    # Only the default P459=Q61848113 (heuristic) qualifier is stamped by
+    # ``formattedclaim`` — no P1001, no reason-specific determination method.
+    quals = p6216["qualifiers"]
+    assert list(quals.keys()) == ["P459"], (
+        f"PDM P6216 must carry only the default P459 qualifier; got {list(quals.keys())}"
+    )
+    assert quals["P459"][0]["datavalue"]["value"]["numeric-id"] == 61848113
+
+    # DPLA-provenance reference triple present.
+    assert any(
+        any(
+            snak.get("datavalue", {}).get("value", {}).get("numeric-id") == 2944483
+            for snak in ref.get("snaks", {}).get("P123", [])
+        )
+        for ref in p6216.get("references", [])
+    ), "PDM shape must carry the DPLA-publisher reference marker"
+
+
+def test_build_rights_claims_pdm_uri_variants_all_route_through_pdm_branch():
+    """DPLA emits the PDM URI in http/https and with/without trailing
+    slash variants. ``normalize_rights_uri`` canonicalises all of them
+    to the same key, and the PDM branch must fire regardless of which
+    variant the source record supplies. Failing on any of these would
+    leak the old rights.json-driven P275=Q7257361 shape into a subset
+    of PDM ingests."""
+    import datetime as _dt
+
+    from ingest_wikimedia.sdc import _build_rights_claims, load_rights_json
+
+    rights = load_rights_json()
+    for variant in (
+        "http://creativecommons.org/publicdomain/mark/1.0",
+        "http://creativecommons.org/publicdomain/mark/1.0/",
+        "https://creativecommons.org/publicdomain/mark/1.0",
+        "https://creativecommons.org/publicdomain/mark/1.0/",
+    ):
+        claims = _build_rights_claims(
+            variant, rights, "abc1234567890", _dt.date(2026, 7, 10)
+        )
+        props = [c["mainsnak"]["property"] for c in claims]
+        assert props == ["P6216"], (
+            f"variant {variant!r} produced {props} instead of a single P6216"
+        )
+
+
 def test_build_source_claim_never_stamps_p2699():
     """``P2699`` is per-ordinal — different ordinals of the same DPLA
     item have different download URLs, so the qualifier can't be baked

@@ -373,11 +373,17 @@ def _fetch_entity_for_cleanup_guard(mediaid: str) -> dict:
 
 
 def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
-    """True iff ``entity`` carries at least one statement with the
-    DPLA-attribution qualifier (``P459 = Q61848113``, "heuristic" →
-    "DPLA"). Mirrors :func:`Module:DPLA`'s ``isDplaDetermined`` filter
-    on Commons so the guard's notion of "has DPLA SDC" matches the
-    template renderer's notion exactly.
+    """True iff ``entity`` carries at least one DPLA-attributed statement.
+
+    Mirrors :func:`Module:DPLA`'s ``isDplaDetermined`` filter on Commons:
+    the canonical DPLA-provenance marker is the ``P123 = Q2944483``
+    (publisher = DPLA) snak in any statement reference, stamped by
+    ``formattedclaim`` on every claim DPLA writes. The prior implementation
+    checked the ``P459 = Q61848113`` qualifier instead — a display-side
+    co-stamp that isn't a reference-independent marker — despite the
+    docstring already claiming alignment with Module:DPLA. Detecting
+    provenance via the reference closes that drift and keeps this guard
+    aligned with the template renderer's notion of "has DPLA SDC".
     """
     if not entity:
         return False
@@ -390,13 +396,8 @@ def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
         for stmt in stmt_list:
             if not isinstance(stmt, dict):
                 continue
-            quals = stmt.get("qualifiers") or {}
-            for q in quals.get("P459", []):
-                dv = q.get("datavalue") if isinstance(q, dict) else None
-                if not isinstance(dv, dict):
-                    continue
-                val = dv.get("value")
-                if isinstance(val, dict) and val.get("id") == "Q61848113":
+            for reference in stmt.get("references") or []:
+                if _is_dpla_reference(reference):
                     return True
     return False
 
