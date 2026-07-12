@@ -849,6 +849,19 @@ def _split_embedded_creator_templates(
     return [(kind, cap) for _s, _e, kind, cap in found], remainder
 
 
+def _creator_sdc_clean(value: str) -> bool:
+    """A community creator value is SDC-clean iff, after splitting out recognised
+    embedded creator templates ({{Creator:}}/{{Unknown}}), the leftover stated-as
+    text carries NO residual template ({{...}}) or wikilink ([[...]]) markup —
+    i.e. it can be stored as a clean SDC string (a P170 QID, or a P170 somevalue
+    + P2093 stated-as). Otherwise the value carries rich wikitext that can't be
+    an SDC string and belongs on the wikitext creator param instead (where its
+    markup renders); :func:`_community_value_unfit_for_sdc` routes it there."""
+    parts, remainder = _split_embedded_creator_templates(value)
+    check = remainder if parts is not None else value
+    return "{{" not in check and "[[" not in check
+
+
 def _extract_institution_qid(value: str) -> str | None:
     """Return the inner Q-ID from a wikitext ``institution`` param
     value, or ``None`` if the value isn't a bare Q-ID or an
@@ -940,25 +953,26 @@ def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
     """True when a community value can't be posted as an SDC claim and must be
     preserved on the migrated template's param instead of dropped.
 
-    Two cases:
+    Cases (any one routes the value to wikitext preservation):
 
-    * **No SDC import mapping at all** (``permission``, ``source``,
-      ``institution`` — not in :data:`LEGACY_IMPORT_PROPERTY`). These have no
-      Phase-3a claim builder, so a *community* override of one — e.g. a
-      hand-set ``permission = {{PD-old-auto-1923|deathyear=1922}}`` — would
-      otherwise land in ``community_imports`` and be silently dropped
-      (``format_legacy_import_claim`` returns ``None``). Preserve it on the
-      template param, where Module:DPLA renders it in the yellow box.
-    * **SDC-mappable but vertical-whitespace-bearing** (``title``/
-      ``description`` monolingualtext, ``creator`` string): the Wikibase text
-      validators reject newlines/tabs/CR, so a value with such whitespace that
-      is *not* a DPLA-prefixed extension (:func:`_split_extension_extras`)
-      can't be an SDC claim either. ``date`` (time) is parsed, not
-      text-validated, so a mapped time key is never unfit on whitespace.
-    * **Unrecognised-language wrapper** — a single ``{{<code>|…}}`` whose code
-      has language-code shape but isn't in :data:`_KNOWN_LANG_CODES`: can't be
-      unwrapped or language-labelled, so preserved as wikitext rather than
-      imported as a mislabelled ``en`` monolingual value with literal markup.
+    * **No SDC import mapping at all** (``permission``/``source``/
+      ``institution`` — not in :data:`LEGACY_IMPORT_PROPERTY`): no Phase-3a
+      claim builder, so a community override would otherwise be silently
+      dropped. Preserve it on the template param (Module:DPLA's yellow box).
+    * **Vertical whitespace** (``title``/``description`` monolingualtext,
+      ``creator`` string): the Wikibase text validators reject newlines/tabs/CR.
+      ``date`` (time) is parsed, not text-validated, so never unfit here.
+    * **Rich creator wikitext** (``creator``): after splitting recognised
+      embedded creator templates, residual ``{{...}}`` / ``[[...]]`` markup
+      remains — the value can't be a clean SDC string, so the whole thing rides
+      the wikitext creator param (where its links render). See
+      :func:`_creator_sdc_clean`.
+    * **Residual monolingual markup** (``title``/``description``): template or
+      wikilink markup survives :func:`_unwrap_lang_template` — an unrecognised
+      language code (``{{nan|…}}``), a multi-parameter wrapper
+      (``{{en|First|Second}}``), or a non-language template — so a literal
+      ``{{…}}`` would otherwise be stored as the monolingual value. Preserve as
+      wikitext instead.
     """
     mapping = LEGACY_IMPORT_PROPERTY.get(key)
     if mapping is None:
@@ -968,10 +982,13 @@ def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
         return False
     if _VERTICAL_WHITESPACE_RE.search(value):
         return True
-    # A single {{<code>|…}} wrapper whose code has language shape but isn't
-    # recognised can't be safely unwrapped/labelled — preserve it as wikitext
-    # rather than import a mislabelled 'en' monolingual value with literal markup.
-    return _is_unrecognized_lang_wrapper(value)
+    if key == "creator":
+        return not _creator_sdc_clean(value)
+    # title/description: unfit if template/wikilink markup survives language
+    # unwrap (an unrecognised code, a multi-param wrapper, or a non-language
+    # template) — a literal {{...}} must not be stored as the monolingual value.
+    text, _lang = _unwrap_lang_template(value)
+    return "{{" in text or "[[" in text
 
 
 def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
@@ -1021,16 +1038,12 @@ def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
     return bool(value_parts) and value_parts.issubset(canonical_parts)
 
 
-# Bare Commons language templates ({{en|text}}, {{de|text}}, …) wrap a single
-# monolingual value in a language code. Only unwrap when the ENTIRE value is
-# one such template with a KNOWN language code — so non-language 2–3 letter
-# templates ({{PD|…}}) and values that merely contain a template are left
-# untouched.
 # Complete ISO 639-1 two-letter language codes (the set MediaWiki's per-language
-# templates use). A single {{<code>|<text>}} wrapper with one of these codes is
-# unwrapped to (text, code); a wrapper whose code has language shape but isn't
-# here is preserved as wikitext (see _is_unrecognized_lang_wrapper), never
-# mislabelled as English.
+# templates use). A single {{<code>|<text>}} wrapper with one of these codes and
+# a sole text parameter is unwrapped to (text, code) by _unwrap_lang_template.
+# Anything else — an unrecognised code, multiple parameters, or a non-language
+# template — leaves residual markup and is preserved on the wikitext param by
+# _community_value_unfit_for_sdc, never stored as a mislabelled 'en' string.
 _KNOWN_LANG_CODES = frozenset(
     "aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce ch "
     "co cr cs cu cv cy da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga "
@@ -1070,28 +1083,6 @@ def _unwrap_lang_template(value: str) -> tuple[str, str]:
             ):
                 return str(params[0].value).strip(), name
     return value, "en"
-
-
-# A {{<code>|…}} whose <code> has language-code shape (2–3 letters + optional
-# -variant) — used to tell a language wrapper apart from a non-language template.
-_LANG_CODE_SHAPE_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]+)*$", re.IGNORECASE)
-
-
-def _is_unrecognized_lang_wrapper(value: str) -> bool:
-    """True when ``value`` is a single ``{{<code>|…}}`` template whose ``<code>``
-    has language-code shape but is NOT in :data:`_KNOWN_LANG_CODES`. Such a
-    wrapper can't be safely unwrapped or language-labelled, so it is preserved on
-    the wikitext template (via :func:`_community_value_unfit_for_sdc`) instead of
-    being imported as a mislabelled ``en`` monolingual value with literal
-    markup."""
-    if "{{" not in value:
-        return False
-    parsed = mwparserfromhell.parse(value.strip())
-    templates = parsed.filter_templates(recursive=False)
-    if len(templates) == 1 and str(parsed).strip() == str(templates[0]).strip():
-        name = str(templates[0].name).strip().casefold()
-        return bool(_LANG_CODE_SHAPE_RE.match(name)) and name not in _KNOWN_LANG_CODES
-    return False
 
 
 def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:

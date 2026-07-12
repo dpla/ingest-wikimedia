@@ -3431,3 +3431,53 @@ def test_parse_creator_shape_passes_through_embedded_creator_compound():
     )
     # an unrecognised {{…}} template is still dropped
     assert _parse_creator_shape("{{some-other-template|x}}") is None
+
+
+def test_community_value_unfit_routes_multiparam_lang_wrapper_to_wikitext():
+    """A known-language wrapper that _unwrap_lang_template won't unwrap
+    (multi-param {{en|First|Second}}) must be routed to wikitext rather than
+    stored as a literal-markup monolingual claim. Sole-param wrappers stay
+    SDC-fit; unrecognised/non-language templates go to wikitext."""
+    from ingest_wikimedia.legacy_artwork import _community_value_unfit_for_sdc
+
+    assert _community_value_unfit_for_sdc("title", "{{en|First|Second}}") is True
+    assert _community_value_unfit_for_sdc("description", "{{en|First|Second}}") is True
+    assert _community_value_unfit_for_sdc("title", "{{en|Just one}}") is False
+    assert _community_value_unfit_for_sdc("description", "{{nan|text}}") is True
+    assert _community_value_unfit_for_sdc("title", "{{PD-US}}") is True
+    assert _community_value_unfit_for_sdc("title", "A plain title") is False
+
+
+def test_community_value_unfit_routes_rich_creator_to_wikitext():
+    """A creator value that keeps residual template/wikilink markup after
+    splitting recognised {{Creator:}}/{{Unknown}} templates (e.g. an
+    unrecognised {{Foo}} or a {{w|...}} link) can't be a clean SDC string, so
+    the whole value is routed to the wikitext creator param. Clean creators
+    (plain names, recognised-template compounds) stay SDC-fit."""
+    from ingest_wikimedia.legacy_artwork import (
+        _community_value_unfit_for_sdc,
+        _creator_sdc_clean,
+    )
+
+    # unrecognised template mixed with a recognised {{Creator:}} -> rich -> wikitext
+    assert _creator_sdc_clean("{{Foo}} {{Creator:B}}") is False
+    assert _community_value_unfit_for_sdc("creator", "{{Foo}} {{Creator:B}}") is True
+    # {{w|...}} wikilink in a compound creator -> wikitext
+    assert (
+        _community_value_unfit_for_sdc(
+            "creator", "Dorpat, Paul; photo by {{w|Jim Marshall}}"
+        )
+        is True
+    )
+    # clean creators stay SDC-fit
+    assert _creator_sdc_clean("Jane Doe") is True
+    assert _community_value_unfit_for_sdc("creator", "Jane Doe") is False
+    assert (
+        _creator_sdc_clean("Dorpat, Paul; graphics: {{Creator:Walt Crowley}}") is True
+    )
+    assert (
+        _community_value_unfit_for_sdc(
+            "creator", "Dorpat, Paul; graphics: {{Creator:Walt Crowley}}"
+        )
+        is False
+    )
