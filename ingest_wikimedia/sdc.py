@@ -1700,7 +1700,8 @@ def parse_other_date_template(value: str) -> str | None:
 # duplicate P571. Named params (|location=…) are ignored. Conservative:
 # returns None for anything else so it can never widen a wrong dedup.
 _TAKEN_TEMPLATE_RE = re.compile(
-    r"^\{\{\s*taken[ _](on|in|circa)\s*\|(.+?)\}\}$", re.IGNORECASE | re.DOTALL
+    r"^\{\{\s*taken[\s_]+(on|in|circa)\s*\|(.+?)\}\}$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 

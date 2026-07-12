@@ -3253,6 +3253,16 @@ def test_unwrap_lang_template_unwraps_known_language_codes():
     assert _unwrap_lang_template("A plain title") == ("A plain title", "en")
     assert _unwrap_lang_template("{{PD-US}}") == ("{{PD-US}}", "en")
     assert _unwrap_lang_template("{{en|Foo}} and more") == ("{{en|Foo}} and more", "en")
+    # Complete ISO 639-1 set: a valid code (eo) unwraps to its own language.
+    assert _unwrap_lang_template("{{eo|Teksto}}") == ("Teksto", "eo")
+    # Explicit 1= positional unwraps.
+    assert _unwrap_lang_template("{{en|1=Explicit}}") == ("Explicit", "en")
+    # Sole text param only: a multi-param template is NOT unwrapped (that would
+    # silently drop the extra parameters).
+    assert _unwrap_lang_template("{{en|First|Second}}") == (
+        "{{en|First|Second}}",
+        "en",
+    )
 
 
 def test_value_equivalent_unwraps_lang_template_for_title_description():
@@ -3296,20 +3306,31 @@ def test_format_claim_bare_unknown_creator_emits_p170_somevalue_with_role():
     assert claim["qualifiers"]["P3831"][0]["datavalue"]["value"]["id"] == "Q33231"
 
 
-def test_split_unknown_from_creator_splits_compound_credit():
-    from ingest_wikimedia.legacy_artwork import _split_unknown_from_creator
+def test_split_embedded_creator_templates_tokenizes_all():
+    from ingest_wikimedia.legacy_artwork import _split_embedded_creator_templates
 
-    assert _split_unknown_from_creator(
+    # single embedded {{Unknown}} + text remainder
+    assert _split_embedded_creator_templates(
         "{{unknown|author}} reprinted by Webster & Stevens"
-    ) == ("author", "reprinted by Webster & Stevens")
-    assert _split_unknown_from_creator(
-        "Webster & Stevens {{Unknown|photographer}}"
-    ) == ("photographer", "Webster & Stevens")
-    assert _split_unknown_from_creator("{{Unknown|author}}") is None
-    assert (
-        _split_unknown_from_creator("Boyd & Braas; reprinted by Webster & Stevens")
-        is None
+    ) == ([("unknown", "author")], "reprinted by Webster & Stevens")
+    # single embedded {{Creator:}} + text remainder
+    assert _split_embedded_creator_templates(
+        "Believed to be by Asahel Curtis {{Creator:Asahel Curtis}}"
+    ) == ([("page", "Asahel Curtis")], "Believed to be by Asahel Curtis")
+    # MULTIPLE templates: both consumed; connector-only remainder is dropped
+    assert _split_embedded_creator_templates("{{Creator:A}} and {{Creator:B}}") == (
+        [("page", "A"), ("page", "B")],
+        "",
     )
+    # both kinds in one value, in document order
+    assert _split_embedded_creator_templates("{{unknown|author}} {{Creator:B}}") == (
+        [("unknown", "author"), ("page", "B")],
+        "",
+    )
+    # no recognised embedded template → (None, value)
+    assert _split_embedded_creator_templates(
+        "Boyd & Braas; reprinted by Webster & Stevens"
+    ) == (None, "Boyd & Braas; reprinted by Webster & Stevens")
 
 
 def test_format_claim_compound_unknown_creator_emits_two_p170_statements():
@@ -3331,19 +3352,27 @@ def test_format_claim_compound_unknown_creator_emits_two_p170_statements():
     )
 
 
-def test_split_creator_page_from_text_splits_embedded_creator_page():
-    from ingest_wikimedia.legacy_artwork import _split_creator_page_from_text
-
-    v = (
-        "Believed to be by Asahel Curtis, working for hydraulic contractors "
-        "Lewis & Wiley Co. {{Creator:Asahel Curtis}}"
+def test_format_claim_compound_multiple_creator_templates_emits_claim_each():
+    # Two {{Creator:}} joined by "and": two QID-resolved page placeholders, no
+    # junk P2093 for the "and" connector.
+    result = format_legacy_import_claim(
+        "creator", "{{Creator:A}} and {{Creator:B}}", "https://example/permalink"
     )
-    rem = (
-        "Believed to be by Asahel Curtis, working for hydraulic contractors "
-        "Lewis & Wiley Co."
+    assert isinstance(result, list) and len(result) == 2
+    assert [c.get("_phase3a_pending_creator_page") for c in result] == ["A", "B"]
+    # {{Unknown|role}} + {{Creator:}}: an unknown-role P170 + a page placeholder.
+    result2 = format_legacy_import_claim(
+        "creator",
+        "{{unknown|photographer}} {{Creator:B}}",
+        "https://example/permalink",
     )
-    assert _split_creator_page_from_text(v) == ("Asahel Curtis", rem)
-    assert _split_creator_page_from_text("Jane Doe") is None
+    assert isinstance(result2, list) and len(result2) == 2
+    assert result2[0]["qualifiers"]["P3831"][0]["datavalue"]["value"]["id"] == "Q33231"
+    assert result2[1].get("_phase3a_pending_creator_page") == "B"
+    # no literal {{ markup survives into any emitted P2093 qualifier
+    for c in result + result2:
+        for q in c.get("qualifiers", {}).get("P2093", []):
+            assert "{{" not in q["datavalue"]["value"]
 
 
 def test_format_claim_compound_creator_page_emits_placeholder_and_clean_stated_as():
@@ -3374,3 +3403,31 @@ def test_community_value_unfit_for_sdc_preserves_unmapped_keys():
     assert _community_value_unfit_for_sdc("permission", "{{PD-US}}") is True
     assert _community_value_unfit_for_sdc("source", "some source") is True
     assert _community_value_unfit_for_sdc("title", "A clean single-line title") is False
+
+
+def test_community_value_unfit_for_sdc_preserves_unrecognized_lang_wrapper():
+    from ingest_wikimedia.legacy_artwork import _community_value_unfit_for_sdc
+
+    # lang-shaped but unrecognised code (3-letter / variant) → preserve as wikitext
+    assert _community_value_unfit_for_sdc("description", "{{nan|some text}}") is True
+    assert _community_value_unfit_for_sdc("description", "{{en-gb|colour}}") is True
+    # a recognised language wrapper is importable (unwrapped at claim-build)
+    assert _community_value_unfit_for_sdc("description", "{{en|clean text}}") is False
+    assert _community_value_unfit_for_sdc("title", "A clean single-line title") is False
+
+
+def test_parse_creator_shape_passes_through_embedded_creator_compound():
+    from ingest_wikimedia.legacy_artwork import _parse_creator_shape
+
+    # a {{…}}-bookended compound EMBEDDING recognised creator templates is passed
+    # through (not dropped) so the claim-builder can tokenise it.
+    assert (
+        _parse_creator_shape("{{unknown|author}} {{Creator:B}}")
+        == "{{unknown|author}} {{Creator:B}}"
+    )
+    assert (
+        _parse_creator_shape("{{Creator:A}} and {{Creator:B}}")
+        == "{{Creator:A}} and {{Creator:B}}"
+    )
+    # an unrecognised {{…}} template is still dropped
+    assert _parse_creator_shape("{{some-other-template|x}}") is None

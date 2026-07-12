@@ -1712,3 +1712,11 @@ def test_dates_semantically_equal_reconciles_taken_on_template():
     assert dates_semantically_equal("{{Taken on|1921-09-21}}", "1921-09-21")
     assert dates_semantically_equal("{{Taken in|1959}}", "1959")
     assert not dates_semantically_equal("{{Taken on|1921-09-21}}", "1930-01-01")
+
+
+def test_parse_taken_on_template_tolerates_repeated_separator():
+    from ingest_wikimedia.sdc import dates_semantically_equal, parse_taken_on_template
+
+    assert parse_taken_on_template("{{Taken  on|1921-09-21}}") == "1921-09-21"
+    assert parse_taken_on_template("{{Taken_on|1921-09-21}}") == "1921-09-21"
+    assert dates_semantically_equal("{{Taken  on|1921-09-21}}", "1921-09-21")

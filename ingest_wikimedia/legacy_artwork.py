@@ -780,6 +780,14 @@ def _parse_creator_shape(value: str) -> str | None:
         # optional role. Preserve as a P170 somevalue (+ P3831 role) rather
         # than dropping it with the other unrecognised templates below.
         return _CREATOR_UNKNOWN_PREFIX + (m.group(1) or "").strip()
+    # A compound value that EMBEDS a recognised creator template alongside
+    # other text/templates (e.g. "{{Unknown|author}} {{Creator:B}}") is passed
+    # through for format_legacy_import_claim to tokenise + split — do NOT drop
+    # it here even though it is {{…}}-bookended.
+    if _EMBEDDED_UNKNOWN_RE.search(stripped) or _EMBEDDED_CREATOR_PAGE_RE.search(
+        stripped
+    ):
+        return stripped
     # Any remaining ``{{…}}`` template-shaped value we don't recognise
     # is dropped rather than passed through as a raw string. See the
     # returns-``None`` clause of the docstring for the rationale.
@@ -788,55 +796,57 @@ def _parse_creator_shape(value: str) -> str | None:
     return stripped
 
 
-# {{Unknown|role}} embedded in a longer creator credit (e.g.
-# "{{unknown|author}} reprinted by Webster & Stevens") — as opposed to a bare
-# {{Unknown|role}}, which _parse_creator_shape already tags as the
-# unknown-creator sentinel. A compound value otherwise falls through as a plain
-# string and stores the literal template markup in the P2093 stated-as.
+# Recognised creator sub-templates that can appear EMBEDDED in a longer,
+# compound free-text creator credit (as opposed to being the entire value —
+# those bare shapes are tagged by _parse_creator_shape). Each is tokenised out
+# and emitted as its own claim; the leftover text becomes a P2093 stated-as.
+# Unanchored (the bare {{Unknown}} matcher is _UNKNOWN_CREATOR_RE).
 _EMBEDDED_UNKNOWN_RE = re.compile(_UNKNOWN_CREATOR_BODY)
-
-
-def _creator_remainder(value: str, m: re.Match) -> str:
-    """The creator text left after removing the matched sub-template ``m``,
-    with dangling join punctuation/whitespace trimmed. Shared by the compound
-    creator splitters."""
-    return (value[: m.start()] + value[m.end() :]).strip(" ;,·—–-\t\n").strip()
-
-
-def _split_unknown_from_creator(value: str) -> tuple[str, str] | None:
-    """If ``value`` contains a ``{{Unknown|role}}`` template alongside other
-    text, return ``(role, remainder)`` so the caller can emit a P170 somevalue
-    (+ P3831 role) for the unknown creator and a separate P170 somevalue +
-    P2093 stated-as for ``remainder``. Returns ``None`` when there is no
-    embedded ``{{Unknown}}`` or when the template is the *entire* value (a bare
-    ``{{Unknown|role}}`` is handled by :func:`_parse_creator_shape`)."""
-    m = _EMBEDDED_UNKNOWN_RE.search(value)
-    if not m:
-        return None
-    remainder = _creator_remainder(value, m)
-    if not remainder:
-        return None
-    return (m.group(1) or "").strip(), remainder
-
-
-# {{Creator:PageName}} embedded in a longer free-text creator credit (e.g.
-# "Believed to be by Asahel Curtis, working for … {{Creator:Asahel Curtis}}").
-# A bare {{Creator:Foo}} is tagged by _parse_creator_shape as a page sentinel;
-# a compound value falls through as a plain string and would store the literal
-# {{Creator:…}} markup in the P2093 stated-as.
 _EMBEDDED_CREATOR_PAGE_RE = re.compile(r"\{\{\s*[Cc]reator\s*:\s*([^}|]+?)\s*\}\}")
+# A remainder made up only of join punctuation / connector words ("A and B")
+# is not a real stated-as name — drop it rather than emit a junk P2093.
+_CREATOR_CONNECTOR_RE = re.compile(
+    r"^(?:and|und|et|&|,|;|/|·|—|–|-|\s)+$", re.IGNORECASE
+)
 
 
-def _split_creator_page_from_text(value: str) -> tuple[str, str] | None:
-    """If ``value`` embeds a ``{{Creator:PageName}}`` transclusion, return
-    ``(page_title, remainder)`` so the caller can emit a P170 creator-page
-    claim (QID-resolved in the materializer) plus a P170 somevalue + P2093
-    stated-as for the remaining community text. ``remainder`` may be empty."""
-    m = _EMBEDDED_CREATOR_PAGE_RE.search(value)
-    if not m:
-        return None
-    remainder = _creator_remainder(value, m)
-    return m.group(1).strip(), remainder
+def _split_embedded_creator_templates(
+    value: str,
+) -> tuple[list[tuple[str, str]] | None, str]:
+    """Tokenise every recognised embedded creator sub-template out of a compound
+    free-text creator credit. Returns ``(parts, remainder)`` where ``parts`` is
+    an ordered list of ``("unknown", role)`` / ``("page", page_title)`` tuples —
+    one per embedded ``{{Unknown|role}}`` / ``{{Creator:Page}}`` — and
+    ``remainder`` is the leftover text with all recognised templates removed and
+    join punctuation trimmed. Returns ``(None, value)`` when the value embeds no
+    recognised creator template.
+
+    Handles multiple templates and both kinds in one value (e.g.
+    ``{{Creator:A}} and {{Creator:B}}`` → two page claims, no stated-as;
+    ``{{unknown|author}} reprinted by {{Creator:B}}`` → an unknown claim, a page
+    claim, and a stated-as remainder), so no literal ``{{…}}`` markup survives
+    into P2093."""
+    found: list[tuple[int, int, str, str]] = []
+    for m in _EMBEDDED_UNKNOWN_RE.finditer(value):
+        found.append((m.start(), m.end(), "unknown", (m.group(1) or "").strip()))
+    for m in _EMBEDDED_CREATOR_PAGE_RE.finditer(value):
+        found.append((m.start(), m.end(), "page", m.group(1).strip()))
+    if not found:
+        return None, value
+    found.sort()
+    kept: list[str] = []
+    last = 0
+    for start, end, _kind, _cap in found:
+        if start < last:  # defensive: overlapping matches (not expected)
+            last = max(last, end)
+            continue
+        kept.append(value[last:start])
+        last = end
+    kept.append(value[last:])
+    remainder = "".join(kept).strip(" ;,·—–-\t\n").strip()
+    if _CREATOR_CONNECTOR_RE.fullmatch(remainder):
+        remainder = ""
+    return [(kind, cap) for _s, _e, kind, cap in found], remainder
 
 
 def _extract_institution_qid(value: str) -> str | None:
@@ -945,14 +955,23 @@ def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
       is *not* a DPLA-prefixed extension (:func:`_split_extension_extras`)
       can't be an SDC claim either. ``date`` (time) is parsed, not
       text-validated, so a mapped time key is never unfit on whitespace.
+    * **Unrecognised-language wrapper** — a single ``{{<code>|…}}`` whose code
+      has language-code shape but isn't in :data:`_KNOWN_LANG_CODES`: can't be
+      unwrapped or language-labelled, so preserved as wikitext rather than
+      imported as a mislabelled ``en`` monolingual value with literal markup.
     """
     mapping = LEGACY_IMPORT_PROPERTY.get(key)
     if mapping is None:
         return True
     _prop, kind = mapping
-    return kind in ("monolingualtext", "string") and bool(
-        _VERTICAL_WHITESPACE_RE.search(value)
-    )
+    if kind not in ("monolingualtext", "string"):
+        return False
+    if _VERTICAL_WHITESPACE_RE.search(value):
+        return True
+    # A single {{<code>|…}} wrapper whose code has language shape but isn't
+    # recognised can't be safely unwrapped/labelled — preserve it as wikitext
+    # rather than import a mislabelled 'en' monolingual value with literal markup.
+    return _is_unrecognized_lang_wrapper(value)
 
 
 def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
@@ -1007,51 +1026,20 @@ def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
 # one such template with a KNOWN language code — so non-language 2–3 letter
 # templates ({{PD|…}}) and values that merely contain a template are left
 # untouched.
+# Complete ISO 639-1 two-letter language codes (the set MediaWiki's per-language
+# templates use). A single {{<code>|<text>}} wrapper with one of these codes is
+# unwrapped to (text, code); a wrapper whose code has language shape but isn't
+# here is preserved as wikitext (see _is_unrecognized_lang_wrapper), never
+# mislabelled as English.
 _KNOWN_LANG_CODES = frozenset(
-    {
-        "en",
-        "de",
-        "fr",
-        "es",
-        "it",
-        "nl",
-        "pt",
-        "sv",
-        "da",
-        "no",
-        "nb",
-        "nn",
-        "fi",
-        "is",
-        "pl",
-        "cs",
-        "sk",
-        "ru",
-        "uk",
-        "be",
-        "bg",
-        "sr",
-        "hr",
-        "sl",
-        "ja",
-        "zh",
-        "ko",
-        "ar",
-        "he",
-        "el",
-        "hu",
-        "ro",
-        "tr",
-        "ca",
-        "gl",
-        "eu",
-        "ga",
-        "cy",
-        "la",
-        "hi",
-        "fa",
-        "id",
-    }
+    "aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce ch "
+    "co cr cs cu cv cy da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga "
+    "gd gl gn gu gv ha he hi ho hr ht hu hy hz ia id ie ig ii ik io is it iu ja "
+    "jv ka kg ki kj kk kl km kn ko kr ks ku kv kw ky la lb lg li ln lo lt lu lv "
+    "mg mh mi mk ml mn mr ms mt my na nb nd ne ng nl nn no nr nv ny oc oj om or "
+    "os pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg sh si sk sl sm sn so sq "
+    "sr ss st su sv sw ta te tg th ti tk tl tn to tr ts tt tw ty ug uk ur uz ve "
+    "vi vo wa wo xh yi yo za zh zu".split()
 )
 
 
@@ -1072,12 +1060,38 @@ def _unwrap_lang_template(value: str) -> tuple[str, str]:
         tpl = templates[0]
         name = str(tpl.name).strip().casefold()
         if name in _KNOWN_LANG_CODES:
-            for p in tpl.params:
-                if not p.showkey:
-                    return str(p.value).strip(), name
-            if tpl.has("1"):
-                return str(tpl.get("1").value).strip(), name
+            # Unwrap only a SOLE text parameter (one positional, or one explicit
+            # 1=). A multi-parameter template like {{en|First|Second}} is not a
+            # simple language wrapper; unwrapping it would silently drop the
+            # extra parameters, so leave it untouched.
+            params = tpl.params
+            if len(params) == 1 and (
+                not params[0].showkey or str(params[0].name).strip() == "1"
+            ):
+                return str(params[0].value).strip(), name
     return value, "en"
+
+
+# A {{<code>|…}} whose <code> has language-code shape (2–3 letters + optional
+# -variant) — used to tell a language wrapper apart from a non-language template.
+_LANG_CODE_SHAPE_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]+)*$", re.IGNORECASE)
+
+
+def _is_unrecognized_lang_wrapper(value: str) -> bool:
+    """True when ``value`` is a single ``{{<code>|…}}`` template whose ``<code>``
+    has language-code shape but is NOT in :data:`_KNOWN_LANG_CODES`. Such a
+    wrapper can't be safely unwrapped or language-labelled, so it is preserved on
+    the wikitext template (via :func:`_community_value_unfit_for_sdc`) instead of
+    being imported as a mislabelled ``en`` monolingual value with literal
+    markup."""
+    if "{{" not in value:
+        return False
+    parsed = mwparserfromhell.parse(value.strip())
+    templates = parsed.filter_templates(recursive=False)
+    if len(templates) == 1 and str(parsed).strip() == str(templates[0]).strip():
+        name = str(templates[0].name).strip().casefold()
+        return bool(_LANG_CODE_SHAPE_RE.match(name)) and name not in _KNOWN_LANG_CODES
+    return False
 
 
 def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
@@ -1355,31 +1369,24 @@ def format_legacy_import_claim(
         # string mapping) is unconventional and Module:DPLA doesn't render
         # it as a creator (so it silently failed to appear as one). This is
         # the same shape the {{Creator:}}-no-QID fallback builds.
-        compound = _split_unknown_from_creator(value)
-        if compound is not None:
-            # Compound credit with an embedded {{Unknown|role}} (e.g.
-            # "{{unknown|author}} reprinted by Webster & Stevens"): split the
-            # unknown-role assertion from the remaining name so neither the raw
-            # template markup nor the role is lost — a P170 somevalue (+ P3831
-            # role) for the unknown creator plus a P170 somevalue + P2093
-            # stated-as for the remainder.
-            role, remainder = compound
-            return [
-                _build_creator_unknown_claim(role, permalink),
-                _stated_as(remainder),
-            ]
-        creator_page = _split_creator_page_from_text(value)
-        if creator_page is not None:
-            # Compound credit with an embedded {{Creator:PageName}}: the page
-            # transclusion becomes a QID-resolved P170 (via the materializer)
-            # and the remaining free text a P170 somevalue + P2093 stated-as,
-            # so neither the structured creator link nor the community's
-            # attribution note is lost to literal markup.
-            page_title, remainder = creator_page
-            result = [_build_pending_creator_page_claim(page_title, permalink)]
+        parts, remainder = _split_embedded_creator_templates(value)
+        if parts is not None:
+            # Compound credit embedding one or more recognised creator templates
+            # ({{Unknown|role}}, {{Creator:Page}}): emit a claim per template
+            # (unknown → P170 somevalue + P3831 role; page → QID-resolved P170),
+            # plus a P2093 stated-as ONLY for the fully-cleaned remainder — so no
+            # literal template markup survives into the stated-as string.
+            claims: list[dict] = []
+            for kind, captured in parts:
+                if kind == "unknown":
+                    claims.append(_build_creator_unknown_claim(captured, permalink))
+                else:  # "page"
+                    claims.append(
+                        _build_pending_creator_page_claim(captured, permalink)
+                    )
             if remainder:
-                result.append(_stated_as(remainder))
-            return result
+                claims.append(_stated_as(remainder))
+            return claims
         return _stated_as(value)
 
     mapping = LEGACY_IMPORT_PROPERTY.get(canonical_key)
@@ -1954,11 +1961,10 @@ def _build_creator_unknown_claim(role: str, permalink: str) -> dict:
     statement has role) qualifier; an absent or unrecognised role yields a
     bare P170 somevalue. Carries the inferred-from-Wikitext reference.
 
-    NOTE: Module:DPLA does not yet render the P3831 role for a somevalue
-    creator (its creator renderer reads only the P2093 name-string
-    qualifier), so this statement is written correctly but renders blank
-    until the module is taught to surface ``{{Unknown|<role>}}`` from a
-    P170 somevalue + P3831. Tracked as the module-update follow-up.
+    Module:DPLA renders this shape as ``{{Unknown|<role>}}`` (e.g. "Unknown
+    photographer") as of the 2026-07-11 module update (revid 1246261799): its
+    creator renderers surface the P3831 role for a somevalue P170 that has no
+    P2093 name-string qualifier. (Before that update the shape rendered blank.)
     """
     claim = {
         "type": "statement",
