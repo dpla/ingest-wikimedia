@@ -703,15 +703,18 @@ def test_format_claim_for_description_uses_p10358():
 
 
 def test_format_claim_for_creator_uses_p2093_string():
-    """``P2093`` (creator — stated as) is the string form, used when
-    we have no Wikidata item match. Editors can later promote to
-    P170 manually."""
+    """A free-text creator with no Wikidata item is stored as the
+    conventional Commons authorship shape: a P170 (creator) somevalue
+    mainsnak qualified by P2093 (author name string) — not a top-level
+    P2093 mainsnak, which Module:DPLA does not render as a creator."""
     claim = format_legacy_import_claim(
         "creator", "Jane Doe", "https://example/permalink"
     )
     assert claim is not None
-    assert claim["mainsnak"]["property"] == "P2093"
-    assert claim["mainsnak"]["datatype"] == "string"
+    assert claim["mainsnak"]["property"] == "P170"
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    assert claim["qualifiers"]["P2093"][0]["datavalue"]["value"] == "Jane Doe"
+    assert claim["qualifiers"]["P2093"][0]["datatype"] == "string"
 
 
 def test_format_claim_for_date_emits_phase3a_placeholder():
@@ -746,7 +749,9 @@ def test_build_legacy_import_claims_iterates_community_imports():
     claims = build_legacy_import_claims(plan)
     assert len(claims) == 2
     props = {c["mainsnak"]["property"] for c in claims}
-    assert props == {"P1476", "P2093"}
+    # Bug 2: a free-text creator is a P170 somevalue (+ P2093 qualifier),
+    # not a top-level P2093 mainsnak.
+    assert props == {"P1476", "P170"}
 
 
 # ---------------------------------------------------------------------------
@@ -2560,7 +2565,10 @@ def test_plan_migration_still_imports_institution_that_differs():
         "File:Foo.jpg", revs, _canonical_params(institution="Q59661041")
     )
     assert plan is not None
-    assert "institution" in plan.community_imports
+    # Bug 4: institution has no SDC property mapping, so a differing community
+    # override is preserved on the wikitext template (yellow box) rather than
+    # dropped — not emitted as an SDC community_import.
+    assert "institution" in plan.wikitext_preserved_extras
 
 
 def test_plan_migration_extract_institution_qid_handles_flat_bare_qid():
@@ -3232,3 +3240,137 @@ def test_parse_creator_shape_passes_through_plain_names():
     # template) must still pass through — the guard checks bounds, not
     # substring occurrence.
     assert _parse_creator_shape("Smith, John (author)") == "Smith, John (author)"
+
+
+def test_unwrap_lang_template_unwraps_known_language_codes():
+    from ingest_wikimedia.legacy_artwork import _unwrap_lang_template
+
+    assert _unwrap_lang_template("{{en|Men standing before the depot}}") == (
+        "Men standing before the depot",
+        "en",
+    )
+    assert _unwrap_lang_template("{{de|Ein Foto}}") == ("Ein Foto", "de")
+    assert _unwrap_lang_template("A plain title") == ("A plain title", "en")
+    assert _unwrap_lang_template("{{PD-US}}") == ("{{PD-US}}", "en")
+    assert _unwrap_lang_template("{{en|Foo}} and more") == ("{{en|Foo}} and more", "en")
+
+
+def test_value_equivalent_unwraps_lang_template_for_title_description():
+    from ingest_wikimedia.legacy_artwork import _value_equivalent_to_canonical
+
+    assert _value_equivalent_to_canonical(
+        "title", "{{en|A Better Title}}", "A Better Title"
+    )
+    assert _value_equivalent_to_canonical("description", "{{en|A desc}}", "A desc")
+    assert not _value_equivalent_to_canonical("title", "{{en|Other}}", "A Better Title")
+
+
+def test_format_claim_title_unwraps_lang_template_into_monolingual_text():
+    claim = format_legacy_import_claim(
+        "title", "{{en|Men standing before the depot}}", "https://example/permalink"
+    )
+    assert claim is not None
+    assert claim["mainsnak"]["datavalue"]["value"] == {
+        "text": "Men standing before the depot",
+        "language": "en",
+    }
+
+
+def test_format_claim_free_text_creator_uses_p170_somevalue_p2093_qualifier():
+    claim = format_legacy_import_claim(
+        "creator", "Jane Doe", "https://example/permalink"
+    )
+    assert claim is not None and not isinstance(claim, list)
+    assert claim["mainsnak"]["property"] == "P170"
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    assert claim["qualifiers"]["P2093"][0]["datavalue"]["value"] == "Jane Doe"
+
+
+def test_format_claim_bare_unknown_creator_emits_p170_somevalue_with_role():
+    claim = format_legacy_import_claim(
+        "creator", "__creator_unknown__:Photographer", "https://example/permalink"
+    )
+    assert claim is not None
+    assert claim["mainsnak"]["property"] == "P170"
+    assert claim["mainsnak"]["snaktype"] == "somevalue"
+    assert claim["qualifiers"]["P3831"][0]["datavalue"]["value"]["id"] == "Q33231"
+
+
+def test_split_unknown_from_creator_splits_compound_credit():
+    from ingest_wikimedia.legacy_artwork import _split_unknown_from_creator
+
+    assert _split_unknown_from_creator(
+        "{{unknown|author}} reprinted by Webster & Stevens"
+    ) == ("author", "reprinted by Webster & Stevens")
+    assert _split_unknown_from_creator(
+        "Webster & Stevens {{Unknown|photographer}}"
+    ) == ("photographer", "Webster & Stevens")
+    assert _split_unknown_from_creator("{{Unknown|author}}") is None
+    assert (
+        _split_unknown_from_creator("Boyd & Braas; reprinted by Webster & Stevens")
+        is None
+    )
+
+
+def test_format_claim_compound_unknown_creator_emits_two_p170_statements():
+    result = format_legacy_import_claim(
+        "creator",
+        "{{unknown|author}} reprinted by Webster & Stevens",
+        "https://example/permalink",
+    )
+    assert isinstance(result, list) and len(result) == 2
+    unknown_claim, stated_claim = result
+    assert unknown_claim["mainsnak"]["property"] == "P170"
+    assert unknown_claim["mainsnak"]["snaktype"] == "somevalue"
+    assert (
+        unknown_claim["qualifiers"]["P3831"][0]["datavalue"]["value"]["id"] == "Q482980"
+    )
+    assert (
+        stated_claim["qualifiers"]["P2093"][0]["datavalue"]["value"]
+        == "reprinted by Webster & Stevens"
+    )
+
+
+def test_split_creator_page_from_text_splits_embedded_creator_page():
+    from ingest_wikimedia.legacy_artwork import _split_creator_page_from_text
+
+    v = (
+        "Believed to be by Asahel Curtis, working for hydraulic contractors "
+        "Lewis & Wiley Co. {{Creator:Asahel Curtis}}"
+    )
+    rem = (
+        "Believed to be by Asahel Curtis, working for hydraulic contractors "
+        "Lewis & Wiley Co."
+    )
+    assert _split_creator_page_from_text(v) == ("Asahel Curtis", rem)
+    assert _split_creator_page_from_text("Jane Doe") is None
+
+
+def test_format_claim_compound_creator_page_emits_placeholder_and_clean_stated_as():
+    v = "Believed to be by Asahel Curtis {{Creator:Asahel Curtis}}"
+    result = format_legacy_import_claim("creator", v, "https://example/permalink")
+    assert isinstance(result, list) and len(result) == 2
+    assert result[0].get("_phase3a_pending_creator_page") == "Asahel Curtis"
+    p2093 = result[1]["qualifiers"]["P2093"][0]["datavalue"]["value"]
+    assert p2093 == "Believed to be by Asahel Curtis"
+    assert "{{" not in p2093
+
+
+def test_build_legacy_import_claims_flattens_compound_creator():
+    plan = MigrationPlan(
+        source_permalink="https://example/permalink",
+        community_imports={
+            "creator": "{{unknown|author}} reprinted by Webster & Stevens",
+        },
+    )
+    claims = build_legacy_import_claims(plan)
+    assert len(claims) == 2
+    assert all(c["mainsnak"]["property"] == "P170" for c in claims)
+
+
+def test_community_value_unfit_for_sdc_preserves_unmapped_keys():
+    from ingest_wikimedia.legacy_artwork import _community_value_unfit_for_sdc
+
+    assert _community_value_unfit_for_sdc("permission", "{{PD-US}}") is True
+    assert _community_value_unfit_for_sdc("source", "some source") is True
+    assert _community_value_unfit_for_sdc("title", "A clean single-line title") is False

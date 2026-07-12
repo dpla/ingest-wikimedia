@@ -1358,6 +1358,17 @@ def dates_semantically_equal(a: str, b: str) -> bool:
     """
     if not a or not b:
         return False
+    # A maintenance-bot or community edit may have reformatted a bare display
+    # date ("1910?") into {{other date|...}} template markup
+    # ("{{other date|~|1910}}"). Reduce that markup to its plain display form
+    # first — parse_dpla_date only understands display strings, not raw
+    # template wikitext — so the reformatted value reconciles against the
+    # canonical date and is stripped, instead of being mistaken for a
+    # community date override. (Ranges like {{other date|between|X|Y}} return
+    # None from parse_other_date_template and pass through to the range
+    # matcher unchanged.)
+    a = parse_other_date_template(a) or parse_taken_on_template(a) or a
+    b = parse_other_date_template(b) or parse_taken_on_template(b) or b
     pa = parse_dpla_date(a)
     pb = parse_dpla_date(b)
     if pa is None or pb is None:
@@ -1680,6 +1691,36 @@ def parse_other_date_template(value: str) -> str | None:
     if modifier in ("s", "decade"):
         return f"{date_arg}s"
     return None
+
+
+# Commons "date taken" templates whose first positional argument is a plain
+# date: {{Taken on|1921-09-21}}, {{Taken in|1921}}, {{Taken circa|1921}}.
+# Reduce to the display string parse_dpla_date understands so a community
+# {{Taken on|…}} reconciles against the canonical date instead of importing a
+# duplicate P571. Named params (|location=…) are ignored. Conservative:
+# returns None for anything else so it can never widen a wrong dedup.
+_TAKEN_TEMPLATE_RE = re.compile(
+    r"^\{\{\s*taken[ _](on|in|circa)\s*\|(.+?)\}\}$", re.IGNORECASE | re.DOTALL
+)
+
+
+def parse_taken_on_template(value: str) -> str | None:
+    """Convert a ``{{Taken on|…}}`` / ``{{Taken in|…}}`` / ``{{Taken circa|…}}``
+    value into the plain display string :func:`parse_dpla_date` understands, or
+    ``None`` when the input isn't one of those templates."""
+    if not value:
+        return None
+    m = _TAKEN_TEMPLATE_RE.match(value.strip())
+    if not m:
+        return None
+    modifier = m.group(1).lower()
+    date_arg = next(
+        (a.strip() for a in m.group(2).split("|") if a.strip() and "=" not in a),
+        "",
+    )
+    if not date_arg:
+        return None
+    return f"circa {date_arg}" if modifier == "circa" else date_arg
 
 
 def _build_date_claim(

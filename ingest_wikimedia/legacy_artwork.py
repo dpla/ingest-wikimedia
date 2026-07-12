@@ -122,10 +122,16 @@ LEGACY_IMPORT_PROPERTY: dict[str, tuple[str, str]] = {
     # in a sentinel form so Phase 3b's claim builder can re-parse with
     # the existing :func:`ingest_wikimedia.sdc.parse_dpla_date` helper.
     "date": ("P571", "time"),
-    # ``creator`` (or ``author``/``artist`` aliases) → P2093 (creator —
-    # stated as), string. Avoids the Wikidata-reconciliation complexity
-    # of P170 (creator) for the common case of a string-only credit;
-    # editors can promote individual statements to P170 manually later.
+    # ``creator`` (or ``author``/``artist`` aliases). NOTE: this entry no
+    # longer drives claim CONSTRUCTION — a free-text community creator is
+    # built as a P170 ``somevalue`` + P2093 *qualifier* statement by
+    # :func:`format_legacy_import_claim` (via :func:`_build_creator_stated_as_claim`),
+    # because on a Commons MediaInfo entity P2093 (author name string) is
+    # only ever a qualifier of P170; a top-level P2093 mainsnak is
+    # unconventional and Module:DPLA doesn't render it as a creator. The
+    # entry is retained solely so :func:`_community_value_unfit_for_sdc`
+    # can look up the ``"string"`` kind and route vertical-whitespace
+    # creator values to wikitext preservation before claim construction.
     "creator": ("P2093", "string"),
 }
 
@@ -669,6 +675,26 @@ _NARA_AUTHOR_RE = re.compile(r"^\s*\{\{\s*NARA-Author\s*\|", re.IGNORECASE)
 # treat them as opaque strings that happen not to match anything.
 _CREATOR_QID_PREFIX = "__creator_qid__:"
 _CREATOR_PAGE_PREFIX = "__creator_page__:"
+# ``{{Unknown|<role>}}`` — an editor's assertion that the creator is unknown
+# but of a known role (e.g. photographer). Captured as its own sentinel so the
+# claim-builder can emit a P170 ``somevalue`` + P3831 (object has role)
+# qualifier instead of dropping it as an unrecognised template.
+_CREATOR_UNKNOWN_PREFIX = "__creator_unknown__:"
+# The {{Unknown|role}} creator grammar, shared by the anchored whole-value
+# matcher (_parse_creator_shape) and the unanchored embedded matcher
+# (_split_unknown_from_creator), so the two never drift apart.
+_UNKNOWN_CREATOR_BODY = r"\{\{\s*[Uu]nknown\s*(?:\|\s*([^}|]*?)\s*)?\}\}"
+_UNKNOWN_CREATOR_RE = re.compile(r"^" + _UNKNOWN_CREATOR_BODY + r"$")
+# {{Unknown|<role>}} role name (casefolded) → the Wikidata role item for the
+# P3831 (object of statement has role) qualifier. Labels verified on Wikidata.
+_UNKNOWN_ROLE_QID = {
+    "photographer": "Q33231",
+    "artist": "Q483501",
+    "author": "Q482980",
+    "engraver": "Q329439",
+    "painter": "Q1028181",
+    "illustrator": "Q644687",
+}
 
 
 def _unwrap_infi_creator(value: str) -> str | None:
@@ -748,12 +774,69 @@ def _parse_creator_shape(value: str) -> str | None:
     m = _CREATOR_PAGE_RE.match(stripped)
     if m:
         return _CREATOR_PAGE_PREFIX + m.group(1).strip()
+    m = _UNKNOWN_CREATOR_RE.match(stripped)
+    if m:
+        # ``{{Unknown}}`` / ``{{Unknown|Photographer}}`` — creator unknown,
+        # optional role. Preserve as a P170 somevalue (+ P3831 role) rather
+        # than dropping it with the other unrecognised templates below.
+        return _CREATOR_UNKNOWN_PREFIX + (m.group(1) or "").strip()
     # Any remaining ``{{…}}`` template-shaped value we don't recognise
     # is dropped rather than passed through as a raw string. See the
     # returns-``None`` clause of the docstring for the rationale.
     if stripped.startswith("{{") and stripped.endswith("}}"):
         return None
     return stripped
+
+
+# {{Unknown|role}} embedded in a longer creator credit (e.g.
+# "{{unknown|author}} reprinted by Webster & Stevens") — as opposed to a bare
+# {{Unknown|role}}, which _parse_creator_shape already tags as the
+# unknown-creator sentinel. A compound value otherwise falls through as a plain
+# string and stores the literal template markup in the P2093 stated-as.
+_EMBEDDED_UNKNOWN_RE = re.compile(_UNKNOWN_CREATOR_BODY)
+
+
+def _creator_remainder(value: str, m: re.Match) -> str:
+    """The creator text left after removing the matched sub-template ``m``,
+    with dangling join punctuation/whitespace trimmed. Shared by the compound
+    creator splitters."""
+    return (value[: m.start()] + value[m.end() :]).strip(" ;,·—–-\t\n").strip()
+
+
+def _split_unknown_from_creator(value: str) -> tuple[str, str] | None:
+    """If ``value`` contains a ``{{Unknown|role}}`` template alongside other
+    text, return ``(role, remainder)`` so the caller can emit a P170 somevalue
+    (+ P3831 role) for the unknown creator and a separate P170 somevalue +
+    P2093 stated-as for ``remainder``. Returns ``None`` when there is no
+    embedded ``{{Unknown}}`` or when the template is the *entire* value (a bare
+    ``{{Unknown|role}}`` is handled by :func:`_parse_creator_shape`)."""
+    m = _EMBEDDED_UNKNOWN_RE.search(value)
+    if not m:
+        return None
+    remainder = _creator_remainder(value, m)
+    if not remainder:
+        return None
+    return (m.group(1) or "").strip(), remainder
+
+
+# {{Creator:PageName}} embedded in a longer free-text creator credit (e.g.
+# "Believed to be by Asahel Curtis, working for … {{Creator:Asahel Curtis}}").
+# A bare {{Creator:Foo}} is tagged by _parse_creator_shape as a page sentinel;
+# a compound value falls through as a plain string and would store the literal
+# {{Creator:…}} markup in the P2093 stated-as.
+_EMBEDDED_CREATOR_PAGE_RE = re.compile(r"\{\{\s*[Cc]reator\s*:\s*([^}|]+?)\s*\}\}")
+
+
+def _split_creator_page_from_text(value: str) -> tuple[str, str] | None:
+    """If ``value`` embeds a ``{{Creator:PageName}}`` transclusion, return
+    ``(page_title, remainder)`` so the caller can emit a P170 creator-page
+    claim (QID-resolved in the materializer) plus a P170 somevalue + P2093
+    stated-as for the remaining community text. ``remainder`` may be empty."""
+    m = _EMBEDDED_CREATOR_PAGE_RE.search(value)
+    if not m:
+        return None
+    remainder = _creator_remainder(value, m)
+    return m.group(1).strip(), remainder
 
 
 def _extract_institution_qid(value: str) -> str | None:
@@ -844,21 +927,28 @@ def _split_extension_extras(value: str, canonical: str) -> str | None:
 
 
 def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
-    """True when a community value can't be posted as its SDC claim type
-    because it contains vertical whitespace.
+    """True when a community value can't be posted as an SDC claim and must be
+    preserved on the migrated template's param instead of dropped.
 
-    ``title``/``description`` (monolingualtext) and ``creator`` (string) go
-    through :func:`_validate_wikibase_text`, whose validator rejects
-    newlines/tabs/CR. A value with such whitespace that is *not* a
-    DPLA-prefixed extension (:func:`_split_extension_extras`) can't be an SDC
-    claim at all, so the caller preserves it on the migrated template's param
-    rather than erroring the whole import. ``date`` (time) is parsed, not
-    text-validated, so it's excluded; keys with no import mapping never reach
-    the text validator either.
+    Two cases:
+
+    * **No SDC import mapping at all** (``permission``, ``source``,
+      ``institution`` — not in :data:`LEGACY_IMPORT_PROPERTY`). These have no
+      Phase-3a claim builder, so a *community* override of one — e.g. a
+      hand-set ``permission = {{PD-old-auto-1923|deathyear=1922}}`` — would
+      otherwise land in ``community_imports`` and be silently dropped
+      (``format_legacy_import_claim`` returns ``None``). Preserve it on the
+      template param, where Module:DPLA renders it in the yellow box.
+    * **SDC-mappable but vertical-whitespace-bearing** (``title``/
+      ``description`` monolingualtext, ``creator`` string): the Wikibase text
+      validators reject newlines/tabs/CR, so a value with such whitespace that
+      is *not* a DPLA-prefixed extension (:func:`_split_extension_extras`)
+      can't be an SDC claim either. ``date`` (time) is parsed, not
+      text-validated, so a mapped time key is never unfit on whitespace.
     """
     mapping = LEGACY_IMPORT_PROPERTY.get(key)
     if mapping is None:
-        return False
+        return True
     _prop, kind = mapping
     return kind in ("monolingualtext", "string") and bool(
         _VERTICAL_WHITESPACE_RE.search(value)
@@ -912,6 +1002,84 @@ def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
     return bool(value_parts) and value_parts.issubset(canonical_parts)
 
 
+# Bare Commons language templates ({{en|text}}, {{de|text}}, …) wrap a single
+# monolingual value in a language code. Only unwrap when the ENTIRE value is
+# one such template with a KNOWN language code — so non-language 2–3 letter
+# templates ({{PD|…}}) and values that merely contain a template are left
+# untouched.
+_KNOWN_LANG_CODES = frozenset(
+    {
+        "en",
+        "de",
+        "fr",
+        "es",
+        "it",
+        "nl",
+        "pt",
+        "sv",
+        "da",
+        "no",
+        "nb",
+        "nn",
+        "fi",
+        "is",
+        "pl",
+        "cs",
+        "sk",
+        "ru",
+        "uk",
+        "be",
+        "bg",
+        "sr",
+        "hr",
+        "sl",
+        "ja",
+        "zh",
+        "ko",
+        "ar",
+        "he",
+        "el",
+        "hu",
+        "ro",
+        "tr",
+        "ca",
+        "gl",
+        "eu",
+        "ga",
+        "cy",
+        "la",
+        "hi",
+        "fa",
+        "id",
+    }
+)
+
+
+def _unwrap_lang_template(value: str) -> tuple[str, str]:
+    """If ``value`` is exactly one bare ``{{<lang>|<text>}}`` language template
+    with a known ISO code, return ``(text, lang)``; otherwise ``(value,
+    "en")``. Lets a community title/description be stored as clean monolingual
+    text with the correct language code instead of literal ``{{en|…}}`` markup,
+    and reconciled against canonical's plain text."""
+    # Fast path: a value with no template markup can't be a bare language
+    # wrapper — skip the mwparserfromhell parse (this runs on every
+    # title/description value across the batch).
+    if "{{" not in value:
+        return value, "en"
+    parsed = mwparserfromhell.parse(value.strip())
+    templates = parsed.filter_templates(recursive=False)
+    if len(templates) == 1 and str(parsed).strip() == str(templates[0]).strip():
+        tpl = templates[0]
+        name = str(tpl.name).strip().casefold()
+        if name in _KNOWN_LANG_CODES:
+            for p in tpl.params:
+                if not p.showkey:
+                    return str(p.value).strip(), name
+            if tpl.has("1"):
+                return str(tpl.get("1").value).strip(), name
+    return value, "en"
+
+
 def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
     """Return True when ``value`` (from wikitext) and ``canonical`` (from
     DPLA) are the same fact for the purpose of migration-planning.
@@ -941,6 +1109,11 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
     Keys outside those sets (other sub-template shapes) fall back to
     strict equality.
     """
+    if key in ("title", "description"):
+        # A community title/description wrapped in a bare language template
+        # ({{en|…}}) is the same fact as canonical's plain text — compare the
+        # unwrapped text so it isn't imported as a spurious community value.
+        value = _unwrap_lang_template(value)[0]
     if value == canonical:
         return True
     if key == "date" and dates_semantically_equal(value, canonical):
@@ -1125,7 +1298,7 @@ def format_legacy_import_claim(
     value: str,
     permalink: str,
     today: datetime.date | None = None,
-) -> dict | None:
+) -> dict | list[dict] | None:
     """Build a Wikibase ``wbeditentity``-ready claim dict for one
     legacy-imported value.
 
@@ -1149,6 +1322,11 @@ def format_legacy_import_claim(
     # can do the SDC comparison + resolution in the executor's
     # network-touching context, keeping :func:`plan_migration` pure.
     if canonical_key == "creator":
+
+        def _stated_as(text: str) -> dict:
+            _validate_wikibase_text(text, "P2093", canonical_key)
+            return _build_creator_stated_as_claim(text, permalink)
+
         if value.startswith(_CREATOR_QID_PREFIX):
             return {
                 "type": "statement",
@@ -1157,20 +1335,63 @@ def format_legacy_import_claim(
                 "_permalink": permalink,
             }
         if value.startswith(_CREATOR_PAGE_PREFIX):
-            return {
-                "type": "statement",
-                "rank": "normal",
-                "_phase3a_pending_creator_page": value[len(_CREATOR_PAGE_PREFIX) :],
-                "_permalink": permalink,
-            }
+            return _build_pending_creator_page_claim(
+                value[len(_CREATOR_PAGE_PREFIX) :], permalink
+            )
+        if value.startswith(_CREATOR_UNKNOWN_PREFIX):
+            # {{Unknown|<role>}} — creator unknown, optional role → P170
+            # somevalue + (recognised) P3831 role qualifier.
+            return _build_creator_unknown_claim(
+                value[len(_CREATOR_UNKNOWN_PREFIX) :], permalink
+            )
+        # A plain free-text creator credit — a stated-as name ("Jane Doe")
+        # or a descriptive line ("illustration photographed circa 1910 by
+        # Walter F. Piper") — with no {{Creator:}} page or {{creator|Wikidata=}}
+        # QID. Preserve it the conventional Commons way: a P170 (creator)
+        # ``somevalue`` statement qualified by P2093 (author name string),
+        # carrying the inferred-from-Wikitext reference. On a Commons
+        # MediaInfo entity P2093 is only ever a *qualifier* of P170 — a
+        # top-level P2093 mainsnak (the old ``LEGACY_IMPORT_PROPERTY``
+        # string mapping) is unconventional and Module:DPLA doesn't render
+        # it as a creator (so it silently failed to appear as one). This is
+        # the same shape the {{Creator:}}-no-QID fallback builds.
+        compound = _split_unknown_from_creator(value)
+        if compound is not None:
+            # Compound credit with an embedded {{Unknown|role}} (e.g.
+            # "{{unknown|author}} reprinted by Webster & Stevens"): split the
+            # unknown-role assertion from the remaining name so neither the raw
+            # template markup nor the role is lost — a P170 somevalue (+ P3831
+            # role) for the unknown creator plus a P170 somevalue + P2093
+            # stated-as for the remainder.
+            role, remainder = compound
+            return [
+                _build_creator_unknown_claim(role, permalink),
+                _stated_as(remainder),
+            ]
+        creator_page = _split_creator_page_from_text(value)
+        if creator_page is not None:
+            # Compound credit with an embedded {{Creator:PageName}}: the page
+            # transclusion becomes a QID-resolved P170 (via the materializer)
+            # and the remaining free text a P170 somevalue + P2093 stated-as,
+            # so neither the structured creator link nor the community's
+            # attribution note is lost to literal markup.
+            page_title, remainder = creator_page
+            result = [_build_pending_creator_page_claim(page_title, permalink)]
+            if remainder:
+                result.append(_stated_as(remainder))
+            return result
+        return _stated_as(value)
 
     mapping = LEGACY_IMPORT_PROPERTY.get(canonical_key)
     if mapping is None:
         return None
     prop, kind = mapping
     if kind == "monolingualtext":
-        _validate_wikibase_text(value, prop, canonical_key)
-        datavalue = _monolingualtext_datavalue(value)
+        # Unwrap a bare language template ({{en|…}}) so the monolingual value
+        # stores clean text with the right language code, not literal markup.
+        text, language = _unwrap_lang_template(value)
+        _validate_wikibase_text(text, prop, canonical_key)
+        datavalue = _monolingualtext_datavalue(text, language)
         datatype = "monolingualtext"
     elif kind == "string":
         _validate_wikibase_text(value, prop, canonical_key)
@@ -1221,7 +1442,11 @@ def build_legacy_import_claims(plan: MigrationPlan) -> list[dict]:
     claims: list[dict] = []
     for key, value in plan.community_imports.items():
         claim = format_legacy_import_claim(key, value, plan.source_permalink)
-        if claim is not None:
+        if claim is None:
+            continue
+        if isinstance(claim, list):
+            claims.extend(claim)
+        else:
             claims.append(claim)
     for filename in plan.related_image_imports:
         claims.append(
@@ -1259,19 +1484,32 @@ def fetch_revision_snapshots(file_page) -> list[RevisionSnapshot]:
     of :func:`plan_migration` is a small dict the executor walks
     cheaply.
 
-    Missing per-revision metadata (suppressed-author revisions, missing
-    text) is tolerated: empty user names become ``""`` and absent text
-    becomes ``""``, so :func:`parse_artwork_params` simply finds no
-    params and the revision contributes nothing to provenance.
+    A SUPPRESSED (RevDel) revision hides its author and content together
+    (``user is None``); it is tolerated — coerced to ``""`` so
+    :func:`parse_artwork_params` finds no params and it contributes nothing
+    to provenance. But a revision with a VISIBLE author and unloaded content
+    (``text is None`` while ``user`` is set) means the
+    ``revisions(content=True)`` fetch came back PARTIAL. That is raised, not
+    tolerated: silently coercing it to ``""`` would drop it from
+    :func:`trace_param_provenance`'s walk, mis-attributing an unchanged
+    DPLA-bot param to whichever later community editor's revision did load —
+    emitting a false "community" SDC import and a bogus "added by Wikimedia
+    users, not verified by the source institution" notice. The caller skips
+    and flags the file; a re-run with a complete fetch migrates it correctly.
     """
     snapshots: list[RevisionSnapshot] = []
     for rev in file_page.revisions(content=True):
-        snapshots.append(
-            RevisionSnapshot(
-                revid=getattr(rev, "revid", 0),
-                user=getattr(rev, "user", "") or "",
-                text=getattr(rev, "text", "") or "",
+        revid = getattr(rev, "revid", 0)
+        user = getattr(rev, "user", None)
+        text = getattr(rev, "text", None)
+        if text is None and user is not None:
+            raise RuntimeError(
+                f"incomplete revision content for {file_page.title()!r} "
+                f"(revid {revid}, user {user!r}): refusing to compute legacy "
+                f"provenance from a partial revision history"
             )
+        snapshots.append(
+            RevisionSnapshot(revid=revid, user=user or "", text=text or "")
         )
     return snapshots
 
@@ -1705,6 +1943,62 @@ def _build_creator_qid_claim(qid: str, permalink: str) -> dict:
             },
         },
         "references": [_reference_snaks(permalink)],
+    }
+
+
+def _build_creator_unknown_claim(role: str, permalink: str) -> dict:
+    """Build a P170 (creator) ``somevalue`` statement for an
+    ``{{Unknown|<role>}}`` community credit — an editor's assertion that the
+    creator is unknown but of a known role (e.g. photographer). A recognised
+    role (:data:`_UNKNOWN_ROLE_QID`) is recorded as a P3831 (object of
+    statement has role) qualifier; an absent or unrecognised role yields a
+    bare P170 somevalue. Carries the inferred-from-Wikitext reference.
+
+    NOTE: Module:DPLA does not yet render the P3831 role for a somevalue
+    creator (its creator renderer reads only the P2093 name-string
+    qualifier), so this statement is written correctly but renders blank
+    until the module is taught to surface ``{{Unknown|<role>}}`` from a
+    P170 somevalue + P3831. Tracked as the module-update follow-up.
+    """
+    claim = {
+        "type": "statement",
+        "rank": "normal",
+        "mainsnak": {
+            "snaktype": "somevalue",
+            "property": "P170",
+            "datatype": "wikibase-item",
+        },
+        "references": [_reference_snaks(permalink)],
+    }
+    role_qid = _UNKNOWN_ROLE_QID.get(role.casefold()) if role else None
+    if role_qid:
+        claim["qualifiers"] = {
+            "P3831": [
+                {
+                    "snaktype": "value",
+                    "property": "P3831",
+                    "datatype": "wikibase-item",
+                    "datavalue": {
+                        "type": "wikibase-entityid",
+                        "value": {"entity-type": "item", "id": role_qid},
+                    },
+                }
+            ]
+        }
+        claim["qualifiers-order"] = ["P3831"]
+    return claim
+
+
+def _build_pending_creator_page_claim(page_title: str, permalink: str) -> dict:
+    """Phase-3a placeholder for a Commons ``{{Creator:PageName}}`` transclusion.
+    :func:`materialize_import_claims` resolves it to a P170 QID (or a P170
+    somevalue + P2093 stated-as fallback when the Creator page has no Wikidata
+    link). Shared by the bare-``{{Creator:}}`` and compound-creator paths."""
+    return {
+        "type": "statement",
+        "rank": "normal",
+        "_phase3a_pending_creator_page": page_title,
+        "_permalink": permalink,
     }
 
 
