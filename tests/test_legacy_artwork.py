@@ -3494,6 +3494,120 @@ def test_is_redundant_dpla_source():
     assert _is_redundant_dpla_source("") is False
 
 
+def test_is_dpla_generated_extra():
+    from ingest_wikimedia.legacy_artwork import _is_dpla_generated_extra
+
+    # only-{{DPLA}} template (any key)
+    assert _is_dpla_generated_extra("source", "{{DPLA|Q1|hub=Q2}}") is True
+    # source/institution: only external link(s) -> uploader source pointer
+    assert (
+        _is_dpla_generated_extra(
+            "source", "[https://www.flickr.com/photos/usnationalarchives/123 A Title]"
+        )
+        is True
+    )
+    assert (
+        _is_dpla_generated_extra("source", "https://catalog.archives.gov/id/306274")
+        is True
+    )
+    assert (
+        _is_dpla_generated_extra("institution", "[https://example.org/x label]") is True
+    )
+    # source with community prose alongside a URL -> kept
+    assert (
+        _is_dpla_generated_extra(
+            "source",
+            "Missouri History Museum<br>URL: http://images.mohistory.org/x.jpg",
+        )
+        is False
+    )
+    # permission: rights-statement link / canned PD blurb -> generated
+    assert (
+        _is_dpla_generated_extra(
+            "permission",
+            "[https://www.archives.gov/social-media/flickr-faqs.html#9 The U.S. National Archives @ Flickr Commons]",
+        )
+        is True
+    )
+    assert (
+        _is_dpla_generated_extra(
+            "permission",
+            "[http://rightsstatements.org/page/UND/1.0/?language=en Copyright undetermined]",
+        )
+        is True
+    )
+    assert (
+        _is_dpla_generated_extra(
+            "permission",
+            "Public Domain: This image is in the public domain and may be used free of charge without permissions or fees.",
+        )
+        is True
+    )
+    # permission with community content -> kept
+    assert (
+        _is_dpla_generated_extra("permission", "{{PD-old-auto-1923|deathyear=1922}}")
+        is False
+    )
+    assert (
+        _is_dpla_generated_extra(
+            "permission",
+            "UND - [http://rightsstatements.org/page/UND/1.0/ x]<br>[https://web.archive.org/y MHS Open Access]: You are welcome to download",
+        )
+        is False
+    )
+    # mapped/community keys unaffected
+    assert _is_dpla_generated_extra("description", "A community note") is False
+
+
+def test_plan_migration_drops_uploader_source_link():
+    """A community-set ``source`` that is only an external link is an uploader
+    source pointer (it becomes SDC) — plan_migration drops it entirely."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title|source=x}}"),
+        (
+            2,
+            "Editor1",
+            "{{Artwork|title=A Title|source=[https://www.flickr.com/photos/usnationalarchives/123 A Title]}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "source" not in plan.community_imports
+    assert "source" not in plan.wikitext_preserved_extras
+    assert "source" not in plan.dpla_originated_params
+
+
+def test_plan_migration_drops_rights_boilerplate_permission():
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title|permission=x}}"),
+        (
+            2,
+            "Editor1",
+            "{{Artwork|title=A Title|permission=[https://www.archives.gov/social-media/flickr-faqs.html#9 The U.S. National Archives @ Flickr Commons]}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "permission" not in plan.wikitext_preserved_extras
+
+
+def test_plan_migration_keeps_source_with_prose():
+    """A ``source`` with community prose (institution note) is preserved."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title|source=x}}"),
+        (
+            2,
+            "Editor1",
+            "{{Artwork|title=A Title|source=Missouri History Museum<br>URL: http://images.mohistory.org/x.jpg}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.wikitext_preserved_extras.get("source", "").startswith(
+        "Missouri History Museum"
+    )
+
+
 def test_community_value_unfit_routes_rich_creator_to_wikitext():
     """A creator value that keeps residual template/wikilink markup after
     splitting recognised {{Creator:}}/{{Unknown}} templates (e.g. an

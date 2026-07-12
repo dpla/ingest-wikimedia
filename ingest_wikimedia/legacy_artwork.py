@@ -566,13 +566,14 @@ def plan_migration(
         if classified.get(key) == "community" and not _value_equivalent_to_canonical(
             key, value, canonical_value
         ):
-            # A value that is only a DPLA-managed source template ({{DPLA}} /
-            # {{DPLA metadata}}) is provenance already rendered from SDC — keeping
-            # it (as an SDC import or on the migrated template param) would just
-            # duplicate that render. Drop it outright, independent of the key's
-            # SDC mapping, so this stays correct if source/institution/permission
-            # gain mappings later.
-            if _is_redundant_dpla_source(value):
+            # A DPLA/uploader-generated boilerplate value (a bare {{DPLA}}
+            # template, an uploader source link, or a rights-statement string) is
+            # provenance already rendered from SDC — keeping it (as an SDC import
+            # or on the migrated template param) would just duplicate that
+            # render. Drop it outright, independent of the key's SDC mapping, so
+            # this stays correct if source/institution/permission gain mappings
+            # later. Conservative: community prose alongside it is preserved.
+            if _is_dpla_generated_extra(key, value):
                 continue
             # Only import community values that *differ* from canonical
             # — a community editor restating DPLA's title verbatim is
@@ -983,6 +984,74 @@ def _is_redundant_dpla_source(value: str) -> bool:
         else:
             return False  # a wikilink or other node -> not purely a DPLA template
     return saw_dpla_template
+
+
+# Known DPLA/uploader-generated rights boilerplate — an explicit allowlist,
+# expected to grow one partner at a time. Its failure mode is deliberately
+# benign: an unmatched variant is preserved (over-kept), never lost. If this
+# list grows large, prefer mapping rights to SDC over lengthening it.
+_RIGHTS_HOSTS = ("rightsstatements.org", "archives.gov/social-media/flickr-faqs")
+_CANNED_PD_BLURB = (
+    "Public Domain: This image is in the public domain and may be "
+    "used free of charge without permissions or fees."
+)
+
+
+def _only_external_links(value: str) -> bool:
+    """True when ``value`` is nothing but external link(s) plus whitespace /
+    ``<br>`` — no prose, templates, or wikilinks. A bare link like this is an
+    uploader-generated source pointer (it becomes the file's SDC source), not
+    community-authored context. Any prose alongside means it is NOT pure."""
+    saw = False
+    for node in mwparserfromhell.parse(value).nodes:
+        if isinstance(node, mwparserfromhell.nodes.ExternalLink):
+            saw = True
+        elif isinstance(node, mwparserfromhell.nodes.Text):
+            if node.value.strip():
+                return False
+        elif (
+            isinstance(node, mwparserfromhell.nodes.Tag)
+            and str(node.tag).strip().lower() == "br"
+        ):
+            continue
+        else:
+            return False
+    return saw
+
+
+def _is_dpla_generated_extra(key: str, value: str) -> bool:
+    """True when an unmapped community param value is DPLA/uploader-generated
+    boilerplate already represented in the file's structured data — preserving
+    it on the migrated ``{{DPLA metadata}}`` template only duplicates the SDC
+    render. Generalises :func:`_is_redundant_dpla_source` (the ``{{DPLA}}``
+    source template) to its sibling unmapped keys:
+
+    * any key: the value is only a ``{{DPLA}}``/``{{DPLA metadata}}`` template;
+    * ``source`` / ``institution``: the value is only external link(s) — an
+      uploader source pointer that the migration writes to SDC anyway;
+    * ``permission``: the value is only rights-statement link(s)
+      (rightsstatements.org, the NARA Flickr-Commons rights link), or the canned
+      DPLA public-domain blurb.
+
+    Conservative: any community prose alongside the boilerplate makes the value
+    NOT purely generated, so it is preserved (e.g. a rights template with a
+    ``deathyear``, or a source line with an institution note)."""
+    if _is_redundant_dpla_source(value):
+        return True
+    if key in ("source", "institution"):
+        return _only_external_links(value)
+    if key == "permission":
+        if casefold_for_compare(value) == casefold_for_compare(_CANNED_PD_BLURB):
+            return True
+        if not _only_external_links(value):
+            return False
+        urls = [
+            str(n.url)
+            for n in mwparserfromhell.parse(value).nodes
+            if isinstance(n, mwparserfromhell.nodes.ExternalLink)
+        ]
+        return all(any(h in u.lower() for h in _RIGHTS_HOSTS) for u in urls)
+    return False
 
 
 def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
