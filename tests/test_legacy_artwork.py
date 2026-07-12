@@ -3448,6 +3448,52 @@ def test_community_value_unfit_routes_multiparam_lang_wrapper_to_wikitext():
     assert _community_value_unfit_for_sdc("title", "A plain title") is False
 
 
+def test_plan_migration_drops_redundant_dpla_source_template():
+    """A community-set ``source = {{DPLA|…}}`` value is DPLA provenance already
+    rendered from SDC — plan_migration must DROP it entirely (neither an SDC
+    community_import nor a preserved wikitext extra), so the migrated
+    {{DPLA metadata}} template doesn't duplicate the SDC render. Regression: the
+    Bug-4 unmapped-key preservation used to re-inject it onto the param."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title|source=orig}}"),
+        (
+            2,
+            "Editor1",
+            "{{Artwork|title=A Title|source={{DPLA|Q69487884|hub=Q83878495|dpla_id=abc}}}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "source" not in plan.community_imports
+    assert "source" not in plan.wikitext_preserved_extras
+    assert "source" not in plan.dpla_originated_params
+
+
+def test_plan_migration_preserves_genuine_community_source():
+    """A genuine community ``source`` override (not a DPLA template) is still
+    preserved on the migrated template param — the drop is narrow."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title|source=orig}}"),
+        (2, "Editor1", "{{Artwork|title=A Title|source=Donated by the county museum}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert (
+        plan.wikitext_preserved_extras.get("source") == "Donated by the county museum"
+    )
+
+
+def test_is_redundant_dpla_source():
+    from ingest_wikimedia.legacy_artwork import _is_redundant_dpla_source
+
+    assert _is_redundant_dpla_source("{{DPLA|Q1|hub=Q2}}") is True
+    assert _is_redundant_dpla_source("  {{DPLA metadata|x=y}}  ") is True
+    assert _is_redundant_dpla_source("{{PD-US}}") is False
+    assert _is_redundant_dpla_source("plain text") is False
+    assert _is_redundant_dpla_source("{{DPLA|Q1}} extra text") is False
+    assert _is_redundant_dpla_source("") is False
+
+
 def test_community_value_unfit_routes_rich_creator_to_wikitext():
     """A creator value that keeps residual template/wikilink markup after
     splitting recognised {{Creator:}}/{{Unknown}} templates (e.g. an
