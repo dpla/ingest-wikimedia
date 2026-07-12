@@ -1689,3 +1689,34 @@ def test_build_claims_for_doc_pins_p813_to_ingest_date():
     assert _p813_times(out_a) == _p813_times(out_b), (
         "identical doc must produce byte-identical P813 stamps"
     )
+
+
+def test_parse_taken_on_template_reduces_to_display_date():
+    from ingest_wikimedia.sdc import parse_taken_on_template
+
+    assert parse_taken_on_template("{{Taken on|1921-09-21}}") == "1921-09-21"
+    assert (
+        parse_taken_on_template("{{taken on|1921-09-21|location=Seattle}}")
+        == "1921-09-21"
+    )
+    assert parse_taken_on_template("{{Taken in|1921}}") == "1921"
+    assert parse_taken_on_template("{{Taken circa|1921}}") == "circa 1921"
+    assert parse_taken_on_template("{{other date|~|1921}}") is None
+    assert parse_taken_on_template("1921-09-21") is None
+    assert parse_taken_on_template("") is None
+
+
+def test_dates_semantically_equal_reconciles_taken_on_template():
+    from ingest_wikimedia.sdc import dates_semantically_equal
+
+    assert dates_semantically_equal("{{Taken on|1921-09-21}}", "1921-09-21")
+    assert dates_semantically_equal("{{Taken in|1959}}", "1959")
+    assert not dates_semantically_equal("{{Taken on|1921-09-21}}", "1930-01-01")
+
+
+def test_parse_taken_on_template_tolerates_repeated_separator():
+    from ingest_wikimedia.sdc import dates_semantically_equal, parse_taken_on_template
+
+    assert parse_taken_on_template("{{Taken  on|1921-09-21}}") == "1921-09-21"
+    assert parse_taken_on_template("{{Taken_on|1921-09-21}}") == "1921-09-21"
+    assert dates_semantically_equal("{{Taken  on|1921-09-21}}", "1921-09-21")
