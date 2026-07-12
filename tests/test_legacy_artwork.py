@@ -3466,6 +3466,7 @@ def test_plan_migration_drops_redundant_dpla_source_template():
     assert plan is not None
     assert "source" not in plan.community_imports
     assert "source" not in plan.wikitext_preserved_extras
+    assert "source" not in plan.dpla_originated_params
 
 
 def test_plan_migration_preserves_genuine_community_source():
