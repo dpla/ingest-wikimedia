@@ -566,6 +566,14 @@ def plan_migration(
         if classified.get(key) == "community" and not _value_equivalent_to_canonical(
             key, value, canonical_value
         ):
+            # A value that is only a DPLA-managed source template ({{DPLA}} /
+            # {{DPLA metadata}}) is provenance already rendered from SDC — keeping
+            # it (as an SDC import or on the migrated template param) would just
+            # duplicate that render. Drop it outright, independent of the key's
+            # SDC mapping, so this stays correct if source/institution/permission
+            # gain mappings later.
+            if _is_redundant_dpla_source(value):
+                continue
             # Only import community values that *differ* from canonical
             # — a community editor restating DPLA's title verbatim is
             # not an import we want to record (it's redundant). Same
@@ -949,6 +957,34 @@ def _split_extension_extras(value: str, canonical: str) -> str | None:
     return remainder
 
 
+_DPLA_MANAGED_TEMPLATE_NAMES = frozenset({"dpla", "dpla metadata"})
+
+
+def _is_redundant_dpla_source(value: str) -> bool:
+    """True when ``value`` is nothing but DPLA-managed source template(s)
+    (``{{DPLA|…}}`` / ``{{DPLA metadata|…}}``) plus whitespace.
+
+    Such a value is DPLA provenance already carried by the file's structured
+    data — re-adding it to the migrated ``{{DPLA metadata}}`` template only
+    duplicates what Module:DPLA already renders from SDC. Any community text or
+    markup alongside the template means the value is NOT purely redundant and is
+    still preserved."""
+    if "dpla" not in value.casefold():
+        return False  # cheap guard: a DPLA-managed name always contains "dpla"
+    saw_dpla_template = False
+    for node in mwparserfromhell.parse(value).nodes:
+        if isinstance(node, mwparserfromhell.nodes.Template):
+            if _template_name(node) not in _DPLA_MANAGED_TEMPLATE_NAMES:
+                return False
+            saw_dpla_template = True
+        elif isinstance(node, mwparserfromhell.nodes.Text):
+            if node.value.strip():
+                return False  # community text alongside the template
+        else:
+            return False  # a wikilink or other node -> not purely a DPLA template
+    return saw_dpla_template
+
+
 def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
     """True when a community value can't be posted as an SDC claim and must be
     preserved on the migrated template's param instead of dropped.
@@ -959,6 +995,8 @@ def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
       ``institution`` — not in :data:`LEGACY_IMPORT_PROPERTY`): no Phase-3a
       claim builder, so a community override would otherwise be silently
       dropped. Preserve it on the template param (Module:DPLA's yellow box).
+      (A value that is only a redundant DPLA source template is dropped earlier,
+      in :func:`plan_migration`, before it reaches this classifier.)
     * **Vertical whitespace** (``title``/``description`` monolingualtext,
       ``creator`` string): the Wikibase text validators reject newlines/tabs/CR.
       ``date`` (time) is parsed, not text-validated, so never unfit here.
