@@ -239,6 +239,22 @@ def _advance_await_target_free_entry(
             "action removed it during the wait window."
         )
 
+    # An admin (or an editor) may have redirected the community file
+    # during the wait window — most likely, redirected it to our tagged
+    # canonical. That means admin already did the merge, just in the
+    # opposite direction from the one we intended. The invariant is
+    # satisfied either way (our canonical holds the S3 SHA1); there is
+    # no move for us to perform. Drop the entry as a decisive
+    # "already-actioned" FAIL rather than blindly moving a redirect
+    # page around and risking a broken redirect chain.
+    if community_page.isRedirectPage():
+        return True, (
+            "FAIL: community file was redirected during the wait window "
+            "— admin (or an editor) already merged it; there is nothing "
+            "for the drain phase to move. Invariant satisfied via the "
+            "existing redirect."
+        )
+
     # Re-validate SHA1 against content drift on the community side.
     actual_sha1 = community_page.latest_file_info.sha1
     if actual_sha1 != expected_sha1:
@@ -536,7 +552,30 @@ def main(no_wait: bool, partner: str) -> None:
         # re-invocation → self-tag path) can be picked up in the same
         # invocation instead of having to wait for the next partner
         # session's drain.
-        _process_await_target_free(partner, site)
+        #
+        # Patient loop: same "wait for human admin action" semantics as
+        # the category-capacity loop above — sleep ``throttle.poll_secs``
+        # between rounds and drain until the sidecar is empty. An entry
+        # that never gets actioned would loop forever; that's acceptable
+        # because patient mode is explicitly designed to wait days/weeks
+        # on Commons volunteers, and the operator ends it via
+        # ``tmux kill-session`` if needed (sidecar persists across kills).
+        while True:
+            pending = await_target_free_sidecar.read_sidecar(partner)
+            if not pending:
+                break
+            _process_await_target_free(partner, site)
+            still_pending = await_target_free_sidecar.read_sidecar(partner)
+            if not still_pending:
+                break
+            logging.info(
+                "Await-target-free: %d entry(ies) still pending for partner "
+                "%s; sleeping %ds before next round.",
+                len(still_pending),
+                partner,
+                int(throttle.poll_secs),
+            )
+            time.sleep(throttle.poll_secs)
         elapsed = time.monotonic() - started_at
         logging.info(
             "Drain-deferred: complete. Emitted %d item(s) over %.0f seconds.",

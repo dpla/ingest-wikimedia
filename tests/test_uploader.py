@@ -863,12 +863,14 @@ def test_resolve_hash_drift_case2_stays_upload_and_tag_when_target_is_dpla_bot_u
     assert action == "upload_and_tag"
 
 
-def test_resolve_hash_drift_case2_stays_upload_and_tag_when_first_uploader_unknown():
-    """When first_uploader can't identify the original uploader (API
-    failure, empty history), default to the conservative UPLOAD_AND_TAG
-    path — same as the pre-fix behaviour. Ensures the new subclass
-    check doesn't regress into a silent no-op when first_uploader is
-    None."""
+def test_resolve_hash_drift_case2_routes_unknown_uploader_to_self_tag_defer():
+    """When ``first_uploader`` can't identify the original uploader (API
+    failure, empty history), route through the non-destructive
+    ``UPLOAD_AND_SELF_TAG_DEFER`` path rather than the destructive
+    ``UPLOAD_AND_TAG`` path. An unknown provenance doesn't prove
+    bot-authorship, so the safer default is to tag OUR own file and let
+    the drain phase resolve, rather than requesting admin deletion of a
+    possibly-community upload."""
     uploader = _build_uploader_with_dpla()
     existing_title = "Some File.jpg"
     intended_title = "Some File - DPLA - abc.jpg"
@@ -886,7 +888,7 @@ def test_resolve_hash_drift_case2_stays_upload_and_tag_when_first_uploader_unkno
             dpla_id="abc" + "a" * 29,
             ordinal=1,
         )
-    assert action == "upload_and_tag"
+    assert action == "upload_and_self_tag_defer"
 
 
 def test_tag_self_and_defer_enqueues_sidecar_entry_with_partner_from_caller(
@@ -939,6 +941,63 @@ def test_tag_self_and_defer_enqueues_sidecar_entry_with_partner_from_caller(
 
     # Other partners' sidecars remain untouched.
     assert await_target_free_sidecar.read_sidecar("bpl") == []
+
+
+def test_tag_self_and_defer_records_sidecar_entry_before_tagging(tmp_path, monkeypatch):
+    """Durability: the sidecar entry MUST land before the Commons tag,
+    so a tag-side failure never leaves the canonical file marked for
+    deletion without a queued intent to promote the community file.
+    Assert order via the call sequence, and confirm that a tag failure
+    leaves the sidecar entry intact for the drain phase (or a re-run)
+    to pick up."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+
+    uploader = _build_uploader_with_dpla()
+
+    call_order: list[str] = []
+    real_add_entry = await_target_free_sidecar.add_entry
+
+    def add_entry_stub(partner, entry):
+        call_order.append("sidecar_add")
+        # Delegate to the underlying implementation (captured before the
+        # patch) so we don't recurse into our own stub.
+        return real_add_entry(partner, entry)
+
+    def tag_stub(*_a, **_kw):
+        call_order.append("tag_as_duplicate")
+        raise RuntimeError("simulated Commons write failure")
+
+    with (
+        patch("tools.uploader.get_page") as get_page,
+        patch(
+            "tools.uploader.await_target_free_sidecar.add_entry",
+            side_effect=add_entry_stub,
+        ),
+        patch("tools.uploader.tag_as_duplicate", side_effect=tag_stub),
+    ):
+        get_page.return_value = MagicMock(text="")
+        # Should NOT raise — the tag failure is caught and logged, since
+        # the sidecar entry (added first) already carries the durable intent.
+        uploader._tag_self_and_defer(
+            partner="heartland",
+            dpla_canonical_title="Foo - DPLA - abc.jpg",
+            community_title="Foo.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
+        )
+
+    # Order: sidecar_add first, then tag_as_duplicate.
+    assert call_order == ["sidecar_add", "tag_as_duplicate"], (
+        f"sidecar entry must be persisted before the Commons tag is emitted; "
+        f"got {call_order!r}"
+    )
+    # And the sidecar entry survives the tag-side crash.
+    entries = await_target_free_sidecar.read_sidecar("heartland")
+    assert len(entries) == 1
+    assert entries[0]["dpla_id"] == "abc" + "a" * 29
 
 
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":

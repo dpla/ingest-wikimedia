@@ -266,11 +266,3 @@ def test_add_entry_blocks_while_lock_is_held_and_proceeds_when_freed(
     # And the entry actually landed.
     stored = await_target_free_sidecar.read_sidecar("nara")
     assert [e["dpla_id"] for e in stored] == ["aaa"]
-
-
-# Some CI runners may lack a `spawn` context that can find the test
-# module — mark the spawn-based test to skip if we can't import from a
-# fresh interpreter. In-process tests still exercise the lock via the
-# threading test above.
-if not hasattr(multiprocessing, "get_context"):  # pragma: no cover
-    pytestmark = pytest.mark.skip(reason="multiprocessing.get_context unavailable")

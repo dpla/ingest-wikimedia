@@ -445,11 +445,15 @@ def _tagged_page(*, exists=True, is_redirect=False, text="") -> MagicMock:
 
 
 def _community_page(
-    *, exists=True, sha1="9719e05ab718aac6d400b239792ceeb45a766954"
+    *,
+    exists=True,
+    is_redirect=False,
+    sha1="9719e05ab718aac6d400b239792ceeb45a766954",
 ) -> MagicMock:
     """MagicMock for the community file — pre-loaded with a valid sha1."""
     p = MagicMock()
     p.exists.return_value = exists
+    p.isRedirectPage.return_value = is_redirect
     p.latest_file_info.sha1 = sha1
     p.title.return_value = "File:Angus.jpg"
     return p
@@ -617,6 +621,30 @@ def test_advance_fail_when_move_blocked_by_article_exists_conflict():
     relink.assert_not_called()
 
 
+def test_advance_fail_when_community_page_is_redirect():
+    """An admin (or an editor) redirected the community file during the
+    wait window — most likely, redirected it to our tagged canonical.
+    The invariant is satisfied either way (our canonical holds the S3
+    SHA1); there is no move to perform. Drop the entry as a decisive
+    FAIL rather than trying to move a redirect page around.
+    """
+    site = MagicMock()
+    tagged = _tagged_page(exists=False)
+    community = _community_page(exists=True, is_redirect=True)
+    with patch(
+        "tools.drain_deferred.get_page",
+        side_effect=lambda _site, title: tagged if "22412cd0" in title else community,
+    ):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is not None and note.startswith("FAIL:")
+    assert "redirected" in note
+    # The move must not have been attempted.
+    community.move.assert_not_called()
+
+
 def test_advance_fail_when_community_sha1_drifted():
     """Content drift on the community side during the wait window —
     the file no longer holds the S3 SHA1 we saw at tag time. Refuse
@@ -658,6 +686,60 @@ def test_process_await_target_free_keeps_pending_entries(override_root):
     ):
         drain_deferred._process_await_target_free("nara", MagicMock())
     assert len(await_target_free_sidecar.read_sidecar("nara")) == 1
+
+
+def test_patient_mode_loops_stage2_until_sidecar_empty(lock_fd, monkeypatch):
+    """Patient mode must poll stage-2 (await-target-free) until its
+    sidecar is empty, sleeping between rounds — mirroring the
+    category-capacity loop's semantics. Two entries here; round 1
+    advances one and leaves one queued, round 2 advances the last.
+    """
+    # Seed only the await sidecar; the category-capacity sidecar is empty
+    # so the outer drain loop skips (but patient-mode still runs stage 2).
+    await_target_free_sidecar.write_sidecar(
+        "nara", [_await_entry(dpla_id="aaa"), _await_entry(dpla_id="bbb")]
+    )
+
+    throttle = MagicMock()
+    throttle.wait_for_capacity.return_value = True
+    throttle.resume_below = 900
+    throttle.poll_secs = 0  # keep the test fast — no real waiting
+    throttle.category_size.return_value = 0
+
+    advance_calls = []
+
+    def fake_advance(entry, _site):
+        advance_calls.append(entry["dpla_id"])
+        # Round 1: only "aaa" advances; "bbb" stays PENDING.
+        # Round 2: "bbb" advances too.
+        if entry["dpla_id"] == "bbb" and advance_calls.count("bbb") == 1:
+            return (False, "PENDING: waiting")
+        return (True, None)
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch(
+            "tools.drain_deferred.DuplicateCategoryThrottle",
+            return_value=throttle,
+        ),
+        patch("tools.drain_deferred.notify_drain_phase_start"),
+        patch("tools.drain_deferred.notify_drain_phase_complete"),
+        patch(
+            "tools.drain_deferred._advance_await_target_free_entry",
+            side_effect=fake_advance,
+        ),
+        # Prevent time.sleep from stalling the test (poll_secs=0 already,
+        # but be defensive if anything else calls sleep).
+        monkeypatch.context() as m,
+    ):
+        m.setattr("tools.drain_deferred.time.sleep", lambda *_a, **_k: None)
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    assert result.exit_code == 0, result.output
+    # Sidecar drained.
+    assert await_target_free_sidecar.read_sidecar("nara") == []
+    # bbb was polled twice (once per round); aaa only once.
+    assert advance_calls.count("bbb") == 2
+    assert advance_calls.count("aaa") == 1
 
 
 def test_process_await_target_free_isolates_per_entry_exceptions(override_root, caplog):
