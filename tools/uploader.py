@@ -795,6 +795,26 @@ class Uploader:
             )
             if existing_file is not None:
                 if existing_file.title(with_ns=False) == page_title:
+                    # Resume guard for a partially-completed Case-2
+                    # self-tag-defer. If a prior run uploaded these bytes
+                    # to the canonical title and then died before writing
+                    # the {{Duplicate}} tag, the await-target-free entry is
+                    # still ``tag_emitted=False`` and drain-deferred will
+                    # sit on it forever (it treats un-emitted entries as
+                    # PENDING, not advanceable). ``find_file_by_hash`` with
+                    # ``preferred_title=page_title`` returns THIS canonical
+                    # file, so control would otherwise skip straight past
+                    # the self-tag-defer branch below and never retry the
+                    # tag. Finish the tag here before returning SKIPPED —
+                    # the upload itself is genuinely already done, only the
+                    # tag needs completing.
+                    if not dry_run:
+                        self._resume_self_tag_if_pending(
+                            partner=partner,
+                            page_title=page_title,
+                            dpla_id=dpla_id,
+                            ordinal=ordinal,
+                        )
                     logging.info(
                         f"Skipping {dpla_id} {ordinal}: Already exists on commons."
                     )
@@ -2202,6 +2222,50 @@ class Uploader:
             raise
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
+
+    def _resume_self_tag_if_pending(
+        self, *, partner: str, page_title: str, dpla_id: str, ordinal: int
+    ) -> None:
+        """Finish a Case-2 self-tag-defer that a prior run left mid-flight.
+
+        Called from the "already exists on Commons" skip path: if an
+        await-target-free entry for ``(dpla_id, ordinal)`` exists with
+        ``tag_emitted=False``, the prior run uploaded the canonical bytes
+        but died before writing the {{Duplicate}} tag. Re-drive the tag
+        via :meth:`_tag_self_and_defer` (whose steps are all idempotent:
+        ``add_entry`` dedupes, ``tag_as_duplicate`` skips an already-
+        tagged page, ``mark_tag_emitted`` is a no-op if already True).
+
+        No pending entry, or one already ``tag_emitted=True`` → nothing
+        to do. Respects the Category:Duplicate throttle exactly like the
+        first-time path: if the category is at capacity, leave the entry
+        ``tag_emitted=False`` and let a later uploader run (or the drain
+        pass, which re-invokes the uploader) retry — never emit a tag
+        that overflows the admins' queue.
+        """
+        pending = await_target_free_sidecar.get_entry(partner, dpla_id, ordinal)
+        if pending is None or pending.get("tag_emitted", True):
+            return
+        if self.dup_throttle is not None and not self.dup_throttle.try_acquire():
+            logging.info(
+                f"Deferring self-tag retry for {dpla_id} {ordinal}: "
+                f"Category:Duplicate at capacity; entry stays tag_emitted="
+                f"False for a later run to finish."
+            )
+            return
+        logging.info(
+            f"Resuming self-tag for {dpla_id} {ordinal}: canonical file "
+            f"[[File:{page_title}]] already uploaded on a prior run but the "
+            f"{{{{Duplicate}}}} tag was never emitted; retrying the tag."
+        )
+        self._tag_self_and_defer(
+            partner=partner,
+            dpla_canonical_title=page_title,
+            community_title=pending["community_title"],
+            dpla_id=dpla_id,
+            ordinal=ordinal,
+            expected_sha1=pending["expected_sha1"],
+        )
 
     def _tag_self_and_defer(
         self,

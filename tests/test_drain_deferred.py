@@ -768,6 +768,52 @@ def test_patient_mode_loops_stage2_until_sidecar_empty(lock_fd, monkeypatch):
     assert advance_calls.count("aaa") == 1
 
 
+def test_patient_mode_stops_when_only_unemitted_entries_remain(lock_fd, monkeypatch):
+    """A ``tag_emitted=False`` entry can only be finished by a future
+    uploader run (stage-2 does not emit tags). Patient mode must NOT
+    spin forever waiting on admin action that can't apply — if every
+    still-pending entry is unemitted, it breaks and leaves them queued.
+    """
+    # One entry, stuck tag_emitted=False. Real _advance would return
+    # PENDING for it (no admin advance possible), so use the real path.
+    await_target_free_sidecar.write_sidecar(
+        "nara", [_await_entry(dpla_id="stuck", tag_emitted=False)]
+    )
+
+    throttle = MagicMock()
+    throttle.wait_for_capacity.return_value = True
+    throttle.resume_below = 900
+    throttle.poll_secs = 0
+    throttle.category_size.return_value = 0
+
+    sleep_calls = {"n": 0}
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
+        patch("tools.drain_deferred.notify_drain_phase_start"),
+        patch("tools.drain_deferred.notify_drain_phase_complete"),
+        patch("tools.drain_deferred.get_page") as get_page,
+        monkeypatch.context() as m,
+    ):
+        # If the loop ever sleeps, it's spinning — fail loudly instead
+        # of hanging the suite.
+        def _tracked_sleep(*_a, **_k):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] > 3:
+                raise AssertionError("patient loop is spinning on an unemitted entry")
+
+        m.setattr("tools.drain_deferred.time.sleep", _tracked_sleep)
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    assert result.exit_code == 0, result.output
+    # Phase gate short-circuits before any Commons fetch.
+    get_page.assert_not_called()
+    # Entry left queued for the next uploader run; loop did not spin.
+    remaining = await_target_free_sidecar.read_sidecar("nara")
+    assert [e["dpla_id"] for e in remaining] == ["stuck"]
+    assert sleep_calls["n"] == 0
+
+
 def test_run_stage2_once_skips_when_partner_lock_held(override_root):
     """The partner-scoped stage-2 lock serializes same-partner stage-2
     rounds. When a foreign holder has it, ``_run_stage2_once`` must

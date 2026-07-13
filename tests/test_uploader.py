@@ -1086,6 +1086,128 @@ def test_tag_self_and_defer_second_call_reflips_tag_emitted_after_prior_failure(
     assert entries[0]["tag_emitted"] is True
 
 
+def test_resume_self_tag_if_pending_finishes_tag_for_uploaded_but_untagged(
+    tmp_path, monkeypatch
+):
+    """The stranding CR flagged: a prior run uploaded the canonical file
+    (so ``find_file_by_hash`` finds it at page_title and the fast-path
+    skip fires) but died before tagging, leaving the sidecar entry
+    ``tag_emitted=False``. ``_resume_self_tag_if_pending`` must finish
+    the tag and flip the phase — otherwise drain-deferred sits on the
+    entry forever.
+    """
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    await_target_free_sidecar.add_entry(
+        "heartland",
+        {
+            "dpla_id": "abc" + "a" * 29,
+            "ordinal": 1,
+            "tagged_title": "Foo - DPLA - abc.jpg",
+            "community_title": "Foo.jpg",
+            "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
+            "tag_emitted": False,
+        },
+    )
+    uploader = _build_uploader_with_dpla()
+    with (
+        patch("tools.uploader.get_page") as get_page,
+        patch("tools.uploader.tag_as_duplicate") as tag,
+    ):
+        get_page.return_value = MagicMock(text="")
+        uploader._resume_self_tag_if_pending(
+            partner="heartland",
+            page_title="Foo - DPLA - abc.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    tag.assert_called_once()
+    entries = await_target_free_sidecar.read_sidecar("heartland")
+    assert entries[0]["tag_emitted"] is True
+
+
+def test_resume_self_tag_if_pending_noop_when_already_emitted(tmp_path, monkeypatch):
+    """A fully-queued entry (``tag_emitted=True``) needs no retry — the
+    resume helper must not re-tag."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    await_target_free_sidecar.add_entry(
+        "heartland",
+        {
+            "dpla_id": "abc" + "a" * 29,
+            "ordinal": 1,
+            "tagged_title": "Foo - DPLA - abc.jpg",
+            "community_title": "Foo.jpg",
+            "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
+            "tag_emitted": True,
+        },
+    )
+    uploader = _build_uploader_with_dpla()
+    with patch("tools.uploader.tag_as_duplicate") as tag:
+        uploader._resume_self_tag_if_pending(
+            partner="heartland",
+            page_title="Foo - DPLA - abc.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    tag.assert_not_called()
+
+
+def test_resume_self_tag_if_pending_noop_when_no_entry(tmp_path, monkeypatch):
+    """No sidecar entry (e.g. a genuine already-done file with no pending
+    workflow) → the resume helper is a clean no-op, never touching
+    Commons."""
+    from ingest_wikimedia import drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    uploader = _build_uploader_with_dpla()
+    with patch("tools.uploader.tag_as_duplicate") as tag:
+        uploader._resume_self_tag_if_pending(
+            partner="heartland",
+            page_title="Foo - DPLA - abc.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    tag.assert_not_called()
+
+
+def test_resume_self_tag_if_pending_respects_throttle_capacity(tmp_path, monkeypatch):
+    """When Category:Duplicate is at capacity, the resume must NOT emit
+    the tag — it leaves the entry ``tag_emitted=False`` for a later run,
+    exactly like the first-time path defers rather than overflowing the
+    admins' queue."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    await_target_free_sidecar.add_entry(
+        "heartland",
+        {
+            "dpla_id": "abc" + "a" * 29,
+            "ordinal": 1,
+            "tagged_title": "Foo - DPLA - abc.jpg",
+            "community_title": "Foo.jpg",
+            "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
+            "tag_emitted": False,
+        },
+    )
+    uploader = _build_uploader_with_dpla()
+    throttle = MagicMock()
+    throttle.try_acquire.return_value = False  # category at capacity
+    uploader.dup_throttle = throttle
+    with patch("tools.uploader.tag_as_duplicate") as tag:
+        uploader._resume_self_tag_if_pending(
+            partner="heartland",
+            page_title="Foo - DPLA - abc.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    tag.assert_not_called()
+    entries = await_target_free_sidecar.read_sidecar("heartland")
+    assert entries[0]["tag_emitted"] is False
+
+
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":
     """Like ``_build_uploader_with_dpla`` but DPLA API raises ``exc`` on
     every ``get_item_metadata`` call. Used to exercise the "colliding

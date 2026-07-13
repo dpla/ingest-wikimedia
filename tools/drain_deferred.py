@@ -461,14 +461,25 @@ def _run_stage2_patient_loop(
     The partner-scoped lock is acquired PER ROUND and released before
     sleeping — so a peer drain-deferred can also run stage-2 for this
     partner during our sleep window, and neither has to wait on the
-    other for a full poll cycle. Entries mid-workflow (tag_emitted=
-    False) are treated as PENDING; the next uploader run flips them
-    to True, and the following round advances them.
+    other for a full poll cycle.
 
-    An entry that a Commons admin never actions loops forever — same
-    contract as the category-capacity loop: patient mode is designed
-    to wait days/weeks and the operator ends it via
-    ``tmux kill-session`` if needed (sidecar persists across kills).
+    Two distinct "pending" states, and the loop treats them
+    differently:
+
+      * ``tag_emitted=True`` — the {{Duplicate}} tag is on Commons and
+        the entry is waiting on a human admin to action it. This is the
+        genuine patient wait: loop and sleep, possibly for days/weeks,
+        until admin acts (operator ends it via ``tmux kill-session`` if
+        needed; the sidecar persists across kills).
+
+      * ``tag_emitted=False`` — the uploader recorded the intent but the
+        tag write never landed. Stage-2 CANNOT advance these and does
+        NOT emit tags itself; only a subsequent uploader pass finishes
+        them (via ``_resume_self_tag_if_pending``). Looping on them here
+        would spin forever with no possible progress. So if EVERY
+        still-pending entry is ``tag_emitted=False``, stop waiting and
+        leave them queued for the next uploader run — no data loss, and
+        no infinite in-batch loop.
     """
     while True:
         pending = await_target_free_sidecar.read_sidecar(partner)
@@ -478,11 +489,24 @@ def _run_stage2_patient_loop(
         still_pending = await_target_free_sidecar.read_sidecar(partner)
         if not still_pending:
             break
+        advanceable = [e for e in still_pending if e.get("tag_emitted", True)]
+        if not advanceable:
+            logging.warning(
+                "Await-target-free: %d entry(ies) for partner %s are still "
+                "tag_emitted=False (the {{Duplicate}} tag never landed); "
+                "stage-2 cannot advance these — it does not emit tags. "
+                "Leaving them queued for the next uploader run to finish "
+                "rather than waiting on admin action that can't apply.",
+                len(still_pending),
+                partner,
+            )
+            break
         logging.info(
             "Await-target-free: %d entry(ies) still pending for partner "
-            "%s; sleeping %ds before next round.",
+            "%s (%d awaiting admin action); sleeping %ds before next round.",
             len(still_pending),
             partner,
+            len(advanceable),
             int(throttle.poll_secs),
         )
         time.sleep(throttle.poll_secs)
