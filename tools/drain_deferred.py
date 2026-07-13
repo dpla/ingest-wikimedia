@@ -34,10 +34,16 @@ The command has two modes:
     target's chain. One best-effort round of each queue; never blocks.
 
 Concurrency: uploader/sdc-sync invocations across the box are serialized
-by a host-level ``flock`` (``_DRAIN_LOCK_PATH``) held only while a round
-runs — released across the patient waits so one partner's multi-day wait
-never blocks another's drain. Cancellation is operator-driven
-(``tmux kill-session``); both queues persist across kills.
+by a host-level ``flock`` (``_DRAIN_LOCK_PATH``). The **await** queue
+acquires it per round and releases it before each patient sleep, so one
+partner's multi-day admin wait never blocks another's await drain. The
+**category** queue holds it across its ``wait_for_capacity`` wait — a
+pre-existing behavior: the category drain blocks on Category:Duplicate
+while holding the lock. (Scoping the category lock per round, and
+interleaving the two queues so await progresses while category is
+capacity-blocked, is a worthwhile follow-up but out of scope here.)
+Cancellation is operator-driven (``tmux kill-session``); both queues
+persist across kills.
 """
 
 from __future__ import annotations

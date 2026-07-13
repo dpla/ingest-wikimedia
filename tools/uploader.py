@@ -1999,30 +1999,19 @@ class Uploader:
         # title-drift-move machinery.
         # Decide whether the sha1-sibling is stranded-DPLA-bot (safe to
         # tag for admin deletion) or community-authored (must NOT be
-        # tagged; instead defer to drain-deferred stage 2). Two signals:
+        # tagged; instead defer). Provenance is decided ONLY by
+        # ``first_uploader``: the file's oldest revision's uploader.
         #
-        #   1. A DPLA-canonical title suffix (``... - DPLA - <id>``) is
-        #      a definitive fingerprint of a bot upload — no community
-        #      editor uses that naming — so we short-circuit to
-        #      UPLOAD_AND_TAG without any API call. Covers the orphan-
-        #      within-item case (our SHA1 lives at "(page 99)" while
-        #      the intended title is "(page 4)").
-        #   2. Otherwise, query ``first_uploader``. If it resolves to a
-        #      known DPLA-adjacent bot, still UPLOAD_AND_TAG. Every
-        #      other outcome — community editor, empty history, or an
-        #      API failure — routes through the non-destructive
-        #      UPLOAD_AND_SELF_TAG_DEFER path. Unknown provenance does
-        #      NOT prove bot-authorship, so defaulting to community-tag
-        #      would be aggressive on ambiguous input.
-        actual_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
-        if actual_dpla_id is not None:
-            logging.info(
-                f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
-                f"has a different hash; will upload correct hash and tag "
-                f"stranded DPLA-bot file [[File:{actual_filename}]] as duplicate."
-            )
-            return DriftResolution.UPLOAD_AND_TAG
-
+        # We deliberately do NOT treat a DPLA-canonical-shaped title
+        # (``... - DPLA - <id>``) as proof of bot authorship. A community
+        # editor can rename a file into that form, and routing on the
+        # filename alone would send a community upload down the
+        # destructive tag-for-deletion path — the exact Bartlett harm
+        # this whole flow exists to prevent. The provenance lookup is one
+        # cheap API call on an already-rare path, and it returns a
+        # DPLA-adjacent bot for our own stranded orphans anyway (e.g. our
+        # SHA1 at "(page 99)" vs intended "(page 4)"), so correctness for
+        # that case is preserved without the shortcut.
         first = first_uploader(self.site, existing_file)
         first_is_dpla_bot = (
             first is not None and _normalize_account(first) in _NORMALIZED_DPLA_BOTS

@@ -781,7 +781,12 @@ def test_resolve_hash_drift_case2_still_tags_when_existing_is_true_orphan():
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
     intended_page.title.return_value = intended_title
-    with patch("tools.uploader.get_page", return_value=intended_page):
+    # A `- DPLA -` orphan of our own item was uploaded by our bot, so
+    # provenance resolves to a DPLA-adjacent bot → UPLOAD_AND_TAG.
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
+    ):
         action = uploader._resolve_hash_drift(
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
@@ -802,7 +807,10 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
     intended_page.title.return_value = intended_title
-    with patch("tools.uploader.get_page", return_value=intended_page):
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
+    ):
         action = uploader._resolve_hash_drift(
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
@@ -833,6 +841,36 @@ def test_resolve_hash_drift_case2_defers_when_target_is_community_authored():
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
             dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_self_tag_defer"
+
+
+def test_resolve_hash_drift_case2_community_first_uploader_beats_dpla_shaped_title():
+    """Provenance is decided by ``first_uploader``, NOT the filename. A
+    file whose title carries a ``- DPLA -`` suffix but whose FIRST
+    uploader is a community editor (e.g. an editor renamed it into that
+    form) must still route to the non-destructive self-tag/defer path —
+    the filename must never force the destructive tag-for-deletion path.
+    """
+    uploader = _build_uploader_with_dpla()
+    dpla_id = "abc" + "a" * 29
+    # DPLA-suffixed title (same item id), but a community editor is the
+    # first uploader — e.g. they renamed their file into the DPLA form.
+    existing_title = f"Angus - DPLA - {dpla_id} (page 9).jpg"
+    intended_title = f"Angus - DPLA - {dpla_id}.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="Fæ"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id=dpla_id,
             ordinal=1,
         )
     assert action == "upload_and_self_tag_defer"
