@@ -96,6 +96,7 @@ from ingest_wikimedia.slack import (
 )
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
+    DUPLICATE_TAG_RE,
     IGNORE_WIKIMEDIA_WARNINGS,
     MIME_UNKNOWN_EXT,
     build_title_drift_move_reason,
@@ -795,23 +796,24 @@ class Uploader:
             )
             if existing_file is not None:
                 if existing_file.title(with_ns=False) == page_title:
-                    # Resume guard for a partially-completed Case-2
-                    # self-tag-defer. If a prior run uploaded these bytes
-                    # to the canonical title and then died before writing
-                    # the {{Duplicate}} tag, the await-target-free entry is
-                    # still ``tag_emitted=False`` and drain-deferred will
-                    # sit on it forever (it treats un-emitted entries as
-                    # PENDING, not advanceable). ``find_file_by_hash`` with
-                    # ``preferred_title=page_title`` returns THIS canonical
-                    # file, so control would otherwise skip straight past
-                    # the self-tag-defer branch below and never retry the
-                    # tag. Finish the tag here before returning SKIPPED —
-                    # the upload itself is genuinely already done, only the
-                    # tag needs completing.
-                    if not dry_run:
-                        self._resume_self_tag_if_pending(
+                    # Our bytes are already at the canonical title. If this
+                    # ordinal is in the await-target-free set (we self-tagged
+                    # it on a prior run and are waiting on a Commons admin),
+                    # reconcile the set against live state before skipping:
+                    #   * canonical still carries {{Duplicate}} → admin
+                    #     hasn't acted; keep it queued for the drain.
+                    #   * tag gone (admin removed it — declined the dedup —
+                    #     without deleting the file) → drop it; the two
+                    #     files coexist (corollary 1), nothing more to do.
+                    # A deleted/redirected canonical never reaches here (the
+                    # file no longer exists at page_title), so it is resolved
+                    # by the empty-canonical Case-3 move on this same re-run.
+                    if not dry_run and await_target_free_sidecar.has_key(
+                        partner, dpla_id, ordinal
+                    ):
+                        self._reconcile_awaiting_skip(
                             partner=partner,
-                            page_title=page_title,
+                            existing_file=existing_file,
                             dpla_id=dpla_id,
                             ordinal=ordinal,
                         )
@@ -882,6 +884,15 @@ class Uploader:
                         )
                         if drift_action == DriftResolution.MOVED:
                             self.tracker.increment(Result.UPLOADED)
+                            # A move into an empty/redirect canonical title
+                            # is exactly how an awaiting Case-2 item resolves
+                            # once a Commons admin frees the tagged title: the
+                            # community file gets promoted here. Drop it from
+                            # the await set (no-op for ordinary title-drift
+                            # moves that were never awaiting).
+                            await_target_free_sidecar.remove_key(
+                                partner, dpla_id, ordinal
+                            )
                             # After a successful move the same file page lives
                             # at page_title; existing_file.pageid is preserved
                             # by MediaWiki across moves so we can stamp it here.
@@ -948,66 +959,28 @@ class Uploader:
                             force_ignore_warnings = True
                         elif drift_action == DriftResolution.UPLOAD_AND_SELF_TAG_DEFER:
                             # Community upload lives at the drift target title
-                            # (revision history's first uploader is a real
-                            # editor, not a DPLA-adjacent bot). Upload our S3
-                            # bytes to the DPLA-canonical title, tag OUR fresh
-                            # file as ``{{Duplicate|<community title>}}``, and
-                            # enqueue an await-target-free entry. The
-                            # drain-deferred phase watches the tagged title;
-                            # once a Commons admin has acted (deletion or
-                            # redirect), it moves the community file into the
-                            # freed DPLA-canonical title, restoring the
-                            # invariant with the community file's history
-                            # intact. Same Category:Duplicate capacity gate
-                            # as UPLOAD_AND_TAG — this ends up in the same
-                            # category and shouldn't add to it if the category
-                            # is already saturated.
-                            # Reconcile against any prior partial run of
-                            # this same (dpla_id, ordinal). Two states:
+                            # (its first uploader is a real editor, not a
+                            # DPLA-adjacent bot). Upload our S3 bytes to the
+                            # DPLA-canonical title, tag OUR fresh file as
+                            # ``{{Duplicate|<community title>}}``, and record
+                            # the (dpla_id, ordinal) in the await-target-free
+                            # set. Once a Commons admin acts on our tagged
+                            # file, the DPLA-canonical title is freed and a
+                            # plain uploader re-run resolves it through the
+                            # normal title-drift machinery (empty canonical →
+                            # Case-3 move of the community file into the freed
+                            # title, history intact).
                             #
-                            #   * fully queued (entry exists and
-                            #     ``tag_emitted=True``) — the tag is
-                            #     already on Commons, drain-deferred
-                            #     owns the next transition, nothing to
-                            #     do this run. SKIPPED, no throttle
-                            #     grant consumed.
-                            #
-                            #   * partially queued (entry exists but
-                            #     ``tag_emitted=False``) — a prior run
-                            #     recorded the sidecar entry but the
-                            #     ``tag_as_duplicate`` call didn't
-                            #     complete (network flake, CSRF, disk
-                            #     full, kill). Fall through to the full
-                            #     path so the throttle+tag retry runs
-                            #     and ``mark_tag_emitted`` flips the
-                            #     phase to True. add_entry inside
-                            #     _tag_self_and_defer is idempotent, so
-                            #     no duplicate sidecar row appears.
-                            existing_entry = await_target_free_sidecar.get_entry(
-                                partner, dpla_id, ordinal
-                            )
-                            if existing_entry and existing_entry.get(
-                                "tag_emitted", False
-                            ):
-                                logging.info(
-                                    f"Skipping {dpla_id} {ordinal}: "
-                                    f"await-target-free entry already fully "
-                                    f"queued for [[File:{page_title}]] "
-                                    f"(drain-deferred owns the next transition)."
-                                )
-                                self.tracker.increment(Result.SKIPPED)
-                                return {
-                                    "status": ORDINAL_SKIPPED,
-                                    "title": page_title,
-                                    "pageid": None,
-                                }
-                            if existing_entry is not None:
-                                logging.info(
-                                    f"Resuming {dpla_id} {ordinal}: "
-                                    f"await-target-free entry exists but "
-                                    f"tag was not emitted on the prior run; "
-                                    f"retrying the tag write."
-                                )
+                            # No idempotency check is needed here: a re-run
+                            # while we're still waiting finds our bytes already
+                            # at page_title and short-circuits at the
+                            # "Already exists on commons" skip far above, never
+                            # reaching this branch. So this path only runs the
+                            # first time, when the canonical is still occupied
+                            # by the other file's content. Same Category:
+                            # Duplicate capacity gate as UPLOAD_AND_TAG — the
+                            # tag lands in that category, so don't add to it
+                            # when saturated; the category drain retries.
                             if (
                                 self.dup_throttle is not None
                                 and not self.dup_throttle.try_acquire()
@@ -1396,7 +1369,6 @@ class Uploader:
                         community_title=self_tag_community_title,
                         dpla_id=dpla_id,
                         ordinal=ordinal,
-                        expected_sha1=sha1,
                     )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
@@ -2223,49 +2195,47 @@ class Uploader:
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
 
-    def _resume_self_tag_if_pending(
-        self, *, partner: str, page_title: str, dpla_id: str, ordinal: int
+    def _reconcile_awaiting_skip(
+        self, *, partner, existing_file, dpla_id: str, ordinal: int
     ) -> None:
-        """Finish a Case-2 self-tag-defer that a prior run left mid-flight.
+        """Reconcile an await-target-free entry against live Commons state
+        on the "already exists at canonical title" skip path.
 
-        Called from the "already exists on Commons" skip path: if an
-        await-target-free entry for ``(dpla_id, ordinal)`` exists with
-        ``tag_emitted=False``, the prior run uploaded the canonical bytes
-        but died before writing the {{Duplicate}} tag. Re-drive the tag
-        via :meth:`_tag_self_and_defer` (whose steps are all idempotent:
-        ``add_entry`` dedupes, ``tag_as_duplicate`` skips an already-
-        tagged page, ``mark_tag_emitted`` is a no-op if already True).
+        Only called for ordinals that ARE in the await set. The canonical
+        file exists at the intended title (that's why we're skipping);
+        the one thing that determines whether we're still waiting is
+        whether it still carries the ``{{Duplicate}}`` tag:
 
-        No pending entry, or one already ``tag_emitted=True`` → nothing
-        to do. Respects the Category:Duplicate throttle exactly like the
-        first-time path: if the category is at capacity, leave the entry
-        ``tag_emitted=False`` and let a later uploader run (or the drain
-        pass, which re-invokes the uploader) retry — never emit a tag
-        that overflows the admins' queue.
+          * still tagged → the admin hasn't acted yet; keep the entry
+            queued so the drain keeps re-running us.
+          * tag gone (admin removed it, declining the dedup, without
+            deleting the file) → the two files legitimately coexist
+            (corollary 1); drop the entry so the drain stops tracking it.
+
+        A read-only reconciliation — it emits no tag and never re-touches
+        the file, so an admin who removed the tag is never edit-warred
+        with. (A deleted or redirected canonical doesn't reach this path:
+        the file no longer exists at the intended title, so the empty-
+        canonical Case-3 move handles it on the same re-run.)
         """
-        pending = await_target_free_sidecar.get_entry(partner, dpla_id, ordinal)
-        if pending is None or pending.get("tag_emitted", True):
-            return
-        if self.dup_throttle is not None and not self.dup_throttle.try_acquire():
-            logging.info(
-                f"Deferring self-tag retry for {dpla_id} {ordinal}: "
-                f"Category:Duplicate at capacity; entry stays tag_emitted="
-                f"False for a later run to finish."
+        try:
+            still_tagged = bool(DUPLICATE_TAG_RE.search(existing_file.text or ""))
+        except Exception as ex:  # noqa: BLE001 — reconciliation is best-effort
+            logging.warning(
+                f"Could not read tag state of [[File:"
+                f"{existing_file.title(with_ns=False)}]] for {dpla_id} "
+                f"{ordinal}; leaving await entry queued: {ex}"
             )
             return
+        if still_tagged:
+            return
         logging.info(
-            f"Resuming self-tag for {dpla_id} {ordinal}: canonical file "
-            f"[[File:{page_title}]] already uploaded on a prior run but the "
-            f"{{{{Duplicate}}}} tag was never emitted; retrying the tag."
+            f"Await-target-free: [[File:{existing_file.title(with_ns=False)}]] "
+            f"({dpla_id} {ordinal}) no longer carries a {{{{Duplicate}}}} tag — "
+            f"a Commons editor declined the dedup. Dropping the await entry; "
+            f"the two files coexist (invariant satisfied at the canonical title)."
         )
-        self._tag_self_and_defer(
-            partner=partner,
-            dpla_canonical_title=page_title,
-            community_title=pending["community_title"],
-            dpla_id=dpla_id,
-            ordinal=ordinal,
-            expected_sha1=pending["expected_sha1"],
-        )
+        await_target_free_sidecar.remove_key(partner, dpla_id, ordinal)
 
     def _tag_self_and_defer(
         self,
@@ -2275,60 +2245,31 @@ class Uploader:
         community_title: str,
         dpla_id: str,
         ordinal: int,
-        expected_sha1: str,
     ) -> None:
-        """Tag OUR just-uploaded DPLA-canonical file as a duplicate of the
-        community file whose bytes we just matched, and enqueue an
-        await-target-free sidecar entry so ``drain-deferred`` can complete
-        the flow after a Commons admin acts on the tag.
+        """Tag OUR just-uploaded DPLA-canonical file
+        ``{{Duplicate|<community title>}}`` and record ``(dpla_id,
+        ordinal)`` in the await-target-free set.
 
-        Emits ``{{Duplicate|<community title>}}`` (single-arg form — the
-        Duplicate template's own default text is more informative than any
-        reason we'd supply). Best-effort like ``_tag_drift_duplicate``: a
-        failure to write the tag or the sidecar entry is logged but does
-        NOT propagate, because the primary upload has already succeeded
-        and the invariant is satisfied — the deferred rename is a
-        follow-up, not a rollback of anything.
+        Once a Commons admin acts on the tag, the DPLA-canonical title is
+        freed and a plain uploader re-run finishes the job: an empty
+        canonical becomes a Case-3 title-drift move of the community file
+        into the freed title (history intact), and the drain drops the
+        entry. Nothing here needs to be crash-consistent beyond "the tag
+        is on Commons and the ID is in the set" — both are re-derivable
+        and idempotent, so a partial failure just retries on the next run.
 
-        The sidecar entry carries the expected community-file SHA1 at
-        tag time so the drain-deferred handler can re-validate against
-        content drift on the community side during the wait window
-        (arbitrary duration — hours to weeks — depending on when a
-        Commons admin actions the tag).
+        Order: record the ID first, then emit the tag. The set entry is
+        the cheap local marker that tells the drain to keep re-running us;
+        emitting it before the (remote, failure-prone) tag write means a
+        tag that lands is always backed by a queued marker. If the tag
+        write fails, the marker lingers harmlessly — a re-run re-enters
+        this path (the canonical is still occupied by the other file until
+        we succeed) and retries; if it never succeeds, the marker is
+        cleaned up by :meth:`_reconcile_awaiting_skip` once our bytes do
+        land. Best-effort like ``_tag_drift_duplicate``: a tag failure is
+        logged, not raised — the upload already satisfied the invariant.
         """
-        # Two-phase persistence keeps the workflow resumable across
-        # partial failures in either direction:
-        #
-        #   Phase 1: sidecar entry with ``tag_emitted=False`` — records
-        #     the intent to promote the community file. Drain-deferred
-        #     honours the phase marker: entries with tag_emitted=False
-        #     stay PENDING (they're mid-workflow, not ready for admin
-        #     advance).
-        #   Phase 2: tag_as_duplicate on Commons — the durable side
-        #     effect that exposes the canonical file to admin deletion.
-        #   Phase 3: mark_tag_emitted flips the phase to True — drain
-        #     is now free to advance the entry once admin acts.
-        #
-        # If phase 2 fails, phase 3 doesn't run, the entry stays
-        # tag_emitted=False, and the next uploader run for this
-        # (dpla_id, ordinal) will re-enter this function (via the
-        # "Resuming" branch upstream) and retry cleanly — add_entry is
-        # idempotent (dedupe), tag_as_duplicate is idempotent (skips
-        # already-tagged files), so the retry is safe even if phase 2
-        # SUCCEEDED but this process died before phase 3 ran.
-        await_target_free_sidecar.add_entry(
-            partner,
-            {
-                "dpla_id": dpla_id,
-                "ordinal": ordinal,
-                "tagged_title": dpla_canonical_title,
-                "community_title": community_title,
-                "expected_sha1": expected_sha1,
-                "tag_emitted": False,
-            },
-        )
-
-        # Phase 2: emit the {{Duplicate}} tag on Commons.
+        await_target_free_sidecar.add_key(partner, dpla_id, ordinal)
         try:
             self_page = get_page(self.site, f"File:{dpla_canonical_title}")
             tag_as_duplicate(
@@ -2346,15 +2287,9 @@ class Uploader:
         except Exception as ex:
             logging.warning(
                 f"Failed to self-tag [[File:{dpla_canonical_title}]] as "
-                f"duplicate of [[File:{community_title}]]: {ex}. Sidecar "
-                f"entry left with tag_emitted=False; a subsequent uploader "
-                f"run for this partner will retry the tag write."
+                f"duplicate of [[File:{community_title}]]: {ex}. A subsequent "
+                f"uploader run for this partner will retry the tag."
             )
-            return
-
-        # Phase 3: flip the workflow phase to fully queued. Drain-deferred
-        # will now advance this entry once a Commons admin actions the tag.
-        await_target_free_sidecar.mark_tag_emitted(partner, dpla_id, ordinal)
 
     def _persist_upload_result(
         self,

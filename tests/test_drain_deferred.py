@@ -10,8 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-import pywikibot
-
 from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 from tools import drain_deferred
 
@@ -376,7 +374,6 @@ def test_acquire_host_lock_nonblocking_skips_when_held():
     drain already holds it, ``_acquire_host_lock(blocking=False)`` returns None
     (so the pass skips) instead of blocking behind a patient drain that can
     hold the lock for hours. Regression for the drain-lock-blocking bug."""
-    import fcntl
 
     # Hold the lock via an independent fd (separate open file description, so
     # flock genuinely conflicts even within this process).
@@ -393,483 +390,186 @@ def test_acquire_host_lock_nonblocking_skips_when_held():
     os.close(fd)
 
 
-def test_no_wait_skips_when_host_lock_held():
-    """When another drain holds the host lock, the opportunistic pass must skip
-    immediately — no throttle, no subprocesses — leaving the sidecar for the
-    terminal drain. Regression: the blocking acquire kept finished sessions
-    open for hours behind a patient drain."""
+def test_no_wait_skips_category_when_host_lock_held_but_still_attempts_await():
+    """Opportunistic pass, host lock held by a peer: the category round
+    is skipped (the holder covers it) but the await round is still
+    attempted — await work is not gated behind category work / the host
+    lock. (The await round then also skips if it can't get the lock; the
+    point is that main() TRIES it.)"""
     drain_sidecar.write_sidecar("nara", ["id-1"])
     with (
-        patch(
-            "tools.drain_deferred._acquire_host_lock", return_value=None
-        ) as lock_mock,
+        patch("tools.drain_deferred._acquire_host_lock", return_value=None),
         patch("tools.drain_deferred._drain_opportunistic_once") as opp,
-        patch("tools.drain_deferred.DuplicateCategoryThrottle") as throttle_ctor,
+        patch("tools.drain_deferred._run_await_round") as await_round,
+        patch("tools.drain_deferred.DuplicateCategoryThrottle"),
         patch("tools.drain_deferred.subprocess.run") as sp,
     ):
         result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
     assert result.exit_code == 0, result.output
-    lock_mock.assert_called_once_with(blocking=False)
-    opp.assert_not_called()
-    throttle_ctor.assert_not_called()
+    opp.assert_not_called()  # category round skipped (lock held)
+    await_round.assert_called_once_with("nara", blocking=False)  # still attempted
     sp.assert_not_called()
     assert drain_sidecar.read_sidecar("nara") == ["id-1"]
 
 
-# ---------------------------------------------------------------------------
-# await-target-free stage-2 handler
-# ---------------------------------------------------------------------------
+def test_no_wait_runs_one_await_round(lock_fd):
+    """Opportunistic pass with await work and a free lock: exactly one
+    await round runs (re-invoke uploader + sdc-sync on the awaiting IDs),
+    no patient loop."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
 
-
-def _await_entry(**overrides) -> dict:
-    """Sidecar entry factory for stage-2 tests. Default is the fully
-    queued state (``tag_emitted=True``) — the phase drain is designed
-    to advance from; tests exercising the in-progress phase override
-    to False.
-    """
-    base = {
-        "dpla_id": "22412cd0",
-        "ordinal": 1,
-        "tagged_title": "Angus - DPLA - 22412cd0.jpg",
-        "community_title": "Angus.jpg",
-        "tag_emitted": True,
-        "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
-    }
-    base.update(overrides)
-    return base
-
-
-def _tagged_page(*, exists=True, is_redirect=False, text="") -> MagicMock:
-    """MagicMock ``pywikibot.FilePage`` for the drift-target (our tagged
-    DPLA-canonical file). Callers customise via kwargs."""
-    p = MagicMock()
-    p.exists.return_value = exists
-    p.isRedirectPage.return_value = is_redirect
-    type(p).text = property(lambda self: text)
-    p.title.return_value = "File:Angus - DPLA - 22412cd0.jpg"
-    return p
-
-
-def _community_page(
-    *,
-    exists=True,
-    is_redirect=False,
-    sha1="9719e05ab718aac6d400b239792ceeb45a766954",
-) -> MagicMock:
-    """MagicMock for the community file — pre-loaded with a valid sha1."""
-    p = MagicMock()
-    p.exists.return_value = exists
-    p.isRedirectPage.return_value = is_redirect
-    p.latest_file_info.sha1 = sha1
-    p.title.return_value = "File:Angus.jpg"
-    return p
-
-
-def test_advance_pending_when_tag_still_present():
-    """State machine: tagged file exists, {{Duplicate}} template still
-    on the page → keep entry queued for the next drain round."""
-    site = MagicMock()
-    tagged = _tagged_page(
-        exists=True,
-        is_redirect=False,
-        text="{{Duplicate|Angus.jpg}}\n== filedesc ==\n",
-    )
-    with patch("tools.drain_deferred.get_page", return_value=tagged):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is False
-    assert note is not None and note.startswith("PENDING:")
-
-
-def test_advance_fail_when_tag_removed_but_page_exists():
-    """An editor decline: tag stripped but page kept. Drop entry and
-    log FAIL — the community-file rename can't proceed against a page
-    the community affirmatively kept."""
-    site = MagicMock()
-    tagged = _tagged_page(
-        exists=True,
-        is_redirect=False,
-        text="== filedesc ==\n{{DPLA metadata}}\n",  # no {{Duplicate}}
-    )
-    with patch("tools.drain_deferred.get_page", return_value=tagged):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is not None and note.startswith("FAIL:")
-    assert "Duplicate" in note
-
-
-def test_advance_executes_move_when_tagged_file_deleted():
-    """Deletion (page no longer exists on Commons) → execute move of
-    community file into the freed canonical title, post the
-    CommonsDelinker relink."""
-    site = MagicMock()
-    tagged = _tagged_page(exists=False, is_redirect=False)
-    community = _community_page(exists=True)
-    with (
-        patch(
-            "tools.drain_deferred.get_page",
-            side_effect=lambda _site, title: (
-                tagged if "22412cd0" in title else community
-            ),
-        ),
-        patch("tools.drain_deferred.file_has_inbound_usage", return_value=True),
-        patch("tools.drain_deferred.post_commonsdelinker_request") as delinker,
-        patch(
-            "tools.drain_deferred.with_csrf_recovery",
-            side_effect=lambda _s, _l, fn: fn(),
-        ),
-        patch(
-            "tools.drain_deferred.build_title_drift_move_reason",
-            return_value="reason",
-        ),
-    ):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is None
-    community.move.assert_called_once()
-    delinker.assert_called_once()
-
-
-def test_advance_executes_move_when_tagged_file_became_redirect():
-    """Redirect (admin merged rather than deleting) is a first-class
-    advance signal — move-onto-a-redirect is a normal pywikibot
-    operation, same as move-into-empty-slot. Per the design, this is
-    NOT an edge case; admins commonly redirect."""
-    site = MagicMock()
-    tagged = _tagged_page(exists=True, is_redirect=True)
-    community = _community_page(exists=True)
-    with (
-        patch(
-            "tools.drain_deferred.get_page",
-            side_effect=lambda _site, title: (
-                tagged if "22412cd0" in title else community
-            ),
-        ),
-        patch("tools.drain_deferred.file_has_inbound_usage", return_value=False),
-        patch("tools.drain_deferred.post_commonsdelinker_request"),
-        patch(
-            "tools.drain_deferred.with_csrf_recovery",
-            side_effect=lambda _s, _l, fn: fn(),
-        ),
-        patch(
-            "tools.drain_deferred.build_title_drift_move_reason",
-            return_value="reason",
-        ),
-    ):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is None
-    community.move.assert_called_once()
-
-
-def test_advance_fail_when_community_file_missing():
-    """Third-party action removed the community file during the wait
-    window — nothing to move. Drop entry with FAIL."""
-    site = MagicMock()
-    tagged = _tagged_page(exists=False)
-    community = _community_page(exists=False)
-    with patch(
-        "tools.drain_deferred.get_page",
-        side_effect=lambda _site, title: tagged if "22412cd0" in title else community,
-    ):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is not None and note.startswith("FAIL:")
-    assert "community file" in note
-
-
-def test_advance_fail_when_move_blocked_by_article_exists_conflict():
-    """A stale redirect or page history at the tagged title makes the
-    move raise ``ArticleExistsConflictError``. The invariant is already
-    satisfied via the tagged title's current state, and retrying every
-    poll would spam the API. Drop the entry with a decisive FAIL."""
-    site = MagicMock()
-    tagged = _tagged_page(exists=True, is_redirect=True)
-    community = _community_page(exists=True)
-
-    def raise_conflict(_title, **_kwargs):
-        raise pywikibot.exceptions.ArticleExistsConflictError("blocked")
-
-    community.move.side_effect = raise_conflict
-    with (
-        patch(
-            "tools.drain_deferred.get_page",
-            side_effect=lambda _site, title: (
-                tagged if "22412cd0" in title else community
-            ),
-        ),
-        patch("tools.drain_deferred.file_has_inbound_usage", return_value=False),
-        patch("tools.drain_deferred.post_commonsdelinker_request") as relink,
-        patch(
-            "tools.drain_deferred.with_csrf_recovery",
-            side_effect=lambda _s, _l, fn: fn(),
-        ),
-        patch(
-            "tools.drain_deferred.build_title_drift_move_reason",
-            return_value="reason",
-        ),
-    ):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is not None and note.startswith("FAIL:")
-    assert "ArticleExistsConflictError" in note
-    relink.assert_not_called()
-
-
-def test_advance_pending_when_tag_emitted_is_false():
-    """Workflow phase gate: an entry recorded by the uploader but whose
-    tag_as_duplicate call never completed carries ``tag_emitted=False``.
-    Drain MUST NOT treat the missing tag as an editor-decline and drop
-    the entry — that would strand community history. Return PENDING so
-    the next uploader run retries the tag and flips the phase.
-    """
-    site = MagicMock()
-    # No page fetches should happen when we short-circuit on the phase gate.
-    with patch("tools.drain_deferred.get_page") as get_page:
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(tag_emitted=False), site
-        )
-    assert should_remove is False
-    assert note is not None and note.startswith("PENDING:")
-    assert "tag_emitted=False" in note
-    # No Commons state was consulted; the gate lives above every fetch.
-    get_page.assert_not_called()
-
-
-def test_advance_fail_when_community_page_is_redirect():
-    """An admin (or an editor) redirected the community file during the
-    wait window — most likely, redirected it to our tagged canonical.
-    The invariant is satisfied either way (our canonical holds the S3
-    SHA1); there is no move to perform. Drop the entry as a decisive
-    FAIL rather than trying to move a redirect page around.
-    """
-    site = MagicMock()
-    tagged = _tagged_page(exists=False)
-    community = _community_page(exists=True, is_redirect=True)
-    with patch(
-        "tools.drain_deferred.get_page",
-        side_effect=lambda _site, title: tagged if "22412cd0" in title else community,
-    ):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is not None and note.startswith("FAIL:")
-    assert "redirected" in note
-    # The move must not have been attempted.
-    community.move.assert_not_called()
-
-
-def test_advance_fail_when_community_sha1_drifted():
-    """Content drift on the community side during the wait window —
-    the file no longer holds the S3 SHA1 we saw at tag time. Refuse
-    to move stale bytes into the canonical title."""
-    site = MagicMock()
-    tagged = _tagged_page(exists=False)
-    community = _community_page(
-        exists=True, sha1="ffffffffffffffffffffffffffffffffffffffff"
-    )
-    with patch(
-        "tools.drain_deferred.get_page",
-        side_effect=lambda _site, title: tagged if "22412cd0" in title else community,
-    ):
-        should_remove, note = drain_deferred._advance_await_target_free_entry(
-            _await_entry(), site
-        )
-    assert should_remove is True
-    assert note is not None and note.startswith("FAIL:")
-    assert "SHA1 drifted" in note
-
-
-def test_process_await_target_free_advances_and_removes(override_root):
-    """End-to-end: an entry that advances is removed from the sidecar."""
-    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
-    with patch(
-        "tools.drain_deferred._advance_await_target_free_entry",
-        return_value=(True, None),
-    ):
-        drain_deferred._process_await_target_free("nara", MagicMock())
-    assert await_target_free_sidecar.read_sidecar("nara") == []
-
-
-def test_process_await_target_free_keeps_pending_entries(override_root):
-    """Entry that returns PENDING stays queued for the next drain round."""
-    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
-    with patch(
-        "tools.drain_deferred._advance_await_target_free_entry",
-        return_value=(False, "PENDING: tagged file still present"),
-    ):
-        drain_deferred._process_await_target_free("nara", MagicMock())
-    assert len(await_target_free_sidecar.read_sidecar("nara")) == 1
-
-
-def test_patient_mode_loops_stage2_until_sidecar_empty(lock_fd, monkeypatch):
-    """Patient mode must poll stage-2 (await-target-free) until its
-    sidecar is empty, sleeping between rounds — mirroring the
-    category-capacity loop's semantics. Two entries here; round 1
-    advances one and leaves one queued, round 2 advances the last.
-    """
-    # Seed only the await sidecar; the category-capacity sidecar is empty
-    # so the outer drain loop skips (but patient-mode still runs stage 2).
-    await_target_free_sidecar.write_sidecar(
-        "nara", [_await_entry(dpla_id="aaa"), _await_entry(dpla_id="bbb")]
-    )
-
-    throttle = MagicMock()
-    throttle.wait_for_capacity.return_value = True
-    throttle.resume_below = 900
-    throttle.poll_secs = 0  # keep the test fast — no real waiting
-    throttle.category_size.return_value = 0
-
-    advance_calls = []
-
-    def fake_advance(entry, _site):
-        advance_calls.append(entry["dpla_id"])
-        # Round 1: only "aaa" advances; "bbb" stays PENDING.
-        # Round 2: "bbb" advances too.
-        if entry["dpla_id"] == "bbb" and advance_calls.count("bbb") == 1:
-            return (False, "PENDING: waiting")
-        return (True, None)
+    def clear_on_rerun(partner, ids):
+        for dpla_id in ids:
+            await_target_free_sidecar.remove_key(partner, dpla_id, 1)
 
     with (
         patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
         patch(
-            "tools.drain_deferred.DuplicateCategoryThrottle",
-            return_value=throttle,
-        ),
-        patch("tools.drain_deferred.notify_drain_phase_start"),
-        patch("tools.drain_deferred.notify_drain_phase_complete"),
-        patch(
-            "tools.drain_deferred._advance_await_target_free_entry",
-            side_effect=fake_advance,
-        ),
-        # Prevent time.sleep from stalling the test (poll_secs=0 already,
-        # but be defensive if anything else calls sleep).
-        monkeypatch.context() as m,
+            "tools.drain_deferred._run_deferred_items", side_effect=clear_on_rerun
+        ) as run,
+        patch("tools.drain_deferred.DuplicateCategoryThrottle"),
     ):
-        m.setattr("tools.drain_deferred.time.sleep", lambda *_a, **_k: None)
-        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+        result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
     assert result.exit_code == 0, result.output
-    # Sidecar drained.
-    assert await_target_free_sidecar.read_sidecar("nara") == []
-    # bbb was polled twice (once per round); aaa only once.
-    assert advance_calls.count("bbb") == 2
-    assert advance_calls.count("aaa") == 1
+    run.assert_called_once()
+    assert run.call_args.args[1] == ["id-1"]
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == []
 
 
-def test_patient_mode_stops_when_only_unemitted_entries_remain(lock_fd, monkeypatch):
-    """A ``tag_emitted=False`` entry can only be finished by a future
-    uploader run (stage-2 does not emit tags). Patient mode must NOT
-    spin forever waiting on admin action that can't apply — if every
-    still-pending entry is unemitted, it breaks and leaves them queued.
-    """
-    # One entry, stuck tag_emitted=False. Real _advance would return
-    # PENDING for it (no admin advance possible), so use the real path.
-    await_target_free_sidecar.write_sidecar(
-        "nara", [_await_entry(dpla_id="stuck", tag_emitted=False)]
-    )
+def test_await_round_skips_when_host_lock_held(override_root):
+    """_run_await_round returns False without running the uploader when
+    the (non-blocking) host lock is held by another drain."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=None),
+        patch("tools.drain_deferred._run_deferred_items") as run,
+    ):
+        ran = drain_deferred._run_await_round("nara", blocking=False)
+    assert ran is False
+    run.assert_not_called()
+    # Set untouched, left for the terminal drain.
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == ["id-1"]
+
+
+def test_await_round_reruns_uploader_on_unique_dpla_ids(override_root, lock_fd):
+    """_run_await_round dedupes per-ordinal keys to unique DPLA IDs (the
+    uploader's unit of work is the item) and re-runs the uploader on
+    them under the host lock."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+    await_target_free_sidecar.add_key("nara", "id-1", 2)  # same item, 2nd ordinal
+    await_target_free_sidecar.add_key("nara", "id-2", 1)
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred._run_deferred_items") as run,
+    ):
+        ran = drain_deferred._run_await_round("nara", blocking=True)
+    assert ran is True
+    run.assert_called_once()
+    assert run.call_args.args[1] == ["id-1", "id-2"]
+
+
+def test_patient_drains_await_when_uploader_rerun_clears_keys(lock_fd, monkeypatch):
+    """Patient mode, await-only: re-running the uploader resolves the
+    awaiting items (the uploader clears the keys — e.g. an admin freed
+    the canonical and the empty-canonical Case-3 move promoted the
+    community file). The loop terminates once the set empties."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+    await_target_free_sidecar.add_key("nara", "id-2", 1)
+
+    def clear_on_rerun(partner, ids):
+        # Simulate the uploader resolving every awaiting item this round.
+        for dpla_id in ids:
+            await_target_free_sidecar.remove_key(partner, dpla_id, 1)
 
     throttle = MagicMock()
-    throttle.wait_for_capacity.return_value = True
-    throttle.resume_below = 900
     throttle.poll_secs = 0
-    throttle.category_size.return_value = 0
-
-    sleep_calls = {"n": 0}
 
     with (
         patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch(
+            "tools.drain_deferred._run_deferred_items", side_effect=clear_on_rerun
+        ) as run,
         patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
-        patch("tools.drain_deferred.notify_drain_phase_start"),
-        patch("tools.drain_deferred.notify_drain_phase_complete"),
-        patch("tools.drain_deferred.get_page") as get_page,
-        monkeypatch.context() as m,
+        patch("tools.drain_deferred.notify_drain_phase_start") as start_ping,
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
     ):
-        # If the loop ever sleeps, it's spinning — fail loudly instead
-        # of hanging the suite.
-        def _tracked_sleep(*_a, **_k):
-            sleep_calls["n"] += 1
-            if sleep_calls["n"] > 3:
-                raise AssertionError("patient loop is spinning on an unemitted entry")
-
-        m.setattr("tools.drain_deferred.time.sleep", _tracked_sleep)
         result = CliRunner().invoke(drain_deferred.main, ["nara"])
     assert result.exit_code == 0, result.output
-    # Phase gate short-circuits before any Commons fetch.
-    get_page.assert_not_called()
-    # Entry left queued for the next uploader run; loop did not spin.
-    remaining = await_target_free_sidecar.read_sidecar("nara")
-    assert [e["dpla_id"] for e in remaining] == ["stuck"]
-    assert sleep_calls["n"] == 0
+    run.assert_called_once()  # one round cleared both items
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == []
+    # Await-only drain (no category work): start/complete pings are for
+    # category work, so neither fires here.
+    start_ping.assert_not_called()
+    done_ping.assert_not_called()
 
 
-def test_run_stage2_once_skips_when_partner_lock_held(override_root):
-    """The partner-scoped stage-2 lock serializes same-partner stage-2
-    rounds. When a foreign holder has it, ``_run_stage2_once`` must
-    non-blocking-skip rather than blocking — the peer round covers our
-    work and we shouldn't wait on it.
-    """
-    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
-    partner_dir = drain_sidecar.partner_dir_path("nara")
-    partner_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = partner_dir / ".stage2-drain.lock"
-    foreign_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(foreign_fd, fcntl.LOCK_EX)
-    try:
-        with patch("tools.drain_deferred._process_await_target_free") as inner:
-            drain_deferred._run_stage2_once("nara", MagicMock())
-        inner.assert_not_called()
-    finally:
-        fcntl.flock(foreign_fd, fcntl.LOCK_UN)
-        os.close(foreign_fd)
+class _StopLoop(Exception):
+    pass
 
 
-def test_run_stage2_once_acquires_and_releases_the_partner_lock(override_root):
-    """Sanity check on the fd lifecycle: after ``_run_stage2_once``
-    completes, the partner-scoped lock is released so a peer drain
-    can acquire it — a leaked fd would break same-partner
-    serialization for the whole process lifetime.
-    """
-    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
-    with patch("tools.drain_deferred._process_await_target_free"):
-        drain_deferred._run_stage2_once("nara", MagicMock())
-    # If the lock leaked, a subsequent non-blocking acquire would fail.
-    fd = drain_deferred._acquire_stage2_lock("nara", blocking=False)
-    assert fd is not None, "stage-2 lock leaked across the call boundary"
-    os.close(fd)
+def test_patient_await_loop_waits_and_does_not_falsely_complete(lock_fd, monkeypatch):
+    """When the awaiting items are NOT resolved by a re-run (admin hasn't
+    acted), the patient loop keeps waiting — it must NOT signal
+    completion while items remain. We break the otherwise-unbounded loop
+    on the first sleep and assert no completion ping fired."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
 
+    throttle = MagicMock()
+    throttle.poll_secs = 0
 
-def test_process_await_target_free_isolates_per_entry_exceptions(override_root, caplog):
-    """A single entry that raises must NOT stop the loop from
-    processing the others — same isolation contract as ``_run_one_round``.
-    The failing entry stays queued."""
-    entries = [_await_entry(dpla_id="bbb"), _await_entry(dpla_id="ccc")]
-    await_target_free_sidecar.write_sidecar("nara", entries)
+    def boom(*_a, **_k):
+        raise _StopLoop
 
-    def side_effect(entry, _site):
-        if entry["dpla_id"] == "bbb":
-            raise RuntimeError("boom")
-        return (True, None)  # ccc advances cleanly
-
-    with patch(
-        "tools.drain_deferred._advance_await_target_free_entry",
-        side_effect=side_effect,
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred._run_deferred_items"),  # no-op: key remains
+        patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+        patch("tools.drain_deferred.time.sleep", side_effect=boom),
     ):
-        drain_deferred._process_await_target_free("nara", MagicMock())
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    # The loop kept waiting (hit sleep) rather than completing.
+    assert isinstance(result.exception, _StopLoop)
+    done_ping.assert_not_called()
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == ["id-1"]
 
-    remaining_ids = [
-        e["dpla_id"] for e in await_target_free_sidecar.read_sidecar("nara")
-    ]
-    # bbb stayed (raised); ccc removed (advanced).
-    assert remaining_ids == ["bbb"]
+
+def test_patient_category_then_await_both_drain_and_complete(lock_fd, monkeypatch):
+    """Patient mode with BOTH queues: category drains first (under the
+    host lock, start ping fires), then await drains; completion pings
+    once both are empty."""
+    drain_sidecar.write_sidecar("nara", ["cat-1"])
+    await_target_free_sidecar.add_key("nara", "await-1", 1)
+
+    throttle = MagicMock()
+    throttle.poll_secs = 0
+    throttle.resume_below = 900
+    throttle.category_size.return_value = 100
+    throttle.wait_for_capacity.return_value = True
+
+    def rerun(partner, ids):
+        # Category round: the ids came from drain_sidecar (already removed
+        # by _run_one_round before calling us) — nothing to re-defer.
+        # Await round: clear the awaiting key.
+        for dpla_id in ids:
+            await_target_free_sidecar.remove_key(partner, dpla_id, 1)
+
+    # main() acquires the host lock once for the category phase and again
+    # per await round, closing each fd — so hand out a FRESH fd per call
+    # (the real _acquire_host_lock opens a new fd each time).
+    def fresh_lock(**_kw):
+        return os.open(os.devnull, os.O_RDONLY)
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", side_effect=fresh_lock),
+        patch("tools.drain_deferred._run_deferred_items", side_effect=rerun),
+        patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
+        patch("tools.drain_deferred.notify_drain_phase_start") as start_ping,
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    assert result.exit_code == 0, result.output
+    start_ping.assert_called_once()
+    done_ping.assert_called_once()
+    assert drain_sidecar.read_sidecar("nara") == []
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == []

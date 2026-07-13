@@ -891,25 +891,14 @@ def test_resolve_hash_drift_case2_routes_unknown_uploader_to_self_tag_defer():
     assert action == "upload_and_self_tag_defer"
 
 
-def test_tag_self_and_defer_enqueues_sidecar_entry_with_partner_from_caller(
-    tmp_path, monkeypatch
-):
-    """CR-review regression: ``_tag_self_and_defer`` used ``self.partner``,
-    which doesn't exist on ``Uploader``. Fix: partner is threaded through
-    from ``process_file``'s caller-provided arg. Verify the sidecar
-    ``add_entry`` call receives that ``partner`` value AND records the
-    ``(dpla_id, ordinal, tagged_title, community_title, expected_sha1)``
-    tuple the drain-deferred stage-2 handler will consume."""
+def test_tag_self_and_defer_records_key_and_tags(tmp_path, monkeypatch):
+    """``_tag_self_and_defer`` records the (dpla_id, ordinal) in the
+    await set and tags OUR canonical file ``{{Duplicate|<community>}}``.
+    The set entry is the marker the drain re-runs on."""
     from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 
-    # Point the sidecar at tmp_path so the test doesn't touch the real
-    # /home/ec2-user tree — same fixture pattern the sidecar's own tests use.
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKIMEDIA_ROOT", tmp_path, raising=False)
     monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-
     uploader = _build_uploader_with_dpla()
-    # ``tag_as_duplicate`` calls into pywikibot's editpage — stub the wire
-    # write entirely so this test only exercises the enqueue contract.
     with (
         patch("tools.uploader.get_page") as get_page,
         patch("tools.uploader.tag_as_duplicate") as tag,
@@ -921,49 +910,31 @@ def test_tag_self_and_defer_enqueues_sidecar_entry_with_partner_from_caller(
             community_title="Foo.jpg",
             dpla_id="abc" + "a" * 29,
             ordinal=1,
-            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
         )
-    # tag_as_duplicate got called with the community title as the pointer.
     tag.assert_called_once()
     _, kwargs = tag.call_args
     assert kwargs.get("correct_filename") == "Foo.jpg"
-
-    # Sidecar recorded the entry against the partner arg (not a bogus
-    # ``self.partner``).
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert len(entries) == 1
-    e = entries[0]
-    assert e["dpla_id"] == "abc" + "a" * 29
-    assert e["ordinal"] == 1
-    assert e["tagged_title"] == "Foo - DPLA - abc.jpg"
-    assert e["community_title"] == "Foo.jpg"
-    assert e["expected_sha1"] == "9719e05ab718aac6d400b239792ceeb45a766954"
-
-    # Other partners' sidecars remain untouched.
-    assert await_target_free_sidecar.read_sidecar("bpl") == []
+    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
+    # Other partners untouched.
+    assert await_target_free_sidecar.awaiting_dpla_ids("bpl") == []
 
 
-def test_tag_self_and_defer_records_sidecar_entry_before_tagging(tmp_path, monkeypatch):
-    """Durability: the sidecar entry MUST land before the Commons tag,
-    so a tag-side failure never leaves the canonical file marked for
-    deletion without a queued intent to promote the community file.
-    Assert order via the call sequence, and confirm that a tag failure
-    leaves the sidecar entry intact for the drain phase (or a re-run)
-    to pick up."""
+def test_tag_self_and_defer_records_key_before_tagging(tmp_path, monkeypatch):
+    """Order: the await key is recorded BEFORE the (remote, failure-prone)
+    tag write, so a tag that lands is always backed by a queued marker. A
+    tag failure is swallowed (best-effort) and the key remains for a
+    re-run / reconcile to handle."""
     from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 
     monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-
     uploader = _build_uploader_with_dpla()
 
     call_order: list[str] = []
-    real_add_entry = await_target_free_sidecar.add_entry
+    real_add_key = await_target_free_sidecar.add_key
 
-    def add_entry_stub(partner, entry):
-        call_order.append("sidecar_add")
-        # Delegate to the underlying implementation (captured before the
-        # patch) so we don't recurse into our own stub.
-        return real_add_entry(partner, entry)
+    def add_key_stub(partner, dpla_id, ordinal):
+        call_order.append("add_key")
+        return real_add_key(partner, dpla_id, ordinal)
 
     def tag_stub(*_a, **_kw):
         call_order.append("tag_as_duplicate")
@@ -972,240 +943,71 @@ def test_tag_self_and_defer_records_sidecar_entry_before_tagging(tmp_path, monke
     with (
         patch("tools.uploader.get_page") as get_page,
         patch(
-            "tools.uploader.await_target_free_sidecar.add_entry",
-            side_effect=add_entry_stub,
+            "tools.uploader.await_target_free_sidecar.add_key",
+            side_effect=add_key_stub,
         ),
         patch("tools.uploader.tag_as_duplicate", side_effect=tag_stub),
     ):
         get_page.return_value = MagicMock(text="")
-        # Should NOT raise — the tag failure is caught and logged, since
-        # the sidecar entry (added first) already carries the durable intent.
+        # Tag failure must NOT propagate — the upload already satisfied
+        # the invariant; the deferred rename is a follow-up.
         uploader._tag_self_and_defer(
             partner="heartland",
             dpla_canonical_title="Foo - DPLA - abc.jpg",
             community_title="Foo.jpg",
             dpla_id="abc" + "a" * 29,
             ordinal=1,
-            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
         )
-
-    # Order: sidecar_add first, then tag_as_duplicate.
-    assert call_order == ["sidecar_add", "tag_as_duplicate"], (
-        f"sidecar entry must be persisted before the Commons tag is emitted; "
-        f"got {call_order!r}"
+    assert call_order == ["add_key", "tag_as_duplicate"], (
+        f"await key must be recorded before the tag write; got {call_order!r}"
     )
-    # And the sidecar entry survives the tag-side crash.
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert len(entries) == 1
-    assert entries[0]["dpla_id"] == "abc" + "a" * 29
-    # Phase marker stays ``tag_emitted=False`` — the tag write didn't
-    # complete, so drain must not treat this entry as ready to advance.
-    # A subsequent uploader run will retry the tag and flip the phase.
-    assert entries[0]["tag_emitted"] is False
+    # Key survives the tag-side crash.
+    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
 
 
-def test_tag_self_and_defer_marks_tag_emitted_true_on_tag_success(
-    tmp_path, monkeypatch
-):
-    """Successful ``tag_as_duplicate`` MUST flip the sidecar entry's
-    ``tag_emitted`` flag to True. Without this, drain-deferred would
-    stay in the PENDING-tag branch forever and never advance the
-    entry.
-    """
+def test_reconcile_awaiting_skip_keeps_key_while_still_tagged(tmp_path, monkeypatch):
+    """On the already-exists skip path, an awaiting ordinal whose
+    canonical still carries {{Duplicate}} is kept queued (admin hasn't
+    acted). No write to Commons."""
     from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 
     monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    await_target_free_sidecar.add_key("heartland", "abc" + "a" * 29, 1)
     uploader = _build_uploader_with_dpla()
-    with (
-        patch("tools.uploader.get_page") as get_page,
-        patch("tools.uploader.tag_as_duplicate"),
-    ):
-        get_page.return_value = MagicMock(text="")
-        uploader._tag_self_and_defer(
-            partner="heartland",
-            dpla_canonical_title="Foo - DPLA - abc.jpg",
-            community_title="Foo.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
-        )
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert len(entries) == 1
-    assert entries[0]["tag_emitted"] is True
-
-
-def test_tag_self_and_defer_second_call_reflips_tag_emitted_after_prior_failure(
-    tmp_path, monkeypatch
-):
-    """End-to-end recoverability: first call fails at the tag step
-    (sidecar entry lands with ``tag_emitted=False``); second call
-    succeeds and flips the phase to True. Simulates the uploader
-    resume path CR asked us to cover.
-    """
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    uploader = _build_uploader_with_dpla()
-
-    # First call — tag raises.
-    with (
-        patch("tools.uploader.get_page") as get_page,
-        patch(
-            "tools.uploader.tag_as_duplicate",
-            side_effect=RuntimeError("transient Commons flake"),
-        ),
-    ):
-        get_page.return_value = MagicMock(text="")
-        uploader._tag_self_and_defer(
-            partner="heartland",
-            dpla_canonical_title="Foo - DPLA - abc.jpg",
-            community_title="Foo.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
-        )
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert entries[0]["tag_emitted"] is False
-
-    # Second call — tag succeeds. Sidecar entry survives; phase flips.
-    with (
-        patch("tools.uploader.get_page") as get_page,
-        patch("tools.uploader.tag_as_duplicate"),
-    ):
-        get_page.return_value = MagicMock(text="")
-        uploader._tag_self_and_defer(
-            partner="heartland",
-            dpla_canonical_title="Foo - DPLA - abc.jpg",
-            community_title="Foo.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
-        )
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert len(entries) == 1, "add_entry must have been idempotent on retry"
-    assert entries[0]["tag_emitted"] is True
-
-
-def test_resume_self_tag_if_pending_finishes_tag_for_uploaded_but_untagged(
-    tmp_path, monkeypatch
-):
-    """The stranding CR flagged: a prior run uploaded the canonical file
-    (so ``find_file_by_hash`` finds it at page_title and the fast-path
-    skip fires) but died before tagging, leaving the sidecar entry
-    ``tag_emitted=False``. ``_resume_self_tag_if_pending`` must finish
-    the tag and flip the phase — otherwise drain-deferred sits on the
-    entry forever.
-    """
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    await_target_free_sidecar.add_entry(
-        "heartland",
-        {
-            "dpla_id": "abc" + "a" * 29,
-            "ordinal": 1,
-            "tagged_title": "Foo - DPLA - abc.jpg",
-            "community_title": "Foo.jpg",
-            "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
-            "tag_emitted": False,
-        },
+    existing = MagicMock()
+    existing.text = "{{Duplicate|Foo.jpg}}\n== filedesc ==\n"
+    existing.title.return_value = "File:Foo - DPLA - abc.jpg"
+    uploader._reconcile_awaiting_skip(
+        partner="heartland",
+        existing_file=existing,
+        dpla_id="abc" + "a" * 29,
+        ordinal=1,
     )
-    uploader = _build_uploader_with_dpla()
-    with (
-        patch("tools.uploader.get_page") as get_page,
-        patch("tools.uploader.tag_as_duplicate") as tag,
-    ):
-        get_page.return_value = MagicMock(text="")
-        uploader._resume_self_tag_if_pending(
-            partner="heartland",
-            page_title="Foo - DPLA - abc.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    tag.assert_called_once()
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert entries[0]["tag_emitted"] is True
+    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
 
 
-def test_resume_self_tag_if_pending_noop_when_already_emitted(tmp_path, monkeypatch):
-    """A fully-queued entry (``tag_emitted=True``) needs no retry — the
-    resume helper must not re-tag."""
+def test_reconcile_awaiting_skip_drops_key_when_tag_removed(tmp_path, monkeypatch):
+    """When the canonical no longer carries {{Duplicate}} (an editor
+    declined the dedup without deleting the file), the await key is
+    dropped — the two files coexist (corollary 1). Read-only: no tag is
+    re-emitted, so we never edit-war with the editor."""
     from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 
     monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    await_target_free_sidecar.add_entry(
-        "heartland",
-        {
-            "dpla_id": "abc" + "a" * 29,
-            "ordinal": 1,
-            "tagged_title": "Foo - DPLA - abc.jpg",
-            "community_title": "Foo.jpg",
-            "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
-            "tag_emitted": True,
-        },
-    )
+    await_target_free_sidecar.add_key("heartland", "abc" + "a" * 29, 1)
     uploader = _build_uploader_with_dpla()
+    existing = MagicMock()
+    existing.text = "== filedesc ==\nno duplicate tag here\n"
+    existing.title.return_value = "File:Foo - DPLA - abc.jpg"
     with patch("tools.uploader.tag_as_duplicate") as tag:
-        uploader._resume_self_tag_if_pending(
+        uploader._reconcile_awaiting_skip(
             partner="heartland",
-            page_title="Foo - DPLA - abc.jpg",
+            existing_file=existing,
             dpla_id="abc" + "a" * 29,
             ordinal=1,
         )
     tag.assert_not_called()
-
-
-def test_resume_self_tag_if_pending_noop_when_no_entry(tmp_path, monkeypatch):
-    """No sidecar entry (e.g. a genuine already-done file with no pending
-    workflow) → the resume helper is a clean no-op, never touching
-    Commons."""
-    from ingest_wikimedia import drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    uploader = _build_uploader_with_dpla()
-    with patch("tools.uploader.tag_as_duplicate") as tag:
-        uploader._resume_self_tag_if_pending(
-            partner="heartland",
-            page_title="Foo - DPLA - abc.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    tag.assert_not_called()
-
-
-def test_resume_self_tag_if_pending_respects_throttle_capacity(tmp_path, monkeypatch):
-    """When Category:Duplicate is at capacity, the resume must NOT emit
-    the tag — it leaves the entry ``tag_emitted=False`` for a later run,
-    exactly like the first-time path defers rather than overflowing the
-    admins' queue."""
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    await_target_free_sidecar.add_entry(
-        "heartland",
-        {
-            "dpla_id": "abc" + "a" * 29,
-            "ordinal": 1,
-            "tagged_title": "Foo - DPLA - abc.jpg",
-            "community_title": "Foo.jpg",
-            "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
-            "tag_emitted": False,
-        },
-    )
-    uploader = _build_uploader_with_dpla()
-    throttle = MagicMock()
-    throttle.try_acquire.return_value = False  # category at capacity
-    uploader.dup_throttle = throttle
-    with patch("tools.uploader.tag_as_duplicate") as tag:
-        uploader._resume_self_tag_if_pending(
-            partner="heartland",
-            page_title="Foo - DPLA - abc.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    tag.assert_not_called()
-    entries = await_target_free_sidecar.read_sidecar("heartland")
-    assert entries[0]["tag_emitted"] is False
+    assert not await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
 
 
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":

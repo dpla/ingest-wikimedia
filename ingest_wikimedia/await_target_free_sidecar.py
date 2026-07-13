@@ -1,47 +1,34 @@
-"""Persistent sidecar for the "await community-target free" deferral stage.
+"""Persistent "await community-target free" set.
 
-The uploader defers a Case-2 hash-drift resolution when the file whose title
-we intend to overwrite is a community upload (i.e. our S3 SHA1 already lives at
-a community-authored Commons title). Rather than tag the community's file for
-speedy deletion — the previous behaviour, which requested a Commons admin
-destroy an older community contribution — the uploader:
+Case-2 hash drift: our S3 source's SHA1 already lives at a
+community-authored Commons title. Rather than tag the community's file
+for deletion, the uploader uploads our bytes to the DPLA-canonical
+title, tags OUR file ``{{Duplicate|<community title>}}``, and records
+the ``(dpla_id, ordinal)`` here. A Commons admin then deletes or
+redirects our tagged file; once they do, the DPLA-canonical title is
+free and a plain **re-run of the uploader** resolves it through the
+existing title-drift machinery (empty canonical → Case-3 move of the
+community file into the freed title, preserving its history). This set
+exists only so the ``drain-deferred`` phase knows which items to keep
+re-running while we wait on the admin, and so the wait doesn't block the
+batch.
 
-  1. uploads the S3 bytes to the DPLA-canonical title (invariant satisfied),
-  2. tags OUR just-uploaded file as ``{{Duplicate|<community title>}}`` so
-     Commons admins can delete or redirect it, and
-  3. writes an entry to this sidecar naming the tagged (DPLA-canonical) file
-     and the community file we want to promote once the tagged file is gone.
+Design note — why this is just a set of keys, not a rich record:
+everything the resolution needs (the community title, the source SHA1,
+whether the tag is still pending) is re-derived from live Commons / S3
+state on each uploader re-run. The uploader is idempotent, so the drain
+is nothing more than "re-run the uploader on these IDs until they stop
+needing it" — the same pattern as :mod:`ingest_wikimedia.drain_sidecar`.
+There is no per-item state machine to keep crash-consistent. A lost set
+degrades gracefully: the tagged files still exist on Commons, and any
+future full partner run re-detects and resolves them (an admin deletion
+becomes an ordinary empty-canonical Case-3 move); the set only makes the
+polling prompt.
 
-The follow-on ``drain-deferred`` phase reads this sidecar, polls each tagged
-title, and — once the tag has been actioned (page deleted, or turned into a
-redirect) — executes a title-drift move of the community file into the freed
-DPLA-canonical title. The community file's revision history and curation
-survive the move; the invariant is satisfied again once the move completes.
-
-Distinct from :mod:`ingest_wikimedia.drain_sidecar` (the ``Category:Duplicate``
-capacity gate), because the wait conditions are per-item (each tagged title
-polled independently), not global (single boolean checked once per round).
-Keeping the two sidecars separate is additive — no schema evolution on the
-existing sidecar — and lets each stage evolve without disturbing the other.
-
-Per-partner scope: mirrors :mod:`drain_sidecar` — one sidecar file per partner
-under ``<partner>/await-target-free.json``, anchored at
-:data:`~ingest_wikimedia.drain_sidecar.INGEST_WIKI_ROOT`.
-
-Entry schema::
-
-    {
-        "dpla_id":         "22412cd0994d36f03c4fcf549db2b8e5",
-        "ordinal":         1,
-        "tagged_title":    "File:… - DPLA - 22412cd0….jpg",
-        "community_title": "File:….jpg",
-        "expected_sha1":   "9719e05a…",
-    }
-
-``expected_sha1`` is the S3 source SHA1 that was true at tag time; the drain
-phase re-validates it against the community file before executing the move so
-that partner-side content churn during the wait window is caught (and doesn't
-silently promote stale bytes into the canonical title).
+Entries are ``"<dpla_id>\\t<ordinal>"`` strings. Per-partner scope,
+stored at ``<partner>/await-target-free.json`` under
+:data:`~ingest_wikimedia.drain_sidecar.INGEST_WIKI_ROOT`, alongside the
+deferred-drain sidecar.
 """
 
 from __future__ import annotations
@@ -58,36 +45,34 @@ from ingest_wikimedia.drain_sidecar import partner_dir_path
 
 SIDECAR_FILENAME = "await-target-free.json"
 _LOCK_SUFFIX = ".lock"
+_KEY_SEP = "\t"
 
 
 def sidecar_path(partner: str) -> Path:
-    """Absolute path to the await-target-free sidecar for ``partner``.
+    """Absolute path to the await-target-free set for ``partner``.
 
-    Same anchor + partner-dir resolution as :mod:`drain_sidecar` so the
-    two sidecars sit alongside each other under the partner working
-    directory.
+    Same anchor + partner-dir resolution as :mod:`drain_sidecar`, so the
+    two sidecars sit alongside each other under the partner directory.
     """
     return partner_dir_path(partner) / SIDECAR_FILENAME
 
 
+def _key(dpla_id: str, ordinal: int) -> str:
+    return f"{dpla_id}{_KEY_SEP}{ordinal}"
+
+
 @contextlib.contextmanager
 def _locked_for_write(partner: str):
-    """Hold an exclusive ``fcntl.flock`` on the sidecar's companion
-    lockfile for the duration of the block.
+    """Hold an exclusive ``fcntl.flock`` on a companion lockfile for the
+    duration of the block.
 
     The uploader's ``multiprocessing.Pool`` fans work out to worker
-    processes that all call :func:`add_entry` / :func:`remove_entry`
-    concurrently. Without this lock, two workers can each read the
-    sidecar, dedupe locally, and race on the ``os.replace`` — one
-    replaces the other's write and the losing worker's entry is lost.
-
-    The lockfile is a separate path (``<sidecar>.lock``) rather than
-    the sidecar itself because :func:`write_sidecar` unlinks an empty
-    sidecar via ``os.replace`` / ``unlink``, and locking the sidecar
-    would leak the lock across those file-swap boundaries. The
-    lockfile is created on first use and never deleted; ``flock``
-    releases automatically on fd close, so a killed worker never
-    strands the lock.
+    processes that each call :func:`add_key` / :func:`remove_key`
+    concurrently; without this lock the read-modify-write races and a
+    worker's update can clobber a sibling's. The lockfile is a separate
+    path (``<sidecar>.lock``) because :func:`_write_keys` unlinks the
+    sidecar on empty, which would drop a lock held on the sidecar itself.
+    ``flock`` releases on fd close, so a killed worker never strands it.
     """
     path = sidecar_path(partner)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,114 +85,14 @@ def _locked_for_write(partner: str):
         os.close(fd)
 
 
-def _normalize_entry(raw: object) -> dict | None:
-    """Return ``raw`` as a validated entry dict, or ``None`` if it's
-    malformed. Guards against corrupt sidecar contents (a stray non-dict
-    element, missing required keys) rather than crashing the drain loop.
-    """
-    if not isinstance(raw, dict):
-        return None
-    dpla_id = raw.get("dpla_id")
-    tagged_title = raw.get("tagged_title")
-    community_title = raw.get("community_title")
-    if not (
-        isinstance(dpla_id, str)
-        and isinstance(tagged_title, str)
-        and isinstance(community_title, str)
-    ):
-        return None
-    ordinal = raw.get("ordinal")
-    if not isinstance(ordinal, int):
-        return None
-    expected_sha1 = raw.get("expected_sha1")
-    if not isinstance(expected_sha1, str):
-        return None
-    # ``tag_emitted`` is the workflow phase marker: True once the
-    # uploader has successfully written the {{Duplicate}} tag on the
-    # canonical file. Entries land with tag_emitted=False (from
-    # add_entry inside _tag_self_and_defer) and flip to True via
-    # mark_tag_emitted() after tag_as_duplicate() returns. Missing on
-    # an entry (an older sidecar shape written before this field
-    # existed) defaults to True — those entries came from a flow that
-    # always tagged before writing the sidecar, so treating them as
-    # fully queued is the correct backwards-compat choice.
-    tag_emitted = raw.get("tag_emitted")
-    if not isinstance(tag_emitted, bool):
-        tag_emitted = True
-    return {
-        "dpla_id": dpla_id,
-        "ordinal": ordinal,
-        "tagged_title": tagged_title,
-        "community_title": community_title,
-        "tag_emitted": tag_emitted,
-        "expected_sha1": expected_sha1,
-    }
+def read_keys(partner: str) -> list[str]:
+    """Return the queued ``"<dpla_id>\\t<ordinal>"`` keys, or an empty
+    list if the file is missing or unreadable.
 
-
-def _quarantine_corrupt_file(path: Path, reason: str) -> None:
-    """Move a damaged sidecar aside to a preserved ``.corrupt`` path and
-    log loudly.
-
-    A missing sidecar is the normal empty state, but an *existing* file
-    that can't be read or whose top-level shape is wrong is a
-    data-integrity event: the queue it represents holds deferred
-    community-file promotions that must NOT be silently dropped. If we
-    just returned ``[]`` and carried on, the patient drain would report
-    "complete" while queued work sat unnoticed, and the next
-    :func:`add_entry` would ``os.replace`` the corrupt bytes away
-    entirely. Quarantining instead (a) preserves the bytes for manual
-    recovery, (b) surfaces a loud ERROR the operator can act on, and
-    (c) still lets the process continue rather than crashing the
-    uploader hot path (``add_entry`` calls this indirectly).
-
-    Picks the first free ``<name>.corrupt`` / ``.corrupt.1`` / … so a
-    second corruption never clobbers an earlier quarantine. A concurrent
-    reader that already moved the file loses the race harmlessly
-    (``FileNotFoundError`` — nothing left to quarantine).
-    """
-    suffix = ".corrupt"
-    candidate = path.with_name(path.name + suffix)
-    n = 1
-    while candidate.exists():
-        candidate = path.with_name(f"{path.name}{suffix}.{n}")
-        n += 1
-    try:
-        os.replace(path, candidate)
-    except FileNotFoundError:
-        return
-    except OSError as ex:
-        logging.error(
-            "await-target-free sidecar at %s is damaged (%s) AND could not be "
-            "quarantined (%s); leaving in place — queued work may be stranded",
-            path,
-            reason,
-            ex,
-        )
-        return
-    logging.error(
-        "await-target-free sidecar at %s is damaged (%s); quarantined to %s. "
-        "Queued deferred-move entries were NOT processed — inspect and restore "
-        "the quarantined file to recover them.",
-        path,
-        reason,
-        candidate,
-    )
-
-
-def read_sidecar(partner: str) -> list[dict]:
-    """Return the list of pending entries in the sidecar.
-
-    A *missing* sidecar is the normal empty state → ``[]``. An
-    *existing* file that is unreadable, unparseable, or structurally
-    wrong is a damaged queue, NOT an empty one: it is quarantined (see
-    :func:`_quarantine_corrupt_file`) and ``[]`` is returned only after
-    the damage has been surfaced and the bytes preserved.
-
-    Per-entry malformation is handled separately and tolerantly: a
-    single bad element (schema drift, a stray non-dict) is skipped while
-    the well-formed entries in the same file still surface. Only
-    whole-file damage triggers quarantine — one drifted entry must not
-    strand the rest of the queue.
+    Missing is the normal empty state. A present-but-unparseable file is
+    treated as empty (like :func:`drain_sidecar.read_sidecar`): the set
+    is reconstructable from Commons, so a mid-write crash mustn't wedge
+    the drain — the operator can inspect the file if it lingers.
     """
     path = sidecar_path(partner)
     if not path.exists():
@@ -216,51 +101,40 @@ def read_sidecar(partner: str) -> list[dict]:
         with open(path) as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as ex:
-        _quarantine_corrupt_file(path, f"unreadable: {ex}")
+        logging.warning(
+            "await-target-free set at %s is unreadable (%s); treating as empty",
+            path,
+            ex,
+        )
         return []
-    entries = data.get("entries") if isinstance(data, dict) else None
-    if not isinstance(entries, list):
-        _quarantine_corrupt_file(path, "top-level shape is not {'entries': [...]}")
+    keys = data.get("awaiting") if isinstance(data, dict) else None
+    if not isinstance(keys, list):
         return []
-    out: list[dict] = []
-    for raw in entries:
-        normalized = _normalize_entry(raw)
-        if normalized is not None:
-            out.append(normalized)
-    return out
+    return [k for k in keys if isinstance(k, str) and _KEY_SEP in k]
 
 
-def write_sidecar(partner: str, entries: list[dict]) -> None:
-    """Overwrite the sidecar with ``entries``. Removes the file when the
-    list is empty so an empty state is unambiguous (missing = nothing
-    pending). Deduplicates by ``(dpla_id, ordinal)`` preserving order.
-
-    Atomic write via tempfile + ``os.replace`` — matches
-    :func:`drain_sidecar.write_sidecar`'s guarantees.
+def _write_keys(partner: str, keys: list[str]) -> None:
+    """Overwrite the set with ``keys`` (deduped, order-preserving);
+    remove the file when empty so the empty state is unambiguous. Atomic
+    via tempfile + ``os.replace``. Caller holds :func:`_locked_for_write`.
     """
     path = sidecar_path(partner)
-    if not entries:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for k in keys:
+        if isinstance(k, str) and _KEY_SEP in k and k not in seen:
+            seen.add(k)
+            ordered.append(k)
+    if not ordered:
         try:
             path.unlink(missing_ok=True)
         except OSError as ex:
             logging.warning(
-                "failed to remove empty await-target-free sidecar at %s: %s",
-                path,
-                ex,
+                "failed to remove empty await-target-free set at %s: %s", path, ex
             )
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    seen: set[tuple[str, int]] = set()
-    ordered: list[dict] = []
-    for entry in entries:
-        normalized = _normalize_entry(entry)
-        if normalized is None:
-            continue
-        key = (normalized["dpla_id"], normalized["ordinal"])
-        if key not in seen:
-            seen.add(key)
-            ordered.append(normalized)
-    payload = {"partner": partner, "entries": ordered}
+    payload = {"partner": partner, "awaiting": ordered}
     tempname: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -281,88 +155,44 @@ def write_sidecar(partner: str, entries: list[dict]) -> None:
         raise
 
 
-def has_entry(partner: str, dpla_id: str, ordinal: int) -> bool:
-    """True iff an entry for ``(dpla_id, ordinal)`` is currently queued.
-
-    Idempotency guard: the uploader consults this before enqueuing a new
-    entry so a re-run of the same partner (before the tagged file is
-    actioned by a Commons admin) doesn't re-emit the tag or duplicate the
-    sidecar entry.
-    """
-    return get_entry(partner, dpla_id, ordinal) is not None
+def has_key(partner: str, dpla_id: str, ordinal: int) -> bool:
+    """True iff ``(dpla_id, ordinal)`` is currently awaiting admin action."""
+    return _key(dpla_id, ordinal) in read_keys(partner)
 
 
-def get_entry(partner: str, dpla_id: str, ordinal: int) -> dict | None:
-    """Return the sidecar entry for ``(dpla_id, ordinal)`` or ``None``
-    if absent. Callers that need to inspect ``tag_emitted`` (workflow
-    phase) use this instead of :func:`has_entry`; a plain existence
-    check would conflate the "in-progress" and "fully-queued" states.
-    """
-    for entry in read_sidecar(partner):
-        if entry["dpla_id"] == dpla_id and entry["ordinal"] == ordinal:
-            return entry
-    return None
-
-
-def mark_tag_emitted(partner: str, dpla_id: str, ordinal: int) -> bool:
-    """Flip the entry's ``tag_emitted`` phase marker to ``True``.
-
-    Called by the uploader after ``tag_as_duplicate`` has successfully
-    written the {{Duplicate}} template on the canonical file — the entry
-    is now durably queued for admin action, and drain-deferred is free
-    to advance it once admin acts.
-
-    Returns True if an entry existed and was updated (or was already
-    True); False if no matching entry was found. Serialized via
-    :func:`_locked_for_write` — safe to call from concurrent uploader
-    Pool workers.
+def add_key(partner: str, dpla_id: str, ordinal: int) -> None:
+    """Record that ``(dpla_id, ordinal)`` is awaiting admin action.
+    Idempotent; serialized across processes via :func:`_locked_for_write`.
     """
     with _locked_for_write(partner):
-        existing = read_sidecar(partner)
-        found = False
-        for entry in existing:
-            if entry["dpla_id"] == dpla_id and entry["ordinal"] == ordinal:
-                entry["tag_emitted"] = True
-                found = True
-                break
-        if found:
-            write_sidecar(partner, existing)
-        return found
+        keys = read_keys(partner)
+        k = _key(dpla_id, ordinal)
+        if k not in keys:
+            keys.append(k)
+            _write_keys(partner, keys)
 
 
-def add_entry(partner: str, entry: dict) -> list[dict]:
-    """Add ``entry`` to the sidecar, deduping by ``(dpla_id, ordinal)``,
-    and return the resulting combined list. If an entry for that key
-    already exists, the sidecar is left unchanged.
-
-    Serialized across processes via :func:`_locked_for_write` so
-    concurrent uploader Pool workers can't lose each other's writes.
-    """
-    normalized = _normalize_entry(entry)
-    if normalized is None:
-        raise ValueError(f"malformed entry rejected: {entry!r}")
-    key = (normalized["dpla_id"], normalized["ordinal"])
-    with _locked_for_write(partner):
-        existing = read_sidecar(partner)
-        if any((e["dpla_id"], e["ordinal"]) == key for e in existing):
-            return existing
-        combined = [*existing, normalized]
-        write_sidecar(partner, combined)
-        return combined
-
-
-def remove_entry(partner: str, dpla_id: str, ordinal: int) -> list[dict]:
-    """Drop the entry keyed by ``(dpla_id, ordinal)`` from the sidecar
-    and return the remaining list. Absent entries are a no-op.
-
-    Serialized across processes via :func:`_locked_for_write` so a
-    concurrent :func:`add_entry` can't be silently overwritten.
+def remove_key(partner: str, dpla_id: str, ordinal: int) -> None:
+    """Drop ``(dpla_id, ordinal)`` from the set (no-op if absent).
+    Serialized across processes via :func:`_locked_for_write`.
     """
     with _locked_for_write(partner):
-        remaining = [
-            e
-            for e in read_sidecar(partner)
-            if not (e["dpla_id"] == dpla_id and e["ordinal"] == ordinal)
-        ]
-        write_sidecar(partner, remaining)
-        return remaining
+        k = _key(dpla_id, ordinal)
+        keys = read_keys(partner)
+        if k in keys:
+            _write_keys(partner, [x for x in keys if x != k])
+
+
+def awaiting_dpla_ids(partner: str) -> list[str]:
+    """Return the unique DPLA IDs with at least one awaiting ordinal, in
+    first-seen order. The drain re-runs the uploader per DPLA ID (its
+    unit of work is the item), so it dedupes the per-ordinal keys here.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for k in read_keys(partner):
+        dpla_id = k.split(_KEY_SEP, 1)[0]
+        if dpla_id not in seen:
+            seen.add(dpla_id)
+            ordered.append(dpla_id)
+    return ordered
