@@ -1065,19 +1065,68 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
 # non-whitespace token is the parameter pipe or the template's closing
 # braces. IGNORECASE handles both `Duplicate` and the `{{duplicate}}`
 # variant some Commons editors use.
-_DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
+DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
+
+
+def first_uploader(site: BaseSite, file_page: FilePage) -> str | None:
+    """Return the username that made the first (oldest) upload of
+    ``file_page``, or ``None`` if the history is empty or the API call
+    fails.
+
+    Used by the uploader's Case-2 hash-drift subclassification to
+    distinguish stranded old DPLA-bot uploads (first uploader is a
+    known bot account — safe to tag for admin cleanup) from
+    community-authored uploads that predate DPLA involvement
+    (first uploader is a real editor — must not be tagged; instead
+    the community file gets promoted to the DPLA-canonical title via
+    the await-target-free deferral flow).
+
+    Queries the oldest file-history revision explicitly (``iidir=newer``
+    + ``iilimit=1``) so we look at the ORIGINAL upload, not the most
+    recent one — a re-upload by DPLA bot on top of a community-uploaded
+    file MUST NOT flip the classification. One API call per Case 2 hit;
+    Case 2 is already the rare path, so the cost is negligible.
+    """
+    try:
+        request = site.simple_request(
+            action="query",
+            titles=file_page.title(),
+            prop="imageinfo",
+            iiprop="user",
+            iilimit=1,
+            iidir="newer",
+        )
+        data = request.submit()
+    except Exception as ex:  # pragma: no cover — defensive
+        logging.warning(
+            "first_uploader: query failed for [[File:%s]]: %s",
+            file_page.title(with_ns=False),
+            ex,
+        )
+        return None
+    pages = (data.get("query") or {}).get("pages") or {}
+    for page in pages.values():
+        for ii in page.get("imageinfo") or []:
+            user = ii.get("user")
+            if isinstance(user, str) and user:
+                return user
+    return None
 
 
 def tag_as_duplicate(
     site: BaseSite,
     file_page: FilePage,
     correct_filename: str,
-    reason: str,
+    reason: str = "",
 ) -> None:
     """Prepend {{Duplicate}} to file_page, flagging it for speedy deletion.
 
     correct_filename should be bare (no 'File:' prefix).
-    reason is the free-text reason shown in the template.
+    reason is the free-text reason shown in the template. When empty
+    (the default), the tag is emitted as ``{{Duplicate|<filename>}}`` —
+    a single-arg form that lets Commons's own default template text
+    speak for the tag, instead of a caller-supplied reason that would be
+    largely duplicative of the template's built-in wording.
 
     Idempotent: if the page already carries a {{Duplicate}} (or
     {{duplicate}}) template, this is a no-op. Two distinct uploader code
@@ -1094,7 +1143,7 @@ def tag_as_duplicate(
     that the pure-prependtext path avoided, but skipping a redundant
     write is worth the single read.
     """
-    if _DUPLICATE_TAG_RE.search(file_page.text or ""):
+    if DUPLICATE_TAG_RE.search(file_page.text or ""):
         logging.info(
             f"Skipping duplicate tag on [[File:{file_page.title(with_ns=False)}]] — "
             f"already tagged as duplicate."
@@ -1102,11 +1151,14 @@ def tag_as_duplicate(
         return
     # Escape `=` so a filename or reason containing literal equals signs
     # doesn't break the template — see escape_template_param.
-    tag = (
-        f"{{{{Duplicate"
-        f"|{escape_template_param(correct_filename)}"
-        f"|{escape_template_param(reason)}}}}}"
-    )
+    if reason:
+        tag = (
+            f"{{{{Duplicate"
+            f"|{escape_template_param(correct_filename)}"
+            f"|{escape_template_param(reason)}}}}}"
+        )
+    else:
+        tag = f"{{{{Duplicate|{escape_template_param(correct_filename)}}}}}"
     summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
     # Trailing newline so the tag sits on its own line above whatever
     # wikitext currently starts the page.

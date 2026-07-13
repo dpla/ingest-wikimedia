@@ -106,6 +106,7 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
+    first_uploader,
     is_same_item_redirect_relic,
     tag_as_duplicate,
     check_content_type,
@@ -122,8 +123,19 @@ from ingest_wikimedia.wikimedia import (
     post_commonsdelinker_request,
 )
 from ingest_wikimedia.legacy_artwork import (
+    DPLA_BOT_ACCOUNTS,
+    _normalize_account,
     import_cross_page_community_sdc,
     rescue_wikitext,
+)
+from ingest_wikimedia import await_target_free_sidecar
+
+# Pre-normalized set of DPLA-adjacent bot usernames, used by the Case-2
+# sub-classification in ``_resolve_hash_drift`` (community vs. stranded-bot
+# authorship of the drift target). Pre-computed at module load so the
+# per-item check is a single set-membership test.
+_NORMALIZED_DPLA_BOTS: frozenset[str] = frozenset(
+    _normalize_account(name) for name in DPLA_BOT_ACCOUNTS
 )
 
 MAX_UPLOAD_RETRIES = 3
@@ -261,6 +273,7 @@ class DriftResolution(str, Enum):
 
     MOVED = "moved"
     UPLOAD_AND_TAG = "upload_and_tag"
+    UPLOAD_AND_SELF_TAG_DEFER = "upload_and_self_tag_defer"
     LEAVE_OTHERS_ALONE = "leave_others_alone"
     ALREADY_CORRECT = "already_correct"
 
@@ -800,6 +813,14 @@ class Uploader:
                 # Resolve hash drift before downloading — Case 3 (simple move)
                 # needs no file download, so detecting it first avoids wasted I/O.
                 drift_old_filename: str | None = None
+                # Community-target Case 2 (see UPLOAD_AND_SELF_TAG_DEFER
+                # dispatch below): title of the community-authored file that
+                # currently holds our S3 SHA1. The post-upload block reads
+                # this to decide whether to tag OUR uploaded file rather than
+                # tagging the community file — the ``drift_old_filename`` /
+                # ``self_tag_community_title`` variables are mutually exclusive.
+                self_tag_community_title: str | None = None
+                self_tag_expected_sha1: str | None = None
                 drift_action: str | None = None
                 force_ignore_warnings = False
                 if existing_file is not None:
@@ -905,6 +926,64 @@ class Uploader:
                                     "pageid": None,
                                 }
                             drift_old_filename = existing_file.title(with_ns=False)
+                            force_ignore_warnings = True
+                        elif drift_action == DriftResolution.UPLOAD_AND_SELF_TAG_DEFER:
+                            # Community upload lives at the drift target title
+                            # (revision history's first uploader is a real
+                            # editor, not a DPLA-adjacent bot). Upload our S3
+                            # bytes to the DPLA-canonical title, tag OUR fresh
+                            # file as ``{{Duplicate|<community title>}}``, and
+                            # enqueue an await-target-free entry. The
+                            # drain-deferred phase watches the tagged title;
+                            # once a Commons admin has acted (deletion or
+                            # redirect), it moves the community file into the
+                            # freed DPLA-canonical title, restoring the
+                            # invariant with the community file's history
+                            # intact. Same Category:Duplicate capacity gate
+                            # as UPLOAD_AND_TAG — this ends up in the same
+                            # category and shouldn't add to it if the category
+                            # is already saturated.
+                            if (
+                                self.dup_throttle is not None
+                                and not self.dup_throttle.try_acquire()
+                            ):
+                                logging.info(
+                                    f"Deferring {dpla_id} {ordinal}: "
+                                    f"Category:Duplicate at capacity; will retry "
+                                    f"upload + self-tag-defer in the drain pass."
+                                )
+                                self.tracker.increment(
+                                    Result.UPLOAD_DEFERRED_DUP_CATEGORY
+                                )
+                                return {
+                                    "status": ORDINAL_DEFERRED,
+                                    "title": page_title,
+                                    "pageid": None,
+                                }
+                            # Idempotency: if an await-target-free entry for
+                            # this (dpla_id, ordinal) already exists, we've
+                            # already emitted the tag on a prior run and are
+                            # waiting for the admin. Don't re-upload or
+                            # re-tag; short-circuit to SKIPPED.
+                            if await_target_free_sidecar.has_entry(
+                                self.partner, dpla_id, ordinal
+                            ):
+                                logging.info(
+                                    f"Skipping {dpla_id} {ordinal}: "
+                                    f"await-target-free entry already pending "
+                                    f"for [[File:{page_title}]] (drain-deferred "
+                                    f"owns the next transition)."
+                                )
+                                self.tracker.increment(Result.SKIPPED)
+                                return {
+                                    "status": ORDINAL_SKIPPED,
+                                    "title": page_title,
+                                    "pageid": None,
+                                }
+                            self_tag_community_title = existing_file.title(
+                                with_ns=False
+                            )
+                            self_tag_expected_sha1 = existing_file.latest_file_info.sha1
                             force_ignore_warnings = True
                         else:  # "leave_others_alone"
                             force_ignore_warnings = True
@@ -1265,6 +1344,14 @@ class Uploader:
                         item_metadata=item_metadata,
                         provider=provider,
                         data_provider=data_provider,
+                    )
+                elif self_tag_community_title:
+                    self._tag_self_and_defer(
+                        dpla_canonical_title=page_title,
+                        community_title=self_tag_community_title,
+                        dpla_id=dpla_id,
+                        ordinal=ordinal,
+                        expected_sha1=self_tag_expected_sha1 or "",
                     )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
@@ -1875,6 +1962,36 @@ class Uploader:
             )
             return DriftResolution.LEAVE_OTHERS_ALONE
 
+        # Case 2 sub-classification: is the file at ``actual_filename`` a
+        # community-authored upload (its FIRST revision made by a non-bot
+        # user) rather than a stranded DPLA-adjacent bot upload? If yes,
+        # tagging IT for admin deletion would be a destructive imposition
+        # on the community — the file may have years of curation, external
+        # references, and the editor may be aware of the DPLA relationship
+        # already (the Bartlett incident: the community wikitext linked
+        # DPLA as ``other versions =``, deliberately not merged).
+        #
+        # Instead, upload our S3 bytes to the DPLA-canonical title so the
+        # invariant is satisfied AND tag OUR just-uploaded file as
+        # ``{{Duplicate|<community title>}}``. A Commons admin then chooses
+        # deletion or redirection; the ``drain-deferred`` phase watches for
+        # that resolution and, once the tagged (DPLA-canonical) title is
+        # freed, executes a title-drift move of the community file into it.
+        # Net effect: the community file's history survives under the
+        # DPLA-canonical title; the invariant is restored via the standard
+        # title-drift-move machinery.
+        first = first_uploader(self.site, existing_file)
+        if first is not None and _normalize_account(first) not in _NORMALIZED_DPLA_BOTS:
+            logging.info(
+                f"Title drift (Case 2 → upload_and_self_tag_defer): "
+                f"[[File:{intended_page.title(with_ns=False)}]] has a different "
+                f"hash and our SHA1 currently lives at community-authored "
+                f"[[File:{actual_filename}]] (first upload by {first!r}). "
+                f"Will upload correct hash to canonical title, tag OUR file "
+                f"as duplicate, and defer the rename to drain-deferred."
+            )
+            return DriftResolution.UPLOAD_AND_SELF_TAG_DEFER
+
         logging.info(
             f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
             f"has a different hash; will upload correct hash and tag "
@@ -2029,6 +2146,80 @@ class Uploader:
             raise
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
+
+    def _tag_self_and_defer(
+        self,
+        *,
+        dpla_canonical_title: str,
+        community_title: str,
+        dpla_id: str,
+        ordinal: int,
+        expected_sha1: str,
+    ) -> None:
+        """Tag OUR just-uploaded DPLA-canonical file as a duplicate of the
+        community file whose bytes we just matched, and enqueue an
+        await-target-free sidecar entry so ``drain-deferred`` can complete
+        the flow after a Commons admin acts on the tag.
+
+        Emits ``{{Duplicate|<community title>}}`` (single-arg form — the
+        Duplicate template's own default text is more informative than any
+        reason we'd supply). Best-effort like ``_tag_drift_duplicate``: a
+        failure to write the tag or the sidecar entry is logged but does
+        NOT propagate, because the primary upload has already succeeded
+        and the invariant is satisfied — the deferred rename is a
+        follow-up, not a rollback of anything.
+
+        The sidecar entry carries the expected community-file SHA1 at
+        tag time so the drain-deferred handler can re-validate against
+        content drift on the community side during the wait window
+        (arbitrary duration — hours to weeks — depending on when a
+        Commons admin actions the tag).
+        """
+        # Tag our own uploaded file. Idempotent inside ``tag_as_duplicate``
+        # (checks for an existing {{Duplicate}} template before prepending).
+        try:
+            self_page = get_page(self.site, f"File:{dpla_canonical_title}")
+            tag_as_duplicate(
+                self.site,
+                self_page,
+                correct_filename=community_title,
+            )
+            logging.info(
+                f"Tagged [[File:{dpla_canonical_title}]] as duplicate of "
+                f"community-authored [[File:{community_title}]] (DPLA ID "
+                f"{dpla_id}); awaiting Commons admin action."
+            )
+        except CsrfRecoveryFailed:
+            raise
+        except Exception as ex:
+            logging.warning(
+                f"Failed to self-tag [[File:{dpla_canonical_title}]] as "
+                f"duplicate of [[File:{community_title}]]: {ex}"
+            )
+            # Fall through anyway — if we DID somehow already tag on a
+            # previous run and this call raced with a Commons-side edit,
+            # we still want the sidecar entry so drain-deferred can
+            # complete the flow.
+
+        # Enqueue for drain-deferred stage-2 handling. Idempotent via
+        # ``add_entry``'s (dpla_id, ordinal) dedupe.
+        try:
+            await_target_free_sidecar.add_entry(
+                self.partner,
+                {
+                    "dpla_id": dpla_id,
+                    "ordinal": ordinal,
+                    "tagged_title": dpla_canonical_title,
+                    "community_title": community_title,
+                    "expected_sha1": expected_sha1,
+                },
+            )
+        except Exception as ex:
+            logging.warning(
+                f"Failed to enqueue await-target-free entry for "
+                f"[[File:{dpla_canonical_title}]] → [[File:{community_title}]] "
+                f"(DPLA ID {dpla_id}): {ex}"
+            )
 
     def _persist_upload_result(
         self,

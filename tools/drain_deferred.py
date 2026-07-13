@@ -47,14 +47,22 @@ from pathlib import Path
 
 import click
 
-from ingest_wikimedia import drain_sidecar
+from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+from ingest_wikimedia.csrf import with_csrf_recovery
 from ingest_wikimedia.dup_throttle import DuplicateCategoryThrottle
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.slack import (
     notify_drain_phase_complete,
     notify_drain_phase_start,
 )
-from ingest_wikimedia.wikimedia import get_site
+from ingest_wikimedia.wikimedia import (
+    DUPLICATE_TAG_RE,
+    build_title_drift_move_reason,
+    file_has_inbound_usage,
+    get_page,
+    get_site,
+    post_commonsdelinker_request,
+)
 
 # Host-level lock file. One drain-deferred process at a time across the
 # shared EC2 instance — see module docstring for the concurrency
@@ -172,6 +180,172 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
             )
 
 
+def _advance_await_target_free_entry(
+    entry: dict, site: object
+) -> tuple[bool, str | None]:
+    """Attempt to advance one await-target-free entry.
+
+    Returns ``(should_remove, note)``:
+
+      * ``(True, None)`` — entry advanced successfully (community file
+        moved into the freed DPLA-canonical title). Caller drops it.
+      * ``(True, "FAIL: <reason>")`` — entry is a dead-end and must NOT
+        stay queued (tag was removed by an editor without deletion,
+        community file has disappeared, etc.). Caller drops it and logs
+        the reason.
+      * ``(False, "PENDING: <reason>")`` — entry is still waiting (tag
+        still present, admin hasn't acted). Caller keeps it queued for
+        the next drain round.
+
+    The advancement action itself — moving the community file into the
+    freed canonical title — mirrors ``Uploader._move_to_correct_title``
+    line-for-line: the same reason string, same CommonsDelinker relink,
+    same title-drift semantics. The two implementations share a
+    conceptual contract (invariant satisfied post-move) even though the
+    code isn't unified — a shared helper is a reasonable future
+    refactor.
+    """
+    dpla_id = entry["dpla_id"]
+    tagged_title = entry["tagged_title"]
+    community_title = entry["community_title"]
+    expected_sha1 = entry["expected_sha1"]
+
+    tagged_page = get_page(site, f"File:{tagged_title}")
+    exists = tagged_page.exists()
+
+    # State machine over the tagged page. Poll order matters:
+    #   1. Doesn't exist → admin deleted, advance.
+    #   2. Redirect → admin merged, advance (move_to_title handles redirects).
+    #   3. Exists with tag → still waiting.
+    #   4. Exists WITHOUT tag → admin (or an editor) removed the tag
+    #      without deleting the page. Treat as decisive decline: drop
+    #      the entry and log FAIL.
+    if exists and not tagged_page.isRedirectPage():
+        text = tagged_page.text or ""
+        if DUPLICATE_TAG_RE.search(text):
+            return False, "PENDING: tagged file still present with Duplicate template"
+        return True, (
+            "FAIL: tagged file still exists but {{Duplicate}} template was "
+            "removed by a Commons editor without deletion — treating as a "
+            "decline and giving up on the rename."
+        )
+
+    # Advance path (deletion OR redirect).
+    community_page = get_page(site, f"File:{community_title}")
+    if not community_page.exists():
+        return True, (
+            "FAIL: community file no longer exists on Commons — a third-party "
+            "action removed it during the wait window."
+        )
+
+    # Re-validate SHA1 against content drift on the community side.
+    actual_sha1 = community_page.latest_file_info.sha1
+    if actual_sha1 != expected_sha1:
+        return True, (
+            f"FAIL: community file SHA1 drifted during the wait window "
+            f"(expected {expected_sha1[:16]}…, now {actual_sha1[:16]}…) — "
+            f"refusing to move stale bytes into the canonical title."
+        )
+
+    # Move community file into the freed canonical title.
+    intended_page = get_page(site, f"File:{tagged_title}")
+    reason = build_title_drift_move_reason(
+        community_title, tagged_title, dpla_id, site.user()
+    )
+    needs_relink = file_has_inbound_usage(site, community_title)
+    logging.info(
+        "Await-target-free advance for %s: moving [[File:%s]] → [[File:%s]]",
+        dpla_id,
+        community_title,
+        tagged_title,
+    )
+    with_csrf_recovery(
+        site,
+        f"move {community_page.title()} → {intended_page.title()}",
+        lambda: community_page.move(
+            intended_page.title(),
+            reason=reason,
+            movetalk=False,
+            noredirect=False,
+        ),
+    )
+    if needs_relink:
+        post_commonsdelinker_request(
+            site, community_title, tagged_title, check_usage=False
+        )
+    return True, None
+
+
+def _process_await_target_free(partner: str, site: object) -> None:
+    """Poll every await-target-free sidecar entry and advance the ones
+    whose tagged file has been actioned by a Commons admin.
+
+    Idempotent — safe to run whether patient or opportunistic. An entry
+    that isn't ready this round stays queued for the next round. Same
+    isolation contract as ``_run_one_round``: a per-item failure
+    (network blip, pywikibot exception) is logged and the entry stays
+    queued.
+    """
+    pending = await_target_free_sidecar.read_sidecar(partner)
+    if not pending:
+        return
+    logging.info(
+        "Await-target-free: polling %d entry(ies) for partner %s.",
+        len(pending),
+        partner,
+    )
+    advanced = 0
+    failed = 0
+    for entry in pending:
+        try:
+            should_remove, note = _advance_await_target_free_entry(entry, site)
+        except Exception as ex:
+            logging.warning(
+                "Await-target-free: entry %s (%s → %s) raised %s; leaving queued.",
+                entry["dpla_id"],
+                entry["community_title"],
+                entry["tagged_title"],
+                ex,
+            )
+            continue
+        if not should_remove:
+            logging.info(
+                "Await-target-free: entry %s (%s → %s) %s.",
+                entry["dpla_id"],
+                entry["community_title"],
+                entry["tagged_title"],
+                note,
+            )
+            continue
+        await_target_free_sidecar.remove_entry(
+            partner, entry["dpla_id"], entry["ordinal"]
+        )
+        if note and note.startswith("FAIL:"):
+            failed += 1
+            logging.warning(
+                "Await-target-free: entry %s (%s → %s) dropped — %s",
+                entry["dpla_id"],
+                entry["community_title"],
+                entry["tagged_title"],
+                note,
+            )
+        else:
+            advanced += 1
+            logging.info(
+                "Await-target-free: entry %s (%s → %s) advanced — community "
+                "file moved into freed canonical title.",
+                entry["dpla_id"],
+                entry["community_title"],
+                entry["tagged_title"],
+            )
+    logging.info(
+        "Await-target-free: %d advanced, %d failed, %d still pending.",
+        advanced,
+        failed,
+        len(pending) - advanced - failed,
+    )
+
+
 def _run_one_round(partner: str, pending: list[str]) -> int:
     """Execute one drain round: clear ``pending`` from the sidecar,
     invoke uploader + sdc-sync on those IDs, return how many the
@@ -285,19 +459,22 @@ def main(no_wait: bool, partner: str) -> None:
     setup_logging(partner, event_type, logging.INFO)
 
     initial_ids = drain_sidecar.read_sidecar(partner)
-    if not initial_ids:
+    initial_await = await_target_free_sidecar.read_sidecar(partner)
+    if not initial_ids and not initial_await:
         logging.info(
-            "Drain-deferred: sidecar for partner %s is empty (or missing); nothing to do.",
+            "Drain-deferred: both sidecars for partner %s are empty (or missing); "
+            "nothing to do.",
             partner,
         )
         return
 
     mode_label = "opportunistic" if no_wait else "patient"
     logging.info(
-        "Drain-deferred: sidecar for partner %s has %d item(s) queued; "
-        "acquiring host lock (mode: %s).",
+        "Drain-deferred: partner %s has %d category-capacity item(s) and %d "
+        "await-target-free entry(ies) queued; acquiring host lock (mode: %s).",
         partner,
         len(initial_ids),
+        len(initial_await),
         mode_label,
     )
 
@@ -312,8 +489,10 @@ def main(no_wait: bool, partner: str) -> None:
     if lock_fd is None:
         logging.info(
             "Drain-deferred (opportunistic): host lock held by another drain; "
-            "skipping this pass — %d item(s) remain queued for the terminal drain.",
+            "skipping this pass — %d category-capacity item(s) and %d "
+            "await-target-free entry(ies) remain queued for the terminal drain.",
             len(initial_ids),
+            len(initial_await),
         )
         return
     try:
@@ -321,10 +500,12 @@ def main(no_wait: bool, partner: str) -> None:
         # ``get_site()`` — same helper the uploader/retirer/fix-categories
         # tools use; also runs ``site.login()``. The throttle requires a
         # non-None site (see :class:`DuplicateCategoryThrottle` guard).
-        throttle = DuplicateCategoryThrottle(get_site())
+        site = get_site()
+        throttle = DuplicateCategoryThrottle(site)
 
         if no_wait:
             _drain_opportunistic_once(partner, throttle)
+            _process_await_target_free(partner, site)
             return
 
         # Patient mode: Slack-notify start (so the operator knows the
@@ -333,6 +514,13 @@ def main(no_wait: bool, partner: str) -> None:
         initial_category_size = throttle.category_size()
         notify_drain_phase_start(partner, len(initial_ids), initial_category_size)
         total_emitted = _drain_loop(partner, throttle)
+        # Stage-2 handling: poll and advance await-target-free entries.
+        # Runs AFTER the patient category-capacity loop so any Case-2
+        # tag emissions this round produced (via _drain_loop → uploader
+        # re-invocation → self-tag path) can be picked up in the same
+        # invocation instead of having to wait for the next partner
+        # session's drain.
+        _process_await_target_free(partner, site)
         elapsed = time.monotonic() - started_at
         logging.info(
             "Drain-deferred: complete. Emitted %d item(s) over %.0f seconds.",
