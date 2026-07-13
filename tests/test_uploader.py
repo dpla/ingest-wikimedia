@@ -889,6 +889,58 @@ def test_resolve_hash_drift_case2_stays_upload_and_tag_when_first_uploader_unkno
     assert action == "upload_and_tag"
 
 
+def test_tag_self_and_defer_enqueues_sidecar_entry_with_partner_from_caller(
+    tmp_path, monkeypatch
+):
+    """CR-review regression: ``_tag_self_and_defer`` used ``self.partner``,
+    which doesn't exist on ``Uploader``. Fix: partner is threaded through
+    from ``process_file``'s caller-provided arg. Verify the sidecar
+    ``add_entry`` call receives that ``partner`` value AND records the
+    ``(dpla_id, ordinal, tagged_title, community_title, expected_sha1)``
+    tuple the drain-deferred stage-2 handler will consume."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    # Point the sidecar at tmp_path so the test doesn't touch the real
+    # /home/ec2-user tree — same fixture pattern the sidecar's own tests use.
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKIMEDIA_ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+
+    uploader = _build_uploader_with_dpla()
+    # ``tag_as_duplicate`` calls into pywikibot's editpage — stub the wire
+    # write entirely so this test only exercises the enqueue contract.
+    with (
+        patch("tools.uploader.get_page") as get_page,
+        patch("tools.uploader.tag_as_duplicate") as tag,
+    ):
+        get_page.return_value = MagicMock(text="")
+        uploader._tag_self_and_defer(
+            partner="heartland",
+            dpla_canonical_title="Foo - DPLA - abc.jpg",
+            community_title="Foo.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+            expected_sha1="9719e05ab718aac6d400b239792ceeb45a766954",
+        )
+    # tag_as_duplicate got called with the community title as the pointer.
+    tag.assert_called_once()
+    _, kwargs = tag.call_args
+    assert kwargs.get("correct_filename") == "Foo.jpg"
+
+    # Sidecar recorded the entry against the partner arg (not a bogus
+    # ``self.partner``).
+    entries = await_target_free_sidecar.read_sidecar("heartland")
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["dpla_id"] == "abc" + "a" * 29
+    assert e["ordinal"] == 1
+    assert e["tagged_title"] == "Foo - DPLA - abc.jpg"
+    assert e["community_title"] == "Foo.jpg"
+    assert e["expected_sha1"] == "9719e05ab718aac6d400b239792ceeb45a766954"
+
+    # Other partners' sidecars remain untouched.
+    assert await_target_free_sidecar.read_sidecar("bpl") == []
+
+
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":
     """Like ``_build_uploader_with_dpla`` but DPLA API raises ``exc`` on
     every ``get_item_metadata`` call. Used to exercise the "colliding

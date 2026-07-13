@@ -966,7 +966,7 @@ class Uploader:
                             # waiting for the admin. Don't re-upload or
                             # re-tag; short-circuit to SKIPPED.
                             if await_target_free_sidecar.has_entry(
-                                self.partner, dpla_id, ordinal
+                                partner, dpla_id, ordinal
                             ):
                                 logging.info(
                                     f"Skipping {dpla_id} {ordinal}: "
@@ -1347,6 +1347,7 @@ class Uploader:
                     )
                 elif self_tag_community_title:
                     self._tag_self_and_defer(
+                        partner=partner,
                         dpla_canonical_title=page_title,
                         community_title=self_tag_community_title,
                         dpla_id=dpla_id,
@@ -2150,6 +2151,7 @@ class Uploader:
     def _tag_self_and_defer(
         self,
         *,
+        partner: str,
         dpla_canonical_title: str,
         community_title: str,
         dpla_id: str,
@@ -2205,7 +2207,7 @@ class Uploader:
         # ``add_entry``'s (dpla_id, ordinal) dedupe.
         try:
             await_target_free_sidecar.add_entry(
-                self.partner,
+                partner,
                 {
                     "dpla_id": dpla_id,
                     "ordinal": ordinal,
