@@ -47,6 +47,7 @@ silently promote stale bytes into the canonical title).
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ from pathlib import Path
 from ingest_wikimedia.drain_sidecar import partner_dir_path
 
 SIDECAR_FILENAME = "await-target-free.json"
+_LOCK_SUFFIX = ".lock"
 
 
 def sidecar_path(partner: str) -> Path:
@@ -66,6 +68,36 @@ def sidecar_path(partner: str) -> Path:
     directory.
     """
     return partner_dir_path(partner) / SIDECAR_FILENAME
+
+
+@contextlib.contextmanager
+def _locked_for_write(partner: str):
+    """Hold an exclusive ``fcntl.flock`` on the sidecar's companion
+    lockfile for the duration of the block.
+
+    The uploader's ``multiprocessing.Pool`` fans work out to worker
+    processes that all call :func:`add_entry` / :func:`remove_entry`
+    concurrently. Without this lock, two workers can each read the
+    sidecar, dedupe locally, and race on the ``os.replace`` — one
+    replaces the other's write and the losing worker's entry is lost.
+
+    The lockfile is a separate path (``<sidecar>.lock``) rather than
+    the sidecar itself because :func:`write_sidecar` unlinks an empty
+    sidecar via ``os.replace`` / ``unlink``, and locking the sidecar
+    would leak the lock across those file-swap boundaries. The
+    lockfile is created on first use and never deleted; ``flock``
+    releases automatically on fd close, so a killed worker never
+    strands the lock.
+    """
+    path = sidecar_path(partner)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + _LOCK_SUFFIX)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _normalize_entry(raw: object) -> dict | None:
@@ -197,27 +229,35 @@ def add_entry(partner: str, entry: dict) -> list[dict]:
     """Add ``entry`` to the sidecar, deduping by ``(dpla_id, ordinal)``,
     and return the resulting combined list. If an entry for that key
     already exists, the sidecar is left unchanged.
+
+    Serialized across processes via :func:`_locked_for_write` so
+    concurrent uploader Pool workers can't lose each other's writes.
     """
     normalized = _normalize_entry(entry)
     if normalized is None:
         raise ValueError(f"malformed entry rejected: {entry!r}")
-    existing = read_sidecar(partner)
     key = (normalized["dpla_id"], normalized["ordinal"])
-    if any((e["dpla_id"], e["ordinal"]) == key for e in existing):
-        return existing
-    combined = [*existing, normalized]
-    write_sidecar(partner, combined)
-    return combined
+    with _locked_for_write(partner):
+        existing = read_sidecar(partner)
+        if any((e["dpla_id"], e["ordinal"]) == key for e in existing):
+            return existing
+        combined = [*existing, normalized]
+        write_sidecar(partner, combined)
+        return combined
 
 
 def remove_entry(partner: str, dpla_id: str, ordinal: int) -> list[dict]:
     """Drop the entry keyed by ``(dpla_id, ordinal)`` from the sidecar
     and return the remaining list. Absent entries are a no-op.
+
+    Serialized across processes via :func:`_locked_for_write` so a
+    concurrent :func:`add_entry` can't be silently overwritten.
     """
-    remaining = [
-        e
-        for e in read_sidecar(partner)
-        if not (e["dpla_id"] == dpla_id and e["ordinal"] == ordinal)
-    ]
-    write_sidecar(partner, remaining)
-    return remaining
+    with _locked_for_write(partner):
+        remaining = [
+            e
+            for e in read_sidecar(partner)
+            if not (e["dpla_id"] == dpla_id and e["ordinal"] == ordinal)
+        ]
+        write_sidecar(partner, remaining)
+        return remaining
