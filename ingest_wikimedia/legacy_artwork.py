@@ -31,7 +31,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import mwparserfromhell
 
@@ -562,19 +562,19 @@ def plan_migration(
     wikitext_preserved_extras: dict[str, str] = {}
 
     for key, value in wikitext_params.items():
+        # A DPLA/uploader-generated boilerplate value (a bare {{DPLA}} template,
+        # an uploader source link, or a rights-statement string) is provenance
+        # already rendered from SDC — keeping it would just duplicate that
+        # render. Drop it outright BEFORE the provenance/canonical-equivalence
+        # branch, so it lands in NO output bucket (community_imports /
+        # wikitext_preserved_extras / dpla_originated_params) regardless of
+        # classification. Conservative: community prose alongside it is preserved.
+        if _is_dpla_generated_extra(key, value):
+            continue
         canonical_value = _canonical_value_for_key(canonical_params, key)
         if classified.get(key) == "community" and not _value_equivalent_to_canonical(
             key, value, canonical_value
         ):
-            # A DPLA/uploader-generated boilerplate value (a bare {{DPLA}}
-            # template, an uploader source link, or a rights-statement string) is
-            # provenance already rendered from SDC — keeping it (as an SDC import
-            # or on the migrated template param) would just duplicate that
-            # render. Drop it outright, independent of the key's SDC mapping, so
-            # this stays correct if source/institution/permission gain mappings
-            # later. Conservative: community prose alongside it is preserved.
-            if _is_dpla_generated_extra(key, value):
-                continue
             # Only import community values that *differ* from canonical
             # — a community editor restating DPLA's title verbatim is
             # not an import we want to record (it's redundant). Same
@@ -990,11 +990,23 @@ def _is_redundant_dpla_source(value: str) -> bool:
 # expected to grow one partner at a time. Its failure mode is deliberately
 # benign: an unmatched variant is preserved (over-kept), never lost. If this
 # list grows large, prefer mapping rights to SDC over lengthening it.
-_RIGHTS_HOSTS = ("rightsstatements.org", "archives.gov/social-media/flickr-faqs")
 _CANNED_PD_BLURB = (
     "Public Domain: This image is in the public domain and may be "
     "used free of charge without permissions or fees."
 )
+
+
+def _is_rights_url(url: str) -> bool:
+    """True for a DPLA/NARA rights-statement URL, matched by parsed host (and
+    path) rather than substring — so ``https://rightsstatements.org@evil.example/…``
+    or a URL merely containing the text elsewhere does NOT match."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host == "rightsstatements.org" or host.endswith(".rightsstatements.org"):
+        return True
+    return (
+        host == "archives.gov" or host.endswith(".archives.gov")
+    ) and parsed.path.startswith("/social-media/flickr-faqs")
 
 
 def _only_external_links(value: str) -> bool:
@@ -1050,7 +1062,7 @@ def _is_dpla_generated_extra(key: str, value: str) -> bool:
             for n in mwparserfromhell.parse(value).nodes
             if isinstance(n, mwparserfromhell.nodes.ExternalLink)
         ]
-        return all(any(h in u.lower() for h in _RIGHTS_HOSTS) for u in urls)
+        return all(_is_rights_url(u) for u in urls)
     return False
 
 

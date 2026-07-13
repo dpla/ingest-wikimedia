@@ -3557,6 +3557,41 @@ def test_is_dpla_generated_extra():
     )
     # mapped/community keys unaffected
     assert _is_dpla_generated_extra("description", "A community note") is False
+    # rights URLs match by parsed host/path, not substring — spoofs must NOT match
+    assert (
+        _is_dpla_generated_extra(
+            "permission", "[https://rightsstatements.org@evil.example/x label]"
+        )
+        is False
+    )
+    assert (
+        _is_dpla_generated_extra(
+            "permission", "[https://evil.example/?ref=rightsstatements.org label]"
+        )
+        is False
+    )
+    assert (
+        _is_dpla_generated_extra(
+            "permission", "[https://rightsstatements.org.evil.com/x label]"
+        )
+        is False
+    )
+
+
+def test_plan_migration_drops_generated_extra_when_dpla_originated():
+    """A generated boilerplate value (here a {{DPLA}} source set by the uploader,
+    so classified dpla / canonical-equivalent) is dropped from ALL buckets — the
+    check runs before the provenance/equivalence branch, so it is not parked in
+    dpla_originated_params."""
+    revs = _make_revs(
+        (1, "DPLA_bot", "{{Artwork|title=A Title|source={{DPLA|Q1|hub=Q2}}}}"),
+        (2, "DPLA_bot", "{{Artwork|title=A Title|source={{DPLA|Q1|hub=Q2}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "source" not in plan.dpla_originated_params
+    assert "source" not in plan.community_imports
+    assert "source" not in plan.wikitext_preserved_extras
 
 
 def test_plan_migration_drops_uploader_source_link():
