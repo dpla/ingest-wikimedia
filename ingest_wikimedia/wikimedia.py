@@ -1068,9 +1068,9 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
 DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
 
 
-def first_uploader(site: BaseSite, file_page: FilePage) -> str | None:
+def first_uploader(file_page: FilePage) -> str | None:
     """Return the username that made the first (oldest) upload of
-    ``file_page``, or ``None`` if the history is empty or the API call
+    ``file_page``, or ``None`` if the history is empty or the lookup
     fails.
 
     Used by the uploader's Case-2 hash-drift subclassification to
@@ -1081,36 +1081,23 @@ def first_uploader(site: BaseSite, file_page: FilePage) -> str | None:
     the community file gets promoted to the DPLA-canonical title via
     the await-target-free deferral flow).
 
-    Queries the oldest file-history revision explicitly (``iidir=newer``
-    + ``iilimit=1``) so we look at the ORIGINAL upload, not the most
-    recent one — a re-upload by DPLA bot on top of a community-uploaded
-    file MUST NOT flip the classification. One API call per Case 2 hit;
-    Case 2 is already the rare path, so the cost is negligible.
+    Reads pywikibot's ``oldest_file_info`` — the earliest file-history
+    revision — so a later re-upload (e.g. a DPLA-bot re-upload on top of
+    a community-authored file) never flips the classification. pywikibot
+    fetches and orders the imageinfo history internally, so we don't
+    hand-roll the query direction. One lookup per Case-2 hit, an already
+    rare path.
     """
     try:
-        request = site.simple_request(
-            action="query",
-            titles=file_page.title(),
-            prop="imageinfo",
-            iiprop="user",
-            iilimit=1,
-            iidir="newer",
-        )
-        data = request.submit()
+        user = file_page.oldest_file_info.user
     except Exception as ex:  # pragma: no cover — defensive
         logging.warning(
-            "first_uploader: query failed for [[File:%s]]: %s",
+            "first_uploader: could not read file history for [[File:%s]]: %s",
             file_page.title(with_ns=False),
             ex,
         )
         return None
-    pages = (data.get("query") or {}).get("pages") or {}
-    for page in pages.values():
-        for ii in page.get("imageinfo") or []:
-            user = ii.get("user")
-            if isinstance(user, str) and user:
-                return user
-    return None
+    return user if isinstance(user, str) and user else None
 
 
 def tag_as_duplicate(

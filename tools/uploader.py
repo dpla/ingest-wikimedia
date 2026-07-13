@@ -2012,7 +2012,7 @@ class Uploader:
         # DPLA-adjacent bot for our own stranded orphans anyway (e.g. our
         # SHA1 at "(page 99)" vs intended "(page 4)"), so correctness for
         # that case is preserved without the shortcut.
-        first = first_uploader(self.site, existing_file)
+        first = first_uploader(existing_file)
         first_is_dpla_bot = (
             first is not None and _normalize_account(first) in _NORMALIZED_DPLA_BOTS
         )
