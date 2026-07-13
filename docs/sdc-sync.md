@@ -44,12 +44,12 @@ sdc-sync --lists <directory-of-txt-files>
 
 | Flag | argparse default | Production value | Set by |
 |---|---|---|---|
-| `--workers` | `1` | `6` | launcher, not sdc-sync |
+| `--workers` | `1` | `24` | launcher, not sdc-sync |
 | `--workers-budget` | `0` (disabled) | `24` | launcher, not sdc-sync |
 | `--normalize-wikitext` / `--no-normalize-wikitext` | on (`default=True`, `BooleanOptionalAction`) | on | — |
 | `--migrate-legacy` | `False` | `False` | — |
 
-The production `6` / `24` figures come from the launcher `scripts/wikimedia_launch.py` (`--workers default="6"`, `--workers-budget default="24"`) and `.github/workflows/wikimedia-launch.yml`, which always pass them explicitly — **not** from sdc-sync's own defaults. Run `sdc-sync --partner <p>` by hand and you get single-worker, no slot budget.
+The production `24` / `24` figures come from the launcher `scripts/wikimedia_launch.py` (`--workers default="24"`, `--workers-budget default="24"`) and `.github/workflows/wikimedia-launch.yml`, which always pass them explicitly — **not** from sdc-sync's own defaults. Run `sdc-sync --partner <p>` by hand and you get single-worker, no slot budget. Matching `--workers` to `--workers-budget` lets a solo sdc-sync session saturate the box-wide slot pool; concurrent sessions block on the flock semaphore and pick up slots as items complete.
 
 **Partner mode** drives off the S3 sidecars only (no `api.dp.la` calls). It iterates the IDs CSV, reads `sdc.json` + `upload-result.json` + `file-list.txt` per item, picks `UPLOADED` / `SKIPPED` ordinals from `upload-result.json`, and calls `process_one_from_sdc(mediaid, dpla_id, sdc_payload, download_url, page_number)` per ordinal. (Ordinals the uploader left in a non-eligible state are still rescued — see [Eligibility, ordinal rescue & pageid self-heal](#eligibility-ordinal-rescue--pageid-self-heal).)
 

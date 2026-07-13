@@ -129,7 +129,7 @@ Source: `tools/sdc_sync.py`. See [sdc-sync.md](sdc-sync.md) for the full SDC dee
 
 **Inputs.** Partner mode: `--partner <partner> [--ids-file PATH]`, plus:
 
-- `--workers N` (default 1) — number of worker processes for partner-mode sync. `N > 1` dispatches per-DPLA-item work to a spawn-start `multiprocessing.Pool`, each worker holding its own pywikibot session; `N = 1` keeps the single-process path. Production launches pass `6`.
+- `--workers N` (default 1) — number of worker processes for partner-mode sync. `N > 1` dispatches per-DPLA-item work to a spawn-start `multiprocessing.Pool`, each worker holding its own pywikibot session; `N = 1` keeps the single-process path. Production launches pass `24` (matched to `--workers-budget`) so a solo session can saturate the box-wide slot pool.
 - `--workers-budget N` (default 0) — box-wide cap on concurrent Commons-writing items across **all** sdc-sync and uploader sessions on the host (see [architecture.md § Intra-host write throttle](architecture.md#intra-host-write-throttle-workerslotbudget)). `0` disables it; production launches pass `24`. Must be identical across concurrent sessions.
 - `--migrate-legacy` — swaps SDC sync for the standalone legacy-Artwork migration mode (see below).
 - `--normalize-wikitext` / `--no-normalize-wikitext` (default on) — controls the post-SDC wikitext-cleanup strip.

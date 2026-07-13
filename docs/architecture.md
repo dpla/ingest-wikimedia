@@ -41,7 +41,7 @@ AWS SSM  →  EC2  (i-033eff6c8c168f999, "wiki downloads")
     │    2. downloader <partner>.csv <partner>
     │    3. uploader   <partner>.csv <partner> --workers-budget 24
     │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv \
-    │                    --workers 6 --workers-budget 24
+    │                    --workers 24 --workers-budget 24
     │    5. drain-deferred --no-wait <partner>   (opportunistic duplicate-tag drain)
     │  Then once per unique partner, at batch end:
     │    6. drain-deferred <partner>             (terminal patient duplicate-tag drain)
@@ -162,7 +162,7 @@ GitHub Actions concurrency keys layer over the SSM-level conflict detection. The
 
 The session-conflict rules above keep *distinct targets* from clobbering each other, but they don't bound how hard the box collectively hammers Commons. That's a separate, finer-grained layer.
 
-Two phases write to Commons: the **uploader** (single-process) and **sdc-sync** (parallelised across a spawn-start `multiprocessing.Pool` via `--workers N`). Each sdc-sync worker — and the uploader — does per-DPLA-*item* work, and Commons' MediaWiki parser pool only tolerates a limited number of concurrent bot writes before maxlag starts to bind. Per-session worker counts can't see each other, so 6 sessions × 6 workers would oversubscribe.
+Two phases write to Commons: the **uploader** (single-process) and **sdc-sync** (parallelised across a spawn-start `multiprocessing.Pool` via `--workers N`). Each sdc-sync worker — and the uploader — does per-DPLA-*item* work, and Commons' MediaWiki parser pool only tolerates a limited number of concurrent bot writes before maxlag starts to bind. Per-session worker counts can't see each other, so 6 sessions × 24 workers would oversubscribe — the box-wide slot budget is what enforces the actual cap regardless of how many workers each session was launched with.
 
 `ingest_wikimedia/worker_slots.py` provides `WorkerSlotBudget`: a box-wide N-permit semaphore backed by `N` `fcntl`-flock slot files. There are **two pools**. The **shared pool** (`/tmp/sdc-sync-worker-slots`, sized by `--workers-budget N`) is the box-wide budget every sdc-sync Pool worker contends over — one slot per item. The **uploader priority pool** (`/tmp/dpla-uploader-priority-slots`, `UPLOADER_PRIORITY_SLOTS = 4`) is a smaller dedicated pool only uploaders use: the uploader's `WorkerSlotBudget` is wired with the priority pool as primary and the shared pool as `fallback`, so it tries a priority slot first and spills into the shared pool only when all priority slots are held by other uploaders. sdc-sync workers construct no fallback, so they can *never* lock a priority slot. The priority pool is **additive** — not carved out of the shared budget — so total box-wide Commons writers = shared budget + 4. Net effect: an uploader is never blocked by sdc-sync workers as long as fewer than 4 uploader items are in flight box-wide. The downloader is deliberately in neither pool (it writes to source sites, not Commons). `budget <= 0` disables the semaphore (acquire is a no-op); `flock` makes it crash-safe (a dead holder's slot frees automatically when its fd closes).
 
@@ -172,8 +172,8 @@ Two phases write to Commons: the **uploader** (single-process) and **sdc-sync** 
 
    ┌───────────────────────┐
    │ sdc-sync session A     │──┐
-   │  Pool(--workers 6)     │  │
-   │   w1 w2 w3 w4 w5 w6     │  ├──▶ shared pool (24 slots, box-wide)
+   │  Pool(--workers 24)    │  │
+   │   w1 w2 … w24          │  ├──▶ shared pool (24 slots, box-wide)
    └───────────────────────┘  │        ▲   (sdc-sync can ONLY use the shared pool)
    ┌───────────────────────┐  │        │
    │ sdc-sync session B …   │──┘        │  overflow: only when all 4 priority slots held
@@ -185,7 +185,7 @@ Two phases write to Commons: the **uploader** (single-process) and **sdc-sync** 
 
 **Invariant: the budget value must be identical across every concurrent session.** It is the cap's whole meaning — if two sessions disagree (24 vs 12), the effective cap degrades to the larger value while the smaller-budget session only ever competes for the lower slots. In practice the value comes from one launch-time default (see below), so all sessions agree.
 
-`tools/sdc_sync.py` itself defaults to `--workers 1 --workers-budget 0` (the single-process, no-cap path, so a hand-run sdc-sync behaves exactly as before). The production values **6 / 24** come from `scripts/wikimedia_launch.py` and the `workers` / `workers_budget` inputs on `wikimedia-launch.yml`: the launcher appends `--workers 6 --workers-budget 24` to the sdc-sync step and `--workers-budget 24` to the uploader step. The cap therefore belongs to the launch path, not to the tool's own defaults.
+`tools/sdc_sync.py` itself defaults to `--workers 1 --workers-budget 0` (the single-process, no-cap path, so a hand-run sdc-sync behaves exactly as before). The production values **24 / 24** come from `scripts/wikimedia_launch.py` and the `workers` / `workers_budget` inputs on `wikimedia-launch.yml`: the launcher appends `--workers 24 --workers-budget 24` to the sdc-sync step and `--workers-budget 24` to the uploader step. Matching `--workers` to `--workers-budget` lets a solo sdc-sync session saturate the box-wide pool; concurrent sessions block on the flock semaphore and pick up slots as items complete. The cap therefore belongs to the launch path, not to the tool's own defaults.
 
 ## Failure semantics
 

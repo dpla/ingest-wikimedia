@@ -209,10 +209,10 @@ sdc-sync --partner <partner> --migrate-legacy
 
 ### `--workers` / `--workers-budget`
 
-`sdc-sync` accepts two parallelism flags, normally set by the launcher / workflow (defaults `6` / `24`) but settable by hand for a manual partner sync:
+`sdc-sync` accepts two parallelism flags, normally set by the launcher / workflow (defaults `24` / `24`) but settable by hand for a manual partner sync:
 
-- `--workers N` — number of worker processes for partner-mode SDC sync. Argparse default is **`1`** (single-process, standalone-safe); the launcher and workflow pass **`6`**. `N>1` dispatches per-DPLA-item work to a multiprocessing pool, each worker holding its own pywikibot session. Items are independent (every ordinal has a unique M-id), so workers never write to the same MediaInfo entity.
-- `--workers-budget N` — box-wide cap on concurrent Commons-writing slots shared across **all** sdc-sync sessions on the host (and the uploader). Argparse default is **`0`** (unlimited / budget disabled); the launcher and workflow pass **`24`** (production runs `~16`+ to keep 6+ concurrent sessions from oversubscribing Commons' parser pool). The single-purpose manual modes (`--list` / `--file` / `--cat`) do not participate in the budget. See [Worker-slot budget](operations.md#worker-slot-budget) for the slot mechanics and ops inspection.
+- `--workers N` — number of worker processes for partner-mode SDC sync. Argparse default is **`1`** (single-process, standalone-safe); the launcher and workflow pass **`24`** so a solo session can saturate the box-wide slot pool. `N>1` dispatches per-DPLA-item work to a multiprocessing pool, each worker holding its own pywikibot session. Items are independent (every ordinal has a unique M-id), so workers never write to the same MediaInfo entity.
+- `--workers-budget N` — box-wide cap on concurrent Commons-writing slots shared across **all** sdc-sync sessions on the host (and the uploader). Argparse default is **`0`** (unlimited / budget disabled); the launcher and workflow pass **`24`** (keeps concurrent sessions from oversubscribing Commons' parser pool). The single-purpose manual modes (`--list` / `--file` / `--cat`) do not participate in the budget. See [Worker-slot budget](operations.md#worker-slot-budget) for the slot mechanics and ops inspection.
 
 ### `--no-normalize-wikitext`
 
