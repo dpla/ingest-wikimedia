@@ -943,6 +943,29 @@ class Uploader:
                             # as UPLOAD_AND_TAG — this ends up in the same
                             # category and shouldn't add to it if the category
                             # is already saturated.
+                            # Idempotency: if an await-target-free entry for
+                            # this (dpla_id, ordinal) already exists, we've
+                            # already emitted the tag on a prior run and are
+                            # waiting for the admin. Don't re-upload, re-tag,
+                            # or consume a throttle grant for a tag that's
+                            # already in Category:Duplicate; short-circuit
+                            # AHEAD of the throttle gate so re-runs don't
+                            # over-consume headroom.
+                            if await_target_free_sidecar.has_entry(
+                                partner, dpla_id, ordinal
+                            ):
+                                logging.info(
+                                    f"Skipping {dpla_id} {ordinal}: "
+                                    f"await-target-free entry already pending "
+                                    f"for [[File:{page_title}]] (drain-deferred "
+                                    f"owns the next transition)."
+                                )
+                                self.tracker.increment(Result.SKIPPED)
+                                return {
+                                    "status": ORDINAL_SKIPPED,
+                                    "title": page_title,
+                                    "pageid": None,
+                                }
                             if (
                                 self.dup_throttle is not None
                                 and not self.dup_throttle.try_acquire()
@@ -957,26 +980,6 @@ class Uploader:
                                 )
                                 return {
                                     "status": ORDINAL_DEFERRED,
-                                    "title": page_title,
-                                    "pageid": None,
-                                }
-                            # Idempotency: if an await-target-free entry for
-                            # this (dpla_id, ordinal) already exists, we've
-                            # already emitted the tag on a prior run and are
-                            # waiting for the admin. Don't re-upload or
-                            # re-tag; short-circuit to SKIPPED.
-                            if await_target_free_sidecar.has_entry(
-                                partner, dpla_id, ordinal
-                            ):
-                                logging.info(
-                                    f"Skipping {dpla_id} {ordinal}: "
-                                    f"await-target-free entry already pending "
-                                    f"for [[File:{page_title}]] (drain-deferred "
-                                    f"owns the next transition)."
-                                )
-                                self.tracker.increment(Result.SKIPPED)
-                                return {
-                                    "status": ORDINAL_SKIPPED,
                                     "title": page_title,
                                     "pageid": None,
                                 }
