@@ -144,10 +144,70 @@ def _normalize_entry(raw: object) -> dict | None:
     }
 
 
+def _quarantine_corrupt_file(path: Path, reason: str) -> None:
+    """Move a damaged sidecar aside to a preserved ``.corrupt`` path and
+    log loudly.
+
+    A missing sidecar is the normal empty state, but an *existing* file
+    that can't be read or whose top-level shape is wrong is a
+    data-integrity event: the queue it represents holds deferred
+    community-file promotions that must NOT be silently dropped. If we
+    just returned ``[]`` and carried on, the patient drain would report
+    "complete" while queued work sat unnoticed, and the next
+    :func:`add_entry` would ``os.replace`` the corrupt bytes away
+    entirely. Quarantining instead (a) preserves the bytes for manual
+    recovery, (b) surfaces a loud ERROR the operator can act on, and
+    (c) still lets the process continue rather than crashing the
+    uploader hot path (``add_entry`` calls this indirectly).
+
+    Picks the first free ``<name>.corrupt`` / ``.corrupt.1`` / … so a
+    second corruption never clobbers an earlier quarantine. A concurrent
+    reader that already moved the file loses the race harmlessly
+    (``FileNotFoundError`` — nothing left to quarantine).
+    """
+    suffix = ".corrupt"
+    candidate = path.with_name(path.name + suffix)
+    n = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}{suffix}.{n}")
+        n += 1
+    try:
+        os.replace(path, candidate)
+    except FileNotFoundError:
+        return
+    except OSError as ex:
+        logging.error(
+            "await-target-free sidecar at %s is damaged (%s) AND could not be "
+            "quarantined (%s); leaving in place — queued work may be stranded",
+            path,
+            reason,
+            ex,
+        )
+        return
+    logging.error(
+        "await-target-free sidecar at %s is damaged (%s); quarantined to %s. "
+        "Queued deferred-move entries were NOT processed — inspect and restore "
+        "the quarantined file to recover them.",
+        path,
+        reason,
+        candidate,
+    )
+
+
 def read_sidecar(partner: str) -> list[dict]:
-    """Return the list of pending entries in the sidecar, or an empty
-    list if the file is missing / unreadable / malformed. Missing sidecar
-    is the normal empty state.
+    """Return the list of pending entries in the sidecar.
+
+    A *missing* sidecar is the normal empty state → ``[]``. An
+    *existing* file that is unreadable, unparseable, or structurally
+    wrong is a damaged queue, NOT an empty one: it is quarantined (see
+    :func:`_quarantine_corrupt_file`) and ``[]`` is returned only after
+    the damage has been surfaced and the bytes preserved.
+
+    Per-entry malformation is handled separately and tolerantly: a
+    single bad element (schema drift, a stray non-dict) is skipped while
+    the well-formed entries in the same file still surface. Only
+    whole-file damage triggers quarantine — one drifted entry must not
+    strand the rest of the queue.
     """
     path = sidecar_path(partner)
     if not path.exists():
@@ -156,14 +216,11 @@ def read_sidecar(partner: str) -> list[dict]:
         with open(path) as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as ex:
-        logging.warning(
-            "await-target-free sidecar at %s is unreadable (%s); treating as empty",
-            path,
-            ex,
-        )
+        _quarantine_corrupt_file(path, f"unreadable: {ex}")
         return []
     entries = data.get("entries") if isinstance(data, dict) else None
     if not isinstance(entries, list):
+        _quarantine_corrupt_file(path, "top-level shape is not {'entries': [...]}")
         return []
     out: list[dict] = []
     for raw in entries:

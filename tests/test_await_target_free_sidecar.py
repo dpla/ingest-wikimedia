@@ -74,11 +74,13 @@ def test_write_dedupes_by_dpla_id_and_ordinal():
     ]
 
 
-def test_read_tolerates_malformed_entries():
-    """Corrupt sidecar (missing keys, wrong types) is treated as empty
-    for the malformed entries; well-formed entries in the same file
-    still surface. Keeps the drain loop resilient rather than crashing
-    on a mid-write truncation."""
+def test_read_tolerates_per_entry_malformation_without_quarantine():
+    """PER-ENTRY malformation is handled tolerantly: a single bad
+    element (schema drift, stray non-dict) is skipped while the
+    well-formed entries in the same file still surface, and the file
+    is NOT quarantined — one drifted entry must not strand the rest of
+    the queue. Only WHOLE-FILE damage triggers quarantine (see the
+    tests below)."""
     path = await_target_free_sidecar.sidecar_path("nara")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -97,13 +99,65 @@ def test_read_tolerates_malformed_entries():
     )
     stored = await_target_free_sidecar.read_sidecar("nara")
     assert [e["dpla_id"] for e in stored] == ["good", "also-good"]
+    # File left in place — not quarantined.
+    assert path.exists()
+    assert not path.with_name(path.name + ".corrupt").exists()
 
 
-def test_read_tolerates_unparseable_file():
+def test_read_quarantines_unparseable_file_instead_of_silent_empty():
+    """A WHOLE-FILE-unparseable existing sidecar is a damaged queue,
+    not an empty one. read_sidecar must quarantine it (move aside,
+    preserving the bytes) and return [] only after — never silently
+    treat the damaged queue as 'nothing pending'."""
     path = await_target_free_sidecar.sidecar_path("nara")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ this is not json")
     assert await_target_free_sidecar.read_sidecar("nara") == []
+    # Original path cleared; bytes preserved in the quarantine file.
+    assert not path.exists()
+    quarantined = path.with_name(path.name + ".corrupt")
+    assert quarantined.exists()
+    assert quarantined.read_text() == "{ this is not json"
+
+
+def test_read_quarantines_wrong_toplevel_shape():
+    """An existing file whose top-level shape isn't
+    ``{'entries': [...]}`` (e.g. a bare list, or a dict missing the
+    key) is also a damaged queue and must be quarantined, not treated
+    as empty."""
+    path = await_target_free_sidecar.sidecar_path("nara")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(["unexpected", "top-level", "list"]))
+    assert await_target_free_sidecar.read_sidecar("nara") == []
+    assert not path.exists()
+    assert path.with_name(path.name + ".corrupt").exists()
+
+
+def test_quarantine_does_not_clobber_a_prior_quarantine():
+    """A second corruption event must not overwrite the first
+    quarantine — the recovery bytes from BOTH events survive under
+    distinct ``.corrupt`` / ``.corrupt.1`` names."""
+    path = await_target_free_sidecar.sidecar_path("nara")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_text("first corruption")
+    await_target_free_sidecar.read_sidecar("nara")
+    path.write_text("second corruption")
+    await_target_free_sidecar.read_sidecar("nara")
+
+    first = path.with_name(path.name + ".corrupt")
+    second = path.with_name(path.name + ".corrupt.1")
+    assert first.read_text() == "first corruption"
+    assert second.read_text() == "second corruption"
+
+
+def test_read_missing_file_is_silent_empty_not_quarantined():
+    """The normal empty state — a missing sidecar — must NOT log a
+    corruption error or create a quarantine file. This is the case the
+    damaged-queue handling must stay distinct from."""
+    path = await_target_free_sidecar.sidecar_path("nara")
+    assert await_target_free_sidecar.read_sidecar("nara") == []
+    assert not path.with_name(path.name + ".corrupt").exists()
 
 
 def test_has_entry_matches_only_on_dpla_id_and_ordinal():
