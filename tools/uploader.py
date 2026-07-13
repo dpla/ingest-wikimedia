@@ -820,7 +820,6 @@ class Uploader:
                 # tagging the community file — the ``drift_old_filename`` /
                 # ``self_tag_community_title`` variables are mutually exclusive.
                 self_tag_community_title: str | None = None
-                self_tag_expected_sha1: str | None = None
                 drift_action: str | None = None
                 force_ignore_warnings = False
                 if existing_file is not None:
@@ -943,22 +942,38 @@ class Uploader:
                             # as UPLOAD_AND_TAG — this ends up in the same
                             # category and shouldn't add to it if the category
                             # is already saturated.
-                            # Idempotency: if an await-target-free entry for
-                            # this (dpla_id, ordinal) already exists, we've
-                            # already emitted the tag on a prior run and are
-                            # waiting for the admin. Don't re-upload, re-tag,
-                            # or consume a throttle grant for a tag that's
-                            # already in Category:Duplicate; short-circuit
-                            # AHEAD of the throttle gate so re-runs don't
-                            # over-consume headroom.
-                            if await_target_free_sidecar.has_entry(
+                            # Reconcile against any prior partial run of
+                            # this same (dpla_id, ordinal). Two states:
+                            #
+                            #   * fully queued (entry exists and
+                            #     ``tag_emitted=True``) — the tag is
+                            #     already on Commons, drain-deferred
+                            #     owns the next transition, nothing to
+                            #     do this run. SKIPPED, no throttle
+                            #     grant consumed.
+                            #
+                            #   * partially queued (entry exists but
+                            #     ``tag_emitted=False``) — a prior run
+                            #     recorded the sidecar entry but the
+                            #     ``tag_as_duplicate`` call didn't
+                            #     complete (network flake, CSRF, disk
+                            #     full, kill). Fall through to the full
+                            #     path so the throttle+tag retry runs
+                            #     and ``mark_tag_emitted`` flips the
+                            #     phase to True. add_entry inside
+                            #     _tag_self_and_defer is idempotent, so
+                            #     no duplicate sidecar row appears.
+                            existing_entry = await_target_free_sidecar.get_entry(
                                 partner, dpla_id, ordinal
+                            )
+                            if existing_entry and existing_entry.get(
+                                "tag_emitted", False
                             ):
                                 logging.info(
                                     f"Skipping {dpla_id} {ordinal}: "
-                                    f"await-target-free entry already pending "
-                                    f"for [[File:{page_title}]] (drain-deferred "
-                                    f"owns the next transition)."
+                                    f"await-target-free entry already fully "
+                                    f"queued for [[File:{page_title}]] "
+                                    f"(drain-deferred owns the next transition)."
                                 )
                                 self.tracker.increment(Result.SKIPPED)
                                 return {
@@ -966,6 +981,13 @@ class Uploader:
                                     "title": page_title,
                                     "pageid": None,
                                 }
+                            if existing_entry is not None:
+                                logging.info(
+                                    f"Resuming {dpla_id} {ordinal}: "
+                                    f"await-target-free entry exists but "
+                                    f"tag was not emitted on the prior run; "
+                                    f"retrying the tag write."
+                                )
                             if (
                                 self.dup_throttle is not None
                                 and not self.dup_throttle.try_acquire()
@@ -986,7 +1008,6 @@ class Uploader:
                             self_tag_community_title = existing_file.title(
                                 with_ns=False
                             )
-                            self_tag_expected_sha1 = existing_file.latest_file_info.sha1
                             force_ignore_warnings = True
                         else:  # "leave_others_alone"
                             force_ignore_warnings = True
@@ -1355,7 +1376,7 @@ class Uploader:
                         community_title=self_tag_community_title,
                         dpla_id=dpla_id,
                         ordinal=ordinal,
-                        expected_sha1=self_tag_expected_sha1 or "",
+                        expected_sha1=sha1,
                     )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
@@ -2211,20 +2232,26 @@ class Uploader:
         (arbitrary duration — hours to weeks — depending on when a
         Commons admin actions the tag).
         """
-        # Order matters: enqueue the sidecar entry BEFORE emitting the
-        # {{Duplicate}} tag on Commons. The tag is a durable side effect
-        # that exposes the canonical file to admin deletion; the sidecar
-        # entry is the ONLY record that tells drain-deferred to promote
-        # the community file into the freed canonical title once admin
-        # acts. If the tag succeeded but the sidecar-add failed (disk
-        # full, flock crash), an admin could delete the canonical file
-        # while we have no queued intent to promote the community file
-        # into its place — community history would be stranded.
+        # Two-phase persistence keeps the workflow resumable across
+        # partial failures in either direction:
         #
-        # Sidecar-first ordering preserves the invariant that any Commons
-        # {{Duplicate}} tag we emit is backed by a durable retry-queue
-        # entry. If sidecar-add fails, we abort with no tag and no
-        # side effects; the whole item retries cleanly next run.
+        #   Phase 1: sidecar entry with ``tag_emitted=False`` — records
+        #     the intent to promote the community file. Drain-deferred
+        #     honours the phase marker: entries with tag_emitted=False
+        #     stay PENDING (they're mid-workflow, not ready for admin
+        #     advance).
+        #   Phase 2: tag_as_duplicate on Commons — the durable side
+        #     effect that exposes the canonical file to admin deletion.
+        #   Phase 3: mark_tag_emitted flips the phase to True — drain
+        #     is now free to advance the entry once admin acts.
+        #
+        # If phase 2 fails, phase 3 doesn't run, the entry stays
+        # tag_emitted=False, and the next uploader run for this
+        # (dpla_id, ordinal) will re-enter this function (via the
+        # "Resuming" branch upstream) and retry cleanly — add_entry is
+        # idempotent (dedupe), tag_as_duplicate is idempotent (skips
+        # already-tagged files), so the retry is safe even if phase 2
+        # SUCCEEDED but this process died before phase 3 ran.
         await_target_free_sidecar.add_entry(
             partner,
             {
@@ -2233,11 +2260,11 @@ class Uploader:
                 "tagged_title": dpla_canonical_title,
                 "community_title": community_title,
                 "expected_sha1": expected_sha1,
+                "tag_emitted": False,
             },
         )
 
-        # Tag our own uploaded file. Idempotent inside ``tag_as_duplicate``
-        # (checks for an existing {{Duplicate}} template before prepending).
+        # Phase 2: emit the {{Duplicate}} tag on Commons.
         try:
             self_page = get_page(self.site, f"File:{dpla_canonical_title}")
             tag_as_duplicate(
@@ -2256,10 +2283,14 @@ class Uploader:
             logging.warning(
                 f"Failed to self-tag [[File:{dpla_canonical_title}]] as "
                 f"duplicate of [[File:{community_title}]]: {ex}. Sidecar "
-                f"entry already recorded; a re-run (uploader idempotency "
-                f"check) or the drain pass will detect the untagged "
-                f"canonical and drop the entry as a decline."
+                f"entry left with tag_emitted=False; a subsequent uploader "
+                f"run for this partner will retry the tag write."
             )
+            return
+
+        # Phase 3: flip the workflow phase to fully queued. Drain-deferred
+        # will now advance this entry once a Commons admin actions the tag.
+        await_target_free_sidecar.mark_tag_emitted(partner, dpla_id, ordinal)
 
     def _persist_upload_result(
         self,

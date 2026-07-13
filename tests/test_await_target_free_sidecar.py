@@ -15,12 +15,16 @@ from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 
 def _entry(dpla_id: str = "22412cd0", ordinal: int = 1, **overrides) -> dict:
     """Canonical entry factory. Fill defaults; individual fields overridable
-    via keyword args."""
+    via keyword args. Default state is fully queued (``tag_emitted=True``);
+    tests exercising the in-progress workflow phase set ``tag_emitted=False``
+    explicitly.
+    """
     base = {
         "dpla_id": dpla_id,
         "ordinal": ordinal,
         "tagged_title": f"File:X - DPLA - {dpla_id}.jpg",
         "community_title": "File:X.jpg",
+        "tag_emitted": True,
         "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
     }
     base.update(overrides)
@@ -161,6 +165,133 @@ def test_sidecar_is_partner_scoped():
     assert [e["dpla_id"] for e in await_target_free_sidecar.read_sidecar("texas")] == [
         "bbb"
     ]
+
+
+def test_add_entry_records_explicit_tag_emitted_false():
+    """New entries can land with ``tag_emitted=False`` — the
+    in-progress phase before the uploader has actually written the
+    Commons tag. Ensure the field round-trips faithfully rather than
+    being clobbered by the ``_normalize_entry`` default.
+    """
+    await_target_free_sidecar.add_entry(
+        "nara",
+        {
+            "dpla_id": "aaa",
+            "ordinal": 1,
+            "tagged_title": "File:T.jpg",
+            "community_title": "File:C.jpg",
+            "expected_sha1": "0" * 40,
+            "tag_emitted": False,
+        },
+    )
+    stored = await_target_free_sidecar.read_sidecar("nara")
+    assert stored[0]["tag_emitted"] is False
+
+
+def test_read_sidecar_defaults_missing_tag_emitted_to_true():
+    """Backwards-compat: entries written before the ``tag_emitted``
+    field existed must be treated as fully queued (True), not as
+    in-progress — the old flow always emitted the tag before writing
+    the entry, so absence of the field is the fully-queued state.
+    """
+    path = await_target_free_sidecar.sidecar_path("nara")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "partner": "nara",
+                "entries": [
+                    {
+                        "dpla_id": "legacy",
+                        "ordinal": 1,
+                        "tagged_title": "File:T.jpg",
+                        "community_title": "File:C.jpg",
+                        "expected_sha1": "0" * 40,
+                    }
+                ],
+            }
+        )
+    )
+    stored = await_target_free_sidecar.read_sidecar("nara")
+    assert stored[0]["tag_emitted"] is True
+
+
+def test_mark_tag_emitted_flips_flag():
+    """After the uploader successfully writes the Commons tag, it
+    calls ``mark_tag_emitted`` — the sidecar entry's phase flag flips
+    to True, and drain-deferred is now free to advance it.
+    """
+    await_target_free_sidecar.add_entry(
+        "nara",
+        {
+            "dpla_id": "aaa",
+            "ordinal": 1,
+            "tagged_title": "File:T.jpg",
+            "community_title": "File:C.jpg",
+            "expected_sha1": "0" * 40,
+            "tag_emitted": False,
+        },
+    )
+    result = await_target_free_sidecar.mark_tag_emitted("nara", "aaa", 1)
+    assert result is True
+    entry = await_target_free_sidecar.get_entry("nara", "aaa", 1)
+    assert entry is not None
+    assert entry["tag_emitted"] is True
+
+
+def test_mark_tag_emitted_missing_entry_returns_false():
+    """A crash-recovery re-run that calls mark_tag_emitted on a
+    (dpla_id, ordinal) with no sidecar entry gets a False back
+    rather than raising — the sidecar being absent is a legitimate
+    state to observe.
+    """
+    result = await_target_free_sidecar.mark_tag_emitted("nara", "ghost", 1)
+    assert result is False
+
+
+def test_mark_tag_emitted_is_idempotent():
+    """Re-flipping an already-True entry is a no-op that still returns
+    True. Lets the uploader's tag-emit retry path call
+    mark_tag_emitted unconditionally on success without special-casing
+    the "was already emitted" branch.
+    """
+    await_target_free_sidecar.add_entry(
+        "nara",
+        {
+            "dpla_id": "aaa",
+            "ordinal": 1,
+            "tagged_title": "File:T.jpg",
+            "community_title": "File:C.jpg",
+            "expected_sha1": "0" * 40,
+            "tag_emitted": True,
+        },
+    )
+    assert await_target_free_sidecar.mark_tag_emitted("nara", "aaa", 1) is True
+    assert await_target_free_sidecar.get_entry("nara", "aaa", 1)["tag_emitted"] is True
+
+
+def test_get_entry_returns_full_entry_or_none():
+    """``get_entry`` returns the entry dict (with all fields including
+    ``tag_emitted``) for a match, or None for a miss — the callers
+    that need to inspect the phase use this instead of ``has_entry``,
+    which conflates in-progress and fully-queued states.
+    """
+    await_target_free_sidecar.add_entry(
+        "nara",
+        {
+            "dpla_id": "aaa",
+            "ordinal": 1,
+            "tagged_title": "File:T.jpg",
+            "community_title": "File:C.jpg",
+            "expected_sha1": "0" * 40,
+            "tag_emitted": False,
+        },
+    )
+    match = await_target_free_sidecar.get_entry("nara", "aaa", 1)
+    assert match is not None
+    assert match["tag_emitted"] is False
+    assert await_target_free_sidecar.get_entry("nara", "aaa", 2) is None
+    assert await_target_free_sidecar.get_entry("nara", "bbb", 1) is None
 
 
 def test_sidecar_path_uses_partner_dir_mapping_for_smithsonian():

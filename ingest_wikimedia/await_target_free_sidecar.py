@@ -122,11 +122,24 @@ def _normalize_entry(raw: object) -> dict | None:
     expected_sha1 = raw.get("expected_sha1")
     if not isinstance(expected_sha1, str):
         return None
+    # ``tag_emitted`` is the workflow phase marker: True once the
+    # uploader has successfully written the {{Duplicate}} tag on the
+    # canonical file. Entries land with tag_emitted=False (from
+    # add_entry inside _tag_self_and_defer) and flip to True via
+    # mark_tag_emitted() after tag_as_duplicate() returns. Missing on
+    # an entry (an older sidecar shape written before this field
+    # existed) defaults to True — those entries came from a flow that
+    # always tagged before writing the sidecar, so treating them as
+    # fully queued is the correct backwards-compat choice.
+    tag_emitted = raw.get("tag_emitted")
+    if not isinstance(tag_emitted, bool):
+        tag_emitted = True
     return {
         "dpla_id": dpla_id,
         "ordinal": ordinal,
         "tagged_title": tagged_title,
         "community_title": community_title,
+        "tag_emitted": tag_emitted,
         "expected_sha1": expected_sha1,
     }
 
@@ -219,10 +232,45 @@ def has_entry(partner: str, dpla_id: str, ordinal: int) -> bool:
     actioned by a Commons admin) doesn't re-emit the tag or duplicate the
     sidecar entry.
     """
+    return get_entry(partner, dpla_id, ordinal) is not None
+
+
+def get_entry(partner: str, dpla_id: str, ordinal: int) -> dict | None:
+    """Return the sidecar entry for ``(dpla_id, ordinal)`` or ``None``
+    if absent. Callers that need to inspect ``tag_emitted`` (workflow
+    phase) use this instead of :func:`has_entry`; a plain existence
+    check would conflate the "in-progress" and "fully-queued" states.
+    """
     for entry in read_sidecar(partner):
         if entry["dpla_id"] == dpla_id and entry["ordinal"] == ordinal:
-            return True
-    return False
+            return entry
+    return None
+
+
+def mark_tag_emitted(partner: str, dpla_id: str, ordinal: int) -> bool:
+    """Flip the entry's ``tag_emitted`` phase marker to ``True``.
+
+    Called by the uploader after ``tag_as_duplicate`` has successfully
+    written the {{Duplicate}} template on the canonical file — the entry
+    is now durably queued for admin action, and drain-deferred is free
+    to advance it once admin acts.
+
+    Returns True if an entry existed and was updated (or was already
+    True); False if no matching entry was found. Serialized via
+    :func:`_locked_for_write` — safe to call from concurrent uploader
+    Pool workers.
+    """
+    with _locked_for_write(partner):
+        existing = read_sidecar(partner)
+        found = False
+        for entry in existing:
+            if entry["dpla_id"] == dpla_id and entry["ordinal"] == ordinal:
+                entry["tag_emitted"] = True
+                found = True
+                break
+        if found:
+            write_sidecar(partner, existing)
+        return found
 
 
 def add_entry(partner: str, entry: dict) -> list[dict]:

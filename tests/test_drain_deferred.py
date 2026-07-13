@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 from unittest.mock import MagicMock, patch
 
@@ -421,12 +422,17 @@ def test_no_wait_skips_when_host_lock_held():
 
 
 def _await_entry(**overrides) -> dict:
-    """Sidecar entry factory for stage-2 tests."""
+    """Sidecar entry factory for stage-2 tests. Default is the fully
+    queued state (``tag_emitted=True``) — the phase drain is designed
+    to advance from; tests exercising the in-progress phase override
+    to False.
+    """
     base = {
         "dpla_id": "22412cd0",
         "ordinal": 1,
         "tagged_title": "Angus - DPLA - 22412cd0.jpg",
         "community_title": "Angus.jpg",
+        "tag_emitted": True,
         "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
     }
     base.update(overrides)
@@ -621,6 +627,26 @@ def test_advance_fail_when_move_blocked_by_article_exists_conflict():
     relink.assert_not_called()
 
 
+def test_advance_pending_when_tag_emitted_is_false():
+    """Workflow phase gate: an entry recorded by the uploader but whose
+    tag_as_duplicate call never completed carries ``tag_emitted=False``.
+    Drain MUST NOT treat the missing tag as an editor-decline and drop
+    the entry — that would strand community history. Return PENDING so
+    the next uploader run retries the tag and flips the phase.
+    """
+    site = MagicMock()
+    # No page fetches should happen when we short-circuit on the phase gate.
+    with patch("tools.drain_deferred.get_page") as get_page:
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(tag_emitted=False), site
+        )
+    assert should_remove is False
+    assert note is not None and note.startswith("PENDING:")
+    assert "tag_emitted=False" in note
+    # No Commons state was consulted; the gate lives above every fetch.
+    get_page.assert_not_called()
+
+
 def test_advance_fail_when_community_page_is_redirect():
     """An admin (or an editor) redirected the community file during the
     wait window — most likely, redirected it to our tagged canonical.
@@ -740,6 +766,42 @@ def test_patient_mode_loops_stage2_until_sidecar_empty(lock_fd, monkeypatch):
     # bbb was polled twice (once per round); aaa only once.
     assert advance_calls.count("bbb") == 2
     assert advance_calls.count("aaa") == 1
+
+
+def test_run_stage2_once_skips_when_partner_lock_held(override_root):
+    """The partner-scoped stage-2 lock serializes same-partner stage-2
+    rounds. When a foreign holder has it, ``_run_stage2_once`` must
+    non-blocking-skip rather than blocking — the peer round covers our
+    work and we shouldn't wait on it.
+    """
+    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
+    partner_dir = drain_sidecar.partner_dir_path("nara")
+    partner_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = partner_dir / ".stage2-drain.lock"
+    foreign_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(foreign_fd, fcntl.LOCK_EX)
+    try:
+        with patch("tools.drain_deferred._process_await_target_free") as inner:
+            drain_deferred._run_stage2_once("nara", MagicMock())
+        inner.assert_not_called()
+    finally:
+        fcntl.flock(foreign_fd, fcntl.LOCK_UN)
+        os.close(foreign_fd)
+
+
+def test_run_stage2_once_acquires_and_releases_the_partner_lock(override_root):
+    """Sanity check on the fd lifecycle: after ``_run_stage2_once``
+    completes, the partner-scoped lock is released so a peer drain
+    can acquire it — a leaked fd would break same-partner
+    serialization for the whole process lifetime.
+    """
+    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
+    with patch("tools.drain_deferred._process_await_target_free"):
+        drain_deferred._run_stage2_once("nara", MagicMock())
+    # If the lock leaked, a subsequent non-blocking acquire would fail.
+    fd = drain_deferred._acquire_stage2_lock("nara", blocking=False)
+    assert fd is not None, "stage-2 lock leaked across the call boundary"
+    os.close(fd)
 
 
 def test_process_await_target_free_isolates_per_entry_exceptions(override_root, caplog):

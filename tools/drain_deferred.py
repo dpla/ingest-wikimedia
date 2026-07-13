@@ -71,6 +71,17 @@ from ingest_wikimedia.wikimedia import (
 # drains serialize.
 _DRAIN_LOCK_PATH = "/home/ec2-user/ingest-wikimedia/.drain-lock"
 
+# Partner-scoped stage-2 lock file name. Placed under each partner's
+# working directory. Held only for the duration of a single stage-2
+# poll round so multiple partners' stage-2 drains run concurrently
+# (the host-wide lock is released before stage-2 begins). Serializes
+# stage-2 rounds for THE SAME partner against another drain-deferred
+# or a concurrent uploader that races on the same sidecar entry —
+# without this, two rounds could both read an entry with
+# tag_emitted=True, both call ``community_page.move``, and one would
+# race a torn "no such source" error on Commons.
+_STAGE2_LOCK_FILENAME = ".stage2-drain.lock"
+
 
 def _acquire_host_lock(blocking: bool = True):
     """Return a file descriptor holding an exclusive ``flock`` on
@@ -103,6 +114,33 @@ def _acquire_host_lock(blocking: bool = True):
         os.close(fd)
         return None
     logging.info("Drain-phase host lock acquired.")
+    return fd
+
+
+def _acquire_stage2_lock(partner: str, blocking: bool = True):
+    """Acquire the partner-scoped stage-2 ``flock``. Returns a held fd
+    or ``None`` when ``blocking=False`` and another drain holds it.
+
+    Scope is one partner: stage-2 for partner A runs concurrently with
+    stage-2 for partner B (they touch different sidecars and different
+    Commons files). What this lock serializes is same-partner rounds —
+    without it, two drain-deferred processes running stage-2 for the
+    same partner could both read an entry with tag_emitted=True, both
+    call community_page.move, and race on Commons.
+
+    Companion behaviour to :func:`_acquire_host_lock`: created lazily,
+    never deleted, released on fd close (so crashes free it).
+    """
+    partner_dir = drain_sidecar.partner_dir_path(partner)
+    partner_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = partner_dir / _STAGE2_LOCK_FILENAME
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    try:
+        fcntl.flock(fd, flags)
+    except BlockingIOError:
+        os.close(fd)
+        return None
     return fd
 
 
@@ -210,6 +248,20 @@ def _advance_await_target_free_entry(
     tagged_title = entry["tagged_title"]
     community_title = entry["community_title"]
     expected_sha1 = entry["expected_sha1"]
+
+    # Workflow phase gate: an entry with tag_emitted=False was recorded
+    # by the uploader but the corresponding tag_as_duplicate call never
+    # completed. Drain must NOT try to advance it — the canonical file
+    # carries no tag, no admin action is possible, and treating the
+    # absent tag as an editor-decline (the untagged FAIL path below)
+    # would prematurely drop a still-in-progress workflow. Keep the
+    # entry queued; the next uploader run for this partner will retry
+    # the tag and flip the phase to True.
+    if not entry.get("tag_emitted", True):
+        return False, (
+            "PENDING: tag not yet emitted by the uploader "
+            "(tag_emitted=False); leaving queued for the uploader to retry."
+        )
 
     tagged_page = get_page(site, f"File:{tagged_title}")
     exists = tagged_page.exists()
@@ -378,6 +430,64 @@ def _process_await_target_free(partner: str, site: object) -> None:
     )
 
 
+def _run_stage2_once(partner: str, site: object) -> None:
+    """Run one stage-2 round under the partner-scoped stage-2 lock.
+
+    Held only for the duration of the round (not across sleeps), so
+    concurrent drains for OTHER partners are unaffected and same-
+    partner rounds serialize cleanly. Non-blocking: if another drain
+    is mid-round for this partner, skip — its work covers ours.
+    """
+    stage2_fd = _acquire_stage2_lock(partner, blocking=False)
+    if stage2_fd is None:
+        logging.info(
+            "Await-target-free: partner-scoped stage-2 lock held by another "
+            "drain for partner %s; skipping this round.",
+            partner,
+        )
+        return
+    try:
+        _process_await_target_free(partner, site)
+    finally:
+        os.close(stage2_fd)
+
+
+def _run_stage2_patient_loop(
+    partner: str, site: object, throttle: DuplicateCategoryThrottle
+) -> None:
+    """Patient stage-2 wait loop: drain until the sidecar is empty,
+    sleeping ``throttle.poll_secs`` between rounds.
+
+    The partner-scoped lock is acquired PER ROUND and released before
+    sleeping — so a peer drain-deferred can also run stage-2 for this
+    partner during our sleep window, and neither has to wait on the
+    other for a full poll cycle. Entries mid-workflow (tag_emitted=
+    False) are treated as PENDING; the next uploader run flips them
+    to True, and the following round advances them.
+
+    An entry that a Commons admin never actions loops forever — same
+    contract as the category-capacity loop: patient mode is designed
+    to wait days/weeks and the operator ends it via
+    ``tmux kill-session`` if needed (sidecar persists across kills).
+    """
+    while True:
+        pending = await_target_free_sidecar.read_sidecar(partner)
+        if not pending:
+            break
+        _run_stage2_once(partner, site)
+        still_pending = await_target_free_sidecar.read_sidecar(partner)
+        if not still_pending:
+            break
+        logging.info(
+            "Await-target-free: %d entry(ies) still pending for partner "
+            "%s; sleeping %ds before next round.",
+            len(still_pending),
+            partner,
+            int(throttle.poll_secs),
+        )
+        time.sleep(throttle.poll_secs)
+
+
 def _run_one_round(partner: str, pending: list[str]) -> int:
     """Execute one drain round: clear ``pending`` from the sidecar,
     invoke uploader + sdc-sync on those IDs, return how many the
@@ -537,7 +647,15 @@ def main(no_wait: bool, partner: str) -> None:
 
         if no_wait:
             _drain_opportunistic_once(partner, throttle)
-            _process_await_target_free(partner, site)
+            # Release the host lock before stage-2. Stage-2 talks to
+            # partner-local resources only (the await sidecar and this
+            # partner's Commons files); holding the host-wide lock
+            # across it would prevent other partners' drains from
+            # running for minutes. Serialization for same-partner
+            # stage-2 rounds is handled by the partner-scoped lock.
+            os.close(lock_fd)
+            lock_fd = None
+            _run_stage2_once(partner, site)
             return
 
         # Patient mode: Slack-notify start (so the operator knows the
@@ -546,36 +664,15 @@ def main(no_wait: bool, partner: str) -> None:
         initial_category_size = throttle.category_size()
         notify_drain_phase_start(partner, len(initial_ids), initial_category_size)
         total_emitted = _drain_loop(partner, throttle)
-        # Stage-2 handling: poll and advance await-target-free entries.
-        # Runs AFTER the patient category-capacity loop so any Case-2
-        # tag emissions this round produced (via _drain_loop → uploader
-        # re-invocation → self-tag path) can be picked up in the same
-        # invocation instead of having to wait for the next partner
-        # session's drain.
-        #
-        # Patient loop: same "wait for human admin action" semantics as
-        # the category-capacity loop above — sleep ``throttle.poll_secs``
-        # between rounds and drain until the sidecar is empty. An entry
-        # that never gets actioned would loop forever; that's acceptable
-        # because patient mode is explicitly designed to wait days/weeks
-        # on Commons volunteers, and the operator ends it via
-        # ``tmux kill-session`` if needed (sidecar persists across kills).
-        while True:
-            pending = await_target_free_sidecar.read_sidecar(partner)
-            if not pending:
-                break
-            _process_await_target_free(partner, site)
-            still_pending = await_target_free_sidecar.read_sidecar(partner)
-            if not still_pending:
-                break
-            logging.info(
-                "Await-target-free: %d entry(ies) still pending for partner "
-                "%s; sleeping %ds before next round.",
-                len(still_pending),
-                partner,
-                int(throttle.poll_secs),
-            )
-            time.sleep(throttle.poll_secs)
+        # Release the host-wide lock before entering the patient
+        # stage-2 wait loop — holding it across days/weeks of polling
+        # for one partner's Commons-admin action would block every
+        # other partner's patient drain and force opportunistic
+        # passes to skip. Stage-2 uses a partner-scoped lock instead
+        # (per-round, so it doesn't hold across sleep).
+        os.close(lock_fd)
+        lock_fd = None
+        _run_stage2_patient_loop(partner, site, throttle)
         elapsed = time.monotonic() - started_at
         logging.info(
             "Drain-deferred: complete. Emitted %d item(s) over %.0f seconds.",
@@ -584,7 +681,8 @@ def main(no_wait: bool, partner: str) -> None:
         )
         notify_drain_phase_complete(partner, elapsed, total_emitted)
     finally:
-        os.close(lock_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 if __name__ == "__main__":
