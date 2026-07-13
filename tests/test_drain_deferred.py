@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from ingest_wikimedia import drain_sidecar
+from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 from tools import drain_deferred
 
 
@@ -411,3 +411,233 @@ def test_no_wait_skips_when_host_lock_held():
     throttle_ctor.assert_not_called()
     sp.assert_not_called()
     assert drain_sidecar.read_sidecar("nara") == ["id-1"]
+
+
+# ---------------------------------------------------------------------------
+# await-target-free stage-2 handler
+# ---------------------------------------------------------------------------
+
+
+def _await_entry(**overrides) -> dict:
+    """Sidecar entry factory for stage-2 tests."""
+    base = {
+        "dpla_id": "22412cd0",
+        "ordinal": 1,
+        "tagged_title": "Angus - DPLA - 22412cd0.jpg",
+        "community_title": "Angus.jpg",
+        "expected_sha1": "9719e05ab718aac6d400b239792ceeb45a766954",
+    }
+    base.update(overrides)
+    return base
+
+
+def _tagged_page(*, exists=True, is_redirect=False, text="") -> MagicMock:
+    """MagicMock ``pywikibot.FilePage`` for the drift-target (our tagged
+    DPLA-canonical file). Callers customise via kwargs."""
+    p = MagicMock()
+    p.exists.return_value = exists
+    p.isRedirectPage.return_value = is_redirect
+    type(p).text = property(lambda self: text)
+    p.title.return_value = "File:Angus - DPLA - 22412cd0.jpg"
+    return p
+
+
+def _community_page(
+    *, exists=True, sha1="9719e05ab718aac6d400b239792ceeb45a766954"
+) -> MagicMock:
+    """MagicMock for the community file — pre-loaded with a valid sha1."""
+    p = MagicMock()
+    p.exists.return_value = exists
+    p.latest_file_info.sha1 = sha1
+    p.title.return_value = "File:Angus.jpg"
+    return p
+
+
+def test_advance_pending_when_tag_still_present():
+    """State machine: tagged file exists, {{Duplicate}} template still
+    on the page → keep entry queued for the next drain round."""
+    site = MagicMock()
+    tagged = _tagged_page(
+        exists=True,
+        is_redirect=False,
+        text="{{Duplicate|Angus.jpg}}\n== filedesc ==\n",
+    )
+    with patch("tools.drain_deferred.get_page", return_value=tagged):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is False
+    assert note is not None and note.startswith("PENDING:")
+
+
+def test_advance_fail_when_tag_removed_but_page_exists():
+    """An editor decline: tag stripped but page kept. Drop entry and
+    log FAIL — the community-file rename can't proceed against a page
+    the community affirmatively kept."""
+    site = MagicMock()
+    tagged = _tagged_page(
+        exists=True,
+        is_redirect=False,
+        text="== filedesc ==\n{{DPLA metadata}}\n",  # no {{Duplicate}}
+    )
+    with patch("tools.drain_deferred.get_page", return_value=tagged):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is not None and note.startswith("FAIL:")
+    assert "Duplicate" in note
+
+
+def test_advance_executes_move_when_tagged_file_deleted():
+    """Deletion (page no longer exists on Commons) → execute move of
+    community file into the freed canonical title, post the
+    CommonsDelinker relink."""
+    site = MagicMock()
+    tagged = _tagged_page(exists=False, is_redirect=False)
+    community = _community_page(exists=True)
+    with (
+        patch(
+            "tools.drain_deferred.get_page",
+            side_effect=lambda _site, title: (
+                tagged if "22412cd0" in title else community
+            ),
+        ),
+        patch("tools.drain_deferred.file_has_inbound_usage", return_value=True),
+        patch("tools.drain_deferred.post_commonsdelinker_request") as delinker,
+        patch(
+            "tools.drain_deferred.with_csrf_recovery",
+            side_effect=lambda _s, _l, fn: fn(),
+        ),
+        patch(
+            "tools.drain_deferred.build_title_drift_move_reason",
+            return_value="reason",
+        ),
+    ):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is None
+    community.move.assert_called_once()
+    delinker.assert_called_once()
+
+
+def test_advance_executes_move_when_tagged_file_became_redirect():
+    """Redirect (admin merged rather than deleting) is a first-class
+    advance signal — move-onto-a-redirect is a normal pywikibot
+    operation, same as move-into-empty-slot. Per the design, this is
+    NOT an edge case; admins commonly redirect."""
+    site = MagicMock()
+    tagged = _tagged_page(exists=True, is_redirect=True)
+    community = _community_page(exists=True)
+    with (
+        patch(
+            "tools.drain_deferred.get_page",
+            side_effect=lambda _site, title: (
+                tagged if "22412cd0" in title else community
+            ),
+        ),
+        patch("tools.drain_deferred.file_has_inbound_usage", return_value=False),
+        patch("tools.drain_deferred.post_commonsdelinker_request"),
+        patch(
+            "tools.drain_deferred.with_csrf_recovery",
+            side_effect=lambda _s, _l, fn: fn(),
+        ),
+        patch(
+            "tools.drain_deferred.build_title_drift_move_reason",
+            return_value="reason",
+        ),
+    ):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is None
+    community.move.assert_called_once()
+
+
+def test_advance_fail_when_community_file_missing():
+    """Third-party action removed the community file during the wait
+    window — nothing to move. Drop entry with FAIL."""
+    site = MagicMock()
+    tagged = _tagged_page(exists=False)
+    community = _community_page(exists=False)
+    with patch(
+        "tools.drain_deferred.get_page",
+        side_effect=lambda _site, title: tagged if "22412cd0" in title else community,
+    ):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is not None and note.startswith("FAIL:")
+    assert "community file" in note
+
+
+def test_advance_fail_when_community_sha1_drifted():
+    """Content drift on the community side during the wait window —
+    the file no longer holds the S3 SHA1 we saw at tag time. Refuse
+    to move stale bytes into the canonical title."""
+    site = MagicMock()
+    tagged = _tagged_page(exists=False)
+    community = _community_page(
+        exists=True, sha1="ffffffffffffffffffffffffffffffffffffffff"
+    )
+    with patch(
+        "tools.drain_deferred.get_page",
+        side_effect=lambda _site, title: tagged if "22412cd0" in title else community,
+    ):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is not None and note.startswith("FAIL:")
+    assert "SHA1 drifted" in note
+
+
+def test_process_await_target_free_advances_and_removes(override_root):
+    """End-to-end: an entry that advances is removed from the sidecar."""
+    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
+    with patch(
+        "tools.drain_deferred._advance_await_target_free_entry",
+        return_value=(True, None),
+    ):
+        drain_deferred._process_await_target_free("nara", MagicMock())
+    assert await_target_free_sidecar.read_sidecar("nara") == []
+
+
+def test_process_await_target_free_keeps_pending_entries(override_root):
+    """Entry that returns PENDING stays queued for the next drain round."""
+    await_target_free_sidecar.write_sidecar("nara", [_await_entry()])
+    with patch(
+        "tools.drain_deferred._advance_await_target_free_entry",
+        return_value=(False, "PENDING: tagged file still present"),
+    ):
+        drain_deferred._process_await_target_free("nara", MagicMock())
+    assert len(await_target_free_sidecar.read_sidecar("nara")) == 1
+
+
+def test_process_await_target_free_isolates_per_entry_exceptions(override_root, caplog):
+    """A single entry that raises must NOT stop the loop from
+    processing the others — same isolation contract as ``_run_one_round``.
+    The failing entry stays queued."""
+    entries = [_await_entry(dpla_id="bbb"), _await_entry(dpla_id="ccc")]
+    await_target_free_sidecar.write_sidecar("nara", entries)
+
+    def side_effect(entry, _site):
+        if entry["dpla_id"] == "bbb":
+            raise RuntimeError("boom")
+        return (True, None)  # ccc advances cleanly
+
+    with patch(
+        "tools.drain_deferred._advance_await_target_free_entry",
+        side_effect=side_effect,
+    ):
+        drain_deferred._process_await_target_free("nara", MagicMock())
+
+    remaining_ids = [
+        e["dpla_id"] for e in await_target_free_sidecar.read_sidecar("nara")
+    ]
+    # bbb stayed (raised); ccc removed (advanced).
+    assert remaining_ids == ["bbb"]

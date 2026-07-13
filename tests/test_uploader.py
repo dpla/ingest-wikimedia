@@ -812,6 +812,83 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
     assert action == "upload_and_tag"
 
 
+def test_resolve_hash_drift_case2_defers_when_target_is_community_authored():
+    """New Case-2 sub-classification: when the drift target's FIRST
+    upload was by a real editor (not a DPLA-adjacent bot), return
+    UPLOAD_AND_SELF_TAG_DEFER instead of tagging the community file
+    for admin deletion. Guards against the Bartlett incident."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Angus F. Bartlett.jpg"  # no DPLA- suffix → community-titled
+    intended_title = "Angus F. Bartlett - DPLA - abc.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    # Force first_uploader to report a real editor.
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="Fæ"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_self_tag_defer"
+
+
+def test_resolve_hash_drift_case2_stays_upload_and_tag_when_target_is_dpla_bot_upload():
+    """A stranded DPLA-bot upload (e.g. pre-normalization title) has a
+    DPLA-adjacent bot as its first uploader — must stay on the legacy
+    UPLOAD_AND_TAG path, not divert to the community-defer flow. Same
+    fixture as the community test, only the first_uploader mock flips."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Some Old Title.jpg"  # no DPLA suffix, but bot-authored
+    intended_title = "Some Old Title - DPLA - abc.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_tag"
+
+
+def test_resolve_hash_drift_case2_stays_upload_and_tag_when_first_uploader_unknown():
+    """When first_uploader can't identify the original uploader (API
+    failure, empty history), default to the conservative UPLOAD_AND_TAG
+    path — same as the pre-fix behaviour. Ensures the new subclass
+    check doesn't regress into a silent no-op when first_uploader is
+    None."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Some File.jpg"
+    intended_title = "Some File - DPLA - abc.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value=None),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_tag"
+
+
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":
     """Like ``_build_uploader_with_dpla`` but DPLA API raises ``exc`` on
     every ``get_item_metadata`` call. Used to exercise the "colliding

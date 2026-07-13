@@ -1581,6 +1581,73 @@ def test_tag_as_duplicate_escapes_equals_in_reason():
     assert "?id=42" not in rendered.replace("?id{{=}}42", "")
 
 
+def test_tag_as_duplicate_without_reason_emits_single_arg_form():
+    """Passing an empty reason drops the second positional param, so the
+    Duplicate template's own default text speaks — the previous
+    caller-supplied reason ("Other file has the correct title.") was
+    largely duplicative of what the template already says."""
+    from ingest_wikimedia.wikimedia import tag_as_duplicate
+
+    site = MagicMock()
+    file_page = MagicMock()
+    type(file_page).text = property(lambda self: "")
+    file_page.title.return_value = "Stranded.jpg"
+
+    tag_as_duplicate(site, file_page, correct_filename="Correct.jpg")
+
+    rendered = site.editpage.call_args.kwargs["prependtext"]
+    assert rendered.startswith("{{Duplicate|Correct.jpg}}"), rendered
+    # And critically: no trailing empty-reason pipe.
+    assert "{{Duplicate|Correct.jpg|}}" not in rendered
+
+
+def test_first_uploader_returns_original_uploader_from_oldest_revision():
+    """The first-uploader check must look at the ORIGINAL upload, not
+    the most recent one — otherwise a DPLA-bot re-upload on top of a
+    community-authored file would misclassify the community file as
+    bot-owned. Uses ``iidir=newer`` + ``iilimit=1`` to fetch the oldest
+    file-history entry."""
+    from ingest_wikimedia.wikimedia import first_uploader
+
+    site = MagicMock()
+    file_page = MagicMock()
+    file_page.title.return_value = "File:Angus F. Bartlett.jpg"
+    fake_request = MagicMock()
+    fake_request.submit.return_value = {
+        "query": {
+            "pages": {
+                "61693477": {
+                    "imageinfo": [{"user": "Fæ"}],
+                }
+            }
+        }
+    }
+    site.simple_request.return_value = fake_request
+
+    assert first_uploader(site, file_page) == "Fæ"
+    # Confirm we queried the OLDEST revision, not the most recent one.
+    _, kwargs = site.simple_request.call_args
+    assert kwargs.get("iidir") == "newer", (
+        f"first_uploader must fetch the oldest history entry via iidir=newer; "
+        f"got kwargs={kwargs!r}"
+    )
+    assert kwargs.get("iilimit") == 1
+
+
+def test_first_uploader_none_when_no_history():
+    """API returned no ``imageinfo`` entries → ``None`` (no first
+    uploader identifiable). Caller falls back to the safe path."""
+    from ingest_wikimedia.wikimedia import first_uploader
+
+    site = MagicMock()
+    file_page = MagicMock()
+    file_page.title.return_value = "File:Missing.jpg"
+    fake_request = MagicMock()
+    fake_request.submit.return_value = {"query": {"pages": {"0": {}}}}
+    site.simple_request.return_value = fake_request
+    assert first_uploader(site, file_page) is None
+
+
 def test_post_commonsdelinker_request_escapes_equals_in_filenames():
     """Same `=` escape contract applies to the
     ``{{universal replace|<old>|<new>|reason=...}}`` template that
