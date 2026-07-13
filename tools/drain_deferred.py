@@ -46,6 +46,7 @@ import time
 from pathlib import Path
 
 import click
+import pywikibot
 
 from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 from ingest_wikimedia.csrf import with_csrf_recovery
@@ -259,16 +260,31 @@ def _advance_await_target_free_entry(
         community_title,
         tagged_title,
     )
-    with_csrf_recovery(
-        site,
-        f"move {community_page.title()} → {intended_page.title()}",
-        lambda: community_page.move(
-            intended_page.title(),
-            reason=reason,
-            movetalk=False,
-            noredirect=False,
-        ),
-    )
+    try:
+        with_csrf_recovery(
+            site,
+            f"move {community_page.title()} → {intended_page.title()}",
+            lambda: community_page.move(
+                intended_page.title(),
+                reason=reason,
+                movetalk=False,
+                noredirect=False,
+            ),
+        )
+    except pywikibot.exceptions.ArticleExistsConflictError as ex:
+        # A stale redirect or page history at the tagged title blocks
+        # the move. The invariant is still satisfied — either the
+        # redirect resolves to the community file (which holds the S3
+        # SHA1) or admin left content we cannot displace. Retrying every
+        # poll would spam the API with a call that cannot succeed, so
+        # treat this as a decisive FAIL: drop the sidecar entry and let
+        # the community file remain at its original title.
+        return True, (
+            f"FAIL: move to canonical title blocked by "
+            f"ArticleExistsConflictError ({ex}) — community file left "
+            f"in place; invariant already satisfied via the tagged "
+            f"title's current state."
+        )
     if needs_relink:
         post_commonsdelinker_request(
             site, community_title, tagged_title, check_usage=False

@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+import pywikibot
+
 from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 from tools import drain_deferred
 
@@ -573,6 +575,46 @@ def test_advance_fail_when_community_file_missing():
     assert should_remove is True
     assert note is not None and note.startswith("FAIL:")
     assert "community file" in note
+
+
+def test_advance_fail_when_move_blocked_by_article_exists_conflict():
+    """A stale redirect or page history at the tagged title makes the
+    move raise ``ArticleExistsConflictError``. The invariant is already
+    satisfied via the tagged title's current state, and retrying every
+    poll would spam the API. Drop the entry with a decisive FAIL."""
+    site = MagicMock()
+    tagged = _tagged_page(exists=True, is_redirect=True)
+    community = _community_page(exists=True)
+
+    def raise_conflict(_title, **_kwargs):
+        raise pywikibot.exceptions.ArticleExistsConflictError("blocked")
+
+    community.move.side_effect = raise_conflict
+    with (
+        patch(
+            "tools.drain_deferred.get_page",
+            side_effect=lambda _site, title: (
+                tagged if "22412cd0" in title else community
+            ),
+        ),
+        patch("tools.drain_deferred.file_has_inbound_usage", return_value=False),
+        patch("tools.drain_deferred.post_commonsdelinker_request") as relink,
+        patch(
+            "tools.drain_deferred.with_csrf_recovery",
+            side_effect=lambda _s, _l, fn: fn(),
+        ),
+        patch(
+            "tools.drain_deferred.build_title_drift_move_reason",
+            return_value="reason",
+        ),
+    ):
+        should_remove, note = drain_deferred._advance_await_target_free_entry(
+            _await_entry(), site
+        )
+    assert should_remove is True
+    assert note is not None and note.startswith("FAIL:")
+    assert "ArticleExistsConflictError" in note
+    relink.assert_not_called()
 
 
 def test_advance_fail_when_community_sha1_drifted():
