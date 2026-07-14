@@ -1,38 +1,49 @@
-"""Drain the per-partner deferred-drain sidecar.
+"""Drain the per-partner deferred queues by re-running the uploader.
 
-The uploader defers Case-2 hash-drift upload+tag operations as an
-atomic unit whenever ``Category:Duplicate`` on Commons is at capacity,
-persisting the deferred DPLA IDs to a per-partner sidecar (see
-``ingest_wikimedia.drain_sidecar``). The drain-deferred command comes
-in two modes:
+Two independent queues, both per-partner, both drained by the same
+mechanism — **re-invoke the idempotent uploader (and sdc-sync) on the
+queued DPLA IDs until the queue empties.** The uploader re-derives all
+state from live S3 / Commons on each run, so the drain holds no per-item
+logic of its own.
 
-  * **Patient (default)** — the terminal phase of a batch. Acquires a
-    host-level ``flock`` and loops until the sidecar is empty,
-    polling ``Category:Duplicate`` (every ``DEFAULT_POLL_SECS`` = 5
-    min by default) with no time budget — designed to wait days or
-    weeks on human-admin category clearing. Emits Slack
-    start/complete notifications so the operator knows the session
-    is in this state.
+  * **Category-capacity queue** (``ingest_wikimedia.drain_sidecar``) —
+    Case-2 hash-drift upload+tag operations the uploader deferred
+    because ``Category:Duplicate`` was at capacity. Drained only while
+    the category is below its resume threshold (the throttle gate).
 
-  * **``--no-wait`` (opportunistic)** — the interstitial phase
-    embedded in each target's upload chain. Runs a single best-effort
-    round: if ``Category:Duplicate`` is currently below the
-    throttle's resume threshold, drain what fits and return; if it's
-    at capacity, exit immediately without waiting. Never blocks
-    subsequent targets in the batch. No Slack notifications — this
-    pass is a bonus, not a milestone. Items that don't clear here
-    stay in the sidecar for the batch's final patient drain.
+  * **Await-target-free set** (``ingest_wikimedia.await_target_free_sidecar``)
+    — Case-2 community-target items where we uploaded our bytes to the
+    DPLA-canonical title and self-tagged ``{{Duplicate|<community>}}``,
+    now waiting on a Commons admin to delete or redirect our tagged
+    file. A re-run of the uploader resolves whatever the admin did:
+    once the canonical title is freed, the empty-canonical Case-3
+    title-drift move promotes the community file into it (history
+    intact); if the admin removed the tag instead (declining), the
+    uploader drops the key and the two files coexist. No capacity gate
+    — an awaiting re-run emits no new tag, so category size is
+    irrelevant to it.
 
-Cancellation is operator-driven — ``tmux kill-session`` at any time.
-The sidecar persists across kills, so a subsequent partner run picks
-up wherever this left off.
+The command has two modes:
 
-See the launcher (``scripts/wikimedia_launch.py``) for the chain
-ordering: per-target opportunistic drains run inside each target's
-chain (so a partner whose Category:Duplicate happened to clear
-mid-run gets its deferrals actioned before the next partner starts),
-and a per-partner patient drain runs at the end of the whole batch
-(so no partner sits idle waiting on Commons volunteers).
+  * **Patient (default)** — the terminal phase of a batch. Drains the
+    category queue (waiting on ``Category:Duplicate`` with no time
+    budget) then the await set (waiting on Commons admins), looping for
+    as long as it takes. Emits Slack start/complete notifications.
+
+  * **``--no-wait`` (opportunistic)** — the interstitial phase in each
+    target's chain. One best-effort round of each queue; never blocks.
+
+Concurrency: uploader/sdc-sync invocations across the box are serialized
+by a host-level ``flock`` (``_DRAIN_LOCK_PATH``). The **await** queue
+acquires it per round and releases it before each patient sleep, so one
+partner's multi-day admin wait never blocks another's await drain. The
+**category** queue holds it across its ``wait_for_capacity`` wait — a
+pre-existing behavior: the category drain blocks on Category:Duplicate
+while holding the lock. (Scoping the category lock per round, and
+interleaving the two queues so await progresses while category is
+capacity-blocked, is a worthwhile follow-up but out of scope here.)
+Cancellation is operator-driven (``tmux kill-session``); both queues
+persist across kills.
 """
 
 from __future__ import annotations
@@ -47,7 +58,7 @@ from pathlib import Path
 
 import click
 
-from ingest_wikimedia import drain_sidecar
+from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 from ingest_wikimedia.dup_throttle import DuplicateCategoryThrottle
 from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.slack import (
@@ -56,10 +67,11 @@ from ingest_wikimedia.slack import (
 )
 from ingest_wikimedia.wikimedia import get_site
 
-# Host-level lock file. One drain-deferred process at a time across the
-# shared EC2 instance — see module docstring for the concurrency
-# rationale. Path is host-scoped (not partner-scoped) so cross-partner
-# drains serialize.
+# Host-level lock file. One uploader-heavy drain round at a time across
+# the shared EC2 instance, so concurrent rounds don't oversubscribe
+# Commons. Path is host-scoped (not partner-scoped) so cross-partner
+# drains serialize. Held only for the duration of a round — never across
+# a patient wait.
 _DRAIN_LOCK_PATH = "/home/ec2-user/ingest-wikimedia/.drain-lock"
 
 
@@ -72,13 +84,11 @@ def _acquire_host_lock(blocking: bool = True):
     crashed drain doesn't leave a stuck lock. The lock file itself is
     created (empty) if missing; it never grows.
 
-    ``blocking=True`` (patient/terminal drain) waits until the lock frees —
-    it legitimately holds the lock for hours while a human clears
-    ``Category:Duplicate``. ``blocking=False`` (opportunistic ``--no-wait``
-    pass) tries once (``LOCK_NB``) and returns ``None`` if the lock is held:
-    the opportunistic pass is a fire-and-forget interstitial round and must
-    NOT block its target's chain behind a long-running patient drain (that
-    was keeping finished sessions open for hours — see the drain-lock bug).
+    ``blocking=True`` (patient drain) waits until the lock frees.
+    ``blocking=False`` (opportunistic ``--no-wait`` pass) tries once
+    (``LOCK_NB``) and returns ``None`` if held: the opportunistic pass is
+    fire-and-forget and must never block its target's chain behind
+    another drain.
     """
     Path(_DRAIN_LOCK_PATH).parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(_DRAIN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
@@ -172,9 +182,14 @@ def _run_deferred_items(partner: str, dpla_ids: list[str]) -> None:
             )
 
 
+# --------------------------------------------------------------------------
+# Category-capacity queue (drain_sidecar)
+# --------------------------------------------------------------------------
+
+
 def _run_one_round(partner: str, pending: list[str]) -> int:
-    """Execute one drain round: clear ``pending`` from the sidecar,
-    invoke uploader + sdc-sync on those IDs, return how many the
+    """Execute one category-queue round: clear ``pending`` from the
+    sidecar, invoke uploader + sdc-sync on those IDs, return how many the
     round emitted (``pre - post``).
 
     Taking the round's IDs out BEFORE the subprocess is load-bearing
@@ -194,11 +209,10 @@ def _run_one_round(partner: str, pending: list[str]) -> int:
 
 
 def _drain_loop(partner: str, throttle: DuplicateCategoryThrottle) -> int:
-    """Patient drain loop for ``partner``. Blocks on
+    """Patient category-queue loop for ``partner``. Blocks on
     :meth:`DuplicateCategoryThrottle.wait_for_capacity` between rounds;
-    returns the total number of items emitted (drained from the
-    sidecar) once it's empty. See module docstring for the rationale
-    on the unbounded wait."""
+    returns the total number of items emitted once the sidecar is empty.
+    Caller holds the host lock for the duration."""
     total_emitted = 0
     while True:
         pending = drain_sidecar.read_sidecar(partner)
@@ -223,10 +237,10 @@ def _drain_loop(partner: str, throttle: DuplicateCategoryThrottle) -> int:
             )
         else:
             # A round that made no progress despite reported capacity is
-            # not fatal here (unlike the old bounded drain that would
-            # abort). Category:Duplicate may have refilled while we were
-            # processing, or the round hit unrelated per-item failures.
-            # Loop back to wait_for_capacity; next round will re-observe.
+            # not fatal. Category:Duplicate may have refilled while we
+            # were processing, or the round hit unrelated per-item
+            # failures. Loop back to wait_for_capacity; next round
+            # re-observes.
             logging.warning(
                 "Drain-deferred: round made no progress (%d item(s) still "
                 "pending). Continuing to wait; category may have refilled.",
@@ -235,20 +249,10 @@ def _drain_loop(partner: str, throttle: DuplicateCategoryThrottle) -> int:
 
 
 def _drain_opportunistic_once(partner: str, throttle: DuplicateCategoryThrottle) -> int:
-    """Single best-effort drain round for ``partner``. If
-    ``Category:Duplicate`` is below the resume threshold RIGHT NOW,
-    drain what's queued; if it's at capacity, exit immediately without
-    waiting. Never blocks the caller.
-
-    Returns the number of items drained (0 if the round didn't fire,
-    positive if it did).
-
-    The opportunistic pass exists so a partner whose category clears
-    mid-batch (a Commons volunteer processes some entries between the
-    partner's upload phase and end-of-batch) gets its deferrals
-    actioned as part of its own chain — before the next target starts
-    — rather than waiting on the batch's terminal patient drain.
-    """
+    """Single best-effort category-queue round for ``partner``. If
+    ``Category:Duplicate`` is below the resume threshold RIGHT NOW, drain
+    what's queued; if it's at capacity, exit immediately. Never blocks.
+    Returns the number of items drained (0 if the round didn't fire)."""
     pending = drain_sidecar.read_sidecar(partner)
     if not pending:
         return 0
@@ -268,80 +272,188 @@ def _drain_opportunistic_once(partner: str, throttle: DuplicateCategoryThrottle)
     return emitted
 
 
+# --------------------------------------------------------------------------
+# Await-target-free set
+# --------------------------------------------------------------------------
+#
+# Draining this set is *exactly* the category-queue pattern — re-run the
+# idempotent uploader on the queued DPLA IDs — with two differences:
+#   * no Category:Duplicate capacity gate (an awaiting re-run emits no
+#     new tag; it only moves the community file into a freed canonical
+#     title, skips while still waiting, or drops a declined key), and
+#   * the uploader OWNS the set (it adds/removes keys as it resolves each
+#     ordinal), so the drain never removes-before-run; it just re-runs
+#     and re-reads until the set empties.
+
+
+def _run_await_round(partner: str, blocking: bool) -> bool:
+    """Run one await round: re-invoke the uploader + sdc-sync on the
+    DPLA IDs with at least one awaiting ordinal, under the host lock.
+
+    Returns ``True`` if the round ran, ``False`` if the set was empty or
+    (opportunistic) the host lock was held by another drain. The host
+    lock is acquired only for the round and released before returning, so
+    a patient await wait never holds it across sleeps.
+    """
+    ids = await_target_free_sidecar.awaiting_dpla_ids(partner)
+    if not ids:
+        return False
+    lock_fd = _acquire_host_lock(blocking=blocking)
+    if lock_fd is None:
+        logging.info(
+            "Await drain (opportunistic): host lock held by another drain; "
+            "skipping — %d item(s) remain awaiting for the terminal drain.",
+            len(ids),
+        )
+        return False
+    try:
+        logging.info(
+            "Await drain: re-running uploader on %d awaiting item(s) for %s.",
+            len(ids),
+            partner,
+        )
+        _run_deferred_items(partner, ids)
+    finally:
+        os.close(lock_fd)
+    return True
+
+
+def _drain_await_patient(partner: str, throttle: DuplicateCategoryThrottle) -> None:
+    """Patient await-target-free loop: re-run the uploader on awaiting
+    items until the set empties, sleeping ``throttle.poll_secs`` between
+    rounds while items remain (they're waiting on a Commons admin).
+
+    Terminates only when the set is empty — the uploader clears each key
+    as it resolves (admin deletion → Case-3 move; admin de-tag → key
+    dropped). A key whose admin never acts keeps the loop alive by
+    design (same unbounded-patience contract as the category loop);
+    the operator ends it via ``tmux kill-session`` (the set persists).
+    """
+    while True:
+        if not await_target_free_sidecar.awaiting_dpla_ids(partner):
+            return
+        _run_await_round(partner, blocking=True)
+        remaining = await_target_free_sidecar.awaiting_dpla_ids(partner)
+        if not remaining:
+            return
+        logging.info(
+            "Await drain: %d item(s) for %s still awaiting Commons admin "
+            "action; sleeping %ds before the next round.",
+            len(remaining),
+            partner,
+            int(throttle.poll_secs),
+        )
+        time.sleep(throttle.poll_secs)
+
+
 @click.command()
 @click.option(
     "--no-wait",
     is_flag=True,
     help=(
-        "Best-effort single-round drain: if Category:Duplicate is at capacity, "
-        "exit immediately rather than waiting. For the per-target opportunistic "
-        "phase; the batch's terminal patient drain runs without this flag."
+        "Best-effort single round of each queue: if Category:Duplicate is at "
+        "capacity (or the host lock is held) skip rather than waiting. For the "
+        "per-target opportunistic phase; the batch's terminal drain runs "
+        "without this flag."
     ),
 )
 @click.argument("partner")
 def main(no_wait: bool, partner: str) -> None:
-    """Drain the deferred-drain sidecar for ``partner``. See module docstring."""
+    """Drain the deferred queues for ``partner``. See module docstring."""
     event_type = "drain-deferred-opportunistic" if no_wait else "drain-deferred"
     setup_logging(partner, event_type, logging.INFO)
 
     initial_ids = drain_sidecar.read_sidecar(partner)
-    if not initial_ids:
+    initial_await = await_target_free_sidecar.awaiting_dpla_ids(partner)
+    if not initial_ids and not initial_await:
         logging.info(
-            "Drain-deferred: sidecar for partner %s is empty (or missing); nothing to do.",
+            "Drain-deferred: both queues for partner %s are empty (or missing); "
+            "nothing to do.",
             partner,
         )
         return
 
     mode_label = "opportunistic" if no_wait else "patient"
     logging.info(
-        "Drain-deferred: sidecar for partner %s has %d item(s) queued; "
-        "acquiring host lock (mode: %s).",
+        "Drain-deferred: partner %s has %d category-capacity item(s) and %d "
+        "await-target-free item(s) queued (mode: %s).",
         partner,
         len(initial_ids),
+        len(initial_await),
         mode_label,
     )
 
-    # Advisory host-level lock. The patient (terminal) drain BLOCKS until
-    # it's free (it can hold the lock for hours/days while a human clears
-    # Category:Duplicate). The opportunistic (--no-wait) pass acquires
-    # NON-BLOCKING and skips if another drain holds it — it must never block
-    # its target's chain behind a patient drain. The ``finally`` below closes
-    # the fd (releasing the flock) on normal exit or exception; a kill
-    # releases it on process exit.
-    lock_fd = _acquire_host_lock(blocking=not no_wait)
-    if lock_fd is None:
-        logging.info(
-            "Drain-deferred (opportunistic): host lock held by another drain; "
-            "skipping this pass — %d item(s) remain queued for the terminal drain.",
-            len(initial_ids),
-        )
+    # ``get_site()`` also runs ``site.login()``; the throttle requires a
+    # non-None site (see :class:`DuplicateCategoryThrottle` guard).
+    site = get_site()
+    throttle = DuplicateCategoryThrottle(site)
+
+    if no_wait:
+        # One best-effort round of each queue, each acquiring the host
+        # lock non-blocking (skip if a peer holds it). The two queues are
+        # independent: a held lock or a full category doesn't stop the
+        # await round from being attempted.
+        if initial_ids:
+            lock_fd = _acquire_host_lock(blocking=False)
+            if lock_fd is None:
+                logging.info(
+                    "Drain-deferred (opportunistic): host lock held; skipping "
+                    "the category round — %d item(s) remain for the terminal "
+                    "drain.",
+                    len(initial_ids),
+                )
+            else:
+                try:
+                    _drain_opportunistic_once(partner, throttle)
+                finally:
+                    os.close(lock_fd)
+        _run_await_round(partner, blocking=False)
         return
-    try:
-        started_at = time.monotonic()
-        # ``get_site()`` — same helper the uploader/retirer/fix-categories
-        # tools use; also runs ``site.login()``. The throttle requires a
-        # non-None site (see :class:`DuplicateCategoryThrottle` guard).
-        throttle = DuplicateCategoryThrottle(get_site())
 
-        if no_wait:
-            _drain_opportunistic_once(partner, throttle)
-            return
+    # Patient mode. Slack-notify start only when there's category work to
+    # announce (the start ping carries the category size / deferred
+    # count). Each phase acquires the host lock only while a round runs.
+    started_at = time.monotonic()
+    notified_start = False
+    total_emitted = 0
+    if initial_ids:
+        lock_fd = _acquire_host_lock(blocking=True)
+        try:
+            notify_drain_phase_start(
+                partner, len(initial_ids), throttle.category_size()
+            )
+            notified_start = True
+            total_emitted = _drain_loop(partner, throttle)
+        finally:
+            os.close(lock_fd)
 
-        # Patient mode: Slack-notify start (so the operator knows the
-        # session is waiting on human-admin category clearing), loop
-        # until empty, Slack-notify complete.
-        initial_category_size = throttle.category_size()
-        notify_drain_phase_start(partner, len(initial_ids), initial_category_size)
-        total_emitted = _drain_loop(partner, throttle)
-        elapsed = time.monotonic() - started_at
+    _drain_await_patient(partner, throttle)
+
+    # Only claim completion when BOTH queues are actually empty. The await
+    # loop returns only when its set is empty, but the category sidecar
+    # could have been re-populated by a concurrent session; check both.
+    remaining_ids = drain_sidecar.read_sidecar(partner)
+    remaining_await = await_target_free_sidecar.awaiting_dpla_ids(partner)
+    elapsed = time.monotonic() - started_at
+    if remaining_ids or remaining_await:
+        logging.warning(
+            "Drain-deferred: finished this pass with %d category + %d await "
+            "item(s) still queued for partner %s; NOT signalling completion.",
+            len(remaining_ids),
+            len(remaining_await),
+            partner,
+        )
+    elif notified_start:
         logging.info(
             "Drain-deferred: complete. Emitted %d item(s) over %.0f seconds.",
             total_emitted,
             elapsed,
         )
         notify_drain_phase_complete(partner, elapsed, total_emitted)
-    finally:
-        os.close(lock_fd)
+    else:
+        logging.info(
+            "Drain-deferred: await-only drain complete for partner %s.", partner
+        )
 
 
 if __name__ == "__main__":

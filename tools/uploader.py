@@ -96,6 +96,7 @@ from ingest_wikimedia.slack import (
 )
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
+    DUPLICATE_TAG_RE,
     IGNORE_WIKIMEDIA_WARNINGS,
     MIME_UNKNOWN_EXT,
     build_title_drift_move_reason,
@@ -106,6 +107,7 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
+    first_uploader,
     is_same_item_redirect_relic,
     tag_as_duplicate,
     check_content_type,
@@ -122,8 +124,19 @@ from ingest_wikimedia.wikimedia import (
     post_commonsdelinker_request,
 )
 from ingest_wikimedia.legacy_artwork import (
+    DPLA_BOT_ACCOUNTS,
+    _normalize_account,
     import_cross_page_community_sdc,
     rescue_wikitext,
+)
+from ingest_wikimedia import await_target_free_sidecar
+
+# Pre-normalized set of DPLA-adjacent bot usernames, used by the Case-2
+# sub-classification in ``_resolve_hash_drift`` (community vs. stranded-bot
+# authorship of the drift target). Pre-computed at module load so the
+# per-item check is a single set-membership test.
+_NORMALIZED_DPLA_BOTS: frozenset[str] = frozenset(
+    _normalize_account(name) for name in DPLA_BOT_ACCOUNTS
 )
 
 MAX_UPLOAD_RETRIES = 3
@@ -261,6 +274,7 @@ class DriftResolution(str, Enum):
 
     MOVED = "moved"
     UPLOAD_AND_TAG = "upload_and_tag"
+    UPLOAD_AND_SELF_TAG_DEFER = "upload_and_self_tag_defer"
     LEAVE_OTHERS_ALONE = "leave_others_alone"
     ALREADY_CORRECT = "already_correct"
 
@@ -782,6 +796,27 @@ class Uploader:
             )
             if existing_file is not None:
                 if existing_file.title(with_ns=False) == page_title:
+                    # Our bytes are already at the canonical title. If this
+                    # ordinal is in the await-target-free set (we self-tagged
+                    # it on a prior run and are waiting on a Commons admin),
+                    # reconcile the set against live state before skipping:
+                    #   * canonical still carries {{Duplicate}} → admin
+                    #     hasn't acted; keep it queued for the drain.
+                    #   * tag gone (admin removed it — declined the dedup —
+                    #     without deleting the file) → drop it; the two
+                    #     files coexist (corollary 1), nothing more to do.
+                    # A deleted/redirected canonical never reaches here (the
+                    # file no longer exists at page_title), so it is resolved
+                    # by the empty-canonical Case-3 move on this same re-run.
+                    if not dry_run and await_target_free_sidecar.has_key(
+                        partner, dpla_id, ordinal
+                    ):
+                        self._reconcile_awaiting_skip(
+                            partner=partner,
+                            existing_file=existing_file,
+                            dpla_id=dpla_id,
+                            ordinal=ordinal,
+                        )
                     logging.info(
                         f"Skipping {dpla_id} {ordinal}: Already exists on commons."
                     )
@@ -800,6 +835,13 @@ class Uploader:
                 # Resolve hash drift before downloading — Case 3 (simple move)
                 # needs no file download, so detecting it first avoids wasted I/O.
                 drift_old_filename: str | None = None
+                # Community-target Case 2 (see UPLOAD_AND_SELF_TAG_DEFER
+                # dispatch below): title of the community-authored file that
+                # currently holds our S3 SHA1. The post-upload block reads
+                # this to decide whether to tag OUR uploaded file rather than
+                # tagging the community file — the ``drift_old_filename`` /
+                # ``self_tag_community_title`` variables are mutually exclusive.
+                self_tag_community_title: str | None = None
                 drift_action: str | None = None
                 force_ignore_warnings = False
                 if existing_file is not None:
@@ -842,6 +884,15 @@ class Uploader:
                         )
                         if drift_action == DriftResolution.MOVED:
                             self.tracker.increment(Result.UPLOADED)
+                            # A move into an empty/redirect canonical title
+                            # is exactly how an awaiting Case-2 item resolves
+                            # once a Commons admin frees the tagged title: the
+                            # community file gets promoted here. Drop it from
+                            # the await set (no-op for ordinary title-drift
+                            # moves that were never awaiting).
+                            await_target_free_sidecar.remove_key(
+                                partner, dpla_id, ordinal
+                            )
                             # After a successful move the same file page lives
                             # at page_title; existing_file.pageid is preserved
                             # by MediaWiki across moves so we can stamp it here.
@@ -905,6 +956,51 @@ class Uploader:
                                     "pageid": None,
                                 }
                             drift_old_filename = existing_file.title(with_ns=False)
+                            force_ignore_warnings = True
+                        elif drift_action == DriftResolution.UPLOAD_AND_SELF_TAG_DEFER:
+                            # Community upload lives at the drift target title
+                            # (its first uploader is a real editor, not a
+                            # DPLA-adjacent bot). Upload our S3 bytes to the
+                            # DPLA-canonical title, tag OUR fresh file as
+                            # ``{{Duplicate|<community title>}}``, and record
+                            # the (dpla_id, ordinal) in the await-target-free
+                            # set. Once a Commons admin acts on our tagged
+                            # file, the DPLA-canonical title is freed and a
+                            # plain uploader re-run resolves it through the
+                            # normal title-drift machinery (empty canonical →
+                            # Case-3 move of the community file into the freed
+                            # title, history intact).
+                            #
+                            # No idempotency check is needed here: a re-run
+                            # while we're still waiting finds our bytes already
+                            # at page_title and short-circuits at the
+                            # "Already exists on commons" skip far above, never
+                            # reaching this branch. So this path only runs the
+                            # first time, when the canonical is still occupied
+                            # by the other file's content. Same Category:
+                            # Duplicate capacity gate as UPLOAD_AND_TAG — the
+                            # tag lands in that category, so don't add to it
+                            # when saturated; the category drain retries.
+                            if (
+                                self.dup_throttle is not None
+                                and not self.dup_throttle.try_acquire()
+                            ):
+                                logging.info(
+                                    f"Deferring {dpla_id} {ordinal}: "
+                                    f"Category:Duplicate at capacity; will retry "
+                                    f"upload + self-tag-defer in the drain pass."
+                                )
+                                self.tracker.increment(
+                                    Result.UPLOAD_DEFERRED_DUP_CATEGORY
+                                )
+                                return {
+                                    "status": ORDINAL_DEFERRED,
+                                    "title": page_title,
+                                    "pageid": None,
+                                }
+                            self_tag_community_title = existing_file.title(
+                                with_ns=False
+                            )
                             force_ignore_warnings = True
                         else:  # "leave_others_alone"
                             force_ignore_warnings = True
@@ -1265,6 +1361,14 @@ class Uploader:
                         item_metadata=item_metadata,
                         provider=provider,
                         data_provider=data_provider,
+                    )
+                elif self_tag_community_title:
+                    self._tag_self_and_defer(
+                        partner=partner,
+                        dpla_canonical_title=page_title,
+                        community_title=self_tag_community_title,
+                        dpla_id=dpla_id,
+                        ordinal=ordinal,
                     )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
@@ -1875,12 +1979,62 @@ class Uploader:
             )
             return DriftResolution.LEAVE_OTHERS_ALONE
 
-        logging.info(
-            f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
-            f"has a different hash; will upload correct hash and tag "
-            f"[[File:{actual_filename}]] as duplicate."
+        # Case 2 sub-classification: is the file at ``actual_filename`` a
+        # community-authored upload (its FIRST revision made by a non-bot
+        # user) rather than a stranded DPLA-adjacent bot upload? If yes,
+        # tagging IT for admin deletion would be a destructive imposition
+        # on the community — the file may have years of curation, external
+        # references, and the editor may be aware of the DPLA relationship
+        # already (the Bartlett incident: the community wikitext linked
+        # DPLA as ``other versions =``, deliberately not merged).
+        #
+        # Instead, upload our S3 bytes to the DPLA-canonical title so the
+        # invariant is satisfied AND tag OUR just-uploaded file as
+        # ``{{Duplicate|<community title>}}``. A Commons admin then chooses
+        # deletion or redirection; the ``drain-deferred`` phase watches for
+        # that resolution and, once the tagged (DPLA-canonical) title is
+        # freed, executes a title-drift move of the community file into it.
+        # Net effect: the community file's history survives under the
+        # DPLA-canonical title; the invariant is restored via the standard
+        # title-drift-move machinery.
+        # Decide whether the sha1-sibling is stranded-DPLA-bot (safe to
+        # tag for admin deletion) or community-authored (must NOT be
+        # tagged; instead defer). Provenance is decided ONLY by
+        # ``first_uploader``: the file's oldest revision's uploader.
+        #
+        # We deliberately do NOT treat a DPLA-canonical-shaped title
+        # (``... - DPLA - <id>``) as proof of bot authorship. A community
+        # editor can rename a file into that form, and routing on the
+        # filename alone would send a community upload down the
+        # destructive tag-for-deletion path — the exact Bartlett harm
+        # this whole flow exists to prevent. The provenance lookup is one
+        # cheap API call on an already-rare path, and it returns a
+        # DPLA-adjacent bot for our own stranded orphans anyway (e.g. our
+        # SHA1 at "(page 99)" vs intended "(page 4)"), so correctness for
+        # that case is preserved without the shortcut.
+        first = first_uploader(existing_file)
+        first_is_dpla_bot = (
+            first is not None and _normalize_account(first) in _NORMALIZED_DPLA_BOTS
         )
-        return DriftResolution.UPLOAD_AND_TAG
+        if first_is_dpla_bot:
+            logging.info(
+                f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
+                f"has a different hash; will upload correct hash and tag "
+                f"stranded DPLA-bot file [[File:{actual_filename}]] as "
+                f"duplicate (first upload by {first!r})."
+            )
+            return DriftResolution.UPLOAD_AND_TAG
+
+        provenance = f"first upload by {first!r}" if first else "uploader unknown"
+        logging.info(
+            f"Title drift (Case 2 → upload_and_self_tag_defer): "
+            f"[[File:{intended_page.title(with_ns=False)}]] has a different "
+            f"hash and our SHA1 currently lives at "
+            f"[[File:{actual_filename}]] ({provenance}). "
+            f"Will upload correct hash to canonical title, tag OUR file "
+            f"as duplicate, and defer the rename to drain-deferred."
+        )
+        return DriftResolution.UPLOAD_AND_SELF_TAG_DEFER
 
     def _tag_drift_duplicate(
         self,
@@ -2029,6 +2183,102 @@ class Uploader:
             raise
         except Exception as ex:
             logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
+
+    def _reconcile_awaiting_skip(
+        self, *, partner, existing_file, dpla_id: str, ordinal: int
+    ) -> None:
+        """Reconcile an await-target-free entry against live Commons state
+        on the "already exists at canonical title" skip path.
+
+        Only called for ordinals that ARE in the await set. The canonical
+        file exists at the intended title (that's why we're skipping);
+        the one thing that determines whether we're still waiting is
+        whether it still carries the ``{{Duplicate}}`` tag:
+
+          * still tagged → the admin hasn't acted yet; keep the entry
+            queued so the drain keeps re-running us.
+          * tag gone (admin removed it, declining the dedup, without
+            deleting the file) → the two files legitimately coexist
+            (corollary 1); drop the entry so the drain stops tracking it.
+
+        A read-only reconciliation — it emits no tag and never re-touches
+        the file, so an admin who removed the tag is never edit-warred
+        with. (A deleted or redirected canonical doesn't reach this path:
+        the file no longer exists at the intended title, so the empty-
+        canonical Case-3 move handles it on the same re-run.)
+        """
+        try:
+            still_tagged = bool(DUPLICATE_TAG_RE.search(existing_file.text or ""))
+        except Exception as ex:  # noqa: BLE001 — reconciliation is best-effort
+            logging.warning(
+                f"Could not read tag state of [[File:"
+                f"{existing_file.title(with_ns=False)}]] for {dpla_id} "
+                f"{ordinal}; leaving await entry queued: {ex}"
+            )
+            return
+        if still_tagged:
+            return
+        logging.info(
+            f"Await-target-free: [[File:{existing_file.title(with_ns=False)}]] "
+            f"({dpla_id} {ordinal}) no longer carries a {{{{Duplicate}}}} tag — "
+            f"a Commons editor declined the dedup. Dropping the await entry; "
+            f"the two files coexist (invariant satisfied at the canonical title)."
+        )
+        await_target_free_sidecar.remove_key(partner, dpla_id, ordinal)
+
+    def _tag_self_and_defer(
+        self,
+        *,
+        partner: str,
+        dpla_canonical_title: str,
+        community_title: str,
+        dpla_id: str,
+        ordinal: int,
+    ) -> None:
+        """Tag OUR just-uploaded DPLA-canonical file
+        ``{{Duplicate|<community title>}}`` and record ``(dpla_id,
+        ordinal)`` in the await-target-free set.
+
+        Once a Commons admin acts on the tag, the DPLA-canonical title is
+        freed and a plain uploader re-run finishes the job: an empty
+        canonical becomes a Case-3 title-drift move of the community file
+        into the freed title (history intact), and the drain drops the
+        entry. Nothing here needs to be crash-consistent beyond "the tag
+        is on Commons and the ID is in the set" — both are re-derivable
+        and idempotent, so a partial failure just retries on the next run.
+
+        Order: record the ID first, then emit the tag. The set entry is
+        the cheap local marker that tells the drain to keep re-running us;
+        emitting it before the (remote, failure-prone) tag write means a
+        tag that lands is always backed by a queued marker. If the tag
+        write fails, the marker lingers harmlessly — a re-run re-enters
+        this path (the canonical is still occupied by the other file until
+        we succeed) and retries; if it never succeeds, the marker is
+        cleaned up by :meth:`_reconcile_awaiting_skip` once our bytes do
+        land. Best-effort like ``_tag_drift_duplicate``: a tag failure is
+        logged, not raised — the upload already satisfied the invariant.
+        """
+        await_target_free_sidecar.add_key(partner, dpla_id, ordinal)
+        try:
+            self_page = get_page(self.site, f"File:{dpla_canonical_title}")
+            tag_as_duplicate(
+                self.site,
+                self_page,
+                correct_filename=community_title,
+            )
+            logging.info(
+                f"Tagged [[File:{dpla_canonical_title}]] as duplicate of "
+                f"community-authored [[File:{community_title}]] (DPLA ID "
+                f"{dpla_id}); awaiting Commons admin action."
+            )
+        except CsrfRecoveryFailed:
+            raise
+        except Exception as ex:
+            logging.warning(
+                f"Failed to self-tag [[File:{dpla_canonical_title}]] as "
+                f"duplicate of [[File:{community_title}]]: {ex}. A subsequent "
+                f"uploader run for this partner will retry the tag."
+            )
 
     def _persist_upload_result(
         self,

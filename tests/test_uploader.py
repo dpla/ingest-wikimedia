@@ -781,7 +781,12 @@ def test_resolve_hash_drift_case2_still_tags_when_existing_is_true_orphan():
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
     intended_page.title.return_value = intended_title
-    with patch("tools.uploader.get_page", return_value=intended_page):
+    # A `- DPLA -` orphan of our own item was uploaded by our bot, so
+    # provenance resolves to a DPLA-adjacent bot → UPLOAD_AND_TAG.
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
+    ):
         action = uploader._resolve_hash_drift(
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
@@ -802,7 +807,10 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
     intended_page.title.return_value = intended_title
-    with patch("tools.uploader.get_page", return_value=intended_page):
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
+    ):
         action = uploader._resolve_hash_drift(
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
@@ -810,6 +818,234 @@ def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
             ordinal=4,
         )
     assert action == "upload_and_tag"
+
+
+def test_resolve_hash_drift_case2_defers_when_target_is_community_authored():
+    """New Case-2 sub-classification: when the drift target's FIRST
+    upload was by a real editor (not a DPLA-adjacent bot), return
+    UPLOAD_AND_SELF_TAG_DEFER instead of tagging the community file
+    for admin deletion. Guards against the Bartlett incident."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Angus F. Bartlett.jpg"  # no DPLA- suffix → community-titled
+    intended_title = "Angus F. Bartlett - DPLA - abc.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    # Force first_uploader to report a real editor.
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="Fæ"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_self_tag_defer"
+
+
+def test_resolve_hash_drift_case2_community_first_uploader_beats_dpla_shaped_title():
+    """Provenance is decided by ``first_uploader``, NOT the filename. A
+    file whose title carries a ``- DPLA -`` suffix but whose FIRST
+    uploader is a community editor (e.g. an editor renamed it into that
+    form) must still route to the non-destructive self-tag/defer path —
+    the filename must never force the destructive tag-for-deletion path.
+    """
+    uploader = _build_uploader_with_dpla()
+    dpla_id = "abc" + "a" * 29
+    # DPLA-suffixed title (same item id), but a community editor is the
+    # first uploader — e.g. they renamed their file into the DPLA form.
+    existing_title = f"Angus - DPLA - {dpla_id} (page 9).jpg"
+    intended_title = f"Angus - DPLA - {dpla_id}.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="Fæ"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id=dpla_id,
+            ordinal=1,
+        )
+    assert action == "upload_and_self_tag_defer"
+
+
+def test_resolve_hash_drift_case2_stays_upload_and_tag_when_target_is_dpla_bot_upload():
+    """A stranded DPLA-bot upload (e.g. pre-normalization title) has a
+    DPLA-adjacent bot as its first uploader — must stay on the legacy
+    UPLOAD_AND_TAG path, not divert to the community-defer flow. Same
+    fixture as the community test, only the first_uploader mock flips."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Some Old Title.jpg"  # no DPLA suffix, but bot-authored
+    intended_title = "Some Old Title - DPLA - abc.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_tag"
+
+
+def test_resolve_hash_drift_case2_routes_unknown_uploader_to_self_tag_defer():
+    """When ``first_uploader`` can't identify the original uploader (API
+    failure, empty history), route through the non-destructive
+    ``UPLOAD_AND_SELF_TAG_DEFER`` path rather than the destructive
+    ``UPLOAD_AND_TAG`` path. An unknown provenance doesn't prove
+    bot-authorship, so the safer default is to tag OUR own file and let
+    the drain phase resolve, rather than requesting admin deletion of a
+    possibly-community upload."""
+    uploader = _build_uploader_with_dpla()
+    existing_title = "Some File.jpg"
+    intended_title = "Some File - DPLA - abc.jpg"
+    intended_page = MagicMock()
+    intended_page.exists.return_value = True
+    intended_page.isRedirectPage.return_value = False
+    intended_page.title.return_value = intended_title
+    with (
+        patch("tools.uploader.get_page", return_value=intended_page),
+        patch("tools.uploader.first_uploader", return_value=None),
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=_drift_existing_file(existing_title),
+            page_title=intended_title,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert action == "upload_and_self_tag_defer"
+
+
+def test_tag_self_and_defer_records_key_and_tags(tmp_path, monkeypatch):
+    """``_tag_self_and_defer`` records the (dpla_id, ordinal) in the
+    await set and tags OUR canonical file ``{{Duplicate|<community>}}``.
+    The set entry is the marker the drain re-runs on."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    uploader = _build_uploader_with_dpla()
+    with (
+        patch("tools.uploader.get_page") as get_page,
+        patch("tools.uploader.tag_as_duplicate") as tag,
+    ):
+        get_page.return_value = MagicMock(text="")
+        uploader._tag_self_and_defer(
+            partner="heartland",
+            dpla_canonical_title="Foo - DPLA - abc.jpg",
+            community_title="Foo.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    tag.assert_called_once()
+    _, kwargs = tag.call_args
+    assert kwargs.get("correct_filename") == "Foo.jpg"
+    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
+    # Other partners untouched.
+    assert await_target_free_sidecar.awaiting_dpla_ids("bpl") == []
+
+
+def test_tag_self_and_defer_records_key_before_tagging(tmp_path, monkeypatch):
+    """Order: the await key is recorded BEFORE the (remote, failure-prone)
+    tag write, so a tag that lands is always backed by a queued marker. A
+    tag failure is swallowed (best-effort) and the key remains for a
+    re-run / reconcile to handle."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    uploader = _build_uploader_with_dpla()
+
+    call_order: list[str] = []
+    real_add_key = await_target_free_sidecar.add_key
+
+    def add_key_stub(partner, dpla_id, ordinal):
+        call_order.append("add_key")
+        return real_add_key(partner, dpla_id, ordinal)
+
+    def tag_stub(*_a, **_kw):
+        call_order.append("tag_as_duplicate")
+        raise RuntimeError("simulated Commons write failure")
+
+    with (
+        patch("tools.uploader.get_page") as get_page,
+        patch(
+            "tools.uploader.await_target_free_sidecar.add_key",
+            side_effect=add_key_stub,
+        ),
+        patch("tools.uploader.tag_as_duplicate", side_effect=tag_stub),
+    ):
+        get_page.return_value = MagicMock(text="")
+        # Tag failure must NOT propagate — the upload already satisfied
+        # the invariant; the deferred rename is a follow-up.
+        uploader._tag_self_and_defer(
+            partner="heartland",
+            dpla_canonical_title="Foo - DPLA - abc.jpg",
+            community_title="Foo.jpg",
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    assert call_order == ["add_key", "tag_as_duplicate"], (
+        f"await key must be recorded before the tag write; got {call_order!r}"
+    )
+    # Key survives the tag-side crash.
+    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
+
+
+def test_reconcile_awaiting_skip_keeps_key_while_still_tagged(tmp_path, monkeypatch):
+    """On the already-exists skip path, an awaiting ordinal whose
+    canonical still carries {{Duplicate}} is kept queued (admin hasn't
+    acted). No write to Commons."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    await_target_free_sidecar.add_key("heartland", "abc" + "a" * 29, 1)
+    uploader = _build_uploader_with_dpla()
+    existing = MagicMock()
+    existing.text = "{{Duplicate|Foo.jpg}}\n== filedesc ==\n"
+    existing.title.return_value = "File:Foo - DPLA - abc.jpg"
+    uploader._reconcile_awaiting_skip(
+        partner="heartland",
+        existing_file=existing,
+        dpla_id="abc" + "a" * 29,
+        ordinal=1,
+    )
+    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
+
+
+def test_reconcile_awaiting_skip_drops_key_when_tag_removed(tmp_path, monkeypatch):
+    """When the canonical no longer carries {{Duplicate}} (an editor
+    declined the dedup without deleting the file), the await key is
+    dropped — the two files coexist (corollary 1). Read-only: no tag is
+    re-emitted, so we never edit-war with the editor."""
+    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
+
+    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
+    await_target_free_sidecar.add_key("heartland", "abc" + "a" * 29, 1)
+    uploader = _build_uploader_with_dpla()
+    existing = MagicMock()
+    existing.text = "== filedesc ==\nno duplicate tag here\n"
+    existing.title.return_value = "File:Foo - DPLA - abc.jpg"
+    with patch("tools.uploader.tag_as_duplicate") as tag:
+        uploader._reconcile_awaiting_skip(
+            partner="heartland",
+            existing_file=existing,
+            dpla_id="abc" + "a" * 29,
+            ordinal=1,
+        )
+    tag.assert_not_called()
+    assert not await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
 
 
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":

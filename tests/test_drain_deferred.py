@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
 
-from ingest_wikimedia import drain_sidecar
+from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
 from tools import drain_deferred
 
 
@@ -373,7 +374,6 @@ def test_acquire_host_lock_nonblocking_skips_when_held():
     drain already holds it, ``_acquire_host_lock(blocking=False)`` returns None
     (so the pass skips) instead of blocking behind a patient drain that can
     hold the lock for hours. Regression for the drain-lock-blocking bug."""
-    import fcntl
 
     # Hold the lock via an independent fd (separate open file description, so
     # flock genuinely conflicts even within this process).
@@ -390,24 +390,186 @@ def test_acquire_host_lock_nonblocking_skips_when_held():
     os.close(fd)
 
 
-def test_no_wait_skips_when_host_lock_held():
-    """When another drain holds the host lock, the opportunistic pass must skip
-    immediately — no throttle, no subprocesses — leaving the sidecar for the
-    terminal drain. Regression: the blocking acquire kept finished sessions
-    open for hours behind a patient drain."""
+def test_no_wait_skips_category_when_host_lock_held_but_still_attempts_await():
+    """Opportunistic pass, host lock held by a peer: the category round
+    is skipped (the holder covers it) but the await round is still
+    attempted — await work is not gated behind category work / the host
+    lock. (The await round then also skips if it can't get the lock; the
+    point is that main() TRIES it.)"""
     drain_sidecar.write_sidecar("nara", ["id-1"])
     with (
-        patch(
-            "tools.drain_deferred._acquire_host_lock", return_value=None
-        ) as lock_mock,
+        patch("tools.drain_deferred._acquire_host_lock", return_value=None),
         patch("tools.drain_deferred._drain_opportunistic_once") as opp,
-        patch("tools.drain_deferred.DuplicateCategoryThrottle") as throttle_ctor,
+        patch("tools.drain_deferred._run_await_round") as await_round,
+        patch("tools.drain_deferred.DuplicateCategoryThrottle"),
         patch("tools.drain_deferred.subprocess.run") as sp,
     ):
         result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
     assert result.exit_code == 0, result.output
-    lock_mock.assert_called_once_with(blocking=False)
-    opp.assert_not_called()
-    throttle_ctor.assert_not_called()
+    opp.assert_not_called()  # category round skipped (lock held)
+    await_round.assert_called_once_with("nara", blocking=False)  # still attempted
     sp.assert_not_called()
     assert drain_sidecar.read_sidecar("nara") == ["id-1"]
+
+
+def test_no_wait_runs_one_await_round(lock_fd):
+    """Opportunistic pass with await work and a free lock: exactly one
+    await round runs (re-invoke uploader + sdc-sync on the awaiting IDs),
+    no patient loop."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+
+    def clear_on_rerun(partner, ids):
+        for dpla_id in ids:
+            await_target_free_sidecar.remove_key(partner, dpla_id, 1)
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch(
+            "tools.drain_deferred._run_deferred_items", side_effect=clear_on_rerun
+        ) as run,
+        patch("tools.drain_deferred.DuplicateCategoryThrottle"),
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["--no-wait", "nara"])
+    assert result.exit_code == 0, result.output
+    run.assert_called_once()
+    assert run.call_args.args[1] == ["id-1"]
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == []
+
+
+def test_await_round_skips_when_host_lock_held(override_root):
+    """_run_await_round returns False without running the uploader when
+    the (non-blocking) host lock is held by another drain."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=None),
+        patch("tools.drain_deferred._run_deferred_items") as run,
+    ):
+        ran = drain_deferred._run_await_round("nara", blocking=False)
+    assert ran is False
+    run.assert_not_called()
+    # Set untouched, left for the terminal drain.
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == ["id-1"]
+
+
+def test_await_round_reruns_uploader_on_unique_dpla_ids(override_root, lock_fd):
+    """_run_await_round dedupes per-ordinal keys to unique DPLA IDs (the
+    uploader's unit of work is the item) and re-runs the uploader on
+    them under the host lock."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+    await_target_free_sidecar.add_key("nara", "id-1", 2)  # same item, 2nd ordinal
+    await_target_free_sidecar.add_key("nara", "id-2", 1)
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred._run_deferred_items") as run,
+    ):
+        ran = drain_deferred._run_await_round("nara", blocking=True)
+    assert ran is True
+    run.assert_called_once()
+    assert run.call_args.args[1] == ["id-1", "id-2"]
+
+
+def test_patient_drains_await_when_uploader_rerun_clears_keys(lock_fd, monkeypatch):
+    """Patient mode, await-only: re-running the uploader resolves the
+    awaiting items (the uploader clears the keys — e.g. an admin freed
+    the canonical and the empty-canonical Case-3 move promoted the
+    community file). The loop terminates once the set empties."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+    await_target_free_sidecar.add_key("nara", "id-2", 1)
+
+    def clear_on_rerun(partner, ids):
+        # Simulate the uploader resolving every awaiting item this round.
+        for dpla_id in ids:
+            await_target_free_sidecar.remove_key(partner, dpla_id, 1)
+
+    throttle = MagicMock()
+    throttle.poll_secs = 0
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch(
+            "tools.drain_deferred._run_deferred_items", side_effect=clear_on_rerun
+        ) as run,
+        patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
+        patch("tools.drain_deferred.notify_drain_phase_start") as start_ping,
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    assert result.exit_code == 0, result.output
+    run.assert_called_once()  # one round cleared both items
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == []
+    # Await-only drain (no category work): start/complete pings are for
+    # category work, so neither fires here.
+    start_ping.assert_not_called()
+    done_ping.assert_not_called()
+
+
+class _StopLoop(Exception):
+    pass
+
+
+def test_patient_await_loop_waits_and_does_not_falsely_complete(lock_fd, monkeypatch):
+    """When the awaiting items are NOT resolved by a re-run (admin hasn't
+    acted), the patient loop keeps waiting — it must NOT signal
+    completion while items remain. We break the otherwise-unbounded loop
+    on the first sleep and assert no completion ping fired."""
+    await_target_free_sidecar.add_key("nara", "id-1", 1)
+
+    throttle = MagicMock()
+    throttle.poll_secs = 0
+
+    def boom(*_a, **_k):
+        raise _StopLoop
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", return_value=lock_fd),
+        patch("tools.drain_deferred._run_deferred_items"),  # no-op: key remains
+        patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+        patch("tools.drain_deferred.time.sleep", side_effect=boom),
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    # The loop kept waiting (hit sleep) rather than completing.
+    assert isinstance(result.exception, _StopLoop)
+    done_ping.assert_not_called()
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == ["id-1"]
+
+
+def test_patient_category_then_await_both_drain_and_complete(lock_fd, monkeypatch):
+    """Patient mode with BOTH queues: category drains first (under the
+    host lock, start ping fires), then await drains; completion pings
+    once both are empty."""
+    drain_sidecar.write_sidecar("nara", ["cat-1"])
+    await_target_free_sidecar.add_key("nara", "await-1", 1)
+
+    throttle = MagicMock()
+    throttle.poll_secs = 0
+    throttle.resume_below = 900
+    throttle.category_size.return_value = 100
+    throttle.wait_for_capacity.return_value = True
+
+    def rerun(partner, ids):
+        # Category round: the ids came from drain_sidecar (already removed
+        # by _run_one_round before calling us) — nothing to re-defer.
+        # Await round: clear the awaiting key.
+        for dpla_id in ids:
+            await_target_free_sidecar.remove_key(partner, dpla_id, 1)
+
+    # main() acquires the host lock once for the category phase and again
+    # per await round, closing each fd — so hand out a FRESH fd per call
+    # (the real _acquire_host_lock opens a new fd each time).
+    def fresh_lock(**_kw):
+        return os.open(os.devnull, os.O_RDONLY)
+
+    with (
+        patch("tools.drain_deferred._acquire_host_lock", side_effect=fresh_lock),
+        patch("tools.drain_deferred._run_deferred_items", side_effect=rerun),
+        patch("tools.drain_deferred.DuplicateCategoryThrottle", return_value=throttle),
+        patch("tools.drain_deferred.notify_drain_phase_start") as start_ping,
+        patch("tools.drain_deferred.notify_drain_phase_complete") as done_ping,
+    ):
+        result = CliRunner().invoke(drain_deferred.main, ["nara"])
+    assert result.exit_code == 0, result.output
+    start_ping.assert_called_once()
+    done_ping.assert_called_once()
+    assert drain_sidecar.read_sidecar("nara") == []
+    assert await_target_free_sidecar.awaiting_dpla_ids("nara") == []
