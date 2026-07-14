@@ -1601,6 +1601,25 @@ def _site_with_empty_entity():
     return site
 
 
+def _site_with_canonical_sdc_entity(props=("P1476", "P170", "P10358", "P571", "P6216")):
+    """Site whose MediaInfo entity already carries canonical render SDC for
+    ``props`` (default: all five render-critical properties) — the precondition
+    the sdc-sync satisfies before the wikitext cleanup, and what the migrate
+    strip guard checks per param. Pass a subset to model a partial canonical
+    write. Carries no inferred-from-Wikitext reference, so
+    ``entity_was_already_migrated`` does not trip and the migration proceeds."""
+    site = MagicMock()
+    site.tokens = {"csrf": "CSRFTOKEN"}
+    entity = {
+        "statements": {
+            prop: [{"mainsnak": {"snaktype": "value", "property": prop}}]
+            for prop in props
+        }
+    }
+    site.simple_request.return_value.submit.return_value = {"entities": {"M42": entity}}
+    return site
+
+
 def _item_md(title="A Title"):
     return (
         {
@@ -2275,7 +2294,10 @@ def test_migrate_legacy_file_strips_params_matching_sdc_in_one_edit():
 
     page = _mock_file_page("File:Foo.jpg", _Rev1.text, [_Rev1()])
     item, provider, dp = _item_md()
-    site = _site_with_empty_entity()
+    # The canonical SDC is already present (the sdc-sync writes it before the
+    # wikitext cleanup) — the real precondition for a migrate strip, and what
+    # STRIP_GUARD_SDC_PROPERTY checks before removing a render-critical param.
+    site = _site_with_canonical_sdc_entity()
     migrate_legacy_file(
         file_page=page,
         item_metadata=item,
@@ -2307,6 +2329,98 @@ def test_migrate_legacy_file_strips_params_matching_sdc_in_one_edit():
     assert "{{DPLA metadata}}" in saved
     # And only one save was issued.
     assert page.save.call_count == 1
+
+
+def test_migrate_legacy_file_keeps_render_params_when_canonical_sdc_absent():
+    """Guard: when the sdc-sync's canonical-SDC write never landed (the entity
+    carries no title/creator/description/date/rights statements), migrate must
+    NOT strip those render-critical params — the strip relies on that SDC being
+    present, and removing the params without it would blank the field in BOTH
+    the wikitext and SDC. They must stay on the template so the page still
+    renders. Structural params (source/institution) may still be stripped; the
+    guard only protects STRIP_GUARD_SDC_PROPERTY keys."""
+
+    class _Rev1:
+        revid, user = 1, "DPLA_bot"
+        text = (
+            "== {{int:filedesc}} ==\n"
+            "     {{ Artwork\n"
+            "        | Other fields 1 = {{ InFi | Creator |"
+            " A Creator | id=fileinfotpl_aut}}\n"
+            "        | title = A Title\n"
+            "        | description = A description\n"
+            "        | date = 1900\n"
+            "        | permission = {{NoC-US | Q1}}\n"
+            "     }}\n"
+        )
+
+    page = _mock_file_page("File:Foo.jpg", _Rev1.text, [_Rev1()])
+    item, provider, dp = _item_md()
+    site = _site_with_empty_entity()  # canonical-SDC write never landed
+    migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    saved = page.text
+    # Render-critical params survive (no SDC counterpart to render them).
+    for key in ("title", "description", "creator", "date", "permission"):
+        assert f"| {key}" in saved, (
+            f"guard should have kept unbacked param {key!r}; full text:\n{saved}"
+        )
+    # And their values are still on the page — nothing was blanked.
+    assert "A Title" in saved and "A description" in saved
+
+
+def test_migrate_legacy_file_strips_only_params_with_backing_sdc():
+    """Per-param independence: with canonical SDC present for only SOME render
+    properties (here title P1476 + date P571), migrate strips exactly those
+    params and keeps the rest (creator/description/permission) with their
+    values. A guard that gated all params on a single property would wrongly
+    strip — or keep — all five together, so this partial case is what
+    distinguishes the per-param filter from an entity-level bail."""
+
+    class _Rev1:
+        revid, user = 1, "DPLA_bot"
+        text = (
+            "== {{int:filedesc}} ==\n"
+            "     {{ Artwork\n"
+            "        | Other fields 1 = {{ InFi | Creator |"
+            " A Creator | id=fileinfotpl_aut}}\n"
+            "        | title = A Title\n"
+            "        | description = A description\n"
+            "        | date = 1900\n"
+            "        | permission = {{NoC-US | Q1}}\n"
+            "     }}\n"
+        )
+
+    page = _mock_file_page("File:Foo.jpg", _Rev1.text, [_Rev1()])
+    item, provider, dp = _item_md()
+    # Only title (P1476) and date (P571) are backed by canonical SDC.
+    site = _site_with_canonical_sdc_entity(props=("P1476", "P571"))
+    migrate_legacy_file(
+        file_page=page,
+        item_metadata=item,
+        provider=provider,
+        data_provider=dp,
+        dpla_id="abc",
+        site=site,
+    )
+    saved = page.text
+    # SDC-backed params are stripped (the renderer supplies them).
+    for key in ("title", "date"):
+        assert f"| {key}" not in saved, (
+            f"backed param {key!r} should have been stripped; full text:\n{saved}"
+        )
+    # Unbacked params — and their values — stay on the template.
+    for key in ("creator", "description", "permission"):
+        assert f"| {key}" in saved, (
+            f"unbacked param {key!r} should have been kept; full text:\n{saved}"
+        )
+    assert "A description" in saved
 
 
 # ---------------------------------------------------------------------------
