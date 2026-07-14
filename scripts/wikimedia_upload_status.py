@@ -599,10 +599,10 @@ def get_phase_and_progress(
         if total_ordinals > 0 and ordinal_count > 0:
             files_pct = f"{ordinal_count / total_ordinals * 100:.1f}"
             progress = f"{ordinal_count:,} / {total_ordinals:,} files, ~{files_pct}%"
-        elif 0 < dpla_id_count <= total:
+        elif dpla_id_count <= total:
             # Legacy partner-mode SDC with no download log: the per-partner ids
             # CSV is a valid item denominator and each "DPLA ID:" marker is one
-            # item.
+            # item. (dpla_id_count > 0 here — the == 0 case returned above.)
             progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
         else:
             # Maintain --cat/--file ("lite") mode: the scope is a Commons
