@@ -135,6 +135,32 @@ LEGACY_IMPORT_PROPERTY: dict[str, tuple[str, str]] = {
     "creator": ("P2093", "string"),
 }
 
+# Render-critical {{DPLA metadata}} params and the SDC property that must
+# already be present before it is safe to strip the param from the wikitext.
+# ``migrate_legacy_file`` posts only community imports (never the canonical
+# scalars), so its strip relies on the sdc-sync's prior canonical-SDC write
+# having landed; stripping a param whose value has no SDC counterpart blanks
+# the field in both representations. ``creator`` renders from P170 (P2093 is
+# only its qualifier); ``permission`` (rights) from P6216.
+#
+# The guard is deliberately PRESENCE-based (is there a statement for this
+# property at all?), a backstop for the dominant failure: the canonical write
+# not firing, leaving the property entirely absent. It is intentionally looser
+# than ``tools/sdc_sync.py``'s provenance-based ``_entity_has_dpla_attributed_claims``
+# (which matches the P123=Q_DPLA publisher reference) — presence cannot
+# over-preserve the normal flow (canonical SDC present ⟹ property present ⟹
+# strip proceeds), whereas a provenance check would entangle with the codebase's
+# two distinct DPLA-attribution markers (P123 reference vs P459 heuristic
+# qualifier) and risk keeping params whose canonical claims are shaped
+# differently. Not accidental inconsistency; a deliberately conservative check.
+STRIP_GUARD_SDC_PROPERTY: dict[str, str] = {
+    "title": "P1476",
+    "creator": "P170",
+    "description": "P10358",
+    "date": "P571",
+    "permission": "P6216",
+}
+
 # Canonical mapping from legacy template param names (case-folded) to
 # the canonical-params keys both the writer and comparator use. Covers
 # the param sets the legacy DPLA-bot ``{{Artwork}}`` form emitted plus
@@ -2707,7 +2733,25 @@ def migrate_legacy_file(
     # ``get_wiki_text`` emits for fresh uploads.
     from .wikitext_normalize import canonicalize, normalize
 
-    rewritten, _stripped = normalize(rewritten, canonical_params)
+    # Guard: never strip a render-critical param into a void. This migration
+    # posts only community imports (not the canonical scalars), so the strip
+    # below relies on the sdc-sync's prior canonical-SDC write having landed.
+    # If that write silently failed for this file, ``entity`` (fetched above,
+    # before our own import) won't carry the param's SDC property, and
+    # stripping it would leave the value in NEITHER the wikitext nor SDC — the
+    # same blanking that ``normalize_page``'s cleanup guard prevents on the
+    # sibling path. Restrict the strip to params whose SDC property is actually
+    # present so an unbacked param stays on the template and still renders.
+    # ``entity`` predates our community import, so this is not fooled by the
+    # claims we just posted (unlike a bare "has any DPLA SDC" entity check).
+    entity_statements = entity.get("statements") or entity.get("claims") or {}
+    strippable_params = {
+        key: value
+        for key, value in canonical_params.items()
+        if key not in STRIP_GUARD_SDC_PROPERTY
+        or STRIP_GUARD_SDC_PROPERTY[key] in entity_statements
+    }
+    rewritten, _stripped = normalize(rewritten, strippable_params)
     rewritten = canonicalize(rewritten)
     # Re-inject wikitext-preserved extension remainders (galleries,
     # HRs, wikitables, etc. the user appended past the DPLA-authored
