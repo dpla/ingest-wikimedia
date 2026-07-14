@@ -1,11 +1,11 @@
 """Cross-session box-wide budget for concurrent Commons-writing work.
 
 The SDC sync ``--workers N`` flag (PR #308) parallelizes one partner run
-across N worker processes. But the wiki EC2 box typically runs 6+
+across N worker processes. But the wiki EC2 box typically runs several
 concurrent wikimedia sessions, and Commons' MediaWiki parser pool only
 tolerates ~16 concurrent bot writes before maxlag starts to bind. A
-per-session worker count can't see the other sessions, so 6 sessions ×
-4 workers = 24 writers would oversubscribe.
+per-session worker count can't see the other sessions, so N sessions ×
+K workers each would oversubscribe once N × K > the box-wide budget.
 
 This module provides a *box-wide* semaphore that all sessions share:
 a fixed directory of N slot files, each acquired with a non-blocking
@@ -135,10 +135,18 @@ UPLOADER_PRIORITY_SLOT_DIR = "/tmp/dpla-uploader-priority-slots"
 # pool tolerates comfortably.
 UPLOADER_PRIORITY_SLOTS = 4
 
-# Poll interval when every slot is currently held. Slots turn over on
-# the order of seconds (one per-item SDC sync), so a sub-second poll
-# keeps latency low without busy-spinning.
-_POLL_INTERVAL_SECONDS = 0.5
+# Poll interval when every slot is currently held. The poll only fires
+# when a scan finds ZERO free slots, so raising this doesn't add wall
+# time to any acquire that finds a slot on the first pass — it only
+# lengthens the average wait during full saturation. Under saturation,
+# a released slot is picked up either by the releasing worker's next
+# acquire (which fires immediately, no poll) or by whichever contender's
+# scan happens to align with the release, so the freed slot is almost
+# never idle for a full poll cycle. 1 s keeps latency well below the
+# per-item work time (median ~1–2 s for a single-file item, tens of
+# seconds to minutes for multi-page items) while cutting the poll-storm
+# rate by half at high concurrency.
+_POLL_INTERVAL_SECONDS = 1.0
 
 # Stable fragment of the "all slots held" log line. Status tooling greps
 # the sdc-sync log tail for this to tell that a session's workers are

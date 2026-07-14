@@ -50,7 +50,7 @@ on:
         description: "SDC-sync worker processes per session (parallelism). 1 = single-process."
         required: false
         type: string
-        default: "6"
+        default: "24"
       workers_budget:
         description: "Box-wide cap on concurrent SDC worker slots across all sessions (0 = unlimited)"
         required: false

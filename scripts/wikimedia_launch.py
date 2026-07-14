@@ -552,11 +552,14 @@ def main() -> None:
     parser.add_argument("--lite", default="false")
     parser.add_argument("--count-only", default="false")
     # Keep in sync with .github/workflows/wikimedia-launch.yml inputs.workers
-    # / inputs.workers_budget (currently 6 / 24), which the workflow always
+    # / inputs.workers_budget (currently 24 / 24), which the workflow always
     # passes explicitly. These defaults only apply to a bare manual launch —
-    # they let it behave like a workflow launch (6 SDC workers under a
+    # they let it behave like a workflow launch (24 SDC workers under a
     # box-wide cap of 24) rather than silently running single-worker, no cap.
-    parser.add_argument("--workers", default="6")
+    # Matching --workers to --workers-budget lets a solo SDC-sync session
+    # saturate the box-wide slot pool; a second session's workers block on
+    # the flock semaphore and pick up slots as items complete.
+    parser.add_argument("--workers", default="24")
     parser.add_argument("--workers-budget", default="24")
     args = parser.parse_args()
 
@@ -620,7 +623,7 @@ def main() -> None:
     # blank) falls back to the conservative default rather than failing
     # the whole launch. --workers must be >= 1; --workers-budget >= 0
     # (0 = unlimited / disabled).
-    sdc_workers = 6
+    sdc_workers = 24
     if args.workers.strip():
         try:
             sdc_workers = int(args.workers)

@@ -268,10 +268,10 @@ uploader <partner>.csv <partner>
 Reads each item's precomputed `sdc.json` and `upload-result.json` from S3, and for every ordinal whose upload status is `UPLOADED` or `SKIPPED`, posts MediaInfo statements (and references) to the corresponding Commons file via the wbeditentity API. Idempotent — re-syncing a fully-synced item produces zero writes.
 
 ```bash
-sdc-sync --partner <partner> --ids-file <partner>.csv --workers 6 --workers-budget 24
+sdc-sync --partner <partner> --ids-file <partner>.csv --workers 24 --workers-budget 24
 ```
 
-`--workers N` runs the partner sync across N worker processes (the launcher and workflow default to `6`); `--workers-budget N` caps concurrent Commons writers box-wide across all sessions (default `24`). See [Worker-slot budget](#worker-slot-budget) below.
+`--workers N` runs the partner sync across N worker processes (the launcher and workflow default to `24`); `--workers-budget N` caps concurrent Commons writers box-wide across all sessions (default `24`). See [Worker-slot budget](#worker-slot-budget) below.
 
 **Wikitext cleanup runs in this phase too.** After posting SDC for an ordinal, sdc-sync also reconciles the file's wikitext:
 
@@ -402,8 +402,8 @@ Inputs:
 - `max_age_days` (optional integer): for `refresh_only` runs, re-download files older than N days in S3 (default: 365)
 - `refresh_only` (boolean, default `false`): run `get-ids-es → downloader` only — skip the upload and SDC phases (see "Alternate run modes" above)
 - `sdc_only` (boolean, default `false`): run `get-ids-es → sdc-sync` only — skip the download and upload phases (see "Alternate run modes" above). Mutually exclusive with `refresh_only`.
-- `workers` (string, default `"6"`): number of SDC-sync worker processes per session. `1` runs single-process; higher values parallelize the partner sync across that many processes. Passed through to `sdc-sync --workers`.
-- `workers_budget` (string, default `"24"`): box-wide cap on concurrent Commons-writing slots shared across all sessions on EC2 (`0` = unlimited). Passed through to `sdc-sync --workers-budget` and the uploader's `--workers-budget`. See [Worker-slot budget](#worker-slot-budget). Both inputs are blank-safe — an empty value falls back to the launcher default (`6` / `24`).
+- `workers` (string, default `"24"`): number of SDC-sync worker processes per session. `1` runs single-process; higher values parallelize the partner sync across that many processes. The default matches `workers_budget` so a solo session can saturate the box-wide slot pool; concurrent sessions block on the flock semaphore and pick up slots as items complete. Passed through to `sdc-sync --workers`.
+- `workers_budget` (string, default `"24"`): box-wide cap on concurrent Commons-writing slots shared across all sessions on EC2 (`0` = unlimited). Passed through to `sdc-sync --workers-budget` and the uploader's `--workers-budget`. See [Worker-slot budget](#worker-slot-budget). Both inputs are blank-safe — an empty value falls back to the launcher default (`24` / `24`).
 
 Steps:
 1. Installs `boto3` and `requests`
