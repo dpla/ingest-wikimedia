@@ -301,6 +301,33 @@ def test_get_phase_and_progress_reports_sdc_syncing_in_progress():
     assert log_mtime > 0
 
 
+def test_get_phase_and_progress_sdc_maintain_cat_reports_bare_file_count():
+    """maintain --cat/--file ("lite") runs sync a Commons category, not the
+    per-partner ids CSV, so the {label}.csv wc -l is a stale/unrelated total
+    (here georgia.csv = 63) and the per-file "DPLA ID:" count exceeds it. With
+    no download log for ordinals, the phase must report a bare file count, not a
+    ratio against the wrong denominator — regression against the observed
+    "1,911 / 63 items, ~3033.3%".
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260714-010640-georgia-sdc.log",
+        awk_counts=[1911, 0, 0, 0, 0],  # 1,911 files processed; no ordinals
+        csv_total=63,  # stale georgia.csv, unrelated to the --cat scope
+        total_ordinals=0,  # maintain --cat has no download log
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None, session="wikimedia-georgia", hub="georgia", label="georgia"
+        )
+    assert phase.startswith("SDC syncing (1,911 files processed)"), phase
+    # No bogus denominator, percentage, or "items" unit.
+    assert "63" not in phase and "%" not in phase and "items" not in phase
+
+
 def test_get_phase_and_progress_flags_waiting_on_slots():
     """When the sdc-log tail's last line is the slot-budget wait message,
     the phase is annotated 'waiting on slots' — and the idle/stale warning

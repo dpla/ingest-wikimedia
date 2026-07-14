@@ -582,10 +582,12 @@ def get_phase_and_progress(
         # `total_ordinals` denominator from the download log) when both
         # are available — same rationale as the Upload branch, since
         # multi-page items take proportionally more SDC-write work than
-        # 1-image items. Falls back to item-level when no download log
-        # has been found (legacy sessions). Terminal completion still
-        # reports items, since the tracker's SDC_ITEMS_SYNCED is per
-        # item.
+        # 1-image items. Falls back to item-level against the per-partner
+        # ids CSV for legacy no-download-log partner sessions, and to a
+        # bare file count for maintain --cat/--file runs (whose scope is a
+        # Commons category / file list, so the CSV is not a valid
+        # denominator). Terminal completion still reports items, since the
+        # tracker's SDC_ITEMS_SYNCED is per item.
         if dpla_id_count == 0:
             start_state = "queued" if waiting_on_slots else "starting..."
             return f"SDC syncing ({start_state}){slot_suffix}", log_mtime
@@ -597,8 +599,21 @@ def get_phase_and_progress(
         if total_ordinals > 0 and ordinal_count > 0:
             files_pct = f"{ordinal_count / total_ordinals * 100:.1f}"
             progress = f"{ordinal_count:,} / {total_ordinals:,} files, ~{files_pct}%"
-        else:
+        elif dpla_id_count <= total:
+            # Legacy partner-mode SDC with no download log: the per-partner ids
+            # CSV is a valid item denominator and each "DPLA ID:" marker is one
+            # item. (dpla_id_count > 0 here — the == 0 case returned above.)
             progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
+        else:
+            # Maintain --cat/--file ("lite") mode: the scope is a Commons
+            # category or file list, not the per-partner ids CSV, so `total`
+            # (the {label}.csv wc -l) is a stale/unrelated count — or 0 — and
+            # there's no download log for ordinals. sdc_sync logs one
+            # "DPLA ID:" marker per category-member FILE on this path
+            # (tools/sdc_sync.py), so report that file count alone rather than a
+            # ratio against a denominator that doesn't describe the scope (the
+            # mismatch is what produced the ">100%" readout).
+            progress = f"{dpla_id_count:,} files processed"
         return (
             f"SDC syncing ({progress}){slot_suffix}{stale_suffix}",
             log_mtime,
