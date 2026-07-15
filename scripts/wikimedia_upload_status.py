@@ -331,8 +331,10 @@ def get_phase_and_progress(
         f"/Skipping.*Already exists on commons/ {{s++}} "
         f"/COUNTS:/ {{c++}} "
         f"/-- Ordinal [0-9]+:/ {{o++}} "
-        f"END {{ print d+0; print u+0; print s+0; print c+0; print o+0 }}"
-        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n0\\n'; "
+        f"/UPLOAD_HAND_FIX:/ {{hf=$2}} "
+        f"/UPLOAD_MERGED_TO_CANONICAL:/ {{mg=$2}} "
+        f"END {{ print d+0; print u+0; print s+0; print c+0; print o+0; print hf+0; print mg+0 }}"
+        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n0\\n0\\n0\\n'; "
         f"{csv_count_cmd}; "
         f"echo {sep}; "
         f"DOWNLOG=$(ls -t {log_dir}/*-{label}-download.log 2>/dev/null | head -1); "
@@ -354,17 +356,22 @@ def get_phase_and_progress(
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
 
     # Layout matches the awk-then-wc shell command above: the awk pass emits
-    # five counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal) and then
-    # `wc -l` emits the CSV total — six lines in total. ``ordinal_count``
-    # is the count of ``-- Ordinal N:`` markers in the active log, which
-    # the SDC phase emits one of per file (numerator for SDC's file-level
-    # progress).
+    # seven counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal, HAND-FIX,
+    # MERGED) and then `wc -l` emits the CSV total — eight lines in total.
+    # HAND-FIX / MERGED are read from the terminal ``COUNTS:`` block (the
+    # authoritative tracker values, one per SHA1-uniqueness outcome) so the
+    # completion summary reports those alongside uploaded/skipped rather than
+    # only the two happy-path counts. ``ordinal_count`` is the count of
+    # ``-- Ordinal N:`` markers in the active log, which the SDC phase emits
+    # one of per file (numerator for SDC's file-level progress).
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
     counts_marker = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
     ordinal_count = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
-    total = _safe_int(count_lines[5]) if len(count_lines) > 5 else 0
+    hand_fix_count = _safe_int(count_lines[5]) if len(count_lines) > 5 else 0
+    merged_count = _safe_int(count_lines[6]) if len(count_lines) > 6 else 0
+    total = _safe_int(count_lines[7]) if len(count_lines) > 7 else 0
 
     # Sum of `Item <id>: N ordinals` lines from the download log — the true
     # file count once downloads have completed. 0 when no download log was
@@ -431,7 +438,9 @@ def get_phase_and_progress(
         # files finish, so count arithmetic alone can fire too early.
         if counts_marker > 0:
             return (
-                f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)",
+                f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, "
+                f"{skipped_count:,} already on Commons, {merged_count:,} merged, "
+                f"{hand_fix_count:,} hand-fix)",
                 log_mtime,
             )
         # File-level progress: the download log gives us the true total

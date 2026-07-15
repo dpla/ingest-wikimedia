@@ -131,6 +131,8 @@ def _fake_ssm_for_phase(
     awk_counts: list[int],
     csv_total: int,
     *,
+    hand_fix: int = 0,
+    merged: int = 0,
     mtime: int = 1700000000,
     now: int | None = None,
     tail: str = "last log line",
@@ -173,6 +175,9 @@ def _fake_ssm_for_phase(
         # callers pass an explicit later ``now`` to exercise staleness.
         body = f"{now_val}\n{mtime}\n{sep}\n{tail}\n{sep}\n"
         body += "\n".join(str(n) for n in awk_counts) + "\n"
+        # HAND-FIX + MERGED (the real awk reads these from the terminal
+        # COUNTS: block) sit between the 5 awk markers and the wc CSV total.
+        body += f"{hand_fix}\n{merged}\n"
         body += f"{csv_total}\n"
         body += f"{sep}\n{total_ordinals}\n"
         return body
@@ -205,7 +210,7 @@ def test_get_phase_and_progress_retry_label_reads_retry_dir_csvs():
         # then csv total = 5 (sum of download+upload retry CSVs)
         return (
             "1700000000\n1700000000\n__WM_SEP__\nDownloading something\n"
-            "__WM_SEP__\n2\n0\n0\n0\n0\n5\n"
+            "__WM_SEP__\n2\n0\n0\n0\n0\n0\n0\n5\n"
         )
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
@@ -1537,6 +1542,38 @@ def test_upload_progress_reports_file_level_when_download_log_available():
     assert "items" not in phase, (
         f"file-level reporting must replace item-level: got {phase!r}"
     )
+
+
+def test_upload_complete_summary_reports_hand_fix_and_merged():
+    """The session-summary completion line surfaces the SHA1-uniqueness
+    outcomes (MERGED + HAND-FIX) read from the terminal COUNTS: block —
+    not just uploaded / already-on-Commons."""
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    # counts_marker=1 => session complete => the COUNTS: block was written,
+    # from which merged (12) and hand_fix (7) are read.
+    fake = _fake_ssm_for_phase(
+        log_filename="20260528-091047-ohio+state-library-upload.log",
+        # [dpla_id, uploaded, skipping, counts_marker, ordinal]
+        awk_counts=[100, 60, 20, 1, 0],
+        hand_fix=7,
+        merged=12,
+        csv_total=100,
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None,
+            session="wikimedia-ohio+state-library",
+            hub="ohio",
+            label="ohio+state-library",
+        )
+    assert phase is not None
+    assert "60 uploaded" in phase, phase
+    assert "20 already on Commons" in phase, phase
+    assert "12 merged" in phase, phase
+    assert "7 hand-fix" in phase, phase
 
 
 def test_upload_progress_falls_back_to_item_level_when_no_download_log():
