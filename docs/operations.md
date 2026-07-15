@@ -435,12 +435,6 @@ When triggered by Slack: always posts (even if no sessions are running).
 
 For each active session, reports the current phase and progress percentage by inspecting the most recent log file.
 
-### `dpla-dup-window.yml`
-
-Triggered by: schedule (hourly), or manually from the Actions tab.
-
-Advances the DPLA duplicate "moving window" so a bounded number of DPLA files stay visible in Commons' Category:Duplicate at a time, oldest-first, as admins clear them. Independent of the upload pipeline — it manages what is already tagged, complementing the uploader's [deferred-drain throttle](#phase-5-deferred-drain-drain-deferred). The `workflow_dispatch` form accepts `target` (default `100` visible DPLA files) and `dry_run` (compute the plan but make no edits).
-
 ---
 
 ## Lambda dispatch mechanism
