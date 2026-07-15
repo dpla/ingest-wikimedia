@@ -117,6 +117,7 @@ from ingest_wikimedia.wikimedia import (
     get_wiki_text,
     wikimedia_url,
     find_file_by_hash,
+    first_uploader,
     extract_dpla_id_from_commons_title,
     is_same_item_redirect_relic,
     check_content_type,
@@ -263,6 +264,18 @@ ORDINAL_FAILED = "FAILED"  # upload attempted, raised, did not land
 #     canonical file inline and our intended title is now a #REDIRECT to it.
 ORDINAL_HAND_FIX = "HAND_FIX"
 ORDINAL_MERGED = "MERGED"
+
+# A file is "community" — off-limits to our automated rename / SDC-merge /
+# redirect / template-migration — only when BOTH signals say it isn't ours:
+# its title lacks the DPLA/NARA naming shape AND its original uploader isn't
+# one of our bots. The AND is deliberate; see ``Uploader._is_community_file``.
+_DPLA_TITLE_MARKERS = (" - DPLA - ", " - NARA - ")
+_DPLA_BOT_UPLOADERS = frozenset({"DPLA bot", "US National Archives bot"})
+
+
+def _has_dpla_shaped_title(title: str) -> bool:
+    """True when a Commons title carries the DPLA or NARA naming shape."""
+    return any(marker in title for marker in _DPLA_TITLE_MARKERS)
 
 
 class DriftResolution(str, Enum):
@@ -831,6 +844,21 @@ class Uploader:
                 # branch below falls through to the download/upload path.
                 if existing_file is not None:
                     existing_title = existing_file.title(with_ns=False)
+                    # Community files are off-limits to our automation: never
+                    # rename, merge onto, redirect, or migrate a file that is
+                    # BOTH non-DPLA/NARA-shaped in title AND not one of our
+                    # bots' uploads. Hand it to a human (distinct reason) and
+                    # stop — checked before any drift resolution so no MOVE /
+                    # MERGE_AND_REDIRECT can touch a community file.
+                    if self._is_community_file(existing_file):
+                        return self._record_community_hand_fix_and_skip(
+                            partner=partner,
+                            dpla_id=dpla_id,
+                            ordinal=ordinal,
+                            our_sha1=sha1,
+                            intended_title=page_title,
+                            community_file=existing_file,
+                        )
                     # Within-item source duplication: the same bytes sit at
                     # another of THIS item's current asset positions (its own
                     # sibling ordinal). Centralize on that sibling (canonical)
@@ -2007,6 +2035,72 @@ class Uploader:
             f"(DPLA ID {dpla_id} ordinal {ordinal})."
         )
 
+    def _is_community_file(self, file_page: pywikibot.FilePage) -> bool:
+        """A file is 'community' — off-limits to our automated rename, SDC
+        merge, redirect, or template migration — only when BOTH signals say it
+        isn't ours: (1) its title lacks the DPLA/NARA shape (``- DPLA -`` /
+        ``- NARA -``), AND (2) its ORIGINAL uploader isn't one of our bots
+        (DPLA bot / US National Archives bot).
+
+        The AND is deliberate. A bot upload with a malformed title (shape fails
+        but uploader is ours) is still ours to fix; a DPLA-shaped file uploaded
+        from a personal account (uploader fails but shape is ours) is still
+        ours to act on. Only a file that looks non-ours on BOTH axes is handed
+        to a human. When the uploader can't be read, err toward community
+        (hands-off)."""
+        if _has_dpla_shaped_title(file_page.title(with_ns=False)):
+            return False
+        try:
+            uploader = first_uploader(file_page)
+        except Exception:  # noqa: BLE001 — unreadable history → treat as community
+            uploader = None
+        return uploader not in _DPLA_BOT_UPLOADERS
+
+    def _record_community_hand_fix_and_skip(
+        self,
+        *,
+        partner: str,
+        dpla_id: str,
+        ordinal: int,
+        our_sha1: str,
+        intended_title: str,
+        community_file: pywikibot.FilePage,
+    ) -> dict:
+        """Our S3 SHA1 matches a COMMUNITY-uploaded file (see
+        :meth:`_is_community_file`). We never rename, merge onto, redirect, or
+        migrate a community file — record it for human review with the distinct
+        ``community_file`` reason and skip (no upload). Best-effort sidecar
+        write; the ordinal is counted as HAND_FIX regardless."""
+        community_title = community_file.title(with_ns=False)
+        try:
+            uploader = first_uploader(community_file)
+        except Exception:  # noqa: BLE001
+            uploader = None
+        try:
+            community_sha1 = community_file.latest_file_info.sha1
+        except Exception:  # noqa: BLE001
+            community_sha1 = None
+        logging.warning(
+            f"HAND-FIX (community) for {dpla_id} {ordinal}: our SHA1 "
+            f"({our_sha1}) matches community-uploaded "
+            f"[[File:{community_title}]] (uploader {uploader!r}); not "
+            f"renaming/merging/migrating a community file — recorded to the "
+            f"hand-fix sidecar."
+        )
+        hand_fix_sidecar.record_hand_fix(
+            partner,
+            dpla_id=dpla_id,
+            ordinal=ordinal,
+            our_sha1=our_sha1,
+            intended_title=intended_title,
+            occupying_title=community_title,
+            occupying_sha1=community_sha1,
+            reason="community_file",
+            community_uploader=uploader,
+        )
+        self.tracker.increment(Result.UPLOAD_HAND_FIX)
+        return {"status": ORDINAL_HAND_FIX, "title": None, "pageid": None}
+
     def _record_hand_fix_and_skip(
         self,
         *,
@@ -2058,6 +2152,7 @@ class Uploader:
             intended_title=intended_title,
             occupying_title=occupying_title,
             occupying_sha1=occupying_sha1,
+            reason="rename_blocked",
             current_title=our_current_title,
         )
         self.tracker.increment(Result.UPLOAD_HAND_FIX)

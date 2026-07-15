@@ -1308,6 +1308,95 @@ def test_track_ordinal_skip_bumps_both_legacy_and_granular_counters():
 # ---------------------------------------------------------------------------
 
 
+def test_is_community_file_true_when_non_shaped_and_non_bot():
+    """Non-DPLA/NARA-shaped title AND a non-bot uploader → community (both
+    signals non-ours), so hands-off."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    fp = _drift_existing_file("Grandma's quilt, summer 1932.jpg")
+    with patch.object(um, "first_uploader", return_value="SomeVolunteer"):
+        assert up._is_community_file(fp) is True
+
+
+def test_is_community_file_false_for_dpla_or_nara_shaped_title():
+    """A DPLA/NARA-shaped title is ours regardless of uploader — covers the
+    'manual DPLA upload from a personal account' edge case."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    with patch.object(um, "first_uploader", return_value="APersonalAccount"):
+        assert (
+            up._is_community_file(
+                _drift_existing_file(
+                    "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg"
+                )
+            )
+            is False
+        )
+        assert (
+            up._is_community_file(_drift_existing_file('"Photo." - NARA - 12345.tif'))
+            is False
+        )
+
+
+def test_is_community_file_false_for_non_shaped_but_bot_uploaded():
+    """A bot upload with a malformed (non-shaped) title is still ours to
+    fix — covers the 'bot uploaded a malformed title' edge case."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    fp = _drift_existing_file("malformed title, no dpla marker.jpg")
+    for bot in ("DPLA bot", "US National Archives bot"):
+        with patch.object(um, "first_uploader", return_value=bot):
+            assert up._is_community_file(fp) is False
+
+
+def test_is_community_file_true_when_uploader_unreadable_and_non_shaped():
+    """Unreadable file history + non-shaped title → err toward community
+    (hands-off) rather than risk touching a non-ours file."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    fp = _drift_existing_file("mystery-scan.jpg")
+    with patch.object(um, "first_uploader", side_effect=RuntimeError("no history")):
+        assert up._is_community_file(fp) is True
+
+
+def test_record_community_hand_fix_and_skip_uses_distinct_reason():
+    """The community hand-fix records the distinct ``community_file`` reason,
+    counts one HAND_FIX, returns ORDINAL_HAND_FIX, and never uploads."""
+    from ingest_wikimedia.tracker import Result, Tracker
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    up.tracker = Tracker()
+    community = _drift_existing_file("Grandma's quilt.jpg")
+    community.latest_file_info.sha1 = "deadbeef"
+    recorded = {}
+    with (
+        patch.object(um, "first_uploader", return_value="Volunteer"),
+        patch.object(
+            um.hand_fix_sidecar,
+            "record_hand_fix",
+            side_effect=lambda *a, **kw: recorded.update(kw),
+        ),
+    ):
+        result = up._record_community_hand_fix_and_skip(
+            partner="ohio",
+            dpla_id="abc",
+            ordinal=1,
+            our_sha1="deadbeef",
+            intended_title="Foo - DPLA - abc.jpg",
+            community_file=community,
+        )
+    assert result["status"] == um.ORDINAL_HAND_FIX
+    assert result["title"] is None
+    assert recorded["reason"] == "community_file"
+    assert recorded["community_uploader"] == "Volunteer"
+    assert up.tracker.count(Result.UPLOAD_HAND_FIX) == 1
+
+
 def _uploader_for_helper_tests():
     """Build an ``Uploader`` instance bypassing ``__init__`` for direct
     invocation of internal helpers — sufficient when the helper only
