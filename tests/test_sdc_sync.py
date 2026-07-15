@@ -3056,7 +3056,7 @@ def test_amend_p760_page_qualifier_noop_when_page_number_is_none_and_no_existing
             "M999",
             "abcdef",
             {"claims": [], "ingest_date": "2026-06-23"},
-            page_number=None,
+            page_numbers=None,
         )
     assert submit_calls == []
     # No writes happened → no terminal invalidate.
@@ -3101,7 +3101,7 @@ def test_amend_p760_page_qualifier_removes_stale_p304_when_page_number_is_none()
             "M999",
             "abcdef",
             {"claims": [], "ingest_date": "2026-06-23"},
-            page_number=None,
+            page_numbers=None,
         )
 
     assert sdc_sync.qualifier_removals == [("M999$p760id", "obsolete-hash")]
@@ -3130,7 +3130,10 @@ def test_amend_p760_page_qualifier_stamps_missing_p304_via_accumulator():
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={2},
         )
 
     assert len(sdc_sync.qualifier_amends) == 1
@@ -3167,7 +3170,10 @@ def test_amend_p760_page_qualifier_idempotent_when_p304_already_matches():
         patch.object(sdc_sync, "invalidate_entity"),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={2},
         )
 
 
@@ -3193,7 +3199,10 @@ def test_amend_p760_page_qualifier_skips_when_no_dpla_authored_p760():
         patch.object(sdc_sync, "invalidate_entity"),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=1
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={1},
         )
 
 
@@ -3232,7 +3241,10 @@ def test_amend_p760_page_qualifier_removes_stale_value_when_page_changes():
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={2},
         )
 
     assert sdc_sync.qualifier_removals == [("M999$p760id", "stale-snak-hash-3")]
@@ -3282,7 +3294,10 @@ def test_amend_p760_page_qualifier_removes_stale_when_expected_also_present():
     sdc_sync._reset_per_file_accumulators()
     with patch.object(sdc_sync, "get_entity", return_value=entity):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={2},
         )
 
     # Only the stale snak got queued for removal; the expected value
@@ -3571,10 +3586,256 @@ def test_amend_p760_page_qualifier_does_not_re_invalidate_when_p304_matches():
         ),
     ):
         sdc_sync._amend_p760_page_qualifier(
-            "M999", "abcdef", {"claims": [], "ingest_date": "2026-06-23"}, page_number=2
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={2},
         )
 
     assert invalidate_calls == []
+
+
+def test_amend_p760_page_qualifier_stamps_multiple_pages_for_merged_file():
+    """A merged within-item duplicate (rule #3) carries SEVERAL page numbers
+    on one P760 statement — ``page_numbers`` is a multi-element set and every
+    missing value is queued as its own P304 snak."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={3, 1},
+        )
+
+    stamped = sorted(
+        snak["datavalue"]["value"]
+        for (_cid, prop, snak) in sdc_sync.qualifier_amends
+        if prop == "P304"
+    )
+    assert stamped == ["1", "3"]
+    assert sdc_sync.qualifier_removals == []
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_amend_p760_page_qualifier_keeps_present_adds_missing_removes_stale():
+    """Merged file: expected pages {1,2}; existing P304 has "1" (keep) and a
+    stale "9" (remove). Only the missing "2" is added; "1" is untouched."""
+    from tools import sdc_sync
+
+    existing_p760 = {
+        "id": "M999$p760id",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abcdef"},
+        },
+        "qualifiers": {
+            "P459": _dpla_p459(),
+            "P304": [
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "1"},
+                    "hash": "h1",
+                },
+                {
+                    "snaktype": "value",
+                    "property": "P304",
+                    "datavalue": {"type": "string", "value": "9"},
+                    "hash": "h9",
+                },
+            ],
+        },
+        "references": [_dpla_reference("abcdef")],
+    }
+    entity = {"pageid": 999, "statements": {"P760": [existing_p760]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        sdc_sync._amend_p760_page_qualifier(
+            "M999",
+            "abcdef",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={1, 2},
+        )
+
+    added = [
+        snak["datavalue"]["value"]
+        for (_c, p, snak) in sdc_sync.qualifier_amends
+        if p == "P304"
+    ]
+    assert added == ["2"]  # only the missing page is added
+    assert sdc_sync.qualifier_removals == [("M999$p760id", "h9")]  # stale removed
+    sdc_sync._reset_per_file_accumulators()
+
+
+def test_build_qualifier_fragments_unions_multiple_p304_snaks():
+    """Two P304 amends queued for one P760 statement (a merged within-item
+    duplicate) fold into a SINGLE fragment carrying BOTH page snaks — the
+    wholesale-replace qualifier set is the union, not last-writer-wins — and
+    the fragment carries ``type: statement`` so the atomic bundle isn't
+    rejected."""
+    from tools import sdc_sync
+
+    stmt = {
+        "id": "M7$p760",
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": "abc"},
+        },
+        "rank": "normal",
+        "qualifiers": {"P459": _dpla_p459()},
+        "references": [_dpla_reference("abc")],
+    }
+    entity = {"pageid": 7, "statements": {"P760": [stmt]}}
+
+    sdc_sync._reset_per_file_accumulators()
+    sdc_sync.qualifier_amends.append(
+        ("M7$p760", "P304", sdc_sync._string_snak("P304", "1"))
+    )
+    sdc_sync.qualifier_amends.append(
+        ("M7$p760", "P304", sdc_sync._string_snak("P304", "3"))
+    )
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags = sdc_sync._build_qualifier_update_fragments("M7")
+    sdc_sync._reset_per_file_accumulators()
+
+    assert len(frags) == 1
+    values = sorted(s["datavalue"]["value"] for s in frags[0]["qualifiers"]["P304"])
+    assert values == ["1", "3"]
+    assert frags[0]["type"] == "statement"
+    assert frags[0]["mainsnak"]["property"] == "P760"
+
+
+def test_normalize_pages_accepts_int_iterable_or_none():
+    from tools import sdc_sync
+
+    assert sdc_sync._normalize_pages(None) == set()
+    assert sdc_sync._normalize_pages(2) == {"2"}
+    assert sdc_sync._normalize_pages("3") == {"3"}
+    assert sdc_sync._normalize_pages({1, 3}) == {"1", "3"}
+    assert sdc_sync._normalize_pages([1, 2, 2]) == {"1", "2"}
+
+
+def test_contributing_dpla_ids_reads_p760_values():
+    from tools import sdc_sync
+
+    def _p760(val):
+        return {
+            "id": f"M1${val}",
+            "mainsnak": {
+                "property": "P760",
+                "snaktype": "value",
+                "datavalue": {"type": "string", "value": val},
+            },
+        }
+
+    assert sdc_sync._contributing_dpla_ids(
+        {"statements": {"P760": [_p760("aaa")]}}
+    ) == {"aaa"}
+    assert sdc_sync._contributing_dpla_ids(
+        {"statements": {"P760": [_p760("aaa"), _p760("bbb")]}}
+    ) == {"aaa", "bbb"}
+    assert sdc_sync._contributing_dpla_ids({}) == set()
+    # somevalue/novalue P760 snaks carry no id and are ignored
+    assert (
+        sdc_sync._contributing_dpla_ids(
+            {
+                "statements": {
+                    "P760": [
+                        {"mainsnak": {"property": "P760", "snaktype": "somevalue"}}
+                    ]
+                }
+            }
+        )
+        == set()
+    )
+
+
+def test_merge_item_onto_canonical_delegates_add_only():
+    """Rule #3 merge entry point is a thin, add-only wrapper: it calls
+    process_one_from_sdc against the canonical mediaid with reconcile=False so
+    no other contributor's statements are removed, forwarding page numbers."""
+    from tools import sdc_sync
+
+    calls = []
+    with patch.object(
+        sdc_sync,
+        "process_one_from_sdc",
+        side_effect=lambda *a, **kw: calls.append((a, kw)),
+    ):
+        sdc_sync.merge_item_onto_canonical(
+            "M42",
+            "dupid",
+            {"claims": [], "ingest_date": "2026-06-23"},
+            page_numbers={5},
+            download_url="http://x/y.jpg",
+        )
+    assert len(calls) == 1
+    args, kw = calls[0]
+    assert args == ("M42", "dupid", {"claims": [], "ingest_date": "2026-06-23"})
+    assert kw["reconcile"] is False
+    assert kw["page_number"] == {5}
+    assert kw["download_url"] == "http://x/y.jpg"
+
+
+def test_process_one_from_sdc_skips_reconcile_on_merged_file():
+    """A merged (multi-contributor, >1 P760) file must NOT be reconciled by a
+    single item's sync — otherwise item A's sync would strip item B's merged
+    statements. Single-contributor files reconcile exactly as before."""
+    from tools import sdc_sync
+
+    def _p760(val):
+        return {
+            "id": f"M1${val}",
+            "mainsnak": {
+                "property": "P760",
+                "snaktype": "value",
+                "datavalue": {"type": "string", "value": val},
+            },
+        }
+
+    payload = {"claims": [], "ingest_date": "2026-06-23"}
+
+    def run(entity):
+        recon = []
+        with (
+            patch.object(sdc_sync, "get_entity", return_value=entity),
+            patch.object(sdc_sync, "_amend_p7482_url_qualifiers"),
+            patch.object(sdc_sync, "_amend_p760_page_qualifier"),
+            patch.object(sdc_sync, "_reconcile_inferred_from_wikitext_dupes"),
+            patch.object(sdc_sync, "_flush_per_file_edits"),
+            patch.object(
+                sdc_sync,
+                "_reconcile_existing_claims",
+                side_effect=lambda *a, **kw: recon.append(a),
+            ),
+        ):
+            sdc_sync.process_one_from_sdc("M999", "aaa", payload)
+        return recon
+
+    # single contributor -> reconciliation runs
+    assert run({"pageid": 999, "statements": {"P760": [_p760("aaa")]}})
+    # merged (two distinct P760) -> reconciliation skipped
+    assert (
+        run({"pageid": 999, "statements": {"P760": [_p760("aaa"), _p760("bbb")]}}) == []
+    )
 
 
 def test_qualifier_values_returns_empty_when_no_qualifiers():

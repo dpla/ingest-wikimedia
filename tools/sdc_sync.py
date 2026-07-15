@@ -2111,7 +2111,7 @@ def _compute_page_numbers(ordinal_items):
     return page_numbers
 
 
-def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
+def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_numbers):
     """Stamp a missing ``P304`` (page-number) qualifier onto an existing
     DPLA-authored ``P760`` (DPLA ID) statement on Commons.
 
@@ -2132,13 +2132,14 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     cleanup pass a file would keep incorrect page metadata after its
     sibling ordinals were deleted.
     """
-    # ``page_number=None`` means "no P304 is expected for this file" —
-    # typically a file that was once part of a multi-file extension
-    # group (with a P304 stamped) but is now a singleton in its group
-    # (e.g. siblings were deleted by a Commons curator). We must still
-    # walk the existing qualifiers and queue any stale P304 removal;
-    # otherwise the file keeps incorrect page metadata indefinitely.
-    expected_value = None if page_number is None else str(page_number)
+    # An empty ``page_numbers`` means "no P304 is expected for this file" —
+    # e.g. a file once part of a multi-file extension group (with a P304
+    # stamped) that is now a singleton in its group (siblings deleted by a
+    # Commons curator). We still walk the existing qualifiers and queue any
+    # stale P304 removal so the file doesn't keep incorrect page metadata.
+    # A multi-element set is a merged file (rule #3 within-item duplicate)
+    # that legitimately carries several page numbers on one P760 statement.
+    expected_values = {str(p) for p in (page_numbers or [])}
 
     entity = get_entity(mediaid)
     existing_p760 = (entity.get("statements") or {}).get("P760") or []
@@ -2161,21 +2162,21 @@ def _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number):
     # for removal). The dispatcher will assemble the wholesale-replace
     # qualifier set from the combined adds and removes across all
     # accumulators when it builds the final wbeditentity payload.
-    expected_already_present = False
+    present = set()
     for q in target_stmt.get("qualifiers", {}).get("P304", []) or []:
         if q.get("snaktype") != "value":
             continue
         dv = q.get("datavalue")
         if not (isinstance(dv, dict) and "value" in dv):
             continue
-        if expected_value is not None and dv["value"] == expected_value:
-            expected_already_present = True
+        if dv["value"] in expected_values:
+            present.add(dv["value"])
         elif q.get("hash"):
             qualifier_removals.append((target_stmt["id"], q["hash"]))
 
-    if expected_value is not None and not expected_already_present:
+    for value in sorted(expected_values - present):
         qualifier_amends.append(
-            (target_stmt["id"], "P304", _string_snak("P304", expected_value))
+            (target_stmt["id"], "P304", _string_snak("P304", value))
         )
 
 
@@ -4425,8 +4426,56 @@ def process_one(mediaid, dpla_id):
         return
 
 
+def _normalize_pages(page_number) -> set[str]:
+    """Normalize the ``page_number`` argument to a set of string P304 values.
+
+    Accepts a single int (the per-ordinal case), an iterable of ints/strs (a
+    merged within-item duplicate carrying several page numbers on one P760),
+    or ``None`` (no page number). A single int reproduces the historical
+    one-page behavior exactly.
+    """
+    if isinstance(page_number, (str, int)):
+        return {str(page_number)}
+    return {str(p) for p in (page_number or [])}
+
+
+def _contributing_dpla_ids(entity) -> set[str]:
+    """DPLA IDs currently represented on a MediaInfo entity, read from its
+    P760 (DPLA ID) statements.
+
+    A file carrying more than one is a MERGED (multi-contributor) file per
+    rule #3 (SDC-merge instead of uploading a duplicate SHA1). Because each
+    contributing DPLA ID has its own P760 statement, the contributor set is
+    self-describing on the entity — no separate manifest sidecar is needed.
+    Used to gate reconciliation so one item's sync can't strip another's
+    merged statements.
+    """
+    ids = set()
+    for stmt in (entity.get("statements") or {}).get("P760", []) or []:
+        try:
+            if stmt["mainsnak"]["snaktype"] == "value":
+                ids.add(stmt["mainsnak"]["datavalue"]["value"])
+        except (KeyError, TypeError):
+            continue
+    return ids
+
+
+def _is_merged_file(entity) -> bool:
+    """True when a MediaInfo entity carries more than one DPLA ID (P760) — a
+    merged, multi-contributor file (rule #3). Such files must not be
+    reconciled by a single item's sync, which only knows its own item's
+    expected statement set.
+    """
+    return len(_contributing_dpla_ids(entity)) > 1
+
+
 def process_one_from_sdc(
-    mediaid, dpla_id, sdc_payload, download_url=None, page_number=None
+    mediaid,
+    dpla_id,
+    sdc_payload,
+    download_url=None,
+    page_number=None,
+    reconcile=True,
 ):
     """Sync SDC for a single Commons file against a precomputed claim list.
 
@@ -4484,6 +4533,11 @@ def process_one_from_sdc(
         )
     _current_ingest_date = datetime.date.fromisoformat(raw_ingest_date)
 
+    # Normalize page_number (a single int for the per-ordinal case, an
+    # iterable for a merged within-item duplicate, or None) to a set of
+    # string P304 values; one qualifier snak is stamped per value.
+    pages = _normalize_pages(page_number)
+
     sdc_claims = sdc_payload.get("claims", [])
     first_check = True
     for source_claim in sdc_claims:
@@ -4512,13 +4566,14 @@ def process_one_from_sdc(
         # claim — same per-ordinal rationale as P2699 above. Only stamped
         # for files that are part of a multi-file extension group on a
         # multipage item; ``page_number`` is ``None`` otherwise.
-        if prop == "P760" and page_number is not None:
+        if prop == "P760" and pages:
             claim.setdefault("qualifiers", {})["P304"] = [
                 {
                     "snaktype": "value",
                     "property": "P304",
-                    "datavalue": {"value": str(page_number), "type": "string"},
+                    "datavalue": {"value": p, "type": "string"},
                 }
+                for p in sorted(pages)
             ]
 
         kind = _check_kind_for_claim(claim)
@@ -4552,11 +4607,55 @@ def process_one_from_sdc(
     # the new-claims / new-refs lists populated by the check() walk
     # above) are then flushed in one atomic wbeditentity per file.
     _amend_p7482_url_qualifiers(mediaid, dpla_id, sdc_payload, download_url)
-    _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, page_number)
-    expected = _build_expected_from_sdc(sdc_payload)
-    _reconcile_existing_claims(mediaid, dpla_id, expected)
-    _reconcile_inferred_from_wikitext_dupes(mediaid)
+    _amend_p760_page_qualifier(mediaid, dpla_id, sdc_payload, pages)
+    # Reconciliation removes DPLA-authored statements not warranted by this
+    # item's sdc.json. On a MERGED file (rule #3 — more than one DPLA ID
+    # present), each per-item sync only knows its own expected set, so
+    # reconciling here would strip the other contributors' statements. Skip
+    # removal for merged files (add-only) and when the caller opts out
+    # (merge_item_onto_canonical). Single-contributor files — every file
+    # today — reconcile exactly as before, so this is a no-op until PR C
+    # starts merging.
+    if reconcile:
+        if _is_merged_file(get_entity(mediaid)):
+            logging.info(
+                " -- %s carries multiple DPLA IDs (merged); skipping "
+                "reconciliation to preserve other contributors' statements.",
+                mediaid,
+            )
+        else:
+            expected = _build_expected_from_sdc(sdc_payload)
+            _reconcile_existing_claims(mediaid, dpla_id, expected)
+            _reconcile_inferred_from_wikitext_dupes(mediaid)
     _flush_per_file_edits(mediaid, dpla_id)
+
+
+def merge_item_onto_canonical(
+    canonical_mediaid, dpla_id, sdc_payload, page_numbers=None, download_url=None
+):
+    """Rule #3: merge a duplicate DPLA item's SDC onto the already-existing
+    canonical Commons file instead of uploading a second byte-identical file.
+
+    Adds this item's P760 (DPLA ID) and any non-duplicative statements as
+    ADDITIONAL values, and stamps its page number(s) as P304 qualifiers, via
+    the same ``check()`` / accumulator machinery ``process_one_from_sdc`` uses
+    — ``check()`` already adds a not-present value alongside and skips one
+    already present, so the merge is additive and idempotent. Reconciliation
+    is disabled (``reconcile=False``) so the canonical owner's (and any other
+    contributor's) statements are never removed.
+
+    ``page_numbers`` is the set of within-item page numbers this DPLA ID
+    occupies on the canonical file (the within-item duplicate case); ``None``
+    when the duplication is cross-item / cross-institution.
+    """
+    process_one_from_sdc(
+        canonical_mediaid,
+        dpla_id,
+        sdc_payload,
+        download_url=download_url,
+        page_number=page_numbers,
+        reconcile=False,
+    )
 
 
 _NORMALIZE_EDIT_SUMMARY = (
