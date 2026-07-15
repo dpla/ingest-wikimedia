@@ -442,15 +442,6 @@ def test_wrap_step_with_marker_tags_each_tool_with_its_phase():
     _assert_step_export(
         "sdc-sync --partner texas --ids-file x.csv --workers 6", "sdc-sync", "sdc-sync "
     )
-    _assert_step_export("drain-deferred nara", "drain-deferred", "drain-deferred ")
-    # ``drain-deferred --no-wait`` (per-target opportunistic phase)
-    # gets a distinct step name so the failure handler tails the
-    # opportunistic log file rather than the batch-terminal one.
-    _assert_step_export(
-        "drain-deferred --no-wait nara",
-        "drain-deferred-opportunistic",
-        "drain-deferred ",
-    )
     # Non-step commands (``cd``, the case-2 graceful-skip ``echo … ; true``,
     # and the ``sdc-sync --cat`` flavour the maintain builder emits — wait,
     # that one IS sdc-sync. Use a true non-step instead.):
@@ -1070,28 +1061,6 @@ def test_active_and_upcoming_labels_active_at_position_zero_returns_all():
     ):
         result = launch_mod.active_and_upcoming_labels(object(), labels)
     assert result == set(labels)
-
-
-def test_active_and_upcoming_labels_empty_set_when_session_in_terminal_drain():
-    """Regression: when ``find_active_label`` returns a synthetic
-    ``drain-<hub>`` label, the session has completed ALL its
-    per-target chain work and moved on to the box-wide terminal drain
-    phase. No per-target label is a conflict candidate — a new
-    request for any of them must be allowed. Return an empty set to
-    signal "no conflicts from this session"."""
-    import scripts.wikimedia_launch as launch_mod
-
-    labels = [
-        "ohio+ohio-university-libraries",
-        "northwest-heritage+whitman-county-library",
-        "bpl+phillips-academy",
-    ]
-    with patch(
-        "ingest_wikimedia.session_state.find_active_label",
-        return_value=("drain-ohio", 1700000000),
-    ):
-        result = launch_mod.active_and_upcoming_labels(object(), labels)
-    assert result == set()
 
 
 def test_active_and_upcoming_labels_threads_session_created():

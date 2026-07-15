@@ -1056,18 +1056,6 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     return "\n".join(parts) + "\n"
 
 
-# Matches a real {{Duplicate}} template invocation. `\s*` on both sides of
-# `duplicate` accepts the whitespace/newlines wikitext allows inside the
-# braces — `{{ Duplicate|…}}`, `{{Duplicate |…}}` and `{{Duplicate\n|…}}`
-# are all valid invocations Commons editors do use. The trailing
-# `(?:\||\}\})` is what prevents `{{DuplicateImageFinder|…}}` from
-# false-matching: we only count it as a duplicate template when the next
-# non-whitespace token is the parameter pipe or the template's closing
-# braces. IGNORECASE handles both `Duplicate` and the `{{duplicate}}`
-# variant some Commons editors use.
-DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
-
-
 def first_uploader(file_page: FilePage) -> str | None:
     """Return the username that made the first (oldest) upload of
     ``file_page``, or ``None`` if the history is empty or the lookup
@@ -1098,64 +1086,6 @@ def first_uploader(file_page: FilePage) -> str | None:
         )
         return None
     return user if isinstance(user, str) and user else None
-
-
-def tag_as_duplicate(
-    site: BaseSite,
-    file_page: FilePage,
-    correct_filename: str,
-    reason: str = "",
-) -> None:
-    """Prepend {{Duplicate}} to file_page, flagging it for speedy deletion.
-
-    correct_filename should be bare (no 'File:' prefix).
-    reason is the free-text reason shown in the template. When empty
-    (the default), the tag is emitted as ``{{Duplicate|<filename>}}`` —
-    a single-arg form that lets Commons's own default template text
-    speak for the tag, instead of a caller-supplied reason that would be
-    largely duplicative of the template's built-in wording.
-
-    Idempotent: if the page already carries a {{Duplicate}} (or
-    {{duplicate}}) template, this is a no-op. Two distinct uploader code
-    paths can both identify the same file as a duplicate of the same
-    target — the per-asset hash-drift correction during upload, and the
-    post-item trailing-orphan sweep that runs after the asset loop —
-    and unconditionally prepending each time produces a stack of
-    redundant tags on the page (see uploader regression where one file
-    got tagged twice within three seconds with the same correct title).
-
-    Uses the MediaWiki `prependtext` API parameter so the existing page
-    text doesn't need to be fetched, modified, and re-saved. The
-    idempotency check above does cost one GET to read `file_page.text`
-    that the pure-prependtext path avoided, but skipping a redundant
-    write is worth the single read.
-    """
-    if DUPLICATE_TAG_RE.search(file_page.text or ""):
-        logging.info(
-            f"Skipping duplicate tag on [[File:{file_page.title(with_ns=False)}]] — "
-            f"already tagged as duplicate."
-        )
-        return
-    # Escape `=` so a filename or reason containing literal equals signs
-    # doesn't break the template — see escape_template_param.
-    if reason:
-        tag = (
-            f"{{{{Duplicate"
-            f"|{escape_template_param(correct_filename)}"
-            f"|{escape_template_param(reason)}}}}}"
-        )
-    else:
-        tag = f"{{{{Duplicate|{escape_template_param(correct_filename)}}}}}"
-    summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
-    # Trailing newline so the tag sits on its own line above whatever
-    # wikitext currently starts the page.
-    with_csrf_recovery(
-        site,
-        f"editpage tag-as-duplicate ({file_page.title(with_ns=False)})",
-        lambda: site.editpage(
-            file_page, summary=summary, minor=False, prependtext=tag + "\n"
-        ),
-    )
 
 
 INVALID_CONTENT_TYPES = frozenset(

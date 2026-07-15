@@ -35,24 +35,21 @@ def test_log_filename_pattern_matches_only_exact_label():
 
 
 def test_log_filename_pattern_matches_only_phase_suffixes():
-    """The five recognised phase suffixes: download, upload, sdc,
-    drain-deferred, drain-deferred-opportunistic. Anything else (e.g.
-    legacy retirer logs) must not match."""
+    """The recognised phase suffixes: id-generation, download, upload,
+    sdc. Anything else (e.g. legacy retirer logs) must not match."""
     from scripts.wikimedia_upload_status import log_filename_pattern_for_label
 
     pattern = re.compile(log_filename_pattern_for_label("nara"))
+    assert pattern.search("20260522-100000-nara-id-generation.log")
     assert pattern.search("20260522-100000-nara-download.log")
     assert pattern.search("20260522-100000-nara-upload.log")
     assert pattern.search("20260522-100000-nara-sdc.log")
-    assert pattern.search("20260522-100000-nara-drain-deferred.log")
-    assert pattern.search("20260522-100000-nara-drain-deferred-opportunistic.log")
     # Other phases (e.g. legacy retirer logs) must NOT match
     assert not pattern.search("20251220-012010-nara-retirer.log")
     assert not pattern.search("20260522-100000-nara-fix.log")
     # Guard against a partial-match footgun: the pattern must be anchored
-    # so that "nara-drain-deferred-oops.log" is NOT interpreted as a
-    # valid drain-deferred variant.
-    assert not pattern.search("20260522-100000-nara-drain-deferred-oops.log")
+    # so that "nara-sdc-oops.log" is NOT interpreted as a valid sdc variant.
+    assert not pattern.search("20260522-100000-nara-sdc-oops.log")
 
 
 def test_log_filename_pattern_handles_regex_metachars_in_label():
@@ -503,232 +500,6 @@ def test_main_picks_latest_active_label_by_mtime_when_earlier_label_aborted():
     chosen_label, chosen_phase, _ = max(active_labels, key=lambda t: t[2])
     assert chosen_label == "nara+center-for-legislative-archives"
     assert chosen_phase == active_phase
-
-
-def _fake_ssm_for_drain(
-    *,
-    log_filename: str,
-    tail: str,
-    queued: int,
-    lock_acquired_count: int | None = None,
-    mtime: int = 1700000000,
-    session_created: int = 0,
-):
-    """Two-call SSM fake for the drain-deferred phase code path.
-
-    Call 1 (precheck): ``session_created\\nlog_filename\\n``.
-    Call 2 (drain state): four SEP-delimited sections —
-    ``{mtime}<SEP>{tail}<SEP>{queued}<SEP>{lock_acquired_count}`` where
-    SEP is ``__WM_DRAIN_SEP__``. The 4th section is the whole-file
-    ``grep -c`` of the lock-acquired marker (decoupled from ``tail`` so
-    the reporter can't be fooled by tail-window eviction on long
-    drains).
-
-    ``lock_acquired_count`` defaults to being derived from ``tail`` —
-    mirroring the common case where the marker is still in-window — but
-    can be set explicitly to exercise the tail-eviction regression
-    (marker present in the full file, absent from the tail).
-    """
-    call = [0]
-    sep = "__WM_DRAIN_SEP__"
-    if lock_acquired_count is None:
-        lock_acquired_count = 1 if "Drain-phase host lock acquired." in tail else 0
-
-    def fake(_client, _cmd, **_kw):
-        call[0] += 1
-        if call[0] == 1:
-            return f"{session_created}\n{log_filename}\n"
-        return (
-            f"{mtime}\n{sep}\n{tail}\n{sep}\n{queued}\n{sep}\n{lock_acquired_count}\n"
-        )
-
-    return fake
-
-
-def test_drain_deferred_reports_waiting_for_lock():
-    """Session queued behind another partner's drain: no
-    ``Drain-phase host lock acquired.`` line yet — must be flagged as
-    lock-waiting rather than as SDC-complete-and-idle."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    fake = _fake_ssm_for_drain(
-        log_filename="20260705-120631-northwest-heritage+oregon-state-archives-drain-deferred.log",
-        tail=(
-            "[INFO] 12:06:31: Drain-deferred: sidecar for partner "
-            "northwest-heritage has 8 item(s) queued; acquiring host lock "
-            "(mode: patient).\n"
-            "[INFO] 12:06:31: Acquiring drain-phase host lock at "
-            "/home/ec2-user/ingest-wikimedia/.drain-lock (blocking until "
-            "available)…"
-        ),
-        queued=8,
-    )
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase, _mtime = get_phase_and_progress(
-            client=None,
-            session="wikimedia-northwest-heritage+oregon-state-archives",
-            hub="northwest-heritage",
-            label="northwest-heritage+oregon-state-archives",
-        )
-    assert "waiting for host lock" in phase
-    assert "8 queued" in phase
-
-
-def test_drain_deferred_reports_throttle_state_when_holding_lock():
-    """Session holding the lock and polling ``Category:Duplicate``:
-    surface the live throttle numbers so operators can gauge how
-    close the resume gate is to opening."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    fake = _fake_ssm_for_drain(
-        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
-        tail=(
-            "[INFO] 14:58:16: Drain-phase host lock acquired.\n"
-            "[INFO] 14:58:16: Category:Duplicate at 979 (>= resume "
-            "threshold 900); waiting 300s before retrying deferred "
-            "duplicate-tags.\n"
-            "[INFO] 15:03:17: Category:Duplicate at 954 (>= resume "
-            "threshold 900); waiting 300s before retrying deferred "
-            "duplicate-tags."
-        ),
-        queued=42,
-    )
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase, _mtime = get_phase_and_progress(
-            client=None,
-            session="wikimedia-ohio",
-            hub="ohio",
-            label="ohio",
-        )
-    assert "42 queued" in phase
-    # Uses the MOST RECENT throttle poll (954), not the earliest (979).
-    assert "954" in phase
-    assert "900" in phase
-
-
-def test_drain_deferred_reports_opportunistic_capacity_skip():
-    """Opportunistic drain that hit ``at capacity`` and exited fast is
-    terminal — surface how many items remain deferred to the
-    batch-terminal patient drain, not a still-working state."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    fake = _fake_ssm_for_drain(
-        log_filename="20260705-092302-bpl+phillips-academy-drain-deferred-opportunistic.log",
-        tail=(
-            "[INFO] 09:23:02: Drain-phase host lock acquired.\n"
-            "[INFO] 09:23:03: Drain-deferred (opportunistic): "
-            "Category:Duplicate at capacity; 7 item(s) remain in sidecar "
-            "for the batch's terminal drain."
-        ),
-        queued=7,
-    )
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase, _mtime = get_phase_and_progress(
-            client=None,
-            session="wikimedia-bpl+phillips-academy",
-            hub="bpl",
-            label="bpl+phillips-academy",
-        )
-    assert "opportunistic" in phase
-    assert "7" in phase
-
-
-def test_drain_deferred_reports_complete_when_sidecar_drained():
-    """Sidecar drained to empty + ``Drain-deferred: complete.`` marker
-    → the phase is terminal and reports completion so the walker can
-    move on."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    fake = _fake_ssm_for_drain(
-        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
-        tail=(
-            "[INFO] 15:00:00: Drain-deferred: complete. Emitted "
-            "42 item(s) over 3600 seconds."
-        ),
-        queued=0,
-    )
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase, _mtime = get_phase_and_progress(
-            client=None,
-            session="wikimedia-ohio",
-            hub="ohio",
-            label="ohio",
-        )
-    assert phase.startswith("Drain complete")
-
-
-def test_drain_deferred_lock_marker_read_from_full_log_not_tail():
-    """Regression (CR #368): a patient drain that has held the lock for
-    hours has scrolled the one-shot ``Drain-phase host lock acquired.``
-    line out of the tail window — the tail is now all throttle-poll
-    lines. The lock state must come from the FULL-log grep count (4th
-    SSM section), so this session still reports its throttle state, NOT
-    a false 'waiting for host lock'."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    fake = _fake_ssm_for_drain(
-        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
-        # Tail is ONLY throttle polls — lock-acquired line evicted.
-        tail=(
-            "[INFO] 14:53:17: Category:Duplicate at 958 (>= resume "
-            "threshold 900); waiting 300s before retrying deferred "
-            "duplicate-tags.\n"
-            "[INFO] 14:58:17: Category:Duplicate at 954 (>= resume "
-            "threshold 900); waiting 300s before retrying deferred "
-            "duplicate-tags."
-        ),
-        queued=42,
-        # But the full-file grep still finds the marker.
-        lock_acquired_count=1,
-    )
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        phase, _mtime = get_phase_and_progress(
-            client=None,
-            session="wikimedia-ohio",
-            hub="ohio",
-            label="ohio",
-        )
-    assert "waiting for host lock" not in phase, (
-        "lock marker evicted from tail must not be misread as lock-waiting"
-    )
-    assert "954" in phase and "900" in phase
-
-
-def test_drain_deferred_returns_none_for_stale_log_predating_session():
-    """Regression (CR #368): when the drain log predates the current
-    session (log_mtime < session_created), the helper must return the
-    ``None`` sentinel — matching every other branch of
-    get_phase_and_progress — so the caller's fallback fires instead of
-    rendering a blank phase string."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    fake = _fake_ssm_for_drain(
-        log_filename="20260705-092303-drain-ohio-drain-deferred.log",
-        tail="[INFO] 09:23:02: Drain-phase host lock acquired.",
-        queued=5,
-        mtime=1700000000,
-        session_created=1700000000 + 3600,  # session started AFTER this log
-    )
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
-        result = get_phase_and_progress(
-            client=None,
-            session="wikimedia-ohio",
-            hub="ohio",
-            label="ohio",
-        )
-    assert result == (None, 0)
 
 
 def test_get_phase_and_progress_returns_none_tuple_when_no_log_exists():
@@ -1231,38 +1002,6 @@ def test_find_active_label_no_session_bound_when_created_is_zero():
     )
 
 
-def test_find_active_label_matches_drain_hub_log():
-    """Regression: a session in its terminal partner-level drain phase
-    writes ``…-drain-<hub>-drain-deferred.log``. That label is NOT in
-    the session's per-target label list, but the reporter needs to see
-    it — previously such a session showed ``SDC complete`` while the
-    tmux window was busy on the box-wide drain flock (PR bug 2).
-
-    ``find_active_label`` synthesizes ``drain-<hub>`` alternatives for
-    each unique hub in the input label set so the freshest drain log
-    surfaces correctly. On match the synthetic label is returned so
-    downstream callers can dispatch on it.
-    """
-    from unittest.mock import patch
-
-    from ingest_wikimedia.session_state import find_active_label
-
-    with patch(
-        "ingest_wikimedia.session_state.ssm_run",
-        return_value=("1700009000.0 20260705-092303-drain-ohio-drain-deferred.log"),
-    ):
-        result = find_active_label(
-            client=None,
-            labels=["ohio+ohio-university-libraries"],
-        )
-    assert result is not None
-    label, _ = result
-    assert label == "drain-ohio", (
-        f"drain-hub synthetic label must be returned when the freshest "
-        f"log is a drain-<hub> file; got {label!r}"
-    )
-
-
 def test_find_active_label_rejects_filename_not_in_label_list():
     """Defensive: if the ``find`` regex's alternation somehow returns a
     label that isn't in ``labels`` (regex prefix collision in a edge
@@ -1298,7 +1037,7 @@ def test_snapshot_running_active_labels_parses_multiple_sessions():
             "|texas+botanical-research-institute-of-texas\n"
             "wikimedia-texas+montgomery-plus-2"
             "|texas+harrie-p-woodson-memorial-library\n"
-            "wikimedia-ohio-and-3-more|drain-ohio\n"
+            "wikimedia-retry-7d-ohio|retry-ohio\n"
         ),
     ):
         snap = snapshot_running_active_labels(client=None)
@@ -1309,7 +1048,7 @@ def test_snapshot_running_active_labels_parses_multiple_sessions():
         "wikimedia-texas+montgomery-plus-2": (
             "texas+harrie-p-woodson-memorial-library"
         ),
-        "wikimedia-ohio-and-3-more": "drain-ohio",
+        "wikimedia-retry-7d-ohio": "retry-ohio",
     }
 
 
@@ -1406,20 +1145,6 @@ def test_active_and_upcoming_labels_falls_back_to_mtime_when_active_label_none()
         )
     mtime.assert_called_once()
     assert upcoming == {"ohio+c"}
-
-
-def test_active_and_upcoming_labels_empty_set_for_drain_hub_active_label():
-    """``drain-<hub>`` means the terminal partner-level drain phase —
-    all per-target work is done → empty set so a new request for any
-    per-target label is not a conflict."""
-    from ingest_wikimedia.session_state import active_and_upcoming_labels
-
-    upcoming = active_and_upcoming_labels(
-        ssm=None,
-        labels=["ohio+a", "nwh+b"],
-        active_label="drain-ohio",
-    )
-    assert upcoming == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1590,137 +1315,6 @@ def test_main_uses_subprocess_snapshot_over_mtime_for_active_label():
     # position 2 of the batch.
     assert "texas+botanical-research-institute-of-texas [2/2]" in text
     assert "Uploading (100 / 500 files, ~20.0%)" in text
-
-
-def test_main_drain_hub_row_attributes_to_parent_chain():
-    """Terminal drain phase renders as one row for the whole batch:
-    label is the batch identity (no drain-<hub> annotation), and
-    ``queue_hubs`` names every canonical partner so the phase reader
-    can sum sidecars across the batch rather than showing only the
-    currently-active partner's slice."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import main
-
-    sessions_out = "wikimedia-ohio+ohio-uni-and-3-more|1700000000\n"
-    captured, fake_post = _capture_slack_post()
-    captured_calls: list[dict] = []
-
-    def fake_phase(client, session, hub, label, **kw):
-        captured_calls.append({"hub": hub, "label": label, **kw})
-        return (
-            "Draining (13 queued, Category:Duplicate at 1,004, needs < 900)",
-            1700009999,
-        )
-
-    with (
-        patch.dict(
-            "os.environ",
-            {"DPLA_SLACK_BOT_TOKEN": "tok-xxx", "NOTIFY_IF_IDLE": "false"},
-        ),
-        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
-        patch(
-            "scripts.wikimedia_upload_status.ssm_run",
-            return_value=sessions_out,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
-            return_value=None,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
-            return_value=None,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.parse_session_labels",
-            return_value=[
-                "ohio+ohio-university-libraries",
-                "northwest-heritage+whitman-county-library",
-                "minnesota+minnesota-legislative-reference-library",
-                "bpl+phillips-academy",
-            ],
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.snapshot_running_active_labels",
-            return_value={"wikimedia-ohio+ohio-uni-and-3-more": "drain-ohio"},
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.get_phase_and_progress",
-            side_effect=fake_phase,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.requests.post",
-            side_effect=fake_post,
-        ),
-    ):
-        main()
-
-    payload = captured["payload"]
-    section_blocks = [b for b in payload["blocks"] if b.get("type") == "section"]
-    text = section_blocks[0]["text"]["text"]
-    assert "ohio+ohio-university-libraries +3 more" in text
-    assert "(drain: ohio)" not in text
-    assert "`drain-ohio`" not in text
-    assert len(captured_calls) == 1
-    assert set(captured_calls[0]["queue_hubs"]) == {
-        "ohio",
-        "northwest-heritage",
-        "minnesota",
-        "bpl",
-    }
-
-
-def test_main_non_drain_row_passes_no_queue_hubs():
-    """Non-drain per-target rows pass ``queue_hubs=None`` so
-    ``_drain_deferred_phase`` (if reached) sums only the row's own
-    partner's sidecar — the batch-total behavior is scoped to the
-    terminal drain phase."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import main
-
-    captured_calls: list[dict] = []
-
-    def fake_phase(client, session, hub, label, **kw):
-        captured_calls.append({"hub": hub, "label": label, **kw})
-        return ("Uploading (10 / 100, ~10%)", 1700000000)
-
-    with (
-        patch.dict(
-            "os.environ",
-            {"DPLA_SLACK_BOT_TOKEN": "tok", "NOTIFY_IF_IDLE": "false"},
-        ),
-        patch("scripts.wikimedia_upload_status.boto3.client", return_value=object()),
-        patch(
-            "scripts.wikimedia_upload_status.ssm_run",
-            return_value="wikimedia-bpl+phillips-academy|1700000000\n",
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.fetch_memory_snapshot",
-            return_value=None,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status._fetch_slot_snapshot",
-            return_value=None,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.snapshot_running_active_labels",
-            return_value={"wikimedia-bpl+phillips-academy": "bpl+phillips-academy"},
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.get_phase_and_progress",
-            side_effect=fake_phase,
-        ),
-        patch(
-            "scripts.wikimedia_upload_status.requests.post",
-            side_effect=_capture_slack_post()[1],
-        ),
-    ):
-        main()
-
-    assert captured_calls == [
-        {"hub": "bpl", "label": "bpl+phillips-academy", "queue_hubs": None}
-    ]
 
 
 def test_main_rows_use_display_id_from_fetch_not_session_name():
@@ -2437,11 +2031,11 @@ def test_get_phase_and_progress_ignores_stale_id_generation_log():
     assert phase is None, phase
 
 
-def test_institution_label_no_log_does_not_grab_partner_drain_log():
+def test_institution_label_no_log_does_not_run_hub_slug_fallback():
     """An institution session in id-generation (no matching log yet) must NOT
-    fall back to the hub-slug glob and pick up an unrelated partner-level
-    ``drain-<hub>`` log — that misreported id-gen sessions as ``Draining``. It
-    returns None so the caller renders ``Generating IDs``."""
+    fall back to the hub-slug glob — a '+' label with no matching log is in
+    id-generation, not a legacy hub-slug run. It returns None (so the caller
+    renders ``Generating IDs``) without ever issuing the fallback query."""
     from unittest.mock import patch
 
     from scripts.wikimedia_upload_status import get_phase_and_progress
@@ -2452,8 +2046,8 @@ def test_institution_label_no_log_does_not_grab_partner_drain_log():
         calls.append(_command)
         if len(calls) == 1:  # precheck: session_created + NO matching log
             return "1700000000\n"
-        # A buggy hub-slug fallback WOULD return this partner-drain log.
-        return "20260709-143326-drain-bpl-drain-deferred.log\n"
+        # A buggy hub-slug fallback WOULD return this unrelated hub log.
+        return "20260709-143326-bpl-download.log\n"
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
         phase, _ = get_phase_and_progress(
@@ -2464,36 +2058,3 @@ def test_institution_label_no_log_does_not_grab_partner_drain_log():
         )
     assert phase is None, phase  # caller (main) renders this as "Generating IDs"
     assert len(calls) == 1, "must not run the hub-slug fallback query for a '+' label"
-
-
-def test_drain_deferred_phase_recognizes_empty_sidecar_completion():
-    """A drain that found an empty/missing sidecar logs ``nothing to do.`` and
-    exits without acquiring the lock — it must read as complete, not
-    ``⏸ waiting for host lock`` (the pre-fix default when no lock-acquired
-    marker was present)."""
-    from unittest.mock import patch
-
-    from scripts.wikimedia_upload_status import get_phase_and_progress
-
-    sep = "__WM_DRAIN_SEP__"  # _drain_deferred_phase's own separator
-    calls = []
-
-    def fake_ssm_run(_client, _command, **_kwargs):
-        calls.append(_command)
-        if len(calls) == 1:  # precheck
-            return "1700000000\n20260709-143326-drain-bpl-drain-deferred.log\n"
-        # _drain_deferred_phase sections: mtime, tail, queued, lock_acquired
-        tail = (
-            "Drain-deferred: sidecar for partner bpl is empty (or missing); "
-            "nothing to do."
-        )
-        return f"1700000000\n{sep}\n{tail}\n{sep}\n0\n{sep}\n0"
-
-    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
-        phase, _ = get_phase_and_progress(
-            client=None,
-            session="wikimedia-drain-bpl",
-            hub="bpl",
-            label="drain-bpl",
-        )
-    assert phase == "Drain complete (nothing queued)", phase

@@ -12,22 +12,35 @@ for. Every branch of :meth:`Uploader.process_file`,
 is chosen because it either enforces this invariant directly or
 delegates to a step that will.
 
-The full statement of the invariant — including corollaries,
-anti-patterns, and past incidents that illustrate the invariant's
-scope — lives in ``docs/upload-invariant.md``. **Read that document
-before making any change to this file that could affect what SHA1
-lands at what Commons title.** In particular:
+## The SHA1-uniqueness constraint (PR C+D)
 
-- Two Commons files with matching SHA1s from two live DPLA IDs is
-  the invariant satisfied (corollary 1), not a bug to fix.
-- Human-authored ``#REDIRECT`` on a Commons title does NOT bind us:
-  the intended title is where the bytes belong for our DPLA ID.
+**No two Commons files may share a SHA1.** The invariant GOAL above is
+unchanged, but we no longer satisfy it by uploading a byte-identical
+second file. When our S3 source's SHA1 already exists on Commons we
+CENTRALIZE that SHA1 to ONE canonical file (the earliest existing
+upload), which carries every contributing DPLA item's structured data,
+and REDIRECT the other expected titles to it. We never upload a second
+copy of bytes already present, and we never emit ``{{Duplicate}}``.
 
-Proposals to "skip the upload when target has our SHA1", "honor the
-existing redirect", or "tag the file as a Commons-side duplicate" for
-the corollary-1 / corollary-2 shapes ARE invariant violations dressed
-up as safety improvements. See the anti-patterns section of the
-invariant document.
+Consequences enforced in this file:
+
+- Once :func:`find_file_by_hash` returns any existing Commons file for
+  our SHA1, ``process_file`` NEVER falls through to an upload. It
+  resolves to exactly one of: SKIP (already at the intended title),
+  MOVE/rename (our SHA1 at a wrong title and the intended title is
+  free or a redirect to our own file), MERGE+REDIRECT (the SHA1 match
+  is legitimate source duplication — same bytes at multiple positions
+  within an item, or across items / institutions), or HAND_FIX (our
+  SHA1 is at a wrong title and the intended title is occupied by a
+  DIFFERENT file, so the bot cannot safely make the rename).
+- Human-authored ``#REDIRECT`` on a Commons title still does not bind
+  us on the fresh-upload path: the intended title is where the bytes
+  belong for our DPLA ID.
+
+The full statement — including the centralize/redirect/merge model —
+lives in ``docs/upload-invariant.md``. **Read that document before
+making any change to this file that could affect what SHA1 lands at
+what Commons title.**
 """
 
 import concurrent.futures
@@ -48,7 +61,6 @@ from pywikibot.site import BaseSite
 
 from tqdm import tqdm
 
-from ingest_wikimedia.dup_throttle import DuplicateCategoryThrottle
 from ingest_wikimedia.common import (
     get_list,
     get_dict,
@@ -89,14 +101,13 @@ from ingest_wikimedia.dpla import (
     WIKIDATA_FIELD_NAME,
     DPLA,
 )
-from ingest_wikimedia import drain_sidecar
+from ingest_wikimedia import hand_fix_sidecar
 from ingest_wikimedia.slack import (
     notify_upload_aborted,
     notify_upload_complete,
 )
 from ingest_wikimedia.wikimedia import (
     WMC_UPLOAD_CHUNK_SIZE,
-    DUPLICATE_TAG_RE,
     IGNORE_WIKIMEDIA_WARNINGS,
     MIME_UNKNOWN_EXT,
     build_title_drift_move_reason,
@@ -107,9 +118,7 @@ from ingest_wikimedia.wikimedia import (
     wikimedia_url,
     find_file_by_hash,
     extract_dpla_id_from_commons_title,
-    first_uploader,
     is_same_item_redirect_relic,
-    tag_as_duplicate,
     check_content_type,
     is_download_only,
     get_page,
@@ -124,19 +133,7 @@ from ingest_wikimedia.wikimedia import (
     post_commonsdelinker_request,
 )
 from ingest_wikimedia.legacy_artwork import (
-    DPLA_BOT_ACCOUNTS,
-    _normalize_account,
-    import_cross_page_community_sdc,
     rescue_wikitext,
-)
-from ingest_wikimedia import await_target_free_sidecar
-
-# Pre-normalized set of DPLA-adjacent bot usernames, used by the Case-2
-# sub-classification in ``_resolve_hash_drift`` (community vs. stranded-bot
-# authorship of the drift target). Pre-computed at module load so the
-# per-item check is a single set-membership test.
-_NORMALIZED_DPLA_BOTS: frozenset[str] = frozenset(
-    _normalize_account(name) for name in DPLA_BOT_ACCOUNTS
 )
 
 MAX_UPLOAD_RETRIES = 3
@@ -177,9 +174,13 @@ def is_dup_sha1_sibling_at_expected_title(
     """Return True iff the existing Commons file is a true sibling at one of
     this item's own expected current titles.
 
-    ``True`` means it's safe to take the ``leave_others_alone`` branch —
-    the per-ordinal iteration is preserving that title intentionally and
-    we can upload our own ordinal alongside it.
+    ``True`` means this is legitimate WITHIN-ITEM source duplication — the
+    same bytes appear at more than one of this item's current asset
+    positions. Under the SHA1-uniqueness constraint (PR C+D) we do NOT
+    upload a second copy: the caller routes this to
+    ``DriftResolution.MERGE_AND_REDIRECT`` — merge this ordinal's page
+    number onto the sibling (canonical) file's SDC and leave a #REDIRECT at
+    our intended title.
 
     ``False`` means the existing file is at a *different* title than any of
     this item's current asset positions (typically a legacy upload from a
@@ -252,13 +253,20 @@ ORDINAL_NOT_PRESENT = "NOT_PRESENT"  # no S3 asset to upload (downloader gap)
 ORDINAL_INELIGIBLE = "INELIGIBLE"  # S3 asset present but uploader chose not
 # to upload (bad MIME, download-only, unguessable extension, etc.)
 ORDINAL_FAILED = "FAILED"  # upload attempted, raised, did not land
-ORDINAL_DEFERRED = (
-    "DEFERRED"  # {{duplicate}}-tagging upload deferred: Category:Duplicate at capacity
-)
+# SHA1-uniqueness redesign (PR C+D). Two new terminal ordinal statuses, both
+# meaning "no NEW canonical Commons file was uploaded at the intended title in
+# this run" — so the SDC sync phase does NOT target the intended title (it
+# treats only UPLOADED / SKIPPED as SDC-eligible).
+#   HAND_FIX — our SHA1 is at a wrong title and the intended title is occupied
+#     by a different file; the rename is blocked, recorded to hand-fix.jsonl.
+#   MERGED — source-duplication SHA1 match; this item's SDC was merged onto the
+#     canonical file inline and our intended title is now a #REDIRECT to it.
+ORDINAL_HAND_FIX = "HAND_FIX"
+ORDINAL_MERGED = "MERGED"
 
 
 class DriftResolution(str, Enum):
-    """The four outcomes ``_resolve_hash_drift`` produces, one per
+    """The outcomes ``_resolve_hash_drift`` produces, one per
     invariant-restoring next step the caller takes.
 
     Values are the caller-visible string sentinels; ``str, Enum``
@@ -268,14 +276,23 @@ class DriftResolution(str, Enum):
     typo or rename is a hard error at import time rather than a
     silent no-match at runtime.
 
-    See ``_resolve_hash_drift``'s docstring for the per-outcome
-    invariant story.
+    See ``_resolve_hash_drift``'s docstring for the per-outcome story.
+
+    Under the SHA1-uniqueness constraint (PR C+D) NONE of these
+    outcomes results in an upload — our SHA1 is already on Commons, so
+    a second byte-identical file is forbidden.
     """
 
     MOVED = "moved"
-    UPLOAD_AND_TAG = "upload_and_tag"
-    UPLOAD_AND_SELF_TAG_DEFER = "upload_and_self_tag_defer"
-    LEAVE_OTHERS_ALONE = "leave_others_alone"
+    # Legitimate source duplication (same bytes at multiple positions within an
+    # item, or across items / institutions): merge this item's SDC onto the
+    # earliest existing (canonical) file and leave a #REDIRECT at our title.
+    MERGE_AND_REDIRECT = "merge_and_redirect"
+    # Our SHA1 is at a wrong title and the intended title is occupied by a
+    # DIFFERENT file (different SHA1) — the rename that would restore the
+    # invariant is blocked and the bot must not pick a winner. Hand off to a
+    # human via the hand-fix.jsonl sidecar; no upload.
+    HAND_FIX = "hand_fix"
     ALREADY_CORRECT = "already_correct"
 
 
@@ -315,8 +332,8 @@ def _canonicalize_commons_title(title: str) -> str:
     Python-string equality between an uploader-constructed title and
     one returned from Commons must fold both forms — otherwise a
     same-page pair reads as drift and misroutes through
-    ``_resolve_hash_drift`` → Case 2 → UPLOAD_AND_TAG, inflating
-    the Case-2 deferral sidecar with false positives.
+    ``_resolve_hash_drift`` (e.g. a phantom HAND_FIX) instead of the
+    ``ALREADY_CORRECT`` skip it deserves.
 
     Also folds whitespace-run vs single-space differences (the
     ``get_page_title`` truncation-lands-on-whitespace edge case).
@@ -350,7 +367,6 @@ class Uploader:
         site: BaseSite,
         category_ensurer: CategoryEnsurer | None = None,
         no_create: bool = False,
-        dup_throttle: DuplicateCategoryThrottle | None = None,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
@@ -362,10 +378,6 @@ class Uploader:
         # write to a File page that does not already exist, so no run can
         # create a new Commons file. Defaults False (normal upload behaviour).
         self.no_create = no_create
-        # dup_throttle: gate on the Case-2 hash-drift tag-emitting path so a
-        # run can't flood the human-maintained Category:Duplicate. None disables
-        # the gate (standalone / unit-test construction); main() injects one.
-        self.dup_throttle = dup_throttle
 
     def _detect_commons_dedup_skip(
         self,
@@ -796,27 +808,8 @@ class Uploader:
             )
             if existing_file is not None:
                 if existing_file.title(with_ns=False) == page_title:
-                    # Our bytes are already at the canonical title. If this
-                    # ordinal is in the await-target-free set (we self-tagged
-                    # it on a prior run and are waiting on a Commons admin),
-                    # reconcile the set against live state before skipping:
-                    #   * canonical still carries {{Duplicate}} → admin
-                    #     hasn't acted; keep it queued for the drain.
-                    #   * tag gone (admin removed it — declined the dedup —
-                    #     without deleting the file) → drop it; the two
-                    #     files coexist (corollary 1), nothing more to do.
-                    # A deleted/redirected canonical never reaches here (the
-                    # file no longer exists at page_title), so it is resolved
-                    # by the empty-canonical Case-3 move on this same re-run.
-                    if not dry_run and await_target_free_sidecar.has_key(
-                        partner, dpla_id, ordinal
-                    ):
-                        self._reconcile_awaiting_skip(
-                            partner=partner,
-                            existing_file=existing_file,
-                            dpla_id=dpla_id,
-                            ordinal=ordinal,
-                        )
+                    # Our bytes are already at the canonical title — invariant
+                    # already satisfied, nothing to do.
                     logging.info(
                         f"Skipping {dpla_id} {ordinal}: Already exists on commons."
                     )
@@ -832,27 +825,19 @@ class Uploader:
                 )
 
             if not dry_run and not file_downloaded:
-                # Resolve hash drift before downloading — Case 3 (simple move)
-                # needs no file download, so detecting it first avoids wasted I/O.
-                drift_old_filename: str | None = None
-                # Community-target Case 2 (see UPLOAD_AND_SELF_TAG_DEFER
-                # dispatch below): title of the community-authored file that
-                # currently holds our S3 SHA1. The post-upload block reads
-                # this to decide whether to tag OUR uploaded file rather than
-                # tagging the community file — the ``drift_old_filename`` /
-                # ``self_tag_community_title`` variables are mutually exclusive.
-                self_tag_community_title: str | None = None
-                drift_action: str | None = None
-                force_ignore_warnings = False
+                # SHA1-uniqueness constraint (PR C+D): if our S3 SHA1 already
+                # exists anywhere on Commons, we NEVER upload a second copy.
+                # Resolve to exactly one non-upload outcome and return — no
+                # branch below falls through to the download/upload path.
                 if existing_file is not None:
-                    # The duplicate-source-SHA1 short-circuit only applies
-                    # when the existing Commons file is at one of THIS item's
-                    # own expected titles — see
-                    # is_dup_sha1_sibling_at_expected_title's docstring for
-                    # why a legacy NARA-bot title with the same SHA1 must
-                    # NOT take this branch (it would leave an orphan
-                    # duplicate alongside our (page N) uploads).
                     existing_title = existing_file.title(with_ns=False)
+                    # Within-item source duplication: the same bytes sit at
+                    # another of THIS item's current asset positions (its own
+                    # sibling ordinal). Centralize on that sibling (canonical)
+                    # file — merge this ordinal's page number onto its SDC and
+                    # leave a #REDIRECT at our intended title. See
+                    # is_dup_sha1_sibling_at_expected_title's docstring for why
+                    # a legacy title with the same SHA1 does NOT take this path.
                     if is_dup_sha1_sibling_at_expected_title(
                         sha1=sha1,
                         existing_file_title=existing_title,
@@ -860,150 +845,89 @@ class Uploader:
                         expected_item_titles=expected_item_titles,
                     ):
                         logging.info(
-                            f"Source asset list contains the same SHA1 at "
-                            f"multiple positions for {dpla_id} {ordinal}; "
-                            f"existing file at "
-                            f"[[File:{existing_title}]] "
-                            f"is a legitimate sibling, not drift. Uploading "
-                            f"to [[File:{page_title}]] without disturbing it."
+                            f"Within-item duplicate SHA1 for {dpla_id} {ordinal}: "
+                            f"canonical file at [[File:{existing_title}]]; merging "
+                            f"SDC and redirecting [[File:{page_title}]] to it."
                         )
-                        # This branch's caller-visible action equals
-                        # ``DriftResolution.LEAVE_OTHERS_ALONE``; no assignment
-                        # to ``drift_action`` is needed because the else branch
-                        # is the only path that dispatches on it, and this
-                        # branch already sets the sole side-effect
-                        # (``force_ignore_warnings = True``) itself.
-                        force_ignore_warnings = True
-                    else:
-                        drift_action = self._resolve_hash_drift(
-                            existing_file=existing_file,
-                            page_title=page_title,
+                        return self._merge_and_redirect(
+                            canonical_file=existing_file,
+                            intended_title=page_title,
                             dpla_id=dpla_id,
                             ordinal=ordinal,
-                            expected_item_titles=expected_item_titles,
+                            partner=partner,
+                            page_label=page_label,
+                            within_item=True,
                         )
-                        if drift_action == DriftResolution.MOVED:
-                            self.tracker.increment(Result.UPLOADED)
-                            # A move into an empty/redirect canonical title
-                            # is exactly how an awaiting Case-2 item resolves
-                            # once a Commons admin frees the tagged title: the
-                            # community file gets promoted here. Drop it from
-                            # the await set (no-op for ordinary title-drift
-                            # moves that were never awaiting).
-                            await_target_free_sidecar.remove_key(
-                                partner, dpla_id, ordinal
-                            )
-                            # After a successful move the same file page lives
-                            # at page_title; existing_file.pageid is preserved
-                            # by MediaWiki across moves so we can stamp it here.
-                            return {
-                                "status": ORDINAL_UPLOADED,
-                                "title": page_title,
-                                "pageid": existing_file.pageid,
-                            }
-                        elif drift_action == DriftResolution.ALREADY_CORRECT:
-                            # ``_resolve_hash_drift`` caught a phantom drift —
-                            # the file the SHA1-lookup returned IS the file
-                            # at the intended title, once pywikibot's title
-                            # normalisation collapsed the raw
-                            # ``page_title`` difference. Treat the same as
-                            # the line-468 identity check that ``process_file``
-                            # attempted before we called ``_resolve_hash_drift``.
-                            # Persist the pywikibot-normalized title, not the
-                            # raw constructed ``page_title`` — downstream
-                            # sidecars / SDC-sync key on the Commons-stored
-                            # form, so returning the raw double-space form
-                            # here would break the very equality checks
-                            # elsewhere in the pipeline this branch exists
-                            # to accommodate.
-                            canonical_title = existing_file.title(with_ns=False)
-                            logging.info(
-                                f"Skipping {dpla_id} {ordinal}: "
-                                f"Already exists on commons (normalized "
-                                f"identity)."
-                            )
-                            self.tracker.increment(Result.SKIPPED)
-                            return {
-                                "status": ORDINAL_SKIPPED,
-                                "title": canonical_title,
-                                "pageid": existing_file.pageid,
-                            }
-                        elif drift_action == DriftResolution.UPLOAD_AND_TAG:
-                            # This ordinal would upload its bytes to the
-                            # canonical title AND tag the stranded sha1-sibling
-                            # {{duplicate}}. If Category:Duplicate is at
-                            # capacity, defer the WHOLE op — not just the tag —
-                            # so we never upload the duplicating bytes and leave
-                            # an untagged duplicate behind. The drain pass
-                            # re-runs this item once the category drains. The
-                            # gate is consulted only here (the rare tag path),
-                            # so ordinary uploads are unaffected.
-                            if (
-                                self.dup_throttle is not None
-                                and not self.dup_throttle.try_acquire()
-                            ):
-                                logging.info(
-                                    f"Deferring {dpla_id} {ordinal}: "
-                                    f"Category:Duplicate at capacity; will retry "
-                                    f"upload + duplicate-tag in the drain pass."
-                                )
-                                self.tracker.increment(
-                                    Result.UPLOAD_DEFERRED_DUP_CATEGORY
-                                )
-                                return {
-                                    "status": ORDINAL_DEFERRED,
-                                    "title": page_title,
-                                    "pageid": None,
-                                }
-                            drift_old_filename = existing_file.title(with_ns=False)
-                            force_ignore_warnings = True
-                        elif drift_action == DriftResolution.UPLOAD_AND_SELF_TAG_DEFER:
-                            # Community upload lives at the drift target title
-                            # (its first uploader is a real editor, not a
-                            # DPLA-adjacent bot). Upload our S3 bytes to the
-                            # DPLA-canonical title, tag OUR fresh file as
-                            # ``{{Duplicate|<community title>}}``, and record
-                            # the (dpla_id, ordinal) in the await-target-free
-                            # set. Once a Commons admin acts on our tagged
-                            # file, the DPLA-canonical title is freed and a
-                            # plain uploader re-run resolves it through the
-                            # normal title-drift machinery (empty canonical →
-                            # Case-3 move of the community file into the freed
-                            # title, history intact).
-                            #
-                            # No idempotency check is needed here: a re-run
-                            # while we're still waiting finds our bytes already
-                            # at page_title and short-circuits at the
-                            # "Already exists on commons" skip far above, never
-                            # reaching this branch. So this path only runs the
-                            # first time, when the canonical is still occupied
-                            # by the other file's content. Same Category:
-                            # Duplicate capacity gate as UPLOAD_AND_TAG — the
-                            # tag lands in that category, so don't add to it
-                            # when saturated; the category drain retries.
-                            if (
-                                self.dup_throttle is not None
-                                and not self.dup_throttle.try_acquire()
-                            ):
-                                logging.info(
-                                    f"Deferring {dpla_id} {ordinal}: "
-                                    f"Category:Duplicate at capacity; will retry "
-                                    f"upload + self-tag-defer in the drain pass."
-                                )
-                                self.tracker.increment(
-                                    Result.UPLOAD_DEFERRED_DUP_CATEGORY
-                                )
-                                return {
-                                    "status": ORDINAL_DEFERRED,
-                                    "title": page_title,
-                                    "pageid": None,
-                                }
-                            self_tag_community_title = existing_file.title(
-                                with_ns=False
-                            )
-                            force_ignore_warnings = True
-                        else:  # "leave_others_alone"
-                            force_ignore_warnings = True
+
+                    drift_action = self._resolve_hash_drift(
+                        existing_file=existing_file,
+                        page_title=page_title,
+                        dpla_id=dpla_id,
+                        ordinal=ordinal,
+                        expected_item_titles=expected_item_titles,
+                    )
+                    if drift_action == DriftResolution.MOVED:
+                        # Our SHA1 was renamed into the previously-empty (or
+                        # redirect-to-self) intended title. The same file page
+                        # now lives at page_title; existing_file.pageid is
+                        # preserved by MediaWiki across moves.
+                        self.tracker.increment(Result.UPLOADED)
+                        return {
+                            "status": ORDINAL_UPLOADED,
+                            "title": page_title,
+                            "pageid": existing_file.pageid,
+                        }
+                    if drift_action == DriftResolution.ALREADY_CORRECT:
+                        # Phantom drift — the SHA1-lookup file IS the file at the
+                        # intended title under whitespace normalisation. Persist
+                        # the pywikibot-normalized title (downstream sidecars /
+                        # SDC-sync key on the Commons-stored form, so the raw
+                        # double-space form would break their equality checks).
+                        canonical_title = existing_file.title(with_ns=False)
+                        logging.info(
+                            f"Skipping {dpla_id} {ordinal}: Already exists on "
+                            f"commons (normalized identity)."
+                        )
+                        self.tracker.increment(Result.SKIPPED)
+                        return {
+                            "status": ORDINAL_SKIPPED,
+                            "title": canonical_title,
+                            "pageid": existing_file.pageid,
+                        }
+                    if drift_action == DriftResolution.MERGE_AND_REDIRECT:
+                        # Cross-item / cross-institution source duplication: our
+                        # SHA1 is another live DPLA ID's canonical content (or a
+                        # sibling position not flagged as a duplicate-source
+                        # SHA1). Merge this item's SDC onto it and redirect our
+                        # intended title — no second byte-identical file.
+                        return self._merge_and_redirect(
+                            canonical_file=existing_file,
+                            intended_title=page_title,
+                            dpla_id=dpla_id,
+                            ordinal=ordinal,
+                            partner=partner,
+                            page_label=page_label,
+                            within_item=False,
+                        )
+                    # DriftResolution.HAND_FIX (and any unforeseen sentinel):
+                    # our SHA1 is at a wrong title and the intended title is
+                    # occupied by a DIFFERENT file (different SHA1) — the bot
+                    # cannot safely make the rename. Record for a human and
+                    # stop; never upload a duplicate.
+                    return self._record_hand_fix_and_skip(
+                        partner=partner,
+                        dpla_id=dpla_id,
+                        ordinal=ordinal,
+                        our_sha1=sha1,
+                        intended_title=page_title,
+                        our_current_file=existing_file,
+                    )
+
+                # existing_file is None — our SHA1 is NOT on Commons; this is a
+                # genuine fresh upload. Any redirect at the intended title is
+                # handled below (a pre-existing redirect does not bind us on the
+                # fresh-upload path).
+                force_ignore_warnings = False
 
                 with tqdm(
                     total=s3_object.content_length,
@@ -1022,23 +946,16 @@ class Uploader:
 
                 wiki_file_page = get_page(self.site, page_title)
 
-                # If the intended title is a redirect, route through the
-                # redirect-handler regardless of what `_resolve_hash_drift`
-                # returned. Uploading directly onto a redirect page fails with
-                # `fileexists-shared-forbidden` — the API treats the upload as
-                # creating a duplicate of the redirect's target. The
-                # redirect-handler below picks the right strategy (move, or
-                # overwrite-in-place with the appropriate metadata
-                # preservation) based on the redirect target, and always sets
-                # `force_ignore_warnings=True` for the subsequent upload.
-                #
-                # Earlier this branch was gated on `drift_action != "leave_others_alone"`,
-                # but `_resolve_hash_drift` can legitimately return "leave_others_alone"
-                # while the intended title is still a redirect — specifically
-                # when the redirect's target is a sibling page rather than the
-                # SHA1's current location. The misleading warning at line ~880
-                # in `_resolve_hash_drift` was the symptom of that earlier
-                # gating mistake.
+                # Fresh-upload path (our SHA1 is not on Commons). If the
+                # intended title is nonetheless a redirect, route through the
+                # redirect-handler: uploading directly onto a redirect page
+                # fails with `fileexists-shared-forbidden` (the API treats the
+                # upload as creating a duplicate of the redirect's target). The
+                # handler picks the right strategy (move, or overwrite-in-place
+                # with the appropriate metadata preservation) based on the
+                # redirect target, and sets `force_ignore_warnings=True` for the
+                # subsequent upload. A pre-existing human/bot redirect does not
+                # bind us — the intended title is where our bytes belong.
                 if wiki_file_page.isRedirectPage():
                     target_title = wiki_file_page.getRedirectTarget().title(
                         with_ns=False
@@ -1067,14 +984,10 @@ class Uploader:
                                 f"Move blocked (ArticleExistsConflictError) for "
                                 f"{dpla_id}; falling back to redirect-overwrite"
                             )
-                            wiki_file_page, redirect_old_filename = (
-                                self._resolve_redirect_overwrite(
-                                    wiki_file_page, dpla_id, wiki_markup
-                                )
+                            wiki_file_page, _ = self._resolve_redirect_overwrite(
+                                wiki_file_page, dpla_id, wiki_markup
                             )
                             force_ignore_warnings = True
-                            if not drift_old_filename:
-                                drift_old_filename = redirect_old_filename
                     else:
                         # Same-item relic: target is a sibling page of this
                         # item — preserve its metadata, since license tags
@@ -1352,24 +1265,6 @@ class Uploader:
                     )
 
                 logging.info(f"Uploaded to {wikimedia_url(page_title)}")
-                if drift_old_filename:
-                    self._tag_drift_duplicate(
-                        drift_old_filename,
-                        page_title,
-                        wiki_markup,
-                        dpla_id,
-                        item_metadata=item_metadata,
-                        provider=provider,
-                        data_provider=data_provider,
-                    )
-                elif self_tag_community_title:
-                    self._tag_self_and_defer(
-                        partner=partner,
-                        dpla_canonical_title=page_title,
-                        community_title=self_tag_community_title,
-                        dpla_id=dpla_id,
-                        ordinal=ordinal,
-                    )
                 self.tracker.increment(Result.UPLOADED)
                 self.tracker.increment(Result.BYTES, file_size)
                 # `wiki_file_page.pageid` is stale for net-new uploads:
@@ -1714,59 +1609,38 @@ class Uploader:
         ordinal: int,
         expected_item_titles: set[str] | None = None,
     ) -> DriftResolution:
-        """Resolve the case where our S3 source's SHA1 already lives on
-        Commons at a different title than we intend to write.
+        """Classify (and, for the rename cases, perform) the resolution when
+        our S3 source's SHA1 already lives on Commons at a different title
+        than we intend to write.
 
-        **Invariant contract**: on any return, the caller has a
-        well-defined next step that, when completed, leaves the S3
-        source's SHA1 at ``get_page_title(dpla_id, …)``'s output — the
-        canonical Commons title for this DPLA item. See
-        ``docs/upload-invariant.md``.
+        Under the SHA1-uniqueness constraint (PR C+D) our SHA1 is already on
+        Commons, so NONE of these outcomes uploads a second copy. See
+        ``docs/upload-invariant.md``. Return values name the case + the
+        caller's next step:
 
-        Return values name the case + the caller's next step:
+        - ``MOVED`` — **title_text_drift**: the same content should simply
+          live at the intended title, which is empty or a redirect to our
+          OWN file. The file has been renamed here (side effect); caller
+          records UPLOADED. One file, one SHA1, canonical title.
 
-        - ``"moved"`` — **title_text_drift**: same DPLA ID's SHA1 lived
-          at a different title (e.g., pre-normalization title, a
-          brackets-vs-parens variant). The file has been moved to the
-          intended title. Caller records UPLOADED and returns. Invariant
-          satisfied by the move.
+        - ``MERGE_AND_REDIRECT`` — **source duplication**: our SHA1 is
+          another LIVE DPLA ID's canonical content (cross-item /
+          cross-institution), or sits at one of THIS item's own current
+          asset positions (within-item). The caller merges this item's SDC
+          onto that canonical file and leaves a ``#REDIRECT`` at our
+          intended title — centralizing the SHA1 to one file.
 
-        - ``"upload_and_tag"`` — **orphan_at_wrong_title**: a file with
-          our SHA1 lives at a title that (a) is NOT one of this item's
-          expected ordinal titles, and (b) either has no recognizable
-          DPLA ID or belongs to a DPLA ID that is no longer live. The
-          caller uploads our bytes to the intended title (restoring
-          the invariant) AND tags the stranded old title as a
-          ``{{Duplicate}}`` so Commons admins can clean up.
+        - ``HAND_FIX`` — **rename blocked**: our SHA1 is at a wrong title and
+          the intended title is occupied by a DIFFERENT file (different
+          SHA1), or by a redirect to some third file, or the colliding
+          file's DPLA ID could not be verified. The bot must neither upload
+          a duplicate nor clobber the occupant, so the caller records the
+          case to the hand-fix.jsonl sidecar for a human.
 
-        - ``"leave_others_alone"`` — **cross_item_or_stranded_orphan**:
-          our SHA1 lives at another live DPLA ID's canonical title
-          (the partner emitted two DPLA IDs for byte-identical
-          content, corollary 1 of the invariant). The caller uploads
-          our bytes to OUR intended title without touching theirs. The
-          resulting two-files-same-SHA1 state on Commons is the
-          invariant satisfied at both DPLA IDs — a faithful projection
-          of partner data, not a bug.
-
-          The same return value is used when the SHA1 lives at a
-          sibling ordinal's expected title within THIS item — a rare
-          shape where deferring to the redirect-handler is the safer
-          resolution. Both sub-cases share the caller's next step
-          (upload to intended title, don't touch the sibling), which
-          is why they share a return value.
-
-        - ``"already_correct"`` — **normalized_identity**: the file
-          the SHA1 lookup returned IS the file at the intended title
-          under whitespace-run normalization (typically a
-          post-title-truncation artefact of ``get_page_title``). No
-          drift to resolve. Caller records SKIPPED and returns.
-
-        Defense-in-depth: for callers that MUST NOT accidentally
-        propose a fix that violates the invariant, see the anti-pattern
-        section of ``docs/upload-invariant.md``. In particular, the
-        ``leave_others_alone`` case's second-file outcome is the
-        invariant satisfied at each DPLA ID and MUST NOT be
-        "fixed" by skipping our upload.
+        - ``ALREADY_CORRECT`` — **normalized_identity**: the file the SHA1
+          lookup returned IS the file at the intended title under
+          whitespace-run normalization (a post-title-truncation artefact of
+          ``get_page_title``). No drift to resolve. Caller records SKIPPED.
         """
         actual_filename = existing_file.title(with_ns=False)
 
@@ -1804,88 +1678,56 @@ class Uploader:
             )
             return DriftResolution.ALREADY_CORRECT
 
-        # --- Hash collision safety check ---
-        # Cross-item collision: the file at the wrong title was uploaded for a
-        # different DPLA ID.  If that other ID is still a valid item, we don't
-        # move or tag — just upload our hash to the correct title and leave
-        # their file alone.  This prevents ping-pong renaming between two
-        # valid items that happen to share a hash.
+        # Cross-item / cross-institution collision: the file at the wrong
+        # title carries a DIFFERENT DPLA ID. If that ID is still a LIVE item,
+        # our SHA1 is legitimate source duplication across DPLA items — merge
+        # our SDC onto their (canonical) file and redirect our title. If the
+        # ID no longer resolves (404) the file is an orphan; fall through to
+        # the rename/hand-fix logic below to reclaim our title. Any other
+        # verification error is conservative → HAND_FIX (never guess).
         #
-        # Same-item collision (same DPLA ID, different title) — including the
-        # post-PR-#173 case where the page-suffix on the existing file no
-        # longer matches the new naming scheme — always falls through to the
-        # Case 1/2/3 migration logic below.  A previous version of this code
-        # special-cased "same DPLA ID, different parsed ordinal" by returning
-        # "leave_others_alone" to avoid disturbing a hypothetical hash-coincidence
-        # between two pages of the same item, but that branch fired routinely
-        # whenever PR #173's per-extension page-label scheme produced a
-        # different (or no) (page N) suffix from the existing Commons file —
-        # creating a silent duplicate at the new title while the old file
-        # stayed orphaned.  The invariant is: a given SHA1 should live at
-        # exactly one Commons title for a given DPLA ID, so always migrate.
+        # Same-item collision (same DPLA ID, different title) — e.g. the
+        # post-PR-#173 case where the page-suffix no longer matches the new
+        # naming scheme — falls through to the rename/redirect logic below.
         existing_dpla_id = extract_dpla_id_from_commons_title(actual_filename)
 
         if existing_dpla_id and existing_dpla_id != dpla_id:
             try:
                 other_item = self.dpla.get_item_metadata(existing_dpla_id)
             except Exception as ex:
-                # A 404 from the DPLA API for the colliding file's DPLA ID
-                # is the strongest possible signal that the existing
-                # Commons file is an orphan: that ID no longer resolves to
-                # any item, so the previous bot upload's DPLA-side anchor
-                # is gone. Treat it exactly like ``other_item is None`` —
-                # fall through to the Case 1/2/3 migration so we move the
-                # orphan to the new ID's title (or upload-and-tag it),
-                # rather than silently creating a duplicate alongside it.
-                #
-                # Distinguishing 404 from other exceptions matters because
-                # the catch-all path is reached by network timeouts, 5xx
-                # responses, JSON parse errors, etc. — none of which carry
-                # the same definitive "the old ID is gone" meaning. Those
-                # stay on the conservative ``leave_others_alone`` fallback so a
-                # transient API blip doesn't trigger a destructive move on
-                # a file that still has a valid sibling item.
+                # 404 → the colliding ID no longer resolves, so its file is an
+                # orphan: fall through and reclaim our title. Any other error
+                # (timeout, 5xx, parse) leaves the collision unverified — route
+                # to hand-fix rather than act on a transient blip.
                 status = getattr(getattr(ex, "response", None), "status_code", None)
                 if status == 404:
                     logging.info(
                         f"Hash drift for {dpla_id} {ordinal}: colliding "
                         f"DPLA item {existing_dpla_id} no longer exists "
                         f"(404); treating [[File:{actual_filename}]] as "
-                        f"an orphan and migrating."
+                        f"an orphan and reclaiming our title."
                     )
                     other_item = None
                 else:
                     logging.warning(
                         f"Hash drift for {dpla_id} {ordinal}: failed to verify "
                         f"colliding DPLA item {existing_dpla_id}: {ex}; "
-                        f"falling back to leave_others_alone."
+                        f"routing to hand-fix (cannot safely resolve)."
                     )
-                    return DriftResolution.LEAVE_OTHERS_ALONE
+                    return DriftResolution.HAND_FIX
             if other_item:
-                # cross_item_or_stranded_orphan: our SHA1 lives at
-                # another LIVE DPLA ID's canonical title. This is
-                # corollary 1 of the upload invariant — partner data
-                # emitted two DPLA IDs pointing to the same source
-                # content; the correct Commons projection is two files
-                # at two DPLA-ID-suffixed titles holding the same bytes.
-                # We upload to OUR intended title. The other DPLA ID's
-                # file remains at its title (its own S3 SHA1 matches
-                # ITS canonical title — invariant satisfied there too).
-                #
-                # ANTI-PATTERN: do NOT add a "skip our upload because
-                # the SHA1 already exists elsewhere on Commons" check
-                # here. Doing so would leave OUR intended title without
-                # its required S3 bytes — direct invariant violation.
-                # See ``docs/upload-invariant.md`` corollary 1 + the
-                # 2026-07-02 Palo Pinto incident.
+                # Our SHA1 is another LIVE DPLA ID's canonical content. Under
+                # the uniqueness constraint we do NOT upload a second file:
+                # centralize on their (earliest) file — merge our item's SDC
+                # onto it and redirect our intended title to it.
                 logging.info(
                     f"Hash drift for {dpla_id} {ordinal}: "
-                    f"[[File:{actual_filename}]] belongs to valid DPLA item "
-                    f"{existing_dpla_id}; uploading to correct title only "
-                    f"(invariant corollary 1: two live DPLA IDs → two "
-                    f"files at two DPLA-ID titles is correct)."
+                    f"[[File:{actual_filename}]] is live DPLA item "
+                    f"{existing_dpla_id}'s canonical content; merging our SDC "
+                    f"onto it and redirecting [[File:{page_title}]] "
+                    f"(cross-item source duplication)."
                 )
-                return DriftResolution.LEAVE_OTHERS_ALONE
+                return DriftResolution.MERGE_AND_REDIRECT
 
         intended_page = get_page(self.site, page_title)
 
@@ -1919,366 +1761,307 @@ class Uploader:
             return DriftResolution.MOVED
 
         if intended_page.isRedirectPage():
-            # Case: title_text_drift_redirect_at_intended (Case 1).
-            # Intended title is a redirect. If it redirects to exactly
-            # our existing file (same filename), move over it — the
-            # redirect was a stale artifact from the same file living
-            # at both names; move restores the invariant.
+            # Intended title is a redirect. If it points at OUR file (a
+            # redirect-to-self relic from the same file living at both names),
+            # move over it — the rename restores the invariant. If it points
+            # elsewhere, renaming would collide with a third file's redirect;
+            # the bot cannot safely resolve that — hand-fix.
             redirect_target = intended_page.getRedirectTarget()
             if redirect_target.title(with_ns=False) == actual_filename:
                 self._move_to_correct_title(
                     existing_file,
                     intended_page,
                     dpla_id,
-                    "title_text_drift_redirect_at_intended (Case 1)",
+                    "title_text_drift_redirect_at_intended",
                     post_commonsdelinker=not sibling_slot,
                 )
                 return DriftResolution.MOVED
-            # Intended title is a redirect, but its target is somewhere
-            # other than where our SHA1 currently lives. We can't apply
-            # the title-drift move here; instead let the caller's
-            # redirect-handler decide (overwrite as same-item relic,
-            # overwrite as cross-item, etc). ``leave_others_alone``
-            # here just means "drift-resolution didn't move or tag
-            # anything"; the redirect-handler still runs
-            # unconditionally now.
             logging.info(
                 f"Hash drift for {dpla_id} {ordinal}: intended title "
                 f"[[File:{intended_page.title(with_ns=False)}]] is a redirect to "
-                f"[[File:{redirect_target.title(with_ns=False)}]], which is not "
-                f"the location of our SHA1 ([[File:{actual_filename}]]); "
-                f"deferring to the redirect-handler in process_file."
+                f"[[File:{redirect_target.title(with_ns=False)}]], not the "
+                f"location of our SHA1 ([[File:{actual_filename}]]); routing to "
+                f"hand-fix."
             )
-            return DriftResolution.LEAVE_OTHERS_ALONE
+            return DriftResolution.HAND_FIX
 
-        # Case: orphan_at_wrong_title / cross_item_or_stranded_orphan (Case 2).
-        # Intended title has real content with a different hash, and the
-        # file found at the wrong title either has no recognisable DPLA
-        # ID or belongs to a DPLA item that is no longer live. Normally
-        # we upload the correct hash to the intended title AND tag the
-        # orphaned old title as a duplicate so it can be cleaned up.
+        # Intended title holds a real file whose SHA1 differs from ours
+        # (find_file_by_hash returned a DIFFERENT title, so the occupant is
+        # not our SHA1).
         #
-        # BUT: if the "old title" is itself an expected title for one of THIS
-        # item's other current asset positions, it is not an orphan — it's a
-        # legitimate ordinal that will be (or has been) processed by its own
-        # iteration of process_file in this same run, and will get its own
-        # correct content written there.  Tagging it as a duplicate at the
-        # current instant produces a tag pointing at a page whose content is
-        # about to change, which makes the tag wrong (and triggers admin
-        # deletion of a still-valid Commons file).  Skip the tag in that case
-        # and just upload our content to the intended title.
+        # If our SHA1 lives at one of THIS item's own current asset positions,
+        # this is within-item source duplication — the same bytes legitimately
+        # appear at more than one position. Renaming would strand that sibling
+        # ordinal, so instead centralize on it: merge our SDC and redirect our
+        # intended title.
         if expected_item_titles and actual_filename in expected_item_titles:
             logging.info(
-                f"Title drift (Case 2 → leave_others_alone): "
-                f"[[File:{intended_page.title(with_ns=False)}]] has a different "
-                f"hash and our SHA1 currently lives at "
-                f"[[File:{actual_filename}]], but that title is one of this "
-                f"item's current asset positions — it will be overwritten by "
-                f"its own ordinal's iteration. Uploading to "
-                f"[[File:{page_title}]] without tagging."
+                f"Hash drift for {dpla_id} {ordinal}: our SHA1 lives at this "
+                f"item's own asset position [[File:{actual_filename}]]; merging "
+                f"SDC and redirecting [[File:{page_title}]] "
+                f"(within-item source duplication)."
             )
-            return DriftResolution.LEAVE_OTHERS_ALONE
+            return DriftResolution.MERGE_AND_REDIRECT
 
-        # Case 2 sub-classification: is the file at ``actual_filename`` a
-        # community-authored upload (its FIRST revision made by a non-bot
-        # user) rather than a stranded DPLA-adjacent bot upload? If yes,
-        # tagging IT for admin deletion would be a destructive imposition
-        # on the community — the file may have years of curation, external
-        # references, and the editor may be aware of the DPLA relationship
-        # already (the Bartlett incident: the community wikitext linked
-        # DPLA as ``other versions =``, deliberately not merged).
-        #
-        # Instead, upload our S3 bytes to the DPLA-canonical title so the
-        # invariant is satisfied AND tag OUR just-uploaded file as
-        # ``{{Duplicate|<community title>}}``. A Commons admin then chooses
-        # deletion or redirection; the ``drain-deferred`` phase watches for
-        # that resolution and, once the tagged (DPLA-canonical) title is
-        # freed, executes a title-drift move of the community file into it.
-        # Net effect: the community file's history survives under the
-        # DPLA-canonical title; the invariant is restored via the standard
-        # title-drift-move machinery.
-        # Decide whether the sha1-sibling is stranded-DPLA-bot (safe to
-        # tag for admin deletion) or community-authored (must NOT be
-        # tagged; instead defer). Provenance is decided ONLY by
-        # ``first_uploader``: the file's oldest revision's uploader.
-        #
-        # We deliberately do NOT treat a DPLA-canonical-shaped title
-        # (``... - DPLA - <id>``) as proof of bot authorship. A community
-        # editor can rename a file into that form, and routing on the
-        # filename alone would send a community upload down the
-        # destructive tag-for-deletion path — the exact Bartlett harm
-        # this whole flow exists to prevent. The provenance lookup is one
-        # cheap API call on an already-rare path, and it returns a
-        # DPLA-adjacent bot for our own stranded orphans anyway (e.g. our
-        # SHA1 at "(page 99)" vs intended "(page 4)"), so correctness for
-        # that case is preserved without the shortcut.
-        first = first_uploader(existing_file)
-        first_is_dpla_bot = (
-            first is not None and _normalize_account(first) in _NORMALIZED_DPLA_BOTS
-        )
-        if first_is_dpla_bot:
-            logging.info(
-                f"Title drift (Case 2): [[File:{intended_page.title(with_ns=False)}]] "
-                f"has a different hash; will upload correct hash and tag "
-                f"stranded DPLA-bot file [[File:{actual_filename}]] as "
-                f"duplicate (first upload by {first!r})."
-            )
-            return DriftResolution.UPLOAD_AND_TAG
-
-        provenance = f"first upload by {first!r}" if first else "uploader unknown"
+        # Our SHA1 is at a wrong title and the intended title is occupied by a
+        # DIFFERENT file. The bot must neither upload a duplicate nor clobber
+        # the occupant, so it cannot make the rename — hand off to a human.
         logging.info(
-            f"Title drift (Case 2 → upload_and_self_tag_defer): "
-            f"[[File:{intended_page.title(with_ns=False)}]] has a different "
-            f"hash and our SHA1 currently lives at "
-            f"[[File:{actual_filename}]] ({provenance}). "
-            f"Will upload correct hash to canonical title, tag OUR file "
-            f"as duplicate, and defer the rename to drain-deferred."
+            f"Hash drift for {dpla_id} {ordinal}: intended title "
+            f"[[File:{intended_page.title(with_ns=False)}]] is occupied by a "
+            f"DIFFERENT file and our SHA1 lives at [[File:{actual_filename}]]; "
+            f"the rename is blocked — routing to hand-fix."
         )
-        return DriftResolution.UPLOAD_AND_SELF_TAG_DEFER
+        return DriftResolution.HAND_FIX
 
-    def _tag_drift_duplicate(
-        self,
-        old_filename: str,
-        new_filename: str,
-        wiki_markup: str,
-        dpla_id: str,
-        item_metadata: dict,
-        provider: dict,
-        data_provider: dict,
-    ) -> None:
-        """Tag a stranded file as duplicate of the new (correct-title)
-        file, AND carry any community-contributed metadata from the
-        old page across to the new one before the admin-side delete.
-
-        This is the one drift path where the source page is *destroyed*, so
-        it does the full community rescue the regular migration does:
-
-        * **Outside the metadata template** — categories, ``{{ImageNote}}``
-          annotations, and every other community template — is carried into
-          the new page's wikitext by :func:`rescue_wikitext`'s node-swap
-          (preserve-by-default: no allowlist to keep in sync with whatever
-          template a community editor reaches for next).
-        * **Inside the old template's params** — values a non-bot editor set
-          — are imported to the new file's SDC by
-          :func:`import_cross_page_community_sdc`, via the same provenance
-          attribution (:func:`plan_migration`) the regular migration uses.
-
-        Rescue and tag are independent best-effort steps — a failure
-        on either is logged and does NOT block the other. The old
-        file's revision history still contains the community
-        contributions even if the rescue's save fails, so manual
-        recovery from page history is always possible.
-
-        Defense-in-depth self-tag guard: if ``old_filename`` and
-        ``new_filename`` resolve to the same Commons page (after
-        whitespace-run normalisation), refuse to tag. Tagging a file as
-        a duplicate of itself would flag it for admin deletion — the
-        destructive outcome the caller's Case 2 detection can slip
-        into if the two names disagree only in whitespace-run form.
-        Commons's ``fileexists-no-change`` check has historically
-        rejected the preceding upload attempt (so ``_tag_drift_duplicate``
-        wasn't reached in practice — see PR authoring for the log
-        audit), but the audit cannot cover future changes to Commons's
-        server-side behaviour, so we belt-and-suspender here.
-        """
-        if _canonicalize_commons_title(old_filename) == _canonicalize_commons_title(
-            new_filename
-        ):
-            logging.warning(
-                f"Refusing to tag [[File:{old_filename}]] as duplicate of "
-                f"[[File:{new_filename}]] — the two names resolve to the "
-                f"same Commons page under whitespace normalisation. This "
-                f"is a phantom-drift signal upstream (see "
-                f"``_resolve_hash_drift``'s ``already_correct`` return); "
-                f"no destructive action taken."
-            )
-            return
-
-        old_page = get_page(self.site, f"File:{old_filename}")
-
-        rescue_summary = (
-            f"Rescue community-contributed metadata from "
-            f"[[File:{old_filename}]] (DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
-        )
-        # Rescue community contributions, if any. SDC first — so a later
-        # wikitext-save failure can't strand the in-template provenance we
-        # imported — then the outside-template node-swap.
-        try:
-            if old_page.exists():
-                # `get_page` is a constructor — no API hit — and we know the
-                # new page exists and isn't a redirect because we just
-                # uploaded it. Skip the exists/redirect round-trips.
-                new_page = get_page(self.site, f"File:{new_filename}")
-                # Resolve the destination pageid explicitly, riding out the
-                # post-upload indexing-lag race, so the SDC import targets a
-                # real MediaInfo entity — a lagged 0/None must never become
-                # the bogus "M0". The wikitext rescue below is independent and
-                # runs regardless.
-                dest_pageid = self._refresh_pageid_with_retries(f"File:{new_filename}")
-                imported = 0
-                if dest_pageid:
-                    imported = import_cross_page_community_sdc(
-                        source_page=old_page,
-                        dest_mediaid=f"M{dest_pageid}",
-                        item_metadata=item_metadata,
-                        provider=provider,
-                        data_provider=data_provider,
-                        dpla_id=dpla_id,
-                        site=self.site,
-                        summary=rescue_summary,
-                    )
-                else:
-                    logging.warning(
-                        f"Skipping community-SDC rescue into "
-                        f"[[File:{new_filename}]]: pageid unresolved post-upload "
-                        f"(sdc-sync's title→pageid fallback recovers next run)."
-                    )
-                rescued = rescue_wikitext(old_page.text or "", wiki_markup)
-                # Equality means the node-swap carried nothing beyond the
-                # fresh block we already uploaded (the old page had no
-                # outside-template content). Skip the save so we don't emit a
-                # no-op revision on the new file.
-                wikitext_changed = rescued.rstrip() != wiki_markup.rstrip()
-                if wikitext_changed:
-                    new_page.text = rescued
-                    with_csrf_recovery(
-                        self.site,
-                        f"save {new_page.title()} (rescue community metadata)",
-                        lambda: new_page.save(summary=rescue_summary, minor=False),
-                    )
-                if imported or wikitext_changed:
-                    logging.info(
-                        f"Rescued community-contributed metadata from "
-                        f"[[File:{old_filename}]] into [[File:{new_filename}]] "
-                        f"(DPLA ID {dpla_id}; {imported} SDC import(s), "
-                        f"wikitext {'updated' if wikitext_changed else 'unchanged'})"
-                    )
-        except CsrfRecoveryFailed:
-            # Session-level fatal — the community-metadata rescue is a
-            # best-effort side-effect, but a stuck CSRF token affects
-            # every subsequent write. Propagate so the run aborts
-            # instead of continuing to log rescue-failed warnings.
-            raise
-        except Exception as ex:
-            logging.warning(
-                f"Failed to rescue community contributions from "
-                f"[[File:{old_filename}]]: {ex}"
-            )
-
-        # Tag the stranded file. Independent of the rescue: even if the
-        # save above failed, queue the old title for speedy deletion so
-        # the search-time SHA1 collision is resolved.
-        try:
-            tag_as_duplicate(
-                self.site,
-                old_page,
-                correct_filename=new_filename,
-                reason="Other file has the correct title.",
-            )
-            logging.info(
-                f"Tagged [[File:{old_filename}]] as duplicate of "
-                f"[[File:{new_filename}]] (DPLA ID {dpla_id})"
-            )
-        except CsrfRecoveryFailed:
-            raise
-        except Exception as ex:
-            logging.warning(f"Failed to tag [[File:{old_filename}]] as duplicate: {ex}")
-
-    def _reconcile_awaiting_skip(
-        self, *, partner, existing_file, dpla_id: str, ordinal: int
-    ) -> None:
-        """Reconcile an await-target-free entry against live Commons state
-        on the "already exists at canonical title" skip path.
-
-        Only called for ordinals that ARE in the await set. The canonical
-        file exists at the intended title (that's why we're skipping);
-        the one thing that determines whether we're still waiting is
-        whether it still carries the ``{{Duplicate}}`` tag:
-
-          * still tagged → the admin hasn't acted yet; keep the entry
-            queued so the drain keeps re-running us.
-          * tag gone (admin removed it, declining the dedup, without
-            deleting the file) → the two files legitimately coexist
-            (corollary 1); drop the entry so the drain stops tracking it.
-
-        A read-only reconciliation — it emits no tag and never re-touches
-        the file, so an admin who removed the tag is never edit-warred
-        with. (A deleted or redirected canonical doesn't reach this path:
-        the file no longer exists at the intended title, so the empty-
-        canonical Case-3 move handles it on the same re-run.)
-        """
-        try:
-            still_tagged = bool(DUPLICATE_TAG_RE.search(existing_file.text or ""))
-        except Exception as ex:  # noqa: BLE001 — reconciliation is best-effort
-            logging.warning(
-                f"Could not read tag state of [[File:"
-                f"{existing_file.title(with_ns=False)}]] for {dpla_id} "
-                f"{ordinal}; leaving await entry queued: {ex}"
-            )
-            return
-        if still_tagged:
-            return
-        logging.info(
-            f"Await-target-free: [[File:{existing_file.title(with_ns=False)}]] "
-            f"({dpla_id} {ordinal}) no longer carries a {{{{Duplicate}}}} tag — "
-            f"a Commons editor declined the dedup. Dropping the await entry; "
-            f"the two files coexist (invariant satisfied at the canonical title)."
-        )
-        await_target_free_sidecar.remove_key(partner, dpla_id, ordinal)
-
-    def _tag_self_and_defer(
+    def _merge_and_redirect(
         self,
         *,
+        canonical_file: pywikibot.FilePage,
+        intended_title: str,
+        dpla_id: str,
+        ordinal: int,
         partner: str,
-        dpla_canonical_title: str,
-        community_title: str,
+        page_label: str,
+        within_item: bool,
+    ) -> dict:
+        """Rule #3 (source duplication): centralize our SHA1 onto the earliest
+        existing (canonical) Commons file instead of uploading a second
+        byte-identical copy, and redirect our intended title to it.
+
+        (a) Merge THIS item's structured data onto the canonical file's
+            MediaInfo entity (add-only; other contributors' statements are
+            preserved). Within-item duplication stamps the page number this
+            ordinal occupies as a P304 qualifier; cross-item passes none.
+        (b) Leave a ``#REDIRECT`` at our intended title. A redirect carries no
+            media, so the one-SHA1-one-file constraint holds.
+
+        Returns an ``ORDINAL_MERGED`` result. The canonical file already
+        carries the merged SDC, so the SDC-sync phase must NOT re-target our
+        (redirect) intended title — ``ORDINAL_MERGED`` is deliberately not in
+        its UPLOADED/SKIPPED eligibility set.
+        """
+        canonical_title = canonical_file.title(with_ns=False)
+        canonical_pageid = canonical_file.pageid
+        # SDC merge is best-effort — the redirect is the load-bearing invariant
+        # step; a merge failure re-runs idempotently on a later pass.
+        if canonical_pageid:
+            self._merge_sdc_onto_canonical(
+                canonical_mediaid=f"M{canonical_pageid}",
+                dpla_id=dpla_id,
+                partner=partner,
+                page_label=page_label,
+                within_item=within_item,
+            )
+        else:
+            logging.warning(
+                f"Merge for {dpla_id} {ordinal}: canonical file "
+                f"[[File:{canonical_title}]] has no resolvable pageid; skipping "
+                f"SDC merge (redirect still created)."
+            )
+        self._create_redirect_to_canonical(
+            intended_title=intended_title,
+            canonical_title=canonical_title,
+            dpla_id=dpla_id,
+            ordinal=ordinal,
+        )
+        self.tracker.increment(Result.UPLOAD_MERGED_TO_CANONICAL)
+        return {
+            "status": ORDINAL_MERGED,
+            "title": canonical_title,
+            "pageid": canonical_pageid or None,
+        }
+
+    def _merge_sdc_onto_canonical(
+        self,
+        *,
+        canonical_mediaid: str,
+        dpla_id: str,
+        partner: str,
+        page_label: str,
+        within_item: bool,
+    ) -> None:
+        """Read this item's staged ``sdc.json`` and merge it onto the canonical
+        file's MediaInfo entity via ``sdc_sync.merge_item_onto_canonical``
+        (already on ``main`` from PR A).
+
+        Imported lazily: ``tools.sdc_sync`` carries heavy module-level state
+        (the ``site`` handle the merge writes through) and is only needed on
+        this rare path. We point its module ``site`` at our authenticated
+        Commons site for the duration of the call. Best-effort throughout: any
+        failure leaves the redirect in place and the SDC re-mergeable next run.
+        """
+        try:
+            from tools import sdc_sync
+        except Exception as ex:  # pragma: no cover — defensive import guard
+            logging.warning(
+                f"Merge for {dpla_id}: could not import sdc_sync ({ex!r}); "
+                f"skipping SDC merge."
+            )
+            return
+        try:
+            sdc_raw = self.s3_client.get_sdc_json(partner, dpla_id)
+        except Exception as ex:
+            logging.warning(
+                f"Merge for {dpla_id}: S3 read of sdc.json failed ({ex!r}); "
+                f"skipping SDC merge."
+            )
+            return
+        if not sdc_raw:
+            logging.info(
+                f"Merge for {dpla_id}: no staged sdc.json; skipping SDC merge "
+                f"(redirect still created)."
+            )
+            return
+        try:
+            sdc_payload = json.loads(sdc_raw)
+        except json.JSONDecodeError as ex:
+            logging.warning(
+                f"Merge for {dpla_id}: sdc.json failed to parse ({ex}); "
+                f"skipping SDC merge."
+            )
+            return
+        # Within-item duplication: stamp the page number this ordinal occupies
+        # as a P304 qualifier. Cross-item / cross-institution: no page number.
+        page_numbers = {page_label} if within_item and page_label else None
+        # The merge writes through sdc_sync's module-level ``site`` handle.
+        sdc_sync.site = self.site
+        try:
+            sdc_sync.merge_item_onto_canonical(
+                canonical_mediaid,
+                dpla_id,
+                sdc_payload,
+                page_numbers=page_numbers,
+            )
+            logging.info(
+                f"Merged SDC for {dpla_id} onto canonical {canonical_mediaid}"
+                + (f" (pages {sorted(page_numbers)})" if page_numbers else "")
+            )
+        except CsrfRecoveryFailed:
+            raise
+        except Exception as ex:
+            logging.warning(
+                f"Merge for {dpla_id}: merge_item_onto_canonical failed "
+                f"({ex!r}); redirect still created, SDC re-mergeable next run."
+            )
+
+    def _create_redirect_to_canonical(
+        self,
+        *,
+        intended_title: str,
+        canonical_title: str,
         dpla_id: str,
         ordinal: int,
     ) -> None:
-        """Tag OUR just-uploaded DPLA-canonical file
-        ``{{Duplicate|<community title>}}`` and record ``(dpla_id,
-        ordinal)`` in the await-target-free set.
+        """Leave a ``#REDIRECT [[File:<canonical>]]`` at our intended title.
 
-        Once a Commons admin acts on the tag, the DPLA-canonical title is
-        freed and a plain uploader re-run finishes the job: an empty
-        canonical becomes a Case-3 title-drift move of the community file
-        into the freed title (history intact), and the drain drops the
-        entry. Nothing here needs to be crash-consistent beyond "the tag
-        is on Commons and the ID is in the set" — both are re-derivable
-        and idempotent, so a partial failure just retries on the next run.
-
-        Order: record the ID first, then emit the tag. The set entry is
-        the cheap local marker that tells the drain to keep re-running us;
-        emitting it before the (remote, failure-prone) tag write means a
-        tag that lands is always backed by a queued marker. If the tag
-        write fails, the marker lingers harmlessly — a re-run re-enters
-        this path (the canonical is still occupied by the other file until
-        we succeed) and retries; if it never succeeds, the marker is
-        cleaned up by :meth:`_reconcile_awaiting_skip` once our bytes do
-        land. Best-effort like ``_tag_drift_duplicate``: a tag failure is
-        logged, not raised — the upload already satisfied the invariant.
+        Idempotent: an intended title already redirecting to the canonical
+        file is a no-op; a redirect pointing elsewhere is re-pointed. Refuses
+        to clobber a real (non-redirect) file — that state is left for a human
+        (logged) rather than overwriting content. Respects the maintain-mode
+        no-create fence: a not-yet-existing intended title is not created in
+        maintain mode.
         """
-        await_target_free_sidecar.add_key(partner, dpla_id, ordinal)
-        try:
-            self_page = get_page(self.site, f"File:{dpla_canonical_title}")
-            tag_as_duplicate(
-                self.site,
-                self_page,
-                correct_filename=community_title,
-            )
+        page = get_page(self.site, intended_title)
+        if page.exists():
+            if not page.isRedirectPage():
+                logging.warning(
+                    f"Redirect for {dpla_id} {ordinal}: intended title "
+                    f"[[File:{intended_title}]] holds a real file; refusing to "
+                    f"overwrite it with a redirect to [[File:{canonical_title}]] "
+                    f"— left for manual review."
+                )
+                return
+            try:
+                current_target = page.getRedirectTarget().title(with_ns=False)
+            except Exception:
+                current_target = None
+            if current_target == canonical_title:
+                logging.info(
+                    f"Redirect for {dpla_id} {ordinal}: "
+                    f"[[File:{intended_title}]] already redirects to "
+                    f"[[File:{canonical_title}]]; nothing to do."
+                )
+                return
+        elif self.no_create:
             logging.info(
-                f"Tagged [[File:{dpla_canonical_title}]] as duplicate of "
-                f"community-authored [[File:{community_title}]] (DPLA ID "
-                f"{dpla_id}); awaiting Commons admin action."
+                f"maintain: not creating redirect [[File:{intended_title}]] → "
+                f"[[File:{canonical_title}]] for {dpla_id} {ordinal} "
+                f"(no-create fence)."
             )
-        except CsrfRecoveryFailed:
-            raise
+            return
+        page.text = f"#REDIRECT [[File:{canonical_title}]]"
+        with_csrf_recovery(
+            self.site,
+            f"save {page.title()} (redirect to canonical for SHA1 centralization)",
+            lambda: page.save(
+                summary=(
+                    f"Redirecting to canonical file holding this SHA1 "
+                    f"(DPLA ID [[dpla:{dpla_id}|{dpla_id}]])"
+                ),
+                minor=False,
+            ),
+        )
+        logging.info(
+            f"Redirected [[File:{intended_title}]] → [[File:{canonical_title}]] "
+            f"(DPLA ID {dpla_id} ordinal {ordinal})."
+        )
+
+    def _record_hand_fix_and_skip(
+        self,
+        *,
+        partner: str,
+        dpla_id: str,
+        ordinal: int,
+        our_sha1: str,
+        intended_title: str,
+        our_current_file: pywikibot.FilePage,
+    ) -> dict:
+        """Record a rename-blocked (HAND_FIX) ordinal to the per-partner
+        ``hand-fix.jsonl`` sidecar and return an ``ORDINAL_HAND_FIX`` result.
+
+        Our S3 SHA1 lives at a wrong Commons title (``our_current_file``) and
+        the intended title is occupied by a DIFFERENT file, so the bot can
+        neither upload a duplicate nor clobber the occupant. A human resolves
+        it. Best-effort: a sidecar write failure never blocks the run (the
+        ordinal is counted and the case re-detects on a later run).
+        """
+        occupying_title: str | None = None
+        occupying_sha1: str | None = None
+        try:
+            occupying = get_page(self.site, intended_title)
+            if occupying.exists():
+                occupying_title = occupying.title(with_ns=False)
+                if not occupying.isRedirectPage():
+                    try:
+                        occupying_sha1 = occupying.latest_file_info.sha1
+                    except Exception:
+                        occupying_sha1 = None
         except Exception as ex:
             logging.warning(
-                f"Failed to self-tag [[File:{dpla_canonical_title}]] as "
-                f"duplicate of [[File:{community_title}]]: {ex}. A subsequent "
-                f"uploader run for this partner will retry the tag."
+                f"Hand-fix for {dpla_id} {ordinal}: could not inspect occupant "
+                f"at [[File:{intended_title}]]: {ex!r}"
             )
+        our_current_title = our_current_file.title(with_ns=False)
+        logging.warning(
+            f"HAND-FIX required for {dpla_id} {ordinal}: our SHA1 ({our_sha1}) "
+            f"lives at [[File:{our_current_title}]] but intended title "
+            f"[[File:{intended_title}]] is occupied by a different file "
+            f"([[File:{occupying_title}]] SHA1 {occupying_sha1}); recorded to "
+            f"the hand-fix sidecar."
+        )
+        hand_fix_sidecar.record_hand_fix(
+            partner,
+            dpla_id=dpla_id,
+            ordinal=ordinal,
+            our_sha1=our_sha1,
+            intended_title=intended_title,
+            occupying_title=occupying_title,
+            occupying_sha1=occupying_sha1,
+            current_title=our_current_title,
+        )
+        self.tracker.increment(Result.UPLOAD_HAND_FIX)
+        return {"status": ORDINAL_HAND_FIX, "title": None, "pageid": None}
 
     def _persist_upload_result(
         self,
@@ -2482,15 +2265,14 @@ class Uploader:
                     }
                     continue
 
-            # After the per-asset loop, look for "trailing-page orphan" Commons
-            # files for this item — pages whose ordinal exceeds the current
-            # source asset count for that extension. These are invisible to
-            # process_file (it only iterates the current asset list), so the
-            # Case 2 tag-as-duplicate path never fires for them when the
-            # source truncated pages off the end of a multi-page item.
-            # Wrap separately so a check failure doesn't get charged as
-            # FAILED against the item itself — the per-asset uploads have
-            # already succeeded at this point.
+            # After the per-asset loop, audit for "trailing-page orphan"
+            # Commons files for this item — pages whose ordinal exceeds the
+            # current source asset count for that extension. These are
+            # invisible to process_file (it only iterates the current asset
+            # list). Under the SHA1-uniqueness redesign this is a log-only
+            # audit: it no longer emits {{Duplicate}} tags. Wrap separately so
+            # a check failure isn't charged as FAILED against the item — the
+            # per-asset uploads have already succeeded at this point.
             try:
                 _post_item_orphan_check(
                     self.site,
@@ -2508,21 +2290,11 @@ class Uploader:
             except Exception as ex:
                 logging.warning(f"Orphan check failed for {dpla_id}: {ex}; continuing")
 
-            # Persist the per-ordinal results so the SDC sync phase (PR 4)
-            # knows which ordinals to attempt structured-data writes on. Fires
-            # even when ordinal_results is empty (e.g. zero files in
-            # file_list.txt) so a previous run's results don't get treated as
-            # the current truth.
+            # Persist the per-ordinal results so the SDC sync phase knows which
+            # ordinals to attempt structured-data writes on. Fires even when
+            # ordinal_results is empty (e.g. zero files in file_list.txt) so a
+            # previous run's results don't get treated as the current truth.
             self._persist_upload_result(partner, dpla_id, ordinal_results, dry_run)
-
-            # Return how many ordinals the dup-category throttle deferred, so
-            # main() knows to re-run this item in the drain pass and the drain
-            # loop can measure progress per ordinal (a multi-page item can clear
-            # some deferred ordinals while others remain). 0 = nothing deferred;
-            # other exits return None, also falsy.
-            return sum(
-                r.get("status") == ORDINAL_DEFERRED for r in ordinal_results.values()
-            )
 
         except CsrfRecoveryFailed:
             # Session-level fatal — propagates to main() so the run
@@ -2645,7 +2417,6 @@ def _init_upload_worker(
 
     commons_site = get_site()
     category_ensurer = CategoryEnsurer(commons_site, dry_run=dry_run)
-    dup_throttle = DuplicateCategoryThrottle(commons_site)
     tools_context = ToolsContext.init(partner)
     tools_context.get_local_fs().setup_temp_dir()
 
@@ -2657,7 +2428,6 @@ def _init_upload_worker(
         commons_site,
         category_ensurer,
         no_create=no_create,
-        dup_throttle=dup_throttle,
     )
 
     if workers_budget > 0:
@@ -2697,7 +2467,7 @@ def _worker_warmup(_ignored):
 
 def _worker_upload_task(dpla_id: str):
     """Process one DPLA item in the pool worker; return
-    ``(dpla_id, tracker_delta, deferred_count, newly_created_delta)``.
+    ``(dpla_id, tracker_delta, newly_created_delta)``.
 
     ``tracker_delta`` is the change in the worker's tracker counters
     across this one item — the parent merges it into its own tracker
@@ -2723,10 +2493,9 @@ def _worker_upload_task(dpla_id: str):
     """
     prior = _worker_uploader.tracker.snapshot()
     prior_newly_created = set(_worker_uploader.category_ensurer.newly_created)
-    deferred_count = 0
     try:
         with _worker_slot_budget.acquire():
-            deferred_count = _worker_uploader.process_item(
+            _worker_uploader.process_item(
                 dpla_id,
                 _worker_providers_json,
                 _worker_partner,
@@ -2741,7 +2510,7 @@ def _worker_upload_task(dpla_id: str):
     newly_created_delta = (
         _worker_uploader.category_ensurer.newly_created - prior_newly_created
     )
-    return dpla_id, delta, deferred_count or 0, newly_created_delta
+    return dpla_id, delta, newly_created_delta
 
 
 def _run_upload_pool(
@@ -2755,7 +2524,6 @@ def _run_upload_pool(
     providers_json: dict,
     workers: int,
     tracker,
-    deferred: dict[str, int],
     newly_created: set[str],
 ) -> None:
     """Dispatch upload across ``workers`` spawned processes.
@@ -2810,7 +2578,7 @@ def _run_upload_pool(
             ]
             for r in warmup_results:
                 r.get(timeout=120)
-            for dpla_id, delta, deferred_count, newly_created_delta in tqdm(
+            for dpla_id, delta, newly_created_delta in tqdm(
                 pool.imap_unordered(_worker_upload_task, dpla_ids),
                 total=len(dpla_ids),
                 desc="Uploading Items",
@@ -2818,8 +2586,6 @@ def _run_upload_pool(
                 ncols=100,
             ):
                 tracker.merge(delta)
-                if deferred_count:
-                    deferred[dpla_id] = deferred_count
                 newly_created.update(newly_created_delta)
     finally:
         listener.stop()
@@ -2886,7 +2652,7 @@ def main(
     # ``setup_logging`` is the first thing we do so its
     # ``_install_logging_excepthook`` covers the whole run — including
     # pre-``try`` setup calls (``check_partner``, ``WorkerSlotBudget``,
-    # ``DuplicateCategoryThrottle``, ``get_site``) that historically ran
+    # ``get_site``) that historically ran
     # before it. Without this, any of those raising produced an exit-1 with
     # no log at all: the launcher's failure handler would then attach a
     # log from an entirely different (older) run, leading operators to
@@ -2897,13 +2663,6 @@ def main(
     commons_site = get_site()
     category_ensurer = CategoryEnsurer(commons_site, dry_run=dry_run)
 
-    # Caps how many files this run may add to the human-maintained
-    # Category:Duplicate (via {{duplicate}} tags on Case-2 hash-drift uploads).
-    # Consulted only on that rare tag-emitting path; ordinary uploads never
-    # touch it and it queries the category size at most once per ~100 tags.
-    # A dry run never tags, so the throttle is simply never consulted.
-    dup_throttle = DuplicateCategoryThrottle(commons_site)
-
     uploader = Uploader(
         tools_context.get_tracker(),
         tools_context.get_local_fs(),
@@ -2912,7 +2671,6 @@ def main(
         commons_site,
         category_ensurer,
         no_create=no_create,
-        dup_throttle=dup_throttle,
     )
 
     dpla = tools_context.get_dpla()
@@ -2977,8 +2735,6 @@ def main(
 
         dpla_ids = load_ids(ids_file)
 
-        # Map of dpla_id -> count of ordinals the dup-category throttle deferred.
-        deferred: dict[str, int] = {}
         try:
             if workers > 1:
                 # Workers each have their own CategoryEnsurer with a private
@@ -2999,7 +2755,6 @@ def main(
                     providers_json=providers_json,
                     workers=workers,
                     tracker=tracker,
-                    deferred=deferred,
                     newly_created=worker_newly_created,
                 )
                 # ``newly_created`` is a copy-returning property; mutate the
@@ -3010,33 +2765,9 @@ def main(
                     dpla_ids, desc="Uploading Items", unit="Item", ncols=100
                 ):
                     with slot_budget.acquire():
-                        deferred_count = uploader.process_item(
+                        uploader.process_item(
                             dpla_id, providers_json, partner, verbose, dry_run
                         )
-                        if deferred_count:
-                            deferred[dpla_id] = deferred_count
-
-            # Any item whose {{duplicate}}-tagging upload was deferred because
-            # Category:Duplicate was full: persist the deferred DPLA IDs to
-            # the per-partner sidecar and exit normally. The pipeline's
-            # next step (``sdc-sync``) will process every item that DID
-            # upload; the ``drain-deferred`` step at the end of the
-            # pipeline reads the sidecar and patiently loops on
-            # Category:Duplicate until the deferred items can complete.
-            #
-            # This replaces the previous in-line ``_drain_deferred_dups``
-            # loop that held the whole session (and blocked sdc-sync) for
-            # up to 4 hours. See ``ingest_wikimedia.drain_sidecar``.
-            if deferred:
-                combined = drain_sidecar.merge_sidecar(partner, list(deferred))
-                logging.info(
-                    "Deferred %d item(s) to the drain-phase sidecar "
-                    "(%d total now queued for partner %s): %s",
-                    len(deferred),
-                    len(combined),
-                    partner,
-                    drain_sidecar.sidecar_path(partner),
-                )
         except CsrfRecoveryFailed as ex:
             # Session's auth is broken and unrecoverable. Abort — do NOT
             # continue to remaining items (every one would hit the same
@@ -3117,12 +2848,17 @@ def _post_item_orphan_check(
     page_labels: dict[int, str],
     dry_run: bool,
 ) -> None:
-    """Tag Commons files whose page-number suffix exceeds the current source
-    asset count for this item — "trailing-page orphans" left behind when the
-    source truncated one or more pages from the end of a multi-page item.
+    """Audit (log-only) Commons files whose page-number suffix exceeds the
+    current source asset count for this item — "trailing-page orphans" left
+    behind when the source truncated one or more pages from the end of a
+    multi-page item.
 
     These are invisible to process_file (which only iterates current asset
-    list positions), so Case 2's tag-as-duplicate never fires for them.
+    list positions). Under the SHA1-uniqueness redesign (PR C+D) this probe
+    no longer emits ``{{Duplicate}}`` tags; the entire tag apparatus is
+    retired. It remains as an audit: every trailing-page orphan found is
+    logged and counted under ``Result.ORPHANS_FLAGGED`` so operators can see
+    what a human may want to reconcile.
 
     For each extension used by the item:
       - Compute the expected per-extension page count from ordinal_exts.
@@ -3134,11 +2870,11 @@ def _post_item_orphan_check(
         tolerating up to _ORPHAN_GAP_TOLERANCE consecutive missing pages
         — orphans aren't always contiguous (e.g. a prior session may have
         moved or deleted (page N) while leaving (page N+1) stranded).
-      - For each orphan found, compare its SHA1 to the SHA1 set of this
-        item's S3 assets of the same extension:
-          - match → tag as duplicate of the matching uploaded title
-          - no match → log a WARNING for manual review (could be a real
-            unrelated upload at that title that we shouldn't touch)
+      - Each orphan found is logged and flagged; nothing is written to
+        Commons.
+
+    ``dry_run`` is accepted for call-site symmetry with the upload phase but
+    is not consulted — this audit never writes to Commons regardless.
     """
     # Declared per-extension page count from the pre-scan.  This is what
     # determines the legitimate (page 1)…(page N) range for the item — we
@@ -3252,49 +2988,27 @@ def _post_item_orphan_check(
                 # it.  In either case the kept_title we'd point at doesn't
                 # actually exist on Commons.  Confirm it does before pointing
                 # an orphan at a phantom target.
+                # Log-only audit (SHA1-uniqueness redesign): the trailing-page
+                # orphan matches a kept asset's SHA1, so it would formerly have
+                # been tagged {{Duplicate}}. That apparatus is retired; we no
+                # longer tag. Record it as FLAGGED (audit) so the run summary
+                # reflects the follow-up a human may want to make.
                 keep_page = pywikibot.FilePage(site, keep_title)
                 if not keep_page.exists():
                     logging.warning(
                         f"Orphan [[File:{candidate_title}]] (SHA1 {orphan_sha1}) "
-                        f"would point at [[File:{keep_title}]] but that title "
-                        f"does not exist on Commons (asset likely skipped or "
-                        f"upload aborted); flagging instead of tagging."
+                        f"matches [[File:{keep_title}]] which does not exist on "
+                        f"Commons (asset likely skipped or upload aborted); "
+                        f"flagging for audit."
                     )
-                    tracker.increment(Result.ORPHANS_FLAGGED)
-                    continue
-                if dry_run:
+                else:
                     logging.info(
-                        f"[DRY RUN] would tag orphan [[File:{candidate_title}]] "
-                        f"as duplicate of [[File:{keep_title}]] (DPLA ID {dpla_id})"
+                        f"Trailing-page orphan [[File:{candidate_title}]] "
+                        f"(SHA1 {orphan_sha1}) duplicates kept asset "
+                        f"[[File:{keep_title}]] (DPLA ID {dpla_id}); "
+                        f"flagging for audit (no tag emitted)."
                     )
-                    tracker.increment(Result.ORPHANS_TAGGED)
-                    continue
-                try:
-                    tag_as_duplicate(
-                        site,
-                        candidate,
-                        correct_filename=keep_title,
-                        reason=(
-                            "Trailing-page orphan: this title has no "
-                            "corresponding asset in the current DPLA source "
-                            "for this item; the matching asset is uploaded at "
-                            f"[[:File:{keep_title}]]."
-                        ),
-                    )
-                    logging.info(
-                        f"Tagged trailing-page orphan [[File:{candidate_title}]] "
-                        f"as duplicate of [[File:{keep_title}]] (DPLA ID {dpla_id})"
-                    )
-                    tracker.increment(Result.ORPHANS_TAGGED)
-                except CsrfRecoveryFailed:
-                    raise
-                except Exception as e:
-                    # The orphan remains unresolved; record as FLAGGED so the
-                    # run summary accurately reflects follow-up work needed.
-                    logging.warning(
-                        f"Failed to tag orphan [[File:{candidate_title}]]: {e}"
-                    )
-                    tracker.increment(Result.ORPHANS_FLAGGED)
+                tracker.increment(Result.ORPHANS_FLAGGED)
             else:
                 logging.warning(
                     f"Orphan beyond asset count: [[File:{candidate_title}]] "

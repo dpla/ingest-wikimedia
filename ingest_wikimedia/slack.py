@@ -207,12 +207,6 @@ _PHASE_LOG_SUFFIX: dict[str, str] = {
     "download": "download",
     "upload": "upload",
     "sdc-sync": "sdc",
-    "drain-deferred": "drain-deferred",
-    # Per-target opportunistic (``--no-wait``) drain runs inside each
-    # target's chain; a distinct log-file suffix keeps it from
-    # colliding with the batch-terminal patient drain of the same
-    # partner.
-    "drain-deferred-opportunistic": "drain-deferred-opportunistic",
 }
 
 # Per-session-label path the launcher tees ``get-ids-es`` stderr to.
@@ -286,8 +280,7 @@ def notify_pipeline_fail() -> None:
       WIKIMEDIA_SESSION_LABEL  — identifies the target in the message
       WIKIMEDIA_STEP           — name of the pipeline step that was running
                                  when the chain broke (``id-generation``,
-                                 ``download``, ``upload``, ``sdc-sync``,
-                                 ``drain-deferred``).
+                                 ``download``, ``upload``, ``sdc-sync``).
                                  Empty / unset → "pipeline step" generic
                                  wording. Set by the launcher's per-step
                                  ``export`` so the latest assignment before
@@ -615,6 +608,13 @@ def notify_upload_complete(
             # routes to the right team.
             f"  not present: {tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT):,}",
             f"  ineligible:  {tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE):,}",
+            # SHA1-uniqueness redesign outcomes (PR C+D): ordinals whose SHA1
+            # was already on Commons and so were centralized onto the canonical
+            # file (MERGED, redirect left at our title) or handed off to a
+            # human because the rename was blocked (HAND-FIX, recorded to
+            # hand-fix.jsonl).
+            f"MERGED:        {tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL):,}",
+            f"HAND-FIX:      {tracker.count(Result.UPLOAD_HAND_FIX):,}",
             f"FAILED:        {total_failed:,}",
             f"BYTES:         {_format_bytes(tracker.count(Result.BYTES))}",
             f"Runtime:       {runtime}",
@@ -736,67 +736,3 @@ def notify_upload_aborted(
             f"Reason: {reason}",
         ],
     )
-
-
-def notify_drain_phase_start(
-    partner_label: str, deferred_count: int, category_size: int
-) -> None:
-    """Ping #tech-alerts that a session has entered the deferred-drain
-    phase — the uploader has finished processing every non-deferred
-    item, sdc-sync has (or is about to) run on those, and the session
-    is now patiently waiting for Category:Duplicate to fall below the
-    resume threshold so it can finish the deferred items.
-
-    Emitted at drain-phase start so the operator knows the session is
-    in this state (rather than hung or making per-item progress). The
-    tmux session stays alive during the wait; kill via the existing
-    Slack kill-session command if you need to abandon.
-    """
-    token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
-    if not token:
-        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
-        return
-    effective_label = (
-        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
-    )
-    msg = (
-        f"⏳ `{effective_label}`: entering deferred-drain phase — "
-        f"{deferred_count:,} item(s) waiting for Category:Duplicate to "
-        f"drain (currently at {category_size:,}). No worker slots held; "
-        f"other partner sessions unaffected."
-    )
-    try:
-        post_message(token, msg)
-    except Exception:
-        logging.warning(
-            "Failed to post drain-phase-start notification to Slack", exc_info=True
-        )
-
-
-def notify_drain_phase_complete(
-    partner_label: str, elapsed_seconds: float, emitted_count: int
-) -> None:
-    """Ping #tech-alerts that the deferred-drain phase drained cleanly —
-    every deferred upload + ``{{duplicate}}`` tag has landed. Emitted at
-    the drain phase's normal exit; a killed / aborted drain leaves the
-    sidecar in place for a future session to resume from.
-    """
-    token = (os.environ.get("DPLA_SLACK_BOT_TOKEN") or "").strip()
-    if not token:
-        logging.warning("DPLA_SLACK_BOT_TOKEN not set — skipping Slack notification")
-        return
-    effective_label = (
-        f"wikimedia-{os.environ.get('WIKIMEDIA_SESSION_LABEL') or partner_label}"
-    )
-    runtime = _format_runtime(elapsed_seconds)
-    msg = (
-        f"✅ `{effective_label}`: deferred-drain phase complete — "
-        f"{emitted_count:,} item(s) emitted their upload + "
-        f"`{{{{duplicate}}}}` tag over {runtime}."
-    )
-    try:
-        post_message(token, msg)
-    except Exception:
-        logging.warning(
-            "Failed to post drain-phase-complete notification to Slack", exc_info=True
-        )
