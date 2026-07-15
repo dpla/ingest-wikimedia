@@ -2200,12 +2200,31 @@ class Uploader:
         ``- NARA -``), AND (2) its ORIGINAL uploader isn't one of our bots
         (DPLA bot / US National Archives bot).
 
-        The AND is deliberate. A bot upload with a malformed title (shape fails
-        but uploader is ours) is still ours to fix; a DPLA-shaped file uploaded
-        from a personal account (uploader fails but shape is ours) is still
-        ours to act on. Only a file that looks non-ours on BOTH axes is handed
-        to a human. When the uploader can't be read, err toward community
-        (hands-off)."""
+        The AND is deliberate, and trusting title-shape alone (the early
+        return below) is intentional — NOT a missing provenance check:
+
+        * A bot upload with a malformed title (shape fails but uploader is
+          ours) is still ours to fix.
+        * A DPLA/NARA-shaped title is treated as ours even when the recorded
+          uploader is a real person, for two reasons. (a) Such files
+          legitimately exist with a non-bot uploader on record — e.g. test
+          pages uploaded from a maintainer's account, or files renamed in from
+          a community member before this rule existed — so the shape is the
+          more reliable "ours" signal there. (b) More fundamentally, a
+          DPLA-shaped title OCCUPIES a title reserved for our content: it is
+          blocking the exact name our upload would take, and no community user
+          has a legitimate expectation of holding that name. Handing it off
+          would strand our own file behind someone else's, so we always act on
+          it regardless of uploader.
+
+        Only a file that looks non-ours on BOTH axes is handed to a human.
+        When the uploader can't be read, err toward community (hands-off).
+
+        (Considered and rejected on PR #408: making uploader-provenance
+        override title shape. Because the bot allowlist is a small fixed set,
+        that would flip every DPLA/NARA-shaped file whose oldest uploader isn't
+        an exact allowlisted account into community-hand-off, stranding our own
+        corpus — the mis-classification this AND-contract exists to prevent.)"""
         if _has_dpla_shaped_title(file_page.title(with_ns=False)):
             return False
         try:
