@@ -3191,7 +3191,7 @@ def test_merge_sdc_onto_canonical_skips_when_no_staged_sdc():
     uploader.s3_client.get_sdc_json.return_value = None
 
     with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
-        uploader._merge_sdc_onto_canonical(
+        result = uploader._merge_sdc_onto_canonical(
             canonical_mediaid="M42",
             dpla_id="yyyy",
             partner="nara",
@@ -3199,6 +3199,11 @@ def test_merge_sdc_onto_canonical_skips_when_no_staged_sdc():
             within_item=True,
         )
 
+    # A genuinely-absent sdc.json (item contributes no claims) is "nothing to
+    # merge" = success, NOT a failure — the caller treats a falsy return as a
+    # retryable merge failure, so pin the True so a regression to None/False
+    # (which would strand the DEDUP outcome in permanent retry) is caught.
+    assert result is True
     merge_mock.assert_not_called()
 
 

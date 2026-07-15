@@ -116,17 +116,21 @@ hypothesis.**
    Commons file's SHA1 — that is circular reasoning.**
 4. Build the matrix (rows = DPLA IDs, columns = intended title / observed
    Commons SHA1 (or redirect target) / S3 SHA1). Put the matrix in your
-   writeup verbatim before drawing conclusions.
+   write-up verbatim before drawing conclusions.
 5. For each row ask: **is that DPLA ID's content discoverable at its
    intended title — either as the canonical file OR as a redirect to the
    one canonical file that holds its SHA1?** And separately: **does any
    SHA1 appear on more than one non-redirect Commons file?**
-6. If every item is discoverable at its intended title AND no SHA1
-   appears on two files → the invariant is satisfied.
-7. If a SHA1 appears on two non-redirect files → that IS a bug now (a
-   uniqueness-constraint violation); one of them should be a redirect to
-   the other (the earliest). If an intended title neither holds the
-   content nor redirects to the canonical file → THAT title is the bug.
+6. If every item is discoverable at its intended title AND this run did
+   not create a second non-redirect file for any SHA1 → the invariant is
+   satisfied.
+7. If this run created a second non-redirect Commons file for a SHA1 →
+   that IS a bug now (a uniqueness-constraint violation); one of them
+   should be a redirect to the other (the earliest). If an intended title
+   neither holds the content nor redirects to the canonical file → THAT
+   title is the bug. (A *pre-existing* legacy duplicate not created by
+   this uploader is out of scope — see the scope note at the top; the
+   uploader does not backfill them.)
 
 ## Failure modes — anti-patterns to actively guard against
 

@@ -1231,6 +1231,19 @@ class Uploader:
                 # suppressed. Mixed-type literal is intentional; the
                 # explicit type annotation documents the union for
                 # readers and silences the static-analysis flag.
+                #
+                # INVARIANT-LOAD-BEARING: the plain fresh-upload path (a
+                # genuine new SHA1 at an unoccupied title) is NOT direct —
+                # file_exists and force_ignore_warnings are both False, so
+                # prefers_direct is False and this yields the LIST, not
+                # ``True``. ``IGNORE_WIKIMEDIA_WARNINGS`` deliberately omits
+                # ``'duplicate'`` (see its definition), so if a concurrent
+                # worker/session races us and publishes our SHA1 first, our
+                # commit surfaces the ``duplicate`` warning and Commons
+                # rejects it — the one-SHA1 backstop the per-SHA1 lock and
+                # this comment's caller rely on. ``True`` is reached only for
+                # deliberate overwrites (file_exists byte-drift, or
+                # force_ignore_warnings redirect handling), never the race.
                 upload_warnings: bool | list[str] = (
                     True if prefers_direct else IGNORE_WIKIMEDIA_WARNINGS
                 )
