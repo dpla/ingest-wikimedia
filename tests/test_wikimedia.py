@@ -17,12 +17,14 @@ from ingest_wikimedia.wikimedia import (
     extract_strings,
     extract_strings_dict,
     file_has_inbound_usage,
+    find_file_by_hash,
     is_same_item_redirect_relic,
     merge_preserved_wikitext,
     post_commonsdelinker_request,
     wiki_file_exists,
     check_content_type,
 )
+from types import SimpleNamespace
 
 
 @patch("ingest_wikimedia.wikimedia.pywikibot.Site")
@@ -482,6 +484,72 @@ def test_wiki_file_exists():
     exists = wiki_file_exists(mock_site, "fakehash")
     assert exists
     mock_site.allimages.assert_called_once()
+
+
+class _FakeHashFilePage:
+    """A minimal FilePage stand-in for find_file_by_hash tests.
+
+    ``title(with_ns=False)`` returns ``title``; ``oldest_file_info.timestamp``
+    returns ``timestamp`` (or the property raises when ``raise_ts`` to simulate
+    unreadable file history). A real class (not a MagicMock) so setting the
+    raising property can't leak across tests via the shared mock class."""
+
+    def __init__(self, title: str, timestamp=None, raise_ts: bool = False):
+        self._title = title
+        self._timestamp = timestamp
+        self._raise_ts = raise_ts
+
+    def title(self, with_ns: bool = False) -> str:
+        return self._title
+
+    @property
+    def oldest_file_info(self):
+        if self._raise_ts:
+            raise RuntimeError("no history")
+        return SimpleNamespace(timestamp=self._timestamp)
+
+
+def test_find_file_by_hash_preferred_title_fast_path():
+    """A file at the preferred_title is returned immediately, regardless of
+    upload order or timestamps."""
+    match = _FakeHashFilePage("Wanted.jpg", timestamp=500)
+    other = _FakeHashFilePage("Other.jpg", timestamp=1)
+    site = MagicMock()
+    site.allimages.return_value = [other, match]
+
+    result = find_file_by_hash(site, "somesha1", preferred_title="Wanted.jpg")
+    assert result is match
+
+
+def test_find_file_by_hash_returns_earliest_upload():
+    """When two files share the SHA1 and neither matches preferred_title, the
+    EARLIEST-uploaded file is canonical — even if the API lists a later upload
+    first (alphabetically)."""
+    newer = _FakeHashFilePage("Aaa newer.jpg", timestamp=200)  # alphabetical first
+    older = _FakeHashFilePage("Zzz older.jpg", timestamp=100)  # alphabetical last
+    site = MagicMock()
+    site.allimages.return_value = [newer, older]
+
+    result = find_file_by_hash(site, "somesha1", preferred_title=None)
+    assert result is older
+
+
+def test_find_file_by_hash_falls_back_to_first_when_timestamps_unreadable():
+    """If no upload timestamp can be read, fall back to the API's first
+    (alphabetical) result so a usable FilePage is still returned."""
+    first = _FakeHashFilePage("A.jpg", raise_ts=True)
+    second = _FakeHashFilePage("B.jpg", raise_ts=True)
+    site = MagicMock()
+    site.allimages.return_value = [first, second]
+
+    result = find_file_by_hash(site, "somesha1", preferred_title=None)
+    assert result is first
+
+
+def test_find_file_by_hash_returns_none_when_no_match():
+    site = MagicMock()
+    site.allimages.return_value = []
+    assert find_file_by_hash(site, "somesha1") is None
 
 
 NEW_WIKITEXT = "== {{int:filedesc}} ==\n{{DPLA metadata|title=Example}}"

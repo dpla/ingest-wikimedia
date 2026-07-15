@@ -19,6 +19,7 @@ from ingest_wikimedia.csrf import (
     is_csrf_token_error,
 )
 from tools.uploader import (
+    DriftResolution,
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     NewFilePageBlocked,
     Uploader,
@@ -1981,6 +1982,124 @@ def test_process_file_backend_fail_retry_exhaustion_counts_once():
     )
 
 
+def test_process_file_octet_stream_redetected_still_uploads():
+    """An octet-stream S3 object whose MIME re-detects to a real image type
+    (``file_downloaded=True``) must still flow through the collision/upload
+    block and upload — not fall through to ORDINAL_INELIGIBLE. The bytes
+    already fetched for re-detection are NOT re-downloaded (the fresh-upload
+    download is guarded by ``if not file_downloaded``). Regression pin for the
+    line-845 gate fix."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "application/octet-stream"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+    # MIME re-detection succeeds: octet-stream -> image/jpeg.
+    uploader.local_fs.get_content_type.return_value = "image/jpeg"
+
+    fake_page = MagicMock()
+    fake_page.exists.return_value = False
+    fake_page.isRedirectPage.return_value = False
+    fake_page.pageid = 0
+
+    # Upload succeeds; the post-upload pageid refresh returns a real id.
+    uploader._safe_upload = MagicMock(return_value="ok")
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=4242)
+
+    title = "File:Something - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=None),
+        patch("tools.uploader.get_page_title", return_value=title),
+        patch("tools.uploader.get_page", return_value=fake_page),
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Something",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "UPLOADED"
+    assert result["pageid"] == 4242
+    # download_file called exactly once — the re-detection fetch. The
+    # fresh-upload download must be skipped because the bytes are on disk.
+    assert fake_s3_object.download_file.call_count == 1
+
+
+def test_process_file_merge_and_redirect_none_expected_titles_no_crash():
+    """A cross-item MERGE_AND_REDIRECT when ``expected_item_titles`` is None
+    (the parameter default) must not raise TypeError on ``x in None`` — the
+    within_item derivation is guarded, yielding within_item=False. Regression
+    pin for the line-945 guard fix."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    existing = MagicMock()
+    existing.title.return_value = (
+        "Other - DPLA - ffffffffffffffffffffffffffffffff (page 1).jpg"
+    )
+
+    title = "File:Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    captured = {}
+
+    def fake_merge(**kwargs):
+        captured.update(kwargs)
+        return {"status": "MERGED", "title": "x", "pageid": 1}
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=existing),
+        patch("tools.uploader.get_page_title", return_value=title),
+        patch.object(uploader, "_is_community_file", return_value=False),
+        patch(
+            "tools.uploader.is_dup_sha1_sibling_at_expected_title",
+            return_value=False,
+        ),
+        patch.object(
+            uploader,
+            "_resolve_hash_drift",
+            return_value=DriftResolution.MERGE_AND_REDIRECT,
+        ),
+        patch.object(uploader, "_merge_and_redirect", side_effect=fake_merge),
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+            expected_item_titles=None,
+        )
+
+    assert result["status"] == "MERGED"
+    assert captured["within_item"] is False
+
+
 # ---------------------------------------------------------------------------
 # CSRF token recovery in the retry loop.
 #
@@ -2743,7 +2862,9 @@ def test_merge_and_redirect_merges_sdc_and_creates_redirect():
 
     with (
         patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
-        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
+        patch.object(
+            uploader, "_create_redirect_to_canonical", return_value="created"
+        ) as redirect_mock,
     ):
         result = uploader._merge_and_redirect(
             canonical_file=canonical,
@@ -2753,6 +2874,7 @@ def test_merge_and_redirect_merges_sdc_and_creates_redirect():
             partner="nara",
             page_label="1",
             within_item=True,
+            sha1="a" * 40,
         )
 
     assert result == {
@@ -2782,7 +2904,9 @@ def test_merge_and_redirect_skips_sdc_when_canonical_pageid_falsy():
 
     with (
         patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
-        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
+        patch.object(
+            uploader, "_create_redirect_to_canonical", return_value="created"
+        ) as redirect_mock,
     ):
         result = uploader._merge_and_redirect(
             canonical_file=canonical,
@@ -2792,6 +2916,7 @@ def test_merge_and_redirect_skips_sdc_when_canonical_pageid_falsy():
             partner="nara",
             page_label="",
             within_item=False,
+            sha1="b" * 40,
         )
 
     merge_mock.assert_not_called()
@@ -2954,7 +3079,7 @@ def test_create_redirect_to_canonical_respects_no_create_fence():
         patch("tools.uploader.get_page", return_value=page),
         patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
     ):
-        uploader._create_redirect_to_canonical(
+        outcome = uploader._create_redirect_to_canonical(
             intended_title="Ours - DPLA - yyyy.jpg",
             canonical_title="Canonical - DPLA - xxxx.jpg",
             dpla_id="yyyy",
@@ -2962,3 +3087,127 @@ def test_create_redirect_to_canonical_respects_no_create_fence():
         )
 
     page.save.assert_not_called()
+    assert outcome == "fenced"
+
+
+def test_create_redirect_to_canonical_preserves_ancillary_wikitext():
+    """Re-pointing an EXISTING redirect that carries a trailing category
+    replaces ONLY the redirect line and keeps the category. Regression pin for
+    the wikitext-preservation fix."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(
+        exists=True, is_redirect=True, redirect_target="Old - DPLA - zzzz.jpg"
+    )
+    page.text = "#REDIRECT [[File:Old - DPLA - zzzz.jpg]]\n[[Category:Some category]]"
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        outcome = uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    assert outcome == "created"
+    assert page.text == (
+        "#REDIRECT [[File:Canonical - DPLA - xxxx.jpg]]\n[[Category:Some category]]"
+    )
+    page.save.assert_called_once()
+
+
+def test_create_redirect_to_canonical_returns_created_for_new_page():
+    """A brand-new redirect page reports the ``created`` outcome."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        outcome = uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    assert outcome == "created"
+
+
+def test_merge_and_redirect_hand_fix_when_intended_title_holds_real_file():
+    """If the intended title is occupied by a DIFFERENT real file, the redirect
+    can't be established → report HAND_FIX (rename_blocked), NOT MERGED. The SDC
+    merge still ran (add-only / idempotent, safe to leave in place). Regression
+    pin for the blocked-redirect outcome routing."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+
+    # A DIFFERENT real (non-redirect) file occupies the intended title.
+    occupant = MagicMock()
+    occupant.exists.return_value = True
+    occupant.isRedirectPage.return_value = False
+    occupant.title.return_value = "Ours - DPLA - yyyy (page 1).jpg"
+    occupant.latest_file_info.sha1 = "ffff" * 10
+
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch("tools.uploader.get_page", return_value=occupant),
+        patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=False,
+            sha1="abcd" * 10,
+        )
+
+    merge_mock.assert_called_once()  # SDC merge still ran
+    assert result["status"] == "HAND_FIX"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    record_mock.assert_called_once()
+    assert record_mock.call_args.kwargs["reason"] == "rename_blocked"
+    # Our SHA1's canonical home is recorded as the current title.
+    assert (
+        record_mock.call_args.kwargs["current_title"]
+        == "Canonical - DPLA - xxxx (page 1).jpg"
+    )
+
+
+def test_merge_and_redirect_fenced_in_maintain_mode_is_not_merged():
+    """maintain-mode no-create fence blocks the net-new redirect page → report
+    a would-create skip (INELIGIBLE), NOT MERGED."""
+    tracker = Tracker()
+    uploader = _uploader(no_create=True)
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch("tools.uploader.get_page", return_value=page),
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=False,
+            sha1="abcd" * 10,
+        )
+
+    merge_mock.assert_called_once()
+    assert result["status"] == "INELIGIBLE"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    assert tracker.count(Result.UPLOAD_SKIPPED_WOULD_CREATE) == 1

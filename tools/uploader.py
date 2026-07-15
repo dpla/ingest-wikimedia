@@ -280,6 +280,15 @@ def _has_dpla_shaped_title(title: str) -> bool:
     return any(marker in title for marker in _DPLA_TITLE_MARKERS)
 
 
+# Matches a single MediaWiki redirect directive: ``#REDIRECT [[Target]]`` with
+# optional whitespace before the target and an optional leading ``:`` in the
+# link (e.g. ``[[:File:Foo.jpg]]``). Case-insensitive per MediaWiki's own
+# ``#redirect`` handling. Used to re-point ONLY the redirect line of an
+# existing redirect page, preserving any ancillary wikitext (categories,
+# templates, comments) that sits around it.
+_REDIRECT_LINE_RE = re.compile(r"#REDIRECT\s*\[\[[^\]]*\]\]", re.IGNORECASE)
+
+
 class DriftResolution(str, Enum):
     """The outcomes ``_resolve_hash_drift`` produces, one per
     invariant-restoring next step the caller takes.
@@ -842,11 +851,16 @@ class Uploader:
                     f"SHA1 found at [[File:{existing_file.title(with_ns=False)}]]"
                 )
 
-            if not dry_run and not file_downloaded:
+            if not dry_run:
                 # SHA1-uniqueness constraint (PR C+D): if our S3 SHA1 already
                 # exists anywhere on Commons, we NEVER upload a second copy.
                 # Resolve to exactly one non-upload outcome and return — no
                 # branch below falls through to the download/upload path.
+                # NOTE: this block is NOT gated on ``file_downloaded``. A file
+                # already fetched by the octet-stream MIME re-detection path
+                # above (file_downloaded=True) must still be collision-resolved
+                # or uploaded here — the fresh-upload download below is the only
+                # step that skips when the bytes are already on disk.
                 if existing_file is not None:
                     existing_title = existing_file.title(with_ns=False)
                     # Community files are off-limits to our automation: never
@@ -890,6 +904,7 @@ class Uploader:
                             partner=partner,
                             page_label=page_label,
                             within_item=True,
+                            sha1=sha1,
                         )
 
                     drift_action = self._resolve_hash_drift(
@@ -942,7 +957,9 @@ class Uploader:
                             ordinal=ordinal,
                             partner=partner,
                             page_label=page_label,
-                            within_item=existing_title in expected_item_titles,
+                            within_item=bool(expected_item_titles)
+                            and existing_title in expected_item_titles,
+                            sha1=sha1,
                         )
                     # DriftResolution.HAND_FIX (and any unforeseen sentinel):
                     # our SHA1 is at a wrong title and the intended title is
@@ -964,20 +981,25 @@ class Uploader:
                 # fresh-upload path).
                 force_ignore_warnings = False
 
-                with tqdm(
-                    total=s3_object.content_length,
-                    leave=False,
-                    desc="S3 Download",
-                    unit="B",
-                    unit_scale=1024,
-                    unit_divisor=True,
-                    delay=2,
-                    ncols=100,
-                ) as t:
-                    s3_object.download_file(
-                        temp_file.name,
-                        Callback=lambda bytes_xfer: t.update(bytes_xfer),
-                    )
+                # Skip re-downloading when the octet-stream MIME re-detection
+                # path above already fetched the bytes to temp_file
+                # (file_downloaded); re-downloading would just refetch the same
+                # object.
+                if not file_downloaded:
+                    with tqdm(
+                        total=s3_object.content_length,
+                        leave=False,
+                        desc="S3 Download",
+                        unit="B",
+                        unit_scale=1024,
+                        unit_divisor=True,
+                        delay=2,
+                        ncols=100,
+                    ) as t:
+                        s3_object.download_file(
+                            temp_file.name,
+                            Callback=lambda bytes_xfer: t.update(bytes_xfer),
+                        )
 
                 wiki_file_page = get_page(self.site, page_title)
 
@@ -1859,6 +1881,7 @@ class Uploader:
         partner: str,
         page_label: str,
         within_item: bool,
+        sha1: str,
     ) -> dict:
         """Rule #3 (source duplication): centralize our SHA1 onto the earliest
         existing (canonical) Commons file instead of uploading a second
@@ -1871,10 +1894,23 @@ class Uploader:
         (b) Leave a ``#REDIRECT`` at our intended title. A redirect carries no
             media, so the one-SHA1-one-file constraint holds.
 
-        Returns an ``ORDINAL_MERGED`` result. The canonical file already
-        carries the merged SDC, so the SDC-sync phase must NOT re-target our
-        (redirect) intended title — ``ORDINAL_MERGED`` is deliberately not in
-        its UPLOADED/SKIPPED eligibility set.
+        The reported outcome is gated on whether the redirect was actually
+        established (``_create_redirect_to_canonical``'s return value):
+
+        - ``created`` / ``already`` → report ``ORDINAL_MERGED`` and bump
+          ``UPLOAD_MERGED_TO_CANONICAL``. Our intended title now resolves to
+          the canonical file. ``ORDINAL_MERGED`` is deliberately NOT in the
+          SDC-sync UPLOADED/SKIPPED eligibility set — the SDC was merged inline
+          onto the canonical file.
+        - ``blocked_real_file`` → the intended title holds a DIFFERENT real
+          file, so the redirect could not be established and our SHA1 is NOT
+          discoverable at the intended title. Do NOT report MERGED; record a
+          ``rename_blocked`` HAND_FIX instead. The SDC merge already ran onto
+          the canonical file (add-only / idempotent), so this is safe and
+          re-runnable.
+        - ``fenced`` → maintain-mode no-create fence declined to create the
+          redirect page. Non-terminal skip (``UPLOAD_SKIPPED_WOULD_CREATE`` +
+          INELIGIBLE), not MERGED — a later non-maintain run creates it.
         """
         canonical_title = canonical_file.title(with_ns=False)
         canonical_pageid = canonical_file.pageid
@@ -1894,12 +1930,38 @@ class Uploader:
                 f"[[File:{canonical_title}]] has no resolvable pageid; skipping "
                 f"SDC merge (redirect still created)."
             )
-        self._create_redirect_to_canonical(
+        redirect_outcome = self._create_redirect_to_canonical(
             intended_title=intended_title,
             canonical_title=canonical_title,
             dpla_id=dpla_id,
             ordinal=ordinal,
         )
+        if redirect_outcome == "blocked_real_file":
+            # A DIFFERENT real file occupies the intended title — the redirect
+            # was NOT established, so we must not claim MERGED. Hand it to a
+            # human (rename_blocked). Our SHA1's canonical home is the canonical
+            # file; the occupant sits at the intended title.
+            return self._record_hand_fix_and_skip(
+                partner=partner,
+                dpla_id=dpla_id,
+                ordinal=ordinal,
+                our_sha1=sha1,
+                intended_title=intended_title,
+                our_current_file=canonical_file,
+            )
+        if redirect_outcome == "fenced":
+            # maintain mode: the redirect page would be net-new and the
+            # no-create fence declined it. Report a would-create skip so the
+            # SDC phase does not target a page that isn't there.
+            self._track_ordinal_skip(Result.UPLOAD_SKIPPED_WOULD_CREATE)
+            return {
+                "status": ORDINAL_INELIGIBLE,
+                "title": None,
+                "pageid": None,
+                "error": "would create a redirect page (blocked in maintain mode)",
+            }
+        # redirect_outcome in ("created", "already"): the redirect is
+        # established and the intended title resolves to the canonical file.
         self.tracker.increment(Result.UPLOAD_MERGED_TO_CANONICAL)
         return {
             "status": ORDINAL_MERGED,
@@ -1987,7 +2049,7 @@ class Uploader:
         canonical_title: str,
         dpla_id: str,
         ordinal: int,
-    ) -> None:
+    ) -> str:
         """Leave a ``#REDIRECT [[File:<canonical>]]`` at our intended title.
 
         Idempotent: an intended title already redirecting to the canonical
@@ -1996,8 +2058,26 @@ class Uploader:
         (logged) rather than overwriting content. Respects the maintain-mode
         no-create fence: a not-yet-existing intended title is not created in
         maintain mode.
+
+        When re-pointing an EXISTING redirect page, replaces ONLY the redirect
+        line (preserving any ancillary wikitext — categories, templates,
+        comments — the page carries around it); a brand-new page gets the bare
+        ``#REDIRECT`` text.
+
+        Returns the outcome so the caller can decide whether the redirect was
+        actually established:
+
+        - ``"created"`` — the redirect was written (new page, or an existing
+          redirect re-pointed).
+        - ``"already"`` — the intended title already redirects to the canonical
+          file; nothing to do.
+        - ``"blocked_real_file"`` — a real (non-redirect) file occupies the
+          intended title; left for a human, no redirect written.
+        - ``"fenced"`` — maintain-mode no-create fence declined to create a
+          net-new redirect page.
         """
         page = get_page(self.site, intended_title)
+        canonical_redirect = f"#REDIRECT [[File:{canonical_title}]]"
         if page.exists():
             if not page.isRedirectPage():
                 logging.warning(
@@ -2006,7 +2086,7 @@ class Uploader:
                     f"overwrite it with a redirect to [[File:{canonical_title}]] "
                     f"— left for manual review."
                 )
-                return
+                return "blocked_real_file"
             try:
                 current_target = page.getRedirectTarget().title(with_ns=False)
             except Exception:
@@ -2017,15 +2097,25 @@ class Uploader:
                     f"[[File:{intended_title}]] already redirects to "
                     f"[[File:{canonical_title}]]; nothing to do."
                 )
-                return
+                return "already"
+            # Existing redirect pointing elsewhere: re-point ONLY the redirect
+            # line so any ancillary wikitext (categories, templates, comments)
+            # survives. Fall back to the bare redirect if no redirect line is
+            # found (an odd redirect page whose text we can't parse).
+            existing_text = page.text or ""
+            new_text, n_subs = _REDIRECT_LINE_RE.subn(
+                canonical_redirect, existing_text, count=1
+            )
+            page.text = new_text if n_subs else canonical_redirect
         elif self.no_create:
             logging.info(
                 f"maintain: not creating redirect [[File:{intended_title}]] → "
                 f"[[File:{canonical_title}]] for {dpla_id} {ordinal} "
                 f"(no-create fence)."
             )
-            return
-        page.text = f"#REDIRECT [[File:{canonical_title}]]"
+            return "fenced"
+        else:
+            page.text = canonical_redirect
         with_csrf_recovery(
             self.site,
             f"save {page.title()} (redirect to canonical for SHA1 centralization)",
@@ -2041,6 +2131,7 @@ class Uploader:
             f"Redirected [[File:{intended_title}]] → [[File:{canonical_title}]] "
             f"(DPLA ID {dpla_id} ordinal {ordinal})."
         )
+        return "created"
 
     def _is_community_file(self, file_page: pywikibot.FilePage) -> bool:
         """A file is 'community' — off-limits to our automated rename, SDC

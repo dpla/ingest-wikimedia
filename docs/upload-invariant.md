@@ -72,13 +72,22 @@ Once `find_file_by_hash` returns any existing file for our SHA1,
    more than one position within an item (within-item), or across items
    / institutions (cross-item). We merge this item's SDC onto the
    earliest (canonical) file and leave a redirect at our intended title.
-4. **HAND_FIX** (`DriftResolution.HAND_FIX`) — our SHA1 is at a wrong
-   title and the intended title is occupied by a DIFFERENT file
-   (different SHA1), or by a redirect to some third file, or the
-   colliding file's DPLA ID could not be verified. The bot can neither
-   upload a duplicate nor safely pick a winner / clobber the occupant, so
-   it records the case to the per-partner `hand-fix.jsonl` sidecar for a
-   human and moves on (`Result.UPLOAD_HAND_FIX`).
+4. **HAND_FIX** — the bot can neither upload a duplicate nor safely pick a
+   winner / clobber the occupant, so it records the case to the per-partner
+   `hand-fix.jsonl` sidecar for a human and moves on
+   (`Result.UPLOAD_HAND_FIX`). Two reasons occur:
+   - **`rename_blocked`** (`DriftResolution.HAND_FIX`) — our SHA1 is at a
+     wrong title and the intended title is occupied by a DIFFERENT file
+     (different SHA1), or by a redirect to some third file, or the
+     colliding file's DPLA ID could not be verified.
+   - **`community_file`** — the SHA1 match is against a COMMUNITY file:
+     its title lacks the DPLA/NARA shape (`- DPLA - ` / `- NARA - `) **AND**
+     its original uploader is not one of our bots (`DPLA_BOT_ACCOUNTS`). We
+     never rename, merge onto, redirect, or migrate a community file, so it
+     is handed to a human untouched. This case is decided in `process_file`
+     (via `_is_community_file` / `_record_community_hand_fix_and_skip`)
+     *before* any drift resolution runs, so no MOVE / MERGE_AND_REDIRECT can
+     touch a community file.
 
 On the fresh-upload path (`find_file_by_hash` returns `None`, i.e. our
 SHA1 is not yet on Commons) the uploader uploads our bytes to the

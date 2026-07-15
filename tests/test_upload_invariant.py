@@ -272,6 +272,7 @@ def test_merge_and_redirect_merges_sdc_and_creates_redirect():
             partner="georgia",
             page_label="",
             within_item=False,
+            sha1="a" * 40,
         )
 
     merge.assert_called_once()
@@ -314,6 +315,7 @@ def test_merge_and_redirect_within_item_stamps_page_number():
             partner="georgia",
             page_label="2",
             within_item=True,
+            sha1="d" * 40,
         )
 
     _, kwargs = merge.call_args

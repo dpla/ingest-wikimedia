@@ -54,7 +54,7 @@ find_file_by_hash(site, sha1, preferred_title=None)   # FilePage or None
 collect_duplicate_source_sha1s(s3, dpla_id, partner)  # set of sha1s appearing > 1× in this item
 ```
 
-`find_file_by_hash` calls Commons' `allimages?sha1=...` API; if any result lives at the `preferred_title`, returns it; otherwise returns the first result alphabetically. `collect_duplicate_source_sha1s` walks each S3 ordinal's user metadata and returns SHA1s that appear at two-or-more positions in the same DPLA item — used to short-circuit drift detection for legitimate intra-item duplicates.
+`find_file_by_hash` calls Commons' `allimages?sha1=...` API; if any result lives at the `preferred_title`, returns it (same-title fast path); otherwise, when more than one file shares the SHA1, it returns the **earliest existing upload** (the file whose `oldest_file_info.timestamp` is earliest), matching the SHA1-uniqueness redesign's canonical = earliest-upload rule — falling back to the API's first (alphabetical) result only if no upload timestamp can be read. `collect_duplicate_source_sha1s` walks each S3 ordinal's user metadata and returns SHA1s that appear at two-or-more positions in the same DPLA item — used to short-circuit drift detection for legitimate intra-item duplicates.
 
 ### The hot path (`process_file`)
 

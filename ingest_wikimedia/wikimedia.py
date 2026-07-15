@@ -859,19 +859,43 @@ def find_file_by_hash(
 ) -> FilePage | None:
     """Return the Commons FilePage with the given SHA1, or None.
 
-    If preferred_title is given and a file with that title (without namespace)
-    shares the hash, it is returned immediately. Otherwise the first result
-    returned by the API (alphabetical) is returned. This handles the rare case
-    where multiple files share a SHA1 and we want the one at the correct title.
+    If ``preferred_title`` is given and a file with that title (without
+    namespace) shares the hash, it is returned immediately — the same-title
+    fast path (our bytes are already at the intended title).
+
+    Otherwise, when more than one file shares the SHA1, the canonical file is
+    the EARLIEST existing upload: the file whose oldest revision has the
+    earliest timestamp (read via ``FilePage.oldest_file_info.timestamp``). This
+    matches the SHA1-uniqueness redesign, which centralizes duplicate content
+    onto the earliest upload. If a file's upload timestamp can't be read, the
+    function falls back to the API's first (alphabetical) result so it still
+    returns a usable FilePage.
     """
     api_site = typing.cast(APISite, site)
-    first: FilePage | None = None
+    candidates: list[FilePage] = []
     for img in api_site.allimages(sha1=sha1):
         if preferred_title and img.title(with_ns=False) == preferred_title:
             return img
-        if first is None:
-            first = img
-    return first
+        candidates.append(img)
+    if not candidates:
+        return None
+
+    def _upload_timestamp(file_page: FilePage):
+        try:
+            return file_page.oldest_file_info.timestamp
+        except Exception:  # noqa: BLE001 — unreadable history → no timestamp
+            return None
+
+    # Default to the API's first (alphabetical) result — the historical
+    # behaviour and the fallback when no timestamp can be read.
+    earliest = candidates[0]
+    earliest_ts = _upload_timestamp(earliest)
+    for file_page in candidates[1:]:
+        ts = _upload_timestamp(file_page)
+        if ts is not None and (earliest_ts is None or ts < earliest_ts):
+            earliest = file_page
+            earliest_ts = ts
+    return earliest
 
 
 _DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
