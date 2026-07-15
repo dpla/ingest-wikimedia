@@ -1,9 +1,8 @@
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 from ingest_wikimedia.wikimedia import (
     COMMONSDELINKER_PAGE,
     MAX_COMMENT_BYTES,
     build_title_drift_move_reason,
-    escape_template_param,
     get_site,
     get_page_title,
     get_wiki_text,

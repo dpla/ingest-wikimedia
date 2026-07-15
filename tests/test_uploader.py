@@ -2711,8 +2711,10 @@ def test_record_hand_fix_and_skip_survives_occupant_inspection_failure():
 
     assert result["status"] == "HAND_FIX"
     assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    uploader.site.upload.assert_not_called()
     record_mock.assert_called_once()
     kwargs = record_mock.call_args.kwargs
+    assert kwargs["intended_title"] == intended_title
     assert kwargs["occupying_title"] is None
     assert kwargs["occupying_sha1"] is None
 
