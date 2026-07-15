@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.session_state import (
+    _PHASE_ALT,
     find_active_label,
     log_filename_pattern_for_label,
     snapshot_running_active_labels,
@@ -211,9 +212,7 @@ def get_phase_and_progress(
         # over from the old moving-window apparatus, after which no phase branch
         # matches and status reads "Unknown". The ('+') exclusion is redundant
         # with the anchored pattern but kept for clarity.
-        legacy_pattern = shlex.quote(
-            rf"^{re.escape(hub)}-(id-generation|download|upload|sdc)\.log$"
-        )
+        legacy_pattern = shlex.quote(rf"^{re.escape(hub)}-({_PHASE_ALT})\.log$")
         log_file = ssm_run(
             client,
             f"ls -t {log_dir}/ 2>/dev/null | grep -E -- {legacy_pattern} "

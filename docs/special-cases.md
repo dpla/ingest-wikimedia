@@ -77,11 +77,11 @@ else:
     drift_action = _resolve_hash_drift(...)  # MOVED / MERGE_AND_REDIRECT / HAND_FIX / ALREADY_CORRECT
 ```
 
-Under the SHA1-uniqueness constraint (PR C+D) **no two Commons files may share a SHA1**: once `find_file_by_hash` returns a hit, the uploader NEVER uploads a second byte-identical copy — it resolves to exactly one non-upload outcome and returns. (The community / sibling / drift branches all run on the live, non-`dry_run` path.)
+Under the SHA1-uniqueness constraint (PR C+D) **the uploader never creates a second Commons file for a SHA1 that already exists** (new uploads only — pre-existing legacy duplicates are out of scope; see [upload-invariant.md](upload-invariant.md)): once `find_file_by_hash` returns a hit, the uploader NEVER uploads a second byte-identical copy — it resolves to exactly one non-upload outcome and returns. (The community / sibling / drift branches all run on the live, non-`dry_run` path.)
 
 ## Hash drift resolution
 
-`_resolve_hash_drift()` is invoked when our SHA1 already exists on Commons but at a different title than we want. Under the SHA1-uniqueness constraint (PR C+D) **no two Commons files may share a SHA1**, so none of its outcomes uploads a second byte-identical copy — every one is a rename, a merge-and-redirect, or a hand-off. It returns a `DriftResolution` str-enum: `MOVED`, `MERGE_AND_REDIRECT`, `HAND_FIX`, or `ALREADY_CORRECT`.
+`_resolve_hash_drift()` is invoked when our SHA1 already exists on Commons but at a different title than we want. Under the SHA1-uniqueness constraint (PR C+D) **the uploader never creates a second Commons file for a SHA1 that already exists**, so none of its outcomes uploads a second byte-identical copy — every one is a rename, a merge-and-redirect, or a hand-off. It returns a `DriftResolution` str-enum: `MOVED`, `MERGE_AND_REDIRECT`, `HAND_FIX`, or `ALREADY_CORRECT`.
 
 Two of the SHA1-already-present outcomes are decided by `process_file` *before* it reaches `_resolve_hash_drift`:
 

@@ -2924,6 +2924,10 @@ def test_merge_and_redirect_fails_when_canonical_pageid_falsy():
     redirect_mock.assert_not_called()  # no redirect over an unmerged item
     assert result["status"] == "FAILED"
     assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    # The FAILED status is returned normally (not via process_file's except
+    # block), so this branch must bump the tracker itself or COUNTS/Slack
+    # would underreport the failure.
+    assert tracker.count(Result.FAILED) == 1
 
 
 def test_merge_and_redirect_fails_when_sdc_merge_fails():
@@ -2956,6 +2960,8 @@ def test_merge_and_redirect_fails_when_sdc_merge_fails():
     redirect_mock.assert_not_called()
     assert result["status"] == "FAILED"
     assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    # Returned normally, so this branch must count the failure itself.
+    assert tracker.count(Result.FAILED) == 1
 
 
 def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():

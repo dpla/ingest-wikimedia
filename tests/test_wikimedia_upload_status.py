@@ -3,6 +3,27 @@
 import re
 
 
+def test_valid_session_label_accepts_bare_hub_institution_and_retry():
+    """_valid_session_label must accept every shape the launcher exports as
+    WIKIMEDIA_SESSION_LABEL: a bare hub slug (whole-hub launch), a
+    ``<hub>+<institution>`` per-target label, and a ``retry-<hub>`` label.
+
+    Regression test: a bare hub slug was previously rejected (the validator
+    only allowed ``+`` or ``retry-`` shapes), so snapshot_running_active_labels
+    silently dropped whole-hub sessions and fell back to the weaker mtime
+    heuristic even though parse_session_labels accepts a bare hub.
+    """
+    from ingest_wikimedia.partners import PARTNER_HUBS
+    from ingest_wikimedia.session_state import _valid_session_label
+
+    some_hub = next(iter(PARTNER_HUBS))  # a real canonical hub slug
+    assert _valid_session_label(some_hub)  # bare hub — the regression case
+    assert _valid_session_label(f"{some_hub}+some-institution")  # per-target
+    assert _valid_session_label(f"retry-{some_hub}")  # retry pipeline
+    assert not _valid_session_label("")  # empty
+    assert not _valid_session_label("not-a-hub-and-no-markers")  # unknown junk
+
+
 def test_log_filename_pattern_matches_only_exact_label():
     """Sibling labels that extend the search label must NOT match.
 

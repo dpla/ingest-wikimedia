@@ -18,14 +18,20 @@ import logging
 import re
 import shlex
 
-from ingest_wikimedia.partners import PARTNER_DIR
+from ingest_wikimedia.partners import PARTNER_DIR, PARTNER_HUBS
 from ingest_wikimedia.ssm import ssm_run
 
 
 # Valid launcher-exported ``WIKIMEDIA_SESSION_LABEL`` shapes:
+# ``<hub>`` (whole-hub launch — the canonical hub slug on its own),
 # ``<hub>+<institution>`` (per-target), ``retry-<hub>`` (retry pipeline).
+# A bare hub slug is a valid label that ``parse_session_labels`` accepts, so it
+# must pass here too or ``snapshot_running_active_labels`` silently drops
+# whole-hub sessions and falls back to the weaker mtime heuristic.
 def _valid_session_label(label: str) -> bool:
-    return bool(label) and ("+" in label or label.startswith("retry-"))
+    return bool(label) and (
+        "+" in label or label.startswith("retry-") or label in PARTNER_HUBS
+    )
 
 
 def snapshot_running_active_labels(client) -> dict[str, str]:

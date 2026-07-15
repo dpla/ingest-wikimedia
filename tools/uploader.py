@@ -1949,6 +1949,12 @@ class Uploader:
                 f"[[File:{canonical_title}]] has no resolvable pageid; cannot "
                 f"merge SDC. Leaving the ordinal for retry (no redirect written)."
             )
+            # Count the retryable failure: these branches return an
+            # ORDINAL_FAILED result normally (not via process_file's except
+            # block), so the tracker must be bumped here or COUNTS/Slack would
+            # underreport merge failures — see the FAILED single-source-of-truth
+            # note on process_file's handler.
+            self.tracker.increment(Result.FAILED)
             return {
                 "status": ORDINAL_FAILED,
                 "title": None,
@@ -1970,6 +1976,7 @@ class Uploader:
                 f"[[File:{canonical_title}]] failed; leaving the ordinal for "
                 f"retry (no redirect written)."
             )
+            self.tracker.increment(Result.FAILED)
             return {
                 "status": ORDINAL_FAILED,
                 "title": None,
