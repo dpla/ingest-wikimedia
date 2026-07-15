@@ -1391,6 +1391,33 @@ def test_post_commonsdelinker_request_uses_appendtext_not_read_modify_write():
     page.save.assert_not_called()
 
 
+def test_post_commonsdelinker_request_escapes_equals_in_filenames():
+    """A filename containing ``=`` must reach the {{universal replace}} template
+    in its ``{{=}}`` form. A raw ``=`` in a positional filename would be parsed
+    as a param name/value split and mangle the relink request (DPLA preserves
+    ``=`` from source titles, so this shape occurs in the wild). Pins that
+    post_commonsdelinker_request applies escape_template_param to the filenames
+    it emits — an integration guard the escape_template_param unit test alone
+    can't provide (a caller that dropped the escaping would still pass it)."""
+    site = MagicMock()
+    with patch("ingest_wikimedia.wikimedia.pywikibot.Page"):
+        post_commonsdelinker_request(
+            site,
+            old_filename="Old = one.jpg",
+            new_filename="New = two.jpg",
+            check_usage=False,
+        )
+    appendtext = site.editpage.call_args.kwargs["appendtext"]
+    # Both filenames land in escaped form...
+    assert "Old {{=}} one.jpg" in appendtext
+    assert "New {{=}} two.jpg" in appendtext
+    # ...and no raw, unescaped filename '=' leaks into the positional params.
+    # (The legitimate ``|reason=`` '=' is a different substring, so scoping the
+    # assertion to the filename strings keeps it precise.)
+    assert "Old = one.jpg" not in appendtext
+    assert "New = two.jpg" not in appendtext
+
+
 def _usage_site(submit_return=None, submit_exc=None):
     """A mock site whose simple_request(...).submit() returns the given
     query result (or raises). Used to drive the usage gate."""
