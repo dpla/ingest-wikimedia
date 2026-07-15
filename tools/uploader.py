@@ -77,6 +77,11 @@ from ingest_wikimedia.s3 import (
 )
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.tracker import Result, Tracker
+from ingest_wikimedia.sha1_lock import (
+    SHA1_LOCK_DIR,
+    acquire_sha1_lock,
+    release_sha1_lock,
+)
 from ingest_wikimedia.worker_slots import (
     UPLOADER_PRIORITY_SLOT_DIR,
     UPLOADER_PRIORITY_SLOTS,
@@ -393,6 +398,7 @@ class Uploader:
         site: BaseSite,
         category_ensurer: CategoryEnsurer | None = None,
         no_create: bool = False,
+        sha1_lock_dir: str | None = None,
     ):
         self.tracker = tracker
         self.local_fs = local_fs
@@ -404,6 +410,14 @@ class Uploader:
         # write to a File page that does not already exist, so no run can
         # create a new Commons file. Defaults False (normal upload behaviour).
         self.no_create = no_create
+        # sha1_lock_dir: directory for the per-SHA1 cross-process upload lock
+        # (see ingest_wikimedia.sha1_lock). None disables it, which is the
+        # default used by programmatic / unit-test construction (hermetic, no
+        # filesystem writes). BOTH production entry points — the parallel pool
+        # workers and the standalone CLI — pass SHA1_LOCK_DIR to enable it: the
+        # lock is box-wide, so even a single-worker standalone run needs it to
+        # serialize against a different partner's concurrent session.
+        self.sha1_lock_dir = sha1_lock_dir
 
     def _detect_commons_dedup_skip(
         self,
@@ -736,6 +750,10 @@ class Uploader:
         structured data to.
         """
         temp_file = self.local_fs.get_temp_file()
+        # Held fd for the per-SHA1 cross-process upload lock (sha1_lock);
+        # None until/unless the fresh-upload double-check acquires it, and
+        # released in this method's finally regardless of how we exit.
+        sha1_lock_fd = None
 
         try:
             wiki_markup = get_wiki_text(dpla_id, item_metadata, provider, data_provider)
@@ -863,6 +881,69 @@ class Uploader:
                 # above (file_downloaded=True) must still be collision-resolved
                 # or uploaded here — the fresh-upload download below is the only
                 # step that skips when the bytes are already on disk.
+                #
+                # Per-SHA1 cross-process guard (double-checked locking). If the
+                # fast-path lookup found nothing, we're headed for a fresh
+                # upload — but another worker/session processing byte-identical
+                # media for a DIFFERENT item may upload our SHA1 first. Take the
+                # per-SHA1 lock (striped flock; see ingest_wikimedia.sha1_lock)
+                # and RE-CHECK: the race-loser then sees the winner's file and
+                # resolves to a non-upload outcome in THIS pass instead of a
+                # duplicate upload Commons rejects (which would cost a spurious
+                # FAILED and defer the SDC merge to a later run). Different SHA1s
+                # don't contend, so parallelism is preserved. The lock is held
+                # through the upload commit and released in this method's
+                # finally. Enabled at both prod entry points (the parallel pool
+                # workers AND the standalone CLI — a standalone single-worker
+                # partner run can still race a different partner's session
+                # box-wide); disabled only for the default sha1_lock_dir=None
+                # used by programmatic / unit-test construction. Skipped for a
+                # falsy sha1 (missing checksum): a lock keyed on empty content
+                # gives no per-content exclusion and would funnel every such
+                # upload onto one bucket.
+                if existing_file is None and self.sha1_lock_dir is not None and sha1:
+                    try:
+                        sha1_lock_fd = acquire_sha1_lock(sha1, self.sha1_lock_dir)
+                    except Exception as lock_ex:  # noqa: BLE001 — best-effort lock
+                        # The lock is an optimization, not a correctness
+                        # dependency (Commons' force_ignore_warnings=False dedup
+                        # is the invariant backstop), so a lock-infrastructure
+                        # failure — e.g. a foreign-owned lock dir — must degrade
+                        # to a lock-less upload, NOT fail the ordinal. Skip the
+                        # re-check and proceed; sha1_lock_fd stays None so the
+                        # finally release is a no-op.
+                        logging.warning(
+                            f"Per-SHA1 upload lock unavailable for {dpla_id} "
+                            f"{ordinal} ({lock_ex}); proceeding without it "
+                            f"(Commons dedup still guards the one-SHA1 invariant)."
+                        )
+                    else:
+                        existing_file = find_file_by_hash(
+                            self.site, sha1, preferred_title=page_title
+                        )
+                        if existing_file is not None:
+                            recheck_title = existing_file.title(with_ns=False)
+                            if recheck_title == page_title:
+                                # A concurrent worker uploaded our bytes at our
+                                # exact intended title — invariant satisfied.
+                                logging.info(
+                                    f"Skipping {dpla_id} {ordinal}: uploaded "
+                                    f"concurrently by another worker (now at the "
+                                    f"intended title)."
+                                )
+                                self.tracker.increment(Result.SKIPPED)
+                                return {
+                                    "status": ORDINAL_SKIPPED,
+                                    "title": page_title,
+                                    "pageid": existing_file.pageid,
+                                }
+                            # Concurrent upload landed at a different title — fall
+                            # through to the collision block below.
+                            logging.info(
+                                f"Concurrent upload detected for {dpla_id} "
+                                f"{ordinal}: SHA1 now at [[File:{recheck_title}]];"
+                                f" resolving as collision."
+                            )
                 if existing_file is not None:
                     existing_title = existing_file.title(with_ns=False)
                     # Community files are off-limits to our automation: never
@@ -982,16 +1063,15 @@ class Uploader:
                 # handled below (a pre-existing redirect does not bind us on the
                 # fresh-upload path).
                 #
-                # Concurrency note: the find_file_by_hash → upload sequence is
-                # not guarded by a cross-worker lock, so two workers processing
-                # byte-identical sources could both observe no match here. The
-                # one-SHA1-one-file constraint is still preserved server-side:
-                # this fresh-upload path uses ``force_ignore_warnings=False`` (a
-                # stash-commit that surfaces, rather than suppresses, MediaWiki
-                # warnings), so the second worker's commit hits Commons's own
-                # duplicate-SHA1 detection and does not publish a second file. A
-                # host-wide SHA1 lock would be belt-and-suspenders but is a
-                # larger change; deferred, tracked separately.
+                # Concurrency: reaching here means the find_file_by_hash
+                # RE-CHECK under the per-SHA1 lock above (when enabled) still
+                # found no match, so we hold the lock through this commit and a
+                # concurrent same-SHA1 worker is serialized behind us. As a
+                # second line of defense — and the sole guard when the lock is
+                # disabled — this commit uses ``force_ignore_warnings=False``, a
+                # stash-commit that surfaces rather than suppresses MediaWiki
+                # warnings, so any commit that still races hits Commons's own
+                # duplicate-SHA1 detection and does not publish a second file.
                 force_ignore_warnings = False
 
                 # Skip re-downloading when the octet-stream MIME re-detection
@@ -1461,6 +1541,10 @@ class Uploader:
             return {"status": ORDINAL_FAILED, "error": str(ex)}
 
         finally:
+            # Release the per-SHA1 upload lock (no-op if never acquired);
+            # closing the fd releases the flock so a waiting same-SHA1 worker
+            # can proceed and re-check against our just-committed file.
+            release_sha1_lock(sha1_lock_fd)
             self.local_fs.clean_up_tmp_file(temp_file)
 
     def _resolve_redirect_move(
@@ -2705,6 +2789,7 @@ def _init_upload_worker(
         commons_site,
         category_ensurer,
         no_create=no_create,
+        sha1_lock_dir=SHA1_LOCK_DIR,
     )
 
     if workers_budget > 0:
@@ -2948,6 +3033,7 @@ def main(
         commons_site,
         category_ensurer,
         no_create=no_create,
+        sha1_lock_dir=SHA1_LOCK_DIR,
     )
 
     dpla = tools_context.get_dpla()

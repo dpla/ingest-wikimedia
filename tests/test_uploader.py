@@ -2100,6 +2100,182 @@ def test_process_file_merge_and_redirect_none_expected_titles_no_crash():
     assert captured["within_item"] is False
 
 
+def test_process_file_sha1_lock_recheck_skips_on_concurrent_upload(tmp_path):
+    """Double-checked locking, SKIP branch. The fast-path SHA1 lookup finds
+    nothing, but the RE-CHECK under the per-SHA1 lock (enabled via
+    sha1_lock_dir) finds the file now present at our intended title — a sibling
+    worker uploaded it while we waited. process_file must SKIP (invariant
+    already satisfied) rather than attempt a duplicate upload, and the real
+    lock must be acquired then released (finally) without error."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.sha1_lock_dir = str(tmp_path)  # enable the lock for this test
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    page_title = "Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    concurrent = MagicMock()
+    concurrent.title.return_value = page_title  # title(with_ns=False) == intended
+    concurrent.pageid = 4242
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        # 1st call (fast path) -> None; 2nd call (re-check under lock) -> file.
+        patch(
+            "tools.uploader.find_file_by_hash", side_effect=[None, concurrent]
+        ) as fbh,
+        patch("tools.uploader.get_page_title", return_value=page_title),
+        patch.object(uploader, "_safe_upload") as safe_upload,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "SKIPPED"
+    assert result["pageid"] == 4242
+    assert fbh.call_count == 2  # fast-path lookup + under-lock re-check
+    safe_upload.assert_not_called()  # no duplicate upload attempted
+    assert tracker.count(Result.SKIPPED) == 1
+
+
+def test_process_file_sha1_lock_recheck_resolves_collision_on_concurrent_drift(
+    tmp_path,
+):
+    """Double-checked locking, collision branch. The re-check under the lock
+    finds the SHA1 now on Commons at a DIFFERENT title (a concurrent sibling
+    landed it there), so process_file resolves it via the normal collision
+    path (merge-and-redirect) instead of uploading a duplicate."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.sha1_lock_dir = str(tmp_path)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    page_title = "Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    concurrent = MagicMock()
+    concurrent.title.return_value = (
+        "Other - DPLA - ffffffffffffffffffffffffffffffff (page 1).jpg"
+    )
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch(
+            "tools.uploader.find_file_by_hash", side_effect=[None, concurrent]
+        ) as fbh,
+        patch("tools.uploader.get_page_title", return_value=page_title),
+        patch.object(uploader, "_is_community_file", return_value=False),
+        patch(
+            "tools.uploader.is_dup_sha1_sibling_at_expected_title",
+            return_value=False,
+        ),
+        patch.object(
+            uploader,
+            "_resolve_hash_drift",
+            return_value=DriftResolution.MERGE_AND_REDIRECT,
+        ),
+        patch.object(
+            uploader,
+            "_merge_and_redirect",
+            return_value={"status": "MERGED", "title": "x", "pageid": 1},
+        ) as merge,
+        patch.object(uploader, "_safe_upload") as safe_upload,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "MERGED"
+    assert fbh.call_count == 2
+    merge.assert_called_once()
+    safe_upload.assert_not_called()  # resolved as collision, not uploaded
+
+
+def test_process_file_sha1_lock_acquire_failure_degrades_to_lockless_upload(tmp_path):
+    """The per-SHA1 lock is an optimization, not a correctness dependency, so an
+    acquire failure (e.g. a foreign-owned lock dir) must degrade to a lock-less
+    upload — NOT fail the ordinal. On acquire error process_file logs and
+    proceeds without the re-check; the upload still runs and Commons' own dedup
+    remains the invariant backstop."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.sha1_lock_dir = str(tmp_path)  # lock enabled...
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    fake_page = MagicMock()
+    fake_page.exists.return_value = False
+    fake_page.isRedirectPage.return_value = False
+    fake_page.pageid = 0
+    uploader._safe_upload = MagicMock(return_value="ok")
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=4242)
+
+    title = "File:Something - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=None) as fbh,
+        patch("tools.uploader.get_page_title", return_value=title),
+        patch("tools.uploader.get_page", return_value=fake_page),
+        # ...but acquiring it blows up (simulated lock-infra failure).
+        patch(
+            "tools.uploader.acquire_sha1_lock",
+            side_effect=RuntimeError("lock dir owned by another uid"),
+        ) as acquire,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Something",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    acquire.assert_called_once()  # we tried to lock
+    assert result["status"] == "UPLOADED"  # degraded, did NOT fail the ordinal
+    assert tracker.count(Result.FAILED) == 0
+    assert fbh.call_count == 1  # re-check skipped (acquire failed) — only fast path
+
+
 # ---------------------------------------------------------------------------
 # CSRF token recovery in the retry loop.
 #
