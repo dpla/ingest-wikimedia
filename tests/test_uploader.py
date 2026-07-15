@@ -747,9 +747,7 @@ def test_resolve_hash_drift_intended_title_occupied_by_different_file_hand_fix()
     dpla_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     existing_title = f"Item - DPLA - {dpla_id} (page 99).jpg"
     intended_title = f"Item - DPLA - {dpla_id} (page 4).jpg"
-    expected_titles = {
-        f"Item - DPLA - {dpla_id} (page {n}).jpg" for n in range(1, 10)
-    }
+    expected_titles = {f"Item - DPLA - {dpla_id} (page {n}).jpg" for n in range(1, 10)}
     intended_page = MagicMock()
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
@@ -937,7 +935,7 @@ def test_chunk_size_file_exists_small_returns_direct():
 
 
 def test_chunk_size_force_ignore_warnings_small_returns_direct():
-    """Hash-drift leave_others_alone on a small file → direct upload (warning bypass)."""
+    """force_ignore_warnings on a small file → direct upload (warning bypass)."""
     assert select_upload_chunk_size(
         file_exists=False,
         force_ignore_warnings=True,
@@ -957,7 +955,7 @@ def test_chunk_size_large_file_exists_forces_chunked():
 
 
 def test_chunk_size_large_force_ignore_warnings_forces_chunked():
-    """Hash-drift leave_others_alone on a 211 MB file (the NARA incident): chunked,
+    """force_ignore_warnings on a 211 MB file (the NARA incident): chunked,
     and prefers_direct still True so the caller logs the size override."""
     nara_incident_size = 221_583_206  # exact bytes of 2_7d3114...
     assert select_upload_chunk_size(
@@ -983,17 +981,16 @@ def test_chunk_size_threshold_under_wikimedia_gateway_limit():
 
 
 # --------------------------------------------------------------------------
-# is_dup_sha1_sibling_at_expected_title — the leave_others_alone short-circuit gate
+# is_dup_sha1_sibling_at_expected_title — the within-item MERGE_AND_REDIRECT gate
 #
 # Pin the contract that prevents the orphan-duplicate bug observed on item
 # fe6f59a29fddf8e3483e91ad805bf039 (Zuni in costume). NARA's mediaMaster
 # listed the same TIF URL at two positions, so duplicate_source_sha1s
-# contained that SHA1. The pre-fix code unconditionally treated any
-# existing file with a matching SHA1 as a sibling, leaving the 2011 legacy
-# NARA-bot title in place and uploading (page 1).tiff and (page 2).tiff
-# beside it — three Commons files with the same SHA1. The helper must
-# return True only when the existing title is one of THIS item's own
-# expected current titles.
+# contained that SHA1. The helper must return True only when the existing
+# file lives at one of THIS item's own expected current titles (routing to
+# the within-item MERGE_AND_REDIRECT short-circuit in process_file); a legacy
+# 2011 NARA-bot title with the same SHA1 must return False so the caller
+# falls through to normal drift handling instead.
 # --------------------------------------------------------------------------
 
 _SHA1 = "76f6fe0a766e4a664b7d99b9e6c0fb8594bac083"
@@ -2443,18 +2440,18 @@ def test_csrf_recovery_failed_propagates_past_process_item_outer_catch():
 
 
 # ---------------------------------------------------------------------------
-# Phantom-drift defense-in-depth (this PR).
+# Phantom-drift defense-in-depth.
 #
 # ``get_page_title``'s ``item_title[:181]`` truncation used to leak a
 # trailing space when the 181st character landed on whitespace, producing
 # a raw Python title with a double-space run around the ``- DPLA -``
-# separator. ``process_file``'s line-468 identity check
+# separator. ``process_file``'s identity check
 # (``existing_file.title(with_ns=False) == page_title``) then failed on
-# the raw-string comparison, and ``_resolve_hash_drift`` fell through to
-# Case 2 tagging the file as a duplicate of itself. Commons's
-# ``fileexists-no-change`` server-side check happened to reject the
-# upload, so ``_tag_drift_duplicate`` was never called — but the guard
-# path is defense-in-depth for any future normalisation drift.
+# the raw-string comparison, and ``_resolve_hash_drift`` risked falling
+# through to a destructive branch (move-to-self / hand-fix) against what is
+# really the same page. The canonicalized-equality guard returns
+# ALREADY_CORRECT instead; these tests pin that guard for any future
+# normalisation drift.
 # ---------------------------------------------------------------------------
 
 
@@ -2474,9 +2471,8 @@ def test_canonicalize_commons_title_treats_underscores_as_space_equivalent():
     (``File:X_Y`` and ``File:X Y`` are the same page). The guard MUST
     fold both forms — otherwise an uploader-constructed underscore
     title vs a previously-uploaded space title (same DPLA ID, same
-    SHA1) reads as drift, falls through to Case 2 UPLOAD_AND_TAG, and
-    inflates the Category:Duplicate deferral sidecar with false
-    positives.
+    SHA1) reads as drift and misroutes through ``_resolve_hash_drift``
+    instead of the ALREADY_CORRECT skip it deserves.
     """
     from tools.uploader import _canonicalize_commons_title
 
@@ -2536,75 +2532,335 @@ def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_mat
     assert action == "already_correct"
 
 
-def test_tag_drift_duplicate_refuses_self_tag_byte_equal():
-    """Belt: even if some caller passes the same title as both
-    ``old_filename`` and ``new_filename``, ``_tag_drift_duplicate``
-    refuses to call ``tag_as_duplicate`` — that would flag the file
-    for admin deletion of itself."""
-    uploader = _build_uploader_with_dpla()
-    same = "Foo - DPLA - cccccccccccccccccccccccccccccccc.jpg"
+# ---------------------------------------------------------------------------
+# _record_hand_fix_and_skip — the HAND_FIX terminal outcome.
+#
+# Our S3 SHA1 lives at a wrong Commons title and the intended title is
+# occupied by a DIFFERENT file, so the bot can neither upload a duplicate nor
+# clobber the occupant. Record the case to the hand-fix.jsonl sidecar, count
+# it, and return ORDINAL_HAND_FIX — no upload.
+# ---------------------------------------------------------------------------
+
+
+def test_record_hand_fix_and_skip_records_sidecar_and_returns_hand_fix():
+    """Returns ORDINAL_HAND_FIX (title/pageid None), records the occupant's
+    title + SHA1 to the sidecar, bumps ``UPLOAD_HAND_FIX``, and never
+    uploads."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    dpla_id = "abcdef0123456789abcdef0123456789"
+    intended_title = f"Item - DPLA - {dpla_id} (page 1).jpg"
+    current_title = f"Legacy Title - NAID 12345 - {dpla_id}.jpg"
+
+    occupant = MagicMock()
+    occupant.exists.return_value = True
+    occupant.isRedirectPage.return_value = False
+    occupant.latest_file_info.sha1 = "occupant-sha1"
+    occupant.title.return_value = intended_title
+
+    our_current_file = _drift_existing_file(current_title)
+
     with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        patch("tools.uploader.get_page") as get_page_mock,
+        patch("tools.uploader.get_page", return_value=occupant),
+        patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
     ):
-        uploader._tag_drift_duplicate(
-            old_filename=same,
-            new_filename=same,
-            wiki_markup="wt",
-            dpla_id="cccccccccccccccccccccccccccccccc",
-            item_metadata={},
-            provider={},
-            data_provider={},
+        result = uploader._record_hand_fix_and_skip(
+            partner="nara",
+            dpla_id=dpla_id,
+            ordinal=1,
+            our_sha1="our-sha1",
+            intended_title=intended_title,
+            our_current_file=our_current_file,
         )
-    tag_mock.assert_not_called()
-    get_page_mock.assert_not_called()
+
+    assert result == {"status": "HAND_FIX", "title": None, "pageid": None}
+    assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    # No upload ever happens on the hand-fix path.
+    uploader.site.upload.assert_not_called()
+    record_mock.assert_called_once()
+    kwargs = record_mock.call_args.kwargs
+    assert record_mock.call_args.args == ("nara",)
+    assert kwargs["dpla_id"] == dpla_id
+    assert kwargs["ordinal"] == 1
+    assert kwargs["our_sha1"] == "our-sha1"
+    assert kwargs["intended_title"] == intended_title
+    assert kwargs["occupying_title"] == intended_title
+    assert kwargs["occupying_sha1"] == "occupant-sha1"
+    assert kwargs["current_title"] == current_title
 
 
-def test_tag_drift_duplicate_refuses_self_tag_whitespace_run_equal():
-    """Suspenders: two titles that differ only in whitespace runs
-    (the exact shape ``get_page_title``'s truncation bug used to
-    produce) resolve to the same Commons page under MediaWiki
-    normalisation. Must not tag."""
-    uploader = _build_uploader_with_dpla()
-    single_space = "Foo Bar - DPLA - dddddddddddddddddddddddddddddddd.jpg"
-    double_space = "Foo Bar  - DPLA - dddddddddddddddddddddddddddddddd.jpg"
+def test_record_hand_fix_and_skip_survives_occupant_inspection_failure():
+    """If inspecting the occupant at the intended title raises (Commons
+    hiccup), the method swallows it, records the case with null occupant
+    fields, still counts it, and returns HAND_FIX."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    dpla_id = "abcdef0123456789abcdef0123456789"
+    intended_title = f"Item - DPLA - {dpla_id} (page 1).jpg"
+
     with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        patch("tools.uploader.get_page") as get_page_mock,
+        # Occupant inspection raises — the method must swallow it and still
+        # record (occupying_title/sha1 = None) and count.
+        patch("tools.uploader.get_page", side_effect=RuntimeError("commons down")),
+        patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
     ):
-        uploader._tag_drift_duplicate(
-            old_filename=single_space,
-            new_filename=double_space,
-            wiki_markup="wt",
-            dpla_id="dddddddddddddddddddddddddddddddd",
-            item_metadata={},
-            provider={},
-            data_provider={},
+        result = uploader._record_hand_fix_and_skip(
+            partner="nara",
+            dpla_id=dpla_id,
+            ordinal=1,
+            our_sha1="our-sha1",
+            intended_title=intended_title,
+            our_current_file=_drift_existing_file("Wrong - DPLA - x.jpg"),
         )
-    tag_mock.assert_not_called()
-    get_page_mock.assert_not_called()
+
+    assert result["status"] == "HAND_FIX"
+    assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    record_mock.assert_called_once()
+    kwargs = record_mock.call_args.kwargs
+    assert kwargs["occupying_title"] is None
+    assert kwargs["occupying_sha1"] is None
 
 
-def test_tag_drift_duplicate_still_tags_when_names_genuinely_differ():
-    """Positive: a genuine hash-drift case (different filenames) still
-    reaches ``tag_as_duplicate`` — the self-tag guard doesn't over-fire."""
+# ---------------------------------------------------------------------------
+# _merge_and_redirect / _merge_sdc_onto_canonical / _create_redirect_to_canonical
+# — the MERGE_AND_REDIRECT terminal outcome (SHA1 centralization).
+# ---------------------------------------------------------------------------
+
+
+def _canonical_file(title: str, pageid: int) -> MagicMock:
+    f = MagicMock()
+    f.title.return_value = title
+    f.pageid = pageid
+    return f
+
+
+def test_merge_and_redirect_merges_sdc_and_creates_redirect():
+    """With a resolvable canonical pageid: merge SDC onto ``M<pageid>``,
+    create the redirect, bump ``UPLOAD_MERGED_TO_CANONICAL``, and return an
+    ORDINAL_MERGED result carrying the canonical title + pageid."""
+    tracker = Tracker()
     uploader = _build_uploader_with_dpla()
-    old_page = MagicMock()
-    old_page.exists.return_value = True
-    old_page.text = ""
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+
     with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        patch("tools.uploader.get_page", return_value=old_page),
-        patch("tools.uploader.rescue_wikitext", return_value="wt"),
-        patch("tools.uploader.import_cross_page_community_sdc", return_value=0),
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
     ):
-        uploader._tag_drift_duplicate(
-            old_filename="Old title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
-            new_filename="New title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
-            wiki_markup="wt",
-            dpla_id="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            item_metadata={},
-            provider={},
-            data_provider={},
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
         )
-    tag_mock.assert_called_once()
+
+    assert result == {
+        "status": "MERGED",
+        "title": "Canonical - DPLA - xxxx (page 1).jpg",
+        "pageid": 777,
+    }
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 1
+    merge_mock.assert_called_once()
+    assert merge_mock.call_args.kwargs["canonical_mediaid"] == "M777"
+    assert merge_mock.call_args.kwargs["within_item"] is True
+    assert merge_mock.call_args.kwargs["page_label"] == "1"
+    redirect_mock.assert_called_once()
+    assert (
+        redirect_mock.call_args.kwargs["canonical_title"]
+        == "Canonical - DPLA - xxxx (page 1).jpg"
+    )
+
+
+def test_merge_and_redirect_skips_sdc_when_canonical_pageid_falsy():
+    """No resolvable canonical pageid → skip the SDC merge (can't target M0)
+    but still create the redirect and count; result pageid is None."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx.jpg", 0)
+
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            within_item=False,
+        )
+
+    merge_mock.assert_not_called()
+    redirect_mock.assert_called_once()
+    assert result["status"] == "MERGED"
+    assert result["pageid"] is None
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 1
+
+
+def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():
+    """Reads the item's staged sdc.json, json-parses it, points sdc_sync at
+    our site, and calls merge_item_onto_canonical with the within-item page
+    number as a P304 qualifier set."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = '{"claims": {"P170": []}}'
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        import tools.sdc_sync as sdc_sync
+
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="3",
+            within_item=True,
+        )
+        assert sdc_sync.site is uploader.site
+
+    uploader.s3_client.get_sdc_json.assert_called_once_with("nara", "yyyy")
+    merge_mock.assert_called_once()
+    args = merge_mock.call_args.args
+    assert args[0] == "M42"
+    assert args[1] == "yyyy"
+    assert args[2] == {"claims": {"P170": []}}
+    assert merge_mock.call_args.kwargs["page_numbers"] == {"3"}
+
+
+def test_merge_sdc_onto_canonical_cross_item_passes_no_page_numbers():
+    """Cross-item duplication carries no page number → page_numbers=None."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = "{}"
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="3",  # ignored because within_item is False
+            within_item=False,
+        )
+
+    assert merge_mock.call_args.kwargs["page_numbers"] is None
+
+
+def test_merge_sdc_onto_canonical_skips_when_no_staged_sdc():
+    """Missing / blank sdc.json → best-effort skip, merge not attempted."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = None
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="1",
+            within_item=True,
+        )
+
+    merge_mock.assert_not_called()
+
+
+def _redirect_intended_page(
+    *, exists: bool, is_redirect: bool = False, redirect_target: str | None = None
+) -> MagicMock:
+    page = MagicMock()
+    page.exists.return_value = exists
+    page.isRedirectPage.return_value = is_redirect
+    page.title.return_value = "File:Ours - DPLA - yyyy.jpg"
+    if redirect_target is not None:
+        rt = MagicMock()
+        rt.title.return_value = redirect_target
+        page.getRedirectTarget.return_value = rt
+    return page
+
+
+def test_create_redirect_to_canonical_creates_when_missing():
+    """Missing intended title (not maintain mode) → write the #REDIRECT and
+    save via with_csrf_recovery."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    assert page.text == "#REDIRECT [[File:Canonical - DPLA - xxxx.jpg]]"
+    page.save.assert_called_once()
+
+
+def test_create_redirect_to_canonical_refuses_to_clobber_real_file():
+    """A real (non-redirect) file at the intended title is left for a human —
+    never overwritten with a redirect."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(exists=True, is_redirect=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery") as csrf_mock,
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    page.save.assert_not_called()
+    csrf_mock.assert_not_called()
+
+
+def test_create_redirect_to_canonical_noops_when_already_redirect_to_canonical():
+    """An intended title already redirecting to the canonical file is a
+    no-op — no re-save."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(
+        exists=True,
+        is_redirect=True,
+        redirect_target="Canonical - DPLA - xxxx.jpg",
+    )
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery") as csrf_mock,
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    page.save.assert_not_called()
+    csrf_mock.assert_not_called()
+
+
+def test_create_redirect_to_canonical_respects_no_create_fence():
+    """Maintain mode (no_create) must not create a redirect at a not-yet-
+    existing intended title."""
+    uploader = _uploader(no_create=True)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    page.save.assert_not_called()
