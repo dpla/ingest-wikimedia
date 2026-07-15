@@ -126,9 +126,11 @@ def get_page_title(
         # whitespace, the constructed title picks up a trailing space
         # that Commons removes at store time. The Python-side raw-string
         # identity check in ``process_file`` then thinks the file has
-        # drifted (constructed vs. stored differ by one space), triggers
-        # phantom Case-2 duplicate-tagging, and the item hangs in the
-        # dup-throttle drain. Concrete repro: DPLA ID
+        # drifted (constructed vs. stored differ by one space) and
+        # mis-routes the ordinal through a phantom hash-drift resolution
+        # (a spurious HAND_FIX or merge) instead of the clean skip that
+        # _resolve_hash_drift's ALREADY_CORRECT branch now produces.
+        # Concrete repro: DPLA ID
         # 95bd6bee5aed3c5311a67d5f6cee490b (NARA / FDR Library), whose
         # 264-char source title lands ``:181`` on the space after
         # ``"...value of farm "``.

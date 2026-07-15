@@ -29,19 +29,6 @@ from ingest_wikimedia.partners import partner_dir_path
 
 SIDECAR_FILENAME = "hand-fix.jsonl"
 
-# The descriptive fields every record carries. Kept explicit so the schema is
-# self-documenting and a reader (human or a future resolver tool) knows what
-# to expect.
-_FIELDS = (
-    "dpla_id",
-    "ordinal",
-    "our_sha1",
-    "intended_title",
-    "occupying_title",
-    "occupying_sha1",
-    "partner",
-)
-
 
 def sidecar_path(partner: str) -> Path:
     """Absolute path to the hand-fix sidecar for ``partner``."""
@@ -90,19 +77,3 @@ def record_hand_fix(
             path,
             ex,
         )
-
-
-def count(partner: str) -> int:
-    """Number of records currently in the partner's hand-fix sidecar.
-
-    Used for the Slack run-summary tally. Missing file → 0; an unreadable
-    file is treated as 0 rather than raised (the tally is informational)."""
-    path = sidecar_path(partner)
-    if not path.exists():
-        return 0
-    try:
-        with open(path) as f:
-            return sum(1 for line in f if line.strip())
-    except OSError as ex:
-        logging.warning("failed to read hand-fix sidecar %s: %s", path, ex)
-        return 0

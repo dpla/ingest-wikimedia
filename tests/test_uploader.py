@@ -1347,9 +1347,16 @@ def test_is_community_file_false_for_non_shaped_but_bot_uploaded():
 
     up = _uploader_for_helper_tests()
     fp = _drift_existing_file("malformed title, no dpla marker.jpg")
-    for bot in ("DPLA bot", "US National Archives bot"):
+    # Full canonical DPLA_BOT_ACCOUNTS set (incl. Flickr upload bot) plus an
+    # underscore variant to exercise _normalize_account (DPLA_bot == DPLA bot).
+    for bot in (
+        "DPLA bot",
+        "US National Archives bot",
+        "Flickr upload bot",
+        "DPLA_bot",
+    ):
         with patch.object(um, "first_uploader", return_value=bot):
-            assert up._is_community_file(fp) is False
+            assert up._is_community_file(fp) is False, bot
 
 
 def test_is_community_file_true_when_uploader_unreadable_and_non_shaped():

@@ -134,6 +134,8 @@ from ingest_wikimedia.wikimedia import (
     post_commonsdelinker_request,
 )
 from ingest_wikimedia.legacy_artwork import (
+    DPLA_BOT_ACCOUNTS,
+    _normalize_account,
     rescue_wikitext,
 )
 
@@ -268,9 +270,9 @@ ORDINAL_MERGED = "MERGED"
 # A file is "community" — off-limits to our automated rename / SDC-merge /
 # redirect / template-migration — only when BOTH signals say it isn't ours:
 # its title lacks the DPLA/NARA naming shape AND its original uploader isn't
-# one of our bots. The AND is deliberate; see ``Uploader._is_community_file``.
+# one of our bots (the canonical ``DPLA_BOT_ACCOUNTS`` set). The AND is
+# deliberate; see ``Uploader._is_community_file``.
 _DPLA_TITLE_MARKERS = (" - DPLA - ", " - NARA - ")
-_DPLA_BOT_UPLOADERS = frozenset({"DPLA bot", "US National Archives bot"})
 
 
 def _has_dpla_shaped_title(title: str) -> bool:
@@ -715,9 +717,12 @@ class Uploader:
 
         The status drives the SDC sync phase: UPLOADED and SKIPPED
         ordinals are eligible for wbsetclaims; NOT_PRESENT, INELIGIBLE,
-        DEFERRED, and FAILED ordinals are not. ``title`` and ``pageid``
-        are populated only for UPLOADED and SKIPPED; everything else
-        has no canonical Commons page to attach structured data to.
+        HAND_FIX, MERGED, and FAILED ordinals are not (a MERGED ordinal
+        already had its SDC merged onto the canonical file inline, and
+        its intended title is now a redirect). ``title`` and ``pageid``
+        are populated for UPLOADED, SKIPPED, and MERGED (the canonical
+        file); everything else has no canonical Commons page to attach
+        structured data to.
         """
         temp_file = self.local_fs.get_temp_file()
 
@@ -923,11 +928,13 @@ class Uploader:
                             "pageid": existing_file.pageid,
                         }
                     if drift_action == DriftResolution.MERGE_AND_REDIRECT:
-                        # Cross-item / cross-institution source duplication: our
-                        # SHA1 is another live DPLA ID's canonical content (or a
-                        # sibling position not flagged as a duplicate-source
-                        # SHA1). Merge this item's SDC onto it and redirect our
-                        # intended title — no second byte-identical file.
+                        # Source duplication resolved by the drift classifier:
+                        # cross-item / cross-institution, OR a within-item
+                        # sibling the primary short-circuit missed (its SHA1 was
+                        # not in duplicate_source_sha1s). Derive within_item from
+                        # the data — canonical at one of THIS item's expected
+                        # titles is within-item — so that case still stamps its
+                        # P304 page number instead of being mislabeled cross-item.
                         return self._merge_and_redirect(
                             canonical_file=existing_file,
                             intended_title=page_title,
@@ -935,7 +942,7 @@ class Uploader:
                             ordinal=ordinal,
                             partner=partner,
                             page_label=page_label,
-                            within_item=False,
+                            within_item=existing_title in expected_item_titles,
                         )
                     # DriftResolution.HAND_FIX (and any unforeseen sentinel):
                     # our SHA1 is at a wrong title and the intended title is
@@ -2054,7 +2061,12 @@ class Uploader:
             uploader = first_uploader(file_page)
         except Exception:  # noqa: BLE001 — unreadable history → treat as community
             uploader = None
-        return uploader not in _DPLA_BOT_UPLOADERS
+        if uploader is None:
+            return True
+        # Compare against the canonical bot allowlist with the same
+        # normalization the provenance logic uses (``DPLA_bot`` == ``DPLA bot``).
+        bot_accounts = {_normalize_account(a) for a in DPLA_BOT_ACCOUNTS}
+        return _normalize_account(uploader) not in bot_accounts
 
     def _record_community_hand_fix_and_skip(
         self,
