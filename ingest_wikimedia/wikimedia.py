@@ -1087,20 +1087,20 @@ def first_uploader(file_page: FilePage) -> str | None:
     ``file_page``, or ``None`` if the history is empty or the lookup
     fails.
 
-    Used by the uploader's Case-2 hash-drift subclassification to
-    distinguish stranded old DPLA-bot uploads (first uploader is a
-    known bot account — safe to tag for admin cleanup) from
-    community-authored uploads that predate DPLA involvement
-    (first uploader is a real editor — must not be tagged; instead
-    the community file gets promoted to the DPLA-canonical title via
-    the await-target-free deferral flow).
+    Used by ``Uploader._is_community_file`` to classify a SHA1-colliding
+    file. If the original uploader is one of our bots
+    (``DPLA_BOT_ACCOUNTS``) the file is ours to act on (rename / SDC merge /
+    redirect); if it's a real editor the file is community-authored and
+    off-limits to our automation, so it is handed to a human via the
+    hand-fix flow untouched. The bot-vs-real-editor distinction is the
+    decisive provenance signal in that classification.
 
     Reads pywikibot's ``oldest_file_info`` — the earliest file-history
     revision — so a later re-upload (e.g. a DPLA-bot re-upload on top of
     a community-authored file) never flips the classification. pywikibot
     fetches and orders the imageinfo history internally, so we don't
-    hand-roll the query direction. One lookup per Case-2 hit, an already
-    rare path.
+    hand-roll the query direction. One lookup per collision hit, an
+    already rare path.
     """
     try:
         user = file_page.oldest_file_info.user

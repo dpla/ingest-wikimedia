@@ -81,7 +81,7 @@ Once `find_file_by_hash` returns any existing file for our SHA1,
      (different SHA1), or by a redirect to some third file, or the
      colliding file's DPLA ID could not be verified.
    - **`community_file`** — the SHA1 match is against a COMMUNITY file:
-     its title lacks the DPLA/NARA shape (`- DPLA - ` / `- NARA - `) **AND**
+     its title lacks the DPLA/NARA shape (`- DPLA -` / `- NARA -`) **AND**
      its original uploader is not one of our bots (`DPLA_BOT_ACCOUNTS`). We
      never rename, merge onto, redirect, or migrate a community file, so it
      is handed to a human untouched. This case is decided in `process_file`
