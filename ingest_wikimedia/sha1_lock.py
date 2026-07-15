@@ -155,4 +155,7 @@ def release_sha1_lock(fd: int | None) -> None:
     try:
         os.close(fd)
     except OSError:
+        # Already closed (e.g. a tolerated double-release) or not a valid fd —
+        # ignore. The lock is an optimization, not a correctness dependency, so
+        # a close failure must never propagate; see the docstring.
         pass

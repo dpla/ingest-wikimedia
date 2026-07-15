@@ -37,8 +37,8 @@ def test_bucket_non_hex_input_does_not_raise():
 def test_acquire_holds_exclusive_then_release_frees(tmp_path):
     sha1 = "deadbeef" + "0" * 32
     lock_dir = str(tmp_path)
-    fd = acquire_sha1_lock(sha1, lock_dir)
     path = os.path.join(lock_dir, f"sha1-{_bucket(sha1):04x}.lock")
+    fd = acquire_sha1_lock(sha1, lock_dir)
     try:
         # While held, a non-blocking exclusive flock on the SAME bucket file
         # from an independent fd must fail (the lock is genuinely exclusive
@@ -69,10 +69,12 @@ def test_different_sha1_different_bucket_do_not_block(tmp_path):
     b = "0" * 39 + "2"
     assert _bucket(a) != _bucket(b)
     fd_a = acquire_sha1_lock(a, lock_dir)
-    fd_b = acquire_sha1_lock(b, lock_dir)  # must not block on fd_a
+    fd_b = None
     try:
+        fd_b = acquire_sha1_lock(b, lock_dir)  # must not block on fd_a
         assert fd_a != fd_b
     finally:
+        # Release both even if the fd_b acquire raises (release is None-safe).
         release_sha1_lock(fd_a)
         release_sha1_lock(fd_b)
 
@@ -83,8 +85,10 @@ def test_release_none_is_noop():
 
 def test_release_is_idempotent(tmp_path):
     fd = acquire_sha1_lock("a" * 40, str(tmp_path))
-    release_sha1_lock(fd)
-    release_sha1_lock(fd)  # double release must not raise (already-closed fd)
+    try:
+        release_sha1_lock(fd)  # first release closes the fd
+    finally:
+        release_sha1_lock(fd)  # double release must not raise (already-closed)
 
 
 def test_foreign_owned_lock_dir_is_refused(tmp_path, monkeypatch):
@@ -93,5 +97,12 @@ def test_foreign_owned_lock_dir_is_refused(tmp_path, monkeypatch):
     # exclusion, so acquire must refuse rather than silently proceed.
     real_uid = os.stat(str(tmp_path)).st_uid
     monkeypatch.setattr(os, "getuid", lambda: real_uid + 4242)
-    with pytest.raises(RuntimeError, match="refusing to use it"):
-        acquire_sha1_lock("b" * 40, str(tmp_path))
+    fd = None
+    try:
+        with pytest.raises(RuntimeError, match="refusing to use it"):
+            # Raises in _check_owner BEFORE any fd is opened, so fd stays None;
+            # the finally is a None-safe no-op (guards against a future change
+            # that opens before the owner check).
+            fd = acquire_sha1_lock("b" * 40, str(tmp_path))
+    finally:
+        release_sha1_lock(fd)
