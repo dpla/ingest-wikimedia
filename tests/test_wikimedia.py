@@ -1,9 +1,8 @@
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 from ingest_wikimedia.wikimedia import (
     COMMONSDELINKER_PAGE,
     MAX_COMMENT_BYTES,
     build_title_drift_move_reason,
-    escape_template_param,
     get_site,
     get_page_title,
     get_wiki_text,
@@ -11,6 +10,7 @@ from ingest_wikimedia.wikimedia import (
     get_permissions_template,
     get_permissions,
     escape_wiki_strings,
+    escape_template_param,
     join,
     collect_duplicate_source_sha1s,
     compute_ordinal_exts_and_page_labels,
@@ -18,13 +18,15 @@ from ingest_wikimedia.wikimedia import (
     extract_strings,
     extract_strings_dict,
     file_has_inbound_usage,
+    find_file_by_hash,
+    first_uploader,
     is_same_item_redirect_relic,
     merge_preserved_wikitext,
     post_commonsdelinker_request,
-    tag_as_duplicate,
     wiki_file_exists,
     check_content_type,
 )
+from types import SimpleNamespace
 
 
 @patch("ingest_wikimedia.wikimedia.pywikibot.Site")
@@ -484,6 +486,118 @@ def test_wiki_file_exists():
     exists = wiki_file_exists(mock_site, "fakehash")
     assert exists
     mock_site.allimages.assert_called_once()
+
+
+class _FakeHashFilePage:
+    """A minimal FilePage stand-in for find_file_by_hash tests.
+
+    ``title(with_ns=False)`` returns ``title``; ``oldest_file_info.timestamp``
+    returns ``timestamp`` (or the property raises when ``raise_ts`` to simulate
+    unreadable file history). A real class (not a MagicMock) so setting the
+    raising property can't leak across tests via the shared mock class."""
+
+    def __init__(self, title: str, timestamp=None, raise_ts: bool = False):
+        self._title = title
+        self._timestamp = timestamp
+        self._raise_ts = raise_ts
+
+    def title(self, with_ns: bool = False) -> str:
+        return self._title
+
+    @property
+    def oldest_file_info(self):
+        if self._raise_ts:
+            raise RuntimeError("no history")
+        return SimpleNamespace(timestamp=self._timestamp)
+
+
+def test_find_file_by_hash_preferred_title_fast_path():
+    """A file at the preferred_title is returned immediately, regardless of
+    upload order or timestamps."""
+    match = _FakeHashFilePage("Wanted.jpg", timestamp=500)
+    other = _FakeHashFilePage("Other.jpg", timestamp=1)
+    site = MagicMock()
+    site.allimages.return_value = [other, match]
+
+    result = find_file_by_hash(site, "somesha1", preferred_title="Wanted.jpg")
+    assert result is match
+
+
+def test_find_file_by_hash_returns_earliest_upload():
+    """When two files share the SHA1 and neither matches preferred_title, the
+    EARLIEST-uploaded file is canonical — even if the API lists a later upload
+    first (alphabetically)."""
+    newer = _FakeHashFilePage("Aaa newer.jpg", timestamp=200)  # alphabetical first
+    older = _FakeHashFilePage("Zzz older.jpg", timestamp=100)  # alphabetical last
+    site = MagicMock()
+    site.allimages.return_value = [newer, older]
+
+    result = find_file_by_hash(site, "somesha1", preferred_title=None)
+    assert result is older
+
+
+def test_find_file_by_hash_falls_back_to_first_when_timestamps_unreadable():
+    """If no upload timestamp can be read, fall back to the API's first
+    (alphabetical) result so a usable FilePage is still returned."""
+    first = _FakeHashFilePage("A.jpg", raise_ts=True)
+    second = _FakeHashFilePage("B.jpg", raise_ts=True)
+    site = MagicMock()
+    site.allimages.return_value = [first, second]
+
+    result = find_file_by_hash(site, "somesha1", preferred_title=None)
+    assert result is first
+
+
+def test_find_file_by_hash_returns_none_when_no_match():
+    site = MagicMock()
+    site.allimages.return_value = []
+    assert find_file_by_hash(site, "somesha1") is None
+
+
+def test_escape_template_param_escapes_equals():
+    # A positional value containing '=' would otherwise be split by the
+    # template parser (name=value); escape_template_param protects it. This is
+    # the escaping post_commonsdelinker_request relies on for titles like
+    # "height of camera objective = 6.5 feet".
+    assert escape_template_param("height = 6.5 feet") == "height {{=}} 6.5 feet"
+    assert escape_template_param("a=b=c") == "a{{=}}b{{=}}c"
+
+
+def test_escape_template_param_leaves_plain_value_untouched():
+    assert escape_template_param("no equals here") == "no equals here"
+
+
+class _FakeUploaderFilePage:
+    """Minimal FilePage stand-in for first_uploader: ``oldest_file_info.user``
+    returns ``user`` (or the property raises when ``raise_info`` to simulate
+    unreadable file history)."""
+
+    def __init__(self, user=None, raise_info=False):
+        self._user = user
+        self._raise = raise_info
+
+    def title(self, with_ns: bool = False) -> str:
+        return "Some File.jpg"
+
+    @property
+    def oldest_file_info(self):
+        if self._raise:
+            raise RuntimeError("no history")
+        return SimpleNamespace(user=self._user)
+
+
+def test_first_uploader_returns_oldest_uploader():
+    assert first_uploader(_FakeUploaderFilePage(user="DPLA bot")) == "DPLA bot"
+
+
+def test_first_uploader_none_when_user_empty():
+    assert first_uploader(_FakeUploaderFilePage(user="")) is None
+
+
+def test_first_uploader_none_when_history_unreadable():
+    # oldest_file_info raising (unreadable history) is caught and returns None,
+    # so the community-file classifier errs toward hands-off rather than crashing.
+    assert first_uploader(_FakeUploaderFilePage(raise_info=True)) is None
 
 
 NEW_WIKITEXT = "== {{int:filedesc}} ==\n{{DPLA metadata|title=Example}}"
@@ -1214,7 +1328,7 @@ def test_move_reason_extreme_filenames_falls_back_to_minimum():
 
 
 # ---------------------------------------------------------------------------
-# post_commonsdelinker_request / tag_as_duplicate — atomic-append behaviour
+# post_commonsdelinker_request — atomic-append behaviour
 # ---------------------------------------------------------------------------
 
 
@@ -1275,6 +1389,33 @@ def test_post_commonsdelinker_request_uses_appendtext_not_read_modify_write():
     assert "|New.jpg" in kwargs["appendtext"]
     # page.save must not be called — that path re-introduces the read.
     page.save.assert_not_called()
+
+
+def test_post_commonsdelinker_request_escapes_equals_in_filenames():
+    """A filename containing ``=`` must reach the {{universal replace}} template
+    in its ``{{=}}`` form. A raw ``=`` in a positional filename would be parsed
+    as a param name/value split and mangle the relink request (DPLA preserves
+    ``=`` from source titles, so this shape occurs in the wild). Pins that
+    post_commonsdelinker_request applies escape_template_param to the filenames
+    it emits — an integration guard the escape_template_param unit test alone
+    can't provide (a caller that dropped the escaping would still pass it)."""
+    site = MagicMock()
+    with patch("ingest_wikimedia.wikimedia.pywikibot.Page"):
+        post_commonsdelinker_request(
+            site,
+            old_filename="Old = one.jpg",
+            new_filename="New = two.jpg",
+            check_usage=False,
+        )
+    appendtext = site.editpage.call_args.kwargs["appendtext"]
+    # Both filenames land in escaped form...
+    assert "Old {{=}} one.jpg" in appendtext
+    assert "New {{=}} two.jpg" in appendtext
+    # ...and no raw, unescaped filename '=' leaks into the positional params.
+    # (The legitimate ``|reason=`` '=' is a different substring, so scoping the
+    # assertion to the filename strings keeps it precise.)
+    assert "Old = one.jpg" not in appendtext
+    assert "New = two.jpg" not in appendtext
 
 
 def _usage_site(submit_return=None, submit_exc=None):
@@ -1386,300 +1527,6 @@ def test_post_commonsdelinker_request_check_usage_false_skips_query_and_posts():
     # No usage query issued, and the request was posted.
     site.simple_request.assert_not_called()
     site.editpage.assert_called_once()
-
-
-def test_tag_as_duplicate_uses_prependtext_not_read_modify_write():
-    """tag_as_duplicate must use site.editpage(prependtext=...) rather
-    than `file_page.text = tag + file_page.text; file_page.save()`.
-
-    The page-text read is now required for the idempotency check (see
-    test_tag_as_duplicate_is_idempotent_when_already_tagged), but the
-    write side must still go through prependtext — MediaWiki concatenates
-    atomically on the primary, no basetimestamp, no read-modify-write
-    save() that would re-introduce edit-conflict risk.
-    """
-    site = MagicMock()
-    file_page = MagicMock()
-    # No prior tag — idempotency check sees empty text and proceeds to write.
-    type(file_page).text = property(lambda self: "")
-    file_page.title.return_value = "Stranded.jpg"
-
-    tag_as_duplicate(
-        site,
-        file_page,
-        correct_filename="Correct.jpg",
-        reason="Other file has the correct title.",
-    )
-
-    assert site.editpage.call_count == 1
-    _, kwargs = site.editpage.call_args
-    assert "prependtext" in kwargs, (
-        f"editpage call must use prependtext; got kwargs={kwargs!r}"
-    )
-    # Tag goes first, followed by a newline so the existing page wikitext
-    # starts on its own line.
-    assert kwargs["prependtext"].startswith("{{Duplicate|Correct.jpg|"), (
-        f"prependtext must begin with the Duplicate template; got "
-        f"{kwargs['prependtext']!r}"
-    )
-    assert kwargs["prependtext"].endswith("\n"), (
-        "prependtext must end with a newline so the original wikitext is "
-        f"line-separated; got {kwargs['prependtext']!r}"
-    )
-    file_page.save.assert_not_called()
-
-
-def test_tag_as_duplicate_is_idempotent_when_already_tagged():
-    """Regression: a page that already carries a {{Duplicate}} template
-    must NOT receive a second one. Two uploader code paths (per-asset
-    hash-drift correction during upload + the post-item trailing-orphan
-    sweep) can both identify the same file as a duplicate of the same
-    target. Unconditionally prepending each time stacks redundant
-    `{{Duplicate|Correct.jpg|...}}` templates on the page — seen in
-    production on a NARA file that got tagged twice within three
-    seconds with the same correct title and two different reasons.
-    """
-    site = MagicMock()
-    file_page = MagicMock()
-    # Page already tagged by an earlier upstream caller in this run.
-    type(file_page).text = property(
-        lambda self: (
-            "{{Duplicate|Correct.jpg|Other file has the correct title.}}\n"
-            "{{Information|description=...}}\n"
-        )
-    )
-    file_page.title.return_value = "Stranded.jpg"
-
-    tag_as_duplicate(
-        site,
-        file_page,
-        correct_filename="Correct.jpg",
-        reason="Trailing-page orphan: this title has no corresponding asset.",
-    )
-
-    site.editpage.assert_not_called()
-    file_page.save.assert_not_called()
-
-
-def test_tag_as_duplicate_idempotency_detects_lowercase_template():
-    """The duplicate-detection regex must also catch `{{duplicate}}`
-    (lowercase variant some Commons editors use) — otherwise our bot
-    would add `{{Duplicate}}` on top of an existing `{{duplicate}}` and
-    re-introduce the double-tag we just fixed."""
-    site = MagicMock()
-    file_page = MagicMock()
-    type(file_page).text = property(lambda self: "{{duplicate|Correct.jpg|reason}}")
-    file_page.title.return_value = "Stranded.jpg"
-
-    tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
-    site.editpage.assert_not_called()
-
-
-def test_tag_as_duplicate_idempotency_detects_whitespace_variants():
-    """The regex must also catch the spaced/newline variants of the
-    template invocation that wikitext allows: `{{ Duplicate|...}}`,
-    `{{Duplicate |...}}`, and `{{Duplicate\\n|...}}` are all valid
-    forms Commons editors emit. Earlier the regex required `|` or `}`
-    to follow `Duplicate` with no whitespace, which would have missed
-    every one of these and re-introduced the double-tag bug whenever
-    the prior tagger used a less-compact form.
-    """
-    for prior_tag in (
-        "{{ Duplicate|Correct.jpg|reason}}",  # space after `{{`
-        "{{Duplicate |Correct.jpg|reason}}",  # space before `|`
-        "{{Duplicate\n|Correct.jpg|reason}}",  # newline before `|`
-        "{{Duplicate}}",  # no args (closes immediately)
-        "{{Duplicate }}",  # no args with trailing whitespace
-    ):
-        site = MagicMock()
-        file_page = MagicMock()
-        type(file_page).text = property(lambda self, t=prior_tag: t)
-        file_page.title.return_value = "Stranded.jpg"
-        tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
-        assert site.editpage.call_count == 0, (
-            f"prior tag {prior_tag!r} should have been detected; "
-            f"editpage was called {site.editpage.call_count} time(s)"
-        )
-
-
-def test_escape_template_param_replaces_equals_with_magic_word():
-    """`=` inside a template positional parameter is interpreted by
-    the MediaWiki parser as a named-parameter separator. The escape
-    must replace every `=` with the ``{{=}}`` magic word so the
-    rendered text is identical but the parser sees no splitter."""
-    assert escape_template_param("no equals") == "no equals"
-    assert escape_template_param("a=b") == "a{{=}}b"
-    assert escape_template_param("multi=one=two") == "multi{{=}}one{{=}}two"
-    assert escape_template_param("") == ""
-
-
-def test_tag_as_duplicate_escapes_equals_in_filename():
-    """Regression: a Spot Pond Reservoir file with a DPLA-preserved
-    source title containing ``"height of camera objective = 6.5
-    feet"`` produced a `{{Duplicate|...=...|...}}` template that
-    MediaWiki parsed as a named parameter, breaking the link and
-    showing an empty positional-1 slot. The bug was visible on
-    Commons rev 1234551826.
-
-    The fix: escape `=` in the correct-filename parameter via the
-    standard ``{{=}}`` magic word."""
-    site = MagicMock()
-    file_page = MagicMock()
-    type(file_page).text = property(lambda self: "")
-    file_page.title.return_value = "Stranded.jpg"
-
-    nasty_title = (
-        'Distribution Department, "height of camera objective = 6.5 feet", '
-        "Ston - DPLA - 01e81012a2a12fa66704075773b08b0c.jpg"
-    )
-    tag_as_duplicate(
-        site,
-        file_page,
-        correct_filename=nasty_title,
-        reason="Other file has the correct title.",
-    )
-
-    assert site.editpage.call_count == 1
-    _, kwargs = site.editpage.call_args
-    rendered = kwargs["prependtext"]
-    # A bare `=` between the first `|` and the second `|` would be the
-    # bug — assert there's no raw `=` between the template-open and the
-    # reason parameter separator.
-    duplicate_open = rendered.index("{{Duplicate|")
-    first_pipe = duplicate_open + len("{{Duplicate|")
-    # Find the SECOND pipe (parameter separator between filename and reason).
-    second_pipe = rendered.index("|", first_pipe + 1)
-    filename_param = rendered[first_pipe:second_pipe]
-    # The filename param must NOT contain a raw `=` — only the {{=}} form.
-    assert "=" not in filename_param.replace("{{=}}", ""), (
-        f"raw `=` survived inside template-parameter position: {filename_param!r}"
-    )
-    assert "{{=}}" in filename_param, (
-        f"escape did not fire on title with `=`: {filename_param!r}"
-    )
-
-
-def test_tag_as_duplicate_escapes_equals_in_reason():
-    """The reason parameter is the second positional param of
-    ``{{Duplicate}}`` — same template-parser hazard. Today the
-    default reason has no `=`, but any future change that introduces
-    one (e.g. embedding a URL fragment) must not break the template."""
-    site = MagicMock()
-    file_page = MagicMock()
-    type(file_page).text = property(lambda self: "")
-    file_page.title.return_value = "Stranded.jpg"
-
-    tag_as_duplicate(
-        site,
-        file_page,
-        correct_filename="Correct.jpg",
-        reason="see https://example.org/?id=42 for context",
-    )
-
-    rendered = site.editpage.call_args.kwargs["prependtext"]
-    assert "?id{{=}}42" in rendered
-    assert "?id=42" not in rendered.replace("?id{{=}}42", "")
-
-
-def test_tag_as_duplicate_without_reason_emits_single_arg_form():
-    """Passing an empty reason drops the second positional param, so the
-    Duplicate template's own default text speaks — the previous
-    caller-supplied reason ("Other file has the correct title.") was
-    largely duplicative of what the template already says."""
-    from ingest_wikimedia.wikimedia import tag_as_duplicate
-
-    site = MagicMock()
-    file_page = MagicMock()
-    type(file_page).text = property(lambda self: "")
-    file_page.title.return_value = "Stranded.jpg"
-
-    tag_as_duplicate(site, file_page, correct_filename="Correct.jpg")
-
-    rendered = site.editpage.call_args.kwargs["prependtext"]
-    assert rendered.startswith("{{Duplicate|Correct.jpg}}"), rendered
-    # And critically: no trailing empty-reason pipe.
-    assert "{{Duplicate|Correct.jpg|}}" not in rendered
-
-
-def test_first_uploader_returns_original_uploader_from_oldest_revision():
-    """The first-uploader check must look at the ORIGINAL upload, not
-    the most recent one — otherwise a DPLA-bot re-upload on top of a
-    community-authored file would misclassify the community file as
-    bot-owned. Reads pywikibot's ``oldest_file_info`` (earliest history
-    entry), which orders the history internally."""
-    from ingest_wikimedia.wikimedia import first_uploader
-
-    file_page = MagicMock()
-    file_page.title.return_value = "File:Angus F. Bartlett.jpg"
-    file_page.oldest_file_info.user = "Fæ"
-    assert first_uploader(file_page) == "Fæ"
-
-
-def test_first_uploader_none_when_history_unavailable():
-    """When the file history can't be read (empty history / API error,
-    surfaced by pywikibot raising on ``oldest_file_info``), return
-    ``None`` so the caller falls back to the safe self-tag/defer path."""
-    from ingest_wikimedia.wikimedia import first_uploader
-
-    file_page = MagicMock()
-    file_page.title.return_value = "File:Missing.jpg"
-    type(file_page).oldest_file_info = PropertyMock(
-        side_effect=Exception("no file history")
-    )
-    assert first_uploader(file_page) is None
-
-
-def test_post_commonsdelinker_request_escapes_equals_in_filenames():
-    """Same `=` escape contract applies to the
-    ``{{universal replace|<old>|<new>|reason=...}}`` template that
-    ``post_commonsdelinker_request`` posts to the CommonsDelinker
-    page. Filenames with `=` would otherwise corrupt the positional
-    params and the delinker would silently no-op."""
-    site = MagicMock()
-    # ``pywikibot.Page(site, ...)`` rejects a MagicMock site, so stub
-    # the page constructor too. ``file_has_inbound_usage`` returns True
-    # so the post path is reached.
-    with (
-        patch("ingest_wikimedia.wikimedia.pywikibot.Page", return_value=MagicMock()),
-        patch("ingest_wikimedia.wikimedia.file_has_inbound_usage", return_value=True),
-    ):
-        post_commonsdelinker_request(
-            site,
-            old_filename="Foo = bar.jpg",
-            new_filename="Foo = bar - DPLA - abc.jpg",
-            check_usage=True,
-        )
-
-    assert site.editpage.call_count == 1
-    appended = site.editpage.call_args.kwargs.get("appendtext", "")
-    # Both positional params must use the {{=}} escape.
-    assert "|Foo {{=}} bar.jpg|" in appended
-    assert "|Foo {{=}} bar - DPLA - abc.jpg|" in appended
-    # And no raw `=` in the positional-param region (the `reason=` named
-    # param is fine; that's a legitimate named-param assignment).
-    template_body = appended[
-        appended.index("{{universal replace") : appended.index("|reason=")
-    ]
-    assert "=" not in template_body.replace("{{=}}", ""), (
-        f"raw `=` survived in positional region: {template_body!r}"
-    )
-
-
-def test_tag_as_duplicate_idempotency_does_not_match_unrelated_templates():
-    """The regex must NOT false-positive on unrelated templates whose
-    name happens to start with 'Duplicate' (e.g. {{DuplicateImageFinder}}).
-    A page with only such a template should still receive its first
-    `{{Duplicate}}` tag from us."""
-    site = MagicMock()
-    file_page = MagicMock()
-    type(file_page).text = property(
-        lambda self: "{{DuplicateImageFinder|param=value}}\n"
-    )
-    file_page.title.return_value = "Stranded.jpg"
-
-    tag_as_duplicate(site, file_page, "Correct.jpg", "reason")
-    # First tag still applied — the unrelated template should not count.
-    assert site.editpage.call_count == 1
 
 
 # ---------------------------------------------------------------------------

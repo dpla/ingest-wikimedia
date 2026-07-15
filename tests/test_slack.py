@@ -8,7 +8,6 @@ log-summary logic that produces the message body.
 import os
 import tempfile
 import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -224,50 +223,6 @@ def _capture_message(env: dict) -> str:
     ):
         notify_pipeline_fail()
     return sent.get("text", "")
-
-
-def test_drain_deferred_opportunistic_step_name_is_wired_consistently():
-    """Three files must agree on the literal ``drain-deferred-opportunistic``
-    for the per-target opportunistic drain to route its failure summary
-    to the right log file:
-
-      1. ``scripts.wikimedia_launch._wrap_step_with_marker`` sets it as
-         the ``WIKIMEDIA_STEP`` value when the command carries
-         ``--no-wait``.
-      2. ``ingest_wikimedia.slack._PHASE_LOG_SUFFIX`` maps it to a
-         log-file suffix that the failure handler tails.
-      3. ``tools.drain_deferred.main`` calls ``setup_logging(partner,
-         "drain-deferred-opportunistic", …)`` under ``--no-wait``, so
-         the log file the failure handler tails is the one the drain
-         actually wrote to.
-
-    Any divergence between the three would silently break the failure-
-    summary path: Slack would show either the wrong log's tail or no
-    tail at all. Pin the three-way agreement so a future rename in
-    one place can't slip.
-    """
-    from scripts.wikimedia_launch import _wrap_step_with_marker
-    from ingest_wikimedia.slack import _PHASE_LOG_SUFFIX
-
-    wrapped = _wrap_step_with_marker("drain-deferred --no-wait nara")
-    assert "WIKIMEDIA_STEP=drain-deferred-opportunistic " in wrapped, (
-        "launcher must emit ``drain-deferred-opportunistic`` as the "
-        "WIKIMEDIA_STEP value for the per-target ``--no-wait`` drain"
-    )
-    assert "drain-deferred-opportunistic" in _PHASE_LOG_SUFFIX, (
-        "slack's _PHASE_LOG_SUFFIX map must include the opportunistic "
-        "step so the failure handler tails the right log"
-    )
-    # The log-file suffix drain_deferred.py writes to must match what
-    # slack.py's failure handler will search for.
-    drain_source = (
-        Path(__file__).resolve().parent.parent / "tools" / "drain_deferred.py"
-    ).read_text()
-    assert '"drain-deferred-opportunistic"' in drain_source, (
-        "tools/drain_deferred.py must call setup_logging with the "
-        "``drain-deferred-opportunistic`` event_type under --no-wait, "
-        "matching what slack.py tails and the launcher emits"
-    )
 
 
 def test_notify_pipeline_fail_says_aborting_this_target_when_not_last():

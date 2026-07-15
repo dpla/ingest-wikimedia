@@ -126,9 +126,11 @@ def get_page_title(
         # whitespace, the constructed title picks up a trailing space
         # that Commons removes at store time. The Python-side raw-string
         # identity check in ``process_file`` then thinks the file has
-        # drifted (constructed vs. stored differ by one space), triggers
-        # phantom Case-2 duplicate-tagging, and the item hangs in the
-        # dup-throttle drain. Concrete repro: DPLA ID
+        # drifted (constructed vs. stored differ by one space) and
+        # mis-routes the ordinal through a phantom hash-drift resolution
+        # (a spurious HAND_FIX or merge) instead of the clean skip that
+        # _resolve_hash_drift's ALREADY_CORRECT branch now produces.
+        # Concrete repro: DPLA ID
         # 95bd6bee5aed3c5311a67d5f6cee490b (NARA / FDR Library), whose
         # 264-char source title lands ``:181`` on the space after
         # ``"...value of farm "``.
@@ -857,19 +859,43 @@ def find_file_by_hash(
 ) -> FilePage | None:
     """Return the Commons FilePage with the given SHA1, or None.
 
-    If preferred_title is given and a file with that title (without namespace)
-    shares the hash, it is returned immediately. Otherwise the first result
-    returned by the API (alphabetical) is returned. This handles the rare case
-    where multiple files share a SHA1 and we want the one at the correct title.
+    If ``preferred_title`` is given and a file with that title (without
+    namespace) shares the hash, it is returned immediately — the same-title
+    fast path (our bytes are already at the intended title).
+
+    Otherwise, when more than one file shares the SHA1, the canonical file is
+    the EARLIEST existing upload: the file whose oldest revision has the
+    earliest timestamp (read via ``FilePage.oldest_file_info.timestamp``). This
+    matches the SHA1-uniqueness redesign, which centralizes duplicate content
+    onto the earliest upload. If a file's upload timestamp can't be read, the
+    function falls back to the API's first (alphabetical) result so it still
+    returns a usable FilePage.
     """
     api_site = typing.cast(APISite, site)
-    first: FilePage | None = None
+    candidates: list[FilePage] = []
     for img in api_site.allimages(sha1=sha1):
         if preferred_title and img.title(with_ns=False) == preferred_title:
             return img
-        if first is None:
-            first = img
-    return first
+        candidates.append(img)
+    if not candidates:
+        return None
+
+    def _upload_timestamp(file_page: FilePage):
+        try:
+            return file_page.oldest_file_info.timestamp
+        except Exception:  # noqa: BLE001 — unreadable history → no timestamp
+            return None
+
+    # Default to the API's first (alphabetical) result — the historical
+    # behaviour and the fallback when no timestamp can be read.
+    earliest = candidates[0]
+    earliest_ts = _upload_timestamp(earliest)
+    for file_page in candidates[1:]:
+        ts = _upload_timestamp(file_page)
+        if ts is not None and (earliest_ts is None or ts < earliest_ts):
+            earliest = file_page
+            earliest_ts = ts
+    return earliest
 
 
 _DPLA_ID_RE = re.compile(r"- DPLA - ([0-9a-f]{32})")
@@ -1056,37 +1082,25 @@ def merge_preserved_wikitext(existing_text: str, new_wikitext: str) -> str:
     return "\n".join(parts) + "\n"
 
 
-# Matches a real {{Duplicate}} template invocation. `\s*` on both sides of
-# `duplicate` accepts the whitespace/newlines wikitext allows inside the
-# braces — `{{ Duplicate|…}}`, `{{Duplicate |…}}` and `{{Duplicate\n|…}}`
-# are all valid invocations Commons editors do use. The trailing
-# `(?:\||\}\})` is what prevents `{{DuplicateImageFinder|…}}` from
-# false-matching: we only count it as a duplicate template when the next
-# non-whitespace token is the parameter pipe or the template's closing
-# braces. IGNORECASE handles both `Duplicate` and the `{{duplicate}}`
-# variant some Commons editors use.
-DUPLICATE_TAG_RE = re.compile(r"\{\{\s*duplicate\s*(?:\||\}\})", re.IGNORECASE)
-
-
 def first_uploader(file_page: FilePage) -> str | None:
     """Return the username that made the first (oldest) upload of
     ``file_page``, or ``None`` if the history is empty or the lookup
     fails.
 
-    Used by the uploader's Case-2 hash-drift subclassification to
-    distinguish stranded old DPLA-bot uploads (first uploader is a
-    known bot account — safe to tag for admin cleanup) from
-    community-authored uploads that predate DPLA involvement
-    (first uploader is a real editor — must not be tagged; instead
-    the community file gets promoted to the DPLA-canonical title via
-    the await-target-free deferral flow).
+    Used by ``Uploader._is_community_file`` to classify a SHA1-colliding
+    file. If the original uploader is one of our bots
+    (``DPLA_BOT_ACCOUNTS``) the file is ours to act on (rename / SDC merge /
+    redirect); if it's a real editor the file is community-authored and
+    off-limits to our automation, so it is handed to a human via the
+    hand-fix flow untouched. The bot-vs-real-editor distinction is the
+    decisive provenance signal in that classification.
 
     Reads pywikibot's ``oldest_file_info`` — the earliest file-history
     revision — so a later re-upload (e.g. a DPLA-bot re-upload on top of
     a community-authored file) never flips the classification. pywikibot
     fetches and orders the imageinfo history internally, so we don't
-    hand-roll the query direction. One lookup per Case-2 hit, an already
-    rare path.
+    hand-roll the query direction. One lookup per collision hit, an
+    already rare path.
     """
     try:
         user = file_page.oldest_file_info.user
@@ -1098,64 +1112,6 @@ def first_uploader(file_page: FilePage) -> str | None:
         )
         return None
     return user if isinstance(user, str) and user else None
-
-
-def tag_as_duplicate(
-    site: BaseSite,
-    file_page: FilePage,
-    correct_filename: str,
-    reason: str = "",
-) -> None:
-    """Prepend {{Duplicate}} to file_page, flagging it for speedy deletion.
-
-    correct_filename should be bare (no 'File:' prefix).
-    reason is the free-text reason shown in the template. When empty
-    (the default), the tag is emitted as ``{{Duplicate|<filename>}}`` —
-    a single-arg form that lets Commons's own default template text
-    speak for the tag, instead of a caller-supplied reason that would be
-    largely duplicative of the template's built-in wording.
-
-    Idempotent: if the page already carries a {{Duplicate}} (or
-    {{duplicate}}) template, this is a no-op. Two distinct uploader code
-    paths can both identify the same file as a duplicate of the same
-    target — the per-asset hash-drift correction during upload, and the
-    post-item trailing-orphan sweep that runs after the asset loop —
-    and unconditionally prepending each time produces a stack of
-    redundant tags on the page (see uploader regression where one file
-    got tagged twice within three seconds with the same correct title).
-
-    Uses the MediaWiki `prependtext` API parameter so the existing page
-    text doesn't need to be fetched, modified, and re-saved. The
-    idempotency check above does cost one GET to read `file_page.text`
-    that the pure-prependtext path avoided, but skipping a redundant
-    write is worth the single read.
-    """
-    if DUPLICATE_TAG_RE.search(file_page.text or ""):
-        logging.info(
-            f"Skipping duplicate tag on [[File:{file_page.title(with_ns=False)}]] — "
-            f"already tagged as duplicate."
-        )
-        return
-    # Escape `=` so a filename or reason containing literal equals signs
-    # doesn't break the template — see escape_template_param.
-    if reason:
-        tag = (
-            f"{{{{Duplicate"
-            f"|{escape_template_param(correct_filename)}"
-            f"|{escape_template_param(reason)}}}}}"
-        )
-    else:
-        tag = f"{{{{Duplicate|{escape_template_param(correct_filename)}}}}}"
-    summary = f"Tagging as duplicate: correct title is [[File:{correct_filename}]]"
-    # Trailing newline so the tag sits on its own line above whatever
-    # wikitext currently starts the page.
-    with_csrf_recovery(
-        site,
-        f"editpage tag-as-duplicate ({file_page.title(with_ns=False)})",
-        lambda: site.editpage(
-            file_page, summary=summary, minor=False, prependtext=tag + "\n"
-        ),
-    )
 
 
 INVALID_CONTENT_TYPES = frozenset(

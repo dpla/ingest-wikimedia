@@ -48,9 +48,6 @@ EC2 (i-033eff6c8c168f999) via AWS SSM
     │    2. downloader <partner>.csv <partner>
     │    3. uploader   <partner>.csv <partner>  (writes per-item upload-result.json)
     │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv
-    │    5. drain-deferred --no-wait <partner>  (opportunistic dup-tag drain)
-    │  Then, once every target finishes:
-    │    drain-deferred <partner>  (patient batch-terminal drain, one per partner)
     ▼
 S3 (s3://dpla-wikimedia/)     Wikimedia Commons
 ```
@@ -98,7 +95,7 @@ Reconciles files already on Commons for a hub/institution (incl. no-longer-opted
 
 Checks for active upload sessions and posts a status summary to **#tech-alerts**. Shows each session's current phase and progress (e.g. `Downloading (1,234 / 5,678 items, ~21.7%)`). Upload and SDC progress are reported at file (ordinal) granularity (`N / M files, ~P%`) when a download log is available.
 
-The summary also carries a context line with the box-wide worker-slot pool (`Worker slots: ~N free of M (K held)`) and EC2 memory (`Memory: X / Y MB used (P% available)`). When the shared slot pool is fully saturated, each slot-consuming row is annotated `[Slots: N]` (slots held) or `[Awaiting slot]` (blocked on acquire). Multi-target sessions show a `[pos/total]` position in the institution chain. A session in the deferred-drain phase reports e.g. `Draining (1,234 queued, Category:Duplicate at 180, needs < 140)` or `Drain complete (…)`.
+The summary also carries a context line with the box-wide worker-slot pool (`Worker slots: ~N free of M (K held)`) and EC2 memory (`Memory: X / Y MB used (P% available)`). When the shared slot pool is fully saturated, each slot-consuming row is annotated `[Slots: N]` (slots held) or `[Awaiting slot]` (blocked on acquire). Multi-target sessions show a `[pos/total]` position in the institution chain.
 
 The status workflow also runs automatically every 6 hours; it only posts when sessions are active (unlike `/wikimedia-status`, which always posts).
 
@@ -234,7 +231,7 @@ Hub-level eligibility does not imply every institution within it is eligible —
 
 ## Pipeline phases
 
-A standard run chains these phases per target within the tmux session: `get-ids-es → downloader → uploader → sdc-sync → drain-deferred --no-wait`. The `&&` chain ensures a later phase only starts if the previous one succeeded. After every target's chain finishes, the batch runs one patient `drain-deferred` per unique partner (see [Phase 5](#phase-5-deferred-drain-drain-deferred)).
+A standard run chains these phases per target within the tmux session: `get-ids-es → downloader → uploader → sdc-sync`. The `&&` chain ensures a later phase only starts if the previous one succeeded.
 
 ### Phase 1: ID generation (`get-ids-es`)
 
@@ -282,16 +279,9 @@ This cleanup is on by default; pass `--no-normalize-wikitext` to leave the pre-s
 
 All phases are idempotent — re-running is safe and picks up where it left off.
 
-### Phase 5: Deferred-drain (`drain-deferred`)
+### Hash-match handling (SHA1 uniqueness)
 
-Standard runs add a fifth step that works off the **Category:Duplicate throttle**. On the uploader's Case-2 hash-drift path — where an existing Commons file's bytes are re-homed to the canonical DPLA-ID title and the stranded copy is tagged `{{duplicate}}` — each tag adds a file to Commons' human-maintained **Category:Duplicate**. To avoid flooding that category, the uploader defers those tags once the category reaches **190** members (`DEFAULT_THRESHOLD`) and does not resume until it drains back below **140** (`DEFAULT_RESUME_BELOW`, a hysteresis band). Each deferred upload+tag pair is written as a unit to a per-partner sidecar, `<partner>/deferred-drain.json`, and the uploader exits normally rather than blocking.
-
-Draining happens in two places:
-
-- **Opportunistic** (`drain-deferred --no-wait <partner>`) — appended to each target's chain. Runs a single best-effort round: if Category:Duplicate is currently below the resume threshold it drains what fits, otherwise it exits immediately without waiting. Never blocks the next target; posts no Slack notifications.
-- **Patient** (`drain-deferred <partner>`) — one per unique partner, run after every target's chain finishes. Acquires a host-level `flock` and loops, polling Category:Duplicate every 5 minutes (`DEFAULT_POLL_SECS`) with no time budget — it can legitimately sit "Draining" for days while Commons volunteers clear the category. Posts deferred-drain start/complete notices to **#tech-alerts**.
-
-Both drains are only added to standard runs — not `maintain`, `sdc_only`, or `refresh_only`. The sidecar persists across `tmux kill-session`, so a later run resumes wherever a killed drain left off.
+There is no longer a separate deferred-drain phase. Under the SHA1-uniqueness constraint (PR C+D) the uploader never creates a second Commons file for a SHA1 that already exists (new uploads only — pre-existing legacy duplicates are out of scope; see [upload-invariant.md](upload-invariant.md)), so when it finds our S3 SHA1 already on Commons it resolves the case **inline** in the upload phase — never uploading a second byte-identical copy — with one of: skip (already at the intended title), move-rename (empty or redirect-to-self intended title), merge-and-redirect (source duplication — merge this item's SDC onto the earliest canonical file and leave a `#REDIRECT`), or hand-fix (recorded to the per-partner `hand-fix.jsonl`, no upload). See [special-cases.md](special-cases.md#hash-drift-resolution) for the decision tree and [sidecars.md](sidecars.md#hand-fixjsonl-local-disk-not-s3) for the hand-fix log.
 
 ### Alternate run modes
 
@@ -434,12 +424,6 @@ When scheduled: posts to #tech-alerts only if sessions are active.
 When triggered by Slack: always posts (even if no sessions are running).
 
 For each active session, reports the current phase and progress percentage by inspecting the most recent log file.
-
-### `dpla-dup-window.yml`
-
-Triggered by: schedule (hourly), or manually from the Actions tab.
-
-Advances the DPLA duplicate "moving window" so a bounded number of DPLA files stay visible in Commons' Category:Duplicate at a time, oldest-first, as admins clear them. Independent of the upload pipeline — it manages what is already tagged, complementing the uploader's [deferred-drain throttle](#phase-5-deferred-drain-drain-deferred). The `workflow_dispatch` form accepts `target` (default `100` visible DPLA files) and `dry_run` (compute the plan but make no edits).
 
 ---
 

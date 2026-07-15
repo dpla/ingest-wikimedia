@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 # Per-URL cache so a warm/long-lived process fetches each config at most once.
 _staged_config_cache: dict[str, dict] = {}
@@ -100,6 +101,23 @@ PARTNER_HUBS: dict[str, str] = {
 PARTNER_DIR: dict[str, str] = {
     "si": "smithsonian",
 }
+
+# Absolute anchor for a partner's on-disk working directory on the wiki
+# EC2 host. CWD-independent so uploader / sdc-sync / sidecar callers (which
+# ``cd`` into ``<root>/<partner_dir>/`` before executing) all resolve to the
+# same flat ``<root>/<partner_dir>/`` path. Tests monkeypatch this to a tmp
+# dir. Re-homed here from the retired ``drain_sidecar`` module (PR C+D); the
+# hand-fix sidecar is the remaining consumer.
+INGEST_WIKI_ROOT = Path("/home/ec2-user/ingest-wikimedia")
+
+
+def partner_dir_path(partner: str) -> Path:
+    """Absolute path to the partner's working directory under
+    :data:`INGEST_WIKI_ROOT`. Resolves ``si`` → ``smithsonian`` via
+    :data:`PARTNER_DIR`; other slugs pass through unchanged.
+    """
+    return INGEST_WIKI_ROOT / PARTNER_DIR.get(partner, partner)
+
 
 # Alternate slugs that map to a canonical slug in PARTNER_HUBS
 _SLUG_ALIASES: dict[str, str] = {

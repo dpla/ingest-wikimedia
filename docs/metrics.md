@@ -108,10 +108,6 @@ A pre-paint inline script (`metrics/index.html` line 11) sets a `.filter-view` c
 
 The frontend and the bot read the same REST API, but they're decoupled: the bot writes Commons `Data:Views/<category>.tab` / `.chart` pages so other on-wiki templates and tools can consume the monthly series without hitting the REST endpoint themselves, while this site goes direct to the REST endpoint for freshness. A change to either side doesn't break the other as long as the REST response schema is stable.
 
-## Sibling scheduled job: `metrics/dpla-dup-window/`
-
-`metrics/` also houses a separate scheduled pywikibot job: `dpla-dup-window/release_window.py`, run hourly by `.github/workflows/dpla-dup-window.yml` as `User:DPLA bot`. It advances the DPLA duplicate "moving window" (`Template:DPLA duplicate/moving window`) so a bounded number of DPLA duplicate files (`--target`, default 100) stay visible, oldest-first, in `Category:Duplicate` for Commons admins to clear. It is a duplicate-throttle for the upload pipeline, not a pageview-metrics job — it shares only the `metrics/` directory, the DPLA bot identity, and the same deferred-login pattern described above (`site.login()` is called only on a run that actually releases files).
-
 ## Why this is separate from the ingest pipeline
 
 The metrics system is operationally and architecturally distinct:

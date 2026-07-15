@@ -18,15 +18,20 @@ import logging
 import re
 import shlex
 
-from ingest_wikimedia.partners import PARTNER_DIR
+from ingest_wikimedia.partners import PARTNER_DIR, PARTNER_HUBS
 from ingest_wikimedia.ssm import ssm_run
 
 
 # Valid launcher-exported ``WIKIMEDIA_SESSION_LABEL`` shapes:
-# ``<hub>+<institution>`` (per-target), ``drain-<hub>`` (terminal
-# partner drain), ``retry-<hub>`` (retry pipeline).
+# ``<hub>`` (whole-hub launch — the canonical hub slug on its own),
+# ``<hub>+<institution>`` (per-target), ``retry-<hub>`` (retry pipeline).
+# A bare hub slug is a valid label that ``parse_session_labels`` accepts, so it
+# must pass here too or ``snapshot_running_active_labels`` silently drops
+# whole-hub sessions and falls back to the weaker mtime heuristic.
 def _valid_session_label(label: str) -> bool:
-    return bool(label) and ("+" in label or label.startswith(("drain-", "retry-")))
+    return bool(label) and (
+        "+" in label or label.startswith("retry-") or label in PARTNER_HUBS
+    )
 
 
 def snapshot_running_active_labels(client) -> dict[str, str]:
@@ -72,36 +77,22 @@ done""",
 
 
 # Ordered phase suffixes in log filenames (``…-<label>-<phase>.log``). Shared by
-# the two patterns below so a new phase is a one-line change; only the trailing
-# optional ``-opportunistic`` differs by regex dialect (Python ``re`` uses a
-# non-capturing ``(?:…)`` group; ``find``'s POSIX ERE can't, so it uses ``(…)``).
-_PHASE_ALT = "id-generation|download|upload|sdc|drain-deferred"
+# the two patterns below so a new phase is a one-line change.
+_PHASE_ALT = "id-generation|download|upload|sdc"
 
 
 def log_filename_pattern_for_label(label: str) -> str:
     """Anchored regex matching log filenames for exactly this label.
 
     Log filenames follow ``{YYYYMMDD}-{HHMMSS}-{label}-<phase>.log`` where
-    ``<phase>`` is one of ``id-generation``, ``download``, ``upload``,
-    ``sdc``, ``drain-deferred``, or ``drain-deferred-opportunistic``.
-    The pattern must match ``…-bpl+phillips-academy-download.log`` and NOT
-    ``…-bpl+phillips-academy-andover-download.log`` — otherwise sibling
-    labels whose names extend this one steal the log selection and the
-    caller sticks on the wrong target. See lessons.md
+    ``<phase>`` is one of ``id-generation``, ``download``, ``upload``, or
+    ``sdc``. The pattern must match ``…-bpl+phillips-academy-download.log``
+    and NOT ``…-bpl+phillips-academy-andover-download.log`` — otherwise
+    sibling labels whose names extend this one steal the log selection and
+    the caller sticks on the wrong target. See lessons.md
     "Log filename phase detection".
-
-    ``drain-deferred`` is included so the status reporter can see the
-    post-SDC deferred-tagging phase — a session that has completed
-    upload+SDC and moved on to draining its Case-2 duplicate-tag
-    sidecar was previously invisible here and misreported as
-    ``SDC complete`` while actually holding a host-level flock and
-    polling ``Category:Duplicate`` capacity.
     """
-    return (
-        rf"-{re.escape(label)}-"
-        rf"({_PHASE_ALT}(?:-opportunistic)?)"
-        r"\.log$"
-    )
+    return rf"-{re.escape(label)}-({_PHASE_ALT})\.log$"
 
 
 def find_active_label(
@@ -135,17 +126,6 @@ def find_active_label(
     stealing the row's identity and progress numbers. The filter is a
     strict prefix on the ``find`` command (``-newermt "@N"``); when 0
     it's omitted and behavior matches the original unbounded query.
-
-    Also matches ``drain-<hub>`` logs for each unique hub appearing in
-    ``labels``. The launcher's terminal partner-level drain step
-    exports ``WIKIMEDIA_SESSION_LABEL=drain-<partner>``, so its log
-    file is ``…-drain-<partner>-drain-deferred.log`` — that name is
-    NOT one of the per-target labels callers pass, and before this
-    change the reporter's "which label is active" lookup silently
-    ignored it, misreporting sessions in terminal drain as
-    ``SDC complete``. On a match the synthetic ``drain-<hub>`` label
-    is returned; downstream callers can either display it as-is or
-    strip the prefix for the row label.
     """
     if not labels:
         return None
@@ -156,21 +136,13 @@ def find_active_label(
         shlex.quote(f"/home/ec2-user/ingest-wikimedia/{PARTNER_DIR.get(h, h)}/logs")
         for h in hubs
     )
-    # Include synthetic ``drain-<hub>`` alternatives so the terminal
-    # partner-level drain step (launcher exports
-    # ``WIKIMEDIA_SESSION_LABEL=drain-<partner>`` before that step) is
-    # visible here. Combined regex alternation avoids doubling the
-    # SSM round trip count.
-    drain_hub_labels = [f"drain-{h}" for h in hubs]
-    label_alt = "|".join(re.escape(lbl) for lbl in [*labels, *drain_hub_labels])
+    label_alt = "|".join(re.escape(lbl) for lbl in labels)
     # Phase alternation MUST stay in sync with
-    # :func:`log_filename_pattern_for_label` — drain-deferred(-opportunistic)
-    # logs are legitimate "newest phase" candidates for a session whose
-    # download/upload/sdc chain finished and moved on to drain.
+    # :func:`log_filename_pattern_for_label`.
     cmd_parts = [
         f"find {paths} -maxdepth 1 -type f -name '*.log'",
         "-regextype posix-extended",
-        f"-regex '.*-({label_alt})-({_PHASE_ALT}(-opportunistic)?)\\.log'",
+        f"-regex '.*-({label_alt})-({_PHASE_ALT})\\.log'",
     ]
     if session_created > 0:
         # Time-bound the lookup to files created after this session's
@@ -187,10 +159,8 @@ def find_active_label(
     # Identify which of our labels matched via the per-label helper —
     # anchored-pattern logic so suffix-collision (e.g.
     # ``bpl+phillips-academy`` vs ``bpl+phillips-academy-andover``) is
-    # handled exactly once. Try synthetic drain-hub labels first because
-    # a ``drain-<hub>`` file name may otherwise be matched against a
-    # per-target label whose prefix coincidentally aligns.
-    for lbl in [*drain_hub_labels, *labels]:
+    # handled exactly once.
+    for lbl in labels:
         if re.search(log_filename_pattern_for_label(lbl), filename):
             return lbl, int(float(mtime_str))
     return None
@@ -220,10 +190,9 @@ def active_and_upcoming_labels(
     session's running child. When ``None``, falls back to
     :func:`find_active_label`'s log-mtime heuristic
     (``session_created``-bounded so a concurrent session's write can't
-    steal identity). Both a ``drain-<hub>`` active label and a lookup
-    that finds no log yet return the empty and all-labels sets
-    respectively; a transient SSM error is logged and treated as the
-    latter so a lookup failure can't silently let a real conflict
+    steal identity). A lookup that finds no log yet returns the
+    all-labels set; a transient SSM error is logged and treated the
+    same way so a lookup failure can't silently let a real conflict
     through.
     """
     if not labels:
@@ -241,8 +210,6 @@ def active_and_upcoming_labels(
         if found is None:
             return set(labels)
         active_label = found[0]
-    if active_label.startswith("drain-"):
-        return set()
     try:
         start_idx = labels.index(active_label)
     except ValueError:

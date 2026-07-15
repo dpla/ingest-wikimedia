@@ -23,7 +23,7 @@ def get_item_s3_path(dpla_id, filename, partner):
 
 One special slug-to-directory mapping: `si` (Smithsonian) maps to `smithsonian/` for the local EC2 working directory, but the S3 prefix is still `si/`.
 
-One sidecar is the exception to the S3 rule: the per-partner `deferred-drain.json` queue lives on the EC2 working disk, not S3 — see [`deferred-drain.json`](#deferred-drainjson-local-disk-not-s3) below.
+One sidecar is the exception to the S3 rule: the per-partner `hand-fix.jsonl` log lives on the EC2 working disk, not S3 — see [`hand-fix.jsonl`](#hand-fixjsonl-local-disk-not-s3) below.
 
 ## Inventory
 
@@ -182,7 +182,8 @@ Per-item upload verdict — the SDC phase's source of truth for which Commons pa
     "3": {"status": "NOT_PRESENT"},
     "4": {"status": "INELIGIBLE"},
     "5": {"status": "FAILED",      "error": "..."},
-    "6": {"status": "DEFERRED",    "title": "...", "pageid": null}
+    "6": {"status": "MERGED",      "title": "...", "pageid": 345678},
+    "7": {"status": "HAND_FIX"}
   }
 }
 ```
@@ -196,7 +197,8 @@ Per-item upload verdict — the SDC phase's source of truth for which Commons pa
 | `NOT_PRESENT` | No corresponding S3 object for this ordinal (downloader didn't write it) |
 | `INELIGIBLE` | Pre-flight rejected (bad MIME, banned filetype, etc.) |
 | `FAILED` | Catastrophic failure; see `error` field |
-| `DEFERRED` | `{{duplicate}}`-tagging upload deferred because Category:Duplicate was at capacity; retried by the drain-deferred phase |
+| `MERGED` | Source-duplicate SHA1 (within-item, or cross-item / cross-institution): this item's SDC was merged onto the earliest existing (canonical) Commons file and a `#REDIRECT` left at our intended title. Carries the canonical file's `title`/`pageid`, but is deliberately NOT SDC-eligible (the SDC was merged inline, so re-targeting the redirect title would double-write) |
+| `HAND_FIX` | Our SHA1 lives at a wrong title and the intended title is occupied by a different file (`rename_blocked`), or the match is a community upload (`community_file`); recorded to `hand-fix.jsonl` for a human. No upload, no `title`/`pageid` |
 
 **Critical correctness detail.** `pageid` is `None` on failure (not `0`) so `sdc_sync.py`'s `if not pageid:` guard cleanly skips malformed entries — `M0` is not a valid Commons mediaid and would propagate downstream as a confusing pywikibot APIError.
 
@@ -224,23 +226,34 @@ The actual media file, one S3 object per ordinal. 1-indexed.
 
 ---
 
-## `deferred-drain.json` (local disk, not S3)
+## `hand-fix.jsonl` (local disk, not S3)
 
-The per-partner queue of DPLA IDs whose Case-2 hash-drift upload+tag was deferred because `Category:Duplicate` on Commons was at capacity. Unlike every other sidecar it lives on the EC2 working disk, not S3: `<INGEST_WIKI_ROOT>/<partner-dir>/deferred-drain.json` (e.g. `/home/ec2-user/ingest-wikimedia/smithsonian/deferred-drain.json` for `si`).
+The per-partner log of hash-drift cases the uploader could not safely resolve on its own — the SHA1-uniqueness redesign's replacement for the retired `deferred-drain.json` queue (and its `{{Duplicate}}`-tag throttle). Unlike every other sidecar it lives on the EC2 working disk, not S3: `<INGEST_WIKI_ROOT>/<partner-dir>/hand-fix.jsonl` (e.g. `/home/ec2-user/ingest-wikimedia/smithsonian/hand-fix.jsonl` for `si`), resolved via `ingest_wikimedia/partners.py::partner_dir_path`.
 
-**Writer.** `tools/uploader.py` via `drain_sidecar.merge_sidecar` — appends (never overwrites) the deferred IDs at the end of the upload pass.
+**Writer.** `tools/uploader.py` via `ingest_wikimedia/hand_fix_sidecar.py::record_hand_fix` — appends one newline-delimited JSON object per `HAND_FIX` ordinal (both the `rename_blocked` and `community_file` reasons). Best-effort: a filesystem error here never aborts the run — the ordinal is already counted (`Result.UPLOAD_HAND_FIX`) and the same case re-detects and re-records on a future run.
 
-**Reader / remover.** `tools/drain_deferred.py` — the `drain-deferred` phase. Patient mode (the default, terminal phase of a batch) blocks on `DuplicateCategoryThrottle.wait_for_capacity`, polling `Category:Duplicate` every 300 s with no time budget until it drops below the resume threshold of 140; `--no-wait` runs a single opportunistic round and exits immediately if the category is at capacity. Each round removes its IDs from the sidecar, re-invokes `uploader` + `sdc-sync` on them as subprocesses, and the patient loop repeats until the sidecar is empty. A host-level `flock` at `/home/ec2-user/ingest-wikimedia/.drain-lock` serialises drains across partners.
+**Reader.** A human. There is no automated consumer: a hand-fix needs a person to pick a winner between two distinct files (or to decide what to do with a community upload). The per-run count is surfaced in the upload phase's Slack summary — the `HAND-FIX:` line in `notify_upload_complete`, from `tracker.count(Result.UPLOAD_HAND_FIX)`.
 
-**Shape:**
+**Shape** (one JSON object per line):
 
 ```json
-{"partner": "<slug>", "deferred_dpla_ids": ["<dpla-id>", "..."]}
+{"dpla_id": "...", "ordinal": 3, "our_sha1": "...", "intended_title": "...", "occupying_title": "...", "occupying_sha1": "...", "reason": "rename_blocked", "partner": "<slug>"}
 ```
 
-Atomic write (tempfile + `os.replace`); the file is removed when the queue empties.
+| Field | Meaning |
+|---|---|
+| `dpla_id` | The DPLA item whose ordinal was blocked |
+| `ordinal` | 1-indexed asset position within the item |
+| `our_sha1` | The S3 source SHA1 that already exists elsewhere on Commons |
+| `intended_title` | The canonical title we wanted to write |
+| `occupying_title` | The file blocking the intended title (a *different* real file for `rename_blocked`; the matched community file for `community_file`) |
+| `occupying_sha1` | The occupant's SHA1 (`null` for a redirect or an unreadable file) |
+| `reason` | `rename_blocked` or `community_file` |
+| `partner` | Partner slug |
 
-**Throttle.** `ingest_wikimedia/dup_throttle.py::DuplicateCategoryThrottle` gates the hash-drift `{{duplicate}}` tag path: defer once `Category:Duplicate` reaches 190 members, resume draining once it falls below 140 (a 50-member hysteresis band).
+Records may carry extra context beyond the fixed schema: `rename_blocked` adds `current_title` (where our SHA1 currently lives), and `community_file` adds `community_uploader` (the matched file's original uploader).
+
+**Lifecycle.** Append-only across a run; never rewritten or auto-removed — a human deletes or truncates the file once the listed cases are resolved. Dry-runs don't reach the write path (drift resolution runs only on the live upload path).
 
 ---
 
@@ -277,7 +290,6 @@ The phases hand off via these sidecars:
 | Upload → SDC | `upload-result.json` | sdc-sync skips ordinals whose status isn't `UPLOADED`/`SKIPPED` |
 | Enumeration → SDC (separate pass) | `sdc.json` | sdc-sync diffs against Commons-side state |
 | Download → SDC (separate pass) | `file-list.txt` | sdc-sync uses per-ordinal URL for `P2699` qualifier |
-| Upload → Drain-deferred | `deferred-drain.json` (local disk) | drain-deferred re-invokes uploader + sdc-sync on the queued IDs once Category:Duplicate drains below 140 |
 
 This decoupling is what lets `sdc-sync` re-run independently of the other phases (the `sdc_only` mode), and lets `refresh-only` re-download without disturbing already-uploaded files.
 {% endraw %}

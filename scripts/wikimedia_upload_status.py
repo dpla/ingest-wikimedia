@@ -17,9 +17,9 @@ import requests
 
 from typing import NamedTuple
 
-from ingest_wikimedia.drain_sidecar import sidecar_path
 from ingest_wikimedia.partners import PARTNER_DIR, parse_session_labels, resolve_slug
 from ingest_wikimedia.session_state import (
+    _PHASE_ALT,
     find_active_label,
     log_filename_pattern_for_label,
     snapshot_running_active_labels,
@@ -83,14 +83,13 @@ class SlotSnapshot(NamedTuple):
 
 
 # Phase-string prefixes that indicate a session is CURRENTLY in a
-# slot-consuming phase (upload / SDC-sync / drain). Used to decide whether
+# slot-consuming phase (upload / SDC-sync). Used to decide whether
 # ``[Awaiting slot]`` is applicable when a saturated snapshot shows the
 # session holds zero slots — a session in "Downloading" or "Generating IDs"
 # is legitimately not waiting for a Commons-write slot, so no suffix.
 _SLOT_CONSUMING_PHASE_PREFIXES: tuple[str, ...] = (
     "Uploading",
     "SDC syncing",
-    "Draining",
 )
 
 SLACK_CHANNEL = "C02HEU2L3"
@@ -142,108 +141,12 @@ def _idle_suffix(now: int, log_mtime: int) -> str:
 # how callers obtain the label.
 _LABEL_SLUG_RE = re.compile(r"[a-z0-9+\-]+")
 
-# The drain-deferred phase emits its `Category:Duplicate at N (>= resume
-# threshold M); waiting Ss…` line every poll interval. Extract N and M
-# so the status readout can show both the current queue size and how
-# close it is to the resume gate.
-_DRAIN_THROTTLE_RE = re.compile(
-    r"Category:Duplicate at (\d+) \(>= resume threshold (\d+)\)"
-)
-
-
-def _drain_deferred_phase(
-    *,
-    client,
-    queue_hubs: list[str],
-    log_path: str,
-    log_file: str,
-    session_created: int,
-) -> tuple[str | None, int]:
-    """Report the drain-deferred phase's live state.
-
-    Queue count sums live sidecar contents across every partner in
-    ``queue_hubs``. Lock and throttle state come from ``log_path``
-    (the currently-running drain's log). The lock-acquired grep runs
-    over the full file, not the tail — a patient drain that has held
-    the lock for hours emits enough throttle-poll lines to scroll the
-    one-shot "lock acquired" marker out of any fixed tail window.
-
-    Returns ``(None, 0)`` when the log predates this session, matching
-    :func:`get_phase_and_progress`'s sentinel.
-    """
-    is_opportunistic = log_file.endswith("-drain-deferred-opportunistic.log")
-    sidecar_paths = " ".join(shlex.quote(str(sidecar_path(h))) for h in queue_hubs)
-    sep = "__WM_DRAIN_SEP__"
-    # Each DPLA ID is a 32-hex-char string on its own line in the JSON
-    # array. ``cat`` silently skips missing files (an empty sidecar =
-    # nothing to drain for that partner), so summing across the batch
-    # is one grep over the concatenation.
-    out = ssm_run(
-        client,
-        f"stat -c %Y {log_path} 2>/dev/null || echo 0; "
-        f"echo {sep}; "
-        f"tail -8 {log_path} 2>/dev/null; "
-        f"echo {sep}; "
-        f"cat {sidecar_paths} 2>/dev/null | grep -oE '[0-9a-f]{{32}}' | wc -l; "
-        f"echo {sep}; "
-        f"grep -cF 'Drain-phase host lock acquired.' {log_path} 2>/dev/null || echo 0",
-    )
-    sections = out.split(f"{sep}\n", 3)
-
-    def _int(s: str) -> int:
-        try:
-            return int(s.strip())
-        except ValueError:
-            return 0
-
-    log_mtime = _int(sections[0]) if sections else 0
-    tail = sections[1] if len(sections) > 1 else ""
-    queued = _int(sections[2]) if len(sections) > 2 else 0
-    lock_acquired = (_int(sections[3]) if len(sections) > 3 else 0) > 0
-
-    if session_created > 0 and log_mtime > 0 and log_mtime < session_created:
-        return None, 0
-
-    if "nothing to do." in tail:
-        # Empty/missing sidecar: the drain logged this and exited immediately,
-        # never acquiring the lock. It's done, not waiting for the host lock —
-        # without this it fell through to the "⏸ waiting for host lock" default.
-        return "Drain complete (nothing queued)", log_mtime
-    if "Drain-deferred: complete." in tail:
-        return f"Drain complete ({queued:,} still queued)", log_mtime
-    if "at capacity; " in tail and is_opportunistic:
-        return (
-            f"Drain (opportunistic) skipped ({queued:,} deferred to terminal drain)",
-            log_mtime,
-        )
-
-    draining = "Draining opportunistically" if is_opportunistic else "Draining"
-    if not lock_acquired:
-        return (
-            f"{draining} ({queued:,} queued, ⏸ waiting for host lock)",
-            log_mtime,
-        )
-    m = None
-    for line in reversed(tail.splitlines()):
-        m = _DRAIN_THROTTLE_RE.search(line)
-        if m:
-            break
-    if m:
-        cat_size, threshold = int(m.group(1)), int(m.group(2))
-        return (
-            f"{draining} ({queued:,} queued, "
-            f"Category:Duplicate at {cat_size:,}, needs < {threshold:,})",
-            log_mtime,
-        )
-    return f"{draining} ({queued:,} queued, host lock acquired)", log_mtime
-
 
 def get_phase_and_progress(
     client,
     session: str,
     hub: str,
     label: str,
-    queue_hubs: list[str] | None = None,
 ) -> tuple[str | None, int]:
     """Return ``(phase_str, log_mtime)`` for this label.
 
@@ -255,13 +158,6 @@ def get_phase_and_progress(
     didn't write a ``COUNTS:`` terminal marker (so it doesn't look
     "complete" via the count-marker test) must not eclipse a subsequent
     label that's actively progressing now.
-
-    ``queue_hubs`` (optional): for a multi-partner batch's terminal
-    drain phase, list of every canonical partner in the batch so the
-    drain readout sums sidecar counts across all of them — the whole
-    terminal drain is one conceptual "the batch is draining"
-    operation. Defaults to ``[hub]`` — the single-partner case where
-    the row's own hub is the only relevant sidecar.
 
     ``label`` MUST be slug-shaped (``[a-z0-9+\\-]+``) — the download-log
     glob below interpolates it unquoted into a shell command.
@@ -309,15 +205,18 @@ def get_phase_and_progress(
         # Backward-compat ONLY for bare-hub labels: pre-session-label sessions
         # used hub-slug-only filenames (e.g. nara-download.log). An institution
         # label ("hub+institution") with no matching log is in id-generation,
-        # not a legacy hub-slug run — falling back here would attach an
-        # unrelated hub log (in particular a partner-level drain-<hub> log) to
-        # it and misreport an id-gen session as "Draining". Exclude drain-<hub>
-        # logs too (they belong to the terminal-drain path, not a target row).
-        hub_prefix = shlex.quote(hub + "-")
+        # not a legacy hub-slug run, so exclude new-format ('+') logs from the
+        # fallback to avoid attaching an unrelated institution's log.
+        # Match ONLY legacy phase filenames (e.g. nara-download.log). A bare
+        # ``<hub>-`` prefix would also select a retired ``<hub>-drain.log`` left
+        # over from the old moving-window apparatus, after which no phase branch
+        # matches and status reads "Unknown". The ('+') exclusion is redundant
+        # with the anchored pattern but kept for clarity.
+        legacy_pattern = shlex.quote(rf"^{re.escape(hub)}-({_PHASE_ALT})\.log$")
         log_file = ssm_run(
             client,
-            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' "
-            "| grep -vF 'drain-' | head -1 || true",
+            f"ls -t {log_dir}/ 2>/dev/null | grep -E -- {legacy_pattern} "
+            "| head -1 || true",
         ).strip()
 
     if not log_file:
@@ -328,22 +227,6 @@ def get_phase_and_progress(
         return None, 0
 
     log_path = shlex.quote(f"{base}/logs/{log_file}")
-
-    # Drain-deferred phase has its own tight state machine: sidecar queue
-    # size + host-lock state + throttle poll number are what matter, not
-    # the download/upload/sdc markers the awk pass below counts. Short-
-    # circuit before the heavier SSM call — one round-trip, direct
-    # signals.
-    if log_file.endswith("-drain-deferred.log") or log_file.endswith(
-        "-drain-deferred-opportunistic.log"
-    ):
-        return _drain_deferred_phase(
-            client=client,
-            queue_hubs=queue_hubs or [hub],
-            log_path=log_path,
-            log_file=log_file,
-            session_created=session_created,
-        )
 
     if log_file.endswith("-id-generation.log"):
         # get-ids-es logs a scope line + periodic "N items enumerated so far".
@@ -361,7 +244,7 @@ def get_phase_and_progress(
         id_mtime = _safe_int(id_lines[1]) if len(id_lines) > 1 else 0
         # Log predates this session — a stale id-generation log from a prior
         # run of this label, picked before the new session has written its
-        # own. Same "predates this session" sentinel as the drain and
+        # own. Same "predates this session" sentinel as the
         # download/upload/sdc branches (return None → caller renders a bare
         # "Generating IDs" rather than a stale enumerated count).
         if session_created > 0 and id_mtime < session_created:
@@ -454,8 +337,10 @@ def get_phase_and_progress(
         f"/Skipping.*Already exists on commons/ {{s++}} "
         f"/COUNTS:/ {{c++}} "
         f"/-- Ordinal [0-9]+:/ {{o++}} "
-        f"END {{ print d+0; print u+0; print s+0; print c+0; print o+0 }}"
-        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n0\\n'; "
+        f"/UPLOAD_HAND_FIX:/ {{hf=$2}} "
+        f"/UPLOAD_MERGED_TO_CANONICAL:/ {{mg=$2}} "
+        f"END {{ print d+0; print u+0; print s+0; print c+0; print o+0; print hf+0; print mg+0 }}"
+        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n0\\n0\\n0\\n'; "
         f"{csv_count_cmd}; "
         f"echo {sep}; "
         f"DOWNLOG=$(ls -t {log_dir}/*-{label}-download.log 2>/dev/null | head -1); "
@@ -477,17 +362,22 @@ def get_phase_and_progress(
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
 
     # Layout matches the awk-then-wc shell command above: the awk pass emits
-    # five counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal) and then
-    # `wc -l` emits the CSV total — six lines in total. ``ordinal_count``
-    # is the count of ``-- Ordinal N:`` markers in the active log, which
-    # the SDC phase emits one of per file (numerator for SDC's file-level
-    # progress).
+    # seven counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal, HAND-FIX,
+    # MERGED) and then `wc -l` emits the CSV total — eight lines in total.
+    # HAND-FIX / MERGED are read from the terminal ``COUNTS:`` block (the
+    # authoritative tracker values, one per SHA1-uniqueness outcome) so the
+    # completion summary reports those alongside uploaded/skipped rather than
+    # only the two happy-path counts. ``ordinal_count`` is the count of
+    # ``-- Ordinal N:`` markers in the active log, which the SDC phase emits
+    # one of per file (numerator for SDC's file-level progress).
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
     counts_marker = _safe_int(count_lines[3]) if len(count_lines) > 3 else 0
     ordinal_count = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
-    total = _safe_int(count_lines[5]) if len(count_lines) > 5 else 0
+    hand_fix_count = _safe_int(count_lines[5]) if len(count_lines) > 5 else 0
+    merged_count = _safe_int(count_lines[6]) if len(count_lines) > 6 else 0
+    total = _safe_int(count_lines[7]) if len(count_lines) > 7 else 0
 
     # Sum of `Item <id>: N ordinals` lines from the download log — the true
     # file count once downloads have completed. 0 when no download log was
@@ -554,7 +444,9 @@ def get_phase_and_progress(
         # files finish, so count arithmetic alone can fire too early.
         if counts_marker > 0:
             return (
-                f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, {skipped_count:,} already on Commons)",
+                f"{_UPLOAD_COMPLETE_PREFIX} ({uploaded_count:,} uploaded, "
+                f"{skipped_count:,} already on Commons, {merged_count:,} merged, "
+                f"{hand_fix_count:,} hand-fix)",
                 log_mtime,
             )
         # File-level progress: the download log gives us the true total
@@ -685,7 +577,7 @@ def _fetch_slot_snapshot(ssm) -> SlotSnapshot | None:
             f'echo "$HOLDERS" | awk "{{print \\$1}}" | while read pid; do '
             f'  [ -z "$pid" ] && continue; '
             # Each pipeline process (uploader, sdc-sync main and its pool
-            # workers, drain) inherits WIKIMEDIA_SESSION_LABEL from the tmux
+            # workers) inherits WIKIMEDIA_SESSION_LABEL from the tmux
             # environ set by the launcher — a robust per-target signal that
             # survives multiprocessing.Pool forks.
             f"  label=$(tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null "
@@ -1017,23 +909,10 @@ def main() -> None:
             return _with_batch_suffix(labels[0]), "Generating IDs"
 
         label, _ = active
-        queue_hubs: list[str] | None = None
-        if label.startswith("drain-"):
-            # Terminal drain: one batch-wide row; queue sums every
-            # canonical partner's sidecar so the count is remaining
-            # work across the batch, not just the current partner.
-            hub = label[len("drain-") :]
-            display_label = (
-                f"{labels[0]} +{len(labels) - 1} more" if multi else labels[0]
-            )
-            queue_hubs = sorted({lbl.split("+")[0] for lbl in labels})
-        else:
-            hub = label.split("+")[0]
-            display_label = _with_batch_suffix(label)
+        hub = label.split("+")[0]
+        display_label = _with_batch_suffix(label)
         try:
-            phase, _ = get_phase_and_progress(
-                ssm, session, hub, label, queue_hubs=queue_hubs
-            )
+            phase, _ = get_phase_and_progress(ssm, session, hub, label)
         except Exception:
             logging.exception("Failed to get status for %s (%s)", session, label)
             return display_label, "Unknown (error)"

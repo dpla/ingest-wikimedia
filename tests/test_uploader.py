@@ -19,6 +19,7 @@ from ingest_wikimedia.csrf import (
     is_csrf_token_error,
 )
 from tools.uploader import (
+    DriftResolution,
     LARGE_FILE_DIRECT_UPLOAD_LIMIT_BYTES,
     NewFilePageBlocked,
     Uploader,
@@ -134,7 +135,14 @@ def test_per_qid_exception_does_not_stop_remaining_qids(caplog):
 
 
 # --------------------------------------------------------------------------
-# _post_item_orphan_check
+# _post_item_orphan_check — log-only audit under the SHA1-uniqueness redesign
+#
+# The orphan check no longer tags: it never writes to Commons. Every
+# trailing-page orphan it finds (SHA1 match or not, keep-title present or
+# not) is logged and counted under ``Result.ORPHANS_FLAGGED``.
+# ``Result.ORPHANS_TAGGED`` is never incremented anymore. These tests pin
+# that no write occurs and that matched orphans are flagged, while keeping
+# the probe / gap-tolerance / redirect-skip mechanics covered.
 # --------------------------------------------------------------------------
 
 
@@ -162,6 +170,7 @@ def _stub_s3_client_for_assets(assets_by_ordinal: dict[int, str]):
 def _make_file_page_factory(
     existing: dict[str, str],
     redirects: set[str] | None = None,
+    created: list | None = None,
 ):
     """Return a stub for pywikibot.FilePage(site, title).
 
@@ -175,6 +184,11 @@ def _make_file_page_factory(
     `latest_file_info` would resolve through to a target.
 
     Titles not in `existing` are nonexistent (`exists()` → False).
+
+    When `created` is a list, every FilePage mock this factory hands out is
+    appended to it, so a test can assert no write method (``save`` /
+    ``editpage`` / ``touch``) was ever called on any probed page — the
+    log-only audit must never write to Commons.
     """
     redirects = redirects or set()
 
@@ -190,9 +204,20 @@ def _make_file_page_factory(
             page.isRedirectPage.return_value = False
             # Accessing latest_file_info on a nonexistent page would raise,
             # but the code-under-test breaks the loop before reading it.
+        if created is not None:
+            created.append(page)
         return page
 
     return _factory
+
+
+def _assert_no_commons_writes(pages: list) -> None:
+    """The log-only orphan audit must never write to Commons. Assert that
+    none of the probed FilePage mocks had a write method invoked."""
+    for page in pages:
+        page.save.assert_not_called()
+        page.editpage.assert_not_called()
+        page.touch.assert_not_called()
 
 
 def test_orphan_check_no_orphan_when_first_probe_is_missing():
@@ -219,8 +244,9 @@ def test_orphan_check_no_orphan_when_first_probe_is_missing():
     assert tracker.count(Result.ORPHANS_FLAGGED) == 0
 
 
-def test_orphan_check_tags_trailing_orphan_with_matching_sha1():
-    """Item has 3 jpgs, (page 4).jpg exists with SHA1 of (page 3) → tag it."""
+def test_orphan_check_flags_trailing_orphan_with_matching_sha1_without_writing():
+    """Item has 3 jpgs, (page 4).jpg exists with SHA1 of (page 3). Under the
+    log-only redesign this is FLAGGED (not TAGGED) and no write occurs."""
     tracker = Tracker()
     s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
     ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
@@ -229,13 +255,12 @@ def test_orphan_check_tags_trailing_orphan_with_matching_sha1():
     orphan_title = f"{base} (page 4).jpg"
     expected_keep = f"{base} (page 3).jpg"
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        # keep_title must also exist on Commons — otherwise we'd flag, not tag.
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        # keep_title also exists on Commons (the "matched a live kept asset"
+        # branch), but the audit still only flags — it never tags.
         fp.side_effect = _make_file_page_factory(
-            existing={orphan_title: "ccc", expected_keep: "ccc"}
+            existing={orphan_title: "ccc", expected_keep: "ccc"}, created=created
         )
         _post_item_orphan_check(
             site=MagicMock(),
@@ -249,11 +274,9 @@ def test_orphan_check_tags_trailing_orphan_with_matching_sha1():
             dry_run=False,
         )
 
-    assert tracker.count(Result.ORPHANS_TAGGED) == 1
-    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
-    tag_mock.assert_called_once()
-    kwargs = tag_mock.call_args.kwargs
-    assert kwargs["correct_filename"] == expected_keep
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_flags_orphan_with_unknown_sha1():
@@ -264,11 +287,11 @@ def test_orphan_check_flags_orphan_with_unknown_sha1():
     page_labels = {1: "1", 2: "2"}
     orphan_title = "T - DPLA - abcd1234abcd1234abcd1234abcd1234 (page 3).jpg"
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing={orphan_title: "zzz_unknown"})
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(
+            existing={orphan_title: "zzz_unknown"}, created=created
+        )
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -283,7 +306,7 @@ def test_orphan_check_flags_orphan_with_unknown_sha1():
 
     assert tracker.count(Result.ORPHANS_FLAGGED) == 1
     assert tracker.count(Result.ORPHANS_TAGGED) == 0
-    tag_mock.assert_not_called()
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_handles_multiple_trailing_orphans():
@@ -300,11 +323,9 @@ def test_orphan_check_handles_multiple_trailing_orphans():
         f"{base} (page 4).jpg": "aaa",  # matches kept (page 1)
     }
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing=existing, created=created)
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -317,10 +338,11 @@ def test_orphan_check_handles_multiple_trailing_orphans():
             dry_run=False,
         )
 
-    assert tracker.count(Result.ORPHANS_TAGGED) == 2
-    assert tag_mock.call_count == 2
-    keep_targets = {c.kwargs["correct_filename"] for c in tag_mock.call_args_list}
-    assert keep_targets == {f"{base} (page 1).jpg", f"{base} (page 2).jpg"}
+    # Both trailing orphans are flagged; neither is tagged, and nothing is
+    # written to Commons.
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 2
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_single_asset_probes_from_page_1():
@@ -339,11 +361,9 @@ def test_orphan_check_single_asset_probes_from_page_1():
         f"{base} (page 1).jpg": "aaa",  # orphan
     }
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing=existing, created=created)
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -356,12 +376,15 @@ def test_orphan_check_single_asset_probes_from_page_1():
             dry_run=False,
         )
 
-    assert tracker.count(Result.ORPHANS_TAGGED) == 1
-    tag_mock.assert_called_once()
-    assert tag_mock.call_args.kwargs["correct_filename"] == f"{base}.jpg"
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    _assert_no_commons_writes(created)
 
 
-def test_orphan_check_dry_run_does_not_save():
+def test_orphan_check_dry_run_flag_is_inert_and_never_writes():
+    """``dry_run`` is accepted for call-site symmetry but unused — the audit
+    is log-only regardless, so the orphan is still flagged and still no write
+    occurs whether dry_run is True or False."""
     tracker = Tracker()
     s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
     ordinal_exts = {1: ".jpg", 2: ".jpg"}
@@ -372,11 +395,9 @@ def test_orphan_check_dry_run_does_not_save():
         f"{base} (page 3).jpg": "bbb",  # orphan
     }
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing=existing, created=created)
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -389,10 +410,9 @@ def test_orphan_check_dry_run_does_not_save():
             dry_run=True,
         )
 
-    # Dry-run still increments TAGGED (it counts the intent), but does not
-    # actually call tag_as_duplicate.
-    assert tracker.count(Result.ORPHANS_TAGGED) == 1
-    tag_mock.assert_not_called()
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_skips_gap_and_finds_orphan_past_it():
@@ -415,11 +435,9 @@ def test_orphan_check_skips_gap_and_finds_orphan_past_it():
         f"{base} (page 2).jpg": "aaa",  # orphan past the gap
     }
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing=existing, created=created)
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -432,16 +450,18 @@ def test_orphan_check_skips_gap_and_finds_orphan_past_it():
             dry_run=False,
         )
 
-    assert tracker.count(Result.ORPHANS_TAGGED) == 1
-    tag_mock.assert_called_once()
-    assert tag_mock.call_args.kwargs["correct_filename"] == f"{base}.jpg"
+    # Gap tolerance let the probe reach the stranded (page 2) orphan; it is
+    # flagged, not tagged, and nothing is written.
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_flags_when_keep_title_does_not_exist():
     """If the S3 asset whose SHA1 matches the orphan was never actually
     uploaded (e.g. process_file SKIPPED it or aborted on timeout), the
-    keep_title we'd point at doesn't exist on Commons.  Don't create a
-    duplicate tag pointing at a phantom file — flag instead.
+    keep_title we'd point at doesn't exist on Commons. The match is still
+    flagged for audit; still no write.
     """
     tracker = Tracker()
     s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
@@ -452,11 +472,9 @@ def test_orphan_check_flags_when_keep_title_does_not_exist():
     # (e.g. process_file skipped that ordinal).
     existing = {f"{base} (page 3).jpg": "bbb"}
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing=existing, created=created)
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -471,45 +489,7 @@ def test_orphan_check_flags_when_keep_title_does_not_exist():
 
     assert tracker.count(Result.ORPHANS_TAGGED) == 0
     assert tracker.count(Result.ORPHANS_FLAGGED) == 1
-    tag_mock.assert_not_called()
-
-
-def test_orphan_check_flags_when_tag_save_fails():
-    """tag_as_duplicate raising shouldn't leave the orphan uncounted —
-    record it as FLAGGED so the run summary captures follow-up work."""
-    tracker = Tracker()
-    s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb"})
-    ordinal_exts = {1: ".jpg", 2: ".jpg"}
-    page_labels = {1: "1", 2: "2"}
-    base = "Item - DPLA - abcd1234abcd1234abcd1234abcd1234"
-    existing = {
-        f"{base} (page 2).jpg": "bbb",  # keep target exists
-        f"{base} (page 3).jpg": "bbb",  # orphan
-    }
-
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch(
-            "tools.uploader.tag_as_duplicate",
-            side_effect=RuntimeError("simulated save failure"),
-        ) as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
-        _post_item_orphan_check(
-            site=MagicMock(),
-            s3_client=s3_client,
-            tracker=tracker,
-            dpla_id="abcd1234abcd1234abcd1234abcd1234",
-            item_title="Item",
-            partner="nara",
-            ordinal_exts=ordinal_exts,
-            page_labels=page_labels,
-            dry_run=False,
-        )
-
-    assert tag_mock.called  # we did try
-    assert tracker.count(Result.ORPHANS_TAGGED) == 0
-    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_uses_declared_count_when_sha1_metadata_missing():
@@ -552,11 +532,9 @@ def test_orphan_check_uses_declared_count_when_sha1_metadata_missing():
     # No (page 4) → nothing to tag overall.
     existing = {f"{base} (page 3).jpg": "ccc"}
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        fp.side_effect = _make_file_page_factory(existing=existing)
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        fp.side_effect = _make_file_page_factory(existing=existing, created=created)
         _post_item_orphan_check(
             site=MagicMock(),
             s3_client=s3_client,
@@ -571,7 +549,7 @@ def test_orphan_check_uses_declared_count_when_sha1_metadata_missing():
 
     assert tracker.count(Result.ORPHANS_TAGGED) == 0
     assert tracker.count(Result.ORPHANS_FLAGGED) == 0
-    tag_mock.assert_not_called()
+    _assert_no_commons_writes(created)
     # And the FilePage probe must not have hit (page 3) — it would have
     # if we used the SHA1-filtered count of 2 instead of the declared 3.
     probed_titles = [call.args[1] for call in fp.call_args_list]
@@ -600,19 +578,14 @@ def test_orphan_check_skips_extensions_with_no_assets():
 
 
 def test_orphan_check_skips_redirect_pages():
-    """Regression: a (page N+1) title that is already a #REDIRECT to a kept
-    asset must NOT be tagged as a duplicate.
+    """A (page N+1) title that is already a #REDIRECT to a kept asset must
+    NOT be flagged.
 
-    The bug: pywikibot's `latest_file_info.sha1` on a redirect *follows*
-    the redirect and returns the target file's sha1, so the orphan check's
-    `orphan_sha1 in sha1_to_kept` lookup always matched, and the bot tagged
-    the redirect page with a `{{Duplicate}}` template — producing:
-
-        {{Duplicate|<target>|Trailing-page orphan: ...}}
-        #REDIRECT [[<target>]]
-
-    which is meaningless (the redirect already does what {{Duplicate}}
-    flags) and pollutes the page with a stray template above the redirect.
+    pywikibot's `latest_file_info.sha1` on a redirect *follows* the redirect
+    and returns the target file's sha1, so a naive `orphan_sha1 in
+    sha1_to_kept` lookup would always match. The audit skips redirects
+    entirely — they already point at the correct target — so nothing is
+    flagged and nothing is written.
 
     Caught from commit 1219698039 on Commons:
     File:Drift Sight, Italian, Crocco - DPLA - 023de366f0c65bec19d5b61b7e3b42d6 (page 4).jpg
@@ -625,16 +598,15 @@ def test_orphan_check_skips_redirect_pages():
     redirect_title = f"{base} (page 4).jpg"
     keep_title = f"{base} (page 3).jpg"
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
         # (page 4) exists, is a redirect, and pywikibot's latest_file_info
         # would (mis)report the target's sha1 ("ccc"). (page 3) exists as a
         # real file with the same sha1.
         fp.side_effect = _make_file_page_factory(
             existing={redirect_title: "ccc", keep_title: "ccc"},
             redirects={redirect_title},
+            created=created,
         )
         _post_item_orphan_check(
             site=MagicMock(),
@@ -648,17 +620,16 @@ def test_orphan_check_skips_redirect_pages():
             dry_run=False,
         )
 
-    # The redirect must NOT have been tagged.
-    tag_mock.assert_not_called()
+    # A redirect is already doing what we'd flag it for; it is neither
+    # flagged nor written.
     assert tracker.count(Result.ORPHANS_TAGGED) == 0
-    # Nor was it flagged for follow-up — a redirect is already doing what
-    # we'd flag it for; no manual review needed.
     assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+    _assert_no_commons_writes(created)
 
 
 def test_orphan_check_skips_redirect_but_continues_probing():
     """A redirect at (page N+1) doesn't stop the probe — if (page N+2) is
-    a real orphan file, it should still get tagged."""
+    a real orphan file, it should still be flagged (not the redirect)."""
     tracker = Tracker()
     s3_client = _stub_s3_client_for_assets({1: "aaa", 2: "bbb", 3: "ccc"})
     ordinal_exts = {1: ".jpg", 2: ".jpg", 3: ".jpg"}
@@ -668,12 +639,10 @@ def test_orphan_check_skips_redirect_but_continues_probing():
     real_orphan_title = f"{base} (page 5).jpg"
     keep_title = f"{base} (page 3).jpg"
 
-    with (
-        patch("tools.uploader.pywikibot.FilePage") as fp,
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-    ):
-        # (page 4) is a redirect (will be skipped).
-        # (page 5) is a real file with the matching sha1 — should be tagged.
+    created: list = []
+    with patch("tools.uploader.pywikibot.FilePage") as fp:
+        # (page 4) is a redirect (skipped, not flagged).
+        # (page 5) is a real file with the matching sha1 — should be flagged.
         # (page 3) exists as the kept target.
         fp.side_effect = _make_file_page_factory(
             existing={
@@ -682,6 +651,7 @@ def test_orphan_check_skips_redirect_but_continues_probing():
                 keep_title: "ccc",
             },
             redirects={redirect_title},
+            created=created,
         )
         _post_item_orphan_check(
             site=MagicMock(),
@@ -695,21 +665,25 @@ def test_orphan_check_skips_redirect_but_continues_probing():
             dry_run=False,
         )
 
-    # Exactly one orphan should be tagged (the real one at page 5), and it
-    # must point at the kept title.
-    assert tag_mock.call_count == 1
-    kwargs = tag_mock.call_args.kwargs
-    assert kwargs["correct_filename"] == keep_title
-    # The first positional arg is the candidate FilePage; verify it's the
-    # real orphan, not the redirect.
-    candidate_arg = tag_mock.call_args.args[1]
-    assert candidate_arg.title() == real_orphan_title
-    assert tracker.count(Result.ORPHANS_TAGGED) == 1
-    assert tracker.count(Result.ORPHANS_FLAGGED) == 0
+    # Exactly one orphan flagged: the real file at (page 5). The redirect at
+    # (page 4) was skipped (proving the probe continued past it), and nothing
+    # was written.
+    assert tracker.count(Result.ORPHANS_FLAGGED) == 1
+    assert tracker.count(Result.ORPHANS_TAGGED) == 0
+    _assert_no_commons_writes(created)
+    probed_titles = [call.args[1] for call in fp.call_args_list]
+    assert redirect_title in probed_titles
+    assert real_orphan_title in probed_titles
 
 
 # --------------------------------------------------------------------------
-# Uploader._resolve_hash_drift — Case 2 skips tag when title is in asset list
+# Uploader._resolve_hash_drift — SHA1-uniqueness resolution outcomes.
+#
+# Our SHA1 is already on Commons, so no branch uploads a second copy. The
+# method returns exactly one of MOVED / MERGE_AND_REDIRECT / HAND_FIX /
+# ALREADY_CORRECT. ``DriftResolution`` subclasses ``str, Enum`` so the enum
+# members compare equal to their string values (``DriftResolution.MOVED ==
+# "moved"``); the assertions below use the string values for brevity.
 # --------------------------------------------------------------------------
 
 
@@ -736,20 +710,19 @@ def _drift_existing_file(title: str) -> MagicMock:
     return f
 
 
-def test_resolve_hash_drift_case2_skips_tag_when_existing_in_expected_titles():
-    """The bug fix: when existing file's title is one of THIS item's other
-    current asset positions, it's a sibling, not an orphan. The duplicate tag
-    would be wasted (the sibling's content will be overwritten by its own
-    ordinal in this same run), so route to leave_others_alone."""
+def test_resolve_hash_drift_within_item_sibling_slot_merges_and_redirects():
+    """Our SHA1 lives at one of THIS item's own current asset positions and
+    the intended title holds a real (different) file → within-item source
+    duplication. No second upload: centralize on the sibling and redirect."""
     uploader = _build_uploader_with_dpla()
-    # Existing file: page N+1 of the SAME item, will be processed soon.
+    # Existing file: page 5 of the SAME item, one of this run's asset slots.
     existing_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 5).jpg"
     intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 4).jpg"
     expected_titles = {
         f"Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page {n}).jpg"
         for n in range(1, 10)
     }
-    # intended_page: exists with different content (Case 2 territory).
+    # intended_page: exists as a real (non-redirect) file with other content.
     intended_page = MagicMock()
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
@@ -762,290 +735,56 @@ def test_resolve_hash_drift_case2_skips_tag_when_existing_in_expected_titles():
             ordinal=4,
             expected_item_titles=expected_titles,
         )
-    assert action == "leave_others_alone"
+    assert action == "merge_and_redirect"
 
 
-def test_resolve_hash_drift_case2_still_tags_when_existing_is_true_orphan():
-    """When the existing file's title is NOT in the current asset list (i.e.
-    it's a trailing orphan beyond what the source authorizes), the tag is
-    still correct and Case 2 should fire as before."""
+def test_resolve_hash_drift_intended_title_occupied_by_different_file_hand_fix():
+    """Our SHA1 is at a wrong title and the intended title is occupied by a
+    DIFFERENT real file that is NOT one of this item's asset slots — the bot
+    cannot safely rename or overwrite, so hand off to a human."""
     uploader = _build_uploader_with_dpla()
-    # Existing file at (page 99) — way beyond our asset list of pages 1..9.
-    existing_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 99).jpg"
-    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 4).jpg"
-    expected_titles = {
-        f"Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page {n}).jpg"
-        for n in range(1, 10)
-    }
+    # Same-item drift (same DPLA id), so the cross-item branch is skipped and
+    # we reach the occupied-intended-title logic.
+    dpla_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    existing_title = f"Item - DPLA - {dpla_id} (page 99).jpg"
+    intended_title = f"Item - DPLA - {dpla_id} (page 4).jpg"
+    expected_titles = {f"Item - DPLA - {dpla_id} (page {n}).jpg" for n in range(1, 10)}
     intended_page = MagicMock()
     intended_page.exists.return_value = True
     intended_page.isRedirectPage.return_value = False
     intended_page.title.return_value = intended_title
-    # A `- DPLA -` orphan of our own item was uploaded by our bot, so
-    # provenance resolves to a DPLA-adjacent bot → UPLOAD_AND_TAG.
-    with (
-        patch("tools.uploader.get_page", return_value=intended_page),
-        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
-    ):
-        action = uploader._resolve_hash_drift(
-            existing_file=_drift_existing_file(existing_title),
-            page_title=intended_title,
-            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ordinal=4,
-            expected_item_titles=expected_titles,
-        )
-    assert action == "upload_and_tag"
-
-
-def test_resolve_hash_drift_case2_tags_when_expected_titles_is_none():
-    """Backward-compat: callers that don't pass expected_item_titles see
-    Case 2 firing as before (no behavior change in that path)."""
-    uploader = _build_uploader_with_dpla()
-    existing_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 5).jpg"
-    intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 4).jpg"
-    intended_page = MagicMock()
-    intended_page.exists.return_value = True
-    intended_page.isRedirectPage.return_value = False
-    intended_page.title.return_value = intended_title
-    with (
-        patch("tools.uploader.get_page", return_value=intended_page),
-        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
-    ):
-        action = uploader._resolve_hash_drift(
-            existing_file=_drift_existing_file(existing_title),
-            page_title=intended_title,
-            dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ordinal=4,
-        )
-    assert action == "upload_and_tag"
-
-
-def test_resolve_hash_drift_case2_defers_when_target_is_community_authored():
-    """New Case-2 sub-classification: when the drift target's FIRST
-    upload was by a real editor (not a DPLA-adjacent bot), return
-    UPLOAD_AND_SELF_TAG_DEFER instead of tagging the community file
-    for admin deletion. Guards against the Bartlett incident."""
-    uploader = _build_uploader_with_dpla()
-    existing_title = "Angus F. Bartlett.jpg"  # no DPLA- suffix → community-titled
-    intended_title = "Angus F. Bartlett - DPLA - abc.jpg"
-    intended_page = MagicMock()
-    intended_page.exists.return_value = True
-    intended_page.isRedirectPage.return_value = False
-    intended_page.title.return_value = intended_title
-    # Force first_uploader to report a real editor.
-    with (
-        patch("tools.uploader.get_page", return_value=intended_page),
-        patch("tools.uploader.first_uploader", return_value="Fæ"),
-    ):
-        action = uploader._resolve_hash_drift(
-            existing_file=_drift_existing_file(existing_title),
-            page_title=intended_title,
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    assert action == "upload_and_self_tag_defer"
-
-
-def test_resolve_hash_drift_case2_community_first_uploader_beats_dpla_shaped_title():
-    """Provenance is decided by ``first_uploader``, NOT the filename. A
-    file whose title carries a ``- DPLA -`` suffix but whose FIRST
-    uploader is a community editor (e.g. an editor renamed it into that
-    form) must still route to the non-destructive self-tag/defer path —
-    the filename must never force the destructive tag-for-deletion path.
-    """
-    uploader = _build_uploader_with_dpla()
-    dpla_id = "abc" + "a" * 29
-    # DPLA-suffixed title (same item id), but a community editor is the
-    # first uploader — e.g. they renamed their file into the DPLA form.
-    existing_title = f"Angus - DPLA - {dpla_id} (page 9).jpg"
-    intended_title = f"Angus - DPLA - {dpla_id}.jpg"
-    intended_page = MagicMock()
-    intended_page.exists.return_value = True
-    intended_page.isRedirectPage.return_value = False
-    intended_page.title.return_value = intended_title
-    with (
-        patch("tools.uploader.get_page", return_value=intended_page),
-        patch("tools.uploader.first_uploader", return_value="Fæ"),
-    ):
+    with patch("tools.uploader.get_page", return_value=intended_page):
         action = uploader._resolve_hash_drift(
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
             dpla_id=dpla_id,
-            ordinal=1,
+            ordinal=4,
+            expected_item_titles=expected_titles,
         )
-    assert action == "upload_and_self_tag_defer"
+    assert action == "hand_fix"
 
 
-def test_resolve_hash_drift_case2_stays_upload_and_tag_when_target_is_dpla_bot_upload():
-    """A stranded DPLA-bot upload (e.g. pre-normalization title) has a
-    DPLA-adjacent bot as its first uploader — must stay on the legacy
-    UPLOAD_AND_TAG path, not divert to the community-defer flow. Same
-    fixture as the community test, only the first_uploader mock flips."""
+def test_resolve_hash_drift_intended_redirect_elsewhere_hand_fix():
+    """Intended title is a redirect to a THIRD file (not the location of our
+    SHA1) — a rename would collide with that redirect; route to hand-fix."""
     uploader = _build_uploader_with_dpla()
-    existing_title = "Some Old Title.jpg"  # no DPLA suffix, but bot-authored
-    intended_title = "Some Old Title - DPLA - abc.jpg"
-    intended_page = MagicMock()
-    intended_page.exists.return_value = True
-    intended_page.isRedirectPage.return_value = False
-    intended_page.title.return_value = intended_title
-    with (
-        patch("tools.uploader.get_page", return_value=intended_page),
-        patch("tools.uploader.first_uploader", return_value="DPLA bot"),
-    ):
+    dpla_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    existing_title = f"Item - DPLA - {dpla_id} (page 5).jpg"
+    intended_title = f"Item - DPLA - {dpla_id} (page 4).jpg"
+    intended_page = _make_intended_page(
+        intended_title,
+        exists=True,
+        is_redirect=True,
+        redirect_target="Some Other File.jpg",
+    )
+    with patch("tools.uploader.get_page", return_value=intended_page):
         action = uploader._resolve_hash_drift(
             existing_file=_drift_existing_file(existing_title),
             page_title=intended_title,
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
+            dpla_id=dpla_id,
+            ordinal=4,
         )
-    assert action == "upload_and_tag"
-
-
-def test_resolve_hash_drift_case2_routes_unknown_uploader_to_self_tag_defer():
-    """When ``first_uploader`` can't identify the original uploader (API
-    failure, empty history), route through the non-destructive
-    ``UPLOAD_AND_SELF_TAG_DEFER`` path rather than the destructive
-    ``UPLOAD_AND_TAG`` path. An unknown provenance doesn't prove
-    bot-authorship, so the safer default is to tag OUR own file and let
-    the drain phase resolve, rather than requesting admin deletion of a
-    possibly-community upload."""
-    uploader = _build_uploader_with_dpla()
-    existing_title = "Some File.jpg"
-    intended_title = "Some File - DPLA - abc.jpg"
-    intended_page = MagicMock()
-    intended_page.exists.return_value = True
-    intended_page.isRedirectPage.return_value = False
-    intended_page.title.return_value = intended_title
-    with (
-        patch("tools.uploader.get_page", return_value=intended_page),
-        patch("tools.uploader.first_uploader", return_value=None),
-    ):
-        action = uploader._resolve_hash_drift(
-            existing_file=_drift_existing_file(existing_title),
-            page_title=intended_title,
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    assert action == "upload_and_self_tag_defer"
-
-
-def test_tag_self_and_defer_records_key_and_tags(tmp_path, monkeypatch):
-    """``_tag_self_and_defer`` records the (dpla_id, ordinal) in the
-    await set and tags OUR canonical file ``{{Duplicate|<community>}}``.
-    The set entry is the marker the drain re-runs on."""
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    uploader = _build_uploader_with_dpla()
-    with (
-        patch("tools.uploader.get_page") as get_page,
-        patch("tools.uploader.tag_as_duplicate") as tag,
-    ):
-        get_page.return_value = MagicMock(text="")
-        uploader._tag_self_and_defer(
-            partner="heartland",
-            dpla_canonical_title="Foo - DPLA - abc.jpg",
-            community_title="Foo.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    tag.assert_called_once()
-    _, kwargs = tag.call_args
-    assert kwargs.get("correct_filename") == "Foo.jpg"
-    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
-    # Other partners untouched.
-    assert await_target_free_sidecar.awaiting_dpla_ids("bpl") == []
-
-
-def test_tag_self_and_defer_records_key_before_tagging(tmp_path, monkeypatch):
-    """Order: the await key is recorded BEFORE the (remote, failure-prone)
-    tag write, so a tag that lands is always backed by a queued marker. A
-    tag failure is swallowed (best-effort) and the key remains for a
-    re-run / reconcile to handle."""
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    uploader = _build_uploader_with_dpla()
-
-    call_order: list[str] = []
-    real_add_key = await_target_free_sidecar.add_key
-
-    def add_key_stub(partner, dpla_id, ordinal):
-        call_order.append("add_key")
-        return real_add_key(partner, dpla_id, ordinal)
-
-    def tag_stub(*_a, **_kw):
-        call_order.append("tag_as_duplicate")
-        raise RuntimeError("simulated Commons write failure")
-
-    with (
-        patch("tools.uploader.get_page") as get_page,
-        patch(
-            "tools.uploader.await_target_free_sidecar.add_key",
-            side_effect=add_key_stub,
-        ),
-        patch("tools.uploader.tag_as_duplicate", side_effect=tag_stub),
-    ):
-        get_page.return_value = MagicMock(text="")
-        # Tag failure must NOT propagate — the upload already satisfied
-        # the invariant; the deferred rename is a follow-up.
-        uploader._tag_self_and_defer(
-            partner="heartland",
-            dpla_canonical_title="Foo - DPLA - abc.jpg",
-            community_title="Foo.jpg",
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    assert call_order == ["add_key", "tag_as_duplicate"], (
-        f"await key must be recorded before the tag write; got {call_order!r}"
-    )
-    # Key survives the tag-side crash.
-    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
-
-
-def test_reconcile_awaiting_skip_keeps_key_while_still_tagged(tmp_path, monkeypatch):
-    """On the already-exists skip path, an awaiting ordinal whose
-    canonical still carries {{Duplicate}} is kept queued (admin hasn't
-    acted). No write to Commons."""
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    await_target_free_sidecar.add_key("heartland", "abc" + "a" * 29, 1)
-    uploader = _build_uploader_with_dpla()
-    existing = MagicMock()
-    existing.text = "{{Duplicate|Foo.jpg}}\n== filedesc ==\n"
-    existing.title.return_value = "File:Foo - DPLA - abc.jpg"
-    uploader._reconcile_awaiting_skip(
-        partner="heartland",
-        existing_file=existing,
-        dpla_id="abc" + "a" * 29,
-        ordinal=1,
-    )
-    assert await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
-
-
-def test_reconcile_awaiting_skip_drops_key_when_tag_removed(tmp_path, monkeypatch):
-    """When the canonical no longer carries {{Duplicate}} (an editor
-    declined the dedup without deleting the file), the await key is
-    dropped — the two files coexist (corollary 1). Read-only: no tag is
-    re-emitted, so we never edit-war with the editor."""
-    from ingest_wikimedia import await_target_free_sidecar, drain_sidecar
-
-    monkeypatch.setattr(drain_sidecar, "INGEST_WIKI_ROOT", tmp_path, raising=False)
-    await_target_free_sidecar.add_key("heartland", "abc" + "a" * 29, 1)
-    uploader = _build_uploader_with_dpla()
-    existing = MagicMock()
-    existing.text = "== filedesc ==\nno duplicate tag here\n"
-    existing.title.return_value = "File:Foo - DPLA - abc.jpg"
-    with patch("tools.uploader.tag_as_duplicate") as tag:
-        uploader._reconcile_awaiting_skip(
-            partner="heartland",
-            existing_file=existing,
-            dpla_id="abc" + "a" * 29,
-            ordinal=1,
-        )
-    tag.assert_not_called()
-    assert not await_target_free_sidecar.has_key("heartland", "abc" + "a" * 29, 1)
+    assert action == "hand_fix"
 
 
 def _build_uploader_with_dpla_raising(exc: Exception) -> "object":
@@ -1082,21 +821,16 @@ def _make_http_404_error() -> Exception:
 
 
 def test_resolve_hash_drift_404_on_colliding_id_falls_through_to_migration():
-    """REGRESSION: when the colliding file's DPLA ID returns 404, the
-    bot used to silently fall back to ``leave_others_alone`` — producing a
-    duplicate on Commons beside the orphaned older title. The 404 is
-    in fact the strongest possible signal that the existing file is
-    an orphan from a removed DPLA item; we now legitimately own this
-    content under the new ID and should migrate (move/tag), not
-    duplicate. This is the bug that flooded the Indiana Riley Old
-    Home Society session with duplicates on 2026-06-15."""
+    """When the colliding file's DPLA ID returns 404, the file is an orphan
+    from a removed DPLA item. Fall through to the intended-title logic; with
+    an empty intended title that means a move → MOVED. (The 404 must NOT be
+    treated as a live cross-item collision — that would MERGE_AND_REDIRECT
+    onto a dead item's file.)"""
     uploader = _build_uploader_with_dpla_raising(_make_http_404_error())
     existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
     intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
-    # Case 3 setup: nothing at the intended title → simple move. We
-    # patch _move_to_correct_title so the test doesn't drive a real
-    # pywikibot move; the assertion is just that we don't bail out
-    # to ``leave_others_alone``.
+    # Nothing at the intended title → simple move. Patch _move_to_correct_title
+    # so the test doesn't drive a real pywikibot move.
     intended_page = MagicMock()
     intended_page.exists.return_value = False
     with (
@@ -1110,18 +844,16 @@ def test_resolve_hash_drift_404_on_colliding_id_falls_through_to_migration():
             ordinal=2,
         )
     assert action == "moved", (
-        "404 on the colliding DPLA ID is the rename signal — the orphan "
-        "must be migrated to our new title, not left in place beside a "
-        "duplicate upload."
+        "404 on the colliding DPLA ID is the orphan signal — the file must "
+        "be migrated to our title, not merged onto a dead item's file."
     )
 
 
-def test_resolve_hash_drift_non_404_exception_stays_on_leave_others_alone():
-    """Conservative fallback: non-404 exceptions (network timeout, 5xx,
-    JSON parse error, etc.) don't carry the same "old ID is gone"
-    meaning a 404 does. Keep these on the existing ``leave_others_alone``
-    path so a transient DPLA API blip doesn't trigger a destructive
-    move on a file that still has a valid sibling item."""
+def test_resolve_hash_drift_non_404_exception_routes_to_hand_fix():
+    """Conservative fallback: a non-404 exception verifying the colliding
+    DPLA item (network timeout, JSON parse error, etc.) leaves the collision
+    unverified — route to HAND_FIX rather than guessing. Never act on a
+    transient DPLA API blip."""
 
     class FlakyConnError(Exception):
         pass
@@ -1129,20 +861,21 @@ def test_resolve_hash_drift_non_404_exception_stays_on_leave_others_alone():
     uploader = _build_uploader_with_dpla_raising(FlakyConnError("connection reset"))
     existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
     intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
-    # No need to set up intended_page — leave_others_alone returns before get_page.
+    # HAND_FIX returns before get_page is consulted.
     action = uploader._resolve_hash_drift(
         existing_file=_drift_existing_file(existing_title),
         page_title=intended_title,
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
     )
-    assert action == "leave_others_alone"
+    assert action == "hand_fix"
 
 
-def test_resolve_hash_drift_5xx_response_stays_on_leave_others_alone():
-    """Sister case to the 404 test: a 5xx-shaped HTTPError must NOT
-    take the 404 branch. Pin the exact status check so a refactor that
-    broadens the gate (e.g. to ``status >= 400``) is caught."""
+def test_resolve_hash_drift_5xx_response_routes_to_hand_fix():
+    """Sister case to the 404 test: a 5xx-shaped HTTPError must NOT take the
+    404 orphan branch. Pin the exact status check so a refactor that broadens
+    the gate (e.g. to ``status >= 400``) is caught — a 5xx is unverified, so
+    HAND_FIX."""
     err = Exception("503 Service Unavailable")
     err.response = MagicMock()  # type: ignore[attr-defined]
     err.response.status_code = 503
@@ -1156,14 +889,14 @@ def test_resolve_hash_drift_5xx_response_stays_on_leave_others_alone():
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
     )
-    assert action == "leave_others_alone"
+    assert action == "hand_fix"
 
 
-def test_resolve_hash_drift_valid_cross_item_collision_leaves_others_alone():
-    """Existing positive case (no regression): when the colliding DPLA
-    item IS still valid, the cross-item-collision branch returns
-    ``leave_others_alone`` — our hash gets its own title and we leave the
-    other valid item's file untouched."""
+def test_resolve_hash_drift_valid_cross_item_collision_merges_and_redirects():
+    """Cross-item source duplication: our SHA1 is a DIFFERENT, still-live DPLA
+    item's canonical content. Under the SHA1-uniqueness constraint we don't
+    upload a second copy — merge our SDC onto their file and redirect our
+    intended title. (live other DPLA id)."""
     uploader = _build_uploader_with_dpla(other_item_exists=True)
     existing_title = "Item - DPLA - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (page 2).jpg"
     intended_title = "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (page 2).jpg"
@@ -1173,7 +906,7 @@ def test_resolve_hash_drift_valid_cross_item_collision_leaves_others_alone():
         dpla_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ordinal=2,
     )
-    assert action == "leave_others_alone"
+    assert action == "merge_and_redirect"
 
 
 # --------------------------------------------------------------------------
@@ -1203,7 +936,7 @@ def test_chunk_size_file_exists_small_returns_direct():
 
 
 def test_chunk_size_force_ignore_warnings_small_returns_direct():
-    """Hash-drift leave_others_alone on a small file → direct upload (warning bypass)."""
+    """force_ignore_warnings on a small file → direct upload (warning bypass)."""
     assert select_upload_chunk_size(
         file_exists=False,
         force_ignore_warnings=True,
@@ -1223,7 +956,7 @@ def test_chunk_size_large_file_exists_forces_chunked():
 
 
 def test_chunk_size_large_force_ignore_warnings_forces_chunked():
-    """Hash-drift leave_others_alone on a 211 MB file (the NARA incident): chunked,
+    """force_ignore_warnings on a 211 MB file (the NARA incident): chunked,
     and prefers_direct still True so the caller logs the size override."""
     nara_incident_size = 221_583_206  # exact bytes of 2_7d3114...
     assert select_upload_chunk_size(
@@ -1249,17 +982,16 @@ def test_chunk_size_threshold_under_wikimedia_gateway_limit():
 
 
 # --------------------------------------------------------------------------
-# is_dup_sha1_sibling_at_expected_title — the leave_others_alone short-circuit gate
+# is_dup_sha1_sibling_at_expected_title — the within-item MERGE_AND_REDIRECT gate
 #
 # Pin the contract that prevents the orphan-duplicate bug observed on item
 # fe6f59a29fddf8e3483e91ad805bf039 (Zuni in costume). NARA's mediaMaster
 # listed the same TIF URL at two positions, so duplicate_source_sha1s
-# contained that SHA1. The pre-fix code unconditionally treated any
-# existing file with a matching SHA1 as a sibling, leaving the 2011 legacy
-# NARA-bot title in place and uploading (page 1).tiff and (page 2).tiff
-# beside it — three Commons files with the same SHA1. The helper must
-# return True only when the existing title is one of THIS item's own
-# expected current titles.
+# contained that SHA1. The helper must return True only when the existing
+# file lives at one of THIS item's own expected current titles (routing to
+# the within-item MERGE_AND_REDIRECT short-circuit in process_file); a legacy
+# 2011 NARA-bot title with the same SHA1 must return False so the caller
+# falls through to normal drift handling instead.
 # --------------------------------------------------------------------------
 
 _SHA1 = "76f6fe0a766e4a664b7d99b9e6c0fb8594bac083"
@@ -1577,6 +1309,102 @@ def test_track_ordinal_skip_bumps_both_legacy_and_granular_counters():
 # ---------------------------------------------------------------------------
 
 
+def test_is_community_file_true_when_non_shaped_and_non_bot():
+    """Non-DPLA/NARA-shaped title AND a non-bot uploader → community (both
+    signals non-ours), so hands-off."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    fp = _drift_existing_file("Grandma's quilt, summer 1932.jpg")
+    with patch.object(um, "first_uploader", return_value="SomeVolunteer"):
+        assert up._is_community_file(fp) is True
+
+
+def test_is_community_file_false_for_dpla_or_nara_shaped_title():
+    """A DPLA/NARA-shaped title is ours regardless of uploader — covers the
+    'manual DPLA upload from a personal account' edge case."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    with patch.object(um, "first_uploader", return_value="APersonalAccount"):
+        assert (
+            up._is_community_file(
+                _drift_existing_file(
+                    "Item - DPLA - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg"
+                )
+            )
+            is False
+        )
+        assert (
+            up._is_community_file(_drift_existing_file('"Photo." - NARA - 12345.tif'))
+            is False
+        )
+
+
+def test_is_community_file_false_for_non_shaped_but_bot_uploaded():
+    """A bot upload with a malformed (non-shaped) title is still ours to
+    fix — covers the 'bot uploaded a malformed title' edge case."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    fp = _drift_existing_file("malformed title, no dpla marker.jpg")
+    # Full canonical DPLA_BOT_ACCOUNTS set (incl. Flickr upload bot) plus an
+    # underscore variant to exercise _normalize_account (DPLA_bot == DPLA bot).
+    for bot in (
+        "DPLA bot",
+        "US National Archives bot",
+        "Flickr upload bot",
+        "DPLA_bot",
+    ):
+        with patch.object(um, "first_uploader", return_value=bot):
+            assert up._is_community_file(fp) is False, bot
+
+
+def test_is_community_file_true_when_uploader_unreadable_and_non_shaped():
+    """Unreadable file history + non-shaped title → err toward community
+    (hands-off) rather than risk touching a non-ours file."""
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    fp = _drift_existing_file("mystery-scan.jpg")
+    with patch.object(um, "first_uploader", side_effect=RuntimeError("no history")):
+        assert up._is_community_file(fp) is True
+
+
+def test_record_community_hand_fix_and_skip_uses_distinct_reason():
+    """The community hand-fix records the distinct ``community_file`` reason,
+    counts one HAND_FIX, returns ORDINAL_HAND_FIX, and never uploads."""
+    from ingest_wikimedia.tracker import Result, Tracker
+    from tools import uploader as um
+
+    up = _uploader_for_helper_tests()
+    up.tracker = Tracker()
+    community = _drift_existing_file("Grandma's quilt.jpg")
+    community.latest_file_info.sha1 = "deadbeef"
+    recorded = {}
+    with (
+        patch.object(um, "first_uploader", return_value="Volunteer"),
+        patch.object(
+            um.hand_fix_sidecar,
+            "record_hand_fix",
+            side_effect=lambda *a, **kw: recorded.update(kw),
+        ),
+    ):
+        result = up._record_community_hand_fix_and_skip(
+            partner="ohio",
+            dpla_id="abc",
+            ordinal=1,
+            our_sha1="deadbeef",
+            intended_title="Foo - DPLA - abc.jpg",
+            community_file=community,
+        )
+    assert result["status"] == um.ORDINAL_HAND_FIX
+    assert result["title"] is None
+    assert recorded["reason"] == "community_file"
+    assert recorded["community_uploader"] == "Volunteer"
+    assert up.tracker.count(Result.UPLOAD_HAND_FIX) == 1
+
+
 def _uploader_for_helper_tests():
     """Build an ``Uploader`` instance bypassing ``__init__`` for direct
     invocation of internal helpers — sufficient when the helper only
@@ -1815,9 +1643,6 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
         # Simulate the pool having populated the parent's newly_created
         # set (each worker's CategoryEnsurer union).
         kwargs["newly_created"].add("Q_worker_created")
-        # And having accounted for one deferred item so main()'s sidecar
-        # merge path also gets exercised.
-        kwargs["deferred"]["deferred_id"] = 2
 
     fake_ctx = MagicMock()
     fake_ctx.get_tracker.return_value = Tracker()
@@ -1846,7 +1671,6 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
         patch.object(up, "load_ids", return_value=["id_a", "id_b", "id_c"]),
         patch.object(up.Uploader, "process_item", side_effect=track_process_item),
         patch.object(up, "_run_upload_pool", side_effect=fake_run_pool),
-        patch.object(up.drain_sidecar, "merge_sidecar", return_value=["deferred_id"]),
     ):
         runner = CliRunner()
         with runner.isolated_filesystem():
@@ -1863,9 +1687,11 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
     assert kwargs["workers"] == 3
     assert kwargs["dpla_ids"] == ["id_a", "id_b", "id_c"]
     assert kwargs["partner"] == "nara"
-    assert kwargs["deferred"] == {"deferred_id": 2}, (
-        "pool must have received the parent-owned deferred dict so the "
-        "post-loop drain-sidecar merge sees deferred items from every worker"
+    # The deferred-count path is gone (the drain sidecar was removed); the
+    # pool signature no longer carries a ``deferred`` dict.
+    assert "deferred" not in kwargs, (
+        "_run_upload_pool must no longer receive a deferred dict "
+        "(drain sidecar removed in the SHA1-uniqueness redesign)"
     )
     assert kwargs["newly_created"] == {"Q_worker_created"}, (
         "pool must have received the parent-owned newly_created set "
@@ -1878,268 +1704,6 @@ def test_main_dispatches_to_pool_when_workers_gt_one():
         "worker-created institution QIDs must be folded back into the "
         "parent ensurer so _post_upload_touch_new_institutions sees them"
     )
-
-
-# ---------------------------------------------------------------------------
-# _tag_drift_duplicate — rescue + tag combined operation
-#
-# Case 2 hash-drift (``upload_and_tag``) is the only title-correction path
-# where the source page is destroyed, so the bot must explicitly preserve
-# community-contributed metadata before queuing it for deletion.
-# _tag_drift_duplicate does both: rescue the old page's content into the new
-# (correct-title) file — outside-template content via rescue_wikitext's
-# node-swap, inside-template community params via import_cross_page_community_sdc
-# — then tag the old one. The steps are independently best-effort so a rescue
-# failure does not block the tag.
-
-
-_NEW_WIKI_MARKUP = "{{DPLA metadata}}\n"
-_DPLA_ID = "abcdef0123456789abcdef0123456789"
-
-
-def _drift_uploader_with_pages(
-    old_text: str,
-    *,
-    old_exists: bool = True,
-    save_raises: Exception | None = None,
-):
-    """Build ``(uploader, old_page, new_page)`` for direct invocation of
-    ``_tag_drift_duplicate``. The new page is a write-only sink — we
-    just upload + save into it; nothing reads its state.
-
-    Tag-step failures are injected via ``patch("tools.uploader.tag_as_duplicate")``
-    at the call site, not here — the helper only needs to control the
-    rescue-side mocks."""
-    from tools.uploader import Uploader
-
-    uploader = Uploader.__new__(Uploader)
-    uploader.site = MagicMock(name="site")
-    # The tag-duplicate rescue resolves the destination pageid via this helper
-    # before the SDC import; give it a real id so the import path is exercised.
-    uploader._refresh_pageid_with_retries = MagicMock(return_value=42)
-
-    old_page = MagicMock(name="old_page")
-    old_page.text = old_text
-    old_page.exists.return_value = old_exists
-
-    new_page = MagicMock(name="new_page")
-    if save_raises is not None:
-        new_page.save.side_effect = save_raises
-    return uploader, old_page, new_page
-
-
-def _patch_get_page(old_page, new_page):
-    """Side-effect for ``get_page`` that returns the right mock by title.
-    Tests use ``File:old.jpg`` and ``File:new.jpg`` consistently."""
-
-    def _side(_site, title):
-        if title == "File:old.jpg":
-            return old_page
-        if title == "File:new.jpg":
-            return new_page
-        raise AssertionError(f"unexpected get_page title: {title!r}")
-
-    return _side
-
-
-def _call_tag_drift(uploader, old_page, new_page, **patches):
-    """Invoke ``_tag_drift_duplicate`` with the standard arg shape so
-    each test asserts on outcomes instead of plumbing the call.
-
-    The inside-template SDC import is patched to a no-op (returns 0) by
-    default, so these tests exercise only the outside-template node-swap
-    rescue; pass ``import_cross_page_community_sdc=<mock>`` to override.
-    """
-    from contextlib import ExitStack
-
-    extras = {f"tools.uploader.{name}": value for name, value in patches.items()}
-    extras.setdefault(
-        "tools.uploader.import_cross_page_community_sdc",
-        MagicMock(return_value=0),
-    )
-    with (
-        patch(
-            "tools.uploader.get_page",
-            side_effect=_patch_get_page(old_page, new_page),
-        ),
-        ExitStack() as stack,
-    ):
-        for target, value in extras.items():
-            stack.enter_context(patch(target, value))
-        uploader._tag_drift_duplicate(
-            "old.jpg",
-            "new.jpg",
-            _NEW_WIKI_MARKUP,
-            _DPLA_ID,
-            item_metadata={},
-            provider={},
-            data_provider={},
-        )
-
-
-def test_rescue_preserves_community_categories_into_new_file():
-    """The headline rescue: a community-curated category on the old
-    file must end up in the new file's wikitext."""
-    old_text = (
-        "{{Information|description=Old description}}\n"
-        "[[Category:Curated by community]]\n"
-        "[[Category:Some 1842 thing]]\n"
-    )
-    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
-
-    with patch("tools.uploader.tag_as_duplicate"):
-        _call_tag_drift(uploader, old_page, new_page)
-
-    assert new_page.save.called, (
-        "Save must be called when the old page has community categories"
-    )
-    saved_text = new_page.text
-    assert "[[Category:Curated by community]]" in saved_text
-    assert "[[Category:Some 1842 thing]]" in saved_text
-    assert saved_text.lstrip().startswith("{{DPLA metadata}}")
-
-
-def test_rescue_preserves_assessment_and_license_templates():
-    """Featured-picture / PD-USGov templates survive the rescue."""
-    old_text = (
-        "=={{Assessment}}==\n"
-        "{{Featured picture|com|nominator=Curator}}\n"
-        "{{PD-USGov-Military}}\n"
-        "[[Category:Notable images]]\n"
-    )
-    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
-
-    with patch("tools.uploader.tag_as_duplicate"):
-        _call_tag_drift(uploader, old_page, new_page)
-
-    saved_text = new_page.text
-    assert "{{Featured picture|com|nominator=Curator}}" in saved_text
-    assert "{{PD-USGov-Military}}" in saved_text
-    assert "[[Category:Notable images]]" in saved_text
-
-
-def test_rescue_imports_inside_template_sdc_from_old_page():
-    """The tag-duplicate path invokes the inside-template SDC rescue,
-    passing the OLD page as source and the NEW (survivor) page as dest —
-    since the old page is about to be deleted, its in-template community
-    provenance has to be captured before it's gone."""
-    old_text = "{{Artwork|title=Old}}\n[[Category:Curated]]\n"
-    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
-    sdc_mock = MagicMock(return_value=2)
-
-    with patch("tools.uploader.tag_as_duplicate"):
-        _call_tag_drift(
-            uploader,
-            old_page,
-            new_page,
-            import_cross_page_community_sdc=sdc_mock,
-        )
-
-    sdc_mock.assert_called_once()
-    kwargs = sdc_mock.call_args.kwargs
-    assert kwargs["source_page"] is old_page
-    # Destination targeted by resolved mediaid (pageid refreshed to 42), not a
-    # raw page object — guards against a lagged pageid becoming "M0".
-    assert kwargs["dest_mediaid"] == "M42"
-    assert kwargs["dpla_id"] == _DPLA_ID
-
-
-def test_rescue_skips_sdc_when_pageid_unresolved():
-    """If the destination pageid can't be resolved post-upload (indexing lag),
-    the SDC import is skipped (no bogus M0) while the wikitext rescue and the
-    tag still proceed."""
-    old_text = "{{Artwork|title=Old}}\n[[Category:Curated]]\n"
-    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
-    uploader._refresh_pageid_with_retries = MagicMock(return_value=None)
-    sdc_mock = MagicMock(return_value=0)
-
-    with patch("tools.uploader.tag_as_duplicate") as tag_mock:
-        _call_tag_drift(
-            uploader, old_page, new_page, import_cross_page_community_sdc=sdc_mock
-        )
-
-    sdc_mock.assert_not_called()  # pageid unresolved → no M0 import
-    assert new_page.save.called  # outside-template wikitext rescue still runs
-    tag_mock.assert_called_once()  # tag still runs
-
-
-def test_rescue_no_save_when_nothing_to_preserve():
-    """If the old page has no content outside its metadata template, the
-    node-swap produces just the fresh block we already uploaded, so the new
-    page must NOT be saved — calling save() on identical content would emit a
-    no-op revision on Commons."""
-    # A bare {{Information}} with nothing around it: node-swapping it for
-    # {{DPLA metadata}} yields exactly wiki_markup, so there's nothing to save.
-    old_text = "{{Information|description=Plain text}}\n"
-    uploader, old_page, new_page = _drift_uploader_with_pages(old_text)
-
-    with patch("tools.uploader.tag_as_duplicate"):
-        _call_tag_drift(uploader, old_page, new_page)
-
-    assert not new_page.save.called
-
-
-def test_rescue_skips_when_old_page_does_not_exist():
-    """Defensive: if the old page is gone (concurrent admin action),
-    don't crash — skip the rescue and proceed with the tag attempt."""
-    uploader, old_page, new_page = _drift_uploader_with_pages(
-        old_text="", old_exists=False
-    )
-
-    with patch("tools.uploader.tag_as_duplicate") as tag_mock:
-        _call_tag_drift(uploader, old_page, new_page)
-
-    assert not new_page.save.called
-    # Tag still runs — best-effort independence.
-    assert tag_mock.called
-
-
-def test_rescue_save_failure_does_not_block_tag(caplog):
-    """A save() failure mid-rescue must not block the subsequent tag.
-    The old page history still has the community contributions, so
-    manual recovery remains possible. Tag must still fire so the
-    duplicate-resolution path completes."""
-    import logging
-
-    uploader, old_page, new_page = _drift_uploader_with_pages(
-        old_text="[[Category:Community]]\n",
-        save_raises=RuntimeError("API timeout"),
-    )
-
-    with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        caplog.at_level(logging.WARNING),
-    ):
-        _call_tag_drift(uploader, old_page, new_page)
-
-    assert any("Failed to rescue" in r.message for r in caplog.records)
-    # Tag must still fire — independent best-effort.
-    assert tag_mock.called
-
-
-def test_tag_failure_does_not_swallow_successful_rescue(caplog):
-    """Symmetric: if the tag step fails, the rescue is still recorded
-    in logs and the new page's saved text reflects the merge."""
-    import logging
-
-    uploader, old_page, new_page = _drift_uploader_with_pages(
-        old_text="[[Category:Community]]\n",
-    )
-
-    with (
-        patch(
-            "tools.uploader.tag_as_duplicate",
-            side_effect=RuntimeError("Commons API down"),
-        ),
-        caplog.at_level(logging.WARNING),
-    ):
-        _call_tag_drift(uploader, old_page, new_page)
-
-    # Rescue succeeded.
-    assert new_page.save.called
-    assert "[[Category:Community]]" in new_page.text
-    # Tag failure is logged but didn't raise.
-    assert any("Failed to tag" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -2416,6 +1980,300 @@ def test_process_file_backend_fail_retry_exhaustion_counts_once():
         f"{MAX_UPLOAD_RETRIES} tries. Test isn't exercising the "
         f"removed-increment site."
     )
+
+
+def test_process_file_octet_stream_redetected_still_uploads():
+    """An octet-stream S3 object whose MIME re-detects to a real image type
+    (``file_downloaded=True``) must still flow through the collision/upload
+    block and upload — not fall through to ORDINAL_INELIGIBLE. The bytes
+    already fetched for re-detection are NOT re-downloaded (the fresh-upload
+    download is guarded by ``if not file_downloaded``). Regression pin for the
+    line-845 gate fix."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "application/octet-stream"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+    # MIME re-detection succeeds: octet-stream -> image/jpeg.
+    uploader.local_fs.get_content_type.return_value = "image/jpeg"
+
+    fake_page = MagicMock()
+    fake_page.exists.return_value = False
+    fake_page.isRedirectPage.return_value = False
+    fake_page.pageid = 0
+
+    # Upload succeeds; the post-upload pageid refresh returns a real id.
+    uploader._safe_upload = MagicMock(return_value="ok")
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=4242)
+
+    title = "File:Something - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=None),
+        patch("tools.uploader.get_page_title", return_value=title),
+        patch("tools.uploader.get_page", return_value=fake_page),
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Something",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "UPLOADED"
+    assert result["pageid"] == 4242
+    # download_file called exactly once — the re-detection fetch. The
+    # fresh-upload download must be skipped because the bytes are on disk.
+    assert fake_s3_object.download_file.call_count == 1
+
+
+def test_process_file_merge_and_redirect_none_expected_titles_no_crash():
+    """A cross-item MERGE_AND_REDIRECT when ``expected_item_titles`` is None
+    (the parameter default) must not raise TypeError on ``x in None`` — the
+    within_item derivation is guarded, yielding within_item=False. Regression
+    pin for the line-945 guard fix."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    existing = MagicMock()
+    existing.title.return_value = (
+        "Other - DPLA - ffffffffffffffffffffffffffffffff (page 1).jpg"
+    )
+
+    title = "File:Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    captured = {}
+
+    def fake_merge(**kwargs):
+        captured.update(kwargs)
+        return {"status": "MERGED", "title": "x", "pageid": 1}
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=existing),
+        patch("tools.uploader.get_page_title", return_value=title),
+        patch.object(uploader, "_is_community_file", return_value=False),
+        patch(
+            "tools.uploader.is_dup_sha1_sibling_at_expected_title",
+            return_value=False,
+        ),
+        patch.object(
+            uploader,
+            "_resolve_hash_drift",
+            return_value=DriftResolution.MERGE_AND_REDIRECT,
+        ),
+        patch.object(uploader, "_merge_and_redirect", side_effect=fake_merge),
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+            expected_item_titles=None,
+        )
+
+    assert result["status"] == "MERGED"
+    assert captured["within_item"] is False
+
+
+def test_process_file_sha1_lock_recheck_skips_on_concurrent_upload(tmp_path):
+    """Double-checked locking, SKIP branch. The fast-path SHA1 lookup finds
+    nothing, but the RE-CHECK under the per-SHA1 lock (enabled via
+    sha1_lock_dir) finds the file now present at our intended title — a sibling
+    worker uploaded it while we waited. process_file must SKIP (invariant
+    already satisfied) rather than attempt a duplicate upload, and the real
+    lock must be acquired then released (finally) without error."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.sha1_lock_dir = str(tmp_path)  # enable the lock for this test
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    page_title = "Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    concurrent = MagicMock()
+    concurrent.title.return_value = page_title  # title(with_ns=False) == intended
+    concurrent.pageid = 4242
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        # 1st call (fast path) -> None; 2nd call (re-check under lock) -> file.
+        patch(
+            "tools.uploader.find_file_by_hash", side_effect=[None, concurrent]
+        ) as fbh,
+        patch("tools.uploader.get_page_title", return_value=page_title),
+        patch.object(uploader, "_safe_upload") as safe_upload,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "SKIPPED"
+    assert result["pageid"] == 4242
+    assert fbh.call_count == 2  # fast-path lookup + under-lock re-check
+    safe_upload.assert_not_called()  # no duplicate upload attempted
+    assert tracker.count(Result.SKIPPED) == 1
+
+
+def test_process_file_sha1_lock_recheck_resolves_collision_on_concurrent_drift(
+    tmp_path,
+):
+    """Double-checked locking, collision branch. The re-check under the lock
+    finds the SHA1 now on Commons at a DIFFERENT title (a concurrent sibling
+    landed it there), so process_file resolves it via the normal collision
+    path (merge-and-redirect) instead of uploading a duplicate."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.sha1_lock_dir = str(tmp_path)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    page_title = "Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    concurrent = MagicMock()
+    concurrent.title.return_value = (
+        "Other - DPLA - ffffffffffffffffffffffffffffffff (page 1).jpg"
+    )
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch(
+            "tools.uploader.find_file_by_hash", side_effect=[None, concurrent]
+        ) as fbh,
+        patch("tools.uploader.get_page_title", return_value=page_title),
+        patch.object(uploader, "_is_community_file", return_value=False),
+        patch(
+            "tools.uploader.is_dup_sha1_sibling_at_expected_title",
+            return_value=False,
+        ),
+        patch.object(
+            uploader,
+            "_resolve_hash_drift",
+            return_value=DriftResolution.MERGE_AND_REDIRECT,
+        ),
+        patch.object(
+            uploader,
+            "_merge_and_redirect",
+            return_value={"status": "MERGED", "title": "x", "pageid": 1},
+        ) as merge,
+        patch.object(uploader, "_safe_upload") as safe_upload,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    assert result["status"] == "MERGED"
+    assert fbh.call_count == 2
+    merge.assert_called_once()
+    safe_upload.assert_not_called()  # resolved as collision, not uploaded
+
+
+def test_process_file_sha1_lock_acquire_failure_degrades_to_lockless_upload(tmp_path):
+    """The per-SHA1 lock is an optimization, not a correctness dependency, so an
+    acquire failure (e.g. a foreign-owned lock dir) must degrade to a lock-less
+    upload — NOT fail the ordinal. On acquire error process_file logs and
+    proceeds without the re-check; the upload still runs and Commons' own dedup
+    remains the invariant backstop."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    uploader.sha1_lock_dir = str(tmp_path)  # lock enabled...
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    fake_page = MagicMock()
+    fake_page.exists.return_value = False
+    fake_page.isRedirectPage.return_value = False
+    fake_page.pageid = 0
+    uploader._safe_upload = MagicMock(return_value="ok")
+    uploader._refresh_pageid_with_retries = MagicMock(return_value=4242)
+
+    title = "File:Something - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=None) as fbh,
+        patch("tools.uploader.get_page_title", return_value=title),
+        patch("tools.uploader.get_page", return_value=fake_page),
+        # ...but acquiring it blows up (simulated lock-infra failure).
+        patch(
+            "tools.uploader.acquire_sha1_lock",
+            side_effect=RuntimeError("lock dir owned by another uid"),
+        ) as acquire,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Something",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+        )
+
+    acquire.assert_called_once()  # we tried to lock
+    assert result["status"] == "UPLOADED"  # degraded, did NOT fail the ordinal
+    assert tracker.count(Result.FAILED) == 0
+    assert fbh.call_count == 1  # re-check skipped (acquire failed) — only fast path
 
 
 # ---------------------------------------------------------------------------
@@ -2973,18 +2831,18 @@ def test_csrf_recovery_failed_propagates_past_process_item_outer_catch():
 
 
 # ---------------------------------------------------------------------------
-# Phantom-drift defense-in-depth (this PR).
+# Phantom-drift defense-in-depth.
 #
 # ``get_page_title``'s ``item_title[:181]`` truncation used to leak a
 # trailing space when the 181st character landed on whitespace, producing
 # a raw Python title with a double-space run around the ``- DPLA -``
-# separator. ``process_file``'s line-468 identity check
+# separator. ``process_file``'s identity check
 # (``existing_file.title(with_ns=False) == page_title``) then failed on
-# the raw-string comparison, and ``_resolve_hash_drift`` fell through to
-# Case 2 tagging the file as a duplicate of itself. Commons's
-# ``fileexists-no-change`` server-side check happened to reject the
-# upload, so ``_tag_drift_duplicate`` was never called — but the guard
-# path is defense-in-depth for any future normalisation drift.
+# the raw-string comparison, and ``_resolve_hash_drift`` risked falling
+# through to a destructive branch (move-to-self / hand-fix) against what is
+# really the same page. The canonicalized-equality guard returns
+# ALREADY_CORRECT instead; these tests pin that guard for any future
+# normalisation drift.
 # ---------------------------------------------------------------------------
 
 
@@ -3004,9 +2862,8 @@ def test_canonicalize_commons_title_treats_underscores_as_space_equivalent():
     (``File:X_Y`` and ``File:X Y`` are the same page). The guard MUST
     fold both forms — otherwise an uploader-constructed underscore
     title vs a previously-uploaded space title (same DPLA ID, same
-    SHA1) reads as drift, falls through to Case 2 UPLOAD_AND_TAG, and
-    inflates the Category:Duplicate deferral sidecar with false
-    positives.
+    SHA1) reads as drift and misroutes through ``_resolve_hash_drift``
+    instead of the ALREADY_CORRECT skip it deserves.
     """
     from tools.uploader import _canonicalize_commons_title
 
@@ -3066,75 +2923,510 @@ def test_resolve_hash_drift_returns_already_correct_on_whitespace_normalized_mat
     assert action == "already_correct"
 
 
-def test_tag_drift_duplicate_refuses_self_tag_byte_equal():
-    """Belt: even if some caller passes the same title as both
-    ``old_filename`` and ``new_filename``, ``_tag_drift_duplicate``
-    refuses to call ``tag_as_duplicate`` — that would flag the file
-    for admin deletion of itself."""
-    uploader = _build_uploader_with_dpla()
-    same = "Foo - DPLA - cccccccccccccccccccccccccccccccc.jpg"
+# ---------------------------------------------------------------------------
+# _record_hand_fix_and_skip — the HAND_FIX terminal outcome.
+#
+# Our S3 SHA1 lives at a wrong Commons title and the intended title is
+# occupied by a DIFFERENT file, so the bot can neither upload a duplicate nor
+# clobber the occupant. Record the case to the hand-fix.jsonl sidecar, count
+# it, and return ORDINAL_HAND_FIX — no upload.
+# ---------------------------------------------------------------------------
+
+
+def test_record_hand_fix_and_skip_records_sidecar_and_returns_hand_fix():
+    """Returns ORDINAL_HAND_FIX (title/pageid None), records the occupant's
+    title + SHA1 to the sidecar, bumps ``UPLOAD_HAND_FIX``, and never
+    uploads."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    dpla_id = "abcdef0123456789abcdef0123456789"
+    intended_title = f"Item - DPLA - {dpla_id} (page 1).jpg"
+    current_title = f"Legacy Title - NAID 12345 - {dpla_id}.jpg"
+
+    occupant = MagicMock()
+    occupant.exists.return_value = True
+    occupant.isRedirectPage.return_value = False
+    occupant.latest_file_info.sha1 = "occupant-sha1"
+    occupant.title.return_value = intended_title
+
+    our_current_file = _drift_existing_file(current_title)
+
     with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        patch("tools.uploader.get_page") as get_page_mock,
+        patch("tools.uploader.get_page", return_value=occupant),
+        patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
     ):
-        uploader._tag_drift_duplicate(
-            old_filename=same,
-            new_filename=same,
-            wiki_markup="wt",
-            dpla_id="cccccccccccccccccccccccccccccccc",
-            item_metadata={},
-            provider={},
-            data_provider={},
+        result = uploader._record_hand_fix_and_skip(
+            partner="nara",
+            dpla_id=dpla_id,
+            ordinal=1,
+            our_sha1="our-sha1",
+            intended_title=intended_title,
+            our_current_file=our_current_file,
         )
-    tag_mock.assert_not_called()
-    get_page_mock.assert_not_called()
+
+    assert result == {"status": "HAND_FIX", "title": None, "pageid": None}
+    assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    # No upload ever happens on the hand-fix path.
+    uploader.site.upload.assert_not_called()
+    record_mock.assert_called_once()
+    kwargs = record_mock.call_args.kwargs
+    assert record_mock.call_args.args == ("nara",)
+    assert kwargs["dpla_id"] == dpla_id
+    assert kwargs["ordinal"] == 1
+    assert kwargs["our_sha1"] == "our-sha1"
+    assert kwargs["intended_title"] == intended_title
+    assert kwargs["occupying_title"] == intended_title
+    assert kwargs["occupying_sha1"] == "occupant-sha1"
+    assert kwargs["current_title"] == current_title
 
 
-def test_tag_drift_duplicate_refuses_self_tag_whitespace_run_equal():
-    """Suspenders: two titles that differ only in whitespace runs
-    (the exact shape ``get_page_title``'s truncation bug used to
-    produce) resolve to the same Commons page under MediaWiki
-    normalisation. Must not tag."""
-    uploader = _build_uploader_with_dpla()
-    single_space = "Foo Bar - DPLA - dddddddddddddddddddddddddddddddd.jpg"
-    double_space = "Foo Bar  - DPLA - dddddddddddddddddddddddddddddddd.jpg"
+def test_record_hand_fix_and_skip_survives_occupant_inspection_failure():
+    """If inspecting the occupant at the intended title raises (Commons
+    hiccup), the method swallows it, records the case with null occupant
+    fields, still counts it, and returns HAND_FIX."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+    dpla_id = "abcdef0123456789abcdef0123456789"
+    intended_title = f"Item - DPLA - {dpla_id} (page 1).jpg"
+
     with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        patch("tools.uploader.get_page") as get_page_mock,
+        # Occupant inspection raises — the method must swallow it and still
+        # record (occupying_title/sha1 = None) and count.
+        patch("tools.uploader.get_page", side_effect=RuntimeError("commons down")),
+        patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
     ):
-        uploader._tag_drift_duplicate(
-            old_filename=single_space,
-            new_filename=double_space,
-            wiki_markup="wt",
-            dpla_id="dddddddddddddddddddddddddddddddd",
-            item_metadata={},
-            provider={},
-            data_provider={},
+        result = uploader._record_hand_fix_and_skip(
+            partner="nara",
+            dpla_id=dpla_id,
+            ordinal=1,
+            our_sha1="our-sha1",
+            intended_title=intended_title,
+            our_current_file=_drift_existing_file("Wrong - DPLA - x.jpg"),
         )
-    tag_mock.assert_not_called()
-    get_page_mock.assert_not_called()
+
+    assert result["status"] == "HAND_FIX"
+    assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    uploader.site.upload.assert_not_called()
+    record_mock.assert_called_once()
+    kwargs = record_mock.call_args.kwargs
+    assert kwargs["intended_title"] == intended_title
+    assert kwargs["occupying_title"] is None
+    assert kwargs["occupying_sha1"] is None
 
 
-def test_tag_drift_duplicate_still_tags_when_names_genuinely_differ():
-    """Positive: a genuine hash-drift case (different filenames) still
-    reaches ``tag_as_duplicate`` — the self-tag guard doesn't over-fire."""
+# ---------------------------------------------------------------------------
+# _merge_and_redirect / _merge_sdc_onto_canonical / _create_redirect_to_canonical
+# — the MERGE_AND_REDIRECT terminal outcome (SHA1 centralization).
+# ---------------------------------------------------------------------------
+
+
+def _canonical_file(title: str, pageid: int) -> MagicMock:
+    f = MagicMock()
+    f.title.return_value = title
+    f.pageid = pageid
+    return f
+
+
+def test_merge_and_redirect_merges_sdc_and_creates_redirect():
+    """With a resolvable canonical pageid: merge SDC onto ``M<pageid>``,
+    create the redirect, bump ``UPLOAD_MERGED_TO_CANONICAL``, and return an
+    ORDINAL_MERGED result carrying the canonical title + pageid."""
+    tracker = Tracker()
     uploader = _build_uploader_with_dpla()
-    old_page = MagicMock()
-    old_page.exists.return_value = True
-    old_page.text = ""
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+
     with (
-        patch("tools.uploader.tag_as_duplicate") as tag_mock,
-        patch("tools.uploader.get_page", return_value=old_page),
-        patch("tools.uploader.rescue_wikitext", return_value="wt"),
-        patch("tools.uploader.import_cross_page_community_sdc", return_value=0),
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(
+            uploader, "_create_redirect_to_canonical", return_value="created"
+        ) as redirect_mock,
     ):
-        uploader._tag_drift_duplicate(
-            old_filename="Old title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
-            new_filename="New title - DPLA - eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.jpg",
-            wiki_markup="wt",
-            dpla_id="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            item_metadata={},
-            provider={},
-            data_provider={},
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
+            sha1="a" * 40,
         )
-    tag_mock.assert_called_once()
+
+    assert result == {
+        "status": "MERGED",
+        "title": "Canonical - DPLA - xxxx (page 1).jpg",
+        "pageid": 777,
+    }
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 1
+    merge_mock.assert_called_once()
+    assert merge_mock.call_args.kwargs["canonical_mediaid"] == "M777"
+    assert merge_mock.call_args.kwargs["within_item"] is True
+    assert merge_mock.call_args.kwargs["page_label"] == "1"
+    redirect_mock.assert_called_once()
+    assert (
+        redirect_mock.call_args.kwargs["canonical_title"]
+        == "Canonical - DPLA - xxxx (page 1).jpg"
+    )
+
+
+def test_merge_and_redirect_fails_when_canonical_pageid_falsy():
+    """No resolvable canonical pageid → the SDC can't be merged, so return a
+    retryable ORDINAL_FAILED and write NO redirect. Reporting MERGED (or leaving
+    a redirect) here would strand the item's metadata: the redirect hides our
+    title and MERGED excludes the ordinal from the SDC-sync phase, so the data
+    would appear nowhere. Not counted as MERGED."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx.jpg", 0)
+
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            within_item=False,
+            sha1="b" * 40,
+        )
+
+    merge_mock.assert_not_called()  # can't target M0
+    redirect_mock.assert_not_called()  # no redirect over an unmerged item
+    assert result["status"] == "FAILED"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    # The FAILED status is returned normally (not via process_file's except
+    # block), so this branch must bump the tracker itself or COUNTS/Slack
+    # would underreport the failure.
+    assert tracker.count(Result.FAILED) == 1
+
+
+def test_merge_and_redirect_fails_when_sdc_merge_fails():
+    """The SDC merge reports failure (False) → return a retryable ORDINAL_FAILED
+    and write NO redirect, so the whole MERGE_AND_REDIRECT re-runs next pass
+    instead of terminally reporting MERGED for data that never landed."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+
+    with (
+        patch.object(
+            uploader, "_merge_sdc_onto_canonical", return_value=False
+        ) as merge_mock,
+        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
+            sha1="a" * 40,
+        )
+
+    merge_mock.assert_called_once()
+    redirect_mock.assert_not_called()
+    assert result["status"] == "FAILED"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    # Returned normally, so this branch must count the failure itself.
+    assert tracker.count(Result.FAILED) == 1
+
+
+def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():
+    """Reads the item's staged sdc.json, json-parses it, points sdc_sync at
+    our site, and calls merge_item_onto_canonical with the within-item page
+    number as a P304 qualifier set."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = '{"claims": {"P170": []}}'
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        import tools.sdc_sync as sdc_sync
+
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="3",
+            within_item=True,
+        )
+        assert sdc_sync.site is uploader.site
+
+    uploader.s3_client.get_sdc_json.assert_called_once_with("nara", "yyyy")
+    merge_mock.assert_called_once()
+    args = merge_mock.call_args.args
+    assert args[0] == "M42"
+    assert args[1] == "yyyy"
+    assert args[2] == {"claims": {"P170": []}}
+    assert merge_mock.call_args.kwargs["page_numbers"] == {"3"}
+
+
+def test_merge_sdc_onto_canonical_cross_item_passes_no_page_numbers():
+    """Cross-item duplication carries no page number → page_numbers=None."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = "{}"
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="3",  # ignored because within_item is False
+            within_item=False,
+        )
+
+    assert merge_mock.call_args.kwargs["page_numbers"] is None
+
+
+def test_merge_sdc_onto_canonical_skips_when_no_staged_sdc():
+    """Missing / blank sdc.json → best-effort skip, merge not attempted."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = None
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        result = uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="1",
+            within_item=True,
+        )
+
+    # A genuinely-absent sdc.json (item contributes no claims) is "nothing to
+    # merge" = success, NOT a failure — the caller treats a falsy return as a
+    # retryable merge failure, so pin the True so a regression to None/False
+    # (which would strand the DEDUP outcome in permanent retry) is caught.
+    assert result is True
+    merge_mock.assert_not_called()
+
+
+def _redirect_intended_page(
+    *, exists: bool, is_redirect: bool = False, redirect_target: str | None = None
+) -> MagicMock:
+    page = MagicMock()
+    page.exists.return_value = exists
+    page.isRedirectPage.return_value = is_redirect
+    page.title.return_value = "File:Ours - DPLA - yyyy.jpg"
+    if redirect_target is not None:
+        rt = MagicMock()
+        rt.title.return_value = redirect_target
+        page.getRedirectTarget.return_value = rt
+    return page
+
+
+def test_create_redirect_to_canonical_creates_when_missing():
+    """Missing intended title (not maintain mode) → write the #REDIRECT and
+    save via with_csrf_recovery."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    assert page.text == "#REDIRECT [[File:Canonical - DPLA - xxxx.jpg]]"
+    page.save.assert_called_once()
+
+
+def test_create_redirect_to_canonical_refuses_to_clobber_real_file():
+    """A real (non-redirect) file at the intended title is left for a human —
+    never overwritten with a redirect."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(exists=True, is_redirect=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery") as csrf_mock,
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    page.save.assert_not_called()
+    csrf_mock.assert_not_called()
+
+
+def test_create_redirect_to_canonical_noops_when_already_redirect_to_canonical():
+    """An intended title already redirecting to the canonical file is a
+    no-op — no re-save."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(
+        exists=True,
+        is_redirect=True,
+        redirect_target="Canonical - DPLA - xxxx.jpg",
+    )
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery") as csrf_mock,
+    ):
+        uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    page.save.assert_not_called()
+    csrf_mock.assert_not_called()
+
+
+def test_create_redirect_to_canonical_respects_no_create_fence():
+    """Maintain mode (no_create) must not create a redirect at a not-yet-
+    existing intended title."""
+    uploader = _uploader(no_create=True)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        outcome = uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    page.save.assert_not_called()
+    assert outcome == "fenced"
+
+
+def test_create_redirect_to_canonical_preserves_ancillary_wikitext():
+    """Re-pointing an EXISTING redirect that carries a trailing category
+    replaces ONLY the redirect line and keeps the category. Regression pin for
+    the wikitext-preservation fix."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(
+        exists=True, is_redirect=True, redirect_target="Old - DPLA - zzzz.jpg"
+    )
+    page.text = "#REDIRECT [[File:Old - DPLA - zzzz.jpg]]\n[[Category:Some category]]"
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        outcome = uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    assert outcome == "created"
+    assert page.text == (
+        "#REDIRECT [[File:Canonical - DPLA - xxxx.jpg]]\n[[Category:Some category]]"
+    )
+    page.save.assert_called_once()
+
+
+def test_create_redirect_to_canonical_returns_created_for_new_page():
+    """A brand-new redirect page reports the ``created`` outcome."""
+    uploader = _uploader(no_create=False)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch("tools.uploader.get_page", return_value=page),
+        patch("tools.uploader.with_csrf_recovery", side_effect=lambda s, d, fn: fn()),
+    ):
+        outcome = uploader._create_redirect_to_canonical(
+            intended_title="Ours - DPLA - yyyy.jpg",
+            canonical_title="Canonical - DPLA - xxxx.jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+        )
+
+    assert outcome == "created"
+
+
+def test_merge_and_redirect_hand_fix_when_intended_title_holds_real_file():
+    """If the intended title is occupied by a DIFFERENT real file, the redirect
+    can't be established → report HAND_FIX (rename_blocked), NOT MERGED. The SDC
+    merge still ran (add-only / idempotent, safe to leave in place). Regression
+    pin for the blocked-redirect outcome routing."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+
+    # A DIFFERENT real (non-redirect) file occupies the intended title.
+    occupant = MagicMock()
+    occupant.exists.return_value = True
+    occupant.isRedirectPage.return_value = False
+    occupant.title.return_value = "Ours - DPLA - yyyy (page 1).jpg"
+    occupant.latest_file_info.sha1 = "ffff" * 10
+
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch("tools.uploader.get_page", return_value=occupant),
+        patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=False,
+            sha1="abcd" * 10,
+        )
+
+    merge_mock.assert_called_once()  # SDC merge still ran
+    assert result["status"] == "HAND_FIX"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    assert tracker.count(Result.UPLOAD_HAND_FIX) == 1
+    record_mock.assert_called_once()
+    assert record_mock.call_args.kwargs["reason"] == "rename_blocked"
+    # Our SHA1's canonical home is recorded as the current title.
+    assert (
+        record_mock.call_args.kwargs["current_title"]
+        == "Canonical - DPLA - xxxx (page 1).jpg"
+    )
+
+
+def test_merge_and_redirect_fenced_in_maintain_mode_is_not_merged():
+    """maintain-mode no-create fence blocks the net-new redirect page → report
+    a would-create skip (INELIGIBLE), NOT MERGED."""
+    tracker = Tracker()
+    uploader = _uploader(no_create=True)
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+    page = _redirect_intended_page(exists=False)
+
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch("tools.uploader.get_page", return_value=page),
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=False,
+            sha1="abcd" * 10,
+        )
+
+    merge_mock.assert_called_once()
+    assert result["status"] == "INELIGIBLE"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+    assert tracker.count(Result.UPLOAD_SKIPPED_WOULD_CREATE) == 1

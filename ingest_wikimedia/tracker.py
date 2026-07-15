@@ -19,12 +19,26 @@ class Result(Enum):
     # core safety invariant of maintain mode — maintenance never emits a new
     # File page — surfaces here so operators can audit that it held.
     UPLOAD_SKIPPED_WOULD_CREATE = auto()
-    # Dup-category throttle: a {{duplicate}}-tagging upload (Case 2 hash-drift)
-    # was deferred because Category:Duplicate was at capacity. Counts each
-    # defer event (a deferred ordinal may be re-attempted — and counted again —
-    # in the drain pass); the number of items still deferred at run end is
-    # logged separately. Not a skip: the work is retried, not abandoned.
-    UPLOAD_DEFERRED_DUP_CATEGORY = auto()
+    # SHA1-uniqueness redesign (PR C+D). No two Commons files may share a
+    # SHA1, so once our S3 SHA1 already exists on Commons the uploader never
+    # uploads a second byte-identical file. Two terminal outcomes replace the
+    # retired {{duplicate}}-tag/defer machinery:
+    #
+    # UPLOAD_HAND_FIX — our S3 SHA1 lives at a wrong Commons title and the
+    #   canonical title we need is occupied by a DIFFERENT file (different
+    #   SHA1), so the rename that would restore the invariant is blocked. No
+    #   upload happens; a descriptive record is written to the per-partner
+    #   hand-fix.jsonl sidecar for a human to resolve. Modelled on
+    #   MAINTAIN_RENAME_BLOCKED (also a rename the bot can't safely make).
+    #
+    # UPLOAD_MERGED_TO_CANONICAL — the SHA1 match comes from legitimate
+    #   source duplication (the same bytes appear at multiple positions
+    #   within an item, or across items / institutions). Instead of a second
+    #   file we centralize the SHA1 to the earliest existing (canonical) file:
+    #   merge this item's SDC onto it and leave a #REDIRECT at our intended
+    #   title. Counts each ordinal redirected onto a canonical file.
+    UPLOAD_HAND_FIX = auto()
+    UPLOAD_MERGED_TO_CANONICAL = auto()
     # An upload attempt returned ``None`` from ``pywikibot.Site.upload()``
     # AND the target title already holds a real file whose SHA1 does not
     # match ours — the signature of Commons treating a subtly-different
