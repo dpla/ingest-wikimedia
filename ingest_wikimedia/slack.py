@@ -729,6 +729,8 @@ def notify_upload_aborted(
             f"SKIPPED:       {tracker.count(Result.SKIPPED):,}",
             f"  not present: {tracker.count(Result.UPLOAD_SKIPPED_NOT_PRESENT):,}",
             f"  ineligible:  {tracker.count(Result.UPLOAD_SKIPPED_INELIGIBLE):,}",
+            f"MERGED:        {tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL):,}",
+            f"HAND-FIX:      {tracker.count(Result.UPLOAD_HAND_FIX):,}",
             f"FAILED:        {tracker.count(Result.FAILED):,}",
             f"BYTES:         {_format_bytes(tracker.count(Result.BYTES))}",
             f"Runtime:       {runtime}",

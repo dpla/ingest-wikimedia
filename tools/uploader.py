@@ -280,13 +280,15 @@ def _has_dpla_shaped_title(title: str) -> bool:
     return any(marker in title for marker in _DPLA_TITLE_MARKERS)
 
 
-# Matches a single MediaWiki redirect directive: ``#REDIRECT [[Target]]`` with
-# optional whitespace before the target and an optional leading ``:`` in the
-# link (e.g. ``[[:File:Foo.jpg]]``). Case-insensitive per MediaWiki's own
-# ``#redirect`` handling. Used to re-point ONLY the redirect line of an
-# existing redirect page, preserving any ancillary wikitext (categories,
-# templates, comments) that sits around it.
-_REDIRECT_LINE_RE = re.compile(r"#REDIRECT\s*\[\[[^\]]*\]\]", re.IGNORECASE)
+# Matches the MediaWiki redirect directive ``#REDIRECT [[Target]]``, ANCHORED
+# to the start of the page (``\A``) where MediaWiki actually recognizes it —
+# only leading whitespace may precede it. Anchoring means a stray ``#REDIRECT``
+# inside a comment or template lower in the page can never be the match target.
+# Allows whitespace before the link and an optional leading ``:`` in it (e.g.
+# ``[[:File:Foo.jpg]]``); case-insensitive per MediaWiki's own ``#redirect``
+# handling. Used to re-point ONLY the directive of an existing redirect page,
+# preserving any ancillary wikitext (categories, templates) that sits below it.
+_REDIRECT_LINE_RE = re.compile(r"\A\s*#REDIRECT\s*\[\[[^\]]*\]\]", re.IGNORECASE)
 
 
 class DriftResolution(str, Enum):
@@ -979,6 +981,17 @@ class Uploader:
                 # genuine fresh upload. Any redirect at the intended title is
                 # handled below (a pre-existing redirect does not bind us on the
                 # fresh-upload path).
+                #
+                # Concurrency note: the find_file_by_hash → upload sequence is
+                # not guarded by a cross-worker lock, so two workers processing
+                # byte-identical sources could both observe no match here. The
+                # one-SHA1-one-file constraint is still preserved server-side:
+                # this fresh-upload path uses ``force_ignore_warnings=False`` (a
+                # stash-commit that surfaces, rather than suppresses, MediaWiki
+                # warnings), so the second worker's commit hits Commons's own
+                # duplicate-SHA1 detection and does not publish a second file. A
+                # host-wide SHA1 lock would be belt-and-suspenders but is a
+                # larger change; deferred, tracked separately.
                 force_ignore_warnings = False
 
                 # Skip re-downloading when the octet-stream MIME re-detection
@@ -1894,8 +1907,17 @@ class Uploader:
         (b) Leave a ``#REDIRECT`` at our intended title. A redirect carries no
             media, so the one-SHA1-one-file constraint holds.
 
-        The reported outcome is gated on whether the redirect was actually
-        established (``_create_redirect_to_canonical``'s return value):
+        Step (a) runs FIRST and is a precondition for (b): a redirect is only
+        written — and ``MERGED`` only reported — once the SDC merge lands. If
+        the canonical file has no resolvable pageid, or the merge fails, we
+        write NO redirect and return a retryable ``ORDINAL_FAILED`` so the whole
+        MERGE_AND_REDIRECT re-runs cleanly next pass. This prevents stranding
+        the item's data: a redirect hides our title and ``ORDINAL_MERGED``
+        excludes the ordinal from the SDC-sync phase, so a redirect left over an
+        unmerged item would make its metadata appear nowhere.
+
+        Once the SDC has merged, the outcome is gated on whether the redirect
+        was established (``_create_redirect_to_canonical``'s return value):
 
         - ``created`` / ``already`` → report ``ORDINAL_MERGED`` and bump
           ``UPLOAD_MERGED_TO_CANONICAL``. Our intended title now resolves to
@@ -1914,22 +1936,49 @@ class Uploader:
         """
         canonical_title = canonical_file.title(with_ns=False)
         canonical_pageid = canonical_file.pageid
-        # SDC merge is best-effort — the redirect is the load-bearing invariant
-        # step; a merge failure re-runs idempotently on a later pass.
-        if canonical_pageid:
-            self._merge_sdc_onto_canonical(
-                canonical_mediaid=f"M{canonical_pageid}",
-                dpla_id=dpla_id,
-                partner=partner,
-                page_label=page_label,
-                within_item=within_item,
-            )
-        else:
+        # Merge the SDC FIRST and only centralize (redirect + terminal MERGED)
+        # once it lands. Leaving a redirect while the contributing item's SDC is
+        # NOT on the canonical file would strand that data: the redirect hides
+        # our title and ORDINAL_MERGED excludes the ordinal from the SDC-sync
+        # phase, so the metadata would never appear anywhere. When the merge
+        # can't run, return a retryable ORDINAL_FAILED (no redirect written) so
+        # a later run re-attempts the whole MERGE_AND_REDIRECT cleanly.
+        if not canonical_pageid:
             logging.warning(
                 f"Merge for {dpla_id} {ordinal}: canonical file "
-                f"[[File:{canonical_title}]] has no resolvable pageid; skipping "
-                f"SDC merge (redirect still created)."
+                f"[[File:{canonical_title}]] has no resolvable pageid; cannot "
+                f"merge SDC. Leaving the ordinal for retry (no redirect written)."
             )
+            return {
+                "status": ORDINAL_FAILED,
+                "title": None,
+                "pageid": None,
+                "error": (
+                    f"canonical [[File:{canonical_title}]] has no resolvable "
+                    f"pageid; SDC merge could not run"
+                ),
+            }
+        if not self._merge_sdc_onto_canonical(
+            canonical_mediaid=f"M{canonical_pageid}",
+            dpla_id=dpla_id,
+            partner=partner,
+            page_label=page_label,
+            within_item=within_item,
+        ):
+            logging.warning(
+                f"Merge for {dpla_id} {ordinal}: SDC merge onto "
+                f"[[File:{canonical_title}]] failed; leaving the ordinal for "
+                f"retry (no redirect written)."
+            )
+            return {
+                "status": ORDINAL_FAILED,
+                "title": None,
+                "pageid": None,
+                "error": (
+                    f"SDC merge onto [[File:{canonical_title}]] failed; "
+                    f"ordinal left for retry"
+                ),
+            }
         redirect_outcome = self._create_redirect_to_canonical(
             intended_title=intended_title,
             canonical_title=canonical_title,
@@ -1977,7 +2026,7 @@ class Uploader:
         partner: str,
         page_label: str,
         within_item: bool,
-    ) -> None:
+    ) -> bool:
         """Read this item's staged ``sdc.json`` and merge it onto the canonical
         file's MediaInfo entity via ``sdc_sync.merge_item_onto_canonical``
         (already on ``main`` from PR A).
@@ -1985,39 +2034,41 @@ class Uploader:
         Imported lazily: ``tools.sdc_sync`` carries heavy module-level state
         (the ``site`` handle the merge writes through) and is only needed on
         this rare path. We point its module ``site`` at our authenticated
-        Commons site for the duration of the call. Best-effort throughout: any
-        failure leaves the redirect in place and the SDC re-mergeable next run.
+        Commons site for the duration of the call.
+
+        Returns ``True`` when the item's SDC was merged onto the canonical
+        file, or when there is genuinely nothing to merge (no staged
+        ``sdc.json`` — the item contributes no structured data). Returns
+        ``False`` on a hard failure (import / S3 read / JSON parse / merge
+        error) so the caller can avoid reporting a terminal ``MERGED`` for an
+        ordinal whose data never landed, and retry it on a later run instead.
         """
         try:
             from tools import sdc_sync
         except Exception as ex:  # pragma: no cover — defensive import guard
             logging.warning(
                 f"Merge for {dpla_id}: could not import sdc_sync ({ex!r}); "
-                f"skipping SDC merge."
+                f"SDC not merged."
             )
-            return
+            return False
         try:
             sdc_raw = self.s3_client.get_sdc_json(partner, dpla_id)
         except Exception as ex:
             logging.warning(
                 f"Merge for {dpla_id}: S3 read of sdc.json failed ({ex!r}); "
-                f"skipping SDC merge."
+                f"SDC not merged."
             )
-            return
+            return False
         if not sdc_raw:
-            logging.info(
-                f"Merge for {dpla_id}: no staged sdc.json; skipping SDC merge "
-                f"(redirect still created)."
-            )
-            return
+            logging.info(f"Merge for {dpla_id}: no staged sdc.json; nothing to merge.")
+            return True
         try:
             sdc_payload = json.loads(sdc_raw)
         except json.JSONDecodeError as ex:
             logging.warning(
-                f"Merge for {dpla_id}: sdc.json failed to parse ({ex}); "
-                f"skipping SDC merge."
+                f"Merge for {dpla_id}: sdc.json failed to parse ({ex}); SDC not merged."
             )
-            return
+            return False
         # Within-item duplication: stamp the page number this ordinal occupies
         # as a P304 qualifier. Cross-item / cross-institution: no page number.
         page_numbers = {page_label} if within_item and page_label else None
@@ -2034,13 +2085,15 @@ class Uploader:
                 f"Merged SDC for {dpla_id} onto canonical {canonical_mediaid}"
                 + (f" (pages {sorted(page_numbers)})" if page_numbers else "")
             )
+            return True
         except CsrfRecoveryFailed:
             raise
         except Exception as ex:
             logging.warning(
                 f"Merge for {dpla_id}: merge_item_onto_canonical failed "
-                f"({ex!r}); redirect still created, SDC re-mergeable next run."
+                f"({ex!r}); SDC not merged, ordinal left for retry next run."
             )
+            return False
 
     def _create_redirect_to_canonical(
         self,

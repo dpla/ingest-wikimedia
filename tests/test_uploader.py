@@ -2894,9 +2894,12 @@ def test_merge_and_redirect_merges_sdc_and_creates_redirect():
     )
 
 
-def test_merge_and_redirect_skips_sdc_when_canonical_pageid_falsy():
-    """No resolvable canonical pageid → skip the SDC merge (can't target M0)
-    but still create the redirect and count; result pageid is None."""
+def test_merge_and_redirect_fails_when_canonical_pageid_falsy():
+    """No resolvable canonical pageid → the SDC can't be merged, so return a
+    retryable ORDINAL_FAILED and write NO redirect. Reporting MERGED (or leaving
+    a redirect) here would strand the item's metadata: the redirect hides our
+    title and MERGED excludes the ordinal from the SDC-sync phase, so the data
+    would appear nowhere. Not counted as MERGED."""
     tracker = Tracker()
     uploader = _build_uploader_with_dpla()
     uploader.tracker = tracker
@@ -2904,9 +2907,7 @@ def test_merge_and_redirect_skips_sdc_when_canonical_pageid_falsy():
 
     with (
         patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
-        patch.object(
-            uploader, "_create_redirect_to_canonical", return_value="created"
-        ) as redirect_mock,
+        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
     ):
         result = uploader._merge_and_redirect(
             canonical_file=canonical,
@@ -2919,11 +2920,42 @@ def test_merge_and_redirect_skips_sdc_when_canonical_pageid_falsy():
             sha1="b" * 40,
         )
 
-    merge_mock.assert_not_called()
-    redirect_mock.assert_called_once()
-    assert result["status"] == "MERGED"
-    assert result["pageid"] is None
-    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 1
+    merge_mock.assert_not_called()  # can't target M0
+    redirect_mock.assert_not_called()  # no redirect over an unmerged item
+    assert result["status"] == "FAILED"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+
+
+def test_merge_and_redirect_fails_when_sdc_merge_fails():
+    """The SDC merge reports failure (False) → return a retryable ORDINAL_FAILED
+    and write NO redirect, so the whole MERGE_AND_REDIRECT re-runs next pass
+    instead of terminally reporting MERGED for data that never landed."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+
+    with (
+        patch.object(
+            uploader, "_merge_sdc_onto_canonical", return_value=False
+        ) as merge_mock,
+        patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
+            sha1="a" * 40,
+        )
+
+    merge_mock.assert_called_once()
+    redirect_mock.assert_not_called()
+    assert result["status"] == "FAILED"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
 
 
 def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():

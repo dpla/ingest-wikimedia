@@ -23,7 +23,10 @@ it when the same bytes are involved more than once.
 
 ## The uniqueness constraint (PR C+D)
 
-**No two Commons files may share a SHA1.**
+**The uploader never creates a second Commons file for a SHA1 that
+already exists.** (This governs what the bot *uploads* going forward; it
+is not a claim that no two files on Commons share a SHA1 today —
+pre-existing legacy duplicates are out of scope, see below.)
 
 We therefore no longer satisfy the goal by uploading a byte-identical
 second file. Instead, when our S3 source's SHA1 already exists on

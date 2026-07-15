@@ -206,10 +206,17 @@ def get_phase_and_progress(
         # label ("hub+institution") with no matching log is in id-generation,
         # not a legacy hub-slug run, so exclude new-format ('+') logs from the
         # fallback to avoid attaching an unrelated institution's log.
-        hub_prefix = shlex.quote(hub + "-")
+        # Match ONLY legacy phase filenames (e.g. nara-download.log). A bare
+        # ``<hub>-`` prefix would also select a retired ``<hub>-drain.log`` left
+        # over from the old moving-window apparatus, after which no phase branch
+        # matches and status reads "Unknown". The ('+') exclusion is redundant
+        # with the anchored pattern but kept for clarity.
+        legacy_pattern = shlex.quote(
+            rf"^{re.escape(hub)}-(id-generation|download|upload|sdc)\.log$"
+        )
         log_file = ssm_run(
             client,
-            f"ls -t {log_dir}/ 2>/dev/null | grep -F {hub_prefix} | grep -vF '+' "
+            f"ls -t {log_dir}/ 2>/dev/null | grep -E -- {legacy_pattern} "
             "| head -1 || true",
         ).strip()
 

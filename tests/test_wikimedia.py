@@ -10,6 +10,7 @@ from ingest_wikimedia.wikimedia import (
     get_permissions_template,
     get_permissions,
     escape_wiki_strings,
+    escape_template_param,
     join,
     collect_duplicate_source_sha1s,
     compute_ordinal_exts_and_page_labels,
@@ -18,6 +19,7 @@ from ingest_wikimedia.wikimedia import (
     extract_strings_dict,
     file_has_inbound_usage,
     find_file_by_hash,
+    first_uploader,
     is_same_item_redirect_relic,
     merge_preserved_wikitext,
     post_commonsdelinker_request,
@@ -550,6 +552,52 @@ def test_find_file_by_hash_returns_none_when_no_match():
     site = MagicMock()
     site.allimages.return_value = []
     assert find_file_by_hash(site, "somesha1") is None
+
+
+def test_escape_template_param_escapes_equals():
+    # A positional value containing '=' would otherwise be split by the
+    # template parser (name=value); escape_template_param protects it. This is
+    # the escaping post_commonsdelinker_request relies on for titles like
+    # "height of camera objective = 6.5 feet".
+    assert escape_template_param("height = 6.5 feet") == "height {{=}} 6.5 feet"
+    assert escape_template_param("a=b=c") == "a{{=}}b{{=}}c"
+
+
+def test_escape_template_param_leaves_plain_value_untouched():
+    assert escape_template_param("no equals here") == "no equals here"
+
+
+class _FakeUploaderFilePage:
+    """Minimal FilePage stand-in for first_uploader: ``oldest_file_info.user``
+    returns ``user`` (or the property raises when ``raise_info`` to simulate
+    unreadable file history)."""
+
+    def __init__(self, user=None, raise_info=False):
+        self._user = user
+        self._raise = raise_info
+
+    def title(self, with_ns: bool = False) -> str:
+        return "Some File.jpg"
+
+    @property
+    def oldest_file_info(self):
+        if self._raise:
+            raise RuntimeError("no history")
+        return SimpleNamespace(user=self._user)
+
+
+def test_first_uploader_returns_oldest_uploader():
+    assert first_uploader(_FakeUploaderFilePage(user="DPLA bot")) == "DPLA bot"
+
+
+def test_first_uploader_none_when_user_empty():
+    assert first_uploader(_FakeUploaderFilePage(user="")) is None
+
+
+def test_first_uploader_none_when_history_unreadable():
+    # oldest_file_info raising (unreadable history) is caught and returns None,
+    # so the community-file classifier errs toward hands-off rather than crashing.
+    assert first_uploader(_FakeUploaderFilePage(raise_info=True)) is None
 
 
 NEW_WIKITEXT = "== {{int:filedesc}} ==\n{{DPLA metadata|title=Example}}"
