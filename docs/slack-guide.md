@@ -235,8 +235,7 @@ Phase annotations you may see on a row:
 - **`⏸ waiting on slots`** — every one of that session's workers is currently blocked on the box-wide worker-slot cap (`--workers-budget`). The session is healthy, just throttled while it waits for a slot to free.
 - **`(queued)`** — the session is parked behind the cap and hasn't logged its first item yet (vs. `starting...`, which means it's launching but not budget-blocked).
 - **`⚠ idle Nm`** — the session's log hasn't been written to in over 30 minutes and it isn't slot-blocked, so it may be hung.
-- **`[Slots: N]` / `[Awaiting slot]`** — shown only when the box-wide slot pool is fully saturated (0 free). `[Slots: N]` = this session currently holds N slots; `[Awaiting slot]` = it's in a slot-consuming phase (upload/SDC/drain) but holds none.
-- **`Draining (N queued, …)` / `Drain complete` / `Drain (opportunistic) skipped`** — the deferred drain phase that runs after a batch's uploads finish, working through a queued backlog of files. `N queued` is the number still waiting in the session's sidecar; the suffix shows host-lock state (`⏸ waiting for host lock`) or the current Commons `Category:Duplicate` size against the resume threshold (`Category:Duplicate at X, needs < Y`).
+- **`[Slots: N]` / `[Awaiting slot]`** — shown only when the box-wide slot pool is fully saturated (0 free). `[Slots: N]` = this session currently holds N slots; `[Awaiting slot]` = it's in a slot-consuming phase (upload/SDC) but holds none.
 
 The trailing context line:
 

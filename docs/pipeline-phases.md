@@ -1,14 +1,14 @@
 {% raw %}
 # Pipeline Phases
 
-Four sequential upload phases per target, followed by a `drain-deferred` phase that actions any duplicate-tag work the uploader deferred. All are idempotent — re-running picks up where it left off. The four upload phases operate per-partner, reading and writing under `s3://dpla-wikimedia/<partner>/images/<sharded-prefix>/<dpla-id>/` (see [sidecars.md](sidecars.md) for the path layout and file inventory).
+Four sequential upload phases per target. All are idempotent — re-running picks up where it left off. They operate per-partner, reading and writing under `s3://dpla-wikimedia/<partner>/images/<sharded-prefix>/<dpla-id>/` (see [sidecars.md](sidecars.md) for the path layout and file inventory).
 
 ```text
-get-ids-es  →  downloader  →  uploader  →  sdc-sync  →  drain-deferred
-   ▼              ▼            ▼              ▼             ▼
-dpla-map.json   media bytes   Commons        MediaInfo    deferred
-sdc.json        file-list.txt upload-        statements   {{Duplicate}}
-                iiif.json     result.json                 tags
+get-ids-es  →  downloader  →  uploader  →  sdc-sync
+   ▼              ▼            ▼              ▼
+dpla-map.json   media bytes   Commons        MediaInfo
+sdc.json        file-list.txt upload-        statements
+                iiif.json     result.json
 ```
 
 ## 1. `get-ids-es` — ID enumeration & metadata staging
@@ -109,19 +109,19 @@ Source: `tools/uploader.py`. The most complex phase.
 
 1. Reads `dpla-map.json` and `file-list.txt` from S3.
 2. Computes per-ordinal Commons file titles via `get_page_title()` and `compute_ordinal_exts_and_page_labels()` — see [special-cases.md](special-cases.md#title-generation) for the sanitization rules.
-3. For each ordinal: downloads the S3 object to a temp file, computes (or reads from S3 metadata) its SHA1, and decides how to upload it. The decision tree handles hash drift, redirects, and cross-item collisions — see [special-cases.md](special-cases.md#duplicate-detection-decision-tree) for the four cases. When a Case-2 resolution would upload bytes **and** tag a stranded sha1-sibling `{{Duplicate}}` but `Category:Duplicate` is at capacity, the whole op is deferred rather than tagged inline: the ordinal is recorded `DEFERRED` and the item is queued in the per-partner drain sidecar for phase 5, `drain-deferred`.
+3. For each ordinal: downloads the S3 object to a temp file, computes (or reads from S3 metadata) its SHA1, and decides what to do with it. Under the SHA1-uniqueness constraint (PR C+D) **no two Commons files may share a SHA1**, so once `find_file_by_hash` returns a hit the uploader NEVER uploads a second byte-identical copy — it resolves inline to exactly one non-upload outcome: SKIP (our content is already at the intended title), MOVE-rename (the intended title is empty or a redirect-to-self, via `_move_to_correct_title`), MERGE_AND_REDIRECT (legitimate source duplication — merge this item's SDC onto the earliest canonical file and leave a `#REDIRECT` at the intended title), or HAND_FIX (the rename is blocked, or the match is a community upload — recorded to `hand-fix.jsonl`, no upload). See [special-cases.md](special-cases.md#hash-drift-resolution) for the full decision tree.
 4. Composes Wikimedia file-page wikitext via `get_wiki_text()` — a `{{DPLA metadata}}` block with `| source = {{DPLA|...}}` and `| Institution = {{Institution|wikidata=...}}` parameters. See [templates.md](templates.md).
 5. Uploads via pywikibot's `site.upload()`. Catches `fileexists-shared-forbidden`, `filetype-badmime`, `filetype-banned`, `duplicate`, `no-change`, `backend-fail-internal` and other Wikimedia errors per the `IGNORE_WIKIMEDIA_WARNINGS` list (which suppresses cosmetic warnings but lets actual conflicts surface).
-6. After the per-ordinal loop, runs a **post-item orphan check**: probes `(page N+1)`, `(page N+2)`, etc. and tags any orphan from a previous run as `{{Duplicate|...}}` if its SHA1 matches a kept ordinal.
+6. After the per-ordinal loop, runs a **post-item orphan check**: probes `(page N+1)`, `(page N+2)`, etc. for stale trailing-page files an earlier run left behind after the source media was truncated. The probe is **log-only** — it writes nothing to Commons (the `{{Duplicate}}`-tag apparatus is retired), counting each orphan found under `Result.ORPHANS_FLAGGED` so an operator can reconcile it by hand. See [special-cases.md](special-cases.md#orphan-audit).
 7. Writes `upload-result.json` to S3 with one entry per ordinal (status / title / pageid / error). This sidecar is the SDC phase's source of truth for which Commons pages exist.
 
 **Dispatch.** When `--workers > 1` (the default, `UPLOADER_PRIORITY_SLOTS` = 4) the items are handed to a spawn-start `multiprocessing.Pool` via `imap_unordered`, each worker process holding its own pywikibot session; `--workers 1` walks the items serially in-process. Either path uploads each item under one box-wide `WorkerSlotBudget` slot when `--workers-budget > 0`.
 
-**Per-ordinal statuses written to `upload-result.json`.** `UPLOADED`, `SKIPPED`, `NOT_PRESENT`, `INELIGIBLE`, `FAILED`, `DEFERRED`. Only `UPLOADED` and `SKIPPED` are SDC-eligible; `DEFERRED` means the duplicate-tag upload was postponed to the drain phase because `Category:Duplicate` was at capacity.
+**Per-ordinal statuses written to `upload-result.json`.** `UPLOADED`, `SKIPPED`, `NOT_PRESENT`, `INELIGIBLE`, `FAILED`, `MERGED`, `HAND_FIX`. Only `UPLOADED` and `SKIPPED` are SDC-eligible. `MERGED` carries the canonical file's `title`/`pageid` but is deliberately *not* SDC-eligible — its SDC was merged onto the canonical file inline, so re-targeting our redirect title would double-write. `HAND_FIX` means the SHA1 match couldn't be safely resolved (rename blocked, or a community-file match) and was recorded to `hand-fix.jsonl` for a human. See [sidecars.md](sidecars.md#upload-resultjson) for the full status table.
 
 **Critical correctness detail: pageid refresh.** `wiki_file_page.pageid` returns the cached `0` from the pre-upload existence check rather than the just-assigned ID. `process_file` constructs a fresh `FilePage` and forces `.exists()` to refresh `pageid` before persisting (`uploader.py:625-649`). On any failure, `pageid` is set to `None` (not `0`) so `sdc_sync.py`'s `if not pageid` guard cleanly skips malformed entries.
 
-**Output.** Phase-end `COUNTS:` block plus per-item summary lines. A "Retry Complete" Slack message variant fires when the session label starts with `retry-` — the helper folds in download-phase failures so operators see one combined count instead of two confusing messages.
+**Output.** Phase-end `COUNTS:` block plus per-item summary lines; the block surfaces `UPLOAD_MERGED_TO_CANONICAL` and `UPLOAD_HAND_FIX` alongside the usual uploaded/skipped/failed totals, and the `#tech-alerts` completion summary reports the same figures as its `MERGED:` and `HAND-FIX:` lines. A "Retry Complete" Slack message variant fires when the session label starts with `retry-` — the helper folds in download-phase failures so operators see one combined count instead of two confusing messages.
 
 ## 4. `sdc-sync` — SDC sync
 
@@ -154,17 +154,6 @@ Legacy mode: `--file "File:Title.jpg"` (repeatable) or `--cat <Category>` or `--
 **Legacy-Artwork migration mode (`--migrate-legacy`).** Instead of running SDC sync, `sdc-sync --partner <partner> --migrate-legacy` walks the same partner IDs CSV and migrates each item's Commons files from the legacy `{{Artwork}}` form to `{{DPLA metadata}}`. For each file it walks the revision history to distinguish DPLA-bot-authored values (overwrite-safe with canonical data) from community contributions, preserves the community values by importing them as SDC statements with the `P887 → Q131783016` ("inferred from Wikitext") + `P4656` (Wikimedia import URL permalink) reference shape, then rewrites the wikitext. The exact same migration also runs automatically inside the post-SDC cleanup pass whenever a normal sync encounters a file still in the legacy form, so the standalone mode is just a way to drive it for a whole partner without re-syncing. `ingest_wikimedia/legacy_artwork.py` holds the logic; counters land in the `LEGACY_*` set.
 
 **Counters tracked.** Sync counters: `SDC_ITEMS_SYNCED` (item fully synced — every eligible ordinal succeeded), `SDC_ITEMS_PARTIALLY_SYNCED` (at least one ordinal synced *and* at least one sibling ordinal errored — broken out so dashboards keying on "items fully done" don't count mixed results as healthy), `SDC_CLAIMS_ADDED`, `SDC_REFS_ADDED`, `SDC_REMOVALS`, `SDC_QUALIFIER_UPDATES`, `SDC_PAGES_EDITED` (distinct Commons file pages actually written), `SDC_ITEMS_SKIPPED_NO_SIDECAR`, `SDC_ITEMS_SKIPPED_MAPPING`, `SDC_ITEMS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_ERROR`, `SDC_ORDINALS_SKIPPED_MISSING_ENTITY`, `SDC_ORDINALS_SKIPPED_MISSING_PAGEID` (uploader recorded a null/zero pageid and the title→pageid fallback couldn't resolve it either), and `SDC_SLOT_WAIT_SECONDS` (aggregate worker-seconds blocked on a `WorkerSlotBudget` slot, summed across workers). The error / mapping / missing-entity split is deliberate — operators need to distinguish bad-data items from bad-network items from upload-never-happened items. Migration mode adds the `LEGACY_*` set (`LEGACY_MIGRATED`, `LEGACY_IMPORTS_POSTED`, `LEGACY_SKIPPED_NOT_LEGACY`, `LEGACY_SKIPPED_ALREADY`, `LEGACY_SKIPPED_ERROR`).
-
-## 5. `drain-deferred` — deferred duplicate-tag drain
-
-Source: `tools/drain_deferred.py`.
-
-The uploader defers a Case-2 duplicate-tag op (upload bytes + tag a stranded sha1-sibling `{{Duplicate}}`) whenever `Category:Duplicate` is at capacity — it records the ordinal `DEFERRED` and queues the item's DPLA ID in a per-partner sidecar (`<partner_dir>/deferred-drain.json`, a local file managed by `ingest_wikimedia/drain_sidecar.py`). The `drain-deferred` phase re-invokes `uploader` and `sdc-sync` on the queued IDs once the category has room. It holds a host-wide advisory `flock` so only one drain touches Commons at a time, and runs in two modes:
-
-- **Opportunistic (`drain-deferred --no-wait <partner>`).** Appended to the end of every upload target's chain. A single best-effort round: if `Category:Duplicate` is below its resume threshold right now it drains what's queued, otherwise it exits immediately without waiting. Never blocks the next target, and posts no Slack notification.
-- **Patient (`drain-deferred <partner>`).** One terminal block per unique partner, queued after every target's chain has finished. Loops until the sidecar is empty, re-polling `Category:Duplicate` every `DEFAULT_POLL_SECS` (300 s ≈ 5 min) with no time budget. Posts its own Slack start/complete messages via `notify_drain_phase_start` / `notify_drain_phase_complete` (not `notify_phase_start`).
-
-The terminal patient drain is queued only for full upload batches — not `refresh_only`, `sdc_only`, or `maintain` runs.
 
 ---
 

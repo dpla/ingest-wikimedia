@@ -42,9 +42,6 @@ AWS SSM  →  EC2  (i-033eff6c8c168f999, "wiki downloads")
     │    3. uploader   <partner>.csv <partner> --workers-budget 24
     │    4. sdc-sync   --partner <partner> --ids-file <partner>.csv \
     │                    --workers 24 --workers-budget 24
-    │    5. drain-deferred --no-wait <partner>   (opportunistic duplicate-tag drain)
-    │  Then once per unique partner, at batch end:
-    │    6. drain-deferred <partner>             (terminal patient duplicate-tag drain)
     ▼
 S3 (s3://dpla-wikimedia/)        Wikimedia Commons
     sidecars + media bytes       file pages + MediaInfo SDC
@@ -213,8 +210,7 @@ The downloader and uploader also handle per-item failures internally; they only 
 | Single-item resolver | `tools/resolve_dpla_ids.py` | One ES batch query + eligibility check + stage |
 | Download | `tools/downloader.py` | Iterate IDs, download media (mediaMaster / IIIF), stage to S3, write `file-list.txt` + `iiif.json` |
 | Upload | `tools/uploader.py` | Iterate IDs, upload from S3 to Commons, resolve hash drift, write `upload-result.json` |
-| SDC sync | `tools/sdc_sync.py` | Read sidecars, post atomic per-file `wbeditentity` to Commons MediaInfo |
-| Deferred-tag drain | `tools/drain_deferred.py` | Patient (terminal) + opportunistic (`--no-wait`) drain of the per-partner deferred-tag sidecar — re-runs the deferred `{{duplicate}}`-tag work once `Category:Duplicate` clears |
+| SDC sync | `tools/sdc_sync.py` | Read sidecars, post atomic per-file `wbeditentity` to Commons MediaInfo; `merge_item_onto_canonical` re-homes a duplicate item's SDC onto the canonical file |
 | Partner registry | `ingest_wikimedia/partners.py` | Hub slugs, aliases, eligibility lookup, slugification, parsing |
 | ES client | `ingest_wikimedia/es.py` | Validated `post_es`, hard timeout, partial-response guards |
 | S3 client | `ingest_wikimedia/s3.py` | `dpla-wikimedia` bucket, sidecar paths, get/put helpers |
@@ -224,8 +220,7 @@ The downloader and uploader also handle per-item failures internally; they only 
 | SDC builders | `ingest_wikimedia/sdc.py` | `build_claims_for_doc`, P1545 chunking, rights mapping, NARA XML parsing, content-hub/service-hub partnership model (P195 + P3831 roles, `CONTENT_HUB_QIDS`) |
 | Legacy migration | `ingest_wikimedia/legacy_artwork.py` | `{{Artwork}}`→`{{DPLA metadata}}` migration: provenance walk, community-value import as SDC, wikitext rewrite |
 | Worker-slot budget | `ingest_wikimedia/worker_slots.py` | Box-wide `flock`-backed concurrent-Commons-write cap: a shared sdc-sync pool plus an additive dedicated uploader priority pool |
-| Deferred-drain sidecar | `ingest_wikimedia/drain_sidecar.py` | Persistent per-partner deferred-tag queue (`<partner>/deferred-drain.json`) the uploader writes when the duplicate-tag throttle defers |
-| Duplicate-tag throttle | `ingest_wikimedia/dup_throttle.py` | `Category:Duplicate` capacity gate — defers `{{duplicate}}` tags at/above `threshold`, resumes below `resume_below` (hysteresis) |
+| Hand-fix sidecar | `ingest_wikimedia/hand_fix_sidecar.py` | Appends one record per `HAND_FIX` ordinal to the per-partner local `<partner>/hand-fix.jsonl` (SHA1 match the bot can't safely resolve: `rename_blocked` or `community_file`) for a human |
 | Wikimedia helpers | `ingest_wikimedia/wikimedia.py` | Title generation, hash-drift handling, CommonsDelinker post |
 | Banlist | `ingest_wikimedia/banlist.py` + `dpla-id-banlist.txt` | Per-DPLA-ID skip list |
 

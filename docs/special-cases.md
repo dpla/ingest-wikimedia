@@ -5,10 +5,10 @@ The uploader carries the bulk of the pipeline's "what if Commons-side state does
 
 1. [Title generation](#title-generation)
 2. [Duplicate-detection decision tree](#duplicate-detection-decision-tree)
-3. [Hash drift: the four cases](#hash-drift-the-four-cases)
+3. [Hash drift resolution](#hash-drift-resolution)
 4. [Redirect handling](#redirect-handling)
 5. [CommonsDelinker integration](#commonsdelinker-integration)
-6. [Orphan tagging](#orphan-tagging)
+6. [Orphan audit](#orphan-audit)
 7. [Wikimedia error codes](#wikimedia-error-codes)
 8. [Content hubs vs. service hubs](#content-hubs-vs-service-hubs)
 9. [Per-ordinal status and pageid rescue](#per-ordinal-status-and-pageid-rescue)
@@ -66,65 +66,67 @@ page_title = get_page_title(...)
 existing = find_file_by_hash(site, sha1, preferred_title=page_title)
 
 if existing is None:
-    upload to page_title             # net-new file
+    upload to page_title                     # net-new file — the ONLY path that uploads
 elif existing.title == page_title:
-    SKIPPED                          # exact match, our content is already there
+    SKIPPED                                  # exact match, our content is already there
+elif _is_community_file(existing):
+    HAND_FIX (reason=community_file)         # never touch a community upload
 elif is_dup_sha1_sibling_at_expected_title(...):
-    proceed with "leave_others_alone"       # legitimate intra-item duplicate, not drift
+    MERGE_AND_REDIRECT (within_item=True)    # legitimate intra-item duplicate
 else:
-    drift_action = _resolve_hash_drift(...)  # see next section
+    drift_action = _resolve_hash_drift(...)  # MOVED / MERGE_AND_REDIRECT / HAND_FIX / ALREADY_CORRECT
 ```
 
-## Hash drift: the four cases
+Under the SHA1-uniqueness constraint (PR C+D) **no two Commons files may share a SHA1**: once `find_file_by_hash` returns a hit, the uploader NEVER uploads a second byte-identical copy — it resolves to exactly one non-upload outcome and returns. (The community / sibling / drift branches all run on the live, non-`dry_run` path.)
 
-`_resolve_hash_drift()` is invoked when our SHA1 already exists on Commons but at a different title than we want. It returns a `DriftResolution` str-enum — `MOVED`, `UPLOAD_AND_TAG`, `LEAVE_OTHERS_ALONE`, or `ALREADY_CORRECT`. Four distinguishable drift cases, plus an `ALREADY_CORRECT` early-return guard (described after Case 3):
+## Hash drift resolution
 
-### Case 0 — Cross-item collision
+`_resolve_hash_drift()` is invoked when our SHA1 already exists on Commons but at a different title than we want. Under the SHA1-uniqueness constraint (PR C+D) **no two Commons files may share a SHA1**, so none of its outcomes uploads a second byte-identical copy — every one is a rename, a merge-and-redirect, or a hand-off. It returns a `DriftResolution` str-enum: `MOVED`, `MERGE_AND_REDIRECT`, `HAND_FIX`, or `ALREADY_CORRECT`.
 
-The existing title encodes a *different* DPLA ID (extracted via `extract_dpla_id_from_commons_title`, regex `- DPLA - ([0-9a-f]{32})`). Whether we leave the existing file alone or migrate it hinges on whether that other DPLA ID still resolves:
+Two of the SHA1-already-present outcomes are decided by `process_file` *before* it reaches `_resolve_hash_drift`:
 
-- **Other item still valid in `api.dp.la`** — two genuinely distinct items happen to share a hash. Both files coexist; we upload to our intended title without touching the existing file. Return `"leave_others_alone"`.
-- **404 on the colliding DPLA ID** — the strongest possible signal that the existing Commons file is an orphan: its DPLA-side anchor is gone. We treat the 404 exactly like `other_item is None` and **fall through to Case 1/2/3 migration** (move or upload-and-tag), rather than silently creating a duplicate alongside the orphan.
-- **Any *other* error (network timeout, 5xx, JSON parse failure)** — none of these mean "the old ID is gone," so we stay on the conservative `"leave_others_alone"` fallback. A transient API blip must not trigger a destructive move on a file that may still have a valid sibling item.
+- **Community file → `HAND_FIX` (`community_file`).** If the matched file is a community upload (see [Community files](#community-files)), the uploader never renames, merges onto, redirects, or migrates it — it records a `community_file` hand-fix and stops.
+- **Within-item sibling → `MERGE_AND_REDIRECT`.** If `is_dup_sha1_sibling_at_expected_title` shows our SHA1 already sits at one of THIS item's own current asset positions, that sibling is the canonical file: merge this ordinal's SDC onto it (stamping the page number) and redirect our intended title to it.
+
+Everything else falls through to `_resolve_hash_drift`, whose outcomes are:
+
+### `MOVED` — rename into place
+
+The intended title is empty, or is a redirect pointing at our OWN file. `_move_to_correct_title` renames the existing file to the canonical title via `existing_file.move(..., noredirect=False)` (leaving a redirect at the old title) and posts a CommonsDelinker request (gated on inbound usage; suppressed for sibling slots — see [CommonsDelinker integration](#commonsdelinker-integration)). The move preserves the page's content inherently: its description is deliberately left untouched, because distinguishing community edits from drifted DPLA-bot fields needs the revision-history provenance walk that the post-SDC `sdc-sync` cleanup (`_post_sdc_cleanup_for_page`) runs on the moved file later in the same pipeline. The caller records the ordinal `UPLOADED` (the file now lives at the canonical title; MediaWiki preserves `pageid` across the move).
+
+### `MERGE_AND_REDIRECT` — source duplication
+
+Legitimate source duplication: either the existing title encodes a *different* DPLA ID that still resolves in `api.dp.la` (two live items genuinely share a hash — cross-item / cross-institution), or our SHA1 sits at one of THIS item's own asset positions (within-item). Rather than a second byte-identical file:
+
+1. Merge THIS item's structured data onto the earliest existing (canonical) file's MediaInfo entity via `sdc_sync.merge_item_onto_canonical` — add-only (`reconcile=False`), so the canonical owner's and any other contributor's statements are preserved. Within-item duplication stamps the ordinal's page number as a **P304** qualifier; cross-item adds this item's DPLA ID as an **additional P760** value and stamps no page number.
+2. Leave a `#REDIRECT [[File:<canonical>]]` at our intended title (`_create_redirect_to_canonical`, idempotent; it refuses to clobber a real file that already sits at the intended title).
+
+The caller records the ordinal `MERGED`. The result carries the canonical file's `title`/`pageid`, but `MERGED` is deliberately **not** in the SDC-sync eligibility set — the SDC was merged inline, so re-targeting our redirect title would double-write.
+
+### `HAND_FIX` — the bot can't safely resolve it
+
+No upload and nothing renamed; a descriptive record is appended to the per-partner `hand-fix.jsonl` sidecar (see [sidecars.md](sidecars.md#hand-fixjsonl-local-disk-not-s3)) for a human, and the ordinal is counted `Result.UPLOAD_HAND_FIX`. Two reasons:
+
+- **`rename_blocked`** — our SHA1 is at a wrong title and the intended title is occupied by a **different** (bad-hash) real file, or by a redirect to some *third* file, or the colliding file's DPLA ID could not be verified (a non-404 API error). The bot can neither upload a duplicate nor clobber the occupant, and it must not pick a winner between two distinct files.
+- **`community_file`** — the matched file is a community upload (decided in `process_file`, above).
+
+### Cross-item collision: the 404-vs-live distinction
+
+When the existing (wrong-title) file encodes a *different* DPLA ID (extracted via `extract_dpla_id_from_commons_title`, regex `- DPLA - ([0-9a-f]{32})`), the outcome hinges on whether that other ID still resolves:
+
+- **Other item still valid in `api.dp.la`** — two genuinely distinct live items share a hash → `MERGE_AND_REDIRECT` (centralize on their canonical file, redirect ours).
+- **404 on the colliding DPLA ID** — its DPLA-side anchor is gone, so the existing file is an orphan: fall through to the empty-intended / redirect / occupied logic and reclaim our title (a `MOVED`, or a `HAND_FIX` if the intended title turns out to be occupied by a different file).
+- **Any *other* error (network timeout, 5xx, JSON parse failure)** — none of these mean "the old ID is gone," so we route to `HAND_FIX` rather than act destructively on a transient blip.
 
 The 404-vs-other distinction is read off `ex.response.status_code`.
 
-### Case 1 — Intended title is a redirect to the existing file
+### `ALREADY_CORRECT` — normalized identity
 
-The existing file lives at some other title, and our intended title is a redirect pointing at it. Treat as Case 3 — move the existing file to our intended title.
+The file the SHA1 lookup returned IS the file at the intended title once MediaWiki's title normalisation (whitespace-run collapse, `_` → space, first-letter uppercase) is applied — typically a truncation/underscore artefact of `get_page_title`. There is no drift to resolve; falling through to the other branches here would attempt a move-to-self, or a redirect/hand-fix against the same page. The guard compares `_canonicalize_commons_title` on both sides; the caller records SKIPPED against the pywikibot-normalised title.
 
-### Case 2 — Intended title has real content with a different hash
+### Community files
 
-Conflict. The intended title is occupied by unrelated content; the existing file at the wrong title is ours. Three actions:
-
-1. Upload our SHA1 to the intended title with `force_ignore_warnings=True` (overwriting the unrelated content).
-2. Tag the old (wrong-title) file with `{{Duplicate|<correct-filename>|...}}` via `_tag_drift_duplicate` / `tag_as_duplicate` — using `prependtext` and the idempotent `_DUPLICATE_TAG_RE` regex so re-runs don't pile up tags. Before tagging, `_tag_drift_duplicate` also **rescues community-contributed metadata** from the old file — merging its license tags, assessment templates (`{{Picture of the day}}`, `{{Featured picture}}`, …), `{{Image extracted}}` parents, and category links forward onto our new upload via `merge_preserved_wikitext` (best-effort; a rescue failure is logged but does not block the tag). This matches the metadata preservation the move and redirect-overwrite paths already do.
-3. No CommonsDelinker request (we didn't move anything; we overwrote and tagged).
-
-Return: `"upload_and_tag"`.
-
-**Throttled and deferrable.** Every `{{Duplicate}}` tag adds a file to the human-maintained Category:Duplicate, so this upload-and-tag op is throttled. When the category is at capacity, the **whole op is deferred** — not just the tag — the ordinal is recorded as `ORDINAL_DEFERRED` and re-run by the drain pass (see [{{Duplicate}} throttle and deferred drain](#duplicate-throttle-and-deferred-drain) under Orphan tagging).
-
-**Sibling-slot fallback.** If the wrong-title file is itself one of this item's other expected ordinal positions (a sibling slot about to be overwritten this run), the duplicate tag is suppressed and the function returns `"leave_others_alone"` instead — the about-to-be-overwritten sibling shouldn't be tagged as a duplicate of a title we're still in the middle of writing.
-
-### Case 3 — Intended title is unoccupied
-
-The existing file is ours but at the wrong title; the intended title has nothing at it. Two actions:
-
-1. Move the existing file to the intended title via `existing_file.move(..., noredirect=False)` — leaving a redirect at the old title.
-2. Post a CommonsDelinker request to rewrite cross-wiki links pointing at the old title.
-
-Exception: if the old title is one of *this item's own* expected ordinal positions (a sibling slot about to be overwritten this same run), the move still happens but the delinker request is suppressed (`post_commonsdelinker=False`) — otherwise we'd ask the delinker to rewrite links pointing at a title we're about to clobber.
-
-Return: `"moved"`.
-
-### Already-correct (normalized identity)
-
-The file the SHA1 lookup returned IS the file at the intended title once MediaWiki's title normalisation (whitespace-run collapse, `_` → space, first-letter uppercase) is applied — typically a truncation/underscore artefact of `get_page_title`. There is no drift to resolve; falling through to Case 1/2/3 here would attempt a move-to-self or an upload-and-tag against the same page. The caller records SKIPPED against the pywikibot-normalised title. Return `"already_correct"`.
-
-### Short-circuit: intra-item duplicate-SHA1
-
-`is_dup_sha1_sibling_at_expected_title` checks whether the existing Commons file is one of THIS item's other expected ordinal positions. If so, the existing file is a legitimate sibling (same source media listed at multiple ordinals), not drift; we go straight to `"leave_others_alone"` and proceed.
+`_is_community_file` treats a file as community-owned — off-limits to automated rename / SDC-merge / redirect / template-migration — only when **both** signals say it isn't ours: (1) its title lacks the DPLA/NARA naming shape (`- DPLA - ` / `- NARA - `), **and** (2) its original uploader (`first_uploader`) is neither `DPLA bot` nor `US National Archives bot`. The AND is deliberate: a bot upload with a malformed title is still ours to fix, and a DPLA-shaped title uploaded from a personal account is still ours to act on. When the uploader can't be read, the file is treated as community (hands-off).
 
 ## Redirect handling
 
@@ -158,28 +160,20 @@ Used otherwise. Replaces the redirect text with fresh wikitext, optionally mergi
 | Call site | When | Posts a delinker request when… |
 |---|---|---|
 | `_resolve_redirect_move` | After moving a redirect target to the intended title | The old title has inbound usage |
-| `_move_to_correct_title` (Case 3) | After moving a file from a wrong title to the intended title | The old title has inbound usage AND is not a suppressed sibling slot |
-| `_move_to_correct_title` (Case 1) | After moving a file when the intended title was a redirect to it | Same: inbound usage AND not a sibling slot |
+| `_move_to_correct_title` (empty intended title) | After moving a file from a wrong title to the (empty) intended title | The old title has inbound usage AND is not a suppressed sibling slot |
+| `_move_to_correct_title` (redirect-to-self at intended title) | After moving a file when the intended title was a redirect to it | Same: inbound usage AND not a sibling slot |
 
 In other words: a delinker request is posted only if the old title has inbound usage and is not a suppressed sibling slot, and the usage check always runs before the move. A sibling slot is suppressed (`post_commonsdelinker=False`) because a later ordinal in the same session will overwrite the redirect at that title with different content, making any link-rewrite request invalid.
 
-The Case-2 path does NOT post a delinker request — there, `_tag_drift_duplicate` flags the old file for human review instead.
+The `MERGE_AND_REDIRECT` and `HAND_FIX` outcomes do NOT post a delinker request: a merge moves no file (it re-homes SDC onto the pre-existing canonical file and leaves a `#REDIRECT` at our *own* intended title), and a hand-fix touches nothing on Commons — so there is no old→new rename for CommonsDelinker to propagate.
 
-## Orphan tagging
+## Orphan audit
 
 The post-item orphan check sweeps for stale files left behind by source-media truncations. If a previous run uploaded `Foo (page 5).jpg` but the source now lists only 4 pages, page 5 is an orphan on Commons.
 
-`_post_item_orphan_check()` probes `(page N+1)`, `(page N+2)`, etc. above the highest kept page label for each extension group. For each found orphan, it compares the orphan's `latest_file_info.sha1` against the per-extension `sha1 → kept_title` map built from this run's surviving ordinals. On match, `tag_as_duplicate` prepends `{{Duplicate|<kept-title>|...}}` to the orphan.
+`_post_item_orphan_check()` probes `(page N+1)`, `(page N+2)`, etc. above the highest kept page label for each extension group (via `FilePage.exists()`, tolerating up to `_ORPHAN_GAP_TOLERANCE` consecutive gaps, since orphans aren't always contiguous). For each found orphan it compares the orphan's `latest_file_info.sha1` against the per-extension `sha1 → kept_title` map built from this run's surviving ordinals.
 
-**Counters:** `Result.ORPHANS_TAGGED` (matched the SHA1 of a kept ordinal and got the duplicate tag), `Result.ORPHANS_FLAGGED` (found but didn't match — left untouched for human review).
-
-`{{Duplicate}}` tagging is idempotent via the regex `_DUPLICATE_TAG_RE` that recognises `{{Duplicate}}` / `{{duplicate}}` with whitespace tolerance and a `(?:\||\}\})` lookahead so existing `{{DuplicateImageFinder|…}}` tags don't false-match.
-
-### {{Duplicate}} throttle and deferred drain
-
-Every `{{Duplicate}}` tag adds a file to the human-maintained Category:Duplicate, which Commons volunteers clear by hand. Commons admins asked (2026-07) that the category stay lean, so the **Case-2 hash-drift** upload-and-tag path is throttled by `DuplicateCategoryThrottle` (`ingest_wikimedia/dup_throttle.py`): it refuses new tags once the category reaches `DEFAULT_THRESHOLD` (190) members and does not resume until it drops below `DEFAULT_RESUME_BELOW` (140) — a hysteresis band. When the gate refuses, the **whole Case-2 op is deferred** (not just the tag), so we never upload the duplicating bytes and leave an untagged duplicate behind: the ordinal is recorded as `ORDINAL_DEFERRED` / `Result.UPLOAD_DEFERRED_DUP_CATEGORY`. Deferred DPLA IDs are persisted to a per-partner `<partner>/deferred-drain.json` sidecar (`ingest_wikimedia/drain_sidecar.py`); a patient `drain-deferred` phase waits for the category to drain, re-invokes the uploader on just those IDs, and loops until the sidecar is empty.
-
-The trailing-page orphan path above is intentionally left **un-gated** — it is bounded to truncated trailing pages per item (low volume) and has no drain channel, so deferring an orphan tag would leave the orphan unresolved with no retry.
+**Log-only (SHA1-uniqueness redesign).** The probe no longer writes anything to Commons — the entire `{{Duplicate}}`-tag apparatus (tagging, the `Category:Duplicate` throttle, and the deferred-drain phase) is retired. Every trailing-page orphan found is logged and counted under `Result.ORPHANS_FLAGGED` — whether or not it matches a kept ordinal's SHA1 — so an operator can see what a human may want to reconcile. Redirects are skipped outright (a redirect already points at its target and has no file content of its own; `latest_file_info` would follow it and falsely match). `Result.ORPHANS_TAGGED` survives in the `Result` enum for backward compatibility but is never incremented.
 
 ## Wikimedia error codes
 
@@ -263,10 +257,13 @@ ORDINAL_SKIPPED      # existing Commons file matches our SHA1
 ORDINAL_NOT_PRESENT  # no S3 asset to upload (downloader gap)
 ORDINAL_INELIGIBLE   # S3 asset present but uploader chose not to upload
 ORDINAL_FAILED       # upload attempted, raised, did not land
-ORDINAL_DEFERRED     # Case-2 upload+tag deferred: Category:Duplicate at capacity
+ORDINAL_MERGED       # source-duplicate SHA1: this item's SDC merged onto the
+                     #   canonical file, #REDIRECT left at our intended title
+ORDINAL_HAND_FIX     # SHA1 at a wrong title with the intended title blocked, or
+                     #   a community-file match: recorded to hand-fix.jsonl, no upload
 ```
 
-UPLOADED and SKIPPED ordinals carry a `title` and `pageid` and are eligible for `wbsetclaims`; NOT_PRESENT / INELIGIBLE / DEFERRED / FAILED have no canonical Commons page to attach structured data to.
+UPLOADED and SKIPPED ordinals carry a `title` and `pageid` and are eligible for `wbsetclaims`. MERGED carries the canonical file's `title`/`pageid` but is deliberately NOT SDC-eligible — its SDC was merged onto the canonical inline, so re-targeting our redirect title would double-write. NOT_PRESENT / INELIGIBLE / HAND_FIX / FAILED have no canonical Commons page of our own to attach structured data to.
 
 **Pageid resolution and the fail-closed contract.** Commons can accept a large (chunked) upload and return without a real `.pageid` (or return `0`) while indexing lags. `_refresh_pageid_with_retries(page_title)` (in `tools/uploader.py`) re-fetches the page with bounded backoff to ride out that lag. If the budget is exhausted without a real id, it returns `None` and the sidecar records `pageid: null` rather than a malformed `0`. That `pageid: null` is a deliberate **fail-closed contract**: `sdc-sync`'s `if not pageid` guard feeds the title→pageid fallback, which recovers the real pageid on the next run.
 
