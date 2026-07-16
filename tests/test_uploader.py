@@ -738,6 +738,39 @@ def test_resolve_hash_drift_within_item_sibling_slot_merges_and_redirects():
     assert action == "merge_and_redirect"
 
 
+def test_resolve_hash_drift_refuses_community_file_defense_in_depth():
+    """Defense-in-depth: process_file gates community files out BEFORE calling
+    _resolve_hash_drift, but the resolver independently refuses them too —
+    returning HAND_FIX_COMMUNITY before any drift classification, so no move /
+    merge-redirect path in it can ever touch a community file even if the
+    primary gate is reordered or removed. Proven by asserting get_page (the
+    first step of the real drift logic) and _move_to_correct_title are never
+    reached."""
+    from tools import uploader as um
+
+    uploader = _build_uploader_with_dpla()
+    dpla_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    # Non-DPLA/NARA-shaped title + a non-bot uploader ⇒ community file.
+    community = _drift_existing_file("Grandma's quilt, summer 1932.jpg")
+    intended_title = f"Item - DPLA - {dpla_id} (page 4).jpg"
+    with (
+        patch.object(um, "first_uploader", return_value="SomeVolunteer"),
+        patch("tools.uploader.get_page") as get_page_mock,
+        patch.object(uploader, "_move_to_correct_title") as move_mock,
+    ):
+        action = uploader._resolve_hash_drift(
+            existing_file=community,
+            page_title=intended_title,
+            dpla_id=dpla_id,
+            ordinal=4,
+            expected_item_titles={intended_title},
+        )
+    assert action == DriftResolution.HAND_FIX_COMMUNITY
+    # Short-circuited before any drift classification or mutation.
+    get_page_mock.assert_not_called()
+    move_mock.assert_not_called()
+
+
 def test_resolve_hash_drift_intended_title_occupied_by_different_file_hand_fix():
     """Our SHA1 is at a wrong title and the intended title is occupied by a
     DIFFERENT real file that is NOT one of this item's asset slots — the bot
@@ -1156,10 +1189,17 @@ def test_case3_move_posts_commonsdelinker_when_actual_is_not_sibling():
     uploader = _build_uploader_with_dpla()
     intended = _make_intended_page(_ITEM_PAGE_8, exists=False)
     # Old NARA-bot title from an earlier scheme — not part of current asset list.
+    # Its title lacks the DPLA/NARA shape, so _resolve_hash_drift's
+    # defense-in-depth community check reads the uploader: it's the NARA bot
+    # (ours), so it is NOT a community file and the Case-3 move proceeds.
     legacy_title = "Foo - NAID 99999.jpg"
     expected_titles = {_ITEM_PAGE_8, _ITEM_PAGE_11}
     with (
         patch("tools.uploader.get_page", return_value=intended),
+        patch(
+            "tools.uploader.first_uploader",
+            return_value="US National Archives bot",
+        ),
         patch.object(uploader, "_move_to_correct_title") as mock_move,
     ):
         action = uploader._resolve_hash_drift(
@@ -2098,6 +2138,76 @@ def test_process_file_merge_and_redirect_none_expected_titles_no_crash():
 
     assert result["status"] == "MERGED"
     assert captured["within_item"] is False
+
+
+def test_process_file_routes_resolver_community_outcome_to_hand_fix():
+    """Defense-in-depth wiring: if the primary community gate is bypassed
+    (_is_community_file patched to False here) but _resolve_hash_drift
+    independently returns HAND_FIX_COMMUNITY, process_file must route to
+    _record_community_hand_fix_and_skip (community_file reason) and NOT to the
+    generic rename_blocked hand-fix. This branch never runs in normal flow (the
+    primary gate returns first), so only a test can catch its call site drifting
+    out of sync with the helper signature."""
+    tracker = Tracker()
+    uploader = _process_file_uploader(tracker)
+
+    uploader.s3_client.get_media_s3_path.return_value = "nara/images/a/b/c/d/abc/1_abc"
+    uploader.s3_client.s3_file_exists.return_value = True
+    fake_s3_object = MagicMock()
+    fake_s3_object.content_length = 100
+    fake_s3_object.metadata = {"sha1": "deadbeef" * 5}
+    fake_s3_object.content_type = "image/jpeg"
+    uploader.s3_client.get_s3.return_value.Object.return_value = fake_s3_object
+
+    existing = MagicMock()
+    existing.title.return_value = "Grandma's quilt, summer 1932.jpg"
+
+    title = "File:Ours - DPLA - abcdef1234567890abcdef1234567890 (page 1).jpg"
+    captured = {}
+
+    def fake_record(**kwargs):
+        captured.update(kwargs)
+        return {"status": "HAND_FIX", "title": None, "pageid": None}
+
+    with (
+        patch("tools.uploader.get_wiki_text", return_value="wt"),
+        patch("tools.uploader.find_file_by_hash", return_value=existing),
+        patch("tools.uploader.get_page_title", return_value=title),
+        # Slip past the PRIMARY gate to exercise the resolver's independent layer.
+        patch.object(uploader, "_is_community_file", return_value=False),
+        patch(
+            "tools.uploader.is_dup_sha1_sibling_at_expected_title",
+            return_value=False,
+        ),
+        patch.object(
+            uploader,
+            "_resolve_hash_drift",
+            return_value=DriftResolution.HAND_FIX_COMMUNITY,
+        ),
+        patch.object(
+            uploader, "_record_community_hand_fix_and_skip", side_effect=fake_record
+        ) as record_mock,
+        patch.object(uploader, "_record_hand_fix_and_skip") as generic_mock,
+    ):
+        result = uploader.process_file(
+            dpla_id="abc",
+            title="Ours",
+            item_metadata={},
+            provider={},
+            data_provider={},
+            ordinal=1,
+            partner="nara",
+            page_label="",
+            verbose=False,
+            dry_run=False,
+            expected_item_titles=None,
+        )
+
+    assert result["status"] == "HAND_FIX"
+    record_mock.assert_called_once()
+    assert captured["community_file"] is existing
+    # Must NOT fall through to the generic rename_blocked hand-fix.
+    generic_mock.assert_not_called()
 
 
 def test_process_file_sha1_lock_recheck_skips_on_concurrent_upload(tmp_path):
