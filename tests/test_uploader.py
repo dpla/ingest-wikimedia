@@ -3264,8 +3264,6 @@ def test_merge_sdc_onto_canonical_within_item_passes_complete_page_set():
     uploader.s3_client.get_sdc_json.return_value = '{"claims": {"P170": []}}'
 
     with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
-        import tools.sdc_sync as sdc_sync
-
         uploader._merge_sdc_onto_canonical(
             canonical_mediaid="M42",
             dpla_id="yyyy",
@@ -3274,7 +3272,6 @@ def test_merge_sdc_onto_canonical_within_item_passes_complete_page_set():
             within_item=True,
             canonical_page_numbers=[1, 2],  # … but the COMPLETE set wins
         )
-        assert sdc_sync.site is uploader.site
 
     uploader.s3_client.get_sdc_json.assert_called_once_with("nara", "yyyy")
     merge_mock.assert_called_once()
@@ -3283,6 +3280,9 @@ def test_merge_sdc_onto_canonical_within_item_passes_complete_page_set():
     assert args[1] == "yyyy"
     assert args[2] == {"claims": {"P170": []}}
     assert merge_mock.call_args.kwargs["page_numbers"] == [1, 2]
+    # The uploader hands its authenticated site through the call (no direct
+    # mutation of sdc_sync.site); merge_item_onto_canonical installs it.
+    assert merge_mock.call_args.kwargs["commons_site"] is uploader.site
 
 
 def test_merge_sdc_onto_canonical_within_item_falls_back_to_own_page():

@@ -146,7 +146,7 @@ LEGACY_IMPORT_PROPERTY: dict[str, tuple[str, str]] = {
 # The guard is deliberately PRESENCE-based (is there a statement for this
 # property at all?), a backstop for the dominant failure: the canonical write
 # not firing, leaving the property entirely absent. It is intentionally looser
-# than ``tools/sdc_sync.py``'s provenance-based ``_entity_has_dpla_attributed_claims``
+# than ``ingest_wikimedia/sdc.py``'s provenance-based ``_entity_has_dpla_attributed_claims``
 # (which matches the P123=Q_DPLA publisher reference) — presence cannot
 # over-preserve the normal flow (canonical SDC present ⟹ property present ⟹
 # strip proceeds), whereas a provenance check would entangle with the codebase's
