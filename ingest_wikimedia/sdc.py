@@ -2008,7 +2008,11 @@ def _is_dpla_reference(reference) -> bool:
     America"). DPLA stamps that snak on every reference it writes via
     formattedclaim, so it's a sufficient marker for "we authored this".
     """
-    snaks = (reference or {}).get("snaks") or {}
+    if not isinstance(reference, dict):
+        return False
+    snaks = reference.get("snaks") or {}
+    if not isinstance(snaks, dict):
+        return False
     for snak in snaks.get("P123") or []:
         try:
             if snak["datavalue"]["value"]["id"] == Q_DPLA:
@@ -2042,7 +2046,10 @@ def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
         for stmt in stmt_list:
             if not isinstance(stmt, dict):
                 continue
-            for reference in stmt.get("references") or []:
+            references = stmt.get("references") or []
+            if not isinstance(references, list):
+                continue
+            for reference in references:
                 if _is_dpla_reference(reference):
                     return True
     return False
