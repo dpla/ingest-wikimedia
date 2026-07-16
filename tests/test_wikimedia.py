@@ -13,9 +13,8 @@ from ingest_wikimedia.wikimedia import (
     escape_template_param,
     join,
     collect_duplicate_source_sha1s,
-    compute_ordinal_exts_and_page_labels,
     compute_sha1_page_numbers,
-    read_sha1_by_ordinal,
+    prescan_ordinals,
     extract_page_ordinal_from_commons_title,
     extract_strings,
     extract_strings_dict,
@@ -1045,7 +1044,7 @@ def test_relic_intended_belongs_to_different_item_is_false():
     assert is_same_item_redirect_relic(intended, target, ITEM) is False
 
 
-# compute_ordinal_exts_and_page_labels — uploader-side gap-squashing
+# prescan_ordinals — ext/page-label facet: uploader-side gap-squashing
 def _fake_s3_client(mime_by_ord: dict[int, str | None]) -> MagicMock:
     """Build a mock S3Client whose Object().content_type returns the configured
     MIME per ordinal. None means the object doesn't exist (raises ClientError)."""
@@ -1062,6 +1061,7 @@ def _fake_s3_client(mime_by_ord: dict[int, str | None]) -> MagicMock:
             )
         obj = MagicMock()
         obj.content_type = mime
+        obj.metadata = {}  # this fixture exercises ext/page-label only
         return obj
 
     boto3_resource = MagicMock()
@@ -1084,7 +1084,7 @@ def test_page_labels_dense_jpegs_match_ordinal():
             5: "image/jpeg",
         }
     )
-    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 5)
+    exts, labels, _ = prescan_ordinals(s3, "abc" * 11, "pa", 5)
     assert exts == {1: ".jpg", 2: ".jpg", 3: ".jpg", 4: ".jpg", 5: ".jpg"}
     assert labels == {1: "1", 2: "2", 3: "3", 4: "4", 5: "5"}
 
@@ -1101,7 +1101,7 @@ def test_page_labels_zero_byte_stub_squashes():
             5: "image/jpeg",
         }
     )
-    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 5)
+    exts, labels, _ = prescan_ordinals(s3, "abc" * 11, "pa", 5)
     assert exts == {1: ".jpg", 2: ".jpg", 3: "", 4: ".jpg", 5: ".jpg"}
     # ord 1-2 = "1","2"; ord 3 ext="" only one, page_label=""; ord 4-5 = "3","4"
     assert labels == {1: "1", 2: "2", 3: "", 4: "3", 5: "4"}
@@ -1111,13 +1111,14 @@ def test_page_labels_clienterror_treated_as_stub_placeholder():
     # Missing S3 object — ordinal_exts gets "" placeholder per the
     # "every continue path must write a placeholder slot" lesson.
     s3 = _fake_s3_client({1: "image/jpeg", 2: None, 3: "image/jpeg"})
-    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
+    exts, labels, _ = prescan_ordinals(s3, "abc" * 11, "pa", 3)
     assert exts == {1: ".jpg", 2: "", 3: ".jpg"}
     assert labels == {1: "1", 2: "", 3: "2"}
 
 
-# read_sha1_by_ordinal — the SINGLE S3 pass both duplicate detection and P304
-# page numbering derive from (so they can never diverge and drop a page).
+# prescan_ordinals — sha1_by_ordinal facet. The SINGLE S3 pass both duplicate
+# detection and P304 page numbering derive from (so they can never diverge and
+# drop a page).
 def _fake_s3_client_with_sha1s(sha1_by_ord: dict[int, object]):
     """Mock S3Client whose Object().metadata[CHECKSUM] returns the configured
     value per ordinal. A str value is the stored sha1 ("" = present but empty);
@@ -1131,6 +1132,7 @@ def _fake_s3_client_with_sha1s(sha1_by_ord: dict[int, object]):
         if isinstance(val, Exception):
             raise val
         obj = MagicMock()
+        obj.content_type = "image/jpeg"  # this fixture exercises the sha1 map only
         obj.metadata = {} if val is None else {"sha1": val}
         return obj
 
@@ -1149,54 +1151,93 @@ def _client_error(code: str):
     return ClientError({"Error": {"Code": code, "Message": "x"}}, "HeadObject")
 
 
-def test_read_sha1_by_ordinal_reads_all():
+def _prescan_sha1(s3, dpla_id, partner, num_files):
+    _, _, sha1_by_ordinal = prescan_ordinals(s3, dpla_id, partner, num_files)
+    return sha1_by_ordinal
+
+
+def test_prescan_ordinals_reads_each_object_once():
+    # The whole point of the fusion: content_type (ext/page-label) and CHECKSUM
+    # (sha1) come from ONE boto3 Object per ordinal — one HEAD, not two passes.
     s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "aaa"})
-    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 3) == {
-        1: "aaa",
-        2: "bbb",
-        3: "aaa",
-    }
+    exts, labels, sha1 = prescan_ordinals(s3, "abc" * 11, "pa", 3)
+    assert sha1 == {1: "aaa", 2: "bbb", 3: "aaa"}
+    assert exts == {1: ".jpg", 2: ".jpg", 3: ".jpg"}
+    assert labels == {1: "1", 2: "2", 3: "3"}
+    # One Object construction per ordinal — the read was not doubled.
+    assert s3.get_s3.return_value.Object.call_count == 3
 
 
-def test_read_sha1_by_ordinal_skips_empty_and_absent_metadata():
+def test_prescan_sha1_reads_all():
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "aaa"})
+    assert _prescan_sha1(s3, "abc" * 11, "pa", 3) == {1: "aaa", 2: "bbb", 3: "aaa"}
+
+
+def test_prescan_sha1_skips_empty_and_absent_metadata():
     # Present object with empty/absent CHECKSUM → ordinal simply absent from the
     # snapshot (the caller treats it as its own singleton group — never a strip).
     s3 = _fake_s3_client_with_sha1s({1: "", 2: None, 3: "ccc"})
-    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 3) == {3: "ccc"}
+    assert _prescan_sha1(s3, "abc" * 11, "pa", 3) == {3: "ccc"}
 
 
-def test_read_sha1_by_ordinal_skips_genuinely_absent_object():
+def test_prescan_sha1_skips_genuinely_absent_object():
     # A 404 / NoSuchKey means the object isn't there (stub) — tolerated skip.
     s3 = _fake_s3_client_with_sha1s({1: _client_error("404"), 2: "bbb"})
-    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 2) == {2: "bbb"}
+    assert _prescan_sha1(s3, "abc" * 11, "pa", 2) == {2: "bbb"}
     s3 = _fake_s3_client_with_sha1s({1: _client_error("NoSuchKey"), 2: "bbb"})
-    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 2) == {2: "bbb"}
+    assert _prescan_sha1(s3, "abc" * 11, "pa", 2) == {2: "bbb"}
 
 
-def test_read_sha1_by_ordinal_single_file_short_circuits_without_s3():
+def test_prescan_sha1_records_download_only_and_octet_stream_ordinals():
+    # SHA1 is read BEFORE the extension classification's continues, so a
+    # download-only (video) or octet-stream ordinal still contributes its
+    # fingerprint to duplicate detection — the behaviour the standalone SHA1
+    # read had before the two passes were fused into this one.
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "ccc"})
+
+    def get_obj(bucket, path):
+        ord_num = int(path.rsplit("/", 1)[-1].split("_", 1)[0])
+        obj = MagicMock()
+        obj.content_type = {
+            1: "image/jpeg",
+            2: "video/mp4",  # download-only
+            3: "binary/octet-stream",  # placeholder
+        }[ord_num]
+        obj.metadata = {"sha1": {1: "aaa", 2: "bbb", 3: "ccc"}[ord_num]}
+        return obj
+
+    s3.get_s3.return_value.Object.side_effect = get_obj
+    exts, _, sha1 = prescan_ordinals(s3, "abc" * 11, "pa", 3)
+    # ord 2 is download-only (absent from exts); ord 3 is octet-stream ("").
+    assert exts == {1: ".jpg", 3: ""}
+    # ...but all three fingerprints are in the snapshot.
+    assert sha1 == {1: "aaa", 2: "bbb", 3: "ccc"}
+
+
+def test_prescan_sha1_single_file_short_circuits_without_s3():
     # A single-file item can't be a within-item duplicate and has no page
-    # number, so we skip the read entirely — matching the sibling's num_files>1
-    # guard. Critically, this avoids turning a transient S3 blip into a
-    # whole-item failure on the dominant single-file shape (the read re-raises).
+    # number, so we skip the read entirely (num_files <= 1 guard). Critically,
+    # this avoids turning a transient S3 blip into a whole-item failure on the
+    # dominant single-file shape (the read re-raises).
     s3 = _fake_s3_client_with_sha1s({1: _client_error("SlowDown")})
-    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 1) == {}
+    assert _prescan_sha1(s3, "abc" * 11, "pa", 1) == {}
     # No S3 object access attempted at all.
     assert s3.get_s3.return_value.Object.call_count == 0
 
 
-def test_read_sha1_by_ordinal_reraises_transient_s3_error():
+def test_prescan_sha1_reraises_transient_s3_error():
     # A transient/permission S3 error must FAIL LOUDLY, not silently drop the
     # ordinal — a dropped ordinal is exactly how a detected duplicate's page goes
-    # un-unioned and P304 gets stripped. Mirrors compute_ordinal_exts_and_page_labels.
+    # un-unioned and P304 gets stripped.
     import pytest
     from botocore.exceptions import ClientError
 
     s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: _client_error("AccessDenied")})
     with pytest.raises(ClientError):
-        read_sha1_by_ordinal(s3, "abc" * 11, "pa", 2)
+        _prescan_sha1(s3, "abc" * 11, "pa", 2)
 
 
-# collect_duplicate_source_sha1s — pure over a read_sha1_by_ordinal snapshot.
+# collect_duplicate_source_sha1s — pure over a prescan_ordinals snapshot.
 def test_collect_duplicate_source_sha1s_all_unique():
     assert collect_duplicate_source_sha1s({1: "aaa", 2: "bbb", 3: "ccc"}) == set()
 
@@ -1316,13 +1357,13 @@ def test_page_labels_non_404_clienterror_propagates():
         {"Error": {"Code": "AccessDenied", "Message": "nope"}}, "HeadObject"
     )
     with pytest.raises(ClientError):
-        compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
+        prescan_ordinals(s3, "abc" * 11, "pa", 3)
 
 
 def test_page_labels_single_file_item_no_pagination():
     # num_files == 1 → no pre-scan, no page label, no (page N) suffix.
     s3 = _fake_s3_client({1: "image/jpeg"})
-    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 1)
+    exts, labels, _ = prescan_ordinals(s3, "abc" * 11, "pa", 1)
     assert exts == {}
     assert labels == {1: ""}
 
@@ -1338,7 +1379,7 @@ def test_page_labels_mixed_extensions_per_ext_counter():
             5: "image/jpeg",
         }
     )
-    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 5)
+    exts, labels, _ = prescan_ordinals(s3, "abc" * 11, "pa", 5)
     assert exts == {1: ".jpg", 2: ".pdf", 3: ".jpg", 4: ".pdf", 5: ".jpg"}
     # jpg counter: ord 1→"1", ord 3→"2", ord 5→"3"
     # pdf counter: ord 2→"1", ord 4→"2"
@@ -1348,7 +1389,7 @@ def test_page_labels_mixed_extensions_per_ext_counter():
 def test_page_labels_unique_extension_gets_empty_label():
     # When only one file has a given extension, no (page N) suffix.
     s3 = _fake_s3_client({1: "image/jpeg", 2: "image/jpeg", 3: "application/pdf"})
-    exts, labels = compute_ordinal_exts_and_page_labels(s3, "abc" * 11, "pa", 3)
+    exts, labels, _ = prescan_ordinals(s3, "abc" * 11, "pa", 3)
     assert exts == {1: ".jpg", 2: ".jpg", 3: ".pdf"}
     # ext_counts: .jpg→2, .pdf→1. Only .jpg gets page numbers.
     assert labels == {1: "1", 2: "2", 3: ""}

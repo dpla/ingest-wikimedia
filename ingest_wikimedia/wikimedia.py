@@ -243,50 +243,90 @@ def get_page_title(
         return f"{escaped_visible_title} - DPLA - {dpla_identifier}{suffix}"
 
 
-def compute_ordinal_exts_and_page_labels(
+def prescan_ordinals(
     s3_client: S3Client,
     dpla_id: str,
     partner: str,
     num_files: int,
-) -> tuple[dict[int, str], dict[int, str]]:
-    """Compute per-ordinal extension and page-label for a multi-file DPLA item.
+) -> tuple[dict[int, str], dict[int, str], dict[int, str]]:
+    """Read every ordinal's S3 object ONCE and return the three per-ordinal facts
+    the uploader derives from a multi-file DPLA item's asset list.
 
-    Mirrors the uploader's pre-scan + per-extension counter logic so any code
-    that needs to predict the Commons title an S3 ordinal will land at can
-    reconstruct it without duplicating the (subtle) accounting. Producer
-    (uploader) and consumer (verifier) MUST share this helper so they never
-    diverge — see lessons.md "Don't normalize platform-dependent values on
-    one side of a producer/consumer pair".
+    A boto3 ``Object`` load is a single HEAD that caches every attribute, so the
+    ``content_type`` (drives the extension / page-label accounting) and the
+    ``CHECKSUM`` user-metadata (the content fingerprint) are read off the SAME
+    object for one request per ordinal, not two passes of ``num_files`` HEADs
+    each. Beyond halving the requests, reading both off one HEAD makes the
+    extension accounting and the SHA1 snapshot provably consistent — the exact
+    divergence the P304 machinery must avoid (see :func:`compute_sha1_page_numbers`).
+
+    Any code that needs to predict the Commons title an ordinal lands at MUST
+    share this helper so producer (uploader) and consumer (verifier) never
+    diverge — see lessons.md "Don't normalize platform-dependent values on one
+    side of a producer/consumer pair".
 
     Returns:
-        ordinal_exts: {ordinal: extension} for ordinals the uploader has
-            classified during pre-scan.
+        ordinal_exts: {ordinal: extension} for ordinals classified during the
+            pre-scan.
               - real ext (e.g. ".jpg") means a normal uploadable file.
-              - "" means a stub or octet-stream placeholder; process_file
-                may still upload it after content-type re-detection but
-                without a (page N) suffix.
-              - ordinals absent from the dict are download-only files
-                (e.g. videos) — staged to S3 but never uploaded.
+              - "" means a stub or octet-stream placeholder; process_file may
+                still upload it after content-type re-detection but without a
+                (page N) suffix.
+              - ordinals absent from the dict are download-only files (e.g.
+                videos) — staged to S3 but never uploaded.
         page_labels: {ordinal: page_label_string} for every ordinal in
-            1..num_files. Pass to get_page_title(page=...). Empty string
-            means no (page N) suffix on the Commons title.
+            1..num_files. Pass to get_page_title(page=...). Empty string means no
+            (page N) suffix on the Commons title.
+        sha1_by_ordinal: {ordinal: stored CHECKSUM sha1}, the item's content
+            fingerprint. Consumed by :func:`collect_duplicate_source_sha1s`
+            (duplicate detection) and :func:`compute_sha1_page_numbers` (P304
+            page numbering). An ordinal with empty/absent CHECKSUM metadata is
+            absent from the map; the caller treats it as its own singleton group,
+            so it keeps its own title-derived page and is never mistaken for a
+            page-less file whose P304 should be stripped. (The error contract and
+            the read-before-classification ordering are documented inline below.)
+
+    Single-file / empty items skip the S3 pass entirely (``num_files <= 1``): one
+    file cannot be a WITHIN-item duplicate of itself and has no page number, so
+    the read is pure overhead — and, because it can re-raise, it would otherwise
+    turn a transient S3 blip into a whole-item failure on the dominant single-
+    file shape. (Cross-item duplication of a lone file is detected separately by
+    process_file's own hash probe, not here.)
+
+    KNOWN RESIDUAL (not a regression; documented, not silently accepted): the
+    SHA1 fingerprint lives only in droppable S3 user-metadata. If a within-item
+    duplicate sibling's CHECKSUM is stripped externally (e.g. a copy_object with
+    MetadataDirective=REPLACE that omits it) BETWEEN a correct run and a re-run,
+    that sibling drops out of the snapshot, the canonical is recomputed without
+    the sibling's page, and the authoritative P304 amend shrinks a
+    previously-correct set. Fixing this needs a fingerprint that survives
+    metadata drift (recompute from bytes, or persist the per-ordinal grouping)
+    — deferred; the add-only "don't shrink" shortcut is rejected because it
+    would also block the legitimate removal of a genuinely-stale P304.
     """
     ordinal_exts: dict[int, str] = {}
+    sha1_by_ordinal: dict[int, str] = {}
     if num_files > 1:
         for i in range(1, num_files + 1):
             s3_path = s3_client.get_media_s3_path(dpla_id, i, partner)
             try:
                 s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
                 mime = s3_obj.content_type
+                sha1 = (s3_obj.metadata or {}).get(CHECKSUM)
             except ClientError as e:
-                # Only treat "object not found" as a stub placeholder.
-                # Anything else (AccessDenied, InternalError, throttling) must
-                # surface so we never silently corrupt the page-label
-                # assignment on a transient S3 failure.
+                # Only treat "object not found" as a stub placeholder. Anything
+                # else (AccessDenied, InternalError, throttling) must surface so
+                # we never silently corrupt the page-label assignment or drop an
+                # ordinal from the SHA1 snapshot on a transient S3 failure.
                 if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
                     ordinal_exts[i] = ""
                     continue
                 raise
+            # Record the fingerprint for every existing ordinal FIRST — before
+            # the extension classification's continues — so download-only and
+            # octet-stream ordinals still count toward duplicate detection.
+            if sha1:
+                sha1_by_ordinal[i] = sha1
             if is_download_only(mime):
                 continue
             if mime in ("application/octet-stream", "binary/octet-stream"):
@@ -306,77 +346,12 @@ def compute_ordinal_exts_and_page_labels(
         else:
             page_labels[ordinal] = ""
 
-    return ordinal_exts, page_labels
-
-
-def read_sha1_by_ordinal(
-    s3_client: S3Client,
-    dpla_id: str,
-    partner: str,
-    num_files: int,
-) -> dict[int, str]:
-    """Read each ordinal's stored SHA1 (the ``CHECKSUM`` S3 user-metadata) in a
-    SINGLE pass over the item's asset list.
-
-    This snapshot is the item's authoritative content fingerprint, and BOTH
-    duplicate detection (:func:`collect_duplicate_source_sha1s`) and P304 page
-    numbering (:func:`compute_sha1_page_numbers`) derive from it. Reading once
-    and sharing the result is deliberate, not incidental: two independent S3
-    passes can DISAGREE (one reads an ordinal's hash, the other transiently
-    fails), and a within-item duplicate that is *detected* but whose page is not
-    *unioned* onto the canonical is exactly how P304 silently drops. One snapshot
-    makes detection and numbering provably consistent — the same producer/
-    consumer-share rule :func:`compute_ordinal_exts_and_page_labels` documents.
-
-    Error contract mirrors that sibling: a genuinely-absent object
-    (404 / NoSuchKey) is skipped; any other S3 error is re-raised so a transient
-    failure fails the item LOUDLY rather than silently under-populating the
-    fingerprint. An object present with empty/absent CHECKSUM metadata is also
-    skipped (ordinal absent from the map) — the caller treats an ordinal with no
-    known SHA1 as its own singleton group, so it still keeps its own
-    title-derived page number and is never mistaken for a page-less file whose
-    P304 should be stripped.
-
-    Single-file items short-circuit to ``{}`` (like the sibling's ``num_files >
-    1`` guard): one file cannot be a WITHIN-item duplicate of itself and has no
-    page number, so the read is pure overhead — and, because it can re-raise,
-    the read would otherwise turn a transient S3 blip into a whole-item failure
-    on the dominant single-file shape. (Cross-item duplication of a lone file is
-    detected separately by process_file's own hash probe, not here.)
-
-    KNOWN RESIDUAL (not a regression; documented, not silently accepted): the
-    SHA1 fingerprint lives only in droppable S3 user-metadata. If a within-item
-    duplicate sibling's CHECKSUM is stripped externally (e.g. a copy_object with
-    MetadataDirective=REPLACE that omits it) BETWEEN a correct run and a re-run,
-    that sibling drops out of the snapshot, the canonical is recomputed without
-    the sibling's page, and the authoritative P304 amend shrinks a
-    previously-correct set. Fixing this needs a fingerprint that survives
-    metadata drift (recompute from bytes, or persist the per-ordinal grouping)
-    — deferred; the add-only "don't shrink" shortcut is rejected because it
-    would also block the legitimate removal of a genuinely-stale P304.
-    """
-    if num_files <= 1:
-        return {}
-    sha1_by_ordinal: dict[int, str] = {}
-    for i in range(1, num_files + 1):
-        s3_path = s3_client.get_media_s3_path(dpla_id, i, partner)
-        try:
-            s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
-            sha1 = (s3_obj.metadata or {}).get(CHECKSUM)
-        except ClientError as e:
-            # 404/NoSuchKey → tolerated skip; anything else re-raises (see the
-            # error-contract paragraph in the docstring for why loud-fail here).
-            if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
-                continue
-            raise
-        if sha1:
-            sha1_by_ordinal[i] = sha1
-    return sha1_by_ordinal
+    return ordinal_exts, page_labels, sha1_by_ordinal
 
 
 def collect_duplicate_source_sha1s(sha1_by_ordinal: dict[int, str]) -> set[str]:
     """Return SHA1s that appear at TWO OR MORE ordinals in this item's asset
-    list, given a :func:`read_sha1_by_ordinal` snapshot.
+    list, given a :func:`prescan_ordinals` snapshot.
 
     A SHA1 in this set means the source lists the same content at multiple
     ordinals — legitimate within-item / cross-item duplication that must
@@ -396,7 +371,7 @@ def compute_sha1_page_numbers(
     page_labels: dict[int, str],
 ) -> dict[int, list[int]]:
     """Map each ordinal to the COMPLETE sorted set of P304 page numbers its
-    content occupies in this item, from a :func:`read_sha1_by_ordinal` snapshot.
+    content occupies in this item, from a :func:`prescan_ordinals` snapshot.
 
     Page numbers come from the title-derived ``page_labels`` — an ordinal's own
     position in its extension series. SHA1 grouping only adds the UNION: a
