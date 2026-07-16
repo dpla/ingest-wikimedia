@@ -118,6 +118,8 @@ from ingest_wikimedia.wikimedia import (
     build_title_drift_move_reason,
     collect_duplicate_source_sha1s,
     compute_ordinal_exts_and_page_labels,
+    compute_sha1_page_numbers,
+    read_sha1_by_ordinal,
     get_page_title,
     get_wiki_text,
     wikimedia_url,
@@ -700,6 +702,7 @@ class Uploader:
         dry_run: bool,
         duplicate_source_sha1s: set[str] | None = None,
         expected_item_titles: set[str] | None = None,
+        canonical_page_numbers: list[int] | None = None,
     ) -> dict:
         """Process one ordinal's source asset and return a per-ordinal result dict.
 
@@ -988,6 +991,7 @@ class Uploader:
                             page_label=page_label,
                             within_item=True,
                             sha1=sha1,
+                            canonical_page_numbers=canonical_page_numbers,
                         )
 
                     drift_action = self._resolve_hash_drift(
@@ -1043,6 +1047,7 @@ class Uploader:
                             within_item=bool(expected_item_titles)
                             and existing_title in expected_item_titles,
                             sha1=sha1,
+                            canonical_page_numbers=canonical_page_numbers,
                         )
                     # DriftResolution.HAND_FIX (and any unforeseen sentinel):
                     # our SHA1 is at a wrong title and the intended title is
@@ -1992,6 +1997,7 @@ class Uploader:
         page_label: str,
         within_item: bool,
         sha1: str,
+        canonical_page_numbers: list[int] | None = None,
     ) -> dict:
         """Rule #3 (source duplication): centralize our SHA1 onto the earliest
         existing (canonical) Commons file instead of uploading a second
@@ -1999,8 +2005,10 @@ class Uploader:
 
         (a) Merge THIS item's structured data onto the canonical file's
             MediaInfo entity (add-only; other contributors' statements are
-            preserved). Within-item duplication stamps the page number this
-            ordinal occupies as a P304 qualifier; cross-item passes none.
+            preserved). Within-item duplication stamps the canonical's COMPLETE
+            page set (``canonical_page_numbers`` — every page position this
+            SHA1 occupies in the item, computed up front) as P304 qualifiers,
+            authoritatively and in one edit; cross-item passes none.
         (b) Leave a ``#REDIRECT`` at our intended title. A redirect carries no
             media, so the one-SHA1-one-file constraint holds.
 
@@ -2067,6 +2075,7 @@ class Uploader:
             partner=partner,
             page_label=page_label,
             within_item=within_item,
+            canonical_page_numbers=canonical_page_numbers,
         ):
             logging.warning(
                 f"Merge for {dpla_id} {ordinal}: SDC merge onto "
@@ -2130,6 +2139,7 @@ class Uploader:
         partner: str,
         page_label: str,
         within_item: bool,
+        canonical_page_numbers: list[int] | None = None,
     ) -> bool:
         """Read this item's staged ``sdc.json`` and merge it onto the canonical
         file's MediaInfo entity via ``sdc_sync.merge_item_onto_canonical``
@@ -2173,9 +2183,23 @@ class Uploader:
                 f"Merge for {dpla_id}: sdc.json failed to parse ({ex}); SDC not merged."
             )
             return False
-        # Within-item duplication: stamp the page number this ordinal occupies
-        # as a P304 qualifier. Cross-item / cross-institution: no page number.
-        page_numbers = {page_label} if within_item and page_label else None
+        # Within-item duplication: stamp the canonical's COMPLETE page set —
+        # every position this SHA1 occupies in the item, computed up front from
+        # the source asset list — as P304 qualifiers, authoritatively and in one
+        # edit. Passing only this ordinal's page would make the authoritative
+        # amend STRIP the canonical's other pages (the bug this fixes). Fall
+        # back to this ordinal's page only if the complete set wasn't supplied;
+        # the SDC-sync phase re-stamps the full set from the recorded numbers
+        # regardless. Cross-item / cross-institution: no page number.
+        if within_item:
+            # ``page_label`` is already a page-number string ("" for none); keep
+            # it as-is (no int() — _normalize_pages/P304 store strings anyway, so
+            # a non-numeric label can never raise here).
+            page_numbers = canonical_page_numbers or (
+                [page_label] if page_label else None
+            )
+        else:
+            page_numbers = None
         # The merge writes through sdc_sync's module-level ``site`` handle.
         sdc_sync.site = self.site
         try:
@@ -2551,14 +2575,31 @@ class Uploader:
                 self.s3_client, dpla_id, partner, len(files)
             )
 
-            # Identify SHA1s that legitimately appear at MORE THAN ONE
-            # position in the source asset list.  process_file uses this to
-            # short-circuit drift correction when its SHA1 is in the set —
-            # the existing Commons file at another title is a valid sibling,
-            # not a drift artefact, and both positions should remain as
-            # separate Commons pages.
-            duplicate_source_sha1s = collect_duplicate_source_sha1s(
+            # Read every ordinal's SHA1 ONCE. Both duplicate detection and the
+            # P304 page-number map derive from this single snapshot, so they can
+            # never disagree — a within-item duplicate that is detected always
+            # has its page unioned onto the canonical (two separate S3 passes
+            # could diverge and drop a page; see read_sha1_by_ordinal).
+            sha1_by_ordinal = read_sha1_by_ordinal(
                 self.s3_client, dpla_id, partner, len(files)
+            )
+
+            # SHA1s that legitimately appear at MORE THAN ONE position in the
+            # source asset list. process_file uses this to short-circuit drift
+            # correction when its SHA1 is in the set — the existing Commons file
+            # at another title is a valid sibling, not a drift artefact, and both
+            # positions should remain as separate Commons pages.
+            duplicate_source_sha1s = collect_duplicate_source_sha1s(sha1_by_ordinal)
+
+            # The COMPLETE P304 page set for each ordinal's file, from the item's
+            # own SHA1 grouping. A within-item duplicate and its canonical share
+            # the same SHA1 and therefore the same full page list, so whichever
+            # ordinal lands the canonical stamps EVERY page position
+            # authoritatively — and each ordinal's list is recorded in
+            # upload-result.json so the SDC-sync phase re-stamps from the same
+            # source of truth rather than re-deriving it per-ordinal.
+            page_numbers_by_ordinal = compute_sha1_page_numbers(
+                sha1_by_ordinal, page_labels
             )
 
             # Build the set of Commons titles this item's current asset list
@@ -2596,6 +2637,12 @@ class Uploader:
             ):
                 logging.info(f"Page {ordinal}")
                 page_label = page_labels.get(ordinal, "")
+                # This ordinal's COMPLETE P304 page set (every page its SHA1
+                # occupies in the item). Passed to the merge path AND recorded so
+                # the SDC-sync phase stamps it authoritatively from this single
+                # source of truth (within-item canonical → all its pages; normal
+                # file → its one page; singleton → []).
+                ordinal_pages = page_numbers_by_ordinal.get(ordinal, [])
                 try:
                     result = self.process_file(
                         dpla_id,
@@ -2610,12 +2657,22 @@ class Uploader:
                         dry_run,
                         duplicate_source_sha1s=duplicate_source_sha1s,
                         expected_item_titles=expected_item_titles,
+                        canonical_page_numbers=ordinal_pages,
                     )
+                    # process_file always returns a dict, but guard defensively:
+                    # a NoneType here would crash the whole item's upload loop.
+                    if isinstance(result, dict):
+                        result["page_numbers"] = ordinal_pages
                     ordinal_results[str(ordinal)] = result
                 except UploadTimeoutError as ex:
                     ordinal_results[str(ordinal)] = {
                         "status": ORDINAL_FAILED,
                         "error": str(ex),
+                        # Record on failure paths too so the SDC-sync reader's
+                        # "field absent = legacy sidecar" signal stays reliable:
+                        # a discovery-rescued failed ordinal then uses this
+                        # recorded set instead of the positional fallback.
+                        "page_numbers": ordinal_pages,
                     }
                     self.handle_upload_exception(ex)
                     break
@@ -2636,6 +2693,10 @@ class Uploader:
                         "title": None,
                         "pageid": None,
                         "error": "would create a new File page (blocked in maintain mode)",
+                        # See the UploadTimeoutError handler: record here too so a
+                        # later discovery-rescue of this ordinal reads the complete
+                        # set rather than the positional fallback.
+                        "page_numbers": ordinal_pages,
                     }
                     continue
 

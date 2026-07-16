@@ -309,46 +309,121 @@ def compute_ordinal_exts_and_page_labels(
     return ordinal_exts, page_labels
 
 
-def collect_duplicate_source_sha1s(
+def read_sha1_by_ordinal(
     s3_client: S3Client,
     dpla_id: str,
     partner: str,
     num_files: int,
-) -> set[str]:
-    """Return SHA1s that appear at TWO OR MORE positions in this item's S3
-    asset list.
+) -> dict[int, str]:
+    """Read each ordinal's stored SHA1 (the ``CHECKSUM`` S3 user-metadata) in a
+    SINGLE pass over the item's asset list.
 
-    A SHA1 in this set means the source data has the same file content
-    listed at multiple ordinals — both/all positions are legitimate per
-    the source and should land at their own Commons titles.  Without
-    this knowledge, _resolve_hash_drift would see SHA1 X already at
-    (page A), be asked to upload it to (page B), and conclude that
-    (page A) is drift to be moved over (page B).  That's wrong: both
-    positions should exist as separate Commons pages.
+    This snapshot is the item's authoritative content fingerprint, and BOTH
+    duplicate detection (:func:`collect_duplicate_source_sha1s`) and P304 page
+    numbering (:func:`compute_sha1_page_numbers`) derive from it. Reading once
+    and sharing the result is deliberate, not incidental: two independent S3
+    passes can DISAGREE (one reads an ordinal's hash, the other transiently
+    fails), and a within-item duplicate that is *detected* but whose page is not
+    *unioned* onto the canonical is exactly how P304 silently drops. One snapshot
+    makes detection and numbering provably consistent — the same producer/
+    consumer-share rule :func:`compute_ordinal_exts_and_page_labels` documents.
 
-    SHA1 metadata read failures (transient S3 errors, stub ordinals)
-    are tolerated — those ordinals are simply absent from the count,
-    which conservatively keeps the SHA1 out of the duplicate set.  We
-    DO log the skipped ordinal: under-counting silently would cause
-    _resolve_hash_drift to incorrectly treat a legitimate sibling as
-    drift and move/redirect it, so visibility matters for diagnosis.
+    Error contract mirrors that sibling: a genuinely-absent object
+    (404 / NoSuchKey) is skipped; any other S3 error is re-raised so a transient
+    failure fails the item LOUDLY rather than silently under-populating the
+    fingerprint. An object present with empty/absent CHECKSUM metadata is also
+    skipped (ordinal absent from the map) — the caller treats an ordinal with no
+    known SHA1 as its own singleton group, so it still keeps its own
+    title-derived page number and is never mistaken for a page-less file whose
+    P304 should be stripped.
+
+    Single-file items short-circuit to ``{}`` (like the sibling's ``num_files >
+    1`` guard): one file cannot be a WITHIN-item duplicate of itself and has no
+    page number, so the read is pure overhead — and, because it can re-raise,
+    the read would otherwise turn a transient S3 blip into a whole-item failure
+    on the dominant single-file shape. (Cross-item duplication of a lone file is
+    detected separately by process_file's own hash probe, not here.)
+
+    KNOWN RESIDUAL (not a regression; documented, not silently accepted): the
+    SHA1 fingerprint lives only in droppable S3 user-metadata. If a within-item
+    duplicate sibling's CHECKSUM is stripped externally (e.g. a copy_object with
+    MetadataDirective=REPLACE that omits it) BETWEEN a correct run and a re-run,
+    that sibling drops out of the snapshot, the canonical is recomputed without
+    the sibling's page, and the authoritative P304 amend shrinks a
+    previously-correct set. Fixing this needs a fingerprint that survives
+    metadata drift (recompute from bytes, or persist the per-ordinal grouping)
+    — deferred; the add-only "don't shrink" shortcut is rejected because it
+    would also block the legitimate removal of a genuinely-stale P304.
     """
-    counts: Counter[str] = Counter()
+    if num_files <= 1:
+        return {}
+    sha1_by_ordinal: dict[int, str] = {}
     for i in range(1, num_files + 1):
         s3_path = s3_client.get_media_s3_path(dpla_id, i, partner)
         try:
             s3_obj = s3_client.get_s3().Object(S3_BUCKET, s3_path)
             sha1 = (s3_obj.metadata or {}).get(CHECKSUM)
-        except Exception as ex:
-            logging.warning(
-                f"collect_duplicate_source_sha1s: skipped ordinal {i} for "
-                f"{dpla_id} (path={s3_path}): {ex}; duplicate detection may "
-                f"under-count this item"
-            )
-            continue
+        except ClientError as e:
+            # 404/NoSuchKey → tolerated skip; anything else re-raises (see the
+            # error-contract paragraph in the docstring for why loud-fail here).
+            if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                continue
+            raise
         if sha1:
-            counts[sha1] += 1
+            sha1_by_ordinal[i] = sha1
+    return sha1_by_ordinal
+
+
+def collect_duplicate_source_sha1s(sha1_by_ordinal: dict[int, str]) -> set[str]:
+    """Return SHA1s that appear at TWO OR MORE ordinals in this item's asset
+    list, given a :func:`read_sha1_by_ordinal` snapshot.
+
+    A SHA1 in this set means the source lists the same content at multiple
+    ordinals — legitimate within-item / cross-item duplication that must
+    centralize onto ONE canonical Commons file rather than upload byte-identical
+    copies. Without this knowledge, _resolve_hash_drift would see SHA1 X already
+    at (page A), be asked to upload it to (page B), and wrongly conclude
+    (page A) is drift to move over (page B). Ordinals whose SHA1 couldn't be read
+    are simply absent from the snapshot, so they neither count toward nor mask a
+    duplicate.
+    """
+    counts: Counter[str] = Counter(sha1_by_ordinal.values())
     return {sha1 for sha1, n in counts.items() if n > 1}
+
+
+def compute_sha1_page_numbers(
+    sha1_by_ordinal: dict[int, str],
+    page_labels: dict[int, str],
+) -> dict[int, list[int]]:
+    """Map each ordinal to the COMPLETE sorted set of P304 page numbers its
+    content occupies in this item, from a :func:`read_sha1_by_ordinal` snapshot.
+
+    Page numbers come from the title-derived ``page_labels`` — an ordinal's own
+    position in its extension series. SHA1 grouping only adds the UNION: a
+    within-item duplicate and its canonical share a SHA1, so the canonical must
+    carry EVERY page position of that SHA1. Detection
+    (:func:`collect_duplicate_source_sha1s`) and numbering derive from the SAME
+    snapshot, so a file detected as a duplicate always has its page unioned onto
+    the canonical — they cannot disagree.
+
+    Every ordinal gets AT LEAST its own page label. An ordinal with no known
+    SHA1 (metadata missing) is its own group of one, so it keeps its own page and
+    is never dropped to ``[]`` — which the authoritative P304 amend would read as
+    "strip all pages". An ordinal that is genuinely a singleton in its extension
+    series (empty label) maps to ``[]``: correct, it has no page number.
+    """
+    pages_by_sha1: dict[str, set[int]] = {}
+    for i, sha1 in sha1_by_ordinal.items():
+        label = page_labels.get(i)
+        if label:  # "" = singleton in its extension group (no page number)
+            pages_by_sha1.setdefault(sha1, set()).add(int(label))
+    result: dict[int, list[int]] = {}
+    for i, label in page_labels.items():
+        own = {int(label)} if label else set()
+        sha1 = sha1_by_ordinal.get(i)
+        group = pages_by_sha1.get(sha1, set()) if sha1 else set()
+        result[i] = sorted(own | group)
+    return result
 
 
 def license_to_markup_code(rights_uri: str) -> str:
