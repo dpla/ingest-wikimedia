@@ -12,14 +12,14 @@ classifiers = ["Private :: Do Not Upload"]
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "boto3-stubs[essential]>=1.43.45",
-    "boto3>=1.43.45",
+    "boto3-stubs[essential]>=1.43.49",
+    "boto3>=1.43.49",
     "certifi>=2026.6.17",
     "click>=8.4.2",
     "mwparserfromhell>=0.7.2",
     "pip-system-certs>=5.3",
     "python-magic>=0.4.27",
-    "pywikibot>=11.4.2",
+    "pywikibot>=11.5.0",
     "requests>=2.34.2",
     "tqdm>=4.68.4",
     "validators>=0.35.0",
@@ -28,11 +28,11 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "coverage>=7.15.0",
-    "mypy>=2.2.0",
+    "coverage>=7.15.2",
+    "mypy>=2.3.0",
     "pytest>=9.1.1",
     "ruff>=0.15.21",
-    "types-requests>=2.33.0.20260518",
+    "types-requests>=2.33.0.20260712",
 ]
 
 [build-system]
