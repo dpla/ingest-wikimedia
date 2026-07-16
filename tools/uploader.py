@@ -2024,11 +2024,15 @@ class Uploader:
         Once the SDC has merged, the outcome is gated on whether the redirect
         was established (``_create_redirect_to_canonical``'s return value):
 
-        - ``created`` / ``already`` → report ``ORDINAL_MERGED`` and bump
-          ``UPLOAD_MERGED_TO_CANONICAL``. Our intended title now resolves to
-          the canonical file. ``ORDINAL_MERGED`` is deliberately NOT in the
-          SDC-sync UPLOADED/SKIPPED eligibility set — the SDC was merged inline
-          onto the canonical file.
+        - ``created`` / ``already`` → report ``ORDINAL_MERGED``. Our intended
+          title now resolves to the canonical file. ``ORDINAL_MERGED`` is
+          deliberately NOT in the SDC-sync UPLOADED/SKIPPED eligibility set — the
+          SDC was merged inline onto the canonical file. The COUNTS tally is
+          separate from that status: a real merge (redirect newly ``created`` OR
+          the SDC merge wrote something) bumps ``UPLOAD_MERGED_TO_CANONICAL``; a
+          pure no-op re-encounter (redirect ``already`` there AND idempotent SDC
+          merge) bumps ``SKIPPED`` instead, matching the UPLOADED-vs-SKIPPED
+          convention. The recorded status stays ``ORDINAL_MERGED`` either way.
         - ``blocked_real_file`` → the intended title holds a DIFFERENT real
           file, so the redirect could not be established and our SHA1 is NOT
           discoverable at the intended title. Do NOT report MERGED; record a
@@ -2069,14 +2073,15 @@ class Uploader:
                     f"pageid; SDC merge could not run"
                 ),
             }
-        if not self._merge_sdc_onto_canonical(
+        merge_ok, sdc_changed = self._merge_sdc_onto_canonical(
             canonical_mediaid=f"M{canonical_pageid}",
             dpla_id=dpla_id,
             partner=partner,
             page_label=page_label,
             within_item=within_item,
             canonical_page_numbers=canonical_page_numbers,
-        ):
+        )
+        if not merge_ok:
             logging.warning(
                 f"Merge for {dpla_id} {ordinal}: SDC merge onto "
                 f"[[File:{canonical_title}]] failed; leaving the ordinal for "
@@ -2122,9 +2127,15 @@ class Uploader:
                 "pageid": None,
                 "error": "would create a redirect page (blocked in maintain mode)",
             }
-        # redirect_outcome in ("created", "already"): the redirect is
-        # established and the intended title resolves to the canonical file.
-        self.tracker.increment(Result.UPLOAD_MERGED_TO_CANONICAL)
+        # redirect_outcome in ("created", "already"): the redirect is established
+        # and the intended title resolves to the canonical file. Tally a real
+        # MERGE vs a no-op SKIP (see docstring); the recorded status stays
+        # ORDINAL_MERGED in BOTH cases — it is a redirect and MUST stay excluded
+        # from sdc-sync eligibility (PR #410 / within-item P304 fix).
+        if redirect_outcome == "created" or sdc_changed:
+            self.tracker.increment(Result.UPLOAD_MERGED_TO_CANONICAL)
+        else:
+            self.tracker.increment(Result.SKIPPED)
         return {
             "status": ORDINAL_MERGED,
             "title": canonical_title,
@@ -2140,7 +2151,7 @@ class Uploader:
         page_label: str,
         within_item: bool,
         canonical_page_numbers: list[int] | None = None,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Read this item's staged ``sdc.json`` and merge it onto the canonical
         file's MediaInfo entity via ``sdc_sync.merge_item_onto_canonical``
         (already on ``main`` from PR A).
@@ -2150,12 +2161,15 @@ class Uploader:
         this rare path. We point its module ``site`` at our authenticated
         Commons site for the duration of the call.
 
-        Returns ``True`` when the item's SDC was merged onto the canonical
-        file, or when there is genuinely nothing to merge (no staged
-        ``sdc.json`` — the item contributes no structured data). Returns
-        ``False`` on a hard failure (import / S3 read / JSON parse / merge
-        error) so the caller can avoid reporting a terminal ``MERGED`` for an
-        ordinal whose data never landed, and retry it on a later run instead.
+        Returns ``(ok, changed)``. ``ok`` is ``True`` when the item's SDC was
+        merged onto the canonical file, or when there is genuinely nothing to
+        merge (no staged ``sdc.json`` — the item contributes no structured
+        data); ``False`` on a hard failure (import / S3 read / JSON parse /
+        merge error) so the caller can avoid reporting a terminal ``MERGED``
+        for an ordinal whose data never landed, and retry it on a later run
+        instead. ``changed`` is ``True`` only when the merge actually wrote to
+        Commons (detected via the SDC write-counter delta), so the caller can
+        distinguish a real merge from an idempotent no-op re-encounter.
         """
         try:
             from tools import sdc_sync
@@ -2164,7 +2178,7 @@ class Uploader:
                 f"Merge for {dpla_id}: could not import sdc_sync ({ex!r}); "
                 f"SDC not merged."
             )
-            return False
+            return False, False
         try:
             sdc_raw = self.s3_client.get_sdc_json(partner, dpla_id)
         except Exception as ex:
@@ -2172,17 +2186,17 @@ class Uploader:
                 f"Merge for {dpla_id}: S3 read of sdc.json failed ({ex!r}); "
                 f"SDC not merged."
             )
-            return False
+            return False, False
         if not sdc_raw:
             logging.info(f"Merge for {dpla_id}: no staged sdc.json; nothing to merge.")
-            return True
+            return True, False
         try:
             sdc_payload = json.loads(sdc_raw)
         except json.JSONDecodeError as ex:
             logging.warning(
                 f"Merge for {dpla_id}: sdc.json failed to parse ({ex}); SDC not merged."
             )
-            return False
+            return False, False
         # Within-item duplication: stamp the canonical's COMPLETE page set —
         # every position this SHA1 occupies in the item, computed up front from
         # the source asset list — as P304 qualifiers, authoritatively and in one
@@ -2202,6 +2216,13 @@ class Uploader:
             page_numbers = None
         # The merge writes through sdc_sync's module-level ``site`` handle.
         sdc_sync.site = self.site
+        # Snapshot the SDC write counter around the merge so we can tell a real
+        # merge (something was written) from an idempotent no-op re-encounter
+        # (everything already present → merge_item_onto_canonical writes
+        # nothing). merge_item_onto_canonical → process_one_from_sdc bumps
+        # these counters on every commit, so a post-minus-pre delta of zero
+        # means the merge changed nothing on Commons this run.
+        writes_before = sdc_sync._sdc_writes_total()
         try:
             sdc_sync.merge_item_onto_canonical(
                 canonical_mediaid,
@@ -2209,11 +2230,13 @@ class Uploader:
                 sdc_payload,
                 page_numbers=page_numbers,
             )
+            changed = sdc_sync._sdc_writes_total() > writes_before
             logging.info(
                 f"Merged SDC for {dpla_id} onto canonical {canonical_mediaid}"
                 + (f" (pages {sorted(page_numbers)})" if page_numbers else "")
+                + ("" if changed else " (no change)")
             )
-            return True
+            return True, changed
         except CsrfRecoveryFailed:
             raise
         except Exception as ex:
@@ -2221,7 +2244,7 @@ class Uploader:
                 f"Merge for {dpla_id}: merge_item_onto_canonical failed "
                 f"({ex!r}); SDC not merged, ordinal left for retry next run."
             )
-            return False
+            return False, False
 
     def _create_redirect_to_canonical(
         self,

@@ -3037,7 +3037,9 @@ def test_merge_and_redirect_merges_sdc_and_creates_redirect():
     canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
 
     with (
-        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(
+            uploader, "_merge_sdc_onto_canonical", return_value=(True, True)
+        ) as merge_mock,
         patch.object(
             uploader, "_create_redirect_to_canonical", return_value="created"
         ) as redirect_mock,
@@ -3117,7 +3119,7 @@ def test_merge_and_redirect_fails_when_sdc_merge_fails():
 
     with (
         patch.object(
-            uploader, "_merge_sdc_onto_canonical", return_value=False
+            uploader, "_merge_sdc_onto_canonical", return_value=(False, False)
         ) as merge_mock,
         patch.object(uploader, "_create_redirect_to_canonical") as redirect_mock,
     ):
@@ -3138,6 +3140,115 @@ def test_merge_and_redirect_fails_when_sdc_merge_fails():
     assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
     # Returned normally, so this branch must count the failure itself.
     assert tracker.count(Result.FAILED) == 1
+
+
+def test_merge_and_redirect_noop_counts_skipped_keeps_merged_status():
+    """Full no-op re-encounter — redirect already existed AND the SDC merge
+    wrote nothing — is tallied as SKIPPED (already-correct), NOT MERGED. But the
+    returned ordinal STATUS stays ORDINAL_MERGED: it is a redirect and must stay
+    excluded from sdc-sync eligibility (PR #410 / within-item P304 fix). Only the
+    COUNTS bucket moves — asserting the status here guards that coupling."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical", return_value=(True, False)),
+        patch.object(uploader, "_create_redirect_to_canonical", return_value="already"),
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
+            sha1="a" * 40,
+        )
+    assert result["status"] == "MERGED"  # eligibility exclusion preserved
+    assert tracker.count(Result.SKIPPED) == 1
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 0
+
+
+def test_merge_and_redirect_sdc_change_counts_merged():
+    """Redirect already existed but the SDC merge actually wrote → real MERGE."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical", return_value=(True, True)),
+        patch.object(uploader, "_create_redirect_to_canonical", return_value="already"),
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
+            sha1="a" * 40,
+        )
+    assert result["status"] == "MERGED"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 1
+    assert tracker.count(Result.SKIPPED) == 0
+
+
+def test_merge_and_redirect_new_redirect_counts_merged_even_if_sdc_noop():
+    """A newly-created redirect is itself a real action this run → MERGE, even
+    when the SDC merge wrote nothing."""
+    tracker = Tracker()
+    uploader = _build_uploader_with_dpla()
+    uploader.tracker = tracker
+    canonical = _canonical_file("Canonical - DPLA - xxxx (page 1).jpg", 777)
+    with (
+        patch.object(uploader, "_merge_sdc_onto_canonical", return_value=(True, False)),
+        patch.object(uploader, "_create_redirect_to_canonical", return_value="created"),
+    ):
+        result = uploader._merge_and_redirect(
+            canonical_file=canonical,
+            intended_title="Ours - DPLA - yyyy (page 1).jpg",
+            dpla_id="yyyy",
+            ordinal=1,
+            partner="nara",
+            page_label="1",
+            within_item=True,
+            sha1="a" * 40,
+        )
+    assert result["status"] == "MERGED"
+    assert tracker.count(Result.UPLOAD_MERGED_TO_CANONICAL) == 1
+    assert tracker.count(Result.SKIPPED) == 0
+
+
+def test_merge_sdc_onto_canonical_reports_changed_via_write_delta():
+    """``changed`` is True only when the SDC write counter advanced across the
+    merge (a real write), False on an idempotent no-op."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = '{"claims": {"P170": []}}'
+    with (
+        patch("tools.sdc_sync.merge_item_onto_canonical"),
+        patch("tools.sdc_sync._sdc_writes_total", side_effect=[0, 1]),
+    ):
+        assert uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="1",
+            within_item=True,
+        ) == (True, True)
+    with (
+        patch("tools.sdc_sync.merge_item_onto_canonical"),
+        patch("tools.sdc_sync._sdc_writes_total", side_effect=[5, 5]),
+    ):
+        assert uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="1",
+            within_item=True,
+        ) == (True, False)
 
 
 def test_merge_sdc_onto_canonical_within_item_passes_complete_page_set():
@@ -3226,10 +3337,11 @@ def test_merge_sdc_onto_canonical_skips_when_no_staged_sdc():
         )
 
     # A genuinely-absent sdc.json (item contributes no claims) is "nothing to
-    # merge" = success, NOT a failure — the caller treats a falsy return as a
-    # retryable merge failure, so pin the True so a regression to None/False
-    # (which would strand the DEDUP outcome in permanent retry) is caught.
-    assert result is True
+    # merge" = success (ok=True), NOT a failure — the caller treats a falsy
+    # ``ok`` as a retryable merge failure, so pin ok=True so a regression to
+    # None/False (which would strand the DEDUP outcome in permanent retry) is
+    # caught. ``changed`` is False: nothing was written.
+    assert result == (True, False)
     merge_mock.assert_not_called()
 
 
@@ -3400,7 +3512,9 @@ def test_merge_and_redirect_hand_fix_when_intended_title_holds_real_file():
     occupant.latest_file_info.sha1 = "ffff" * 10
 
     with (
-        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(
+            uploader, "_merge_sdc_onto_canonical", return_value=(True, True)
+        ) as merge_mock,
         patch("tools.uploader.get_page", return_value=occupant),
         patch("tools.uploader.hand_fix_sidecar.record_hand_fix") as record_mock,
     ):
@@ -3438,7 +3552,9 @@ def test_merge_and_redirect_fenced_in_maintain_mode_is_not_merged():
     page = _redirect_intended_page(exists=False)
 
     with (
-        patch.object(uploader, "_merge_sdc_onto_canonical") as merge_mock,
+        patch.object(
+            uploader, "_merge_sdc_onto_canonical", return_value=(True, True)
+        ) as merge_mock,
         patch("tools.uploader.get_page", return_value=page),
     ):
         result = uploader._merge_and_redirect(

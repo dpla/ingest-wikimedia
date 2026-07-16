@@ -680,6 +680,9 @@ _INFI_CREATOR_LABEL_RE = re.compile(r"^\s*creator\s*$", re.IGNORECASE)
 
 # ``Other fields 1``, ``Other fields 2``, ..., or the bare ``Other fields``.
 # Case-folded param names since ``_normalize_param_name`` already lower-cases.
+# NB: distinct from ``_NUMBERED_OTHER_FIELDS_RE`` (used by the rescue display-row
+# carry) — that one excludes the bare form and adds the modern ``other_fields``;
+# don't unify them (see the comment there). This one drives creator extraction.
 _OTHER_FIELDS_PARAM_RE = re.compile(r"^other fields(?: \d+)?$")
 
 # ``{{creator|Wikidata=Q56159174}}`` — Commons Creator template with a
@@ -2396,6 +2399,19 @@ def entity_was_already_migrated(entity: dict) -> bool:
     return False
 
 
+def _find_dpla_metadata_node(wikicode):
+    """Return the first ``{{DPLA metadata}}`` template node in ``wikicode``,
+    or ``None``. (Node form of :func:`_extract_dpla_metadata_template`.)"""
+    return next(
+        (
+            t
+            for t in wikicode.filter_templates()
+            if _template_name(t) == "dpla metadata"
+        ),
+        None,
+    )
+
+
 def _extract_dpla_metadata_template(block: str) -> str:
     """Pull just the ``{{DPLA metadata ...}}`` template out of
     ``block``. ``block`` is typically the full upload-form output of
@@ -2411,11 +2427,8 @@ def _extract_dpla_metadata_template(block: str) -> str:
     ``{{DPLA metadata}}`` template is found in it — a defensive
     no-op for callers that already pass just the template.
     """
-    wikicode = mwparserfromhell.parse(block)
-    for tpl in wikicode.filter_templates():
-        if _template_name(tpl) == "dpla metadata":
-            return str(tpl)
-    return block
+    node = _find_dpla_metadata_node(mwparserfromhell.parse(block))
+    return str(node) if node is not None else block
 
 
 def render_migrated_wikitext(
@@ -2451,6 +2464,52 @@ def render_migrated_wikitext(
     return text
 
 
+# Community-added display params on a ``{{DPLA metadata}}`` invocation that the
+# fresh ``get_wiki_text`` block never emits (it is built from the fixed
+# ``dpla_metadata_params`` set): the modern single ``other_fields`` and the
+# legacy numbered ``Other fields N``. Names match exactly what ``Module:DPLA``
+# reads — ``args.other_fields`` (underscore) and ``args['other fields ' .. i]``
+# / ``['Other fields ' .. i]`` (space) — so casefold but do NOT collapse
+# underscores to spaces (the two forms are distinct params to the renderer).
+# NB: distinct from ``_OTHER_FIELDS_PARAM_RE`` (creator-extraction, matches the
+# bare ``other fields`` too); intentionally not unified.
+_NUMBERED_OTHER_FIELDS_RE = re.compile(r"other fields \d+")
+
+
+def _is_user_extension_param(param) -> bool:
+    name = _normalize_param_name(param)
+    return (
+        name == "other_fields" or _NUMBERED_OTHER_FIELDS_RE.fullmatch(name) is not None
+    )
+
+
+def _carry_user_extension_params(old_template, new_block: str) -> str:
+    """Return ``new_block`` with any user-extension params (see
+    :func:`_is_user_extension_param`) copied from ``old_template`` when the
+    fresh block's ``{{DPLA metadata}}`` lacks them.
+
+    Used only when the node being swapped is itself a ``{{DPLA metadata}}``
+    template — the cross-page drift rescue over a source already on the new
+    form. Without this, a rescue replaces the whole node with the fresh block
+    and drops these community-added display rows. Only these extension params
+    are carried: every other param is canonical and is intentionally refreshed
+    by the rescue, so a fresh-block value always wins.
+    """
+    to_carry = [p for p in old_template.params if _is_user_extension_param(p)]
+    if not to_carry:
+        return new_block
+    fresh = mwparserfromhell.parse(new_block)
+    target = _find_dpla_metadata_node(fresh)
+    if target is None:
+        return new_block
+    existing = {_normalize_param_name(p) for p in target.params}
+    for p in to_carry:
+        if _normalize_param_name(p) in existing:
+            continue  # fresh block already sets it — canonical value wins
+        target.add(str(p.name).strip(), str(p.value).strip())
+    return str(fresh)
+
+
 def _swap_wrapper_node(
     original_text: str,
     new_template_block: str,
@@ -2465,11 +2524,20 @@ def _swap_wrapper_node(
     so callers can distinguish "swapped the wrapper" from "nothing to do"
     (the shared preserve-by-default primitive behind both the regular
     migration and the cross-page drift rescue).
+
+    When the matched wrapper is itself a ``{{DPLA metadata}}`` template (the
+    rescue path — ``render_migrated_wikitext`` passes only legacy names, so it
+    never hits this), community-added display rows (``other_fields`` / numbered
+    ``Other fields N``) are carried from the old node into the fresh block,
+    which is built from canonical params only and would otherwise drop them.
     """
     wikicode = mwparserfromhell.parse(original_text)
     for tpl in wikicode.filter_templates():
         if _template_name(tpl) in wrapper_names:
-            wikicode.replace(tpl, _extract_dpla_metadata_template(new_template_block))
+            replacement = _extract_dpla_metadata_template(new_template_block)
+            if _template_name(tpl) == "dpla metadata":
+                replacement = _carry_user_extension_params(tpl, replacement)
+            wikicode.replace(tpl, replacement)
             return str(wikicode), True
     return original_text, False
 

@@ -1553,6 +1553,73 @@ def test_rescue_wikitext_recognizes_all_wrappers(wrapper):
     assert "title=Old" not in result  # old wrapper replaced, not appended
 
 
+def test_rescue_wikitext_carries_other_fields_from_dpla_metadata_source():
+    """When the source is already on {{DPLA metadata}}, a rescue node-swaps it
+    for the fresh block — which is built from canonical params only. Community
+    display rows added via ``other_fields`` (mirrors {{Information}}) must be
+    carried across, or the rescue silently drops user-contributed content."""
+    source = (
+        "== {{int:filedesc}} ==\n"
+        "{{DPLA metadata\n"
+        "| title = Old Title\n"
+        "| other_fields = {{information field|Text|MOTE, MR.; Calhoun Times}}\n"
+        "}}\n"
+        "[[Category:Keep]]"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata\n| title = New Title\n}}")
+    assert "other_fields" in result and "MOTE, MR." in result  # carried
+    assert "New Title" in result and "Old Title" not in result  # canonical refreshed
+    assert "[[Category:Keep]]" in result
+
+
+def test_rescue_wikitext_carries_numbered_other_fields():
+    """The legacy numbered ``Other fields N`` shape is carried too."""
+    source = (
+        "{{DPLA metadata\n"
+        "| title = Old\n"
+        "| Other fields 2 = {{InFi|Notes|A community note}}\n"
+        "}}"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata\n| title = New\n}}")
+    assert "Other fields 2" in result and "A community note" in result
+
+
+def test_rescue_wikitext_does_not_carry_canonical_params():
+    """Only the user-extension params are carried — a canonical param present on
+    the old node (but not the fresh block) is NOT resurrected, so the rescue
+    still refreshes/clears stale canonical metadata as intended."""
+    source = (
+        "{{DPLA metadata\n"
+        "| title = Old\n"
+        "| date = 1899\n"  # stale canonical param, absent from fresh block
+        "| other_fields = {{InFi|Text|keep me}}\n"
+        "}}"
+    )
+    result = rescue_wikitext(source, "{{DPLA metadata\n| title = New\n}}")
+    assert "keep me" in result  # extension carried
+    assert "1899" not in result  # stale canonical param dropped, not carried
+
+
+def test_rescue_wikitext_carries_other_fields_with_full_form_new_block():
+    """The real caller passes get_wiki_text()'s FULL upload form (heading +
+    blank line + template), not a bare template. The node-swap must still
+    extract template-only (no duplicated heading) AND carry other_fields."""
+    source = (
+        "== {{int:filedesc}} ==\n"
+        "{{DPLA metadata\n"
+        "| title = Old\n"
+        "| other_fields = {{InFi|Text|keep me}}\n"
+        "}}\n"
+        "[[Category:Keep]]"
+    )
+    full_form_new = "== {{int:filedesc}} ==\n\n{{DPLA metadata\n| title = New\n}}"
+    result = rescue_wikitext(source, full_form_new)
+    assert "keep me" in result  # other_fields carried
+    assert "title = New" in result and "title = Old" not in result
+    assert result.count("{{int:filedesc}}") == 1  # heading NOT duplicated
+    assert "[[Category:Keep]]" in result
+
+
 def test_rescue_wikitext_falls_back_to_allowlist_when_no_wrapper():
     """A source with no recognised metadata wrapper can't be node-swapped, so
     rescue_wikitext falls back to the narrow merge_preserved_wikitext allowlist
