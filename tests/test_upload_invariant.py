@@ -319,7 +319,10 @@ def test_merge_and_redirect_within_item_stamps_page_number():
         )
 
     _, kwargs = merge.call_args
-    assert kwargs["page_numbers"] == {"2"}
+    # Fallback path: no canonical_page_numbers passed, so the merge stamps just
+    # this ordinal's own page as a single-element list (the primary path passes
+    # the complete list[int]; see test_merge_sdc_onto_canonical_* in test_uploader).
+    assert kwargs["page_numbers"] == ["2"]
 
 
 def test_create_redirect_refuses_to_clobber_real_file():

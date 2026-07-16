@@ -5708,13 +5708,32 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         # Prefer the COMPLETE page set the uploader recorded for this ordinal
         # (every position its SHA1 occupies in the item — so a within-item
         # canonical that absorbed a duplicate carries ALL its pages). An empty
-        # list means a singleton with no page qualifier. Only when the field is
-        # entirely absent (an upload-result.json written before the uploader
-        # recorded page_numbers) do we fall back to the positional computation.
-        recorded_pages = data.get("page_numbers")
-        if recorded_pages is None:
+        # list means a singleton with no page qualifier. Key ABSENCE (not a
+        # null/empty value) is the legacy signal: only an upload-result.json
+        # written before the uploader recorded page_numbers lacks the key, and
+        # only then do we fall back to the positional computation.
+        if "page_numbers" not in data:
             page_number = page_numbers_fallback.get(ord_str)
         else:
+            recorded_pages = data["page_numbers"]
+            # The recorded value drives an AUTHORITATIVE P304 reconcile (adds
+            # missing, strips stale), so a corrupt/hand-edited value must never
+            # reach it. The writer only ever emits a list of positive ints (or
+            # []). Anything else (null, string, negatives, non-list) is treated
+            # as untrustworthy: skip the ordinal loudly rather than strip P304
+            # from garbage.
+            if not (
+                isinstance(recorded_pages, list)
+                and all(isinstance(p, int) and p > 0 for p in recorded_pages)
+            ):
+                logging.warning(
+                    f" -- Ordinal {ord_str}: malformed page_numbers"
+                    f" {recorded_pages!r} in upload-result.json; skipping ordinal"
+                    " (refusing to reconcile P304 from untrusted data)."
+                )
+                tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
+                had_ordinal_error = True
+                continue
             page_number = recorded_pages or None
         try:
             process_one_from_sdc(

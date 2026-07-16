@@ -2668,6 +2668,11 @@ class Uploader:
                     ordinal_results[str(ordinal)] = {
                         "status": ORDINAL_FAILED,
                         "error": str(ex),
+                        # Record on failure paths too so the SDC-sync reader's
+                        # "field absent = legacy sidecar" signal stays reliable:
+                        # a discovery-rescued failed ordinal then uses this
+                        # recorded set instead of the positional fallback.
+                        "page_numbers": ordinal_pages,
                     }
                     self.handle_upload_exception(ex)
                     break
@@ -2688,6 +2693,10 @@ class Uploader:
                         "title": None,
                         "pageid": None,
                         "error": "would create a new File page (blocked in maintain mode)",
+                        # See the UploadTimeoutError handler: record here too so a
+                        # later discovery-rescue of this ordinal reads the complete
+                        # set rather than the positional fallback.
+                        "page_numbers": ordinal_pages,
                     }
                     continue
 

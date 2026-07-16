@@ -7052,3 +7052,36 @@ def test_partner_item_cross_item_merged_only_does_not_sync_or_discover(monkeypat
     }
     calls = _drive_partner_item(monkeypatch, ordinals=ordinals)
     assert calls == []
+
+
+def test_partner_item_malformed_page_numbers_skips_ordinal(monkeypatch):
+    # A present-but-malformed page_numbers (corrupt/hand-edited sidecar) must NOT
+    # drive the authoritative P304 reconcile — the ordinal is skipped, not synced
+    # with garbage that could strip real pages.
+    for bad in ("notalist", [-1], [0], [1, "x"], {"1": 1}):
+        ordinals = {
+            "1": {
+                "status": "UPLOADED",
+                "pageid": 100,
+                "title": "X.jpg",
+                "page_numbers": bad,
+            },
+        }
+        calls = _drive_partner_item(monkeypatch, ordinals=ordinals)
+        assert calls == [], f"expected skip for malformed page_numbers={bad!r}"
+
+
+def test_partner_item_explicit_null_page_numbers_skips_ordinal(monkeypatch):
+    # Explicit null is distinct from an absent key: the fixed writer never emits
+    # null (it writes [] for "no pages"), so a present null is untrusted → skip,
+    # NOT the legacy positional fallback (which an absent key would take).
+    ordinals = {
+        "1": {
+            "status": "UPLOADED",
+            "pageid": 100,
+            "title": "X.jpg",
+            "page_numbers": None,
+        },
+    }
+    calls = _drive_partner_item(monkeypatch, ordinals=ordinals)
+    assert calls == []
