@@ -14,6 +14,8 @@ from ingest_wikimedia.wikimedia import (
     join,
     collect_duplicate_source_sha1s,
     compute_ordinal_exts_and_page_labels,
+    compute_sha1_page_numbers,
+    read_sha1_by_ordinal,
     extract_page_ordinal_from_commons_title,
     extract_strings,
     extract_strings_dict,
@@ -1114,19 +1116,22 @@ def test_page_labels_clienterror_treated_as_stub_placeholder():
     assert labels == {1: "1", 2: "", 3: "2"}
 
 
-# collect_duplicate_source_sha1s — drift logic must recognize legit duplicates
-def _fake_s3_client_with_sha1s(sha1_by_ord: dict[int, str | None]):
-    """Mock S3Client whose Object().metadata['sha1'] returns the configured sha1
-    per ordinal. None means the ordinal raises (treated as missing)."""
+# read_sha1_by_ordinal — the SINGLE S3 pass both duplicate detection and P304
+# page numbering derive from (so they can never diverge and drop a page).
+def _fake_s3_client_with_sha1s(sha1_by_ord: dict[int, object]):
+    """Mock S3Client whose Object().metadata[CHECKSUM] returns the configured
+    value per ordinal. A str value is the stored sha1 ("" = present but empty);
+    an Exception value is raised when that ordinal's object is accessed; an
+    absent ordinal returns an object with no CHECKSUM metadata."""
     s3_client = MagicMock()
 
     def get_obj(bucket, path):
         ord_num = int(path.rsplit("/", 1)[-1].split("_", 1)[0])
-        sha1 = sha1_by_ord.get(ord_num)
-        if sha1 is None:
-            raise RuntimeError("missing")
+        val = sha1_by_ord.get(ord_num)
+        if isinstance(val, Exception):
+            raise val
         obj = MagicMock()
-        obj.metadata = {"sha1": sha1}
+        obj.metadata = {} if val is None else {"sha1": val}
         return obj
 
     boto3_resource = MagicMock()
@@ -1138,61 +1143,162 @@ def _fake_s3_client_with_sha1s(sha1_by_ord: dict[int, str | None]):
     return s3_client
 
 
+def _client_error(code: str):
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "HeadObject")
+
+
+def test_read_sha1_by_ordinal_reads_all():
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "aaa"})
+    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 3) == {
+        1: "aaa",
+        2: "bbb",
+        3: "aaa",
+    }
+
+
+def test_read_sha1_by_ordinal_skips_empty_and_absent_metadata():
+    # Present object with empty/absent CHECKSUM → ordinal simply absent from the
+    # snapshot (the caller treats it as its own singleton group — never a strip).
+    s3 = _fake_s3_client_with_sha1s({1: "", 2: None, 3: "ccc"})
+    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 3) == {3: "ccc"}
+
+
+def test_read_sha1_by_ordinal_skips_genuinely_absent_object():
+    # A 404 / NoSuchKey means the object isn't there (stub) — tolerated skip.
+    s3 = _fake_s3_client_with_sha1s({1: _client_error("404"), 2: "bbb"})
+    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 2) == {2: "bbb"}
+    s3 = _fake_s3_client_with_sha1s({1: _client_error("NoSuchKey"), 2: "bbb"})
+    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 2) == {2: "bbb"}
+
+
+def test_read_sha1_by_ordinal_single_file_short_circuits_without_s3():
+    # A single-file item can't be a within-item duplicate and has no page
+    # number, so we skip the read entirely — matching the sibling's num_files>1
+    # guard. Critically, this avoids turning a transient S3 blip into a
+    # whole-item failure on the dominant single-file shape (the read re-raises).
+    s3 = _fake_s3_client_with_sha1s({1: _client_error("SlowDown")})
+    assert read_sha1_by_ordinal(s3, "abc" * 11, "pa", 1) == {}
+    # No S3 object access attempted at all.
+    assert s3.get_s3.return_value.Object.call_count == 0
+
+
+def test_read_sha1_by_ordinal_reraises_transient_s3_error():
+    # A transient/permission S3 error must FAIL LOUDLY, not silently drop the
+    # ordinal — a dropped ordinal is exactly how a detected duplicate's page goes
+    # un-unioned and P304 gets stripped. Mirrors compute_ordinal_exts_and_page_labels.
+    import pytest
+    from botocore.exceptions import ClientError
+
+    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: _client_error("AccessDenied")})
+    with pytest.raises(ClientError):
+        read_sha1_by_ordinal(s3, "abc" * 11, "pa", 2)
+
+
+# collect_duplicate_source_sha1s — pure over a read_sha1_by_ordinal snapshot.
 def test_collect_duplicate_source_sha1s_all_unique():
-    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "ccc"})
-    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == set()
+    assert collect_duplicate_source_sha1s({1: "aaa", 2: "bbb", 3: "ccc"}) == set()
 
 
 def test_collect_duplicate_source_sha1s_one_pair_repeats():
     # Sherman pattern: same content at positions 1 and 12.
-    s3 = _fake_s3_client_with_sha1s(
-        {
-            1: "aaa",
-            2: "bbb",
-            3: "ccc",
-            4: "ddd",
-            5: "eee",
-            6: "fff",
-            7: "ggg",
-            8: "hhh",
-            9: "iii",
-            10: "jjj",
-            11: "kkk",
-            12: "aaa",
-            13: "bbb",
-        }
-    )
-    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 13) == {"aaa", "bbb"}
+    snapshot = {
+        1: "aaa",
+        2: "bbb",
+        3: "ccc",
+        4: "ddd",
+        5: "eee",
+        6: "fff",
+        7: "ggg",
+        8: "hhh",
+        9: "iii",
+        10: "jjj",
+        11: "kkk",
+        12: "aaa",
+        13: "bbb",
+    }
+    assert collect_duplicate_source_sha1s(snapshot) == {"aaa", "bbb"}
 
 
 def test_collect_duplicate_source_sha1s_same_sha1_three_times():
-    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: "bbb", 3: "aaa", 4: "aaa"})
-    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 4) == {"aaa"}
+    assert collect_duplicate_source_sha1s({1: "aaa", 2: "bbb", 3: "aaa", 4: "aaa"}) == {
+        "aaa"
+    }
 
 
-def test_collect_duplicate_source_sha1s_handles_missing_metadata():
-    # Read failures are tolerated; affected ordinals are absent from the count.
-    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: None, 3: "aaa"})
-    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == {"aaa"}
+def test_collect_duplicate_source_sha1s_ordinal_absent_from_snapshot():
+    # An ordinal whose SHA1 couldn't be read is absent from the snapshot, so it
+    # neither counts toward nor masks a duplicate.
+    assert collect_duplicate_source_sha1s({1: "aaa", 3: "aaa"}) == {"aaa"}
 
 
-def test_collect_duplicate_source_sha1s_logs_skipped_ordinals(caplog):
-    """Silent skips would hide drift miscorrection; ensure each failed read
-    produces a WARNING line so an operator can see why the count is low."""
-    import logging as _logging
-
-    s3 = _fake_s3_client_with_sha1s({1: "aaa", 2: None, 3: "aaa"})
-    with caplog.at_level(_logging.WARNING):
-        collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3)
-    messages = " | ".join(r.message for r in caplog.records)
-    assert "skipped ordinal 2" in messages
-    assert "under-count" in messages
+def test_collect_duplicate_source_sha1s_empty_snapshot():
+    assert collect_duplicate_source_sha1s({}) == set()
 
 
-def test_collect_duplicate_source_sha1s_skips_empty_sha1():
-    # Empty sha1 metadata (e.g. truncated) is not counted as duplicate-of-itself.
-    s3 = _fake_s3_client_with_sha1s({1: "", 2: "", 3: "aaa"})
-    assert collect_duplicate_source_sha1s(s3, "abc" * 11, "pa", 3) == set()
+# compute_sha1_page_numbers — pure over the snapshot; every ordinal keeps at
+# least its own title-derived page, plus the SHA1-group union for duplicates.
+def test_compute_sha1_page_numbers_within_item_duplicate_gets_complete_set():
+    # The bug repro (DPLA ID 2332631a…): two byte-identical JPGs at pages 1 and
+    # 2 of one item. BOTH ordinals map to the COMPLETE set [1, 2], so whichever
+    # lands the canonical stamps every page it occupies — never a single page
+    # that the authoritative amend would use to strip the other.
+    result = compute_sha1_page_numbers({1: "aaa", 2: "aaa"}, {1: "1", 2: "2"})
+    assert result == {1: [1, 2], 2: [1, 2]}
+
+
+def test_compute_sha1_page_numbers_within_item_triplicate():
+    # Same content at three positions → the complete set is all three pages.
+    result = compute_sha1_page_numbers(
+        {1: "aaa", 2: "aaa", 3: "aaa"}, {1: "1", 2: "2", 3: "3"}
+    )
+    assert result == {1: [1, 2, 3], 2: [1, 2, 3], 3: [1, 2, 3]}
+
+
+def test_compute_sha1_page_numbers_normal_multipage_each_its_own_page():
+    # Parity: a normal multipage item (distinct content per page) keeps the
+    # per-ordinal single-page behavior — no accidental unioning.
+    result = compute_sha1_page_numbers(
+        {1: "aaa", 2: "bbb", 3: "ccc"}, {1: "1", 2: "2", 3: "3"}
+    )
+    assert result == {1: [1], 2: [2], 3: [3]}
+
+
+def test_compute_sha1_page_numbers_singleton_maps_to_empty():
+    # A single-file item has no page series ("" label) → empty list, so the sync
+    # stamps no P304 qualifier (and correctly strips any stale one).
+    assert compute_sha1_page_numbers({1: "aaa"}, {1: ""}) == {1: []}
+
+
+def test_compute_sha1_page_numbers_dup_pair_plus_standalone_other_ext():
+    # A JPG pair (within-item dup, pages 1 & 2) alongside a standalone PDF
+    # (its own extension series, singleton → no page). The dup pair each get
+    # [1, 2]; the PDF gets [].
+    result = compute_sha1_page_numbers(
+        {1: "aaa", 2: "aaa", 3: "ppp"}, {1: "1", 2: "2", 3: ""}
+    )
+    assert result == {1: [1, 2], 2: [1, 2], 3: []}
+
+
+def test_compute_sha1_page_numbers_missing_sha1_keeps_own_page_no_strip():
+    # REGRESSION (the fix's own bug): ordinal 1's CHECKSUM metadata is missing
+    # (a documented real bucket state after copy_object drops user metadata), so
+    # it is ABSENT from the snapshot — but it is a normal page-1 file, not a
+    # duplicate. It must keep its own title-derived page [1], NOT be dropped to
+    # [] (which the authoritative P304 amend would read as "strip page 1").
+    result = compute_sha1_page_numbers({2: "bbb"}, {1: "1", 2: "2"})
+    assert result == {1: [1], 2: [2]}
+
+
+def test_compute_sha1_page_numbers_duplicate_with_missing_sibling_sha1():
+    # A within-item duplicate where the SECOND sibling's SHA1 is missing from
+    # the snapshot: because detection and numbering share this snapshot, ordinal
+    # 2 is NOT seen as a duplicate of 1, so they are treated as two separate
+    # single-page files — no false union, and critically no strip. Page 2 is
+    # preserved on ordinal 2's own file rather than lost.
+    result = compute_sha1_page_numbers({1: "aaa"}, {1: "1", 2: "2"})
+    assert result == {1: [1], 2: [2]}
 
 
 def test_page_labels_non_404_clienterror_propagates():

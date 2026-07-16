@@ -3140,10 +3140,15 @@ def test_merge_and_redirect_fails_when_sdc_merge_fails():
     assert tracker.count(Result.FAILED) == 1
 
 
-def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():
+def test_merge_sdc_onto_canonical_within_item_passes_complete_page_set():
     """Reads the item's staged sdc.json, json-parses it, points sdc_sync at
-    our site, and calls merge_item_onto_canonical with the within-item page
-    number as a P304 qualifier set."""
+    our site, and calls merge_item_onto_canonical with the CANONICAL'S COMPLETE
+    page set (every position its SHA1 occupies in the item) as P304 qualifiers.
+
+    This is the within-item P304-stripping fix: a within-item duplicate at page
+    2 must not stamp only {2} onto the canonical — the authoritative amend would
+    read that as the full set and STRIP the canonical's page 1. Passing the
+    complete [1, 2] set (computed up front) stamps every page in one edit."""
     uploader = _build_uploader_with_dpla()
     uploader.s3_client.get_sdc_json.return_value = '{"claims": {"P170": []}}'
 
@@ -3154,8 +3159,9 @@ def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():
             canonical_mediaid="M42",
             dpla_id="yyyy",
             partner="nara",
-            page_label="3",
+            page_label="2",  # this dup ordinal's own page …
             within_item=True,
+            canonical_page_numbers=[1, 2],  # … but the COMPLETE set wins
         )
         assert sdc_sync.site is uploader.site
 
@@ -3165,7 +3171,27 @@ def test_merge_sdc_onto_canonical_within_item_passes_page_numbers():
     assert args[0] == "M42"
     assert args[1] == "yyyy"
     assert args[2] == {"claims": {"P170": []}}
-    assert merge_mock.call_args.kwargs["page_numbers"] == {"3"}
+    assert merge_mock.call_args.kwargs["page_numbers"] == [1, 2]
+
+
+def test_merge_sdc_onto_canonical_within_item_falls_back_to_own_page():
+    """When the complete set wasn't supplied (defensive fallback), a within-item
+    merge stamps just this ordinal's own page. The SDC-sync phase re-stamps the
+    full recorded set regardless, so this transient partial is corrected."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = '{"claims": {"P170": []}}'
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="3",
+            within_item=True,
+            canonical_page_numbers=None,
+        )
+
+    assert merge_mock.call_args.kwargs["page_numbers"] == ["3"]
 
 
 def test_merge_sdc_onto_canonical_cross_item_passes_no_page_numbers():

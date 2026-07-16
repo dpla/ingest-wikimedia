@@ -6933,3 +6933,122 @@ def test_assert_build_sdc_on_miss_allowed_permits_safe_combos():
     sdc_sync._assert_build_sdc_on_miss_allowed(True, "georgia")
     sdc_sync._assert_build_sdc_on_miss_allowed(False, "nara")
     sdc_sync._assert_build_sdc_on_miss_allowed(False, None)
+
+
+# ---------------------------------------------------------------------------
+# _process_one_partner_item — P304 page-number source of truth + MERGED
+# exclusion. Regression coverage for the within-item P304-stripping bug
+# (PR #408 follow-up, fix/within-item-p304-stripping). The sync must (a)
+# stamp the COMPLETE page set the uploader recorded per ordinal, and (b)
+# skip MERGED (redirect) ordinals entirely rather than discovery-rescue and
+# re-derive them.
+# ---------------------------------------------------------------------------
+
+
+def _drive_partner_item(monkeypatch, *, ordinals, file_list=None):
+    """Drive ``_process_one_partner_item`` with a stubbed S3 + Commons surface.
+
+    Returns the ``[(mediaid, page_number), ...]`` list capturing every
+    ``process_one_from_sdc`` call in order, so a test can assert which ordinals
+    synced and with what P304 page value.
+    """
+    from tools import sdc_sync
+
+    s3 = MagicMock()
+    s3.get_sdc_json.return_value = '{"claims": [{"P": 1}], "ingest_date": "2026-01-01"}'
+    s3.get_upload_result.return_value = json.dumps({"ordinals": ordinals})
+    s3.get_file_list.return_value = file_list or []
+
+    calls = []
+
+    def fake_process_one(
+        mediaid, dpla_id, payload, download_url=None, page_number=None
+    ):
+        calls.append((mediaid, page_number))
+
+    monkeypatch.setattr(sdc_sync, "process_one_from_sdc", fake_process_one)
+    monkeypatch.setattr(sdc_sync, "tracker", MagicMock(), raising=False)
+    monkeypatch.setattr(sdc_sync, "site", MagicMock(), raising=False)
+    # Constant write counter → no null-edit touch → the Commons site is never
+    # actually hit; keeps the test offline.
+    monkeypatch.setattr(sdc_sync, "_sdc_writes_total", lambda: 0)
+    # Skip the post-SDC cleanup pass entirely.
+    monkeypatch.setattr(sdc_sync, "_normalize_wikitext_enabled", False, raising=False)
+    # Discovery must NOT run when every ordinal is already resolved (eligible or
+    # terminally MERGED). Make it loud so a regression that routes MERGED back
+    # into discovery fails here.
+    monkeypatch.setattr(
+        sdc_sync,
+        "_find_existing_commons_files_by_dpla_id",
+        lambda d: pytest.fail("discovery must not run for resolved ordinals"),
+    )
+
+    sdc_sync._process_one_partner_item(s3, "ohio", "a" * 32, 1, 1)
+    return calls
+
+
+def test_partner_item_within_item_stamps_complete_recorded_page_set(monkeypatch):
+    # The bug repro at the sync layer: two byte-identical JPGs at pages 1 and 2.
+    # Ordinal 1 is the canonical (UPLOADED); ordinal 2 MERGED (redirect) onto it.
+    # Only the canonical syncs, and it stamps the COMPLETE set [1, 2] — never a
+    # single page that the authoritative amend would use to STRIP the other.
+    ordinals = {
+        "1": {
+            "status": "UPLOADED",
+            "pageid": 100,
+            "title": "X (page 1).jpg",
+            "page_numbers": [1, 2],
+        },
+        "2": {
+            "status": "MERGED",
+            "pageid": 101,
+            "title": "X (page 2).jpg",
+            "page_numbers": [1, 2],
+        },
+    }
+    calls = _drive_partner_item(monkeypatch, ordinals=ordinals, file_list=["u1", "u2"])
+    assert calls == [("M100", [1, 2])]
+
+
+def test_partner_item_singleton_recorded_empty_list_yields_none(monkeypatch):
+    # A singleton records page_numbers=[]; the sync must pass None (no P304),
+    # NOT an empty set (which the authoritative amend would read as "strip all").
+    ordinals = {
+        "1": {
+            "status": "UPLOADED",
+            "pageid": 100,
+            "title": "X.jpg",
+            "page_numbers": [],
+        },
+    }
+    calls = _drive_partner_item(monkeypatch, ordinals=ordinals)
+    assert calls == [("M100", None)]
+
+
+def test_partner_item_missing_page_numbers_field_falls_back_to_positional(monkeypatch):
+    # An OLD upload-result.json written before the uploader recorded
+    # page_numbers: the field is absent, so the sync falls back to the
+    # positional per-extension computation (two JPGs → pages 1 and 2).
+    ordinals = {
+        "1": {"status": "UPLOADED", "pageid": 100, "title": "X - a.jpg"},
+        "2": {"status": "UPLOADED", "pageid": 200, "title": "X - b.jpg"},
+    }
+    calls = _drive_partner_item(monkeypatch, ordinals=ordinals, file_list=["u1", "u2"])
+    assert calls == [("M100", 1), ("M200", 2)]
+
+
+def test_partner_item_cross_item_merged_only_does_not_sync_or_discover(monkeypatch):
+    # A cross-item duplicate whose only ordinal MERGED onto another item's
+    # canonical. Its own title is a redirect with no MediaInfo — it must NOT be
+    # synced here, and (the fix) must NOT be discovery-rescued as a standalone
+    # file. No eligible ordinals → the item is skipped with zero sync calls.
+    ordinals = {
+        "1": {
+            "status": "MERGED",
+            "pageid": 100,
+            "title": "X.jpg",
+            "page_numbers": [],
+        },
+    }
+    calls = _drive_partner_item(monkeypatch, ordinals=ordinals)
+    assert calls == []

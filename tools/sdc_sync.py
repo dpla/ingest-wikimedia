@@ -4501,14 +4501,15 @@ def process_one_from_sdc(
     statements on Commons that lack P2699, ``_amend_p7482_url_qualifiers``
     POSTs the missing qualifier via wbsetqualifier (idempotent).
 
-    ``page_number`` is the per-ordinal P304 (page-number) value computed
-    by :func:`_compute_page_numbers` from upload-result.json's per-file
-    extension grouping. Supplied only for files that are part of a
-    multi-file extension group on a multipage item; ``None`` for
-    single-file ordinals. When supplied, the P760 (DPLA ID) claim
-    receives a P304 qualifier with the page number; the legacy-state
-    backfill ``_amend_p760_page_qualifier`` handles existing P760
-    statements that lack it.
+    ``page_number`` is the P304 (page-number) value(s) for this file: a
+    single int, an iterable of ints (a within-item canonical that absorbed
+    a duplicate carries EVERY page its SHA1 occupies — the complete set the
+    uploader recorded in upload-result.json), or ``None`` for a single-file
+    ordinal with no page series. Treated AUTHORITATIVELY: the P760 (DPLA ID)
+    claim's P304 qualifiers are reconciled to exactly this set via
+    :func:`_amend_p760_page_qualifier` (missing added, stale removed), so the
+    complete set must be passed — a partial set would strip the file's other
+    pages.
     """
     # Drop every prior file's cached entity at the file boundary so the
     # cache doesn't leak entities across files (see _entity_cache
@@ -5499,6 +5500,14 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
             continue
         if data.get("status") in ("UPLOADED", "SKIPPED"):
             eligible[ord_str] = data
+        elif data.get("status") == "MERGED":
+            # Terminal within-item/cross-item duplicate: its own title is a
+            # redirect to the canonical (no MediaInfo of its own), and its page
+            # is already carried on the canonical's P304. It must NOT be
+            # discovery-rescued and synced as if it were a standalone file —
+            # doing so re-derives page numbers against the redirect and can
+            # double-count. Skip it entirely.
+            continue
         else:
             # NOT_PRESENT / INELIGIBLE / FAILED — the upload phase
             # couldn't confirm this ordinal in *this* run, but the
@@ -5599,13 +5608,24 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         tracker.increment(Result.SDC_ITEMS_SKIPPED_MAPPING)
         return
 
-    # Compute per-ordinal P304 (page-number) values for any
-    # multi-file extension group. Single-file groups (one JPG,
-    # one PDF, etc.) are absent from the map — `page_numbers.get(
-    # ord_str)` returns None for them and process_one_from_sdc
-    # skips the qualifier. JPGs and PDFs are numbered as
-    # independent series per the user-confirmed rule.
-    page_numbers = _compute_page_numbers(ordinal_items)
+    # Per-ordinal P304 page numbers. The authoritative source is the COMPLETE
+    # page set the uploader recorded per ordinal in upload-result.json
+    # (``data["page_numbers"]`` — every page position that file's SHA1 occupies
+    # in the item, so a within-item canonical carries ALL its pages). This is
+    # read below per ordinal. ``_compute_page_numbers`` is retained only as a
+    # fallback for OLD upload-result.json files written before the uploader
+    # recorded page_numbers; it numbers eligible ordinals positionally and does
+    # NOT see within-item duplicates (the stripping bug), so it is used only
+    # when the recorded field is absent.
+    #
+    # KNOWN LEGACY LIMITATION: because the fallback can't see within-item dups
+    # and its result still drives the AUTHORITATIVE amend below, re-syncing a
+    # #408-era within-item item from its old (field-less) sidecar re-strips the
+    # canonical's extra pages. This is not a regression (those items are already
+    # stripped by the original bug), but the operational fix is to RE-RUN THE
+    # UPLOAD PHASE (which regenerates the sidecar WITH page_numbers), not to run
+    # sdc-sync alone against the stale sidecar.
+    page_numbers_fallback = _compute_page_numbers(ordinal_items)
 
     for ord_str, data in ordinal_items:
         pageid = data.get("pageid")
@@ -5685,13 +5705,24 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
                 download_url = file_list[ord_num - 1] or None
             else:
                 download_url = None
+        # Prefer the COMPLETE page set the uploader recorded for this ordinal
+        # (every position its SHA1 occupies in the item — so a within-item
+        # canonical that absorbed a duplicate carries ALL its pages). An empty
+        # list means a singleton with no page qualifier. Only when the field is
+        # entirely absent (an upload-result.json written before the uploader
+        # recorded page_numbers) do we fall back to the positional computation.
+        recorded_pages = data.get("page_numbers")
+        if recorded_pages is None:
+            page_number = page_numbers_fallback.get(ord_str)
+        else:
+            page_number = recorded_pages or None
         try:
             process_one_from_sdc(
                 mediaid,
                 dpla_id,
                 sdc_payload,
                 download_url=download_url,
-                page_number=page_numbers.get(ord_str),
+                page_number=page_number,
             )
         except _MissingEntityError:
             # Commons says the MediaInfo entity at this M-id doesn't
