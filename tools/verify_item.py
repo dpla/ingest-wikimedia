@@ -5,9 +5,9 @@ sha1 landed at its intended Commons title.
 
 For each ordinal in the item's file_list this script:
   1. reads the S3 object's sha1 + size + content-type,
-  2. uses compute_ordinal_exts_and_page_labels() — the same helper the
-     uploader uses — to determine the Commons page_label the bot would
-     have assigned to that ordinal (gap-squashing logic and all),
+  2. uses prescan_ordinals() — the same helper the uploader uses — to
+     determine the Commons page_label the bot would have assigned to that
+     ordinal (gap-squashing logic and all),
   3. queries the Commons MediaWiki API for the file at the resulting
      intended title and compares its sha1 to S3.
 
@@ -51,9 +51,9 @@ from ingest_wikimedia.s3 import S3_BUCKET, S3Client
 from ingest_wikimedia.tools_context import ToolsContext
 from ingest_wikimedia.wikimedia import (
     check_content_type,
-    compute_ordinal_exts_and_page_labels,
     get_page_title,
     is_download_only,
+    prescan_ordinals,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -179,9 +179,7 @@ def main() -> None:
     # Use the same helper the uploader uses to compute per-ordinal page labels
     # so the intended Commons titles match exactly what the bot uploads to,
     # including the gap-squashing per-extension counter logic.
-    _, page_labels = compute_ordinal_exts_and_page_labels(
-        s3_client_obj, dpla_id, partner, num_files
-    )
+    _, page_labels, _ = prescan_ordinals(s3_client_obj, dpla_id, partner, num_files)
 
     s3 = boto3.client("s3")
     correct = 0

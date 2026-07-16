@@ -117,9 +117,8 @@ from ingest_wikimedia.wikimedia import (
     MIME_UNKNOWN_EXT,
     build_title_drift_move_reason,
     collect_duplicate_source_sha1s,
-    compute_ordinal_exts_and_page_labels,
     compute_sha1_page_numbers,
-    read_sha1_by_ordinal,
+    prescan_ordinals,
     get_page_title,
     get_wiki_text,
     wikimedia_url,
@@ -2594,18 +2593,13 @@ class Uploader:
 
             files = self.s3_client.get_file_list(partner, dpla_id)
 
-            # Pre-scan via the shared helper so the verifier can reconstruct
-            # the same page-label assignments without duplicating the logic.
-            ordinal_exts, page_labels = compute_ordinal_exts_and_page_labels(
-                self.s3_client, dpla_id, partner, len(files)
-            )
-
-            # Read every ordinal's SHA1 ONCE. Both duplicate detection and the
-            # P304 page-number map derive from this single snapshot, so they can
-            # never disagree — a within-item duplicate that is detected always
-            # has its page unioned onto the canonical (two separate S3 passes
-            # could diverge and drop a page; see read_sha1_by_ordinal).
-            sha1_by_ordinal = read_sha1_by_ordinal(
+            # Single S3 pre-scan (one HEAD per ordinal) over the shared helper,
+            # so the verifier can reconstruct the same page-label assignments
+            # without duplicating the logic. The extension/page-label accounting
+            # and the SHA1 snapshot come from the SAME HEAD per object, so they
+            # can never diverge — a within-item duplicate that is detected always
+            # has its page unioned onto the canonical (see prescan_ordinals).
+            ordinal_exts, page_labels, sha1_by_ordinal = prescan_ordinals(
                 self.s3_client, dpla_id, partner, len(files)
             )
 
