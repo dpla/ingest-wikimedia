@@ -19,6 +19,8 @@ from ingest_wikimedia.logs import setup_logging
 from ingest_wikimedia.sdc import (
     CHUNKABLE_PROPS,
     NARA_PROVIDER_NAME,
+    _entity_has_dpla_attributed_claims,
+    _is_dpla_reference,
     build_claims_for_doc,
     casefold_for_compare,
     fetch_institutions_v2,
@@ -370,36 +372,6 @@ def _fetch_entity_for_cleanup_guard(mediaid: str) -> dict:
     if not isinstance(ent, dict):
         return {}
     return ent
-
-
-def _entity_has_dpla_attributed_claims(entity: dict) -> bool:
-    """True iff ``entity`` carries at least one DPLA-attributed statement.
-
-    Mirrors :func:`Module:DPLA`'s ``isDplaDetermined`` filter on Commons:
-    the canonical DPLA-provenance marker is the ``P123 = Q2944483``
-    (publisher = DPLA) snak in any statement reference, stamped by
-    ``formattedclaim`` on every claim DPLA writes. The prior implementation
-    checked the ``P459 = Q61848113`` qualifier instead — a display-side
-    co-stamp that isn't a reference-independent marker — despite the
-    docstring already claiming alignment with Module:DPLA. Detecting
-    provenance via the reference closes that drift and keeps this guard
-    aligned with the template renderer's notion of "has DPLA SDC".
-    """
-    if not entity:
-        return False
-    statements = entity.get("statements") or entity.get("claims") or {}
-    if not isinstance(statements, dict):
-        return False
-    for stmt_list in statements.values():
-        if not isinstance(stmt_list, list):
-            continue
-        for stmt in stmt_list:
-            if not isinstance(stmt, dict):
-                continue
-            for reference in stmt.get("references") or []:
-                if _is_dpla_reference(reference):
-                    return True
-    return False
 
 
 def _classify_item_outcome(synced_this_item: bool, had_ordinal_error: bool) -> Result:
@@ -1005,22 +977,6 @@ def _allowed_qualifier_props(prop):
     statement property. Always includes P459 (the determination-method
     marker stamped by formattedclaim)."""
     return {"P459"} | _DPLA_EXTRA_QUALIFIER_PROPS.get(prop, set())
-
-
-def _is_dpla_reference(reference):
-    """Return True iff `reference` is a DPLA-authored reference, identified
-    by a `P123 = Q2944483` snak (publisher = "Digital Public Library of
-    America"). DPLA stamps that snak on every reference it writes via
-    formattedclaim, so it's a sufficient marker for "we authored this".
-    """
-    snaks = (reference or {}).get("snaks") or {}
-    for snak in snaks.get("P123") or []:
-        try:
-            if snak["datavalue"]["value"]["id"] == "Q2944483":
-                return True
-        except (KeyError, TypeError):
-            continue
-    return False
 
 
 def _is_safe_to_amend_in_place(statement, prop):
@@ -4632,7 +4588,12 @@ def process_one_from_sdc(
 
 
 def merge_item_onto_canonical(
-    canonical_mediaid, dpla_id, sdc_payload, page_numbers=None, download_url=None
+    canonical_mediaid,
+    dpla_id,
+    sdc_payload,
+    page_numbers=None,
+    download_url=None,
+    commons_site=None,
 ):
     """Rule #3: merge a duplicate DPLA item's SDC onto the already-existing
     canonical Commons file instead of uploading a second byte-identical file.
@@ -4648,7 +4609,15 @@ def merge_item_onto_canonical(
     ``page_numbers`` is the set of within-item page numbers this DPLA ID
     occupies on the canonical file (the within-item duplicate case); ``None``
     when the duplication is cross-item / cross-institution.
+
+    ``commons_site``, when provided, is installed as the module-level pywikibot
+    ``site`` the merge writes through — so out-of-module callers (the uploader's
+    dedup path) hand their authenticated site in via this parameter instead of
+    reaching into and mutating ``sdc_sync.site`` directly.
     """
+    if commons_site is not None:
+        global site
+        site = commons_site
     process_one_from_sdc(
         canonical_mediaid,
         dpla_id,

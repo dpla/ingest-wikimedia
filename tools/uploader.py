@@ -2214,8 +2214,6 @@ class Uploader:
             )
         else:
             page_numbers = None
-        # The merge writes through sdc_sync's module-level ``site`` handle.
-        sdc_sync.site = self.site
         # Snapshot the SDC write counter around the merge so we can tell a real
         # merge (something was written) from an idempotent no-op re-encounter
         # (everything already present → merge_item_onto_canonical writes
@@ -2224,11 +2222,15 @@ class Uploader:
         # means the merge changed nothing on Commons this run.
         writes_before = sdc_sync._sdc_writes_total()
         try:
+            # Pass our authenticated site through the call (merge_item_onto_canonical
+            # installs it as sdc_sync's module ``site``) rather than mutating
+            # sdc_sync.site from here.
             sdc_sync.merge_item_onto_canonical(
                 canonical_mediaid,
                 dpla_id,
                 sdc_payload,
                 page_numbers=page_numbers,
+                commons_site=self.site,
             )
             changed = sdc_sync._sdc_writes_total() > writes_before
             logging.info(
