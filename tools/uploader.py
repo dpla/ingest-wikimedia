@@ -325,6 +325,14 @@ class DriftResolution(str, Enum):
     # invariant is blocked and the bot must not pick a winner. Hand off to a
     # human via the hand-fix.jsonl sidecar; no upload.
     HAND_FIX = "hand_fix"
+    # The existing file is a COMMUNITY upload (non-DPLA/NARA title AND not one
+    # of our bots) — off-limits to every mutating path. Distinct from HAND_FIX
+    # so the caller records it with the ``community_file`` reason rather than
+    # ``rename_blocked``. In normal flow ``process_file`` gates community files
+    # out BEFORE calling ``_resolve_hash_drift``, so this outcome is a
+    # defense-in-depth second layer (see ``_resolve_hash_drift``); it fires only
+    # if that primary gate is ever bypassed or reordered.
+    HAND_FIX_COMMUNITY = "hand_fix_community"
     ALREADY_CORRECT = "already_correct"
 
 
@@ -953,7 +961,10 @@ class Uploader:
                     # BOTH non-DPLA/NARA-shaped in title AND not one of our
                     # bots' uploads. Hand it to a human (distinct reason) and
                     # stop — checked before any drift resolution so no MOVE /
-                    # MERGE_AND_REDIRECT can touch a community file.
+                    # MERGE_AND_REDIRECT can touch a community file. This is the
+                    # PRIMARY layer; _resolve_hash_drift independently refuses
+                    # community files too (DriftResolution.HAND_FIX_COMMUNITY)
+                    # as defense-in-depth.
                     if self._is_community_file(existing_file):
                         return self._record_community_hand_fix_and_skip(
                             partner=partner,
@@ -1047,6 +1058,20 @@ class Uploader:
                             and existing_title in expected_item_titles,
                             sha1=sha1,
                             canonical_page_numbers=canonical_page_numbers,
+                        )
+                    if drift_action == DriftResolution.HAND_FIX_COMMUNITY:
+                        # Defense-in-depth: the resolver refused a community
+                        # file. In normal flow the community gate above already
+                        # returned, so reaching here means that primary gate was
+                        # bypassed — record with the community reason (not
+                        # rename_blocked) so the distinct signal is preserved.
+                        return self._record_community_hand_fix_and_skip(
+                            partner=partner,
+                            dpla_id=dpla_id,
+                            ordinal=ordinal,
+                            our_sha1=sha1,
+                            intended_title=page_title,
+                            community_file=existing_file,
                         )
                     # DriftResolution.HAND_FIX (and any unforeseen sentinel):
                     # our SHA1 is at a wrong title and the intended title is
@@ -1812,8 +1837,33 @@ class Uploader:
           lookup returned IS the file at the intended title under
           whitespace-run normalization (a post-title-truncation artefact of
           ``get_page_title``). No drift to resolve. Caller records SKIPPED.
+
+        - ``HAND_FIX_COMMUNITY`` — **community file**: the existing file isn't
+          ours (see :meth:`_is_community_file`). This is a DEFENSE-IN-DEPTH
+          second layer: ``process_file`` already refuses community files before
+          calling this method, so in normal flow the check below is not reached.
+          It is here so the resolver is correct in isolation — no mutating path
+          in it (the ``_move_to_correct_title`` calls, or the caller's merge on
+          ``MERGE_AND_REDIRECT``) can ever touch a community file even if the
+          primary gate is later reordered or removed. It is checked first,
+          before any other classification.
         """
         actual_filename = existing_file.title(with_ns=False)
+
+        # Defense-in-depth (see the HAND_FIX_COMMUNITY docstring entry above):
+        # never let a community file reach the move / merge-redirect outcomes
+        # below. process_file's own gate already returned for community files in
+        # normal flow, so on the same FilePage this re-check's uploader read is a
+        # pywikibot cache hit, not a second network call — a cheap, independent
+        # second layer on an invariant we never want to breach.
+        if self._is_community_file(existing_file):
+            logging.warning(
+                f"Hash drift for {dpla_id} {ordinal}: "
+                f"[[File:{actual_filename}]] is a COMMUNITY file; refusing to "
+                f"resolve (defense-in-depth — process_file's community gate "
+                f"should have caught this first). Routing to hand-fix."
+            )
+            return DriftResolution.HAND_FIX_COMMUNITY
 
         # Defense-in-depth: if pywikibot's normalized title for the file
         # that carries this SHA1 equals the intended title we're about

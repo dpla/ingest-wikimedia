@@ -401,8 +401,10 @@ def test_drift_resolution_sentinel_contract_pin():
         "MOVED": "moved",
         "MERGE_AND_REDIRECT": "merge_and_redirect",
         "HAND_FIX": "hand_fix",
+        "HAND_FIX_COMMUNITY": "hand_fix_community",
         "ALREADY_CORRECT": "already_correct",
     }
     # ``str, Enum`` subclass preserves string-ness for legacy comparisons.
     assert isinstance(DriftResolution.MERGE_AND_REDIRECT, str)
     assert DriftResolution.HAND_FIX == "hand_fix"
+    assert DriftResolution.HAND_FIX_COMMUNITY == "hand_fix_community"
