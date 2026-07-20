@@ -317,7 +317,41 @@ def find_legacy_template(wikitext: str):
     return None
 
 
-def parse_artwork_params(wikitext: str) -> dict[str, str]:
+# Prefix marking an UNMAPPED legacy param (one with no DPLA canonical/SDC
+# target — photographer, genre, depicted people, …) in the parse output, keyed
+# by its original-cased label. Chosen so it can't collide with a canonical key
+# (title/description/date/creator/source/institution/permission) or with a real
+# param name a template is likely to carry.
+_UNMAPPED_KEY_PREFIX = "unmapped:"
+
+
+def _escape_top_level_pipes(value: str) -> str:
+    """Escape only TOP-LEVEL ``|`` to ``{{!}}`` so ``value`` survives as a single
+    template parameter, leaving pipes inside nested templates (e.g.
+    ``{{ubl|a|b}}``) untouched. ``=`` needs no escaping inside a named ``value=``
+    parameter — only the first ``=`` splits."""
+    out = []
+    for node in mwparserfromhell.parse(value).nodes:
+        if isinstance(node, mwparserfromhell.nodes.Text):
+            out.append(node.value.replace("|", "{{!}}"))
+        else:
+            out.append(str(node))
+    return "".join(out)
+
+
+def _information_field_row(label: str, value: str) -> str:
+    """Format one unmapped legacy param as an ``{{Information field}}`` row for
+    the migrated template's ``other_fields`` (Module:DPLA renders these verbatim
+    in the yellow user-contribution box, mirroring ``{{Information}}``)."""
+    return "{{Information field|name=%s|value=%s}}" % (
+        _escape_top_level_pipes(label),
+        _escape_top_level_pipes(value),
+    )
+
+
+def parse_artwork_params(
+    wikitext: str, include_unmapped: bool = False
+) -> dict[str, str]:
     """Extract the canonical-key → value dict from a legacy template
     invocation in ``wikitext``.
 
@@ -331,10 +365,15 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
     (crediting the AWB edit for a real content change would misclassify
     the value as community-contributed) and by downstream SDC-storage
     paths (a stored value that literally contains ``{{!}}`` is nonsense
-    outside a template context). Unrecognised param names are dropped
-    silently — those don't have a canonical target and the wikitext-
-    rewrite step preserves them by leaving the template untouched if
-    the param wasn't migrated.
+    outside a template context). Unrecognised param names have no
+    canonical/SDC target: by default they are dropped, but with
+    ``include_unmapped=True`` they are returned keyed
+    ``{_UNMAPPED_KEY_PREFIX}<original label>`` so the migration can
+    preserve a community-authored one as an ``{{Information field}}`` row
+    in ``other_fields`` instead of losing it. (The migration node-swaps
+    the whole legacy template for a fresh ``{{DPLA metadata}}`` block, so
+    a param not carried forward here is gone — it is NOT preserved by
+    "leaving the template untouched".)
 
     Repairs literal-``|`` truncation of named-param values. Legacy
     ``{{Artwork}}`` uploads sometimes wrote pipe-separated subject
@@ -402,6 +441,17 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
             last_named_recognised = True
             continue
         if canonical is None:
+            # An unmapped named param (photographer, genre, depicted people, …)
+            # — no DPLA canonical/SDC target. With include_unmapped, record it
+            # under its ORIGINAL-cased label (stable across revisions for the
+            # provenance walk) so the migration can preserve a community-authored
+            # one as an {{Information field}} row. Skip the modern ``other_fields``
+            # passthrough param (already a run of {{InFi}} rows — don't re-wrap
+            # it). Not stitched for positional overflow, same as before.
+            if include_unmapped and param_name != "other_fields":
+                stitched.append(
+                    [_UNMAPPED_KEY_PREFIX + str(param.name).strip(), str(param.value)]
+                )
             last_named_recognised = False
             continue
         stitched.append([canonical, str(param.value)])
@@ -495,6 +545,7 @@ def _extract_related_image_files(wikitext: str) -> list[str]:
 
 def trace_param_provenance(
     revisions: Iterable[RevisionSnapshot],
+    include_unmapped: bool = False,
 ) -> dict[str, str]:
     """Walk revisions oldest→newest to find which editor last set each
     legacy-template param to its current value.
@@ -519,14 +570,14 @@ def trace_param_provenance(
     if not sorted_revs:
         return {}
 
-    final_params = parse_artwork_params(sorted_revs[-1].text)
+    final_params = parse_artwork_params(sorted_revs[-1].text, include_unmapped)
     if not final_params:
         return {}
 
     provenance: dict[str, str] = {}
     prior_seen: dict[str, str] = {}
     for rev in sorted_revs:
-        rev_params = parse_artwork_params(rev.text)
+        rev_params = parse_artwork_params(rev.text, include_unmapped)
         # Drop entries from prior_seen for params the current revision
         # no longer carries. Without this, a delete → re-add of the
         # same string at a later revision looks like "unchanged" (the
@@ -610,15 +661,30 @@ def plan_migration(
     if find_legacy_template(latest.text) is None:
         return None
 
-    wikitext_params = parse_artwork_params(latest.text)
-    provenance = trace_param_provenance(sorted_revs)
+    wikitext_params = parse_artwork_params(latest.text, include_unmapped=True)
+    provenance = trace_param_provenance(sorted_revs, include_unmapped=True)
     classified = classify_param_provenance(provenance, bot_accounts)
 
     community_imports: dict[str, str] = {}
     dpla_originated: dict[str, str] = {}
     wikitext_preserved_extras: dict[str, str] = {}
+    other_field_rows: list[str] = []
 
     for key, value in wikitext_params.items():
+        if key.startswith(_UNMAPPED_KEY_PREFIX):
+            # An unmapped legacy param (photographer, genre, depicted people, …)
+            # has no DPLA canonical/SDC target. Preserve a COMMUNITY-authored one
+            # as an {{Information field}} row in other_fields (Module:DPLA renders
+            # it in the yellow box); a DPLA-bot-authored one is boilerplate with
+            # no SDC target and is dropped — the same treatment a mapped
+            # DPLA-originated value gets. A bare redundant {{DPLA}} source
+            # template is likewise dropped, not wrapped.
+            if classified.get(key) != "community" or _is_redundant_dpla_source(value):
+                continue
+            other_field_rows.append(
+                _information_field_row(key.removeprefix(_UNMAPPED_KEY_PREFIX), value)
+            )
+            continue
         # A DPLA/uploader-generated boilerplate value (a bare {{DPLA}} template,
         # an uploader source link, or a rights-statement string) is provenance
         # already rendered from SDC — keeping it would just duplicate that
@@ -678,6 +744,13 @@ def plan_migration(
             community_imports[key] = value
         else:
             dpla_originated[key] = value
+
+    if other_field_rows:
+        # Community-authored unmapped params, preserved as a run of
+        # {{Information field}} rows in the migrated template's ``other_fields``
+        # param (the fresh get_wiki_text block never emits it, so there is no
+        # canonical value to collide with).
+        wikitext_preserved_extras["other_fields"] = "\n".join(other_field_rows)
 
     legacy_template = find_legacy_template(latest.text)
     return MigrationPlan(

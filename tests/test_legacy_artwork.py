@@ -3849,6 +3849,83 @@ def test_plan_migration_preserves_unparseable_title_template():
     assert "title" not in plan.community_imports
 
 
+# ---------------------------------------------------------------------------
+# Unmapped-param preservation via other_fields
+# ---------------------------------------------------------------------------
+def test_parse_artwork_params_include_unmapped_keys_and_default_drop():
+    from ingest_wikimedia.legacy_artwork import (
+        _UNMAPPED_KEY_PREFIX,
+        parse_artwork_params,
+    )
+
+    text = "{{Photograph|title=T|photographer=Jane Doe|depicted people=John}}"
+    # Default: unmapped params dropped (only the mapped `title` survives).
+    assert set(parse_artwork_params(text)) == {"title"}
+    # include_unmapped: unmapped params surface under the prefix, original case.
+    unmapped = parse_artwork_params(text, include_unmapped=True)
+    assert unmapped[f"{_UNMAPPED_KEY_PREFIX}photographer"] == "Jane Doe"
+    assert unmapped[f"{_UNMAPPED_KEY_PREFIX}depicted people"] == "John"
+    # The modern other_fields passthrough is never re-wrapped as unmapped.
+    assert f"{_UNMAPPED_KEY_PREFIX}other_fields" not in parse_artwork_params(
+        "{{Photograph|title=T|other_fields={{InFi|X|Y}}}}", include_unmapped=True
+    )
+
+
+def test_information_field_row_escapes_top_level_pipes_only():
+    from ingest_wikimedia.legacy_artwork import _information_field_row
+
+    # A plain value is embedded verbatim.
+    assert (
+        _information_field_row("genre", "portrait")
+        == "{{Information field|name=genre|value=portrait}}"
+    )
+    # A nested template's pipes survive; a top-level pipe is escaped to {{!}}.
+    assert (
+        _information_field_row("people", "{{ubl|Alice|Bob}}")
+        == "{{Information field|name=people|value={{ubl|Alice|Bob}}}}"
+    )
+    assert (
+        _information_field_row("note", "a|b")
+        == "{{Information field|name=note|value=a{{!}}b}}"
+    )
+
+
+def test_plan_migration_preserves_community_unmapped_params_as_other_fields():
+    """The Herrick photographer/genre/depicted-people case: community-authored
+    params with no DPLA/SDC target are preserved as {{Information field}} rows in
+    other_fields, not dropped."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Photograph|title=A Title|photographer=Jane Doe|genre=portrait"
+            "|depicted people=John Smith}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    other_fields = plan.wikitext_preserved_extras.get("other_fields")
+    assert other_fields == (
+        "{{Information field|name=photographer|value=Jane Doe}}\n"
+        "{{Information field|name=genre|value=portrait}}\n"
+        "{{Information field|name=depicted people|value=John Smith}}"
+    )
+
+
+def test_plan_migration_drops_dpla_authored_unmapped_params():
+    """An unmapped param last set by a DPLA account is boilerplate with no SDC
+    target — dropped (community-authored-only policy), not carried to
+    other_fields."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|title=A Title}}"),
+        (2, "DPLA bot", "{{Photograph|title=A Title|accession number=X123}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "other_fields" not in plan.wikitext_preserved_extras
+
+
 def test_format_claim_title_unwraps_lang_template_into_monolingual_text():
     claim = format_legacy_import_claim(
         "title", "{{en|Men standing before the depot}}", "https://example/permalink"
