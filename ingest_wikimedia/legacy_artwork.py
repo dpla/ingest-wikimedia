@@ -30,7 +30,7 @@ import datetime
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urlencode, urlparse
 
 import mwparserfromhell
@@ -577,6 +577,7 @@ def plan_migration(
     revisions: Iterable[RevisionSnapshot],
     canonical_params: dict,
     bot_accounts: frozenset[str] = MIGRATION_PROVENANCE_ACCOUNTS,
+    resolve_qid_redirect: Callable[[str], str] | None = None,
 ) -> MigrationPlan | None:
     """Compute the migration plan for a legacy-Artwork file.
 
@@ -594,6 +595,13 @@ def plan_migration(
     detect cases where a "community" provenance is actually a
     community editor re-stating what DPLA already has — in that case
     nothing is imported (the value is redundant with canonical).
+
+    ``resolve_qid_redirect`` optionally resolves a Wikidata Q-ID through
+    redirects (see :func:`_make_redirect_resolver`); it widens the
+    ``institution`` equivalence check so a community value that used an
+    older Q now redirecting to canonical's current Q is treated as
+    DPLA's own. Omitted (None) in the pure/test path — equivalence then
+    rests on the byte comparison alone.
     """
     sorted_revs = sorted(revisions, key=lambda r: r.revid)
     if not sorted_revs:
@@ -622,7 +630,7 @@ def plan_migration(
             continue
         canonical_value = _canonical_value_for_key(canonical_params, key)
         if classified.get(key) == "community" and not _value_equivalent_to_canonical(
-            key, value, canonical_value
+            key, value, canonical_value, resolve_qid_redirect
         ):
             # Only import community values that *differ* from canonical
             # — a community editor restating DPLA's title verbatim is
@@ -1052,17 +1060,126 @@ _CANNED_PD_BLURB = (
 )
 
 
+def _is_rightsstatements_host(host: str) -> bool:
+    """True when ``host`` (already lowercased) is rightsstatements.org or a
+    subdomain of it. Matched on the parsed hostname, so a look-alike like
+    ``rightsstatements.org.evil.example`` does not match."""
+    return host == "rightsstatements.org" or host.endswith(".rightsstatements.org")
+
+
 def _is_rights_url(url: str) -> bool:
     """True for a DPLA/NARA rights-statement URL, matched by parsed host (and
     path) rather than substring — so ``https://rightsstatements.org@evil.example/…``
     or a URL merely containing the text elsewhere does NOT match."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if host == "rightsstatements.org" or host.endswith(".rightsstatements.org"):
+    if _is_rightsstatements_host(host):
         return True
     return (
         host == "archives.gov" or host.endswith(".archives.gov")
     ) and parsed.path.startswith("/social-media/flickr-faqs")
+
+
+# Template:Rights statement's first positional arg accepts any of {bare code,
+# http:// URI, https:// URI} for these rightsstatements.org statements — its
+# /switch maps all three forms of each to one Wikidata item. All reduce to the
+# lowercased code. (The DPLA pipeline itself only emits NoC-US / NKC via
+# get_permissions_template, but community-authored wikitext may use any of them.)
+_RS_STATEMENT_CODES = frozenset(
+    {
+        "inc",
+        "inc-ow-eu",
+        "inc-edu",
+        "inc-nc",
+        "inc-ruu",
+        "noc-cr",
+        "noc-nc",
+        "noc-oklr",
+        "noc-us",
+        "cne",
+        "und",
+        "nkc",
+    }
+)
+
+
+def _rs_statement_code(arg: str) -> str | None:
+    """Reduce a ``{{Rights statement}}`` argument to its lowercased
+    rightsstatements.org statement code, or None. Accepts the three forms the
+    template's switch accepts — a bare code (``NoC-US``), an ``http://`` URI, or
+    an ``https://`` URI (``…/vocab/NoC-US/1.0/``) — treating the two schemes as
+    equivalent exactly as the template does (host matched by parsed hostname, so
+    a look-alike like ``rightsstatements.org.evil.example`` does not match)."""
+    arg = arg.strip()
+    parsed = urlparse(arg)
+    if _is_rightsstatements_host((parsed.hostname or "").lower()):
+        parts = [p for p in parsed.path.split("/") if p]
+        code = parts[1].lower() if len(parts) >= 2 and parts[0] == "vocab" else ""
+    else:
+        code = arg.lower()
+    return code if code in _RS_STATEMENT_CODES else None
+
+
+def _is_ignorable_node(node) -> bool:
+    """True for a node that carries no meaning in a display value — a
+    whitespace-only ``Text`` node or a ``<br>`` ``Tag``. Lets callers test
+    whether a value is a single significant node (a template/link) surrounded
+    only by layout whitespace."""
+    if isinstance(node, mwparserfromhell.nodes.Text):
+        return not node.value.strip()
+    return (
+        isinstance(node, mwparserfromhell.nodes.Tag)
+        and str(node.tag).strip().lower() == "br"
+    )
+
+
+def _rights_identity(value: str) -> str | None:
+    """Reduce a ``permission`` value to a canonical rights key so representations
+    of the same rights compare equal regardless of surface form:
+
+    * ``{{Rights statement|<code|http|https URI>}}`` → the RS statement code;
+    * the permission template the uploader emits (``{{NoC-US|Q…}}``,
+      ``{{NKC|Q…}}``, ``{{cc-zero}}``, ``{{PD-US}}``, ``{{Cc-by-4.0}}``) → its
+      lowercased template name — which for the RS statements *is* the code, so it
+      collapses onto the ``{{Rights statement}}`` form above;
+    * a bare rights-statement URI → the RS statement code.
+
+    Returns None for anything that is not a single, recognised rights
+    representation (community prose, a non-rights template, or a rights template
+    mixed with other content) — so a genuinely different community permission is
+    preserved by the caller, never silently dropped.
+
+    Note the drop semantics differ from :func:`_is_dpla_generated_extra`'s
+    permission branch, which drops a bare rights-statement *external link*
+    UNCONDITIONALLY (uploader boilerplate) before this comparator runs. Here the
+    permission-TEMPLATE form is dropped only when it EQUALS canonical — the more
+    conservative choice, since a template can legitimately name a *different*
+    community-chosen right, which is then preserved."""
+    meaningful = [
+        node
+        for node in mwparserfromhell.parse(value).nodes
+        if not _is_ignorable_node(node)
+    ]
+    if len(meaningful) != 1:
+        return None
+    node = meaningful[0]
+    if isinstance(node, mwparserfromhell.nodes.Template):
+        name = _template_name(node)
+        if name == "rights statement":
+            return (
+                _rs_statement_code(str(node.get("1").value)) if node.has("1") else None
+            )
+        if name in _RS_STATEMENT_CODES or name.startswith(("cc-", "pd-")):
+            return name
+        return None
+    if isinstance(node, mwparserfromhell.nodes.ExternalLink):
+        # A bare rights-statement URI (mwparserfromhell parses a bare URL as an
+        # external-link node).
+        return _rs_statement_code(str(node.url))
+    if isinstance(node, mwparserfromhell.nodes.Text):
+        # A bare rights code as plain text (e.g. a hand-typed ``NoC-US``).
+        return _rs_statement_code(node.value)
+    return None
 
 
 def _only_external_links(value: str) -> bool:
@@ -1074,15 +1191,7 @@ def _only_external_links(value: str) -> bool:
     for node in mwparserfromhell.parse(value).nodes:
         if isinstance(node, mwparserfromhell.nodes.ExternalLink):
             saw = True
-        elif isinstance(node, mwparserfromhell.nodes.Text):
-            if node.value.strip():
-                return False
-        elif (
-            isinstance(node, mwparserfromhell.nodes.Tag)
-            and str(node.tag).strip().lower() == "br"
-        ):
-            continue
-        else:
+        elif not _is_ignorable_node(node):
             return False
     return saw
 
@@ -1254,17 +1363,69 @@ _KNOWN_LANG_CODES = frozenset(
 )
 
 
+def _unwrap_title_template(value: str) -> tuple[str, str] | None:
+    """If ``value`` is a sole Commons ``{{Title|…}}`` formatting template
+    carrying exactly one title string (plus an optional language), return
+    ``(text, lang)``; otherwise None so the caller falls back to verbatim
+    handling. ``{{Title}}`` is display-only formatting, so a title wrapped in it
+    is the same fact as the plain string — this lets it reconcile against
+    canonical and, when it differs, import as clean monolingual SDC.
+
+    Recognised shapes (``lang`` defaults to ``en`` — DPLA's default language):
+
+    * ``{{Title|XXX}}`` / ``{{Title|1=XXX}}``                 → ``("XXX", "en")``
+    * ``{{Title|en=XXX}}`` / ``{{Title|es=XXX}}``             → ``("XXX", "<code>")``
+    * ``{{Title|XXX|lang=en}}`` / ``{{Title|1=XXX|lang=es}}`` → ``("XXX", "<code>")``
+
+    Anything else — a second title string, an unknown extra parameter, a nested
+    template — returns None; the value is preserved verbatim rather than risk
+    dropping content."""
+    if "{{" not in value:
+        return None
+    parsed = mwparserfromhell.parse(value.strip())
+    templates = parsed.filter_templates(recursive=False)
+    if len(templates) != 1 or str(parsed).strip() != str(templates[0]).strip():
+        return None
+    tpl = templates[0]
+    if _template_name(tpl) != "title":
+        return None
+    text: str | None = None
+    lang = "en"
+    for param in tpl.params:
+        name = str(param.name).strip()
+        param_value = str(param.value).strip()
+        if name == "1":
+            if text is not None:
+                return None  # a second title string — not a simple wrapper
+            text = param_value
+        elif name == "lang":
+            lang = param_value.lower()
+        elif name.casefold() in _KNOWN_LANG_CODES:
+            if text is not None:
+                return None  # positional + language-keyed text is ambiguous
+            text, lang = param_value, name.casefold()
+        else:
+            return None  # unknown parameter — don't guess
+    if not text:
+        return None
+    return text, lang
+
+
 def _unwrap_lang_template(value: str) -> tuple[str, str]:
     """If ``value`` is exactly one bare ``{{<lang>|<text>}}`` language template
-    with a known ISO code, return ``(text, lang)``; otherwise ``(value,
-    "en")``. Lets a community title/description be stored as clean monolingual
-    text with the correct language code instead of literal ``{{en|…}}`` markup,
-    and reconciled against canonical's plain text."""
+    with a known ISO code (or a ``{{Title|…}}`` formatting wrapper), return
+    ``(text, lang)``; otherwise ``(value, "en")``. Lets a community
+    title/description be stored as clean monolingual text with the correct
+    language code instead of literal ``{{en|…}}`` / ``{{Title|…}}`` markup, and
+    reconciled against canonical's plain text."""
     # Fast path: a value with no template markup can't be a bare language
     # wrapper — skip the mwparserfromhell parse (this runs on every
     # title/description value across the batch).
     if "{{" not in value:
         return value, "en"
+    title = _unwrap_title_template(value)
+    if title is not None:
+        return title
     parsed = mwparserfromhell.parse(value.strip())
     templates = parsed.filter_templates(recursive=False)
     if len(templates) == 1 and str(parsed).strip() == str(templates[0]).strip():
@@ -1283,7 +1444,12 @@ def _unwrap_lang_template(value: str) -> tuple[str, str]:
     return value, "en"
 
 
-def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
+def _value_equivalent_to_canonical(
+    key: str,
+    value: str,
+    canonical: str,
+    resolve_qid_redirect: Callable[[str], str] | None = None,
+) -> bool:
     """Return True when ``value`` (from wikitext) and ``canonical`` (from
     DPLA) are the same fact for the purpose of migration-planning.
 
@@ -1313,10 +1479,18 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
     strict equality.
     """
     if key in ("title", "description"):
-        # A community title/description wrapped in a bare language template
-        # ({{en|…}}) is the same fact as canonical's plain text — compare the
-        # unwrapped text so it isn't imported as a spurious community value.
-        value = _unwrap_lang_template(value)[0]
+        # A community title/description wrapped in a language template
+        # ({{en|…}}) or the {{Title|…}} formatting template is the same fact as
+        # canonical's plain text — compare the unwrapped text so it isn't
+        # imported as a spurious community value. But only when the wrapper's
+        # language is DPLA's default (English): a non-English wrapper
+        # ({{Title|es=…}}) is a distinct fact even if the text matches, so it
+        # must NOT be treated as redundant — it should import as its own
+        # language-tagged monolingual claim instead.
+        text, lang = _unwrap_lang_template(value)
+        if lang != "en":
+            return False
+        value = text
     if value == canonical:
         return True
     if key == "date" and dates_semantically_equal(value, canonical):
@@ -1325,6 +1499,29 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
         wiki_qid = _extract_institution_qid(value)
         canon_qid = _extract_institution_qid(canonical) or canonical.strip()
         if wiki_qid and wiki_qid == canon_qid:
+            return True
+        if wiki_qid and canon_qid and resolve_qid_redirect is not None:
+            # A community editor may have used an older institution Q that
+            # Wikidata has since merged into canonical's current Q (a redirect).
+            # Resolve the community Q — mirroring Module:DPLA's
+            # ``mw.wikibase.getEntity(q):getId()`` — so a redirected-equivalent
+            # value is recognised as DPLA's own and dropped, not preserved as a
+            # spurious community contribution. Compare against the raw canonical
+            # Q first (the common case — canonical is DPLA's current Q); only
+            # resolve canonical too if that misses (both sides redirected).
+            resolved_wiki = resolve_qid_redirect(wiki_qid)
+            if resolved_wiki == canon_qid or resolved_wiki == resolve_qid_redirect(
+                canon_qid
+            ):
+                return True
+    if key == "permission":
+        # ``{{Rights statement|<code|URI>}}`` and the uploader-emitted permission
+        # template ({{NoC-US|Q…}}, {{cc-zero}}, …) render the same rights from
+        # different wikitext, so a byte/casefold compare misses them. Compare the
+        # canonical rights key instead; None means an unrecognised representation
+        # (community prose / a different right), which stays preserved.
+        identity = _rights_identity(value)
+        if identity is not None and identity == _rights_identity(canonical):
             return True
     if key in CASEFOLD_COMPARE_KEYS:
         folded_value = casefold_for_compare(value)
@@ -2798,7 +2995,13 @@ def migrate_legacy_file(
     canonical_params = dpla_metadata_params(
         dpla_id, item_metadata, provider, data_provider
     )
-    plan = plan_migration(title, revisions, canonical_params, bot_accounts)
+    plan = plan_migration(
+        title,
+        revisions,
+        canonical_params,
+        bot_accounts,
+        resolve_qid_redirect=_make_redirect_resolver(site),
+    )
     if plan is None:
         return MigrationResult(skipped_reason="no-legacy-template")
 
@@ -2966,6 +3169,7 @@ def import_cross_page_community_sdc(
         fetch_revision_snapshots(source_page),
         canonical_params,
         bot_accounts,
+        resolve_qid_redirect=_make_redirect_resolver(site),
     )
     if plan is None or (not plan.community_imports and not plan.related_image_imports):
         return 0
@@ -2981,6 +3185,35 @@ def import_cross_page_community_sdc(
         summary=summary or build_migration_summary(len(claims)),
     )
     return len(claims)
+
+
+def _make_redirect_resolver(site) -> Callable[[str], str]:
+    """Build a memoised Wikidata Q-ID redirect resolver for :func:`plan_migration`.
+
+    A Q that Wikidata has turned into a redirect resolves to its target Q-ID
+    (mirroring Module:DPLA's ``mw.wikibase.getEntity(q):getId()``); a
+    non-redirect, unknown, or malformed Q — and any network error — resolves to
+    itself, so redirect resolution only ever *widens* institution equivalence and
+    never blocks a migration. Bound to ``site``'s Wikidata data repository;
+    results are cached for the resolver's life (typically one Q per file)."""
+    import pywikibot
+
+    repo = site.data_repository()
+    cache: dict[str, str] = {}
+
+    def resolve(qid: str) -> str:
+        if qid not in cache:
+            resolved = qid
+            try:
+                item = pywikibot.ItemPage(repo, qid)
+                if item.isRedirectPage():
+                    resolved = item.getRedirectTarget().getID()
+            except Exception:  # noqa: BLE001 — best-effort; fall back to identity
+                resolved = qid
+            cache[qid] = resolved
+        return cache[qid]
+
+    return resolve
 
 
 def _fetch_entity_or_empty(site, mediaid: str) -> dict:
