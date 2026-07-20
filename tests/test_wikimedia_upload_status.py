@@ -154,6 +154,7 @@ def _fake_ssm_for_phase(
     *,
     hand_fix: int = 0,
     merged: int = 0,
+    maintain_scope: int = 0,
     mtime: int = 1700000000,
     now: int | None = None,
     tail: str = "last log line",
@@ -197,8 +198,10 @@ def _fake_ssm_for_phase(
         body = f"{now_val}\n{mtime}\n{sep}\n{tail}\n{sep}\n"
         body += "\n".join(str(n) for n in awk_counts) + "\n"
         # HAND-FIX + MERGED (the real awk reads these from the terminal
-        # COUNTS: block) sit between the 5 awk markers and the wc CSV total.
-        body += f"{hand_fix}\n{merged}\n"
+        # COUNTS: block) then the maintain-scope total ("maintain scope: N
+        # files", 0 for partner-mode runs) sit between the 5 awk markers and
+        # the wc CSV total.
+        body += f"{hand_fix}\n{merged}\n{maintain_scope}\n"
         body += f"{csv_total}\n"
         body += f"{sep}\n{total_ordinals}\n"
         return body
@@ -227,11 +230,12 @@ def test_get_phase_and_progress_retry_label_reads_retry_dir_csvs():
         captured.append(command)
         if len(captured) == 1:
             return "1700000000\n20260601-120000-retry-northwest-heritage-download.log\n"
-        # awk pass: dpla_id=2, uploaded=0, skipping=0, counts=0;
-        # then csv total = 5 (sum of download+upload retry CSVs)
+        # awk pass: dpla_id=2, uploaded=0, skipping=0, counts=0, ordinal=0,
+        # hand_fix=0, merged=0, maintain_scope=0; then csv total = 5 (sum of
+        # download+upload retry CSVs).
         return (
             "1700000000\n1700000000\n__WM_SEP__\nDownloading something\n"
-            "__WM_SEP__\n2\n0\n0\n0\n0\n0\n0\n5\n"
+            "__WM_SEP__\n2\n0\n0\n0\n0\n0\n0\n0\n5\n"
         )
 
     with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake_ssm_run):
@@ -349,6 +353,68 @@ def test_get_phase_and_progress_sdc_maintain_cat_reports_bare_file_count():
     assert phase.startswith("SDC syncing (1,911 files processed)"), phase
     # No bogus denominator, percentage, or "items" unit.
     assert "63" not in phase and "%" not in phase and "items" not in phase
+
+
+def test_get_phase_and_progress_sdc_maintain_reports_scope_ratio():
+    """A maintain run that logged its enumerated scope ("maintain scope: N
+    files") reports file-level progress x / y — same file unit as the per-file
+    "DPLA ID:" numerator — NOT a bare count and NOT the stale per-partner CSV.
+    """
+    from unittest.mock import patch
+
+    from scripts.wikimedia_upload_status import get_phase_and_progress
+
+    fake = _fake_ssm_for_phase(
+        log_filename="20260716-164300-georgia-sdc.log",
+        awk_counts=[1896, 0, 0, 0, 0],  # 1,896 files processed
+        maintain_scope=4000,  # enumerated category scope, logged at scan time
+        csv_total=63,  # stale georgia.csv — must be ignored in favor of scope
+        total_ordinals=0,  # maintain --cat has no download log
+    )
+    with patch("scripts.wikimedia_upload_status.ssm_run", side_effect=fake):
+        phase, _ = get_phase_and_progress(
+            client=None, session="wikimedia-georgia", hub="georgia", label="georgia"
+        )
+    assert phase.startswith("SDC syncing (1,896 / 4,000 files, ~47.4%)"), phase
+    assert "63" not in phase and "items" not in phase  # not the CSV denominator
+
+
+def test_sdc_counts_awk_extracts_fields_from_prefixed_log_lines():
+    """Run the REAL _SDC_COUNTS_AWK against a realistic -sdc.log sample.
+
+    Guards the awk field indices against the log-line prefix. The other tests
+    mock ssm_run with pre-parsed integer lines, so they never exercise the awk —
+    they can't catch a wrong field index. The maintain-scope marker is a normal
+    prefixed record ("[INFO] <time>: maintain scope: N files"), so its number
+    must be read at $(NF-1); reading $3 (the first message word, "maintain")
+    silently yields 0 and makes the whole feature inert — this pins that.
+    """
+    import subprocess
+
+    from scripts.wikimedia_upload_status import _SDC_COUNTS_AWK
+
+    sample = (
+        "[INFO] 16:43:00: maintain scope: 4000 files\n"
+        "[INFO] 16:43:01: DPLA ID: aaaa\n"
+        "[INFO] 16:43:02: -- Ordinal 1: M1\n"
+        "[INFO] 16:43:03: Uploaded to https://commons.wikimedia.org/wiki/File:X.jpg\n"
+        "[INFO] 16:43:04: DPLA ID: bbbb\n"
+        "[INFO] 16:43:05: Skipping cccc 1: Already exists on commons.\n"
+        # The COUNTS: block is logged as "\n" + str(tracker), so its lines have
+        # NO log prefix — that's why HAND-FIX/MERGED read $2, not $(NF-1).
+        "[INFO] 16:43:06: \n"
+        "COUNTS:\n"
+        "UPLOAD_HAND_FIX: 3\n"
+        "UPLOAD_MERGED_TO_CANONICAL: 7\n"
+    )
+    result = subprocess.run(
+        ["awk", _SDC_COUNTS_AWK], input=sample, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    # order: DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal, HAND-FIX, MERGED, scope
+    assert result.stdout.split() == ["2", "1", "1", "1", "1", "3", "7", "4000"], (
+        result.stdout
+    )
 
 
 def test_get_phase_and_progress_flags_waiting_on_slots():
