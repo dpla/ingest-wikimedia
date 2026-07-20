@@ -543,6 +543,47 @@ def _extract_related_image_files(wikitext: str) -> list[str]:
     return files
 
 
+def _provenance_value_unchanged(key: str, new_value: str, prior_value: str) -> bool:
+    """True when a revision leaves a param's SUBSTANCE unchanged — a
+    byte-identical value, or a formatting-only edit that reparses to the same
+    migrated outcome (``circa 1926`` rewritten as ``{{other date|circa|1926}}``,
+    a title wrapped in ``{{en|…}}`` / ``{{Title|…}}``, an institution written as
+    ``{{Institution|wikidata=Q}}`` vs the bare ``Q``, …). Used by
+    :func:`trace_param_provenance` so a cosmetic community edit does not
+    re-attribute a value away from whoever set its substance.
+
+    Symmetric and drift-INTOLERANT, deliberately NOT reusing
+    :func:`_value_equivalent_to_canonical`: that comparator is wikitext-vs-DPLA
+    and treats a ``; ``-joined *subset* as equivalent to absorb DPLA-side drift.
+    Here both sides are revisions of the SAME wikitext param, so a genuine
+    add/remove of a list value IS a substantive community edit that must
+    re-attribute — hence exact (not subset) comparison of the compared forms."""
+    if new_value == prior_value:
+        return True
+    if key == "date":
+        return dates_semantically_equal(new_value, prior_value)
+    if key in ("title", "description"):
+        new_text, new_lang = _unwrap_lang_template(new_value)
+        prior_text, prior_lang = _unwrap_lang_template(prior_value)
+        return new_lang == prior_lang and casefold_for_compare(
+            new_text
+        ) == casefold_for_compare(prior_text)
+    if key == "permission":
+        new_rights = _rights_identity(new_value)
+        return new_rights is not None and new_rights == _rights_identity(prior_value)
+    if key == "institution":
+        new_qid = _extract_institution_qid(new_value)
+        return bool(new_qid) and new_qid == _extract_institution_qid(prior_value)
+    if key == "creator":
+        # A free-text creator credit — same casefold/punctuation-trim tolerance
+        # the canonical comparator applies to CASEFOLD_COMPARE_KEYS (title /
+        # description / permission are already handled by their own branches
+        # above; creator is the only member that reaches here).
+        new_folded = casefold_for_compare(new_value)
+        return bool(new_folded) and new_folded == casefold_for_compare(prior_value)
+    return False
+
+
 def trace_param_provenance(
     revisions: Iterable[RevisionSnapshot],
     include_unmapped: bool = False,
@@ -590,9 +631,18 @@ def trace_param_provenance(
         for stale in tuple(prior_seen.keys() - rev_params.keys()):
             prior_seen.pop(stale, None)
         for key, value in rev_params.items():
-            if value != prior_seen.get(key):
+            prior = prior_seen.get(key)
+            # Re-attribute only on a SUBSTANTIVE change. A formatting-only edit
+            # that reparses to the same value (e.g. a community editor rewrote
+            # the bot's "circa 1926" as {{other date|circa|1926}}) leaves the
+            # migrated outcome identical, so it must keep the original setter's
+            # provenance — otherwise a cosmetic community edit flips a
+            # DPLA-originated value to "community" and it gets preserved/imported
+            # instead of dropped. Always track the latest form in prior_seen so
+            # the final-value filter below still matches.
+            if prior is None or not _provenance_value_unchanged(key, value, prior):
                 provenance[key] = rev.user
-                prior_seen[key] = value
+            prior_seen[key] = value
     # Only return entries whose tracked value still matches the final
     # value — a param that was edited and then reverted back to a prior
     # form would otherwise carry stale provenance.

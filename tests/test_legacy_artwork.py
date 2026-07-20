@@ -648,6 +648,62 @@ def test_plan_migration_community_institution_plaintext_preserved_verbatim():
     )
 
 
+def test_provenance_ignores_formatting_only_community_edit():
+    """The Wooten case: the bot set a "circa" date; a non-bot reformatted it to
+    an equivalent {{other date}} shape. The reparse-identical edit must NOT
+    re-attribute the value away from the bot."""
+    revs = _make_revs(
+        (1, "US National Archives bot", "{{Photograph|date=circa 1926}}"),
+        (2, "SomeEditor", "{{Photograph|date={{other date|circa|1926}}}}"),
+    )
+    provenance = trace_param_provenance(revs)
+    assert provenance.get("date") == "US National Archives bot"
+    # And a substantive change still re-attributes to the editor who made it.
+    revs2 = _make_revs(
+        (1, "US National Archives bot", "{{Photograph|date=circa 1926}}"),
+        (2, "SomeEditor", "{{Photograph|date=1930}}"),
+    )
+    assert trace_param_provenance(revs2).get("date") == "SomeEditor"
+
+
+def test_provenance_value_unchanged_per_key_semantics():
+    from ingest_wikimedia.legacy_artwork import _provenance_value_unchanged
+
+    # date: semantic equality, not bytes.
+    assert _provenance_value_unchanged(
+        "date", "{{other date|circa|1926}}", "circa 1926"
+    )
+    assert not _provenance_value_unchanged("date", "1926", "circa 1926")
+    # title: language wrapper / {{Title}} formatting is non-substantive; a
+    # different language is substantive.
+    assert _provenance_value_unchanged("title", "{{en|A Title}}", "A Title")
+    assert _provenance_value_unchanged("title", "{{Title|en=A Title}}", "A Title")
+    assert not _provenance_value_unchanged("title", "{{es|A Title}}", "A Title")
+    assert not _provenance_value_unchanged("title", "Different", "A Title")
+    # institution: sub-template vs bare Q is non-substantive.
+    assert _provenance_value_unchanged(
+        "institution", "{{Institution|wikidata=Q1}}", "Q1"
+    )
+    assert not _provenance_value_unchanged("institution", "Q2", "Q1")
+    # A community add to a ; -joined description is SUBSTANTIVE (no subset
+    # tolerance here, unlike _value_equivalent_to_canonical).
+    assert not _provenance_value_unchanged("description", "A; B; C", "A; B")
+
+
+def test_plan_migration_formatting_only_date_edit_stays_dpla_originated():
+    """End to end: the bot's date, cosmetically reformatted by a community
+    editor, migrates as DPLA-originated (dropped, renders from SDC) — not
+    preserved/imported as a community value."""
+    revs = _make_revs(
+        (1, "US National Archives bot", "{{Photograph|date=circa 1926}}"),
+        (2, "SomeEditor", "{{Photograph|date={{other date|circa|1926}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="circa 1926"))
+    assert plan is not None
+    assert "date" not in plan.community_imports
+    assert "date" not in plan.wikitext_preserved_extras
+
+
 def test_migration_provenance_accounts_extend_bots_with_staff():
     """The migration provenance default is bots + staff; ``DPLA_BOT_ACCOUNTS``
     (which also gates the uploader's separate uploader/community-file check) is
