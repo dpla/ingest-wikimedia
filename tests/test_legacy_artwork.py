@@ -589,6 +589,75 @@ def test_plan_migration_skips_community_value_that_matches_canonical():
     assert plan.dpla_originated_params["title"] == "A Title"
 
 
+def test_plan_migration_staff_institution_edit_is_dpla_originated_not_preserved():
+    """Q3: an ``institution`` value last set by a DPLA STAFF account (Dominic)
+    is a correction to DPLA's own data, not a third-party contribution — so it
+    classifies dpla-originated (dropped in favour of canonical SDC P195), NOT
+    preserved on the migrated template. Preserving it is exactly what produced
+    the Category:Pages with script errors batch. Uses the default provenance
+    set, which now includes staff via MIGRATION_PROVENANCE_ACCOUNTS."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|Institution={{Institution|wikidata=Q1}}}}"),
+        (2, "Dominic", "{{Artwork|Institution={{Institution|wikidata=Q2}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    # The load-bearing property: NOT preserved and NOT imported as community.
+    assert "institution" not in plan.wikitext_preserved_extras
+    assert "institution" not in plan.community_imports
+    # Staff edit is treated as DPLA-originated (overwritten by canonical SDC).
+    assert plan.dpla_originated_params.get("institution") == "{{Institution|wikidata=Q2}}"
+
+
+def test_plan_migration_community_institution_template_normalized_to_bare_qid():
+    """Q1: a genuine third-party ``institution = {{Institution|wikidata=Q}}`` is
+    still preserved (there is no institution->SDC import path yet), but
+    normalized to the bare Q so the migrated param is the renderer-safe flat
+    ``institution = Q`` rather than a sub-template that breaks Module:DPLA."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title=A Title|Institution={{Institution|wikidata=Q105635856}}}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.wikitext_preserved_extras.get("institution") == "Q105635856"
+
+
+def test_plan_migration_community_institution_plaintext_preserved_verbatim():
+    """A community institution that is NOT a ``{{Institution|wikidata=Q}}`` (free
+    text — no bare Q to extract) is preserved verbatim; the renderer treats it as
+    an opaque literal (and the Module:DPLA belt keeps it from erroring)."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title=A Title|institution=Middle Georgia Archives}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.wikitext_preserved_extras.get("institution") == "Middle Georgia Archives"
+
+
+def test_migration_provenance_accounts_extend_bots_with_staff():
+    """The migration provenance default is bots + staff; ``DPLA_BOT_ACCOUNTS``
+    (which also gates the uploader's separate uploader/community-file check) is
+    NOT widened, keeping this scoped to migration provenance."""
+    from ingest_wikimedia.legacy_artwork import (
+        DPLA_STAFF_ACCOUNTS,
+        MIGRATION_PROVENANCE_ACCOUNTS,
+    )
+
+    assert "Dominic" in DPLA_STAFF_ACCOUNTS
+    assert "Dominic" not in DPLA_BOT_ACCOUNTS
+    assert MIGRATION_PROVENANCE_ACCOUNTS == DPLA_BOT_ACCOUNTS | DPLA_STAFF_ACCOUNTS
+
+
 def test_plan_migration_imports_creator_param_that_differs_from_canonical():
     """Regression: canonical 'creator' is a plain string (extract_strings),
     not an {{InFi|Creator|...}} dict. A file whose Artwork template carries
