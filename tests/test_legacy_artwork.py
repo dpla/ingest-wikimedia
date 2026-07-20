@@ -3914,12 +3914,12 @@ def test_parse_artwork_params_include_unmapped_keys_and_default_drop():
         parse_artwork_params,
     )
 
-    text = "{{Photograph|title=T|photographer=Jane Doe|depicted people=John}}"
+    text = "{{Photograph|title=T|genre=portrait|depicted people=John}}"
     # Default: unmapped params dropped (only the mapped `title` survives).
     assert set(parse_artwork_params(text)) == {"title"}
     # include_unmapped: unmapped params surface under the prefix, original case.
     unmapped = parse_artwork_params(text, include_unmapped=True)
-    assert unmapped[f"{_UNMAPPED_KEY_PREFIX}photographer"] == "Jane Doe"
+    assert unmapped[f"{_UNMAPPED_KEY_PREFIX}genre"] == "portrait"
     assert unmapped[f"{_UNMAPPED_KEY_PREFIX}depicted people"] == "John"
     # The modern other_fields passthrough is never re-wrapped as unmapped.
     assert f"{_UNMAPPED_KEY_PREFIX}other_fields" not in parse_artwork_params(
@@ -3947,26 +3947,60 @@ def test_information_field_row_escapes_top_level_pipes_only():
 
 
 def test_plan_migration_preserves_community_unmapped_params_as_other_fields():
-    """The Herrick photographer/genre/depicted-people case: community-authored
-    params with no DPLA/SDC target are preserved as {{Information field}} rows in
-    other_fields, not dropped."""
+    """The Herrick genre/depicted-people case: community-authored params with no
+    DPLA/SDC target are preserved as {{Information field}} rows in other_fields,
+    not dropped. (``photographer`` is NOT among these — it maps to creator/SDC;
+    see test_photographer_param_migrates_as_creator_not_other_fields.)"""
     revs = _make_revs(
         (1, "DPLA bot", "{{Photograph|title=A Title}}"),
         (
             2,
             "CommunityEditor",
-            "{{Photograph|title=A Title|photographer=Jane Doe|genre=portrait"
-            "|depicted people=John Smith}}",
+            "{{Photograph|title=A Title|genre=portrait|depicted people=John Smith}}",
         ),
     )
     plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
     assert plan is not None
     other_fields = plan.wikitext_preserved_extras.get("other_fields")
     assert other_fields == (
-        "{{Information field|name=photographer|value=Jane Doe}}\n"
         "{{Information field|name=genre|value=portrait}}\n"
         "{{Information field|name=depicted people|value=John Smith}}"
     )
+
+
+def test_photographer_param_migrates_as_creator_not_other_fields():
+    """{{Photograph}}'s ``photographer`` is the creator — it routes through the
+    creator machinery (→ P170 SDC), NOT the unmapped/other_fields fallback."""
+    from ingest_wikimedia.legacy_artwork import (
+        _CREATOR_QID_PREFIX,
+        _UNMAPPED_KEY_PREFIX,
+        parse_artwork_params,
+    )
+
+    # QID shape → creator QID sentinel (materialises to a P170 creator claim).
+    parsed = parse_artwork_params(
+        "{{Photograph|photographer={{creator|wikidata=Q110083830}}}}",
+        include_unmapped=True,
+    )
+    assert parsed == {"creator": f"{_CREATOR_QID_PREFIX}Q110083830"}
+    assert f"{_UNMAPPED_KEY_PREFIX}photographer" not in parsed
+
+    # Free-text shape → the plain creator string path (P170 somevalue + P2093).
+    parsed_text = parse_artwork_params(
+        "{{Photograph|photographer=Jane Doe}}", include_unmapped=True
+    )
+    assert parsed_text == {"creator": "Jane Doe"}
+
+    # End to end: a community photographer imports as a creator claim, and does
+    # not leak into other_fields.
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|title=A Title}}"),
+        (2, "CommunityEditor", "{{Photograph|title=A Title|photographer=Jane Doe}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports.get("creator") == "Jane Doe"
+    assert "other_fields" not in plan.wikitext_preserved_extras
 
 
 def test_plan_migration_drops_dpla_authored_unmapped_params():

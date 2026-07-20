@@ -198,6 +198,12 @@ ARTWORK_PARAM_TO_CANONICAL_KEY: dict[str, str] = {
     "author": "creator",
     "artist": "creator",
     "creator": "creator",
+    # {{Photograph}}'s ``photographer`` names the photo's creator (on that
+    # template ``author`` is itself an alias of ``photographer``). Route it
+    # through the creator machinery so ``photographer = {{creator|wikidata=Q}}``
+    # migrates to a P170 creator statement (QID-resolved) — same as ``creator``
+    # — instead of riding as verbatim ``other_fields`` wikitext.
+    "photographer": "creator",
     "source": "source",
     "institution": "institution",
     "permission": "permission",
