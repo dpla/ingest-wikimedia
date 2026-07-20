@@ -76,6 +76,28 @@ DPLA_BOT_ACCOUNTS: frozenset[str] = frozenset(
     }
 )
 
+# DPLA staff accounts. An edit made by these accounts to a DPLA-authored field
+# is a correction to DPLA's OWN data (e.g. fixing an institution Q-ID), not a
+# third-party community contribution — so for MIGRATION PROVENANCE they are
+# treated like the bot: the value is DPLA-originated and safe to overwrite with
+# canonical SDC, never preserved as a "community" value on the migrated template.
+#
+# Scoped to migration provenance ONLY, and deliberately NOT merged into
+# ``DPLA_BOT_ACCOUNTS``: that set also gates the uploader's community-file
+# ownership check, which keys on a file's original UPLOADER (a different
+# question from "who last edited a metadata field"). Widening it there could
+# change collision handling for staff-uploaded files — out of scope here.
+DPLA_STAFF_ACCOUNTS: frozenset[str] = frozenset(
+    {
+        "Dominic",
+    }
+)
+
+# The account set the migration provenance walker treats as DPLA-originated:
+# automated uploaders + DPLA staff. Default for ``plan_migration`` /
+# ``classify_param_provenance`` / ``migrate_legacy_file``.
+MIGRATION_PROVENANCE_ACCOUNTS: frozenset[str] = DPLA_BOT_ACCOUNTS | DPLA_STAFF_ACCOUNTS
+
 
 def _normalize_account(name: str) -> str:
     """Casefold and collapse underscores to spaces so ``DPLA_bot`` and
@@ -532,15 +554,16 @@ def trace_param_provenance(
 
 def classify_param_provenance(
     provenance: dict[str, str],
-    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    bot_accounts: frozenset[str] = MIGRATION_PROVENANCE_ACCOUNTS,
 ) -> dict[str, str]:
     """For each param, label its provenance as ``"dpla"`` or
     ``"community"`` based on whose account introduced its current value.
 
     ``bot_accounts`` is parameterised purely so tests can pass a
     custom allowlist. Production callers should accept the module
-    default; new bot accounts get added to :data:`DPLA_BOT_ACCOUNTS`
-    rather than the per-call argument.
+    default (:data:`MIGRATION_PROVENANCE_ACCOUNTS` — bots + DPLA staff);
+    new DPLA-origin accounts get added to :data:`DPLA_BOT_ACCOUNTS` (bots)
+    or :data:`DPLA_STAFF_ACCOUNTS` (staff) rather than the per-call argument.
     """
     bot_set = {_normalize_account(a) for a in bot_accounts}
     return {
@@ -553,7 +576,7 @@ def plan_migration(
     file_title: str,
     revisions: Iterable[RevisionSnapshot],
     canonical_params: dict,
-    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    bot_accounts: frozenset[str] = MIGRATION_PROVENANCE_ACCOUNTS,
 ) -> MigrationPlan | None:
     """Compute the migration plan for a legacy-Artwork file.
 
@@ -638,7 +661,11 @@ def plan_migration(
                 # renders it in the yellow box — instead of failing the whole
                 # file's import. Same destination as the extension case above:
                 # community content that can't be SDC lands in wikitext.
-                wikitext_preserved_extras[key] = value
+                # Entity-ID params (institution) are normalized to a bare Q so a
+                # community ``{{Institution|wikidata=Q}}`` rides as the renderer-
+                # safe flat ``institution = Q`` rather than a module-breaking
+                # sub-template (see _normalize_preserved_param).
+                wikitext_preserved_extras[key] = _normalize_preserved_param(key, value)
                 continue
             community_imports[key] = value
         else:
@@ -1137,6 +1164,29 @@ def _community_value_unfit_for_sdc(key: str, value: str) -> bool:
     # template) — a literal {{...}} must not be stored as the monolingual value.
     text, _lang = _unwrap_lang_template(value)
     return "{{" in text or "[[" in text
+
+
+def _normalize_preserved_param(key: str, value: str) -> str:
+    """Normalize an entity-ID param value being preserved verbatim onto the
+    migrated ``{{DPLA metadata}}`` template.
+
+    ``institution`` is the only preserved param Module:DPLA feeds to a Wikibase
+    lookup (via ``{{Institution|wikidata=...}}``), which raises a script error on
+    anything that is not a bare Q-ID — and because Scribunto pre-expands template
+    args, a preserved ``{{Institution|wikidata=Q}}`` reaches the renderer as vcard
+    HTML, not an ID. Reduce that shape to its bare ``Q`` so the migrated param is
+    the flat ``institution = Q`` the renderer handles safely, instead of blindly
+    carrying a sub-template into a slot the module treats as an entity ID. Any
+    other key, or an institution value that is not a single
+    ``{{Institution|wikidata=Q}}`` (e.g. free text), is returned unchanged — there
+    is no bare ID to extract and the renderer treats such a value as an opaque
+    literal."""
+    if key == "institution":
+        # _extract_institution_qid handles both the {{Institution|wikidata=Q}}
+        # sub-template and a bare/whitespace-padded Q, returning None for free
+        # text — so a non-ID literal falls through to verbatim preservation.
+        return _extract_institution_qid(value) or value
+    return value
 
 
 def _multi_value_subset_of_canonical(value: str, canonical: str) -> bool:
@@ -2720,7 +2770,7 @@ def migrate_legacy_file(
     data_provider: dict,
     dpla_id: str,
     site,
-    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    bot_accounts: frozenset[str] = MIGRATION_PROVENANCE_ACCOUNTS,
     summary: str | None = None,
 ) -> MigrationResult:
     """End-to-end legacy-Artwork migration for a single file.
@@ -2856,7 +2906,7 @@ def import_cross_page_community_sdc(
     data_provider: dict,
     dpla_id: str,
     site,
-    bot_accounts: frozenset[str] = DPLA_BOT_ACCOUNTS,
+    bot_accounts: frozenset[str] = MIGRATION_PROVENANCE_ACCOUNTS,
     summary: str | None = None,
 ) -> int:
     """Rescue community-authored, *in-template* metadata from a source page's
