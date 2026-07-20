@@ -606,7 +606,9 @@ def test_plan_migration_staff_institution_edit_is_dpla_originated_not_preserved(
     assert "institution" not in plan.wikitext_preserved_extras
     assert "institution" not in plan.community_imports
     # Staff edit is treated as DPLA-originated (overwritten by canonical SDC).
-    assert plan.dpla_originated_params.get("institution") == "{{Institution|wikidata=Q2}}"
+    assert (
+        plan.dpla_originated_params.get("institution") == "{{Institution|wikidata=Q2}}"
+    )
 
 
 def test_plan_migration_community_institution_template_normalized_to_bare_qid():
@@ -641,7 +643,9 @@ def test_plan_migration_community_institution_plaintext_preserved_verbatim():
     )
     plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
     assert plan is not None
-    assert plan.wikitext_preserved_extras.get("institution") == "Middle Georgia Archives"
+    assert (
+        plan.wikitext_preserved_extras.get("institution") == "Middle Georgia Archives"
+    )
 
 
 def test_migration_provenance_accounts_extend_bots_with_staff():
