@@ -97,6 +97,30 @@ SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 _UPLOAD_COMPLETE_PREFIX = "Upload complete"
 _SDC_COMPLETE_PREFIX = "SDC complete"
 
+# One-pass awk over a phase log, emitting eight integers in the fixed order the
+# parser indexes: DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal, HAND-FIX,
+# MERGED, maintain-scope. HAND-FIX/MERGED read $2 — they come from the
+# prefix-less continuation lines of the multi-line ``COUNTS:`` record. The
+# maintain-scope marker is instead a normal PREFIXED log line
+# (``[INFO] <time>: maintain scope: N files``), so its number is ``$(NF-1)`` —
+# the field before the trailing "files", robust to however wide the log-line
+# prefix is (counting from the message start would miss the prefix, which
+# silently zeroed this out in the first draft).
+# CONTRACT: the "maintain scope: N files" wording is shared with
+# tools/sdc_sync.py's _log_maintain_scope(); change them together.
+_SDC_COUNTS_AWK = (
+    "/DPLA ID:/ {d++} "
+    "/Uploaded to/ {u++} "
+    "/Skipping.*Already exists on commons/ {s++} "
+    "/COUNTS:/ {c++} "
+    "/-- Ordinal [0-9]+:/ {o++} "
+    "/UPLOAD_HAND_FIX:/ {hf=$2} "
+    "/UPLOAD_MERGED_TO_CANONICAL:/ {mg=$2} "
+    "/maintain scope: [0-9]+ files/ {mt=$(NF-1)} "
+    "END { print d+0; print u+0; print s+0; print c+0; print o+0; "
+    "print hf+0; print mg+0; print mt+0 }"
+)
+
 # Slack Block Kit caps a single ``section`` block's text element at 3000
 # characters. A hub-busy day with many active sessions can collectively
 # exceed that on row count alone, so the formatter splits across multiple
@@ -140,6 +164,13 @@ def _idle_suffix(now: int, log_mtime: int) -> str:
 # slug shape at runtime to keep that interpolation safe regardless of
 # how callers obtain the label.
 _LABEL_SLUG_RE = re.compile(r"[a-z0-9+\-]+")
+
+
+def _files_progress(num: int, den: int) -> str:
+    """``N / M files, ~P%`` — the shared file-level progress string used by the
+    Upload and SDC branches (maintain-scope, download-log ordinals). Callers
+    guard ``den > 0`` (it also selects which branch applies)."""
+    return f"{num:,} / {den:,} files, ~{num / den * 100:.1f}%"
 
 
 def get_phase_and_progress(
@@ -315,15 +346,14 @@ def get_phase_and_progress(
         "/Downloading [a-z0-9-]+ [a-f0-9]+ [0-9]+ from / {dl++} "
         "END {print (item>0 ? item : dl)}"
     )
-    # One awk pass counts all four marker lines in a single sequential read
-    # of the upload log; the previous code ran four separate `grep -c`
-    # invocations over the same file (plus the COUNTS: probe), which on
-    # multi-GB NARA logs translated to four full sequential reads and four
-    # SSM round-trips of pipeline setup overhead. Output is still four
-    # lines (dpla_id, uploaded, skipping, counts) in the same order as
-    # before, followed by the CSV total from `wc -l`. The download-log
-    # ordinal sum is emitted after a fresh separator so the output sections
-    # stay self-describing.
+    # One awk pass (``_SDC_COUNTS_AWK``) counts all the marker lines in a single
+    # sequential read of the log; the previous code ran several separate
+    # `grep -c` invocations over the same file, which on multi-GB NARA logs
+    # translated to that many full sequential reads and SSM round-trips of
+    # pipeline setup overhead. Output is eight lines (dpla_id, uploaded,
+    # skipping, counts, ordinal, hand-fix, merged, maintain-scope), followed by
+    # the CSV total from `wc -l`. The download-log ordinal sum is emitted after a
+    # fresh separator so the output sections stay self-describing.
     out = ssm_run(
         client,
         f"date +%s; "
@@ -331,16 +361,8 @@ def get_phase_and_progress(
         f"echo {sep}; "
         f"tail -5 {log_path}; "
         f"echo {sep}; "
-        f"awk '"
-        f"/DPLA ID:/ {{d++}} "
-        f"/Uploaded to/ {{u++}} "
-        f"/Skipping.*Already exists on commons/ {{s++}} "
-        f"/COUNTS:/ {{c++}} "
-        f"/-- Ordinal [0-9]+:/ {{o++}} "
-        f"/UPLOAD_HAND_FIX:/ {{hf=$2}} "
-        f"/UPLOAD_MERGED_TO_CANONICAL:/ {{mg=$2}} "
-        f"END {{ print d+0; print u+0; print s+0; print c+0; print o+0; print hf+0; print mg+0 }}"
-        f"' {log_path} 2>/dev/null || printf '0\\n0\\n0\\n0\\n0\\n0\\n0\\n'; "
+        f"awk '{_SDC_COUNTS_AWK}' {log_path} 2>/dev/null "
+        f"|| printf '0\\n0\\n0\\n0\\n0\\n0\\n0\\n0\\n'; "
         f"{csv_count_cmd}; "
         f"echo {sep}; "
         f"DOWNLOG=$(ls -t {log_dir}/*-{label}-download.log 2>/dev/null | head -1); "
@@ -362,14 +384,17 @@ def get_phase_and_progress(
     count_lines = sections[2].strip().splitlines() if len(sections) > 2 else []
 
     # Layout matches the awk-then-wc shell command above: the awk pass emits
-    # seven counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal, HAND-FIX,
-    # MERGED) and then `wc -l` emits the CSV total — eight lines in total.
-    # HAND-FIX / MERGED are read from the terminal ``COUNTS:`` block (the
-    # authoritative tracker values, one per SHA1-uniqueness outcome) so the
+    # eight counts (DPLA-ID, Uploaded, Skipping, COUNTS, Ordinal, HAND-FIX,
+    # MERGED, maintain-scope) and then `wc -l` emits the CSV total — nine lines
+    # in total. HAND-FIX / MERGED are read from the terminal ``COUNTS:`` block
+    # (the authoritative tracker values, one per SHA1-uniqueness outcome) so the
     # completion summary reports those alongside uploaded/skipped rather than
     # only the two happy-path counts. ``ordinal_count`` is the count of
     # ``-- Ordinal N:`` markers in the active log, which the SDC phase emits
     # one of per file (numerator for SDC's file-level progress).
+    # ``maintain_total`` is the enumerated scope a maintain --cat/--file run
+    # logs ("maintain scope: N files"); 0 for partner-mode runs, which have no
+    # such marker (they fall through to the download-log / CSV denominators).
     dpla_id_count = _safe_int(count_lines[0]) if len(count_lines) > 0 else 0
     uploaded_count = _safe_int(count_lines[1]) if len(count_lines) > 1 else 0
     skipped_count = _safe_int(count_lines[2]) if len(count_lines) > 2 else 0
@@ -377,7 +402,8 @@ def get_phase_and_progress(
     ordinal_count = _safe_int(count_lines[4]) if len(count_lines) > 4 else 0
     hand_fix_count = _safe_int(count_lines[5]) if len(count_lines) > 5 else 0
     merged_count = _safe_int(count_lines[6]) if len(count_lines) > 6 else 0
-    total = _safe_int(count_lines[7]) if len(count_lines) > 7 else 0
+    maintain_total = _safe_int(count_lines[7]) if len(count_lines) > 7 else 0
+    total = _safe_int(count_lines[8]) if len(count_lines) > 8 else 0
 
     # Sum of `Item <id>: N ordinals` lines from the download log — the true
     # file count once downloads have completed. 0 when no download log was
@@ -456,8 +482,7 @@ def get_phase_and_progress(
         # found, so legacy sessions still get a readout.
         files_done = uploaded_count + skipped_count
         if total_ordinals > 0:
-            files_pct = f"{files_done / total_ordinals * 100:.1f}"
-            progress = f"{files_done:,} / {total_ordinals:,} files, ~{files_pct}%"
+            progress = _files_progress(files_done, total_ordinals)
         else:
             progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
         return (
@@ -475,10 +500,12 @@ def get_phase_and_progress(
         # are available — same rationale as the Upload branch, since
         # multi-page items take proportionally more SDC-write work than
         # 1-image items. Falls back to item-level against the per-partner
-        # ids CSV for legacy no-download-log partner sessions, and to a
-        # bare file count for maintain --cat/--file runs (whose scope is a
-        # Commons category / file list, so the CSV is not a valid
-        # denominator). Terminal completion still reports items, since the
+        # ids CSV for legacy no-download-log partner sessions. Maintain
+        # --cat/--file runs report file-level against their enumerated scope
+        # ("maintain scope: N files", logged at scan time) when present, and
+        # a bare file count otherwise (streaming --cat / legacy logs) — the
+        # per-partner CSV is never a valid denominator for a Commons category
+        # / file-list scope. Terminal completion still reports items, since the
         # tracker's SDC_ITEMS_SYNCED is per item.
         if dpla_id_count == 0:
             start_state = "queued" if waiting_on_slots else "starting..."
@@ -488,23 +515,28 @@ def get_phase_and_progress(
                 f"{_SDC_COMPLETE_PREFIX} ({dpla_id_count:,} items processed)",
                 log_mtime,
             )
-        if total_ordinals > 0 and ordinal_count > 0:
-            files_pct = f"{ordinal_count / total_ordinals * 100:.1f}"
-            progress = f"{ordinal_count:,} / {total_ordinals:,} files, ~{files_pct}%"
+        if maintain_total > 0:
+            # Maintain --cat/--file: the run logged its enumerated scope
+            # ("maintain scope: N files") — a file-level denominator in the same
+            # unit as the per-file "DPLA ID:" markers counted here. Prefer it: it
+            # describes the actual Commons category / file-list scope, unlike the
+            # per-partner CSV (whose mismatch produced the old >100% read). The
+            # scope is a snapshot of a live category, so the % is an estimate.
+            progress = _files_progress(dpla_id_count, maintain_total)
+        elif total_ordinals > 0 and ordinal_count > 0:
+            progress = _files_progress(ordinal_count, total_ordinals)
         elif dpla_id_count <= total:
             # Legacy partner-mode SDC with no download log: the per-partner ids
             # CSV is a valid item denominator and each "DPLA ID:" marker is one
             # item. (dpla_id_count > 0 here — the == 0 case returned above.)
             progress = f"{dpla_id_count:,} / {total:,} items, ~{pct(dpla_id_count)}%"
         else:
-            # Maintain --cat/--file ("lite") mode: the scope is a Commons
-            # category or file list, not the per-partner ids CSV, so `total`
-            # (the {label}.csv wc -l) is a stale/unrelated count — or 0 — and
-            # there's no download log for ordinals. sdc_sync logs one
-            # "DPLA ID:" marker per category-member FILE on this path
-            # (tools/sdc_sync.py), so report that file count alone rather than a
-            # ratio against a denominator that doesn't describe the scope (the
-            # mismatch is what produced the ">100%" readout).
+            # Maintain with no scope marker (streaming --cat, or a legacy log
+            # predating the marker): report the bare per-file count rather than a
+            # ratio against the per-partner CSV, which doesn't describe the
+            # category / file-list scope (the mismatch produced the old >100%
+            # readout). sdc_sync logs one "DPLA ID:" marker per category-member
+            # FILE on this path (tools/sdc_sync.py).
             progress = f"{dpla_id_count:,} files processed"
         return (
             f"SDC syncing ({progress}){slot_suffix}{stale_suffix}",

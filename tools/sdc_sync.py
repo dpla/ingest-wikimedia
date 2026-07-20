@@ -5799,6 +5799,20 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         tracker.increment(Result.SDC_PAGES_EDITED, len(pages_edited))
 
 
+def _log_maintain_scope(total_files: int) -> None:
+    """Log the enumerated maintain scope into the -sdc.log so the status poller
+    (scripts/wikimedia_upload_status.py) can render an ``x / y files``
+    denominator instead of a bare processed count.
+
+    CONTRACT: the wording is parsed by that poller's ``_SDC_COUNTS_AWK`` regex
+    (``/maintain scope: [0-9]+ files/``, number at ``$(NF-1)``) — change both
+    together. Emitted only where the total is known up front for free (the
+    ``--files`` list and the parallel ``--cat`` enumeration); the streaming
+    ``--cat`` path leaves it unlogged (see there).
+    """
+    logging.info(f"maintain scope: {total_files} files")
+
+
 def _enumerate_maintain_groups(generator, limit):
     """Walk the ``--cat`` page generator once and bucket files by embedded DPLA
     id for parallel maintain.
@@ -6241,6 +6255,11 @@ def main() -> None:
         # ``--count-only`` is a maintain-mode pre-flight: tally how each file
         # would re-link without writing anything.
         tally = _new_maintain_tally(args.maintain and args.count_only)
+        # Scope is the explicit file list (known up front); emit it for the
+        # status poller's "x / y files" denominator. Not for count-only (a
+        # read-only sizing pre-flight that logs nothing else).
+        if args.maintain and not args.count_only:
+            _log_maintain_scope(len(args.files))
         for title in args.files:
             print("\n" + title)
             page = pywikibot.FilePage(site, title)
@@ -6278,12 +6297,23 @@ def main() -> None:
                 f"maintain: {total_files} files in {len(groups)} id-group(s); "
                 f"{_workers} workers."
             )
+            # Emit the enumerated scope into the -sdc.log (the print above only
+            # reaches stdout) so wikimedia_upload_status.py can show an
+            # "x / y files" denominator instead of a bare processed count. It's
+            # the same file-level unit as the per-file "DPLA ID:" markers the
+            # poller counts as the numerator; the count is a snapshot of a live
+            # category, so the status % is an estimate.
+            _log_maintain_scope(total_files)
             _run_maintain_parallel(groups, _workers)
             _emit_maintain_summary(
                 _s3_partner or args.cat, time.time() - start_time, workers=_workers
             )
             return
 
+        # Streaming (non-parallel) --cat: the generator is consumed lazily, so
+        # the total is never materialized — no _log_maintain_scope() here (the
+        # status poller falls back to a bare per-file count). Forcing a scope
+        # marker would require an eager pre-enumeration that defeats streaming.
         tally = _new_maintain_tally(args.maintain and args.count_only)
         for page in generator:
             title = page.title()
