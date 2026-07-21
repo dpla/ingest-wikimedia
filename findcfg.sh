@@ -1,1 +1,0 @@
-sudo -u ec2-user bash -lc 'cd /home/ec2-user/ingest-wikimedia && ls -la *.toml 2>/dev/null; grep -rl "dpla_api_key" --include=*.toml . 2>/dev/null | head; for d in tn il digitalnc; do echo "--- $d ---"; ls $d/*.toml 2>/dev/null; done'
