@@ -98,6 +98,24 @@ DPLA_STAFF_ACCOUNTS: frozenset[str] = frozenset(
 # ``classify_param_provenance`` / ``migrate_legacy_file``.
 MIGRATION_PROVENANCE_ACCOUNTS: frozenset[str] = DPLA_BOT_ACCOUNTS | DPLA_STAFF_ACCOUNTS
 
+# Third-party FORMATTING bots. Their edits are cosmetic — AWB pipe/whitespace
+# passes, structured-data housekeeping — and must be TRANSPARENT to provenance:
+# a formatting bot that reformats a value (e.g. JarektBot escaping a stray ``|``
+# to ``{{!}}``) is not "setting" it, so attribution passes through to whoever set
+# the substance. Without this, such an edit is the last non-DPLA touch and
+# flips a DPLA-originated value to "community", preserving a stale duplicate.
+# Distinct from ``MIGRATION_PROVENANCE_ACCOUNTS``: these are NOT DPLA and are not
+# classified DPLA-originated — they are simply skipped as value-setters. The
+# semantic (reparse-identical) check in ``_provenance_value_unchanged`` already
+# neutralises escaping-only edits; this is the backstop for a formatter edit that
+# does change the parsed value (spacing/serialization) yet carries no content.
+FORMATTER_BOT_ACCOUNTS: frozenset[str] = frozenset(
+    {
+        "JarektBot",
+        "SchlurcherBot",
+    }
+)
+
 
 def _normalize_account(name: str) -> str:
     """Casefold and collapse underscores to spaces so ``DPLA_bot`` and
@@ -593,6 +611,7 @@ def _provenance_value_unchanged(key: str, new_value: str, prior_value: str) -> b
 def trace_param_provenance(
     revisions: Iterable[RevisionSnapshot],
     include_unmapped: bool = False,
+    formatter_accounts: frozenset[str] = FORMATTER_BOT_ACCOUNTS,
 ) -> dict[str, str]:
     """Walk revisions oldest→newest to find which editor last set each
     legacy-template param to its current value.
@@ -621,9 +640,11 @@ def trace_param_provenance(
     if not final_params:
         return {}
 
+    formatter_set = {_normalize_account(a) for a in formatter_accounts}
     provenance: dict[str, str] = {}
     prior_seen: dict[str, str] = {}
     for rev in sorted_revs:
+        is_formatter = _normalize_account(rev.user) in formatter_set
         rev_params = parse_artwork_params(rev.text, include_unmapped)
         # Drop entries from prior_seen for params the current revision
         # no longer carries. Without this, a delete → re-add of the
@@ -646,7 +667,16 @@ def trace_param_provenance(
             # DPLA-originated value to "community" and it gets preserved/imported
             # instead of dropped. Always track the latest form in prior_seen so
             # the final-value filter below still matches.
-            if prior is None or not _provenance_value_unchanged(key, value, prior):
+            #
+            # A FORMATTER bot (JarektBot AWB pipe-escaping, SchlurcherBot SDC
+            # housekeeping) is transparent: its edits never re-attribute, so the
+            # value keeps whoever set its substance. This is the backstop for a
+            # formatter edit whose parsed value differs (spacing/serialization)
+            # yet carries no content — the reparse-identical case is already
+            # covered by _provenance_value_unchanged above.
+            if (
+                prior is None or not _provenance_value_unchanged(key, value, prior)
+            ) and not is_formatter:
                 provenance[key] = rev.user
             prior_seen[key] = value
     # Only return entries whose tracked value still matches the final
@@ -3316,22 +3346,33 @@ def import_cross_page_community_sdc(
     return len(claims)
 
 
+# Wikidata Q-ID redirect targets, cached for the life of the PROCESS (keyed by
+# repository db-name + Q-ID) so a batch migration resolves each institution Q at
+# most once — institution Q-IDs are shared across many files from the same
+# provider, and a per-file cache would repeat the same network round-trip on
+# every mismatching file. Bounded by the number of distinct redirected Q-IDs
+# (small); multiprocessing workers each keep their own copy, which is fine.
+_REDIRECT_TARGET_CACHE: dict[tuple[str, str], str] = {}
+
+
 def _make_redirect_resolver(site) -> Callable[[str], str]:
-    """Build a memoised Wikidata Q-ID redirect resolver for :func:`plan_migration`.
+    """Build a Wikidata Q-ID redirect resolver for :func:`plan_migration`.
 
     A Q that Wikidata has turned into a redirect resolves to its target Q-ID
     (mirroring Module:DPLA's ``mw.wikibase.getEntity(q):getId()``); a
     non-redirect, unknown, or malformed Q — and any network error — resolves to
     itself, so redirect resolution only ever *widens* institution equivalence and
     never blocks a migration. Bound to ``site``'s Wikidata data repository;
-    results are cached for the resolver's life (typically one Q per file)."""
+    results are memoised in the process-wide :data:`_REDIRECT_TARGET_CACHE` so a
+    Q resolved for one file is reused across every later file in the run."""
     import pywikibot
 
     repo = site.data_repository()
-    cache: dict[str, str] = {}
+    repo_key = repo.dbName()
 
     def resolve(qid: str) -> str:
-        if qid not in cache:
+        cache_key = (repo_key, qid)
+        if cache_key not in _REDIRECT_TARGET_CACHE:
             resolved = qid
             try:
                 item = pywikibot.ItemPage(repo, qid)
@@ -3339,8 +3380,8 @@ def _make_redirect_resolver(site) -> Callable[[str], str]:
                     resolved = item.getRedirectTarget().getID()
             except Exception:  # noqa: BLE001 — best-effort; fall back to identity
                 resolved = qid
-            cache[qid] = resolved
-        return cache[qid]
+            _REDIRECT_TARGET_CACHE[cache_key] = resolved
+        return _REDIRECT_TARGET_CACHE[cache_key]
 
     return resolve
 

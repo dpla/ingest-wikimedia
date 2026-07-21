@@ -690,6 +690,25 @@ def test_provenance_value_unchanged_per_key_semantics():
     assert not _provenance_value_unchanged("description", "A; B; C", "A; B")
 
 
+def test_provenance_formatter_bot_edit_does_not_reattribute():
+    """A FORMATTER bot (JarektBot) is transparent to provenance even when its
+    edit changes the parsed value — attribution stays with the prior substantive
+    setter (the DPLA bot). This is the backstop beyond the reparse-identical
+    check: it's what keeps JarektBot's pipe-escaping from flipping a
+    DPLA-uploaded value to 'community'. A genuine editor IS attributed."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|description=Foo}}"),
+        (2, "JarektBot", "{{Photograph|description=Foo reformatted}}"),
+    )
+    assert trace_param_provenance(revs).get("description") == "DPLA bot"
+    # Control: a non-formatter editor making the same change is attributed.
+    revs_human = _make_revs(
+        (1, "DPLA bot", "{{Photograph|description=Foo}}"),
+        (2, "RealEditor", "{{Photograph|description=Foo reformatted}}"),
+    )
+    assert trace_param_provenance(revs_human).get("description") == "RealEditor"
+
+
 def test_plan_migration_formatting_only_date_edit_stays_dpla_originated():
     """End to end: the bot's date, cosmetically reformatted by a community
     editor, migrates as DPLA-originated (dropped, renders from SDC) — not
@@ -3754,7 +3773,10 @@ def test_make_redirect_resolver_resolves_caches_and_is_best_effort(monkeypatch):
     errors to the identity so resolution never blocks a migration."""
     import pywikibot
 
+    from ingest_wikimedia import legacy_artwork
     from ingest_wikimedia.legacy_artwork import _make_redirect_resolver
+
+    legacy_artwork._REDIRECT_TARGET_CACHE.clear()  # process-wide cache: isolate
 
     constructed: list[str] = []
 
@@ -3776,9 +3798,13 @@ def test_make_redirect_resolver_resolves_caches_and_is_best_effort(monkeypatch):
 
     monkeypatch.setattr(pywikibot, "ItemPage", FakeItemPage)
 
+    class FakeRepo:
+        def dbName(self):
+            return "wikidatawiki"
+
     class FakeSite:
         def data_repository(self):
-            return object()
+            return FakeRepo()
 
     resolve = _make_redirect_resolver(FakeSite())
     assert resolve("Q_old") == "Q_new"  # redirect followed
