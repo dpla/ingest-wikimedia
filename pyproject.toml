@@ -12,18 +12,18 @@ classifiers = ["Private :: Do Not Upload"]
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "boto3-stubs[essential]>=1.43.49",
-    "boto3>=1.43.49",
-    "certifi>=2026.6.17",
+    "boto3-stubs[essential]>=1.43.55",
+    "boto3>=1.43.55",
+    "certifi>=2026.7.22",
     "click>=8.4.2",
     "mwparserfromhell>=0.7.2",
     "pip-system-certs>=5.3",
     "python-magic>=0.4.27",
-    "pywikibot>=11.5.0",
+    "pywikibot>=11.6.0",
     "requests>=2.34.2",
-    "tqdm>=4.68.4",
+    "tqdm>=4.69.1",
     "validators>=0.35.0",
-    "types-boto3-s3>=1.43.31",
+    "types-boto3-s3>=1.43.50",
 ]
 
 [dependency-groups]
@@ -36,7 +36,7 @@ dev = [
     # per-item-except conventions and would churn ~40 files for no benefit. The
     # ruff CI action resolves this constraint (it ignores uv.lock), so the cap
     # is what actually pins CI. Bump deliberately if 0.16 is ever adopted.
-    "ruff>=0.15.21,<0.16",
+    "ruff>=0.15.22,<0.16",
     "types-requests>=2.33.0.20260712",
 ]
 
