@@ -31,7 +31,12 @@ dev = [
     "coverage>=7.15.2",
     "mypy>=2.3.0",
     "pytest>=9.1.1",
-    "ruff>=0.15.21",
+    # Capped below 0.16: its default ruleset (LOG015 "use own logger", BLE001,
+    # stricter isort) clashes with this repo's intentional root-logger + broad
+    # per-item-except conventions and would churn ~40 files for no benefit. The
+    # ruff CI action resolves this constraint (it ignores uv.lock), so the cap
+    # is what actually pins CI. Bump deliberately if 0.16 is ever adopted.
+    "ruff>=0.15.21,<0.16",
     "types-requests>=2.33.0.20260712",
 ]
 
