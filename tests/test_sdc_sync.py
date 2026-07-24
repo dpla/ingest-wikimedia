@@ -7085,3 +7085,121 @@ def test_partner_item_explicit_null_page_numbers_skips_ordinal(monkeypatch):
     }
     calls = _drive_partner_item(monkeypatch, ordinals=ordinals)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Fail-loud on systemic sidecar/skip failure (_assert_not_systemic_failure)
+# and per-ordinal transient write retry (_process_one_from_sdc_with_retry).
+# ---------------------------------------------------------------------------
+def test_systemic_failure_raises_when_nothing_synced():
+    from tools import sdc_sync
+    from tools.sdc_sync import SdcSystemicFailure
+
+    sdc_sync.tracker.reset()
+    sdc_sync.tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR, 820)
+    with pytest.raises(SdcSystemicFailure):
+        sdc_sync._assert_not_systemic_failure(820)
+
+
+def test_systemic_failure_raises_on_high_fraction():
+    from tools import sdc_sync
+    from tools.sdc_sync import SdcSystemicFailure
+
+    sdc_sync.tracker.reset()
+    sdc_sync.tracker.increment(Result.SDC_ITEMS_SYNCED, 40)
+    sdc_sync.tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR, 60)  # 60/100 >= 0.5
+    with pytest.raises(SdcSystemicFailure):
+        sdc_sync._assert_not_systemic_failure(100)
+
+
+def test_systemic_failure_allows_small_partial():
+    from tools import sdc_sync
+
+    sdc_sync.tracker.reset()
+    sdc_sync.tracker.increment(Result.SDC_ITEMS_SYNCED, 9603)
+    sdc_sync.tracker.increment(Result.SDC_ITEMS_SKIPPED_ERROR, 10)  # 10/9613, synced>0
+    sdc_sync._assert_not_systemic_failure(9613)  # no raise
+
+
+def test_systemic_failure_noop_when_clean_or_empty():
+    from tools import sdc_sync
+
+    sdc_sync.tracker.reset()
+    sdc_sync.tracker.increment(Result.SDC_ITEMS_SYNCED, 100)
+    sdc_sync._assert_not_systemic_failure(100)  # no failures -> no raise
+    sdc_sync.tracker.reset()
+    sdc_sync._assert_not_systemic_failure(0)  # empty worklist -> no raise
+
+
+def test_write_retry_succeeds_after_transient():
+    import pywikibot
+    from tools import sdc_sync
+
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise pywikibot.exceptions.ServerError("boom")
+
+    with (
+        patch.object(sdc_sync, "process_one_from_sdc", side_effect=flaky),
+        patch.object(sdc_sync.time, "sleep"),
+    ):
+        sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
+    assert calls["n"] == 3
+
+
+def test_write_retry_gives_up_after_max_attempts():
+    import pywikibot
+    from tools import sdc_sync
+
+    calls = {"n": 0}
+
+    def always(*a, **k):
+        calls["n"] += 1
+        raise pywikibot.exceptions.ServerError("boom")
+
+    with (
+        patch.object(sdc_sync, "process_one_from_sdc", side_effect=always),
+        patch.object(sdc_sync.time, "sleep"),
+        pytest.raises(pywikibot.exceptions.ServerError),
+    ):
+        sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
+    assert calls["n"] == sdc_sync._WRITE_RETRY_ATTEMPTS
+
+
+def test_write_retry_does_not_retry_nontransient():
+    from tools import sdc_sync
+
+    calls = {"n": 0}
+
+    def bad(*a, **k):
+        calls["n"] += 1
+        raise ValueError("logic bug")
+
+    with (
+        patch.object(sdc_sync, "process_one_from_sdc", side_effect=bad),
+        patch.object(sdc_sync.time, "sleep"),
+        pytest.raises(ValueError),
+    ):
+        sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
+    assert calls["n"] == 1  # non-transient: no retry
+
+
+def test_write_retry_passes_through_missing_entity():
+    from tools import sdc_sync
+
+    calls = {"n": 0}
+
+    def missing(*a, **k):
+        calls["n"] += 1
+        raise sdc_sync._MissingEntityError("gone")
+
+    with (
+        patch.object(sdc_sync, "process_one_from_sdc", side_effect=missing),
+        patch.object(sdc_sync.time, "sleep"),
+        pytest.raises(sdc_sync._MissingEntityError),
+    ):
+        sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
+    assert calls["n"] == 1  # never retried
