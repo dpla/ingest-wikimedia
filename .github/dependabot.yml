@@ -25,6 +25,17 @@ updates:
     schedule:
       interval: "weekly"
     versioning-strategy: auto
+    ignore:
+      # ruff 0.16 changed its default ruleset (LOG015 "use own logger", BLE001,
+      # stricter isort) in ways that clash with this repo's intentional
+      # root-logger + broad-per-item-except conventions — adopting it would
+      # churn ~40 files for no benefit (see the ruff cap in pyproject.toml).
+      # Stay on 0.15.x: patch bumps still flow; a 0.16 move must be deliberate,
+      # not an auto-bump folded into the weekly grouped PR.
+      - dependency-name: "ruff"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
     groups:
       python-dependencies:
         patterns:

@@ -673,6 +673,17 @@ def notify_sdc_complete(
         f"ORDINAL NO PAGEID:    {tracker.count(Result.SDC_ORDINALS_SKIPPED_MISSING_PAGEID):,}",
         f"ORDINAL ERRORS:       {tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR):,}",
     ]
+    # Surface write failures prominently: per-item wbeditentity failures that
+    # survived the retry are otherwise buried among the counters while the run
+    # still reports "complete". A leading flag tells the operator to check the
+    # ERROR log lines ("SDC sync failed after retries") and re-run the affected
+    # items, rather than the failures passing silently.
+    # Count ordinal-level failures only. SDC_ITEMS_SKIPPED_ERROR is incremented
+    # when *all* of an item's ordinals already hit SDC_ORDINALS_SKIPPED_ERROR,
+    # so summing the two would double-count a fully-failed item.
+    write_failures = tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR)
+    if write_failures:
+        stats_lines.insert(0, f"WRITE FAILURES (see log): {write_failures:,}")
     # Maintain mode also renames title-drifted files to their canonical title;
     # surface those outcomes (only on maintain runs, to keep the regular SDC
     # summary uncluttered). RENAME BLOCKED counts files left non-canonical

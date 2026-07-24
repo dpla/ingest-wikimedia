@@ -130,6 +130,29 @@ _workers: int = 1
 # ``args.workers_budget`` at main() time.
 _workers_budget: int = 0
 
+# A partner-mode run whose per-item skips (errors + missing sidecars) reach
+# this fraction of the worklist is treated as a SYSTEMIC failure and aborted
+# loudly rather than emitting a success ``COUNTS:`` marker + green Slack
+# summary. This closes the silent-completion hole seen in the Sinton
+# 2026-07-02 run, which skipped 820/820 items on stale (pre-``ingest_date``)
+# sidecars yet exited 0. Override with SDC_SYSTEMIC_FAIL_FRACTION.
+_SYSTEMIC_FAIL_FRACTION: float = float(
+    os.environ.get("SDC_SYSTEMIC_FAIL_FRACTION", "0.5")
+)
+
+# Bounded application-level retry for a per-ordinal SDC write that fails with a
+# transient error AFTER pywikibot's own maxlag/read-timeout retries are
+# exhausted — a fresh attempt seconds later usually lands (the STS-82
+# 2026-06-16 run lost ~10 files to a transient wbeditentity ServerError
+# mid-run, silently skipped). Only clearly-transient server/network classes
+# are retried; data/logic errors raise on the first attempt so they don't loop.
+_WRITE_RETRY_ATTEMPTS: int = int(os.environ.get("SDC_WRITE_RETRY_ATTEMPTS", "3"))
+_TRANSIENT_WRITE_ERRORS = (
+    pywikibot.exceptions.ServerError,
+    pywikibot.exceptions.TimeoutError,
+    requests.exceptions.RequestException,
+)
+
 # Per-worker WorkerSlotBudget instance. Defaults to a disabled (no-op)
 # budget so ``_worker_slot_budget.acquire()`` is always safe to call even
 # before a worker runs its initializer; _init_partner_worker replaces it
@@ -5373,6 +5396,61 @@ def _get_partner_s3_client():
     return _s3_client
 
 
+def _process_one_from_sdc_with_retry(
+    mediaid, dpla_id, sdc_payload, download_url, page_number
+):
+    """``process_one_from_sdc`` with a bounded retry for transient write errors.
+
+    ``wbeditentity`` lands atomically (whole bundle or nothing), and
+    ``process_one_from_sdc`` re-reads the entity and re-diffs on each call, so a
+    retry after a failed write is idempotent — it recomputes and re-posts only
+    what's still missing. Retries apply ONLY to clearly-transient server/network
+    classes (``_TRANSIENT_WRITE_ERRORS``); ``_MissingEntityError``,
+    ``CsrfRecoveryFailed``, and ``FatalServerError`` (a ``ServerError`` subclass
+    pywikibot treats as non-recoverable) pass straight through (never retried),
+    and any other (data/logic) exception propagates on the first attempt so it
+    can't loop.
+    """
+    for attempt in range(1, _WRITE_RETRY_ATTEMPTS + 1):
+        try:
+            process_one_from_sdc(
+                mediaid,
+                dpla_id,
+                sdc_payload,
+                download_url=download_url,
+                page_number=page_number,
+            )
+            return
+        except (
+            _MissingEntityError,
+            CsrfRecoveryFailed,
+            pywikibot.exceptions.FatalServerError,
+        ):
+            # Ordering guard: caught (and immediately re-raised) BEFORE the
+            # transient clause so these are never swept into the retry.
+            # FatalServerError is a ServerError subclass (so it WOULD match
+            # _TRANSIENT_WRITE_ERRORS) that pywikibot itself never retries —
+            # it's non-recoverable, so a retry would predictably fail and waste
+            # attempts. CsrfRecoveryFailed is session-fatal (must abort the run,
+            # never retry); _MissingEntityError is a clean per-ordinal skip the
+            # caller classifies. This clause must precede the transient one.
+            raise
+        except _TRANSIENT_WRITE_ERRORS:
+            if attempt >= _WRITE_RETRY_ATTEMPTS:
+                raise
+            wait = min(2**attempt, 30)
+            logging.warning(
+                " -- Ordinal write for %s (%s) hit a transient error"
+                " (attempt %d/%d); retrying in %ds.",
+                dpla_id,
+                mediaid,
+                attempt,
+                _WRITE_RETRY_ATTEMPTS,
+                wait,
+            )
+            time.sleep(wait)
+
+
 def _process_one_partner_item(s3, partner, dpla_id, idx, total):
     """Process one DPLA item end-to-end in partner mode — read S3
     sidecars, drive per-ordinal SDC sync against Commons, run the
@@ -5705,12 +5783,8 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
                 continue
             page_number = recorded_pages or None
         try:
-            process_one_from_sdc(
-                mediaid,
-                dpla_id,
-                sdc_payload,
-                download_url=download_url,
-                page_number=page_number,
+            _process_one_from_sdc_with_retry(
+                mediaid, dpla_id, sdc_payload, download_url, page_number
             )
         except _MissingEntityError:
             # Commons says the MediaInfo entity at this M-id doesn't
@@ -5738,7 +5812,7 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
         except Exception:
             logging.exception(
                 f" -- Ordinal {ord_str} ({mediaid}) for {dpla_id}:"
-                " SDC sync failed; skipping ordinal."
+                " SDC sync failed after retries; skipping ordinal."
             )
             tracker.increment(Result.SDC_ORDINALS_SKIPPED_ERROR)
             had_ordinal_error = True
@@ -5975,6 +6049,44 @@ def _run_maintain_parallel(groups, workers):
     )
 
 
+class SdcSystemicFailure(RuntimeError):
+    """A partner-mode run whose per-item skips are dominated by errors or
+    missing sidecars. Raised (instead of emitting a success ``COUNTS:``
+    marker) so the run fails loudly — non-zero exit + ``notify_pipeline_fail``
+    — rather than masquerading as a clean completion."""
+
+
+def _assert_not_systemic_failure(total_items):
+    """Abort a partner-mode run whose item skips (errors + missing sidecars)
+    dominate the worklist — the silent-completion hole (fail loudly).
+
+    Fatal when nothing synced but items failed (a whole-run failure, e.g. every
+    sidecar staged pre-``ingest_date``), or when the failed fraction reaches
+    ``_SYSTEMIC_FAIL_FRACTION``. A handful of per-item failures amid many
+    successes (handled by the per-ordinal retry + surfaced in the summary) is
+    NOT systemic and does not abort the run.
+    """
+    if total_items <= 0:
+        return
+    failed = tracker.count(Result.SDC_ITEMS_SKIPPED_ERROR) + tracker.count(
+        Result.SDC_ITEMS_SKIPPED_NO_SIDECAR
+    )
+    if failed == 0:
+        return
+    synced = tracker.count(Result.SDC_ITEMS_SYNCED) + tracker.count(
+        Result.SDC_ITEMS_PARTIALLY_SYNCED
+    )
+    if synced == 0 or failed / total_items >= _SYSTEMIC_FAIL_FRACTION:
+        msg = (
+            f"SDC sync systemic failure: {failed}/{total_items} items skipped on "
+            f"errors/missing sidecars, {synced} synced. Most likely stale or "
+            "unstaged sidecars — regenerate with a fresh get-ids-* run. Refusing "
+            "to report success."
+        )
+        logging.error(msg)
+        raise SdcSystemicFailure(msg)
+
+
 def _run_partner_mode(partner, ids_file):
     """Drive the SDC phase from precomputed S3 sidecars for a whole partner.
 
@@ -6042,6 +6154,9 @@ def _run_partner_mode(partner, ids_file):
                 tracker.increment(Result.SDC_SLOT_WAIT_SECONDS, slot_wait)
         else:
             _run_partner_mode_parallel(partner, dpla_ids, workers)
+        # Fail loudly if this run's skips are systemic (e.g. stale sidecars)
+        # rather than emitting a spurious success COUNTS: + green summary.
+        _assert_not_systemic_failure(len(dpla_ids))
         completed = True
     except BaseException as exc:
         # The per-ordinal try/except above already swallows every routine
