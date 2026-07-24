@@ -648,6 +648,81 @@ def test_plan_migration_community_institution_plaintext_preserved_verbatim():
     )
 
 
+def test_provenance_ignores_formatting_only_community_edit():
+    """The Wooten case: the bot set a "circa" date; a non-bot reformatted it to
+    an equivalent {{other date}} shape. The reparse-identical edit must NOT
+    re-attribute the value away from the bot."""
+    revs = _make_revs(
+        (1, "US National Archives bot", "{{Photograph|date=circa 1926}}"),
+        (2, "SomeEditor", "{{Photograph|date={{other date|circa|1926}}}}"),
+    )
+    provenance = trace_param_provenance(revs)
+    assert provenance.get("date") == "US National Archives bot"
+    # And a substantive change still re-attributes to the editor who made it.
+    revs2 = _make_revs(
+        (1, "US National Archives bot", "{{Photograph|date=circa 1926}}"),
+        (2, "SomeEditor", "{{Photograph|date=1930}}"),
+    )
+    assert trace_param_provenance(revs2).get("date") == "SomeEditor"
+
+
+def test_provenance_value_unchanged_per_key_semantics():
+    from ingest_wikimedia.legacy_artwork import _provenance_value_unchanged
+
+    # date: semantic equality, not bytes.
+    assert _provenance_value_unchanged(
+        "date", "{{other date|circa|1926}}", "circa 1926"
+    )
+    assert not _provenance_value_unchanged("date", "1926", "circa 1926")
+    # title: language wrapper / {{Title}} formatting is non-substantive; a
+    # different language is substantive.
+    assert _provenance_value_unchanged("title", "{{en|A Title}}", "A Title")
+    assert _provenance_value_unchanged("title", "{{Title|en=A Title}}", "A Title")
+    assert not _provenance_value_unchanged("title", "{{es|A Title}}", "A Title")
+    assert not _provenance_value_unchanged("title", "Different", "A Title")
+    # institution: sub-template vs bare Q is non-substantive.
+    assert _provenance_value_unchanged(
+        "institution", "{{Institution|wikidata=Q1}}", "Q1"
+    )
+    assert not _provenance_value_unchanged("institution", "Q2", "Q1")
+    # A community add to a ; -joined description is SUBSTANTIVE (no subset
+    # tolerance here, unlike _value_equivalent_to_canonical).
+    assert not _provenance_value_unchanged("description", "A; B; C", "A; B")
+
+
+def test_provenance_formatter_bot_edit_does_not_reattribute():
+    """A FORMATTER bot (JarektBot) is transparent to provenance even when its
+    edit changes the parsed value — attribution stays with the prior substantive
+    setter (the DPLA bot). This is the backstop beyond the reparse-identical
+    check: it's what keeps JarektBot's pipe-escaping from flipping a
+    DPLA-uploaded value to 'community'. A genuine editor IS attributed."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|description=Foo}}"),
+        (2, "JarektBot", "{{Photograph|description=Foo reformatted}}"),
+    )
+    assert trace_param_provenance(revs).get("description") == "DPLA bot"
+    # Control: a non-formatter editor making the same change is attributed.
+    revs_human = _make_revs(
+        (1, "DPLA bot", "{{Photograph|description=Foo}}"),
+        (2, "RealEditor", "{{Photograph|description=Foo reformatted}}"),
+    )
+    assert trace_param_provenance(revs_human).get("description") == "RealEditor"
+
+
+def test_plan_migration_formatting_only_date_edit_stays_dpla_originated():
+    """End to end: the bot's date, cosmetically reformatted by a community
+    editor, migrates as DPLA-originated (dropped, renders from SDC) — not
+    preserved/imported as a community value."""
+    revs = _make_revs(
+        (1, "US National Archives bot", "{{Photograph|date=circa 1926}}"),
+        (2, "SomeEditor", "{{Photograph|date={{other date|circa|1926}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(date="circa 1926"))
+    assert plan is not None
+    assert "date" not in plan.community_imports
+    assert "date" not in plan.wikitext_preserved_extras
+
+
 def test_migration_provenance_accounts_extend_bots_with_staff():
     """The migration provenance default is bots + staff; ``DPLA_BOT_ACCOUNTS``
     (which also gates the uploader's separate uploader/community-file check) is
@@ -3527,6 +3602,444 @@ def test_value_equivalent_unwraps_lang_template_for_title_description():
     )
     assert _value_equivalent_to_canonical("description", "{{en|A desc}}", "A desc")
     assert not _value_equivalent_to_canonical("title", "{{en|Other}}", "A Better Title")
+
+
+# ---------------------------------------------------------------------------
+# Rights-statement permission equivalence
+# ---------------------------------------------------------------------------
+def test_rights_identity_collapses_all_rights_statement_forms():
+    """Template:Rights statement accepts a bare code, an http:// URI, and an
+    https:// URI for each rightsstatements.org statement; all three — plus the
+    uploader-emitted permission template and a bare URI — reduce to one key."""
+    from ingest_wikimedia.legacy_artwork import _rights_identity
+
+    assert _rights_identity("{{rights statement|NoC-US}}") == "noc-us"
+    assert _rights_identity("{{rights statement|noc-us}}") == "noc-us"
+    assert (
+        _rights_identity(
+            "{{rights statement|http://rightsstatements.org/vocab/NoC-US/1.0/}}"
+        )
+        == "noc-us"
+    )
+    assert (
+        _rights_identity(
+            "{{rights statement|https://rightsstatements.org/vocab/NoC-US/1.0/}}"
+        )
+        == "noc-us"
+    )
+    # The uploader-emitted permission templates: RS name IS the code; CC/PD names.
+    assert _rights_identity("{{NoC-US | Q47530911}}") == "noc-us"
+    assert _rights_identity("{{NKC | Q1}}") == "nkc"
+    assert _rights_identity("{{cc-zero}}") == "cc-zero"
+    assert _rights_identity("{{PD-US}}") == "pd-us"
+    assert _rights_identity("{{Cc-by-4.0}}") == "cc-by-4.0"
+    # A bare rights-statement URI (no template).
+    assert _rights_identity("http://rightsstatements.org/vocab/InC/1.0/") == "inc"
+
+
+def test_rights_identity_none_for_non_rights_or_mixed_content():
+    """Unrecognised or mixed content yields None so the caller preserves it —
+    a genuinely different community permission is never silently dropped."""
+    from ingest_wikimedia.legacy_artwork import _rights_identity, _rs_statement_code
+
+    assert _rights_identity("Free-text permission note") is None
+    assert _rights_identity("{{rights statement|NoC-US}} plus a note") is None
+    assert _rights_identity("{{some other template}}") is None
+    assert _rights_identity("{{rights statement}}") is None  # no positional arg
+    assert _rights_identity("{{rights statement|not-a-code}}") is None
+    # Host is matched by parsed hostname, so a look-alike does not match.
+    assert (
+        _rs_statement_code("http://rightsstatements.org.evil.example/vocab/NoC-US/1.0/")
+        is None
+    )
+
+
+def test_value_equivalent_permission_matches_rights_statement_to_canonical():
+    """The Herrick case: community wikitext ``{{rights statement|<NoC-US URI>}}``
+    is the same right as canonical ``{{NoC-US | Q…}}`` and must compare equal."""
+    from ingest_wikimedia.legacy_artwork import _value_equivalent_to_canonical
+
+    assert _value_equivalent_to_canonical(
+        "permission",
+        "{{rights statement|http://rightsstatements.org/vocab/NoC-US/1.0/}}",
+        "{{NoC-US | Q47530911}}",
+    )
+    # A different rights statement is NOT equivalent.
+    assert not _value_equivalent_to_canonical(
+        "permission", "{{rights statement|InC}}", "{{NoC-US | Q47530911}}"
+    )
+
+
+def test_plan_migration_drops_community_rights_statement_matching_canonical():
+    """A community editor who restated DPLA's rights as ``{{rights statement|
+    <URI>}}`` is not a contribution to preserve — it renders from SDC. It must
+    NOT ride the migrated template's ``permission`` param (the Herrick bug)."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title=A Title|permission="
+            "{{rights statement|http://rightsstatements.org/vocab/NoC-US/1.0/}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(permission="{{NoC-US | Q47530911}}")
+    )
+    assert plan is not None
+    assert "permission" not in plan.wikitext_preserved_extras
+    assert "permission" not in plan.community_imports
+
+
+def test_plan_migration_preserves_community_rights_statement_that_differs():
+    """A community rights statement that differs from canonical is a real
+    override and stays preserved on the migrated template."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title=A Title|permission={{rights statement|InC}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(permission="{{NoC-US | Q47530911}}")
+    )
+    assert plan is not None
+    assert (
+        plan.wikitext_preserved_extras.get("permission") == "{{rights statement|InC}}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Institution redirect equivalence
+# ---------------------------------------------------------------------------
+def test_plan_migration_drops_institution_redirecting_to_canonical():
+    """A community institution Q that Wikidata has merged into canonical's
+    current Q (a redirect) is DPLA's own value in disguise — with a redirect
+    resolver it must NOT be preserved (the Herrick #2 case)."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title=A Title|institution={{Institution|wikidata=Q12345}}}}",
+        ),
+    )
+    resolve = {"Q12345": "Q59661041"}.get  # Q12345 -> canonical Q59661041
+
+    def resolver(qid):
+        return resolve(qid, qid)
+
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(institution="Q59661041"),
+        resolve_qid_redirect=resolver,
+    )
+    assert plan is not None
+    assert "institution" not in plan.wikitext_preserved_extras
+    assert "institution" not in plan.community_imports
+    # Without a resolver the redirect can't be seen, so it stays preserved.
+    plan_no_resolver = plan_migration(
+        "File:Foo.jpg", revs, _canonical_params(institution="Q59661041")
+    )
+    assert plan_no_resolver.wikitext_preserved_extras.get("institution") == "Q12345"
+
+
+def test_plan_migration_keeps_institution_that_is_not_a_redirect():
+    """A resolver that leaves an unrelated Q unchanged must not equate it with
+    canonical — a genuinely different institution stays preserved."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title=A Title|institution={{Institution|wikidata=Q99999}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(institution="Q59661041"),
+        resolve_qid_redirect=lambda qid: qid,  # nothing is a redirect
+    )
+    assert plan is not None
+    assert plan.wikitext_preserved_extras.get("institution") == "Q99999"
+
+
+def test_make_redirect_resolver_resolves_caches_and_is_best_effort(monkeypatch):
+    """``_make_redirect_resolver`` follows redirects, memoises, and swallows
+    errors to the identity so resolution never blocks a migration."""
+    import pywikibot
+
+    from ingest_wikimedia import legacy_artwork
+    from ingest_wikimedia.legacy_artwork import _make_redirect_resolver
+
+    legacy_artwork._REDIRECT_TARGET_CACHE.clear()  # process-wide cache: isolate
+
+    constructed: list[str] = []
+
+    class FakeItemPage:
+        def __init__(self, repo, qid):
+            constructed.append(qid)
+            self._qid = qid
+
+        def isRedirectPage(self):
+            if self._qid == "Q_boom":
+                raise pywikibot.exceptions.Error("kaboom")
+            return self._qid == "Q_old"
+
+        def getRedirectTarget(self):
+            return FakeItemPage(None, "Q_new")
+
+        def getID(self):
+            return self._qid
+
+    monkeypatch.setattr(pywikibot, "ItemPage", FakeItemPage)
+
+    class FakeRepo:
+        def dbName(self):
+            return "wikidatawiki"
+
+    class FakeSite:
+        def data_repository(self):
+            return FakeRepo()
+
+    resolve = _make_redirect_resolver(FakeSite())
+    assert resolve("Q_old") == "Q_new"  # redirect followed
+    assert resolve("Q_plain") == "Q_plain"  # non-redirect -> identity
+    assert resolve("Q_boom") == "Q_boom"  # error -> identity, not a raise
+    # Second lookup of a cached Q builds no new ItemPage.
+    before = len(constructed)
+    assert resolve("Q_old") == "Q_new"
+    assert len(constructed) == before
+
+
+# ---------------------------------------------------------------------------
+# {{Title}} formatting-template handling
+# ---------------------------------------------------------------------------
+def test_unwrap_title_template_recognised_and_rejected_shapes():
+    from ingest_wikimedia.legacy_artwork import _unwrap_title_template
+
+    # Recognised: positional, 1=, language-keyed, positional + lang=.
+    assert _unwrap_title_template("{{Title|Herrick, Myron T. 1905}}") == (
+        "Herrick, Myron T. 1905",
+        "en",
+    )
+    assert _unwrap_title_template("{{Title|1=Foo}}") == ("Foo", "en")
+    assert _unwrap_title_template("{{Title|en=Foo}}") == ("Foo", "en")
+    assert _unwrap_title_template("{{Title|es=Foo}}") == ("Foo", "es")
+    assert _unwrap_title_template("{{Title|Foo|lang=en}}") == ("Foo", "en")
+    assert _unwrap_title_template("{{Title|1=Foo|lang=es}}") == ("Foo", "es")
+    # Multi-line shape (as the bot preserved it on Herrick).
+    assert _unwrap_title_template("{{title\n  |en=Herrick, Myron T. 1905\n  }}") == (
+        "Herrick, Myron T. 1905",
+        "en",
+    )
+    # Rejected → None (caller preserves verbatim): two title strings, an
+    # unknown extra param, a non-Title template, or empty.
+    assert _unwrap_title_template("{{Title|Foo|Bar}}") is None
+    assert _unwrap_title_template("{{Title|Foo|unexpected=y}}") is None
+    assert _unwrap_title_template("{{en|Foo}}") is None
+    assert _unwrap_title_template("{{Title|}}") is None
+    assert _unwrap_title_template("plain text, no template") is None
+
+
+def test_value_equivalent_title_template_language_aware():
+    from ingest_wikimedia.legacy_artwork import _value_equivalent_to_canonical
+
+    # English (default) forms matching canonical are equivalent (dropped).
+    assert _value_equivalent_to_canonical("title", "{{Title|en=XXX}}", "XXX")
+    assert _value_equivalent_to_canonical("title", "{{Title|XXX}}", "XXX")
+    assert _value_equivalent_to_canonical("title", "{{Title|XXX|lang=en}}", "XXX")
+    # A non-English wrapper is a distinct fact even if the text matches.
+    assert not _value_equivalent_to_canonical("title", "{{Title|es=XXX}}", "XXX")
+    # A different English title is not equivalent.
+    assert not _value_equivalent_to_canonical("title", "{{Title|YYY}}", "XXX")
+
+
+def test_plan_migration_drops_title_template_matching_dpla():
+    """Case 1 (the Herrick title): a community ``{{Title|en=XXX}}`` matching the
+    DPLA title renders from SDC — not preserved, not imported."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Artwork|title={{Title|en=Herrick, Myron T. 1905}}}}",
+        ),
+    )
+    plan = plan_migration(
+        "File:Foo.jpg",
+        revs,
+        _canonical_params(title="Herrick, Myron T. 1905"),
+    )
+    assert plan is not None
+    assert "title" not in plan.wikitext_preserved_extras
+    assert "title" not in plan.community_imports
+
+
+def test_plan_migration_imports_differing_title_template_as_sdc():
+    """Case 2: a community ``{{Title|YYY}}`` that differs from DPLA imports as an
+    inferred-from-Wikitext P1476 (English monolingual) SDC claim, not preserved
+    as a wikitext param."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (2, "CommunityEditor", "{{Artwork|title={{Title|A community title}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(title="XXX"))
+    assert plan is not None
+    assert "title" not in plan.wikitext_preserved_extras
+    assert plan.community_imports.get("title") == "{{Title|A community title}}"
+    claim = format_legacy_import_claim(
+        "title", plan.community_imports["title"], "https://example/permalink"
+    )
+    assert claim["mainsnak"]["datavalue"]["value"] == {
+        "text": "A community title",
+        "language": "en",
+    }
+
+
+def test_plan_migration_imports_foreign_language_title_as_sdc():
+    """Case 3: ``{{Title|es=XXX}}`` whose text matches DPLA's English title is
+    still a distinct fact (different language) — imported as an ``es`` monolingual
+    claim, not dropped as redundant."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (2, "CommunityEditor", "{{Artwork|title={{Title|es=XXX}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(title="XXX"))
+    assert plan is not None
+    assert plan.community_imports.get("title") == "{{Title|es=XXX}}"
+    claim = format_legacy_import_claim(
+        "title", plan.community_imports["title"], "https://example/permalink"
+    )
+    assert claim["mainsnak"]["datavalue"]["value"] == {"text": "XXX", "language": "es"}
+
+
+def test_plan_migration_preserves_unparseable_title_template():
+    """Case 4: a ``{{Title|…}}`` shape we can't parse (two title strings) falls
+    back to verbatim wikitext preservation rather than dropping content."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Artwork|title=A Title}}"),
+        (2, "CommunityEditor", "{{Artwork|title={{Title|First|Second}}}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params(title="XXX"))
+    assert plan is not None
+    assert plan.wikitext_preserved_extras.get("title") == "{{Title|First|Second}}"
+    assert "title" not in plan.community_imports
+
+
+# ---------------------------------------------------------------------------
+# Unmapped-param preservation via other_fields
+# ---------------------------------------------------------------------------
+def test_parse_artwork_params_include_unmapped_keys_and_default_drop():
+    from ingest_wikimedia.legacy_artwork import (
+        _UNMAPPED_KEY_PREFIX,
+        parse_artwork_params,
+    )
+
+    text = "{{Photograph|title=T|genre=portrait|depicted people=John}}"
+    # Default: unmapped params dropped (only the mapped `title` survives).
+    assert set(parse_artwork_params(text)) == {"title"}
+    # include_unmapped: unmapped params surface under the prefix, original case.
+    unmapped = parse_artwork_params(text, include_unmapped=True)
+    assert unmapped[f"{_UNMAPPED_KEY_PREFIX}genre"] == "portrait"
+    assert unmapped[f"{_UNMAPPED_KEY_PREFIX}depicted people"] == "John"
+    # The modern other_fields passthrough is never re-wrapped as unmapped.
+    assert f"{_UNMAPPED_KEY_PREFIX}other_fields" not in parse_artwork_params(
+        "{{Photograph|title=T|other_fields={{InFi|X|Y}}}}", include_unmapped=True
+    )
+
+
+def test_information_field_row_escapes_top_level_pipes_only():
+    from ingest_wikimedia.legacy_artwork import _information_field_row
+
+    # A plain value is embedded verbatim.
+    assert (
+        _information_field_row("genre", "portrait")
+        == "{{Information field|name=genre|value=portrait}}"
+    )
+    # A nested template's pipes survive; a top-level pipe is escaped to {{!}}.
+    assert (
+        _information_field_row("people", "{{ubl|Alice|Bob}}")
+        == "{{Information field|name=people|value={{ubl|Alice|Bob}}}}"
+    )
+    assert (
+        _information_field_row("note", "a|b")
+        == "{{Information field|name=note|value=a{{!}}b}}"
+    )
+
+
+def test_plan_migration_preserves_community_unmapped_params_as_other_fields():
+    """The Herrick genre/depicted-people case: community-authored params with no
+    DPLA/SDC target are preserved as {{Information field}} rows in other_fields,
+    not dropped. (``photographer`` is NOT among these — it maps to creator/SDC;
+    see test_photographer_param_migrates_as_creator_not_other_fields.)"""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|title=A Title}}"),
+        (
+            2,
+            "CommunityEditor",
+            "{{Photograph|title=A Title|genre=portrait|depicted people=John Smith}}",
+        ),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    other_fields = plan.wikitext_preserved_extras.get("other_fields")
+    assert other_fields == (
+        "{{Information field|name=genre|value=portrait}}\n"
+        "{{Information field|name=depicted people|value=John Smith}}"
+    )
+
+
+def test_photographer_param_migrates_as_creator_not_other_fields():
+    """{{Photograph}}'s ``photographer`` is the creator — it routes through the
+    creator machinery (→ P170 SDC), NOT the unmapped/other_fields fallback."""
+    from ingest_wikimedia.legacy_artwork import (
+        _CREATOR_QID_PREFIX,
+        _UNMAPPED_KEY_PREFIX,
+        parse_artwork_params,
+    )
+
+    # QID shape → creator QID sentinel (materialises to a P170 creator claim).
+    parsed = parse_artwork_params(
+        "{{Photograph|photographer={{creator|wikidata=Q110083830}}}}",
+        include_unmapped=True,
+    )
+    assert parsed == {"creator": f"{_CREATOR_QID_PREFIX}Q110083830"}
+    assert f"{_UNMAPPED_KEY_PREFIX}photographer" not in parsed
+
+    # Free-text shape → the plain creator string path (P170 somevalue + P2093).
+    parsed_text = parse_artwork_params(
+        "{{Photograph|photographer=Jane Doe}}", include_unmapped=True
+    )
+    assert parsed_text == {"creator": "Jane Doe"}
+
+    # End to end: a community photographer imports as a creator claim, and does
+    # not leak into other_fields.
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|title=A Title}}"),
+        (2, "CommunityEditor", "{{Photograph|title=A Title|photographer=Jane Doe}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert plan.community_imports.get("creator") == "Jane Doe"
+    assert "other_fields" not in plan.wikitext_preserved_extras
+
+
+def test_plan_migration_drops_dpla_authored_unmapped_params():
+    """An unmapped param last set by a DPLA account is boilerplate with no SDC
+    target — dropped (community-authored-only policy), not carried to
+    other_fields."""
+    revs = _make_revs(
+        (1, "DPLA bot", "{{Photograph|title=A Title}}"),
+        (2, "DPLA bot", "{{Photograph|title=A Title|accession number=X123}}"),
+    )
+    plan = plan_migration("File:Foo.jpg", revs, _canonical_params())
+    assert plan is not None
+    assert "other_fields" not in plan.wikitext_preserved_extras
 
 
 def test_format_claim_title_unwraps_lang_template_into_monolingual_text():
