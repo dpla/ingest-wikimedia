@@ -7203,3 +7203,22 @@ def test_write_retry_passes_through_missing_entity():
     ):
         sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
     assert calls["n"] == 1  # never retried
+
+
+def test_write_retry_does_not_retry_fatal_server_error():
+    import pywikibot
+    from tools import sdc_sync
+
+    calls = {"n": 0}
+
+    def fatal(*a, **k):
+        calls["n"] += 1
+        raise pywikibot.exceptions.FatalServerError("fatal")
+
+    with (
+        patch.object(sdc_sync, "process_one_from_sdc", side_effect=fatal),
+        patch.object(sdc_sync.time, "sleep"),
+        pytest.raises(pywikibot.exceptions.FatalServerError),
+    ):
+        sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
+    assert calls["n"] == 1  # FatalServerError is non-recoverable: never retried

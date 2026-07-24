@@ -5405,9 +5405,11 @@ def _process_one_from_sdc_with_retry(
     ``process_one_from_sdc`` re-reads the entity and re-diffs on each call, so a
     retry after a failed write is idempotent — it recomputes and re-posts only
     what's still missing. Retries apply ONLY to clearly-transient server/network
-    classes (``_TRANSIENT_WRITE_ERRORS``); ``_MissingEntityError`` and
-    ``CsrfRecoveryFailed`` pass straight through (never retried), and any other
-    (data/logic) exception propagates on the first attempt so it can't loop.
+    classes (``_TRANSIENT_WRITE_ERRORS``); ``_MissingEntityError``,
+    ``CsrfRecoveryFailed``, and ``FatalServerError`` (a ``ServerError`` subclass
+    pywikibot treats as non-recoverable) pass straight through (never retried),
+    and any other (data/logic) exception propagates on the first attempt so it
+    can't loop.
     """
     for attempt in range(1, _WRITE_RETRY_ATTEMPTS + 1):
         try:
@@ -5419,14 +5421,19 @@ def _process_one_from_sdc_with_retry(
                 page_number=page_number,
             )
             return
-        except (_MissingEntityError, CsrfRecoveryFailed):
+        except (
+            _MissingEntityError,
+            CsrfRecoveryFailed,
+            pywikibot.exceptions.FatalServerError,
+        ):
             # Ordering guard: caught (and immediately re-raised) BEFORE the
-            # transient clause so these can never be swept into the retry even
-            # if _TRANSIENT_WRITE_ERRORS is later broadened to a base class they
-            # subclass. CsrfRecoveryFailed is session-fatal (must abort the run,
+            # transient clause so these are never swept into the retry.
+            # FatalServerError is a ServerError subclass (so it WOULD match
+            # _TRANSIENT_WRITE_ERRORS) that pywikibot itself never retries —
+            # it's non-recoverable, so a retry would predictably fail and waste
+            # attempts. CsrfRecoveryFailed is session-fatal (must abort the run,
             # never retry); _MissingEntityError is a clean per-ordinal skip the
-            # caller classifies. Neither is transient. With today's tuple this
-            # is technically redundant, but it pins the invariant.
+            # caller classifies. This clause must precede the transient one.
             raise
         except _TRANSIENT_WRITE_ERRORS:
             if attempt >= _WRITE_RETRY_ATTEMPTS:

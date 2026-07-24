@@ -678,9 +678,10 @@ def notify_sdc_complete(
     # still reports "complete". A leading flag tells the operator to check the
     # ERROR log lines ("SDC sync failed after retries") and re-run the affected
     # items, rather than the failures passing silently.
-    write_failures = tracker.count(Result.SDC_ITEMS_SKIPPED_ERROR) + tracker.count(
-        Result.SDC_ORDINALS_SKIPPED_ERROR
-    )
+    # Count ordinal-level failures only. SDC_ITEMS_SKIPPED_ERROR is incremented
+    # when *all* of an item's ordinals already hit SDC_ORDINALS_SKIPPED_ERROR,
+    # so summing the two would double-count a fully-failed item.
+    write_failures = tracker.count(Result.SDC_ORDINALS_SKIPPED_ERROR)
     if write_failures:
         stats_lines.insert(0, f"WRITE FAILURES (see log): {write_failures:,}")
     # Maintain mode also renames title-drifted files to their canonical title;
