@@ -2963,7 +2963,18 @@ def _build_merged_wholefile_fragments(
     for cid in contributors:
         if cid in expected_by_id:
             continue
-        raw = s3.get_sdc_json(partner, cid) if s3 is not None else None
+        try:
+            raw = s3.get_sdc_json(partner, cid) if s3 is not None else None
+        except Exception as e:  # noqa: BLE001 - degrade, never lose the pending edit
+            logging.warning(
+                " -- %s: S3 error reading contributor %s sdc.json: %r; "
+                "reconciling references only, no claim removal.",
+                mediaid,
+                cid,
+                e,
+            )
+            degraded = True
+            continue
         if not raw:
             logging.warning(
                 " -- %s: contributor %s sdc.json not loadable (partner=%s); "
@@ -4885,7 +4896,16 @@ def process_one_from_sdc(
         else:
             _reconcile_existing_claims(mediaid, dpla_id, expected)
             _reconcile_inferred_from_wikitext_dupes(mediaid)
-    _flush_per_file_edits(mediaid, dpla_id, expected=expected, s3=s3, partner=partner)
+    # Gate the whole-file reconciler's inputs on `reconcile`: passing s3/partner
+    # is what lets _flush_per_file_edits queue claim removals, so reconcile=False
+    # (merge_item_onto_canonical's add-only contract) must withhold them.
+    _flush_per_file_edits(
+        mediaid,
+        dpla_id,
+        expected=expected,
+        s3=s3 if reconcile else None,
+        partner=partner if reconcile else None,
+    )
 
 
 def merge_item_onto_canonical(

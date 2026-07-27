@@ -7537,3 +7537,55 @@ def test_wholefile_handles_novalue_statement_without_crashing():
     assert "NV" not in removals  # undecidable -> not deleted, no crash
     # and _statement_value_is_expected returns None (undecidable), not a crash
     assert sdc_sync._statement_value_is_expected(novalue_stmt, dup_expected) is None
+
+
+def test_wholefile_degrades_no_removal_on_s3_error():
+    # A transient S3 error (get_sdc_json re-raises non-404 ClientErrors) mid-flush
+    # must degrade to reference-only, never abort the pending edit or delete a claim.
+    import datetime
+
+    from tools import sdc_sync
+
+    entity = _merged_entity([_dpla_reference(_DUP)])  # Q999 attributed to dup only
+    dup_expected = sdc_sync._build_expected_from_sdc(
+        {"claims": [_p760_claim(_DUP)], "ingest_date": "2026-05-27"}
+    )
+    s3 = MagicMock()
+    s3.get_sdc_json.side_effect = RuntimeError("s3 boom")
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags, removals, degraded = sdc_sync._build_merged_wholefile_fragments(
+            "M1", _DUP, dup_expected, datetime.date(2026, 5, 27), s3, "nara", set()
+        )
+    assert degraded is True
+    assert removals == []  # contributor unverifiable -> never delete
+    # dup's own misattributed ref is still dropped (dup provably doesn't assert Q999)
+    s_frag = next(f for f in frags if f["id"] == "S")
+    assert s_frag["references"] == []
+
+
+def test_reconcile_false_withholds_s3_partner_from_flush():
+    # merge_item_onto_canonical opts out of reconciliation (reconcile=False); the
+    # add-only contract requires the whole-file reconciler's removal inputs
+    # (s3/partner) be withheld so no contributor's claims can be removed.
+    from tools import sdc_sync
+
+    captured = {}
+
+    def spy_flush(mediaid, dpla_id, expected=None, s3=None, partner=None):
+        captured["s3"] = s3
+        captured["partner"] = partner
+
+    with (
+        patch.object(sdc_sync, "get_entity", return_value={"statements": {}}),
+        patch.object(sdc_sync, "_flush_per_file_edits", side_effect=spy_flush),
+    ):
+        sdc_sync.process_one_from_sdc(
+            "M1",
+            _DUP,
+            {"claims": [], "ingest_date": "2026-05-27"},
+            reconcile=False,
+            s3=MagicMock(),
+            partner="nara",
+        )
+    assert captured["s3"] is None
+    assert captured["partner"] is None
