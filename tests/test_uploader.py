@@ -3432,6 +3432,31 @@ def test_merge_sdc_onto_canonical_cross_item_passes_no_page_numbers():
     assert merge_mock.call_args.kwargs["page_numbers"] is None
 
 
+def test_merge_sdc_onto_canonical_threads_download_url_for_p2699():
+    """The merged contributor's per-ordinal download URL is threaded through to
+    merge_item_onto_canonical so its P7482 (source of file) statement gets a
+    P2699 (URL) qualifier — the same one a normally-synced file receives. P2699
+    is not stored in sdc.json (it differs per Commons file), so without this the
+    merged contributor's P7482 would land without its download URL."""
+    uploader = _build_uploader_with_dpla()
+    uploader.s3_client.get_sdc_json.return_value = "{}"
+
+    with patch("tools.sdc_sync.merge_item_onto_canonical") as merge_mock:
+        uploader._merge_sdc_onto_canonical(
+            canonical_mediaid="M42",
+            dpla_id="yyyy",
+            partner="nara",
+            page_label="3",
+            within_item=False,
+            download_url="https://s3.amazonaws.com/NARAprodstorage/x/y_01.JPG",
+        )
+
+    assert (
+        merge_mock.call_args.kwargs["download_url"]
+        == "https://s3.amazonaws.com/NARAprodstorage/x/y_01.JPG"
+    )
+
+
 def test_merge_sdc_onto_canonical_skips_when_no_staged_sdc():
     """Missing / blank sdc.json → best-effort skip, merge not attempted."""
     uploader = _build_uploader_with_dpla()
