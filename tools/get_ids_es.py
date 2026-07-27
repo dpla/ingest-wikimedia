@@ -408,7 +408,10 @@ def main(
     rights = load_rights_json()
     subject_ids = fetch_subjects_json()
 
-    banlist = Banlist()
+    # Batch launches (single_id is None) block on an in-progress Quarry run so
+    # the launch uses the freshly-generated banlist; single-ID re-stages don't
+    # wait (they hold the last good list).
+    banlist = Banlist(wait_for_run=single_id is None)
     s3_client = S3Client()
     search_after = None
 

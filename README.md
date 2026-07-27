@@ -46,7 +46,7 @@ Pre-commit hooks use [ruff](https://docs.astral.sh/ruff/) for linting and format
 | `.github/workflows/` | Workflow definitions for launch, kill, retry, status, CIM pageviews, plus CI (pytest, ruff, codeql) |
 | `metrics/` | Source for the GitHub-Pages site plus the scheduled `CIMviews.py` bot |
 | `tests/` | Pytest suite (one `test_<module>.py` per source module) |
-| `dpla-id-banlist.txt` | DPLA IDs to skip in eligibility checks |
+| `dpla-id-banlist.txt` | Committed floor of DPLA IDs to skip in eligibility checks; unioned at runtime with the live Quarry deletion feed (see `docs/maintenance-tools.md`) |
 | `rights.json` | Rights-URI → Wikidata QID mapping consumed by SDC builders |
 
 ## CLI reference

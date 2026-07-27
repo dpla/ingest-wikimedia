@@ -222,7 +222,7 @@ The downloader and uploader also handle per-item failures internally; they only 
 | Worker-slot budget | `ingest_wikimedia/worker_slots.py` | Box-wide `flock`-backed concurrent-Commons-write cap: a shared sdc-sync pool plus an additive dedicated uploader priority pool |
 | Hand-fix sidecar | `ingest_wikimedia/hand_fix_sidecar.py` | Appends one record per `HAND_FIX` ordinal to the per-partner local `<partner>/hand-fix.jsonl` (SHA1 match the bot can't safely resolve: `rename_blocked` or `community_file`) for a human |
 | Wikimedia helpers | `ingest_wikimedia/wikimedia.py` | Title generation, hash-drift handling, CommonsDelinker post |
-| Banlist | `ingest_wikimedia/banlist.py` + `dpla-id-banlist.txt` | Per-DPLA-ID skip list |
+| Banlist | `ingest_wikimedia/banlist.py` + `dpla-id-banlist.txt` | Per-DPLA-ID skip list: committed file (floor) unioned at runtime with the live Quarry deletion feed (query 90099), gated on run completion, additive-only, cached ~6h, env kill-switch `INGEST_WIKIMEDIA_BANLIST_REMOTE=0` |
 
 The shared library (`ingest_wikimedia/`) is deliberately layered so `partners.py` is stdlib-only — the Lambda only needs that one module and `urllib`, no AWS SDK, no requests, no pywikibot. That keeps the Lambda cold-start fast.
 {% endraw %}

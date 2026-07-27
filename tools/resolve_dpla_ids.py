@@ -45,7 +45,9 @@ _IS_SHOWN_AT_FIELD = "isShownAt"
 )
 def main(dpla_ids: tuple[str, ...], maintain: bool) -> None:
     """Resolve DPLA_IDS, check eligibility, and stage metadata to S3."""
-    banlist = Banlist()
+    # Launch path: block on an in-progress Quarry run so the eligibility gate
+    # uses the freshly-generated banlist.
+    banlist = Banlist(wait_for_run=True)
     s3_client = S3Client()
 
     # Single batched ES query for all IDs — avoids N round-trips.
