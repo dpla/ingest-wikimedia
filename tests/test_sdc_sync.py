@@ -6962,7 +6962,13 @@ def _drive_partner_item(monkeypatch, *, ordinals, file_list=None):
     calls = []
 
     def fake_process_one(
-        mediaid, dpla_id, payload, download_url=None, page_number=None
+        mediaid,
+        dpla_id,
+        payload,
+        download_url=None,
+        page_number=None,
+        s3=None,
+        partner=None,
     ):
         calls.append((mediaid, page_number))
 
@@ -7222,3 +7228,312 @@ def test_write_retry_does_not_retry_fatal_server_error():
     ):
         sdc_sync._process_one_from_sdc_with_retry("M1", "id", {}, None, None)
     assert calls["n"] == 1  # FatalServerError is non-recoverable: never retried
+
+
+# ---------------------------------------------------------------------------
+# Merged-file per-item reference reconciliation (#420-followup: the
+# collision-merge reference-clobber bug). _build_merged_reference_fragments
+# must (a) add THIS item's ref to statements whose value it asserts, (b) strip
+# THIS item's ref from statements it does NOT assert (misattribution), and
+# (c) never touch another contributor's reference.
+# ---------------------------------------------------------------------------
+_DUP = "0ec536d49dca64f3b98143158b3403fc"
+_CANON = "d5d7ee74764bc75852f5dcc0365bba91"
+
+
+def _p854_urls(reference):
+    return [
+        s.get("datavalue", {}).get("value", "")
+        for s in (reference.get("snaks") or {}).get("P854", [])
+    ]
+
+
+def _string_stmt(stmt_id, prop, value, references=None):
+    stmt = {
+        "id": stmt_id,
+        "mainsnak": {
+            "property": prop,
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": value},
+        },
+    }
+    if references is not None:
+        stmt["references"] = references
+    return stmt
+
+
+def test_merged_ref_strips_misattributed_own_ref():
+    import datetime
+
+    from tools import sdc_sync
+
+    # P760 = canonical id, wrongly carrying the DUP item's reference. The dup
+    # does not assert P760=canonical, so its ref must be stripped.
+    entity = {
+        "statements": {
+            "P760": [_string_stmt("S1", "P760", _CANON, [_dpla_reference(_DUP)])]
+        }
+    }
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags = sdc_sync._build_merged_reference_fragments(
+            "M1", _DUP, set(), datetime.date(2026, 5, 27), {"P760": [_DUP]}
+        )
+    assert len(frags) == 1 and frags[0]["id"] == "S1"
+    assert frags[0]["references"] == []  # the only (dup) ref removed
+
+
+def test_merged_ref_adds_own_ref_alongside_other_contributor():
+    import datetime
+
+    from tools import sdc_sync
+
+    # Shared value (P195=Q518155) carrying only the CANONICAL contributor's
+    # reference; the dup asserts it too, so the dup ref is ADDED alongside —
+    # the canonical ref is preserved verbatim (co-existence).
+    entity = {
+        "statements": {
+            "P195": [
+                _item_statement(
+                    "S2", "Q518155", references=[_dpla_reference(_CANON)], prop="P195"
+                )
+            ]
+        }
+    }
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags = sdc_sync._build_merged_reference_fragments(
+            "M1", _DUP, set(), datetime.date(2026, 5, 27), {"P195": ["Q518155"]}
+        )
+    assert len(frags) == 1
+    urls = [u for ref in frags[0]["references"] for u in _p854_urls(ref)]
+    assert f"https://dp.la/item/{_CANON}" in urls  # canonical preserved
+    assert f"https://dp.la/item/{_DUP}" in urls  # dup added alongside
+
+
+def test_merged_ref_never_touches_other_contributors_ref():
+    import datetime
+
+    from tools import sdc_sync
+
+    # A statement the dup does NOT assert, carrying only the canonical
+    # contributor's ref and no dup ref → nothing to do → no fragment (the
+    # canonical ref is left verbatim, never rewritten to the dup).
+    entity = {
+        "statements": {
+            "P170": [
+                _item_statement(
+                    "S3", "Q123", references=[_dpla_reference(_CANON)], prop="P170"
+                )
+            ]
+        }
+    }
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags = sdc_sync._build_merged_reference_fragments(
+            "M1", _DUP, set(), datetime.date(2026, 5, 27), {}
+        )
+    assert frags == []
+
+
+def test_merged_dispatch_skips_when_expected_missing():
+    import datetime
+
+    from tools import sdc_sync
+
+    # Dispatcher on a merged file (2 P760s) with no expected map (legacy caller)
+    # must skip the refresh entirely rather than run the clobbering single-item
+    # path.
+    entity = {
+        "statements": {
+            "P760": [
+                _string_stmt("A", "P760", _CANON, [_dpla_reference(_CANON)]),
+                _string_stmt("B", "P760", _DUP, [_dpla_reference(_DUP)]),
+            ]
+        }
+    }
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags = sdc_sync._build_reference_refresh_fragments(
+            "M1", _DUP, set(), datetime.date(2026, 5, 27), expected=None
+        )
+    assert frags == []
+
+
+def test_merged_ref_string_value_tuple_parity_add():
+    import datetime
+
+    from tools import sdc_sync
+
+    # Build `expected` the PRODUCTION way — through _build_expected_from_sdc,
+    # which yields the (value, p1545) tuple shape for string claims. The file
+    # carries the same P760 string value with only the canonical contributor's
+    # reference; the dup asserts it, so its ref must be ADDED alongside. This
+    # exercises the string tuple-matching path positively (a plain-string
+    # `expected` would silently never match and strip refs it should keep).
+    sdc_payload = {
+        "claims": [
+            {
+                "mainsnak": {
+                    "property": "P760",
+                    "snaktype": "value",
+                    "datavalue": {"type": "string", "value": _DUP},
+                }
+            }
+        ]
+    }
+    expected = sdc_sync._build_expected_from_sdc(sdc_payload)
+    entity = {
+        "statements": {
+            "P760": [_string_stmt("S", "P760", _DUP, [_dpla_reference(_CANON)])]
+        }
+    }
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags = sdc_sync._build_merged_reference_fragments(
+            "M1", _DUP, set(), datetime.date(2026, 5, 27), expected
+        )
+    assert len(frags) == 1
+    urls = [u for ref in frags[0]["references"] for u in _p854_urls(ref)]
+    assert f"https://dp.la/item/{_CANON}" in urls  # preserved verbatim
+    assert f"https://dp.la/item/{_DUP}" in urls  # dup ref added (tuple match worked)
+
+
+# ---------------------------------------------------------------------------
+# Whole-file, all-contributor reconciliation for merged files
+# (_build_merged_wholefile_fragments): claim removal ONLY when every
+# contributor's data is loadable and none assert the value; degrade + preserve
+# otherwise; never touch foreign references.
+# ---------------------------------------------------------------------------
+def _fake_s3(sdc_by_id):
+    m = MagicMock()
+
+    def get_sdc_json(partner, cid):
+        payload = sdc_by_id.get(cid)
+        return json.dumps(payload) if payload is not None else None
+
+    m.get_sdc_json.side_effect = get_sdc_json
+    return m
+
+
+def _p760_claim(v):
+    return {
+        "mainsnak": {
+            "property": "P760",
+            "snaktype": "value",
+            "datavalue": {"type": "string", "value": v},
+        }
+    }
+
+
+def _merged_entity(extra_p170_refs):
+    # A merged file: two P760 contributors, plus one P170=Q999 statement whose
+    # references the test varies.
+    return {
+        "statements": {
+            "P760": [
+                _string_stmt("p1", "P760", _DUP, [_dpla_reference(_DUP)]),
+                _string_stmt("p2", "P760", _CANON, [_dpla_reference(_CANON)]),
+            ],
+            "P170": [
+                _item_statement("S", "Q999", references=extra_p170_refs, prop="P170")
+            ],
+        }
+    }
+
+
+def test_wholefile_removes_orphan_only_when_all_loaded():
+    import datetime
+
+    from tools import sdc_sync
+
+    entity = _merged_entity([_dpla_reference(_DUP)])  # Q999 attributed to dup only
+    dup_expected = sdc_sync._build_expected_from_sdc(
+        {"claims": [_p760_claim(_DUP)], "ingest_date": "2026-05-27"}
+    )
+    # canonical's staged sdc.json asserts only its own P760 — nobody asserts Q999
+    s3 = _fake_s3(
+        {_CANON: {"claims": [_p760_claim(_CANON)], "ingest_date": "2026-05-27"}}
+    )
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags, removals, degraded = sdc_sync._build_merged_wholefile_fragments(
+            "M1", _DUP, dup_expected, datetime.date(2026, 5, 27), s3, "nara", set()
+        )
+    assert degraded is False
+    assert "S" in removals  # no contributor asserts Q999 -> claim removed
+    assert "p1" not in removals and "p2" not in removals  # each P760 kept
+
+
+def test_wholefile_degrades_no_removal_when_contributor_unloadable():
+    import datetime
+
+    from tools import sdc_sync
+
+    entity = _merged_entity([_dpla_reference(_DUP)])
+    dup_expected = sdc_sync._build_expected_from_sdc(
+        {"claims": [_p760_claim(_DUP)], "ingest_date": "2026-05-27"}
+    )
+    s3 = _fake_s3({})  # canonical's sdc.json NOT loadable
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags, removals, degraded = sdc_sync._build_merged_wholefile_fragments(
+            "M1", _DUP, dup_expected, datetime.date(2026, 5, 27), s3, "nara", set()
+        )
+    assert degraded is True
+    assert removals == []  # cannot verify -> never delete
+    # dup's misattributed ref on Q999 is still dropped (dup provably doesn't assert)
+    s_frag = next(f for f in frags if f["id"] == "S")
+    assert s_frag["references"] == []
+
+
+def test_wholefile_preserves_foreign_ref_and_keeps_claim():
+    import datetime
+
+    from tools import sdc_sync
+
+    foreign = _foreign_reference()
+    entity = _merged_entity([foreign, _dpla_reference(_DUP)])
+    dup_expected = sdc_sync._build_expected_from_sdc(
+        {"claims": [_p760_claim(_DUP)], "ingest_date": "2026-05-27"}
+    )
+    s3 = _fake_s3(
+        {_CANON: {"claims": [_p760_claim(_CANON)], "ingest_date": "2026-05-27"}}
+    )
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags, removals, degraded = sdc_sync._build_merged_wholefile_fragments(
+            "M1", _DUP, dup_expected, datetime.date(2026, 5, 27), s3, "nara", set()
+        )
+    assert "S" not in removals  # foreign ref present -> claim kept
+    s_frag = next(f for f in frags if f["id"] == "S")
+    assert s_frag["references"] == [foreign]  # dup ref dropped, foreign preserved
+
+
+def test_wholefile_handles_novalue_statement_without_crashing():
+    # A community-added `novalue` statement (no datavalue) must not abort the
+    # flush — the shared extractor is guarded, so the value reads as undecidable
+    # and the statement is left verbatim.
+    import datetime
+
+    from tools import sdc_sync
+
+    novalue_stmt = {
+        "id": "NV",
+        "mainsnak": {"property": "P170", "snaktype": "novalue"},
+        "references": [_dpla_reference(_DUP)],
+    }
+    entity = {
+        "statements": {
+            "P760": [
+                _string_stmt("p1", "P760", _DUP, [_dpla_reference(_DUP)]),
+                _string_stmt("p2", "P760", _CANON, [_dpla_reference(_CANON)]),
+            ],
+            "P170": [novalue_stmt],
+        }
+    }
+    dup_expected = sdc_sync._build_expected_from_sdc(
+        {"claims": [_p760_claim(_DUP)], "ingest_date": "2026-05-27"}
+    )
+    s3 = _fake_s3(
+        {_CANON: {"claims": [_p760_claim(_CANON)], "ingest_date": "2026-05-27"}}
+    )
+    with patch.object(sdc_sync, "get_entity", return_value=entity):
+        frags, removals, degraded = sdc_sync._build_merged_wholefile_fragments(
+            "M1", _DUP, dup_expected, datetime.date(2026, 5, 27), s3, "nara", set()
+        )
+    assert "NV" not in removals  # undecidable -> not deleted, no crash
+    # and _statement_value_is_expected returns None (undecidable), not a crash
+    assert sdc_sync._statement_value_is_expected(novalue_stmt, dup_expected) is None
