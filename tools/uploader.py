@@ -710,6 +710,7 @@ class Uploader:
         duplicate_source_sha1s: set[str] | None = None,
         expected_item_titles: set[str] | None = None,
         canonical_page_numbers: list[int] | None = None,
+        download_url: str | None = None,
     ) -> dict:
         """Process one ordinal's source asset and return a per-ordinal result dict.
 
@@ -1002,6 +1003,7 @@ class Uploader:
                             within_item=True,
                             sha1=sha1,
                             canonical_page_numbers=canonical_page_numbers,
+                            download_url=download_url,
                         )
 
                     drift_action = self._resolve_hash_drift(
@@ -1058,6 +1060,7 @@ class Uploader:
                             and existing_title in expected_item_titles,
                             sha1=sha1,
                             canonical_page_numbers=canonical_page_numbers,
+                            download_url=download_url,
                         )
                     if drift_action == DriftResolution.HAND_FIX_COMMUNITY:
                         # Defense-in-depth: the resolver refused a community
@@ -2047,6 +2050,7 @@ class Uploader:
         within_item: bool,
         sha1: str,
         canonical_page_numbers: list[int] | None = None,
+        download_url: str | None = None,
     ) -> dict:
         """Rule #3 (source duplication): centralize our SHA1 onto the earliest
         existing (canonical) Commons file instead of uploading a second
@@ -2129,6 +2133,7 @@ class Uploader:
             page_label=page_label,
             within_item=within_item,
             canonical_page_numbers=canonical_page_numbers,
+            download_url=download_url,
         )
         if not merge_ok:
             logging.warning(
@@ -2200,10 +2205,18 @@ class Uploader:
         page_label: str,
         within_item: bool,
         canonical_page_numbers: list[int] | None = None,
+        download_url: str | None = None,
     ) -> tuple[bool, bool]:
         """Read this item's staged ``sdc.json`` and merge it onto the canonical
         file's MediaInfo entity via ``sdc_sync.merge_item_onto_canonical``
         (already on ``main`` from PR A).
+
+        ``download_url`` is this ordinal's direct source URL (its ``file-list.txt``
+        entry). It is threaded through so the merged contributor's P7482 (source
+        of file) statement gets its per-ordinal P2699 (URL) qualifier — the same
+        one a normally-synced file receives. P2699 is not stored in ``sdc.json``
+        (it differs per Commons file), so without this the merged contributor's
+        P7482 lands without its download URL.
 
         Imported lazily: ``tools.sdc_sync`` carries heavy module-level state
         (the ``site`` handle the merge writes through) and is only needed on
@@ -2279,6 +2292,7 @@ class Uploader:
                 dpla_id,
                 sdc_payload,
                 page_numbers=page_numbers,
+                download_url=download_url,
                 commons_site=self.site,
             )
             changed = sdc_sync._sdc_writes_total() > writes_before
@@ -2698,7 +2712,7 @@ class Uploader:
             # pageid?, error?}}.
             ordinal_results: dict[str, dict] = {}
 
-            for ordinal, _ in enumerate(
+            for ordinal, media_url in enumerate(
                 tqdm(
                     files, desc="Uploading Files", leave=False, unit="File", ncols=100
                 ),
@@ -2727,6 +2741,7 @@ class Uploader:
                         duplicate_source_sha1s=duplicate_source_sha1s,
                         expected_item_titles=expected_item_titles,
                         canonical_page_numbers=ordinal_pages,
+                        download_url=media_url,
                     )
                     # process_file always returns a dict, but guard defensively:
                     # a NoneType here would crash the whole item's upload loop.
