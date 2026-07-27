@@ -220,6 +220,54 @@ The post-SDC wikitext cleanup (legacy migration + redundant-param strip) is **on
 
 ---
 
+## Banlist
+
+`ingest_wikimedia/banlist.py` (`Banlist`) is the per-DPLA-ID skip list consulted
+during eligibility checks (criterion in `get-ids-es`, `get-ids-nara`,
+`resolve-dpla-ids`, and `DPLA.is_wiki_eligible`). It exists to stop the bot from
+re-uploading a file that a Commons curator has deleted — repeatedly re-uploading
+deleted files is what gets a bot blocked.
+
+**Two sources, unioned at runtime:**
+
+1. **Committed floor** — `dpla-id-banlist.txt` at the repo root, one 32-char
+   DPLA ID per line. Always loaded.
+2. **Live Quarry feed** — the [`DPLA files deleted at Commons:Deletion requests`](https://quarry.wmcloud.org/query/90099)
+   query (query id `90099`), which returns the DPLA IDs of every DPLA-origin file
+   deleted via a Commons deletion request. Fetched on each `Banlist()`
+   construction and **unioned onto** the committed floor.
+
+**Regenerating the banlist** is now just: **open query 90099 on Quarry and click
+"Submit query" to run it again.** The next pipeline invocation picks up the new
+IDs automatically — no code edit, PR, or deploy. Quarry does not re-run on its
+own, so this one click is the whole refresh.
+
+**Safety properties** (why relying on the live feed is safe):
+
+- **Additive-only.** The remote source can only *add* IDs; the banlist never
+  shrinks below the committed file. A Quarry outage, error page, still-running
+  run, or garbage response degrades at worst to file-only behavior.
+- **Run-completion gated.** A run takes several minutes (~9 min for this query).
+  The code reads the query `meta` endpoint and consumes the output only when
+  `latest_run.status == "complete"`, never a partial mid-run result.
+- **Launches wait for an in-progress run.** Batch-launch entrypoints
+  (`get-ids-es` in batch mode, `get-ids-nara`, `resolve-dpla-ids`) construct the
+  banlist with `wait_for_run=True`: if a run is in progress they block, polling
+  until it completes (bounded by `RUN_WAIT_TIMEOUT_SECONDS`, default 15 min),
+  then use the freshly-generated list. Runs are only triggered manually, so this
+  is a rare, deliberate situation — kick off the Quarry run, then launch, and
+  the launch picks up your new IDs. On timeout the launch falls back to the last
+  good list rather than blocking forever. Non-launch constructions (the
+  single-ID re-staging fan-out) never wait.
+- **Cached ~6h.** Fetched IDs are cached to a local temp file so the single-ID
+  re-staging fan-out doesn't hit Quarry once per process.
+- **Kill-switch.** Set `INGEST_WIKIMEDIA_BANLIST_REMOTE=0` to pin the banlist to
+  the committed file only.
+
+The committed file is still worth refreshing periodically (so the permanent floor
+doesn't drift far behind Quarry), but it is no longer on the critical path for a
+newly-deleted file to take effect.
+
 ## Where these tools run
 
 All maintenance tools are typically invoked on EC2 via SSM, from the partner's working directory:

@@ -182,7 +182,7 @@ def test_not_wiki_eligible_dataprovider_wikidata(
 def test_not_wiki_eligible_dpla_id(
     dpla, good_dpla_id, good_item_metadata, good_provider, good_data_provider
 ):
-    dpla.banlist = Banlist()
+    dpla.banlist = Banlist(fetch_remote=False)
     banlist_path = Path(__file__).parent.parent / BANLIST_FILE_NAME
     with open(banlist_path, "r") as file:
         banlist = [line.rstrip() for line in file]

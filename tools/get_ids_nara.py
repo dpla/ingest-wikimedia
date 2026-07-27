@@ -247,7 +247,8 @@ def main() -> None:
     """
     notify_phase_start(PARTNER, "id-generation")
 
-    banlist = Banlist()
+    # Batch launch: block on an in-progress Quarry run so we use the fresh list.
+    banlist = Banlist(wait_for_run=True)
     s3_client = S3Client()
     seen_ids: set[str] = set()
 
