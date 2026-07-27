@@ -139,6 +139,8 @@ def _write_cache(ids: set[str]) -> None:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
+            # Best-effort cleanup; a leftover temp file is harmless (it's never
+            # read — only CACHE_PATH is) and gets cleared with the temp dir.
             pass
 
 
