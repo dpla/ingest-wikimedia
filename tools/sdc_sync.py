@@ -2801,19 +2801,269 @@ def _dpla_reference_is_canonical(reference, dpla_id, ingest_date):
     a reference that lost P123 entirely reads as foreign and is left
     untouched here — a deliberate known limitation, since "repairing" it
     would risk overwriting a genuinely third-party reference."""
+    # "Canonical for this item" = the reference belongs to this item (DPLA
+    # marker + this item's P854 URL) AND its P813 retrieved-date matches the
+    # item's ingestDate.
+    return _reference_belongs_to_item(reference, dpla_id) and _p813_matches(
+        reference, ingest_date
+    )
+
+
+def _reference_belongs_to_item(reference, dpla_id):
+    """True iff ``reference`` is a DPLA reference whose P854 dp.la URL is
+    *this item's* — i.e. the reference was authored for ``dpla_id``, not for
+    another contributing DPLA item on a merged file. Keys on P854 (not just the
+    P123 publisher marker) so per-item reconciliation on a merged file only ever
+    touches its own references and leaves other contributors' references
+    verbatim."""
     if not _is_dpla_reference(reference):
         return False
     expected_url = _dpla_item_url(dpla_id)
-    snaks = reference.get("snaks") or {}
-    p854_ok = any(
+    return any(
         (snak.get("datavalue") or {}).get("value") == expected_url
-        for snak in snaks.get("P854") or []
+        for snak in (reference.get("snaks") or {}).get("P854") or []
     )
-    return p854_ok and _p813_matches(reference, ingest_date)
+
+
+def _statement_value_is_expected(stmt, expected):
+    """True iff the Commons statement's comparable value is in this item's
+    ``expected`` map (``{prop: [comparable]}`` from its sdc.json) — i.e. this
+    item actually asserts this value. Uses the same shape-aware extraction
+    (:func:`_extract_comparable_value`) that built ``expected``, so the two
+    sides line up (mirrors ``_reconcile_existing_claims``). Returns ``None``
+    when the value can't be extracted, so callers can leave an undecidable
+    statement untouched rather than guess."""
+    # _extract_comparable_value must be inside the guard: it indexes
+    # mainsnak["datavalue"], which a ``novalue`` statement (e.g. a community
+    # "unknown author" P170) doesn't have — an uncaught KeyError here would
+    # abort the whole file's flush. This helper is the first place the shared
+    # extractor runs over arbitrary live Commons statements.
+    try:
+        prop = stmt["mainsnak"]["property"]
+        comparable = _extract_comparable_value(stmt)
+    except (KeyError, IndexError, TypeError):
+        return None
+    if comparable is None:
+        return None
+    return comparable in expected.get(prop, [])
+
+
+def _build_merged_reference_fragments(
+    mediaid, dpla_id, already_touched_ids, ingest_date, expected
+):
+    """Per-item reference reconciliation for a MERGED (multi-DPLA-ID) file.
+
+    Unlike the single-item refresh — which canonicalizes *every* DPLA
+    reference to the one item — a merged file carries statements from several
+    contributing items, so each item's sync must touch ONLY its own references
+    (keyed on P854 via :func:`_reference_belongs_to_item`) and leave every other
+    contributor's reference verbatim. For this item's ``dpla_id`` and its
+    ``expected`` value map, per statement:
+
+    * value IS this item's (in ``expected``): ensure exactly one canonical
+      reference for this item is present — canonicalize a stale one, or ADD one
+      alongside the other contributors' references if missing (co-existence).
+    * value is NOT this item's: strip this item's reference if wrongly present
+      (a misattribution), leaving other contributors' references intact.
+
+    Never removes the claim itself (value-level removal is skipped on merged
+    files by design). Undecidable statements (comparable value can't be
+    extracted) are left untouched.
+    """
+    entity = get_entity(mediaid)
+    fragments = []
+    for prop_stmts in (entity.get("statements") or {}).values():
+        for stmt in prop_stmts:
+            stmt_id = stmt.get("id")
+            if not stmt_id or stmt_id in already_touched_ids:
+                continue
+            existing_refs = stmt.get("references") or []
+            mine = _statement_value_is_expected(stmt, expected)
+            if mine is None:
+                continue  # can't decide ownership — leave verbatim
+            new_refs = []
+            changed = False
+            kept_my_ref = False
+            for ref in existing_refs:
+                if not _reference_belongs_to_item(ref, dpla_id):
+                    new_refs.append(ref)  # another contributor's / foreign — keep
+                    continue
+                # This item's reference.
+                if not mine:
+                    changed = True  # misattributed — drop my ref
+                    continue
+                if kept_my_ref:
+                    changed = True  # collapse a duplicate of my own ref
+                    continue
+                kept_my_ref = True
+                if _dpla_reference_is_canonical(ref, dpla_id, ingest_date):
+                    new_refs.append(ref)
+                else:
+                    new_refs.append(_build_dpla_reference(dpla_id, ingest_date))
+                    changed = True
+            if mine and not kept_my_ref:
+                # My value, but my reference is absent — add it (co-existing).
+                new_refs.append(_build_dpla_reference(dpla_id, ingest_date))
+                changed = True
+            if changed:
+                fragments.append(
+                    {
+                        "id": stmt_id,
+                        "type": "statement",
+                        "mainsnak": copy.deepcopy(stmt["mainsnak"]),
+                        "rank": stmt.get("rank", "normal"),
+                        "qualifiers": copy.deepcopy(stmt.get("qualifiers") or {}),
+                        "references": new_refs,
+                    }
+                )
+    return fragments
+
+
+def _reference_owner_id(reference):
+    """The DPLA item id in a DPLA reference's P854 ``dp.la/item/<id>`` URL, or
+    ``None`` when the reference carries no such URL (foreign / malformed) — used
+    to attribute each reference on a merged file to its contributing item."""
+    for snak in (reference.get("snaks") or {}).get("P854") or []:
+        val = (snak.get("datavalue") or {}).get("value") or ""
+        if "/item/" in val:
+            return val.rsplit("/item/", 1)[-1]
+    return None
+
+
+def _build_merged_wholefile_fragments(
+    mediaid,
+    this_dpla_id,
+    this_expected,
+    this_ingest_date,
+    s3,
+    partner,
+    already_touched_ids,
+):
+    """Whole-file, all-contributor reconciliation for a MERGED file.
+
+    Returns ``(reference_fragments, removal_ids, degraded)``. Loads every
+    contributing item's expected value set — the running item from
+    ``this_expected``, the rest via ``s3.get_sdc_json(partner, id)`` (each also
+    yields that item's ingestDate for its P813). Then, per DPLA statement,
+    reconciles its references to exactly the contributors that assert the value:
+    canonicalize/keep a reference for each asserting loaded contributor, drop a
+    loaded contributor's reference where it no longer asserts, and leave foreign
+    references and any *unloadable* contributor's references verbatim.
+
+    A claim is queued for removal ONLY when every contributor's sidecar loaded
+    (``degraded`` is False) AND no contributor asserts it AND it retains no
+    reference at all — never when a contributor's data couldn't be loaded, so a
+    cross-partner contributor's statements are never deleted blind.
+    """
+    entity = get_entity(mediaid)
+    contributors = _contributing_dpla_ids(entity)
+    expected_by_id = {this_dpla_id: this_expected}
+    ingest_by_id = {this_dpla_id: this_ingest_date}
+    degraded = False
+    for cid in contributors:
+        if cid in expected_by_id:
+            continue
+        try:
+            raw = s3.get_sdc_json(partner, cid) if s3 is not None else None
+        except Exception as e:  # noqa: BLE001 - degrade, never lose the pending edit
+            logging.warning(
+                " -- %s: S3 error reading contributor %s sdc.json: %r; "
+                "reconciling references only, no claim removal.",
+                mediaid,
+                cid,
+                e,
+            )
+            degraded = True
+            continue
+        if not raw:
+            logging.warning(
+                " -- %s: contributor %s sdc.json not loadable (partner=%s); "
+                "reconciling references only, no claim removal.",
+                mediaid,
+                cid,
+                partner,
+            )
+            degraded = True
+            continue
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            degraded = True
+            continue
+        expected_by_id[cid] = _build_expected_from_sdc(payload)
+        idate = payload.get("ingest_date")
+        ingest_by_id[cid] = (
+            datetime.date.fromisoformat(idate)
+            if isinstance(idate, str)
+            else this_ingest_date
+        )
+    loaded = set(expected_by_id)
+
+    fragments = []
+    removals = []
+    for prop_stmts in (entity.get("statements") or {}).values():
+        for stmt in prop_stmts:
+            sid = stmt.get("id")
+            if not sid or sid in already_touched_ids:
+                continue
+            existing = stmt.get("references") or []
+            new_refs = []
+            changed = False
+            seen_owners = set()
+            for ref in existing:
+                if not _is_dpla_reference(ref):
+                    new_refs.append(ref)  # foreign — keep in place
+                    continue
+                owner = _reference_owner_id(ref)
+                if owner not in loaded:
+                    new_refs.append(ref)  # unloadable contributor — keep verbatim
+                    continue
+                verdict = _statement_value_is_expected(stmt, expected_by_id[owner])
+                if verdict is None:  # undecidable shape — keep
+                    new_refs.append(ref)
+                    seen_owners.add(owner)
+                    continue
+                if not verdict:  # owner no longer asserts — drop
+                    changed = True
+                    continue
+                if owner in seen_owners:  # duplicate of owner — collapse
+                    changed = True
+                    continue
+                seen_owners.add(owner)
+                if _dpla_reference_is_canonical(ref, owner, ingest_by_id[owner]):
+                    new_refs.append(ref)
+                else:
+                    new_refs.append(_build_dpla_reference(owner, ingest_by_id[owner]))
+                    changed = True
+            for cid in sorted(loaded):  # asserting contributors with no ref yet
+                if cid in seen_owners:
+                    continue
+                if _statement_value_is_expected(stmt, expected_by_id[cid]):
+                    new_refs.append(_build_dpla_reference(cid, ingest_by_id[cid]))
+                    changed = True
+            remove = (
+                not degraded
+                and not new_refs
+                and any(_is_dpla_reference(r) for r in existing)
+            )
+            if remove:
+                removals.append(sid)
+            elif changed:
+                fragments.append(
+                    {
+                        "id": sid,
+                        "type": "statement",
+                        "mainsnak": copy.deepcopy(stmt["mainsnak"]),
+                        "rank": stmt.get("rank", "normal"),
+                        "qualifiers": copy.deepcopy(stmt.get("qualifiers") or {}),
+                        "references": new_refs,
+                    }
+                )
+    return fragments, removals, degraded
 
 
 def _build_reference_refresh_fragments(
-    mediaid, dpla_id, already_touched_ids, ingest_date
+    mediaid, dpla_id, already_touched_ids, ingest_date, expected=None
 ):
     """Build reference-update fragments that make each DPLA-authored claim's
     DPLA reference *canonical and up-to-date* — the full P854+P123+P813
@@ -2836,8 +3086,22 @@ def _build_reference_refresh_fragments(
     reference is already canonical gets no spurious edit. Pinning P813 to
     ``ingestDate`` (rather than today) means back-to-back sync runs against
     unchanged partner data produce no reference-refresh churn at all.
+
+    On a MERGED (multi-DPLA-ID) file this single-item canonicalization is wrong
+    — it would rewrite other contributors' references to this one item and
+    misattribute their statements — so it delegates to
+    :func:`_build_merged_reference_fragments` (per-item, P854-scoped). That
+    needs this item's ``expected`` value map; when a caller doesn't supply it
+    (legacy paths), the refresh is skipped on a merged file rather than run the
+    clobbering single-item path.
     """
     entity = get_entity(mediaid)
+    if _is_merged_file(entity):
+        if expected is None:
+            return []
+        return _build_merged_reference_fragments(
+            mediaid, dpla_id, already_touched_ids, ingest_date, expected
+        )
     fragments = []
     for prop_stmts in (entity.get("statements") or {}).values():
         for stmt in prop_stmts:
@@ -2921,7 +3185,7 @@ def _p813_matches(reference, target_date):
     return False
 
 
-def _flush_per_file_edits(mediaid, dpla_id):
+def _flush_per_file_edits(mediaid, dpla_id, expected=None, s3=None, partner=None):
     """Drain every per-file accumulator into a single ``wbeditentity``
     POST via :func:`_submit_per_item_edit`. Called at the end of each
     ``process_one_from_sdc`` and ``process_one`` invocation; this is
@@ -2950,26 +3214,46 @@ def _flush_per_file_edits(mediaid, dpla_id):
     removal_fragments = [{"id": cid, "remove": ""} for cid in removals]
     reference_updates = list(refclaims["claims"])
 
-    has_any_other_edit = bool(
+    touched_ids = set()
+    for frag in qualifier_fragments + removal_fragments + reference_updates:
+        fid = frag.get("id")
+        if fid:
+            touched_ids.add(fid)
+
+    # A merged file with the item's expected map AND an S3 client available runs
+    # the whole-file, all-contributor reconciliation on EVERY sync (not gated on
+    # other edits, so pure reference/removal drift is still corrected): each
+    # statement's references are reconciled to exactly the contributors that
+    # assert its value, and an unwarranted claim is removed only when every
+    # contributor's data was loadable. Otherwise fall back to the single- /
+    # per-item reference refresh, gated (as before) on there being another edit
+    # to piggyback on.
+    if (
+        expected is not None
+        and s3 is not None
+        and partner is not None
+        and _is_merged_file(get_entity(mediaid))
+    ):
+        ingest_date = _require_ingest_date()
+        wf_refs, wf_removals, _degraded = _build_merged_wholefile_fragments(
+            mediaid, dpla_id, expected, ingest_date, s3, partner, touched_ids
+        )
+        reference_updates.extend(wf_refs)
+        removal_fragments.extend({"id": rid, "remove": ""} for rid in wf_removals)
+    elif (
         claims["claims"]
         or reference_updates
         or qualifier_fragments
         or removal_fragments
-    )
-    if has_any_other_edit:
+    ):
         # Only need the ingest date when we're actually building a
         # reference-refresh fragment. This keeps the "nothing to do"
         # path callable without a set ingest date (used by tests and by
         # process_one entry points that short-circuit before setting it).
         ingest_date = _require_ingest_date()
-        touched_ids = set()
-        for frag in qualifier_fragments + removal_fragments + reference_updates:
-            fid = frag.get("id")
-            if fid:
-                touched_ids.add(fid)
         reference_updates.extend(
             _build_reference_refresh_fragments(
-                mediaid, dpla_id, touched_ids, ingest_date
+                mediaid, dpla_id, touched_ids, ingest_date, expected=expected
             )
         )
 
@@ -4455,6 +4739,8 @@ def process_one_from_sdc(
     download_url=None,
     page_number=None,
     reconcile=True,
+    s3=None,
+    partner=None,
 ):
     """Sync SDC for a single Commons file against a precomputed claim list.
 
@@ -4596,18 +4882,30 @@ def process_one_from_sdc(
     # (merge_item_onto_canonical). Single-contributor files — every file
     # today — reconcile exactly as before, so this is a no-op until PR C
     # starts merging.
+    # Built once and reused: the value-level removal reconciler (single-item
+    # only) AND the merged-file reference reconciliation (in _flush) both key
+    # off this item's expected value map.
+    expected = _build_expected_from_sdc(sdc_payload)
     if reconcile:
         if _is_merged_file(get_entity(mediaid)):
             logging.info(
-                " -- %s carries multiple DPLA IDs (merged); skipping "
-                "reconciliation to preserve other contributors' statements.",
+                " -- %s carries multiple DPLA IDs (merged); skipping value-level "
+                "reconciliation (add-only) — references are reconciled per-item.",
                 mediaid,
             )
         else:
-            expected = _build_expected_from_sdc(sdc_payload)
             _reconcile_existing_claims(mediaid, dpla_id, expected)
             _reconcile_inferred_from_wikitext_dupes(mediaid)
-    _flush_per_file_edits(mediaid, dpla_id)
+    # Gate the whole-file reconciler's inputs on `reconcile`: passing s3/partner
+    # is what lets _flush_per_file_edits queue claim removals, so reconcile=False
+    # (merge_item_onto_canonical's add-only contract) must withhold them.
+    _flush_per_file_edits(
+        mediaid,
+        dpla_id,
+        expected=expected,
+        s3=s3 if reconcile else None,
+        partner=partner if reconcile else None,
+    )
 
 
 def merge_item_onto_canonical(
@@ -5397,7 +5695,7 @@ def _get_partner_s3_client():
 
 
 def _process_one_from_sdc_with_retry(
-    mediaid, dpla_id, sdc_payload, download_url, page_number
+    mediaid, dpla_id, sdc_payload, download_url, page_number, s3=None, partner=None
 ):
     """``process_one_from_sdc`` with a bounded retry for transient write errors.
 
@@ -5419,6 +5717,8 @@ def _process_one_from_sdc_with_retry(
                 sdc_payload,
                 download_url=download_url,
                 page_number=page_number,
+                s3=s3,
+                partner=partner,
             )
             return
         except (
@@ -5784,7 +6084,13 @@ def _process_one_partner_item(s3, partner, dpla_id, idx, total):
             page_number = recorded_pages or None
         try:
             _process_one_from_sdc_with_retry(
-                mediaid, dpla_id, sdc_payload, download_url, page_number
+                mediaid,
+                dpla_id,
+                sdc_payload,
+                download_url,
+                page_number,
+                s3=s3,
+                partner=partner,
             )
         except _MissingEntityError:
             # Commons says the MediaInfo entity at this M-id doesn't
