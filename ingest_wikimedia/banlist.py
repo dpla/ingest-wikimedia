@@ -126,10 +126,20 @@ def _cache_is_fresh() -> bool:
 
 
 def _write_cache(ids: set[str]) -> None:
+    # Write to a per-process temp file in the same directory, then atomically
+    # rename into place. CACHE_PATH is shared across the concurrent single-ID
+    # fan-out, so a plain truncate-then-write could let a reader catch a
+    # half-written file; os.replace makes the swap atomic on the same fs.
+    tmp = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{os.getpid()}.tmp")
     try:
-        CACHE_PATH.write_text("\n".join(sorted(ids)) + "\n")
+        tmp.write_text("\n".join(sorted(ids)) + "\n")
+        tmp.replace(CACHE_PATH)
     except OSError as e:
         logging.warning("Banlist: could not write remote cache %s: %s", CACHE_PATH, e)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _await_complete_run(headers: dict[str, str], wait_for_run: bool) -> int:
