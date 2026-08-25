@@ -42,7 +42,7 @@ permissions:
       - name: Configure AWS credentials (GitHub OIDC)
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
-          role-to-assume: ${{ secrets.WIKIMEDIA_AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::283408157088:role/github-actions-ingest-wikimedia
           aws-region: us-east-1
 ```
 
@@ -51,9 +51,9 @@ permissions:
 boto3 scripts pick up through the default credential chain — so the explicit
 `AWS_*` step env is gone.
 
-The role ARN is supplied as the repository secret **`WIKIMEDIA_AWS_ROLE_ARN`**
-(kept out of the committed YAML so this public repo does not expose the account
-ID).
+The role ARN is hardcoded in the workflow YAML — it is an identifier, not a
+credential, so nothing sensitive is exposed (the same account ID already appears
+in the sibling `dpla/ingestion3` workflow). No GitHub secret is used for it.
 
 ## AWS side (one-time provisioning, by someone with IAM access)
 
@@ -69,7 +69,7 @@ individual's account. That is the liability this migration removes.
 **1. Ensure the account's GitHub OIDC provider exists** (account-level; reuse if
 present — do not duplicate):
 
-```
+```bash
 aws iam list-open-id-connect-providers
 # look for .../token.actions.githubusercontent.com ; create only if absent:
 aws iam create-open-id-connect-provider \
@@ -78,9 +78,9 @@ aws iam create-open-id-connect-provider \
   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
 ```
 
-**2. Create the role with an OIDC trust policy scoped to this repo.** `:*` allows
-any branch/tag/environment — tighten to `ref:refs/heads/main` or an
-`environment:<name>` once branch testing (below) is done.
+**2. Create the role with an OIDC trust policy scoped to this repo's `main` branch
+only.** Narrow from the start: a `workflow_dispatch` run on a non-`main` ref must
+not be able to assume the role.
 
 ```json
 {
@@ -88,12 +88,14 @@ any branch/tag/environment — tighten to `ref:refs/heads/main` or an
   "Statement": [{
     "Effect": "Allow",
     "Principal": {
-      "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+      "Federated": "arn:aws:iam::283408157088:oidc-provider/token.actions.githubusercontent.com"
     },
     "Action": "sts:AssumeRoleWithWebIdentity",
     "Condition": {
-      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-      "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:dpla/ingest-wikimedia:*" }
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:dpla/ingest-wikimedia:ref:refs/heads/main"
+      }
     }
   }]
 }
@@ -110,7 +112,7 @@ any branch/tag/environment — tighten to `ref:refs/heads/main` or an
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
       "Resource": [
-        "arn:aws:ec2:us-east-1:<ACCOUNT_ID>:instance/i-033eff6c8c168f999",
+        "arn:aws:ec2:us-east-1:283408157088:instance/i-033eff6c8c168f999",
         "arn:aws:ssm:us-east-1::document/AWS-RunShellScript"
       ]
     },
@@ -128,22 +130,22 @@ any branch/tag/environment — tighten to `ref:refs/heads/main` or an
 `ssm:SendCommand` IS scoped — to this one instance and only the
 `AWS-RunShellScript` document.
 
-**4. Set the repo secret** `WIKIMEDIA_AWS_ROLE_ARN` to the role ARN.
+The role ARN is hardcoded in the workflows, so there is **no GitHub secret to set**.
 
 ## Rollout order
 
-1. Provision the OIDC provider + role (above) and set `WIKIMEDIA_AWS_ROLE_ARN`.
-2. Merge this change (or test from the branch first — see below).
+1. Provision the OIDC provider + role (above).
+2. Merge this change to `main`.
 3. Verify a real run end-to-end (e.g. `wikimedia-upload-status`, the cheapest —
-   it only reads instance state and posts to Slack).
+   it only reads instance state and posts to Slack). Because the trust is
+   `main`-only, verification runs from `main` after merge — a non-`main` branch
+   cannot assume the role.
 4. Only then **delete the `WIKIMEDIA_AWS_ACCESS_KEY_ID` / `WIKIMEDIA_AWS_SECRET_ACCESS_KEY`
    secrets and deactivate + delete the old IAM access keys.**
 
-Testing from this PR branch requires the trust policy to allow the branch ref —
-keep the `repo:...:*` scope until a branch run succeeds, then tighten to
-main/environment.
-
 ## Rollback
 
-Re-add the `WIKIMEDIA_AWS_*` secrets and revert the workflow diff. Nothing else
-in the pipeline depends on the auth method.
+Revert the workflow diff (which restores the `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` step env) and re-add the `WIKIMEDIA_AWS_ACCESS_KEY_ID` /
+`WIKIMEDIA_AWS_SECRET_ACCESS_KEY` secrets if they were removed. Nothing else in
+the pipeline depends on the auth method.
