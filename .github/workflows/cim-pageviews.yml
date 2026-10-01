@@ -1,9 +1,11 @@
 name: CIM Pageviews Bot
 
 on:
-  schedule:
-    - cron: '0 8 * * *'      # daily – categories mode
-    - cron: '0 8 1,7 * *'    # 1st and 7th of each month – data mode
+  # Scheduled runs paused 2026-09-30. To resume, uncomment this block; the job
+  # `if:` conditions below still key off these exact cron strings.
+  # schedule:
+  #   - cron: '0 8 * * *'      # daily – categories mode
+  #   - cron: '0 8 1,7 * *'    # 1st and 7th of each month – data mode
   workflow_dispatch:
     inputs:
       mode:
