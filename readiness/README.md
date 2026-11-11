@@ -17,6 +17,7 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 | [California Digital Library](https://dp.la/search?partner=%22California+Digital+Library%22) | 🔶 [california_digital_library_inventory.md](california_digital_library_inventory.md) |
 | [Community Webs](https://dp.la/search?partner=%22Community+Webs%22) | ➖ no eligible items |
 | [Connecticut Digital Archive](https://dp.la/search?partner=%22Connecticut+Digital+Archive%22) | ➖ no eligible items |
+| [Dartmouth Libraries](https://dp.la/search?partner=%22Dartmouth+Libraries%22) | 🔶 [dartmouth_libraries_inventory.md](dartmouth_libraries_inventory.md) |
 | [David Rumsey](https://dp.la/search?partner=%22David+Rumsey%22) | ➖ no eligible items |
 | [Digital Commonwealth](https://dp.la/search?partner=%22Digital+Commonwealth%22) | 🤝 [digital_commonwealth_inventory.md](digital_commonwealth_inventory.md) |
 | [Digital Library of Georgia](https://dp.la/search?partner=%22Digital+Library+of+Georgia%22) | 🤝 [digital_library_of_georgia_inventory.md](digital_library_of_georgia_inventory.md) |
@@ -32,10 +33,13 @@ This directory contains upload readiness assessments for DPLA hubs, evaluating t
 | [Indiana Memory](https://dp.la/search?partner=%22Indiana+Memory%22) | 🤝 [indiana_memory_inventory.md](indiana_memory_inventory.md) |
 | [Internet Archive](https://dp.la/search?partner=%22Internet+Archive%22) | 🤝 [internet_archive_inventory.md](internet_archive_inventory.md) |
 | [J. Paul Getty Trust](https://dp.la/search?partner=%22J.+Paul+Getty+Trust%22) | ➖ no eligible items |
+| [Jewish Heritage and History Hub](https://dp.la/search?partner=%22Jewish+Heritage+and+History+Hub%22) | 🔶 [jewish_heritage_and_history_hub_inventory.md](jewish_heritage_and_history_hub_inventory.md) |
+| [JSTOR](https://dp.la/search?partner=%22JSTOR%22) | 🔶 [jstor_inventory.md](jstor_inventory.md) |
 | [Kentucky Digital Library](https://dp.la/search?partner=%22Kentucky+Digital+Library%22) | ➖ no eligible items |
 | [Library of Congress](https://dp.la/search?partner=%22Library+of+Congress%22) | ➖ no eligible items |
 | [Michigan Service Hub](https://dp.la/search?partner=%22Michigan+Service+Hub%22) | 🔶 [michigan_service_hub_inventory.md](michigan_service_hub_inventory.md) |
 | [Minnesota Digital Library](https://dp.la/search?partner=%22Minnesota+Digital+Library%22) | 🤝 [minnesota_digital_library_inventory.md](minnesota_digital_library_inventory.md) |
+| [Mississippi Digital Library](https://dp.la/search?partner=%22Mississippi+Digital+Library%22) | 🔶 [mississippi_digital_library_inventory.md](mississippi_digital_library_inventory.md) |
 | [Mountain West Digital Library](https://dp.la/search?partner=%22Mountain+West+Digital+Library%22) | 🤝 [mountain_west_digital_library_inventory.md](mountain_west_digital_library_inventory.md) |
 | [National Archives and Records Administration](https://dp.la/search?partner=%22National+Archives+and+Records+Administration%22) | ✅ **already participating hub-wide** |
 | [NJ/DE Digital Collective](https://dp.la/search?partner=%22NJ%2FDE+Digital+Collective%22) | 🔶 [nj_de_digital_collective_inventory.md](nj_de_digital_collective_inventory.md) |
