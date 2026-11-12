@@ -30,7 +30,7 @@ import datetime
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urlencode, urlparse
 
 import mwparserfromhell
@@ -97,6 +97,24 @@ DPLA_STAFF_ACCOUNTS: frozenset[str] = frozenset(
 # automated uploaders + DPLA staff. Default for ``plan_migration`` /
 # ``classify_param_provenance`` / ``migrate_legacy_file``.
 MIGRATION_PROVENANCE_ACCOUNTS: frozenset[str] = DPLA_BOT_ACCOUNTS | DPLA_STAFF_ACCOUNTS
+
+# Third-party FORMATTING bots. Their edits are cosmetic — AWB pipe/whitespace
+# passes, structured-data housekeeping — and must be TRANSPARENT to provenance:
+# a formatting bot that reformats a value (e.g. JarektBot escaping a stray ``|``
+# to ``{{!}}``) is not "setting" it, so attribution passes through to whoever set
+# the substance. Without this, such an edit is the last non-DPLA touch and
+# flips a DPLA-originated value to "community", preserving a stale duplicate.
+# Distinct from ``MIGRATION_PROVENANCE_ACCOUNTS``: these are NOT DPLA and are not
+# classified DPLA-originated — they are simply skipped as value-setters. The
+# semantic (reparse-identical) check in ``_provenance_value_unchanged`` already
+# neutralises escaping-only edits; this is the backstop for a formatter edit that
+# does change the parsed value (spacing/serialization) yet carries no content.
+FORMATTER_BOT_ACCOUNTS: frozenset[str] = frozenset(
+    {
+        "JarektBot",
+        "SchlurcherBot",
+    }
+)
 
 
 def _normalize_account(name: str) -> str:
@@ -198,6 +216,12 @@ ARTWORK_PARAM_TO_CANONICAL_KEY: dict[str, str] = {
     "author": "creator",
     "artist": "creator",
     "creator": "creator",
+    # {{Photograph}}'s ``photographer`` names the photo's creator (on that
+    # template ``author`` is itself an alias of ``photographer``). Route it
+    # through the creator machinery so ``photographer = {{creator|wikidata=Q}}``
+    # migrates to a P170 creator statement (QID-resolved) — same as ``creator``
+    # — instead of riding as verbatim ``other_fields`` wikitext.
+    "photographer": "creator",
     "source": "source",
     "institution": "institution",
     "permission": "permission",
@@ -317,7 +341,41 @@ def find_legacy_template(wikitext: str):
     return None
 
 
-def parse_artwork_params(wikitext: str) -> dict[str, str]:
+# Prefix marking an UNMAPPED legacy param (one with no DPLA canonical/SDC
+# target — photographer, genre, depicted people, …) in the parse output, keyed
+# by its original-cased label. Chosen so it can't collide with a canonical key
+# (title/description/date/creator/source/institution/permission) or with a real
+# param name a template is likely to carry.
+_UNMAPPED_KEY_PREFIX = "unmapped:"
+
+
+def _escape_top_level_pipes(value: str) -> str:
+    """Escape only TOP-LEVEL ``|`` to ``{{!}}`` so ``value`` survives as a single
+    template parameter, leaving pipes inside nested templates (e.g.
+    ``{{ubl|a|b}}``) untouched. ``=`` needs no escaping inside a named ``value=``
+    parameter — only the first ``=`` splits."""
+    out = []
+    for node in mwparserfromhell.parse(value).nodes:
+        if isinstance(node, mwparserfromhell.nodes.Text):
+            out.append(node.value.replace("|", "{{!}}"))
+        else:
+            out.append(str(node))
+    return "".join(out)
+
+
+def _information_field_row(label: str, value: str) -> str:
+    """Format one unmapped legacy param as an ``{{Information field}}`` row for
+    the migrated template's ``other_fields`` (Module:DPLA renders these verbatim
+    in the yellow user-contribution box, mirroring ``{{Information}}``)."""
+    return "{{Information field|name=%s|value=%s}}" % (
+        _escape_top_level_pipes(label),
+        _escape_top_level_pipes(value),
+    )
+
+
+def parse_artwork_params(
+    wikitext: str, include_unmapped: bool = False
+) -> dict[str, str]:
     """Extract the canonical-key → value dict from a legacy template
     invocation in ``wikitext``.
 
@@ -331,10 +389,15 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
     (crediting the AWB edit for a real content change would misclassify
     the value as community-contributed) and by downstream SDC-storage
     paths (a stored value that literally contains ``{{!}}`` is nonsense
-    outside a template context). Unrecognised param names are dropped
-    silently — those don't have a canonical target and the wikitext-
-    rewrite step preserves them by leaving the template untouched if
-    the param wasn't migrated.
+    outside a template context). Unrecognised param names have no
+    canonical/SDC target: by default they are dropped, but with
+    ``include_unmapped=True`` they are returned keyed
+    ``{_UNMAPPED_KEY_PREFIX}<original label>`` so the migration can
+    preserve a community-authored one as an ``{{Information field}}`` row
+    in ``other_fields`` instead of losing it. (The migration node-swaps
+    the whole legacy template for a fresh ``{{DPLA metadata}}`` block, so
+    a param not carried forward here is gone — it is NOT preserved by
+    "leaving the template untouched".)
 
     Repairs literal-``|`` truncation of named-param values. Legacy
     ``{{Artwork}}`` uploads sometimes wrote pipe-separated subject
@@ -402,6 +465,17 @@ def parse_artwork_params(wikitext: str) -> dict[str, str]:
             last_named_recognised = True
             continue
         if canonical is None:
+            # An unmapped named param (photographer, genre, depicted people, …)
+            # — no DPLA canonical/SDC target. With include_unmapped, record it
+            # under its ORIGINAL-cased label (stable across revisions for the
+            # provenance walk) so the migration can preserve a community-authored
+            # one as an {{Information field}} row. Skip the modern ``other_fields``
+            # passthrough param (already a run of {{InFi}} rows — don't re-wrap
+            # it). Not stitched for positional overflow, same as before.
+            if include_unmapped and param_name != "other_fields":
+                stitched.append(
+                    [_UNMAPPED_KEY_PREFIX + str(param.name).strip(), str(param.value)]
+                )
             last_named_recognised = False
             continue
         stitched.append([canonical, str(param.value)])
@@ -493,8 +567,51 @@ def _extract_related_image_files(wikitext: str) -> list[str]:
     return files
 
 
+def _provenance_value_unchanged(key: str, new_value: str, prior_value: str) -> bool:
+    """True when a revision leaves a param's SUBSTANCE unchanged — a
+    byte-identical value, or a formatting-only edit that reparses to the same
+    migrated outcome (``circa 1926`` rewritten as ``{{other date|circa|1926}}``,
+    a title wrapped in ``{{en|…}}`` / ``{{Title|…}}``, an institution written as
+    ``{{Institution|wikidata=Q}}`` vs the bare ``Q``, …). Used by
+    :func:`trace_param_provenance` so a cosmetic community edit does not
+    re-attribute a value away from whoever set its substance.
+
+    Symmetric and drift-INTOLERANT, deliberately NOT reusing
+    :func:`_value_equivalent_to_canonical`: that comparator is wikitext-vs-DPLA
+    and treats a ``; ``-joined *subset* as equivalent to absorb DPLA-side drift.
+    Here both sides are revisions of the SAME wikitext param, so a genuine
+    add/remove of a list value IS a substantive community edit that must
+    re-attribute — hence exact (not subset) comparison of the compared forms."""
+    if new_value == prior_value:
+        return True
+    if key == "date":
+        return dates_semantically_equal(new_value, prior_value)
+    if key in ("title", "description"):
+        new_text, new_lang = _unwrap_lang_template(new_value)
+        prior_text, prior_lang = _unwrap_lang_template(prior_value)
+        return new_lang == prior_lang and casefold_for_compare(
+            new_text
+        ) == casefold_for_compare(prior_text)
+    if key == "permission":
+        new_rights = _rights_identity(new_value)
+        return new_rights is not None and new_rights == _rights_identity(prior_value)
+    if key == "institution":
+        new_qid = _extract_institution_qid(new_value)
+        return bool(new_qid) and new_qid == _extract_institution_qid(prior_value)
+    if key == "creator":
+        # A free-text creator credit — same casefold/punctuation-trim tolerance
+        # the canonical comparator applies to CASEFOLD_COMPARE_KEYS (title /
+        # description / permission are already handled by their own branches
+        # above; creator is the only member that reaches here).
+        new_folded = casefold_for_compare(new_value)
+        return bool(new_folded) and new_folded == casefold_for_compare(prior_value)
+    return False
+
+
 def trace_param_provenance(
     revisions: Iterable[RevisionSnapshot],
+    include_unmapped: bool = False,
+    formatter_accounts: frozenset[str] = FORMATTER_BOT_ACCOUNTS,
 ) -> dict[str, str]:
     """Walk revisions oldest→newest to find which editor last set each
     legacy-template param to its current value.
@@ -519,14 +636,16 @@ def trace_param_provenance(
     if not sorted_revs:
         return {}
 
-    final_params = parse_artwork_params(sorted_revs[-1].text)
+    final_params = parse_artwork_params(sorted_revs[-1].text, include_unmapped)
     if not final_params:
         return {}
 
+    formatter_set = {_normalize_account(a) for a in formatter_accounts}
     provenance: dict[str, str] = {}
     prior_seen: dict[str, str] = {}
     for rev in sorted_revs:
-        rev_params = parse_artwork_params(rev.text)
+        is_formatter = _normalize_account(rev.user) in formatter_set
+        rev_params = parse_artwork_params(rev.text, include_unmapped)
         # Drop entries from prior_seen for params the current revision
         # no longer carries. Without this, a delete → re-add of the
         # same string at a later revision looks like "unchanged" (the
@@ -539,9 +658,27 @@ def trace_param_provenance(
         for stale in tuple(prior_seen.keys() - rev_params.keys()):
             prior_seen.pop(stale, None)
         for key, value in rev_params.items():
-            if value != prior_seen.get(key):
+            prior = prior_seen.get(key)
+            # Re-attribute only on a SUBSTANTIVE change. A formatting-only edit
+            # that reparses to the same value (e.g. a community editor rewrote
+            # the bot's "circa 1926" as {{other date|circa|1926}}) leaves the
+            # migrated outcome identical, so it must keep the original setter's
+            # provenance — otherwise a cosmetic community edit flips a
+            # DPLA-originated value to "community" and it gets preserved/imported
+            # instead of dropped. Always track the latest form in prior_seen so
+            # the final-value filter below still matches.
+            #
+            # A FORMATTER bot (JarektBot AWB pipe-escaping, SchlurcherBot SDC
+            # housekeeping) is transparent: its edits never re-attribute, so the
+            # value keeps whoever set its substance. This is the backstop for a
+            # formatter edit whose parsed value differs (spacing/serialization)
+            # yet carries no content — the reparse-identical case is already
+            # covered by _provenance_value_unchanged above.
+            if (
+                prior is None or not _provenance_value_unchanged(key, value, prior)
+            ) and not is_formatter:
                 provenance[key] = rev.user
-                prior_seen[key] = value
+            prior_seen[key] = value
     # Only return entries whose tracked value still matches the final
     # value — a param that was edited and then reverted back to a prior
     # form would otherwise carry stale provenance.
@@ -577,6 +714,7 @@ def plan_migration(
     revisions: Iterable[RevisionSnapshot],
     canonical_params: dict,
     bot_accounts: frozenset[str] = MIGRATION_PROVENANCE_ACCOUNTS,
+    resolve_qid_redirect: Callable[[str], str] | None = None,
 ) -> MigrationPlan | None:
     """Compute the migration plan for a legacy-Artwork file.
 
@@ -594,6 +732,13 @@ def plan_migration(
     detect cases where a "community" provenance is actually a
     community editor re-stating what DPLA already has — in that case
     nothing is imported (the value is redundant with canonical).
+
+    ``resolve_qid_redirect`` optionally resolves a Wikidata Q-ID through
+    redirects (see :func:`_make_redirect_resolver`); it widens the
+    ``institution`` equivalence check so a community value that used an
+    older Q now redirecting to canonical's current Q is treated as
+    DPLA's own. Omitted (None) in the pure/test path — equivalence then
+    rests on the byte comparison alone.
     """
     sorted_revs = sorted(revisions, key=lambda r: r.revid)
     if not sorted_revs:
@@ -602,15 +747,30 @@ def plan_migration(
     if find_legacy_template(latest.text) is None:
         return None
 
-    wikitext_params = parse_artwork_params(latest.text)
-    provenance = trace_param_provenance(sorted_revs)
+    wikitext_params = parse_artwork_params(latest.text, include_unmapped=True)
+    provenance = trace_param_provenance(sorted_revs, include_unmapped=True)
     classified = classify_param_provenance(provenance, bot_accounts)
 
     community_imports: dict[str, str] = {}
     dpla_originated: dict[str, str] = {}
     wikitext_preserved_extras: dict[str, str] = {}
+    other_field_rows: list[str] = []
 
     for key, value in wikitext_params.items():
+        if key.startswith(_UNMAPPED_KEY_PREFIX):
+            # An unmapped legacy param (photographer, genre, depicted people, …)
+            # has no DPLA canonical/SDC target. Preserve a COMMUNITY-authored one
+            # as an {{Information field}} row in other_fields (Module:DPLA renders
+            # it in the yellow box); a DPLA-bot-authored one is boilerplate with
+            # no SDC target and is dropped — the same treatment a mapped
+            # DPLA-originated value gets. A bare redundant {{DPLA}} source
+            # template is likewise dropped, not wrapped.
+            if classified.get(key) != "community" or _is_redundant_dpla_source(value):
+                continue
+            other_field_rows.append(
+                _information_field_row(key.removeprefix(_UNMAPPED_KEY_PREFIX), value)
+            )
+            continue
         # A DPLA/uploader-generated boilerplate value (a bare {{DPLA}} template,
         # an uploader source link, or a rights-statement string) is provenance
         # already rendered from SDC — keeping it would just duplicate that
@@ -622,7 +782,7 @@ def plan_migration(
             continue
         canonical_value = _canonical_value_for_key(canonical_params, key)
         if classified.get(key) == "community" and not _value_equivalent_to_canonical(
-            key, value, canonical_value
+            key, value, canonical_value, resolve_qid_redirect
         ):
             # Only import community values that *differ* from canonical
             # — a community editor restating DPLA's title verbatim is
@@ -670,6 +830,13 @@ def plan_migration(
             community_imports[key] = value
         else:
             dpla_originated[key] = value
+
+    if other_field_rows:
+        # Community-authored unmapped params, preserved as a run of
+        # {{Information field}} rows in the migrated template's ``other_fields``
+        # param (the fresh get_wiki_text block never emits it, so there is no
+        # canonical value to collide with).
+        wikitext_preserved_extras["other_fields"] = "\n".join(other_field_rows)
 
     legacy_template = find_legacy_template(latest.text)
     return MigrationPlan(
@@ -1052,17 +1219,126 @@ _CANNED_PD_BLURB = (
 )
 
 
+def _is_rightsstatements_host(host: str) -> bool:
+    """True when ``host`` (already lowercased) is rightsstatements.org or a
+    subdomain of it. Matched on the parsed hostname, so a look-alike like
+    ``rightsstatements.org.evil.example`` does not match."""
+    return host == "rightsstatements.org" or host.endswith(".rightsstatements.org")
+
+
 def _is_rights_url(url: str) -> bool:
     """True for a DPLA/NARA rights-statement URL, matched by parsed host (and
     path) rather than substring — so ``https://rightsstatements.org@evil.example/…``
     or a URL merely containing the text elsewhere does NOT match."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if host == "rightsstatements.org" or host.endswith(".rightsstatements.org"):
+    if _is_rightsstatements_host(host):
         return True
     return (
         host == "archives.gov" or host.endswith(".archives.gov")
     ) and parsed.path.startswith("/social-media/flickr-faqs")
+
+
+# Template:Rights statement's first positional arg accepts any of {bare code,
+# http:// URI, https:// URI} for these rightsstatements.org statements — its
+# /switch maps all three forms of each to one Wikidata item. All reduce to the
+# lowercased code. (The DPLA pipeline itself only emits NoC-US / NKC via
+# get_permissions_template, but community-authored wikitext may use any of them.)
+_RS_STATEMENT_CODES = frozenset(
+    {
+        "inc",
+        "inc-ow-eu",
+        "inc-edu",
+        "inc-nc",
+        "inc-ruu",
+        "noc-cr",
+        "noc-nc",
+        "noc-oklr",
+        "noc-us",
+        "cne",
+        "und",
+        "nkc",
+    }
+)
+
+
+def _rs_statement_code(arg: str) -> str | None:
+    """Reduce a ``{{Rights statement}}`` argument to its lowercased
+    rightsstatements.org statement code, or None. Accepts the three forms the
+    template's switch accepts — a bare code (``NoC-US``), an ``http://`` URI, or
+    an ``https://`` URI (``…/vocab/NoC-US/1.0/``) — treating the two schemes as
+    equivalent exactly as the template does (host matched by parsed hostname, so
+    a look-alike like ``rightsstatements.org.evil.example`` does not match)."""
+    arg = arg.strip()
+    parsed = urlparse(arg)
+    if _is_rightsstatements_host((parsed.hostname or "").lower()):
+        parts = [p for p in parsed.path.split("/") if p]
+        code = parts[1].lower() if len(parts) >= 2 and parts[0] == "vocab" else ""
+    else:
+        code = arg.lower()
+    return code if code in _RS_STATEMENT_CODES else None
+
+
+def _is_ignorable_node(node) -> bool:
+    """True for a node that carries no meaning in a display value — a
+    whitespace-only ``Text`` node or a ``<br>`` ``Tag``. Lets callers test
+    whether a value is a single significant node (a template/link) surrounded
+    only by layout whitespace."""
+    if isinstance(node, mwparserfromhell.nodes.Text):
+        return not node.value.strip()
+    return (
+        isinstance(node, mwparserfromhell.nodes.Tag)
+        and str(node.tag).strip().lower() == "br"
+    )
+
+
+def _rights_identity(value: str) -> str | None:
+    """Reduce a ``permission`` value to a canonical rights key so representations
+    of the same rights compare equal regardless of surface form:
+
+    * ``{{Rights statement|<code|http|https URI>}}`` → the RS statement code;
+    * the permission template the uploader emits (``{{NoC-US|Q…}}``,
+      ``{{NKC|Q…}}``, ``{{cc-zero}}``, ``{{PD-US}}``, ``{{Cc-by-4.0}}``) → its
+      lowercased template name — which for the RS statements *is* the code, so it
+      collapses onto the ``{{Rights statement}}`` form above;
+    * a bare rights-statement URI → the RS statement code.
+
+    Returns None for anything that is not a single, recognised rights
+    representation (community prose, a non-rights template, or a rights template
+    mixed with other content) — so a genuinely different community permission is
+    preserved by the caller, never silently dropped.
+
+    Note the drop semantics differ from :func:`_is_dpla_generated_extra`'s
+    permission branch, which drops a bare rights-statement *external link*
+    UNCONDITIONALLY (uploader boilerplate) before this comparator runs. Here the
+    permission-TEMPLATE form is dropped only when it EQUALS canonical — the more
+    conservative choice, since a template can legitimately name a *different*
+    community-chosen right, which is then preserved."""
+    meaningful = [
+        node
+        for node in mwparserfromhell.parse(value).nodes
+        if not _is_ignorable_node(node)
+    ]
+    if len(meaningful) != 1:
+        return None
+    node = meaningful[0]
+    if isinstance(node, mwparserfromhell.nodes.Template):
+        name = _template_name(node)
+        if name == "rights statement":
+            return (
+                _rs_statement_code(str(node.get("1").value)) if node.has("1") else None
+            )
+        if name in _RS_STATEMENT_CODES or name.startswith(("cc-", "pd-")):
+            return name
+        return None
+    if isinstance(node, mwparserfromhell.nodes.ExternalLink):
+        # A bare rights-statement URI (mwparserfromhell parses a bare URL as an
+        # external-link node).
+        return _rs_statement_code(str(node.url))
+    if isinstance(node, mwparserfromhell.nodes.Text):
+        # A bare rights code as plain text (e.g. a hand-typed ``NoC-US``).
+        return _rs_statement_code(node.value)
+    return None
 
 
 def _only_external_links(value: str) -> bool:
@@ -1074,15 +1350,7 @@ def _only_external_links(value: str) -> bool:
     for node in mwparserfromhell.parse(value).nodes:
         if isinstance(node, mwparserfromhell.nodes.ExternalLink):
             saw = True
-        elif isinstance(node, mwparserfromhell.nodes.Text):
-            if node.value.strip():
-                return False
-        elif (
-            isinstance(node, mwparserfromhell.nodes.Tag)
-            and str(node.tag).strip().lower() == "br"
-        ):
-            continue
-        else:
+        elif not _is_ignorable_node(node):
             return False
     return saw
 
@@ -1254,17 +1522,69 @@ _KNOWN_LANG_CODES = frozenset(
 )
 
 
+def _unwrap_title_template(value: str) -> tuple[str, str] | None:
+    """If ``value`` is a sole Commons ``{{Title|…}}`` formatting template
+    carrying exactly one title string (plus an optional language), return
+    ``(text, lang)``; otherwise None so the caller falls back to verbatim
+    handling. ``{{Title}}`` is display-only formatting, so a title wrapped in it
+    is the same fact as the plain string — this lets it reconcile against
+    canonical and, when it differs, import as clean monolingual SDC.
+
+    Recognised shapes (``lang`` defaults to ``en`` — DPLA's default language):
+
+    * ``{{Title|XXX}}`` / ``{{Title|1=XXX}}``                 → ``("XXX", "en")``
+    * ``{{Title|en=XXX}}`` / ``{{Title|es=XXX}}``             → ``("XXX", "<code>")``
+    * ``{{Title|XXX|lang=en}}`` / ``{{Title|1=XXX|lang=es}}`` → ``("XXX", "<code>")``
+
+    Anything else — a second title string, an unknown extra parameter, a nested
+    template — returns None; the value is preserved verbatim rather than risk
+    dropping content."""
+    if "{{" not in value:
+        return None
+    parsed = mwparserfromhell.parse(value.strip())
+    templates = parsed.filter_templates(recursive=False)
+    if len(templates) != 1 or str(parsed).strip() != str(templates[0]).strip():
+        return None
+    tpl = templates[0]
+    if _template_name(tpl) != "title":
+        return None
+    text: str | None = None
+    lang = "en"
+    for param in tpl.params:
+        name = str(param.name).strip()
+        param_value = str(param.value).strip()
+        if name == "1":
+            if text is not None:
+                return None  # a second title string — not a simple wrapper
+            text = param_value
+        elif name == "lang":
+            lang = param_value.lower()
+        elif name.casefold() in _KNOWN_LANG_CODES:
+            if text is not None:
+                return None  # positional + language-keyed text is ambiguous
+            text, lang = param_value, name.casefold()
+        else:
+            return None  # unknown parameter — don't guess
+    if not text:
+        return None
+    return text, lang
+
+
 def _unwrap_lang_template(value: str) -> tuple[str, str]:
     """If ``value`` is exactly one bare ``{{<lang>|<text>}}`` language template
-    with a known ISO code, return ``(text, lang)``; otherwise ``(value,
-    "en")``. Lets a community title/description be stored as clean monolingual
-    text with the correct language code instead of literal ``{{en|…}}`` markup,
-    and reconciled against canonical's plain text."""
+    with a known ISO code (or a ``{{Title|…}}`` formatting wrapper), return
+    ``(text, lang)``; otherwise ``(value, "en")``. Lets a community
+    title/description be stored as clean monolingual text with the correct
+    language code instead of literal ``{{en|…}}`` / ``{{Title|…}}`` markup, and
+    reconciled against canonical's plain text."""
     # Fast path: a value with no template markup can't be a bare language
     # wrapper — skip the mwparserfromhell parse (this runs on every
     # title/description value across the batch).
     if "{{" not in value:
         return value, "en"
+    title = _unwrap_title_template(value)
+    if title is not None:
+        return title
     parsed = mwparserfromhell.parse(value.strip())
     templates = parsed.filter_templates(recursive=False)
     if len(templates) == 1 and str(parsed).strip() == str(templates[0]).strip():
@@ -1283,7 +1603,12 @@ def _unwrap_lang_template(value: str) -> tuple[str, str]:
     return value, "en"
 
 
-def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool:
+def _value_equivalent_to_canonical(
+    key: str,
+    value: str,
+    canonical: str,
+    resolve_qid_redirect: Callable[[str], str] | None = None,
+) -> bool:
     """Return True when ``value`` (from wikitext) and ``canonical`` (from
     DPLA) are the same fact for the purpose of migration-planning.
 
@@ -1313,10 +1638,18 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
     strict equality.
     """
     if key in ("title", "description"):
-        # A community title/description wrapped in a bare language template
-        # ({{en|…}}) is the same fact as canonical's plain text — compare the
-        # unwrapped text so it isn't imported as a spurious community value.
-        value = _unwrap_lang_template(value)[0]
+        # A community title/description wrapped in a language template
+        # ({{en|…}}) or the {{Title|…}} formatting template is the same fact as
+        # canonical's plain text — compare the unwrapped text so it isn't
+        # imported as a spurious community value. But only when the wrapper's
+        # language is DPLA's default (English): a non-English wrapper
+        # ({{Title|es=…}}) is a distinct fact even if the text matches, so it
+        # must NOT be treated as redundant — it should import as its own
+        # language-tagged monolingual claim instead.
+        text, lang = _unwrap_lang_template(value)
+        if lang != "en":
+            return False
+        value = text
     if value == canonical:
         return True
     if key == "date" and dates_semantically_equal(value, canonical):
@@ -1325,6 +1658,29 @@ def _value_equivalent_to_canonical(key: str, value: str, canonical: str) -> bool
         wiki_qid = _extract_institution_qid(value)
         canon_qid = _extract_institution_qid(canonical) or canonical.strip()
         if wiki_qid and wiki_qid == canon_qid:
+            return True
+        if wiki_qid and canon_qid and resolve_qid_redirect is not None:
+            # A community editor may have used an older institution Q that
+            # Wikidata has since merged into canonical's current Q (a redirect).
+            # Resolve the community Q — mirroring Module:DPLA's
+            # ``mw.wikibase.getEntity(q):getId()`` — so a redirected-equivalent
+            # value is recognised as DPLA's own and dropped, not preserved as a
+            # spurious community contribution. Compare against the raw canonical
+            # Q first (the common case — canonical is DPLA's current Q); only
+            # resolve canonical too if that misses (both sides redirected).
+            resolved_wiki = resolve_qid_redirect(wiki_qid)
+            if resolved_wiki == canon_qid or resolved_wiki == resolve_qid_redirect(
+                canon_qid
+            ):
+                return True
+    if key == "permission":
+        # ``{{Rights statement|<code|URI>}}`` and the uploader-emitted permission
+        # template ({{NoC-US|Q…}}, {{cc-zero}}, …) render the same rights from
+        # different wikitext, so a byte/casefold compare misses them. Compare the
+        # canonical rights key instead; None means an unrecognised representation
+        # (community prose / a different right), which stays preserved.
+        identity = _rights_identity(value)
+        if identity is not None and identity == _rights_identity(canonical):
             return True
     if key in CASEFOLD_COMPARE_KEYS:
         folded_value = casefold_for_compare(value)
@@ -2798,7 +3154,13 @@ def migrate_legacy_file(
     canonical_params = dpla_metadata_params(
         dpla_id, item_metadata, provider, data_provider
     )
-    plan = plan_migration(title, revisions, canonical_params, bot_accounts)
+    plan = plan_migration(
+        title,
+        revisions,
+        canonical_params,
+        bot_accounts,
+        resolve_qid_redirect=_make_redirect_resolver(site),
+    )
     if plan is None:
         return MigrationResult(skipped_reason="no-legacy-template")
 
@@ -2966,6 +3328,7 @@ def import_cross_page_community_sdc(
         fetch_revision_snapshots(source_page),
         canonical_params,
         bot_accounts,
+        resolve_qid_redirect=_make_redirect_resolver(site),
     )
     if plan is None or (not plan.community_imports and not plan.related_image_imports):
         return 0
@@ -2981,6 +3344,46 @@ def import_cross_page_community_sdc(
         summary=summary or build_migration_summary(len(claims)),
     )
     return len(claims)
+
+
+# Wikidata Q-ID redirect targets, cached for the life of the PROCESS (keyed by
+# repository db-name + Q-ID) so a batch migration resolves each institution Q at
+# most once — institution Q-IDs are shared across many files from the same
+# provider, and a per-file cache would repeat the same network round-trip on
+# every mismatching file. Bounded by the number of distinct redirected Q-IDs
+# (small); multiprocessing workers each keep their own copy, which is fine.
+_REDIRECT_TARGET_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _make_redirect_resolver(site) -> Callable[[str], str]:
+    """Build a Wikidata Q-ID redirect resolver for :func:`plan_migration`.
+
+    A Q that Wikidata has turned into a redirect resolves to its target Q-ID
+    (mirroring Module:DPLA's ``mw.wikibase.getEntity(q):getId()``); a
+    non-redirect, unknown, or malformed Q — and any network error — resolves to
+    itself, so redirect resolution only ever *widens* institution equivalence and
+    never blocks a migration. Bound to ``site``'s Wikidata data repository;
+    results are memoised in the process-wide :data:`_REDIRECT_TARGET_CACHE` so a
+    Q resolved for one file is reused across every later file in the run."""
+    import pywikibot
+
+    repo = site.data_repository()
+    repo_key = repo.dbName()
+
+    def resolve(qid: str) -> str:
+        cache_key = (repo_key, qid)
+        if cache_key not in _REDIRECT_TARGET_CACHE:
+            resolved = qid
+            try:
+                item = pywikibot.ItemPage(repo, qid)
+                if item.isRedirectPage():
+                    resolved = item.getRedirectTarget().getID()
+            except Exception:  # noqa: BLE001 — best-effort; fall back to identity
+                resolved = qid
+            _REDIRECT_TARGET_CACHE[cache_key] = resolved
+        return _REDIRECT_TARGET_CACHE[cache_key]
+
+    return resolve
 
 
 def _fetch_entity_or_empty(site, mediaid: str) -> dict:
