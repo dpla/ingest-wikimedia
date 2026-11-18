@@ -493,6 +493,8 @@ End-to-end testing via a synthetic invoke isn't practical — the handler enforc
 
 ## EC2 infrastructure
 
+> **Paused, November 2026.** The box described here may be stopped or gone, and the status workflow is disabled. See [recommissioning.md](recommissioning.md) for the current state and the steps to bring up a replacement.
+
 - **Instance**: `i-033eff6c8c168f999` (name: "wiki downloads") — always running
 - **Resources**: ~7.6 GiB RAM, **no swap** — see [Memory and concurrency planning](#memory-and-concurrency-planning) before launching several runs at once
 - **Access**: AWS SSM (`ssm:SendCommand` / `ssm:GetCommandInvocation`)
