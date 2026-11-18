@@ -31,6 +31,10 @@ Update this table whenever a piece of the system is turned off or back on. It is
 | 2026-11-18 | `wikimedia-upload-status.yml` disabled in GitHub (stops the 6-hourly cron and `/wikimedia-status`) | `gh workflow enable wikimedia-upload-status.yml --repo dpla/ingest-wikimedia` |
 | 2026-11-18 | Box logs, working files and home directory backed up to S3 (see [Where the saved state lives](#where-the-saved-state-lives)) | n/a |
 | 2026-11-18 | EBS snapshot `snap-0a1b2f9178032b106` taken of the box's root volume | n/a |
+| 2026-11-18 | Unattached Elastic IP `54.164.1.31` (`wikimedia-ingest`) released | Cannot be recovered; nothing used it |
+| 2026-11-18 | All non-empty media deleted from `s3://dpla-wikimedia`: 15,337,590 files, 120.5 TB. Sidecars and the 2,748,438 zero-byte retired placeholders kept. Key list, logs and scripts are under `_ops/delete-manifest-20261118/` | Not recoverable from AWS (no versioning). See [S3 state](#s3-state-and-what-it-means-for-the-first-runs) |
+| 2026-11-18 | 148 incomplete multipart uploads aborted | n/a |
+| 2026-11-18 | Box `i-033eff6c8c168f999` terminated; its root volume was deleted with it | [Path A](#path-a-restore-the-box-from-the-snapshot) or [Path B](#path-b-build-a-box-from-scratch) |
 
 To check the live state rather than trust this table:
 
@@ -267,15 +271,15 @@ cd ~/ingest-wikimedia/bpl && source ../.venv/bin/activate && python -c "import p
 
 ## S3 state and what it means for the first runs
 
-`s3://dpla-wikimedia/<partner>/images/…` holds two kinds of object per item (see [sidecars.md](sidecars.md)): the media bytes (`<ordinal>_<dpla-id>`) and small sidecars (`dpla-map.json`, `sdc.json`, `file-list.txt`, `upload-result.json`, `iiif.json`). At the pause the bucket held about 120 TB, almost all of it media.
+`s3://dpla-wikimedia/<partner>/images/…` holds two kinds of object per item (see [sidecars.md](sidecars.md)): the media bytes (`<ordinal>_<dpla-id>`) and small sidecars (`dpla-map.json`, `sdc.json`, `file-list.txt`, `upload-result.json`, `iiif.json`). Before the pause the bucket held about 120 TB, almost all of it media.
 
-If the media bytes have been deleted to save storage and only sidecars kept (check the [Pause log](#pause-log)):
+The media bytes were deleted on 2026-11-18 and only the sidecars kept (about 106 GB), along with the zero-byte placeholders that `retirer` had already left for files confirmed on Commons. That means:
 
 - **Still works without re-downloading:** `/wikimedia-upload sdc …` and `/wikimedia-upload maintain lite …`. Both run from sidecars and the live Commons state.
 - **Needs media again:** a normal upload run and the default `maintain` route. The uploader reads each file from S3 even when the result is a skip, so the downloader will re-fetch everything in scope from the partner first. Plan runs institution by institution rather than whole hubs.
-- **SHA1s:** the `CHECKSUM` metadata lived on the media objects, so it is gone with them. Commons still has each file's SHA1, and the downloader re-stamps it on re-download.
+- **SHA1s:** the `CHECKSUM` metadata lived on the media objects, so it is gone with them, except on the zero-byte placeholders. Commons still has each file's SHA1. On re-download the downloader computes a fresh SHA1 from the bytes it fetches, so it will differ from Commons' if the partner's file has changed since.
 
-If sidecars were deleted too, `upload-result.json` (the map from DPLA item and ordinal to Commons title and page ID) is rebuilt by a normal upload run, and `sdc-sync` can recover existing files by DPLA ID search in the meantime ([sdc-sync.md → Eligibility, ordinal rescue & pageid self-heal](sdc-sync.md#eligibility-ordinal-rescue--pageid-self-heal)).
+If the sidecars are ever deleted too, `upload-result.json` (the map from DPLA item and ordinal to Commons title and page ID) is rebuilt only by a normal upload run. Until that run has written it, partner-mode `sdc-sync` skips the item entirely: its DPLA-ID search ([sdc-sync.md → Eligibility, ordinal rescue & pageid self-heal](sdc-sync.md#eligibility-ordinal-rescue--pageid-self-heal)) rescues individual ordinals inside an item that already has an `upload-result.json`, not items without one.
 ## Smoke test
 
 In order, cheapest first:
