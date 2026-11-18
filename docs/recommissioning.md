@@ -281,7 +281,7 @@ If sidecars were deleted too, `upload-result.json` (the map from DPLA item and o
 In order, cheapest first:
 
 1. `/wikimedia-status` in Slack. Expect `No active Wikimedia upload sessions.` plus a memory line in #tech-alerts. This proves Slack → Lambda → GitHub Actions → OIDC → SSM → box.
-2. `/wikimedia-upload maintain count "<hub>|<institution>"` for a small institution. Read-only: it exercises Elasticsearch and the Commons login without writing anything. (S3 access was already checked in [Check the box](#check-the-box).)
+2. `/wikimedia-upload maintain count "<hub>|<institution>"` for a small institution that already has files on Commons. Read-only: it exercises Elasticsearch and the Commons login without writing anything. Expect a nonzero file count; an institution with no Commons category is skipped without contacting either. (S3 access was already checked in [Check the box](#check-the-box).)
 3. `/wikimedia-upload <dpla-id>` for one item known to be on Commons already. A healthy result is a skip in the upload phase and zero SDC writes. If media was deleted from S3, this re-downloads that one item first.
 
 {% endraw %}
