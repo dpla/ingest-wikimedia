@@ -277,9 +277,9 @@ The media bytes were deleted on 2026-11-18 and only the sidecars kept (about 106
 
 - **Still works without re-downloading:** `/wikimedia-upload sdc …` and `/wikimedia-upload maintain lite …`. Both run from sidecars and the live Commons state.
 - **Needs media again:** a normal upload run and the default `maintain` route. The uploader reads each file from S3 even when the result is a skip, so the downloader will re-fetch everything in scope from the partner first. Plan runs institution by institution rather than whole hubs.
-- **SHA1s:** the `CHECKSUM` metadata lived on the media objects, so it is gone with them, except on the zero-byte placeholders. Commons still has each file's SHA1, and the downloader re-stamps it on re-download.
+- **SHA1s:** the `CHECKSUM` metadata lived on the media objects, so it is gone with them, except on the zero-byte placeholders. Commons still has each file's SHA1. On re-download the downloader computes a fresh SHA1 from the bytes it fetches, so it will differ from Commons' if the partner's file has changed since.
 
-If the sidecars are ever deleted too, `upload-result.json` (the map from DPLA item and ordinal to Commons title and page ID) is rebuilt by a normal upload run, and `sdc-sync` can recover existing files by DPLA ID search in the meantime ([sdc-sync.md → Eligibility, ordinal rescue & pageid self-heal](sdc-sync.md#eligibility-ordinal-rescue--pageid-self-heal)).
+If the sidecars are ever deleted too, `upload-result.json` (the map from DPLA item and ordinal to Commons title and page ID) is rebuilt only by a normal upload run. Until that run has written it, partner-mode `sdc-sync` skips the item entirely: its DPLA-ID search ([sdc-sync.md → Eligibility, ordinal rescue & pageid self-heal](sdc-sync.md#eligibility-ordinal-rescue--pageid-self-heal)) rescues individual ordinals inside an item that already has an `upload-result.json`, not items without one.
 ## Smoke test
 
 In order, cheapest first:
