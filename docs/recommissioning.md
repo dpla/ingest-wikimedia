@@ -132,12 +132,13 @@ SNAP=snap-0a1b2f9178032b106
 
 # 1. Register a launchable image from the snapshot.
 AMI=$(aws ec2 register-image \
-  --name "wiki-downloads-restore-$(date +%Y%m%d)" \
+  --name "wiki-downloads-restore-$(date +%Y%m%d-%H%M%S)" \
   --architecture arm64 --virtualization-type hvm --boot-mode uefi \
   --ena-support --imds-support v2.0 \
   --root-device-name /dev/xvda \
   --block-device-mappings "DeviceName=/dev/xvda,Ebs={SnapshotId=$SNAP,VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true}" \
   --query ImageId --output text)
+aws ec2 wait image-available --image-ids "$AMI"
 
 # 2. Launch it with the same placement and role as the old box.
 aws ec2 run-instances \
@@ -260,7 +261,7 @@ cd ~/ingest-wikimedia/bpl && source ../.venv/bin/activate && python -c "import p
    ```
 
    The managed policy `wikimedia-status-ssm` (attached to the legacy IAM user `wikimedia-status-gh-action`) also names the old instance. It predates OIDC and is unused; delete the user and policy rather than update them.
-3. **Docs.** Replace the old instance ID in `docs/architecture.md`, `docs/github-actions-aws-oidc.md`, `docs/maintenance-tools.md`, `docs/operations.md` and this file.
+3. **Docs.** Replace the old instance ID in `docs/architecture.md`, `docs/github-actions-aws-oidc.md`, `docs/maintenance-tools.md`, `docs/operations.md` and the references to the active instance in this file. Keep the old ID in the Pause log and in the `_box-backup/` paths: those name the saved state, which stays under the old prefix.
 4. **Workflows.** Reverse each row of the [Pause log](#pause-log) that turned something off, using the command in its last column.
 5. **Lambda.** Nothing to change unless slash commands fail: then check that `GH_TOKEN` has not expired, and redeploy the handler if `lambda/wikimedia-slack-dispatch/handler.py` changed during the pause ([operations.md → Deploying the Lambda](operations.md#deploying-the-lambda)).
 
@@ -280,7 +281,7 @@ If sidecars were deleted too, `upload-result.json` (the map from DPLA item and o
 In order, cheapest first:
 
 1. `/wikimedia-status` in Slack. Expect `No active Wikimedia upload sessions.` plus a memory line in #tech-alerts. This proves Slack → Lambda → GitHub Actions → OIDC → SSM → box.
-2. `/wikimedia-upload maintain count "<hub>|<institution>"` for a small institution. Read-only: it exercises Elasticsearch, S3 and the Commons login without writing anything.
+2. `/wikimedia-upload maintain count "<hub>|<institution>"` for a small institution. Read-only: it exercises Elasticsearch and the Commons login without writing anything. (S3 access was already checked in [Check the box](#check-the-box).)
 3. `/wikimedia-upload <dpla-id>` for one item known to be on Commons already. A healthy result is a skip in the upload phase and zero SDC writes. If media was deleted from S3, this re-downloads that one item first.
 
 {% endraw %}
