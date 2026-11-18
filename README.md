@@ -12,6 +12,7 @@ A run is triggered from Slack (e.g. `/wikimedia-upload bpl`), dispatched through
 
 - **[docs/slack-guide.md](docs/slack-guide.md)** — Copy-paste Slack examples for every run type (hub-level, institution-level, Wikidata QID, single DPLA ID, refresh-only, SDC-only, retry, kill, status). Non-technical.
 - **[docs/operations.md](docs/operations.md)** — Full operations reference: hub registry, eligibility rules, session naming, monitoring, troubleshooting playbook.
+- **[docs/recommissioning.md](docs/recommissioning.md)** — The pipeline is **paused as of November 2026**. What was shut down, where the saved state and secrets live, and the exact steps to commission a replacement EC2 box and resume runs.
 
 ### Architecture and internals
 
